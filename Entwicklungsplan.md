@@ -73,9 +73,17 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
 ## Offen — wird wirklich gebaut
 - [ ] **SSO**: Windshift kann OIDC — Dev: an unseren Dex hängen (wie Frappe);
   Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-Userverwaltung
-- [ ] **Absprungpunkte bauen** (Entscheid 10.07.): Windshift-Spalte der 5 Team-Cockpits
-  + Link-Punkte im PLS-/PM-Gantt auf unsere Instanz verdrahten, sobald das URL-Schema
-  abgeleitet ist (kein Dominik-Blocker mehr)
+- [~] **Absprungpunkte bauen** (Entscheid 10.07.): stabiler Deep-Link `<base>/item/<ITEM_KEY>`
+  (base aus `site_config` `windshift_url`, Default `http://localhost:8088`; Link-Logik SSOT in
+  `pilanda_engineering.api.get_team_cockpit`).
+  - [x] **Windshift-Spalte der 5 Team-Cockpits verdrahtet (10.07.2026):** echter Deep-Link bei
+    gepflegtem `Task.custom_eng_windshift_task`, sonst „nicht verknüpft"; alle 5 Bundles gebaut,
+    HTTP 200, Render-Zweig nachgewiesen (Feld + Lese-API + Frontends).
+  - [ ] **OFFEN — Absprungpunkte direkt im PLS-Gantt / PM-Gantt** (Gantt-Balken → Windshift-Task):
+    separater Auftrag, noch nicht gebaut.
+  - **Hinweis Erst-Setup:** Die Ziel-Tasks in Windshift entstehen erst, wenn Marco den
+    Windshift-Setup-Wizard durchläuft und die ersten Tasks anlegt — bis dahin rendern die Links
+    korrekt, laufen aber ggf. in 404.
 - [ ] **Prod-Betrieb später**: wo die eine geteilte Instanz fürs Haus läuft
   (Server/Backup) — mit IT, wenn es soweit ist
 
