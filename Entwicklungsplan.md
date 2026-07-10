@@ -9,10 +9,18 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
 
 ## Bindende Entscheide
 - **Kein Nav-Modul** (Marco 07.07.2026): Aufruf als **„ToDo" unter „Allgemein" + Dashboard-Karte**
-  in der Pilanda-Shell (aktuell `localhost:8088`; Einbindung pilanda `f2ffc8e`/`97607f5`).
-- **Upstream = `codeberg.org/realigned/windshift-core`** (AGPL-3.0). Die Root-`README.md` ist
-  Upstream-Text (nennt GitHub als Push-Mirror des Upstreams — das betrifft das Upstream-Repo,
-  nicht dieses). Upstream-Sync-Strategie = Dominik.
+  in der Pilanda-Shell.
+- **Betriebsmodell (Marco 10.07.2026, präzisiert):** WIR betreiben eine **eigene
+  Windshift-Instanz, gebaut aus DIESEM Repo (`develop`), in Docker** — eigene Datenbank
+  im Docker-Volume (Start: SQLite; PostgreSQL-Wechsel offen), per API an Frappe.
+  **Dominiks Server-Installation ist sein Test-/Feature-Labor mit Usern und für unseren
+  Betrieb NICHT relevant** — wir verlinken nie dorthin. Code-Fluss: Dominiks Welt →
+  dieses Repo (`develop`) → unsere Docker-Instanz. **Update-Takt bewusst:** git pull →
+  Docker-Rebuild → Kurztest (kein Auto-Folgen).
+- **Task-URL-Schema leiten WIR selbst ab** (aus Repo-Code/laufender Instanz) — keine
+  Abhängigkeit von Dominiks Installation.
+- **Upstream-Kette:** `codeberg.org/realigned/windshift-core` (AGPL-3.0) → Dominiks Welt →
+  dieses Repo. Die Root-`README.md` ist Upstream-Text. Upstream-Sync = Dominik.
 - **Lizenz AGPL-3.0 beachten:** bei eigenen Modifikationen + Netzwerk-Bereitstellung besteht
   Quellcode-Offenlegungspflicht gegenüber den Nutzern — für interne Nutzung unkritisch,
   bei Kunden-/Extern-Zugriff (Customer Portal!) vorher prüfen.
@@ -37,14 +45,16 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   ARCHITEKTUR §2, Architektur-Diagramm, BENCH-Matrix (als Nicht-Bench-Stack), dieser Fachplan
 
 ## Offen — wird wirklich gebaut
-- [ ] **Betriebsmodell klären** [Dominik]: wo läuft die produktive Instanz
-  (aktuell Dominiks `:8088`), Deployment/Backup, SQLite vs. PostgreSQL
-- [ ] **SSO** [Dominik/IT]: Windshift kann OIDC — Anbindung an LCS/Entra ID, sobald der
-  stack-weite SSO-Auftrag (IT) steht; keine Doppel-Userverwaltung
-- [ ] **Absprungpunkte bauen** (Entscheid 10.07. s. oben): Link-Punkte im PLS-Gantt und
-  PM-Gantt (Balken → Arbeitspaket → Technik-Task). Voraussetzung: Ziel-URL-Schema mit
-  Dominik klären (Board-/Task-Adressierung in Windshift), dann UI-Verdrahtung in
-  `pilanda_pls`/`pilanda_pm`
+- [ ] **Eigene Docker-Instanz in der Dev-Env** (Entscheid 10.07. s. oben): Compose-Service
+  aus diesem Repo bauen (Dockerfile liegt bei), SQLite-Volume, Port 8088, Ersteinrichtung;
+  danach Task-URL-Schema aus der laufenden Instanz ableiten — in Arbeit
+- [ ] **SSO**: Windshift kann OIDC — Dev: an unseren Dex hängen (wie Frappe);
+  Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-Userverwaltung
+- [ ] **Absprungpunkte bauen** (Entscheid 10.07.): Windshift-Spalte der 5 Team-Cockpits
+  + Link-Punkte im PLS-/PM-Gantt auf unsere Instanz verdrahten, sobald das URL-Schema
+  abgeleitet ist (kein Dominik-Blocker mehr)
+- [ ] **Prod-Betrieb später**: wo die eine geteilte Instanz fürs Haus läuft
+  (Server/Backup) — mit IT, wenn es soweit ist
 
 ## Grenzen / ehrliche Hinweise
 - Dieses Repo ist der **Quellcode-Stand** von Windshift in unserer Org; das laufende
