@@ -22,8 +22,9 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
 - **Optik = Upstream-Look** (Marco 10.07.2026): KEIN `--pp-*`-Angleich — Update-Fähigkeit
   geht vor Einheitsoptik; bewusste, dokumentierte Ausnahme vom Theme-Zielbild.
 - **Scope-Start = NUR Technik** (Marco 10.07.2026): Taskmanagement zunächst für die
-  Engineering-Bereiche (engineering, projectengineering; künftig tecdoc, e-engineering,
-  researchdevelop). Alle anderen Bereiche später.
+  Engineering-Bereiche (`pilanda_engineering`, `pilanda_projectengineering`,
+  `pilanda_technicaldocu`, `pilanda_electricalengineering`, `pilanda_researchdevelop` —
+  die drei Team-Repos seit 10.07. eingegliedert). Alle anderen Bereiche später.
 - **Kopplung = NUR Verlinkung** (Marco 10.07.2026): Absprungpunkte aus **PLS-Gantt** und
   **PM-Gantt** (Gantt-Balken → Arbeitspaket PLS → Task in der Technik) als Links —
   keine Datenkopplung/kein Sync.
