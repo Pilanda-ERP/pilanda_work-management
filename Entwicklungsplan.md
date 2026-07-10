@@ -75,8 +75,7 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   - Windshift nennt Tasks „Work Items" (Route-View `item-detail`).
 
 ## Offen — wird wirklich gebaut
-- [~] **SSO**: Windshift kann OIDC — **Dev-Verdrahtung an unseren Dex steht
-  (10.07.2026)**, E2E-Nachweis noch offen an EINEM Dev-Schalter:
+- [x] **SSO Dev-Teil KOMPLETT — „ein Login für alles" E2E verifiziert (10.07.2026):**
   - [x] Dex-Client `windshift` (`_devenv/dex/config.yaml`, Secret Dev-Wert,
     RedirectURI `http://localhost:8088/api/sso/callback/windshift`) — Discovery 200.
   - [x] Windshift-OIDC-Provider `LCS SSO` in der windshift-DB (slug `windshift`,
@@ -86,15 +85,18 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
     Dex-HTTP-URL; reproduzierbar im Setup-Helfer. Nachweis: `GET /api/sso/status`
     → `{"enabled":true,"provider_name":"LCS SSO",...}` (Login-Seite zeigt den
     SSO-Knopf).
-  - [ ] **E2E-Login blockiert an SSRF-Schutz**: der server-seitige OIDC-Call
-    (Discovery/Token) geht auf `host.docker.internal` = private Host-Gateway-IP
-    (192.168.65.254), die Windshifts `SafeNetDialer` blockt. Verifizierter Fehler:
-    `OIDC discovery failed … dial host resolves to a blocked IP range:
-    192.168.65.254`. Freigabe = `ALLOW_LOCAL_CONNECTIONS=true` am `windshift`-
-    Service (NUR Dev; in `docker-compose.dev.yml` dokumentiert, bewusst nicht
-    aktiv eingecheckt — SSRF-Schwächung braucht ausdrückliche Freigabe). Danach
-    Container neu erstellen → E2E-Code-Flow als `t.tester@lcs.local` läuft durch.
-  - Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-User-
+  - [x] **E2E-Login verifiziert (10.07.2026, nach expliziter Marco-Freigabe des
+    Dev-Schalters):** `ALLOW_LOCAL_CONNECTIONS=true` am `windshift`-Service aktiv
+    (NUR Dev — Windshifts SSRF-Schutz blockte sonst den Dex-Call auf die private
+    Host-Gateway-IP; in Prod mit Entra/HTTPS bleibt der Schalter AUS). Kompletter
+    OIDC-Code-Flow durchgespielt: `/api/sso/login/windshift` → Dex-Login
+    `t.tester@lcs.local` → 303 mit Code → Callback 302 + Session-Cookie →
+    `GET /api/auth/me` = `{"email":"t.tester@lcs.local", …}` — Nutzer wurde per
+    **Auto-Provisioning** beim ersten SSO-Login angelegt (id 2, email_verified).
+    Hinweis Cookie-Verhalten: Windshift setzt state/pkce/session-Cookies mit
+    `Secure` — Browser akzeptieren das auf `localhost` (trustworthy origin),
+    Skript-Clients müssen die Cookies explizit mitführen.
+  - [ ] Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-User-
     verwaltung. Umstieg = Issuer/Client-IDs tauschen (gleicher Code-Flow).
 - [~] **Absprungpunkte bauen** (Entscheid 10.07.): stabiler Deep-Link `<base>/item/<ITEM_KEY>`
   (base aus `site_config` `windshift_url`, Default `http://localhost:8088`; Link-Logik SSOT in
