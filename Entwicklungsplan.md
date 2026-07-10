@@ -104,8 +104,18 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   - [x] **Windshift-Spalte der 5 Team-Cockpits verdrahtet (10.07.2026):** echter Deep-Link bei
     gepflegtem `Task.custom_eng_windshift_task`, sonst „nicht verknüpft"; alle 5 Bundles gebaut,
     HTTP 200, Render-Zweig nachgewiesen (Feld + Lese-API + Frontends).
-  - [ ] **OFFEN — Absprungpunkte direkt im PLS-Gantt / PM-Gantt** (Gantt-Balken → Windshift-Task):
-    separater Auftrag, noch nicht gebaut.
+  - [x] **PM-Gantt-Absprung gebaut (10.07.2026):** dezenter Deep-Link im Vorgangs-Inspektor
+    (`pilanda_pm`), nur bei gepflegtem `Task.custom_eng_windshift_task`; das Gantt-Backend hängt
+    `windshift_url` je Vorgang an (Link-Logik SSOT `pilanda_engineering.api.get_windshift_links`).
+    Nachweis: Bundle HTTP 200 + Link-Zweig, `/app/pm-gantt` 200, E2E `TASK-2026-00525` →
+    `http://localhost:8088/item/ETECH-1` in Projekt `PROJ-0011`, PM-Tests grün (Details pilanda_pm-Plan).
+  - [~] **PLS-Absprung bewusst zurückgestellt (10.07.2026 — Realitäts-Entscheid, NICHT gebaut):**
+    `/app/pls-portfolio` zeigt heute **nur die Projektebene** (eine Zeile je Projekt); die AP-/Task-Ebene
+    (Portfolio-Gantt-Drilldown Projekt→WBS→Task→Gate) ist ein offener PLS-Punkt. Der Windshift-Key lebt
+    aber am **Task** (Arbeitspaket) — auf Projektebene gibt es kein sinnvolles 1:1-Sprungziel, und ein
+    Projektzeilen-Link aufs Technik-Cockpit wäre irreführend (Cockpit ist team-, nicht projektgefiltert).
+    Daher **kein erfundener AP-Absprung**: der PLS-AP-Absprung kommt MIT der PLS-AP-Ebene (dann via
+    demselben SSOT-Helper, analog PM-Inspektor). Begründung auch im pilanda_pls-Plan.
   - **Hinweis Erst-Setup:** Die Ziel-Tasks in Windshift entstehen erst, wenn Marco den
     Windshift-Setup-Wizard durchläuft und die ersten Tasks anlegt — bis dahin rendern die Links
     korrekt, laufen aber ggf. in 404.
