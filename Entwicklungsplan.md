@@ -12,7 +12,12 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   in der Pilanda-Shell.
 - **Betriebsmodell (Marco 10.07.2026, präzisiert):** WIR betreiben eine **eigene
   Windshift-Instanz, gebaut aus DIESEM Repo (`develop`), in Docker** — eigene Datenbank
-  im Docker-Volume (Start: SQLite; PostgreSQL-Wechsel offen), per API an Frappe.
+  im Docker-Volume, per API an Frappe.
+- **DB = PostgreSQL von Anfang an (Marco 10.07.2026):** Dev=Prod, **kein späterer
+  DB-Umzug**. MariaDB wird von Windshift nicht unterstützt; die Mitnutzung der
+  Frappe-DB wurde bewusst verworfen (Datenhoheit, Kopplung nur per API). Eigener
+  Compose-Service `windshift-db` (postgres:17, Volume `windshift-db-data`), DSN
+  `postgresql://windshift:windshift@windshift-db:5432/windshift?sslmode=disable`.
   **Dominiks Server-Installation ist sein Test-/Feature-Labor mit Usern und für unseren
   Betrieb NICHT relevant** — wir verlinken nie dorthin. Code-Fluss: Dominiks Welt →
   dieses Repo (`develop`) → unsere Docker-Instanz. **Update-Takt bewusst:** git pull →
@@ -43,11 +48,29 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
 - [x] §5-Eingliederung ins Repo-Inventar (10.07.2026): `develop` angelegt + Default,
   Repo-Beschreibung, `pilanda-dev.code-workspace` + cSpell, Master §1 (19 Repos),
   ARCHITEKTUR §2, Architektur-Diagramm, BENCH-Matrix (als Nicht-Bench-Stack), dieser Fachplan
+- [x] **Eigene Docker-Instanz in der Dev-Env (10.07.2026)** — Compose-Services
+  `windshift` (build aus diesem Repo/Dockerfile, `pilanda-windshift:local`) +
+  `windshift-db` (postgres:17) in `pilanda/_devenv/docker-compose.dev.yml`,
+  Compose-Projekt `pilanda`, Port **8088**, Volumes `pilanda_windshift-data`
+  (Attachments/Plugins/Prompts) + `pilanda_windshift-db-data` (PostgreSQL).
+  **Nachweise:** HTTP `GET http://localhost:8088` → **200** (`<title>Windshift -
+  Work Management</title>`); `GET /api/setup/status` → 200
+  `{"setup_completed":false,...}`; PostgreSQL belegt (235 Tabellen in DB
+  `windshift`, Log `postgres timestamp backfill complete`); CORS/CSRF-Origin
+  `http://localhost:8088`. **Ersteinrichtung = manueller Setup-Wizard durch Marco**
+  im Browser (Erst-Admin + Module) — kein Env/CLI-Bootstrap; danach Auth aktiv.
+- [x] **Task-URL-Schema abgeleitet (aus `frontend/src/lib/router.js`, Code-Fund;
+  praktisch klickbar erst nach Setup/Login):**
+  - Stabiler, menschenlesbarer Deep-Link (**für PLS-/PM-Gantt-Absprünge empfohlen**):
+    `http://localhost:8088/workspace/<WORKSPACE_KEY>/item/<ITEM_NUMBER>`
+    bzw. Kurzform `http://localhost:8088/item/<WORKSPACE_KEY>-<ITEM_NUMBER>`
+    (Item-Key-Format `PROJ-123` = `workspace_key`-`workspace_item_number`,
+    `utils/itemKey.js`).
+  - Numerische Form (so erzeugt die eingebaute „Copy Link"-Aktion, `ItemDetail.svelte`):
+    `http://localhost:8088/workspaces/<workspaceId>/items/<itemId>`.
+  - Windshift nennt Tasks „Work Items" (Route-View `item-detail`).
 
 ## Offen — wird wirklich gebaut
-- [ ] **Eigene Docker-Instanz in der Dev-Env** (Entscheid 10.07. s. oben): Compose-Service
-  aus diesem Repo bauen (Dockerfile liegt bei), SQLite-Volume, Port 8088, Ersteinrichtung;
-  danach Task-URL-Schema aus der laufenden Instanz ableiten — in Arbeit
 - [ ] **SSO**: Windshift kann OIDC — Dev: an unseren Dex hängen (wie Frappe);
   Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-Userverwaltung
 - [ ] **Absprungpunkte bauen** (Entscheid 10.07.): Windshift-Spalte der 5 Team-Cockpits
