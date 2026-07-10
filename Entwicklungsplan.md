@@ -57,8 +57,12 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   Work Management</title>`); `GET /api/setup/status` → 200
   `{"setup_completed":false,...}`; PostgreSQL belegt (235 Tabellen in DB
   `windshift`, Log `postgres timestamp backfill complete`); CORS/CSRF-Origin
-  `http://localhost:8088`. **Ersteinrichtung = manueller Setup-Wizard durch Marco**
-  im Browser (Erst-Admin + Module) — kein Env/CLI-Bootstrap; danach Auth aktiv.
+  `http://localhost:8088`. **Ersteinrichtung headless erledigt (10.07.2026)** —
+  Erst-Admin `admin@lcs.local` per `POST /api/setup/complete` (kein Browser-Wizard
+  mehr); reproduzierbar via `_devenv/setup/windshift-sso-setup.ps1` (idempotent,
+  Zugangsdaten aus Env, Dev-Defaults in `.env.example`). Nachweis: `GET
+  /api/setup/status` → `{"setup_completed":true,"admin_user_created":true,...}`,
+  Admin-Login `POST /api/auth/login` → `/api/auth/me` liefert `is_system_admin:true`.
 - [x] **Task-URL-Schema abgeleitet (aus `frontend/src/lib/router.js`, Code-Fund;
   praktisch klickbar erst nach Setup/Login):**
   - Stabiler, menschenlesbarer Deep-Link (**für PLS-/PM-Gantt-Absprünge empfohlen**):
@@ -71,8 +75,27 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   - Windshift nennt Tasks „Work Items" (Route-View `item-detail`).
 
 ## Offen — wird wirklich gebaut
-- [ ] **SSO**: Windshift kann OIDC — Dev: an unseren Dex hängen (wie Frappe);
-  Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-Userverwaltung
+- [~] **SSO**: Windshift kann OIDC — **Dev-Verdrahtung an unseren Dex steht
+  (10.07.2026)**, E2E-Nachweis noch offen an EINEM Dev-Schalter:
+  - [x] Dex-Client `windshift` (`_devenv/dex/config.yaml`, Secret Dev-Wert,
+    RedirectURI `http://localhost:8088/api/sso/callback/windshift`) — Discovery 200.
+  - [x] Windshift-OIDC-Provider `LCS SSO` in der windshift-DB (slug `windshift`,
+    Issuer `http://host.docker.internal:5556/dex`, `auto_provision_users`,
+    Client-Secret app-verschlüsselt). Angelegt per Admin-API (HTTPS-Dummy-Issuer,
+    da `ValidateExternalURL` HTTPS erzwingt) + SQL-Downgrade des Issuers auf die
+    Dex-HTTP-URL; reproduzierbar im Setup-Helfer. Nachweis: `GET /api/sso/status`
+    → `{"enabled":true,"provider_name":"LCS SSO",...}` (Login-Seite zeigt den
+    SSO-Knopf).
+  - [ ] **E2E-Login blockiert an SSRF-Schutz**: der server-seitige OIDC-Call
+    (Discovery/Token) geht auf `host.docker.internal` = private Host-Gateway-IP
+    (192.168.65.254), die Windshifts `SafeNetDialer` blockt. Verifizierter Fehler:
+    `OIDC discovery failed … dial host resolves to a blocked IP range:
+    192.168.65.254`. Freigabe = `ALLOW_LOCAL_CONNECTIONS=true` am `windshift`-
+    Service (NUR Dev; in `docker-compose.dev.yml` dokumentiert, bewusst nicht
+    aktiv eingecheckt — SSRF-Schwächung braucht ausdrückliche Freigabe). Danach
+    Container neu erstellen → E2E-Code-Flow als `t.tester@lcs.local` läuft durch.
+  - Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-User-
+    verwaltung. Umstieg = Issuer/Client-IDs tauschen (gleicher Code-Flow).
 - [~] **Absprungpunkte bauen** (Entscheid 10.07.): stabiler Deep-Link `<base>/item/<ITEM_KEY>`
   (base aus `site_config` `windshift_url`, Default `http://localhost:8088`; Link-Logik SSOT in
   `pilanda_engineering.api.get_team_cockpit`).
