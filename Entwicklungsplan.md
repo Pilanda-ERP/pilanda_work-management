@@ -84,9 +84,10 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   - [x] Dex-Client `windshift` (`_devenv/dex/config.yaml`, Secret Dev-Wert,
     RedirectURI `http://localhost:8088/api/sso/callback/windshift`) — Discovery 200.
   - [x] Windshift-OIDC-Provider `LCS SSO` in der windshift-DB (slug `windshift`,
-    Issuer `http://host.docker.internal:5556/dex`, `auto_provision_users`,
-    Client-Secret app-verschlüsselt). Angelegt per Admin-API (HTTPS-Dummy-Issuer,
-    da `ValidateExternalURL` HTTPS erzwingt) + SQL-Downgrade des Issuers auf die
+    Issuer **`http://localhost:5556/dex`** (seit 11.07.2026, vorher
+    `host.docker.internal` — s. u.), `auto_provision_users`, Client-Secret
+    app-verschlüsselt). Angelegt per Admin-API (HTTPS-Dummy-Issuer, da
+    `ValidateExternalURL` HTTPS erzwingt) + SQL-Downgrade des Issuers auf die
     Dex-HTTP-URL; reproduzierbar im Setup-Helfer. Nachweis: `GET /api/sso/status`
     → `{"enabled":true,"provider_name":"LCS SSO",...}` (Login-Seite zeigt den
     SSO-Knopf).
@@ -101,6 +102,25 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
     Hinweis Cookie-Verhalten: Windshift setzt state/pkce/session-Cookies mit
     `Secure` — Browser akzeptieren das auf `localhost` (trustworthy origin),
     Skript-Clients müssen die Cookies explizit mitführen.
+  - [x] **SSO ohne Host-Eingriff + Bereiche-Seed E2E verifiziert (11.07.2026):**
+    Issuer stack-weit auf `http://localhost:5556/dex` umgestellt (Frappe UND
+    Windshift) — der Browser erreicht Dex über den published Port, KEIN
+    `host.docker.internal`-hosts-Eintrag und KEIN Admin/UAC mehr nötig (die
+    stale-IP-Timeout-Falle ist damit weg). Server-seitig treffen die Container
+    Dex unter `localhost:5556` über je einen socat-Loopback-Sidecar
+    (`dex-bridge-frappe`/`dex-bridge-windshift`, `network_mode: service:<x>`,
+    `127.0.0.1:5556`→`dex:5556`; `_devenv/docker-compose.dev.yml`).
+    `ALLOW_LOCAL_CONNECTIONS=true` bleibt nötig (localhost = Loopback). E2E rein
+    über localhost: `/api/sso/login/windshift` → **302 auf `localhost:5556`** →
+    Dex-Login t.tester → Callback → `GET /api/auth/me` = t.tester → Workspaces-
+    Liste zeigt die 4 Technik-Bereiche → `ETECH-1` abrufbar.
+  - [x] **Technik-Bereiche geseedet (11.07.2026):** `_devenv/setup/windshift-seed.ps1`
+    (idempotent, vom SSO-Setup aufgerufen) legt 4 Workspaces an — Projektierung
+    (**PROJ**), Forschung & Entwicklung (**RND**), Elektrotechnik (**ETECH**),
+    Technische Dokumentation (**TECDOC**) — macht `t.tester` in allen zum
+    Editor-Mitglied und seedet ein Demo-Work-Item **ETECH-1**. Damit sind die
+    Bereiche beim ersten Login schon DA; der Marco-Restschritt „Workspaces/Tasks
+    zuerst anlegen" ENTFÄLLT.
   - [ ] Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-User-
     verwaltung. Umstieg = Issuer/Client-IDs tauschen (gleicher Code-Flow).
 - [x] **Absprungpunkte gebaut** (Entscheid 10.07.): stabiler Deep-Link `<base>/item/<ITEM_KEY>`
@@ -122,9 +142,12 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
     (jetzt projektgefiltert, Deep-Link am Task = 1:1-Ziel, Link-Logik weiter SSOT `pilanda_engineering.api`).
     Nachweis: Build grün, `/app/pls-projekt-cockpit` 200, E2E PROJ-0011 → 15 APs, ETECH-1 →
     `http://localhost:8088/item/ETECH-1`. Details im pilanda_pls-Plan.
-  - **Hinweis Erst-Setup:** Die Ziel-Tasks in Windshift entstehen erst, wenn Marco den
-    Windshift-Setup-Wizard durchläuft und die ersten Tasks anlegt — bis dahin rendern die Links
-    korrekt, laufen aber ggf. in 404.
+  - **Erst-Setup ERLEDIGT (11.07.2026):** Die 4 Technik-Bereiche + das Demo-Item **ETECH-1**
+    werden jetzt automatisch geseedet (`_devenv/setup/windshift-seed.ps1`, idempotent) —
+    der Deep-Link `http://localhost:8088/item/ETECH-1` (aus `TASK-2026-00525`, Projekt
+    `PROJ-0011`) zeigt auf ein ECHTES Item. Marco muss nichts mehr von Hand anlegen; weitere
+    Ziel-Tasks entstehen im normalen Betrieb (bis dahin rendern Links auf noch nicht angelegte
+    Tasks korrekt, laufen aber ggf. in 404).
 - [ ] **Prod-Betrieb später**: wo die eine geteilte Instanz fürs Haus läuft
   (Server/Backup) — mit IT, wenn es soweit ist
 
