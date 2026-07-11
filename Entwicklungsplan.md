@@ -10,6 +10,11 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
 ## Bindende Entscheide
 - **Kein Nav-Modul** (Marco 07.07.2026): Aufruf als **„ToDo" unter „Allgemein" + Dashboard-Karte**
   in der Pilanda-Shell.
+- **Dev-Login = der ZENTRALE Testnutzer `t.tester@lcs.local` via SSO** (Marco 11.07.2026,
+  Klarstellung): KEIN eigener Windshift-User im Env — der eine Stack-Testnutzer (SSOT
+  `pilanda/_devenv/.env` + Dex + Frappe-Seed, BENCH §1) meldet sich per „Login with LCS SSO"
+  an; Windshift legt die lokale Zeile beim ersten Login automatisch an (Auto-Provisioning,
+  belegt 10.07.). Der Env-Admin `admin@lcs.local` ist nur Bootstrap/Verwaltung, kein Tages-Login.
 - **Betriebsmodell (Marco 10.07.2026, präzisiert):** WIR betreiben eine **eigene
   Windshift-Instanz, gebaut aus DIESEM Repo (`develop`), in Docker** — eigene Datenbank
   im Docker-Volume, per API an Frappe.
