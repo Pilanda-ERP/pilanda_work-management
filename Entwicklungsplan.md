@@ -1,6 +1,6 @@
 # Entwicklungsplan — pilanda_work-management (Aufgaben / Taskmanagement der Unit — Windshift)
 > Master: pilanda/ENTWICKLUNGSPLAN.md · Theme-Mitbau: pilanda_theme/CONTRIBUTING.md
-> Stand: 10.07.2026 · Regel: NUR echte Zustände abhaken — Wahrheit ist Pflicht.
+> Stand: 13.07.2026 · Regel: NUR echte Zustände abhaken — Wahrheit ist Pflicht.
 
 Rolle: **Taskmanagement/„Aufgaben" der Pilanda-Unit** auf Basis von **Windshift**
 (Open-Source Work-Management: Kanban-Boards, Workflows, Custom Fields, Zeiterfassung,
@@ -8,11 +8,16 @@ Test-/Asset-Management; Go + Svelte 5, self-hosted, SQLite/PostgreSQL). **Owner:
 Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — kein Frappe.
 
 ## Bindende Entscheide
-- **Kein Nav-Modul** (Marco 07.07.2026): Aufruf als **„ToDo" unter „Allgemein" + Dashboard-Karte**
-  in der Pilanda-Shell.
+- **Kein Nav-Modul** (Marco 07.07.2026): Aufruf in der Pilanda-Shell unter **„Allgemein"** +
+  Dashboard-Karte.
+- **UI-Label = „Arbeitspakete"** (Regel Master §6.1-6: Windshift heißt in der UI nirgends
+  „Windshift"): Ziel-Verortung **Allgemein ▸ Aufgaben ▸ Team-Arbeitspakete / Meine
+  Arbeitspakete** (Master §6, E4). Das **heutige Ist-Label ist „ToDo"** — die Umbenennung
+  in der Shell/Nav-SSOT ist ein **OFFENER Punkt** (Code-Umstellung mit Nav-Umbau N2, s. Offen).
 - **Dev-Login = der ZENTRALE Testnutzer `t.tester@lcs.local` via SSO** (Marco 11.07.2026,
   Klarstellung): KEIN eigener Windshift-User im Env — der eine Stack-Testnutzer (SSOT
-  `pilanda/_devenv/.env` + Dex + Frappe-Seed, BENCH §1) meldet sich per „Login with LCS SSO"
+  `pilanda/_devenv/.env` + IdP + Frappe-Seed, BENCH §1; IdP seit 13.07.2026 Keycloak 26.7,
+  vorher Dex) meldet sich per „Login with LCS SSO"
   an; Windshift legt die lokale Zeile beim ersten Login automatisch an (Auto-Provisioning,
   belegt 10.07.). Der Env-Admin `admin@lcs.local` ist nur Bootstrap/Verwaltung, kein Tages-Login.
 - **Betriebsmodell (Marco 10.07.2026, präzisiert):** WIR betreiben eine **eigene
@@ -49,7 +54,8 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
 
 ## Erledigt
 - [x] Windshift-Instanz läuft (Dominik) und ist seit 07.07.2026 in die Pilanda-Shell
-  eingebunden: „ToDo" unter „Allgemein" + Dashboard-Karte (kein Nav-Modul)
+  eingebunden: unter „Allgemein" + Dashboard-Karte (kein Nav-Modul) — **Ist-Label „ToDo"**;
+  Ziel-Label „Arbeitspakete" (Allgemein ▸ Aufgaben ▸ Team-/Meine Arbeitspakete) folgt mit N2, s. Offen
 - [x] §5-Eingliederung ins Repo-Inventar (10.07.2026): `develop` angelegt + Default,
   Repo-Beschreibung, `pilanda-dev.code-workspace` + cSpell, Master §1 (19 Repos),
   ARCHITEKTUR §2, Architektur-Diagramm, BENCH-Matrix (als Nicht-Bench-Stack), dieser Fachplan
@@ -79,8 +85,13 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
     `http://localhost:8088/workspaces/<workspaceId>/items/<itemId>`.
   - Windshift nennt Tasks „Work Items" (Route-View `item-detail`).
 
-## Offen — wird wirklich gebaut
-- [x] **SSO Dev-Teil KOMPLETT — „ein Login für alles" E2E verifiziert (10.07.2026):**
+- [x] **SSO Dev-Teil (Dex) — „ein Login für alles" E2E verifiziert (10./11.07.2026):**
+  > **Abgelöst 13.07.2026 — Dex → Keycloak 26.7:** Der Dev-SSO wurde stack-weit von Dex
+  > auf **Keycloak 26.7** umgestellt (Commit `78468e7` im pilanda-Repo: Issuer
+  > `http://localhost:5556/realms/lcs`, `realm.tmpl.json` + `render-realm.ps1`, Dex-Dateien
+  > entfernt). Der unten dokumentierte **Dex-E2E-Flow war 10./11.07. verifiziert**
+  > (historischer Stand, Nachweis bleibt stehen); der **Keycloak-E2E steht noch aus**
+  > (s. Offen). Die Dex-Detailschritte gelten als Beleg der damals erreichten Funktion.
   - [x] Dex-Client `windshift` (`_devenv/dex/config.yaml`, Secret Dev-Wert,
     RedirectURI `http://localhost:8088/api/sso/callback/windshift`) — Discovery 200.
   - [x] Windshift-OIDC-Provider `LCS SSO` in der windshift-DB (slug `windshift`,
@@ -121,8 +132,6 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
     Editor-Mitglied und seedet ein Demo-Work-Item **ETECH-1**. Damit sind die
     Bereiche beim ersten Login schon DA; der Marco-Restschritt „Workspaces/Tasks
     zuerst anlegen" ENTFÄLLT.
-  - [ ] Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-User-
-    verwaltung. Umstieg = Issuer/Client-IDs tauschen (gleicher Code-Flow).
 - [x] **Absprungpunkte gebaut** (Entscheid 10.07.): stabiler Deep-Link `<base>/item/<ITEM_KEY>`
   (base aus `site_config` `windshift_url`, Default `http://localhost:8088`; Link-Logik SSOT in
   `pilanda_engineering.api`). Alle drei Flächen erledigt: 5 Team-Cockpits, PM-Inspektor, PLS-AP-Ebene.
@@ -148,6 +157,15 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
     `PROJ-0011`) zeigt auf ein ECHTES Item. Marco muss nichts mehr von Hand anlegen; weitere
     Ziel-Tasks entstehen im normalen Betrieb (bis dahin rendern Links auf noch nicht angelegte
     Tasks korrekt, laufen aber ggf. in 404).
+## Offen — wird wirklich gebaut
+- [ ] **Keycloak-E2E (Dev) verifizieren:** Der SSO-Login-Flow gegen **Keycloak 26.7**
+  (Issuer `http://localhost:5556/realms/lcs`) ist umgestellt, aber der End-to-End-Login
+  Windshift ↔ Keycloak ist **noch NICHT verifiziert** (der frühere E2E-Nachweis galt für
+  Dex). OIDC-Provider in der windshift-DB auf den Keycloak-Issuer umstellen + Flow
+  `/api/sso/login/windshift` → Keycloak-Login `t.tester` → Callback → `GET /api/auth/me`
+  nachweisen.
+- [ ] Prod: LCS/Entra mit dem stack-weiten SSO-Auftrag (IT); keine Doppel-User-
+  verwaltung. Umstieg = Issuer/Client-IDs tauschen (gleicher Code-Flow).
 - [ ] **Prod-Betrieb später**: wo die eine geteilte Instanz fürs Haus läuft
   (Server/Backup) — mit IT, wenn es soweit ist
 
