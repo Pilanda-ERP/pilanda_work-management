@@ -55,6 +55,8 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
   `pilanda/docs/conventions/planungslogik.md` §6): Fortschritt und Termine des Projekts entstehen nur am Vorgang des
   PM-Projektplans (Technik meldet im Team-Cockpit). Was im Aufgabenboard erledigt wird,
   ändert weder Fortschritt noch Termine im Plan.
+- **Konzept Projektplaner und Vorlagen (Entscheid M. Hagspiel 04.10.2026, kanonisch `pilanda/docs/conventions/planungslogik.md` §5/§7):** ein Projektobjekt (ERPNext `Project`, Vorgänge = `Task`, `project-object-ssot.md`); der Projektplaner ist unabhängig und frei erweiterbar (Niveau MS Project / Primavera P6), Vorlagen, Regeln und Rechnung sind eigener Code mit eigenem Datenmodell, nie an ERPNext-Interna gebunden.
+  Das Aufgabenboard ersetzt den Projektplan nicht: Termine und Fortschritt des Projekts entstehen nur am Vorgang (`Task`) im Projektplaner; Board-Aufgaben sind per Deep-Link angebunden, keine eigene Terminrechnung, keine eigenen Projekt- oder Vorlagenobjekte.
 
 ## Erledigt
 - [x] Windshift-Instanz läuft (Dominik) und ist seit 07.07.2026 in die Pilanda-Shell
