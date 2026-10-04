@@ -1,6 +1,6 @@
 # Entwicklungsplan — pilanda_work-management (Aufgaben / Taskmanagement der Unit — Windshift)
 > Master: pilanda/ENTWICKLUNGSPLAN.md · Theme-Mitbau: pilanda_theme/CONTRIBUTING.md
-> Stand: 13.07.2026 · Regel: NUR echte Zustände abhaken — Wahrheit ist Pflicht.
+> Stand: 04.10.2026 (Planungslogik) · davor 13.07.2026 · Regel: NUR echte Zustände abhaken — Wahrheit ist Pflicht.
 
 Rolle: **Taskmanagement/„Aufgaben" der Pilanda-Unit** auf Basis von **Windshift**
 (Open-Source Work-Management: Kanban-Boards, Workflows, Custom Fields, Zeiterfassung,
@@ -51,6 +51,10 @@ Eigenständiger Stack **neben** der Bench (wie die salesbot-Scout-Runtime) — k
 - **Kopplung = NUR Verlinkung** (Marco 10.07.2026): Absprungpunkte aus **PLS-Gantt** und
   **PM-Gantt** (Gantt-Balken → Arbeitspaket PLS → Task in der Technik) als Links —
   keine Datenkopplung/kein Sync.
+- **Das Aufgabenboard zählt NICHT für den Plan** (Entscheid M. Hagspiel 04.10.2026,
+  `pilanda/docs/conventions/planungslogik.md` §6): Fortschritt und Termine des Projekts entstehen nur am Vorgang des
+  PM-Projektplans (Technik meldet im Team-Cockpit). Was im Aufgabenboard erledigt wird,
+  ändert weder Fortschritt noch Termine im Plan.
 
 ## Erledigt
 - [x] Windshift-Instanz läuft (Dominik) und ist seit 07.07.2026 in die Pilanda-Shell
