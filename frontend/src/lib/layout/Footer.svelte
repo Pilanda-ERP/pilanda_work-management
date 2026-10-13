@@ -17,7 +17,7 @@
       </div>
       
       <!-- Links -->
-      <div class="flex items-center space-x-6 text-sm">
+      <div class="flex flex-wrap items-center justify-center gap-x-6 gap-y-3 text-sm">
         <button
           onclick={() => navigate('/about')}
           class="text-[var(--ds-text-link)] hover:text-[var(--ds-text-link-hovered)] transition-colors cursor-pointer bg-transparent border-none"
@@ -29,6 +29,12 @@
           class="text-[var(--ds-text-link)] hover:text-[var(--ds-text-link-hovered)] transition-colors cursor-pointer bg-transparent border-none"
         >
           {t('footer.apiReference')}
+        </button>
+        <button
+          onclick={() => navigate('/licenses')}
+          class="text-[var(--ds-text-link)] hover:text-[var(--ds-text-link-hovered)] transition-colors cursor-pointer bg-transparent border-none"
+        >
+          {t('footer.licenses')}
         </button>
         <a href="https://github.com/Windshiftapp/core/issues" target="_blank" rel="noopener noreferrer" class="text-[var(--ds-text-link)] hover:text-[var(--ds-text-link-hovered)] transition-colors">
           {t('footer.reportProblem')}

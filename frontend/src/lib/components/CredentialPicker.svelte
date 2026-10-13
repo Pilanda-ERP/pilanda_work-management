@@ -17,7 +17,6 @@
   the name so the admin can spot rows that haven't had a secret stored yet.
 -->
 <script>
-  import { onMount } from 'svelte';
   import Select from './Select.svelte';
   import { actionCredentials } from '../api/ai.js';
 
@@ -37,24 +36,30 @@
   let credentials = $state([]);
   let loading = $state(true);
   let loadError = $state('');
+  let loadGeneration = 0;
 
-  async function loadCredentials() {
+  async function loadCredentials(requestedWorkspaceId) {
+    const generation = ++loadGeneration;
     loading = true;
     loadError = '';
     try {
-      const data = workspaceId
-        ? await actionCredentials.getForWorkspace(workspaceId)
+      const data = requestedWorkspaceId
+        ? await actionCredentials.getForWorkspace(requestedWorkspaceId)
         : await actionCredentials.getAllGlobal();
+      if (generation !== loadGeneration) return;
       credentials = Array.isArray(data) ? data : [];
     } catch (err) {
+      if (generation !== loadGeneration) return;
       loadError = err?.message || 'Failed to load credentials';
       credentials = [];
     } finally {
-      loading = false;
+      if (generation === loadGeneration) loading = false;
     }
   }
 
-  onMount(loadCredentials);
+  $effect(() => {
+    loadCredentials(Number(workspaceId) || 0);
+  });
 
   const filtered = $derived(
     types && types.length
@@ -70,7 +75,7 @@
   );
 
   function formatLabel(c) {
-    const scope = c.workspace_id ? 'workspace' : 'global';
+    const scope = c.applies_to_all_workspaces ? 'global' : 'workspace';
     const fp = c.has_secret && c.secret_prefix ? ` · ${c.secret_prefix}` : '';
     const status = c.is_enabled ? '' : ' · disabled';
     return `${c.name} (${c.credential_type}, ${scope}${fp}${status})`;
@@ -78,11 +83,11 @@
 </script>
 
 {#if loading}
-  <div class="text-sm text-zinc-500 dark:text-zinc-400">Loading credentials…</div>
+  <div class="text-sm text-ds-text-subtle">Loading credentials…</div>
 {:else if loadError}
-  <div class="text-sm text-rose-600 dark:text-rose-400">{loadError}</div>
+  <div class="text-sm text-ds-text-danger">{loadError}</div>
 {:else if !options.length}
-  <div class="text-sm text-zinc-500 dark:text-zinc-400">
+  <div class="text-sm text-ds-text-subtle">
     No credentials available. Create one in <span class="font-medium">Action credentials</span>.
   </div>
 {:else}

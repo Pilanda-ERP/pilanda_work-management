@@ -1,10 +1,12 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,74 +15,132 @@ import (
 	"windshift/internal/repository"
 )
 
+var ErrWorkspaceHasProtectedIntegrationLinks = errors.New("workspace has provider-managed integration links")
+
+// ErrPersonalWorkspaceDeactivation guards baseline provisioning: the owner
+// cannot deactivate a personal workspace, only offboarding/SCIM flows may.
+var ErrPersonalWorkspaceDeactivation = errors.New("personal workspaces cannot be deactivated")
+
+// ErrWorkspaceKeyImmutable marks key edits outside the personal-workspace
+// scope; regular workspace keys stay immutable because external references
+// (item keys, integrations) rely on them.
+var ErrWorkspaceKeyImmutable = errors.New("workspace key can only be changed for personal workspaces")
+
+// Create-from-template-pack errors. The pack is verified before the workspace
+// exists, and a provisioning failure after creation compensates by deleting
+// the just-created workspace so callers never see a half-provisioned result.
+var (
+	ErrWorkspacePackUnavailable  = errors.New("workspace pack provisioning is not available")
+	ErrWorkspacePackNotFound     = errors.New("workspace pack not found")
+	ErrWorkspacePackProvisioning = errors.New("workspace pack provisioning failed")
+)
+
+// WorkspacePackProvisioner provisions an embedded pack into a workspace the
+// service just created. Implemented by PackApplyService; a nil provisioner
+// refuses TemplatePack.
+type WorkspacePackProvisioner interface {
+	// VerifyBuiltinPack validates the named built-in pack (manifest and plugin
+	// requirements) without writing anything.
+	VerifyBuiltinPack(ctx context.Context, name string) (*PackApplyReport, error)
+	// ApplyBuiltinPackToWorkspace runs the schema, content, and conformance
+	// stages against an already-created workspace.
+	ApplyBuiltinPackToWorkspace(ctx context.Context, actor AuditActor, name string, workspaceID int) (*PackApplyReport, error)
+}
+
 // WorkspaceService encapsulates workspace business logic used by both HTTP handlers
 // and other services.
 type WorkspaceService struct {
-	db   database.Database
-	repo *repository.WorkspaceRepository
+	db                    database.Database
+	repo                  *repository.WorkspaceRepository
+	itemRepo              *repository.ItemRepository
+	slaRepo               *repository.SLARepository
+	templates             *repository.WorkspaceTemplateRepository
+	boards                *repository.BoardConfigurationRepository
+	integrationLinkGuards *IntegrationLinkGuards
+	access                WorkspaceSourceAccess
+	packProvisioner       WorkspacePackProvisioner
+}
+
+// SetPackProvisioner installs the optional create-from-template-pack
+// provisioner. Called after construction because PackApplyService depends on
+// this service for name-based workspace creation.
+func (s *WorkspaceService) SetPackProvisioner(provisioner WorkspacePackProvisioner) {
+	s.packProvisioner = provisioner
 }
 
 // NewWorkspaceService creates a new WorkspaceService.
 func NewWorkspaceService(db database.Database) *WorkspaceService {
 	return &WorkspaceService{
-		db:   db,
-		repo: repository.NewWorkspaceRepository(db),
+		db:                    db,
+		repo:                  repository.NewWorkspaceRepository(db),
+		itemRepo:              repository.NewItemRepository(db),
+		slaRepo:               repository.NewSLARepository(db),
+		templates:             repository.NewWorkspaceTemplateRepository(db),
+		boards:                repository.NewBoardConfigurationRepository(db),
+		integrationLinkGuards: NewIntegrationLinkGuards(db),
 	}
+}
+
+// NewWorkspaceServiceWithAccess creates a WorkspaceService whose template
+// clones authorize the source workspace through the given access checker.
+func NewWorkspaceServiceWithAccess(db database.Database, access WorkspaceSourceAccess) *WorkspaceService {
+	service := NewWorkspaceService(db)
+	service.access = access
+	return service
 }
 
 // WorkspaceListParams contains the parameters for listing workspaces.
 type WorkspaceListParams struct {
-	UserID int
-	Limit  int
-	Offset int
+	WorkspaceIDs []int
+	Search       string
+	Limit        int
+	Offset       int
 }
 
-// WorkspaceListResult contains a workspace with minimal fields for list views.
-type WorkspaceListResult struct {
-	ID          int
-	Name        string
-	Key         string
-	Description string
-	Active      bool
-	IsPersonal  bool
-	Icon        string
-	Color       string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-}
-
-// List retrieves all workspaces accessible to a user with pagination.
-// This checks both direct user workspace roles and group workspace roles.
-func (s *WorkspaceService) List(params WorkspaceListParams) ([]WorkspaceListResult, int, error) {
+// List retrieves a page from an already-authorized workspace ID snapshot.
+func (s *WorkspaceService) List(params WorkspaceListParams) ([]models.Workspace, int, error) {
+	if len(params.WorkspaceIDs) == 0 {
+		return []models.Workspace{}, 0, nil
+	}
+	// The ID set is the caller's authorized scope, bounded by the user's
+	// accessible workspace count — far below SQLite's 32k and Postgres' 65k
+	// parameter limits at the 10k-workspace target.
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(params.WorkspaceIDs)), ",")
+	workspaceArgs := make([]any, 0, len(params.WorkspaceIDs)+6)
+	for _, workspaceID := range params.WorkspaceIDs {
+		workspaceArgs = append(workspaceArgs, workspaceID)
+	}
+	where := " WHERE w.id IN (" + placeholders + ")"
+	if search := strings.TrimSpace(params.Search); search != "" {
+		pattern := "%" + escapeLikePattern(search) + "%"
+		where += " AND (LOWER(w.name) LIKE LOWER(?) ESCAPE '\\'"
+		where += " OR LOWER(w.key) LIKE LOWER(?) ESCAPE '\\'"
+		where += " OR LOWER(w.description) LIKE LOWER(?) ESCAPE '\\')"
+		workspaceArgs = append(workspaceArgs, pattern, pattern, pattern)
+	}
+	// COUNT(*) OVER () returns the filtered total with the page in one query
+	// instead of a separate COUNT per fetched page.
 	rows, err := s.db.Query(`
-		SELECT DISTINCT w.id, w.name, w.key, w.description, w.active, w.is_personal,
-		       w.icon, w.color, w.created_at, w.updated_at
+		SELECT w.id, w.name, w.key, w.description, w.active, w.is_template, w.is_personal,
+		       w.icon, w.color, w.internal_comments_enabled, w.created_at, w.updated_at,
+		       COUNT(*) OVER ()
 		FROM workspaces w
-		LEFT JOIN user_workspace_roles uwr ON w.id = uwr.workspace_id AND uwr.user_id = ?
-		LEFT JOIN (
-			SELECT DISTINCT gwr.workspace_id
-			FROM group_workspace_roles gwr
-			JOIN group_members gm ON gwr.group_id = gm.group_id
-			WHERE gm.user_id = ?
-		) grp ON w.id = grp.workspace_id
-		WHERE (w.active = true AND (w.is_personal = false OR w.is_personal IS NULL))
-		   OR (w.active = false AND uwr.role_id IS NOT NULL)
-		   OR (w.active = false AND grp.workspace_id IS NOT NULL)
-		   OR (w.is_personal = true AND w.owner_id = ?)
+		`+where+`
 		ORDER BY w.name
 		LIMIT ? OFFSET ?
-	`, params.UserID, params.UserID, params.UserID, params.Limit, params.Offset)
+	`, append(workspaceArgs, params.Limit, params.Offset)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to list workspaces: %w", err)
 	}
 	defer rows.Close()
 
-	var workspaces []WorkspaceListResult
+	var workspaces []models.Workspace
+	total := 0
 	for rows.Next() {
-		var ws WorkspaceListResult
+		var ws models.Workspace
 		var icon, color sql.NullString
-		err = rows.Scan(&ws.ID, &ws.Name, &ws.Key, &ws.Description, &ws.Active, &ws.IsPersonal,
-			&icon, &color, &ws.CreatedAt, &ws.UpdatedAt)
+		err = rows.Scan(&ws.ID, &ws.Name, &ws.Key, &ws.Description, &ws.Active, &ws.IsTemplate, &ws.IsPersonal,
+			&icon, &color, &ws.InternalCommentsEnabled, &ws.CreatedAt, &ws.UpdatedAt, &total)
 		if err != nil {
 			continue
 		}
@@ -93,57 +153,40 @@ func (s *WorkspaceService) List(params WorkspaceListParams) ([]WorkspaceListResu
 	}
 
 	if workspaces == nil {
-		workspaces = []WorkspaceListResult{}
-	}
-
-	// Get total count
-	var total int
-	err = s.db.QueryRow(`
-		SELECT COUNT(DISTINCT w.id)
-		FROM workspaces w
-		LEFT JOIN user_workspace_roles uwr ON w.id = uwr.workspace_id AND uwr.user_id = ?
-		LEFT JOIN (
-			SELECT DISTINCT gwr.workspace_id
-			FROM group_workspace_roles gwr
-			JOIN group_members gm ON gwr.group_id = gm.group_id
-			WHERE gm.user_id = ?
-		) grp ON w.id = grp.workspace_id
-		WHERE (w.active = true AND (w.is_personal = false OR w.is_personal IS NULL))
-		   OR (w.active = false AND uwr.role_id IS NOT NULL)
-		   OR (w.active = false AND grp.workspace_id IS NOT NULL)
-		   OR (w.is_personal = true AND w.owner_id = ?)
-	`, params.UserID, params.UserID, params.UserID).Scan(&total)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to count workspaces: %w", err)
+		workspaces = []models.Workspace{}
 	}
 
 	return workspaces, total, nil
 }
 
-// GetByID retrieves a workspace by ID with minimal fields.
-func (s *WorkspaceService) GetByID(id int) (*WorkspaceListResult, error) {
-	var ws WorkspaceListResult
-	var icon, color sql.NullString
-	err := s.db.QueryRow(`
-		SELECT id, name, key, description, active, is_personal, icon, color, created_at, updated_at
-		FROM workspaces WHERE id = ?
-	`, id).Scan(&ws.ID, &ws.Name, &ws.Key, &ws.Description, &ws.Active, &ws.IsPersonal,
-		&icon, &color, &ws.CreatedAt, &ws.UpdatedAt)
+func escapeLikePattern(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
 
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("workspace not found: %d", id)
+// GetByID retrieves a workspace by ID.
+func (s *WorkspaceService) GetByID(id int) (*models.Workspace, error) {
+	ws, err := s.repo.FindByID(id)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, fmt.Errorf("workspace not found: %d: %w", id, repository.ErrNotFound)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workspace: %w", err)
 	}
-
-	ws.Icon = icon.String
-	ws.Color = color.String
-
-	return &ws, nil
+	categories, err := s.repo.GetTimeProjectCategories(id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workspace time project categories: %w", err)
+	}
+	ws.TimeProjectCategories = categories
+	return ws, nil
 }
 
 // CreateWorkspaceParams contains the parameters for creating a workspace.
+// TemplateWorkspaceID, when set, clones the referenced template workspace's
+// configuration-set assignment, work-item templates, and seed items into the
+// new workspace inside one transaction.
 type CreateWorkspaceParams struct {
 	Name        string
 	Key         string
@@ -151,130 +194,456 @@ type CreateWorkspaceParams struct {
 	Icon        string
 	Color       string
 	CreatorID   int
+
+	Active        *bool
+	TimeProjectID *int
+	IsPersonal    bool
+	OwnerID       *int
+	AvatarURL     *string
+	DefaultView   string
+
+	TemplateWorkspaceID *int
+	// TemplatePack, when set, is a built-in pack name whose configuration set,
+	// content, and conformance are applied to the new workspace. Mutually
+	// exclusive with TemplateWorkspaceID.
+	TemplatePack string
+
+	// RestrictedToCreator grants the creator the Viewer role inside the
+	// creation transaction, gating the workspace to assigned users from the
+	// first committed moment instead of briefly exposing it as open.
+	RestrictedToCreator *bool
 }
 
-// CreateWorkspaceResult contains the result of creating a workspace.
+// CreateWorkspaceResult contains the result of creating a workspace. The
+// copy counts stay zero for blank creation.
 type CreateWorkspaceResult struct {
-	Workspace *WorkspaceListResult
+	Workspace                *models.Workspace
+	SourceWorkspaceID        int
+	ConfigSetAttached        bool
+	TemplatesCopied          int
+	ItemsCopied              int
+	OmittedCustomFieldValues int
 }
 
-// Create creates a new workspace and grants admin permission to the creator.
-func (s *WorkspaceService) Create(params CreateWorkspaceParams) (*CreateWorkspaceResult, error) {
-	// Normalize key to uppercase
+// Create creates a new workspace and grants the Administrator role to the
+// creator. When a template source is supplied, the clone runs in the same
+// transaction so the workspace, role grant, and copied data commit atomically.
+// The whole transaction is retried on PostgreSQL serialization aborts and
+// rare rank collisions; validation and authorization errors never retry.
+func (s *WorkspaceService) Create(ctx context.Context, params CreateWorkspaceParams) (*CreateWorkspaceResult, error) {
+	if params.Name == "" || params.Key == "" {
+		return nil, fmt.Errorf("workspace name and key are required")
+	}
+	if params.IsPersonal && params.TemplateWorkspaceID != nil {
+		return nil, fmt.Errorf("%w: personal workspaces cannot be created from a template", ErrInvalidWorkspaceTemplate)
+	}
+	if params.TemplatePack != "" && params.TemplateWorkspaceID != nil {
+		return nil, fmt.Errorf("%w: template_pack and template_workspace_id are mutually exclusive", ErrWorkspacePackProvisioning)
+	}
+	if params.TemplatePack != "" {
+		if s.packProvisioner == nil {
+			return nil, ErrWorkspacePackUnavailable
+		}
+		// Resolve and verify the pack before the workspace exists, so an unknown
+		// or unsatisfiable pack never creates an orphan.
+		report, err := s.packProvisioner.VerifyBuiltinPack(ctx, params.TemplatePack)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %q: %w", ErrWorkspacePackNotFound, params.TemplatePack, err)
+		}
+		if report == nil || report.Status != PackVerifyStatusVerified {
+			return nil, fmt.Errorf("%w: pack %q requirements are not satisfied", ErrWorkspacePackProvisioning, params.TemplatePack)
+		}
+	}
+
 	key := strings.ToUpper(params.Key)
-
-	// Check for duplicate key
-	exists, err := s.repo.KeyExists(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check key existence: %w", err)
-	}
-	if exists {
-		return nil, fmt.Errorf("workspace key already exists: %s", key)
+	if params.DefaultView == "" {
+		params.DefaultView = "board"
 	}
 
-	// Create workspace
-	var id int64
-	err = s.db.QueryRow(`
-		INSERT INTO workspaces (name, key, description, icon, color, active)
-		VALUES (?, ?, ?, ?, ?, true) RETURNING id
-	`, params.Name, key, params.Description, params.Icon, params.Color).Scan(&id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create workspace: %w", err)
-	}
+	started := time.Now()
+	var lastErr error
+	for attempt := 0; attempt < workspaceCloneMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("workspace creation canceled: %w", err)
+		}
 
-	// Grant admin permission to creator
-	_, err = s.db.ExecWrite(`
-		INSERT INTO user_workspace_roles (workspace_id, user_id, role_id, granted_by, granted_at)
-		SELECT ?, ?, id, ?, CURRENT_TIMESTAMP FROM workspace_roles WHERE name = 'Administrator'
-	`, id, params.CreatorID, params.CreatorID)
-	if err != nil {
-		slog.Warn("failed to grant admin permission to workspace creator", "error", err, "workspace_id", id)
-	}
+		var txOpts *sql.TxOptions
+		if s.db.GetDriverName() == "postgres" {
+			// All source reads form one point-in-time snapshot.
+			txOpts = &sql.TxOptions{Isolation: sql.LevelRepeatableRead}
+		}
+		tx, err := s.db.BeginTx(ctx, txOpts)
+		if err != nil {
+			return nil, fmt.Errorf("begin workspace creation transaction: %w", err)
+		}
 
-	// Return created workspace
-	ws, err := s.GetByID(int(id))
-	if err != nil {
-		return nil, fmt.Errorf("workspace created but failed to retrieve: %w", err)
-	}
+		result, err := s.createWorkspaceTx(ctx, tx, params, key)
+		if err != nil {
+			_ = tx.Rollback()
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("workspace creation canceled: %w", ctx.Err())
+			}
+			if isWorkspaceCloneRetryable(err) && attempt < workspaceCloneMaxAttempts-1 {
+				lastErr = err
+				continue
+			}
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			if isWorkspaceCloneRetryable(err) && attempt < workspaceCloneMaxAttempts-1 {
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("commit workspace creation: %w", err)
+		}
 
-	return &CreateWorkspaceResult{Workspace: ws}, nil
+		if result.ItemsCopied > 0 || result.TemplatesCopied > 0 || result.ConfigSetAttached {
+			repository.InvalidateItemListCountCache(s.db, result.Workspace.ID)
+			logWorkspaceCloneResult(result, time.Since(started))
+		}
+		if params.TemplatePack != "" {
+			if err := s.provisionTemplatePack(ctx, params, result); err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+	return nil, fmt.Errorf("workspace creation failed after retries: %w", lastErr)
 }
 
-// UpdateWorkspaceParams contains the parameters for updating a workspace.
+// provisionTemplatePack applies the pack's schema, content, and conformance to
+// a freshly committed workspace. No single transaction spans workspace
+// creation, configuration-set import, and bundle import, so a provisioning
+// failure compensates by deleting the workspace the caller just asked for.
+func (s *WorkspaceService) provisionTemplatePack(ctx context.Context, params CreateWorkspaceParams, result *CreateWorkspaceResult) error {
+	// PostgreSQL item numbering needs the per-workspace sequence; content import
+	// may create items. The application layer also ensures this, idempotently.
+	if err := s.repo.CreateItemSequence(int64(result.Workspace.ID)); err != nil {
+		slog.Warn("failed to create item sequence before pack provisioning",
+			"workspace_id", result.Workspace.ID, "error", err)
+	}
+	report, provisionErr := s.packProvisioner.ApplyBuiltinPackToWorkspace(ctx, AuditActor{UserID: params.CreatorID}, params.TemplatePack, result.Workspace.ID)
+	if provisionErr == nil && report != nil && report.Status == PackApplyStatusApplied {
+		return nil
+	}
+	detail := "provisioning did not complete"
+	if provisionErr != nil {
+		detail = provisionErr.Error()
+	} else if failed := firstFailedPackStage(report); failed != nil {
+		detail = fmt.Sprintf("stage %q failed: %s", failed.Name, failed.Detail)
+	} else if report != nil {
+		detail = report.Status
+	}
+
+	// The schema stage may have imported a configuration set that the failure
+	// now orphans. Remove it (and the workflow it created fresh) before the
+	// workspace disappears; shared global registries are adopted by design and
+	// intentionally survive. A schema stage reported ok is a fresh import; a
+	// skipped stage means an existing set was adopted and must be left alone.
+	if freshConfigSetID := freshlyImportedConfigSetID(report); freshConfigSetID > 0 {
+		s.compensateFreshPackConfigurationSet(ctx, freshConfigSetID, result.Workspace.ID)
+	}
+	if delErr := s.Delete(result.Workspace.ID); delErr != nil {
+		slog.Error("failed to roll back workspace after pack provisioning failure",
+			"workspace_id", result.Workspace.ID, "pack", params.TemplatePack, "error", delErr)
+	}
+	return fmt.Errorf("%w: pack %q: %s", ErrWorkspacePackProvisioning, params.TemplatePack, detail)
+}
+
+// freshlyImportedConfigSetID returns the configuration set a pack apply
+// imported from the template, or 0 when the schema stage adopted an existing
+// set (or never reached a set). The schema stage is only reported ok on a
+// fresh import; reuse is reported skipped.
+func freshlyImportedConfigSetID(report *PackApplyReport) int {
+	if report == nil || report.ConfigSetID <= 0 {
+		return 0
+	}
+	for i := range report.Stages {
+		if report.Stages[i].Name == PackStageSchema && report.Stages[i].Status == PackStageStatusOK {
+			return report.ConfigSetID
+		}
+	}
+	return 0
+}
+
+// compensateFreshPackConfigurationSet removes a configuration set imported by
+// a failed create-from-template-pack together with the workflow it created.
+// It refuses when another workspace already adopted the set or another
+// configuration set references the workflow, so a concurrent or shared apply
+// is never damaged. Deleting the workflow cascades its condition and approval
+// sets. Shared global registries (statuses, item types, custom fields,
+// priorities, link types, screens) are matched by name and adopted rather than
+// owned, so they stay for the next apply.
+func (s *WorkspaceService) compensateFreshPackConfigurationSet(ctx context.Context, configSetID, workspaceID int) {
+	repo := repository.NewConfigurationSetRepository(s.db)
+	set, err := repo.FindByIDBasic(configSetID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return
+	}
+	if err != nil {
+		slog.Warn("failed to load configuration set for pack rollback",
+			"configuration_set_id", configSetID, "error", err)
+		return
+	}
+
+	var otherWorkspaces int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM workspace_configuration_sets
+		WHERE configuration_set_id = ? AND workspace_id != ?
+	`, configSetID, workspaceID).Scan(&otherWorkspaces); err != nil {
+		slog.Warn("failed to check configuration-set sharing for pack rollback",
+			"configuration_set_id", configSetID, "error", err)
+		return
+	}
+	if otherWorkspaces > 0 {
+		slog.Warn("leaving configuration set behind: another workspace adopted it",
+			"configuration_set_id", configSetID)
+		return
+	}
+
+	workflowID := set.WorkflowID
+	if err := repo.Delete(configSetID); err != nil {
+		slog.Warn("failed to remove configuration set after pack provisioning failure",
+			"configuration_set_id", configSetID, "error", err)
+		return
+	}
+	if workflowID == nil {
+		return
+	}
+
+	var workflowRefs int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM configuration_sets WHERE workflow_id = ?`, *workflowID,
+	).Scan(&workflowRefs); err != nil {
+		slog.Warn("failed to check workflow references for pack rollback",
+			"workflow_id", *workflowID, "error", err)
+		return
+	}
+	if workflowRefs > 0 {
+		return
+	}
+	if _, err := s.db.ExecWriteContext(ctx, `DELETE FROM workflows WHERE id = ?`, *workflowID); err != nil {
+		slog.Warn("failed to remove workflow after pack provisioning failure",
+			"workflow_id", *workflowID, "error", err)
+	}
+}
+
+// NullableUpdate distinguishes an omitted field from an explicit null.
+type NullableUpdate[T any] struct {
+	Present bool
+	Value   *T
+}
+
+// UpdateWorkspaceParams contains the fields to update on a workspace.
 type UpdateWorkspaceParams struct {
-	ID          int
-	Name        *string
-	Description *string
-	Active      *bool
-	Icon        *string
-	Color       *string
+	ID                      int
+	Name                    *string
+	Key                     *string
+	Description             *string
+	Active                  *bool
+	TimeProjectID           NullableUpdate[int]
+	IsPersonal              *bool
+	OwnerID                 NullableUpdate[int]
+	Icon                    *string
+	Color                   *string
+	AvatarURL               NullableUpdate[string]
+	DefaultView             *string
+	InternalCommentsEnabled *bool
+	TimeProjectCategories   *[]int
+	IsTemplate              *bool
 }
 
-// Update updates an existing workspace.
-func (s *WorkspaceService) Update(params UpdateWorkspaceParams) (*WorkspaceListResult, error) {
-	// Load existing workspace
-	var ws struct {
-		ID          int
-		Name        string
-		Description string
-		Active      bool
-		Icon        sql.NullString
-		Color       sql.NullString
-	}
-	err := s.db.QueryRow("SELECT id, name, description, active, icon, color FROM workspaces WHERE id = ?", params.ID).
-		Scan(&ws.ID, &ws.Name, &ws.Description, &ws.Active, &ws.Icon, &ws.Color)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("workspace not found: %d", params.ID)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to load workspace: %w", err)
+// Update changes only the supplied workspace fields. Personal workspaces and
+// templates are mutually exclusive in both directions. Personal workspaces
+// cannot be deactivated, and only personal workspaces may change their key.
+func (s *WorkspaceService) Update(params UpdateWorkspaceParams) (*models.Workspace, error) {
+	if params.IsPersonal != nil || params.IsTemplate != nil || params.Active != nil || params.Key != nil {
+		current, err := s.repo.FindByIDBasic(params.ID)
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, fmt.Errorf("workspace not found: %d: %w", params.ID, repository.ErrNotFound)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if params.Active != nil && !*params.Active && current.IsPersonal {
+			return nil, ErrPersonalWorkspaceDeactivation
+		}
+		if params.Key != nil && *params.Key != current.Key && !current.IsPersonal {
+			return nil, ErrWorkspaceKeyImmutable
+		}
+		nextIsPersonal := current.IsPersonal
+		if params.IsPersonal != nil {
+			nextIsPersonal = *params.IsPersonal
+		}
+		nextIsTemplate := current.IsTemplate
+		if params.IsTemplate != nil {
+			nextIsTemplate = *params.IsTemplate
+		}
+		if nextIsPersonal && nextIsTemplate {
+			return nil, ErrPersonalWorkspaceTemplate
+		}
 	}
 
-	// Apply updates
+	sets := make([]string, 0, 12)
+	args := make([]any, 0, 13)
+	appendField := func(column string, value any) {
+		sets = append(sets, column+" = ?")
+		args = append(args, value)
+	}
+
 	if params.Name != nil {
-		ws.Name = *params.Name
+		appendField("name", *params.Name)
+	}
+	if params.Key != nil {
+		appendField("key", *params.Key)
 	}
 	if params.Description != nil {
-		ws.Description = *params.Description
+		appendField("description", *params.Description)
 	}
 	if params.Active != nil {
-		ws.Active = *params.Active
+		appendField("active", *params.Active)
+	}
+	if params.TimeProjectID.Present {
+		appendField("time_project_id", nullableUpdateValue(params.TimeProjectID))
+	}
+	if params.IsPersonal != nil {
+		appendField("is_personal", *params.IsPersonal)
+	}
+	if params.OwnerID.Present {
+		appendField("owner_id", nullableUpdateValue(params.OwnerID))
 	}
 	if params.Icon != nil {
-		ws.Icon = sql.NullString{String: *params.Icon, Valid: true}
+		appendField("icon", *params.Icon)
 	}
 	if params.Color != nil {
-		ws.Color = sql.NullString{String: *params.Color, Valid: true}
+		appendField("color", *params.Color)
+	}
+	if params.AvatarURL.Present {
+		appendField("avatar_url", nullableUpdateValue(params.AvatarURL))
+	}
+	if params.DefaultView != nil {
+		if err := s.validateDefaultView(params.ID, *params.DefaultView); err != nil {
+			return nil, err
+		}
+		appendField("default_view", *params.DefaultView)
+	}
+	if params.InternalCommentsEnabled != nil {
+		appendField("internal_comments_enabled", *params.InternalCommentsEnabled)
+	}
+	if params.IsTemplate != nil {
+		appendField("is_template", *params.IsTemplate)
 	}
 
-	_, err = s.db.ExecWrite(`
-		UPDATE workspaces SET name = ?, description = ?, active = ?, icon = ?, color = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, ws.Name, ws.Description, ws.Active, ws.Icon.String, ws.Color.String, params.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to update workspace: %w", err)
+	if len(sets) > 0 {
+		sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
+		args = append(args, params.ID)
+		result, err := s.db.ExecWrite(
+			"UPDATE workspaces SET "+strings.Join(sets, ", ")+" WHERE id = ?",
+			args...,
+		)
+		if err != nil {
+			if database.IsUniqueConstraintError(err) {
+				return nil, fmt.Errorf("workspace key already exists: %d: %w", params.ID, repository.ErrDuplicateEntry)
+			}
+			return nil, fmt.Errorf("failed to update workspace: %w", err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read workspace update result: %w", err)
+		}
+		if rows == 0 {
+			return nil, fmt.Errorf("workspace not found: %d: %w", params.ID, repository.ErrNotFound)
+		}
 	}
 
-	// Return updated workspace
+	if params.TimeProjectCategories != nil {
+		if err := s.repo.SaveTimeProjectCategories(params.ID, *params.TimeProjectCategories); err != nil {
+			return nil, fmt.Errorf("failed to update workspace time project categories: %w", err)
+		}
+	}
+
 	return s.GetByID(params.ID)
+}
+
+// validateDefaultView rejects a default_view that the workspace's view
+// settings disable. Values outside the known view set (legacy data) pass.
+func (s *WorkspaceService) validateDefaultView(workspaceID int, defaultView string) error {
+	if !slices.Contains(models.BoardViewIDs, defaultView) {
+		return nil
+	}
+	wsConfig, err := s.boards.GetByWorkspaceID(workspaceID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to load workspace view settings: %w", err)
+	}
+	if set := wsConfig.ViewSettings.EnabledViewSet(); set != nil {
+		if _, ok := set[defaultView]; !ok {
+			return fmt.Errorf("%w: view %q is disabled by the workspace view settings", ErrWorkspaceMutationInvalid, defaultView)
+		}
+	}
+	return nil
+}
+
+func nullableUpdateValue[T any](update NullableUpdate[T]) any {
+	if update.Value == nil {
+		return nil
+	}
+	return *update.Value
 }
 
 // Delete removes a workspace by ID.
 func (s *WorkspaceService) Delete(id int) error {
-	// Check workspace exists
-	exists, err := s.repo.Exists(id)
-	if err != nil {
-		return fmt.Errorf("failed to check workspace existence: %w", err)
-	}
-	if !exists {
-		return fmt.Errorf("workspace not found: %d", id)
+	if err := database.WithTx(s.db, func(tx database.Tx) error {
+		exists, err := s.repo.LockForDeleteTx(tx, id)
+		if err != nil {
+			return fmt.Errorf("check workspace existence: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf("workspace not found: %d: %w", id, repository.ErrNotFound)
+		}
+		if err := s.itemRepo.LockWorkspaceItemsTx(tx, id); err != nil {
+			return err
+		}
+
+		hasProtectedLinks, err := s.integrationLinkGuards.HasLinksForWorkspaceTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if hasProtectedLinks {
+			return ErrWorkspaceHasProtectedIntegrationLinks
+		}
+
+		// Remove SLA configuration first so goal targets are gone before the
+		// workspace's calendars cascade; the goal-target calendar FK would
+		// otherwise abort the delete depending on cascade order.
+		if err := s.slaRepo.DeleteWorkspaceMetricsTx(context.Background(), tx, id); err != nil {
+			return err
+		}
+
+		// Intakes routing into this workspace would keep polling and failing once
+		// the workspace is gone; remove them with it.
+		if err := repository.NewIntakeRepository(s.db).DeleteByWorkspaceTx(tx, id); err != nil {
+			return err
+		}
+
+		if err := s.repo.DeleteTx(tx, id); err != nil {
+			return fmt.Errorf("delete workspace: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	// Delete workspace (cascade will handle related records)
-	err = s.repo.Delete(id)
-	if err != nil {
-		return fmt.Errorf("failed to delete workspace: %w", err)
+	// The sequence is auxiliary cleanup. Run it after the workspace deletion
+	// commits so a failed DROP cannot roll back an otherwise valid deletion or
+	// leave a PostgreSQL transaction permanently aborted.
+	if err := s.repo.DropItemSequence(int64(id)); err != nil {
+		slog.Warn("failed to drop item sequence for workspace", "workspace_id", id, "error", err)
 	}
+
+	repository.InvalidateItemListCountCache(s.db, id)
 
 	return nil
 }
@@ -290,111 +659,64 @@ func (s *WorkspaceService) KeyExists(key string) (bool, error) {
 	return s.repo.KeyExists(strings.ToUpper(key))
 }
 
-// GetStatuses retrieves statuses available for a workspace via its configuration set.
-// If the workspace has a config set with a workflow that defines transitions, only
-// statuses reachable as from_status_id or to_status_id of those transitions are returned.
-// Otherwise (no config set, no workflow, or no transitions), all statuses are returned.
+// GetStatuses retrieves statuses available through the workspace's effective
+// workflows. This follows the same fallback chain used for item transitions:
+// item-type override, configuration-set workflow, then the global default
+// workflow. A status is returned only when at least one applicable workflow
+// references it. Personal workspaces are not workflow-bound and retain access
+// to the full status catalog.
 func (s *WorkspaceService) GetStatuses(workspaceID int) ([]models.Status, error) {
-	rows, err := s.db.Query(`
-		SELECT DISTINCT s.id, s.name, s.description, s.category_id, s.is_default,
-		       sc.name as category_name, sc.color as category_color, sc.is_completed
-		FROM statuses s
-		JOIN status_categories sc ON s.category_id = sc.id
-		WHERE NOT EXISTS (
-			SELECT 1 FROM workspace_configuration_sets wcs
-			JOIN configuration_sets cs ON wcs.configuration_set_id = cs.id
-			JOIN workflow_transitions wt ON wt.workflow_id = cs.workflow_id
-			WHERE wcs.workspace_id = ?
-		)
-		OR EXISTS (
-			SELECT 1 FROM workspace_configuration_sets wcs
-			JOIN configuration_sets cs ON wcs.configuration_set_id = cs.id
-			JOIN workflow_transitions wt ON wt.workflow_id = cs.workflow_id
-			WHERE wcs.workspace_id = ?
-			  AND (wt.from_status_id = s.id OR wt.to_status_id = s.id)
-		)
-		ORDER BY s.category_id, s.name
-	`, workspaceID, workspaceID)
+	statuses, err := s.GetStatusesForWorkspaces([]int{workspaceID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workspace statuses: %w", err)
 	}
-	defer rows.Close()
-
-	var statuses []models.Status
-	for rows.Next() {
-		var status models.Status
-		var description sql.NullString
-		err := rows.Scan(
-			&status.ID, &status.Name, &description, &status.CategoryID, &status.IsDefault,
-			&status.CategoryName, &status.CategoryColor, &status.IsCompleted,
-		)
-		if err != nil {
-			continue
-		}
-		status.Description = description.String
-		statuses = append(statuses, status)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate workspace statuses: %w", err)
-	}
-
-	if statuses == nil {
-		statuses = []models.Status{}
-	}
-
 	return statuses, nil
 }
 
-// GetItemTypes retrieves item types available for a workspace via its configuration set.
-// If the workspace has a config set with item types defined, only those are returned.
-// If no config set exists, all item types are returned.
+// GetStatusesForWorkspaces returns the union of statuses available to any of
+// the supplied workspaces in one query. An empty workspace list means global
+// status context and therefore returns the complete status catalog.
+func (s *WorkspaceService) GetStatusesForWorkspaces(workspaceIDs []int) ([]models.Status, error) {
+	return repository.NewStatusRepository(s.db).ListForWorkspaces(workspaceIDs)
+}
+
+// ListTemplateSummaries returns every structurally eligible template
+// (active, non-personal, marked as a template) with picker metadata.
+// Callers must still filter the result to templates visible to the user.
+func (s *WorkspaceService) ListTemplateSummaries(ctx context.Context) ([]models.WorkspaceTemplateSummary, error) {
+	return s.templates.ListTemplateSummaries(ctx)
+}
+
+// GetItemTypes retrieves item types available for a workspace via its effective
+// configuration set (assigned, else the global default). When the effective set
+// enumerates item types, only those are returned; otherwise all item types are
+// returned.
 func (s *WorkspaceService) GetItemTypes(workspaceID int) ([]ItemTypeResult, error) {
-	rows, err := s.db.Query(`
-		SELECT DISTINCT it.id, it.name, it.description, it.icon, it.color,
-		       it.hierarchy_level, it.sort_order, it.is_default
-		FROM item_types it
-		WHERE NOT EXISTS (
-			SELECT 1 FROM workspace_configuration_sets wcs
-			JOIN configuration_set_item_types csit ON wcs.configuration_set_id = csit.configuration_set_id
-			WHERE wcs.workspace_id = ?
-		)
-		OR EXISTS (
-			SELECT 1 FROM workspace_configuration_sets wcs
-			JOIN configuration_set_item_types csit ON wcs.configuration_set_id = csit.configuration_set_id
-			WHERE wcs.workspace_id = ? AND csit.item_type_id = it.id
-		)
-		ORDER BY it.hierarchy_level, it.sort_order, it.name
-	`, workspaceID, workspaceID)
+	rows, err := repository.NewItemTypeRepository(s.db).ListForWorkspace(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workspace item types: %w", err)
 	}
-
-	return ScanItemTypes(rows)
+	out := make([]ItemTypeResult, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ItemTypeResult{ID: row.ID, BuiltinKey: row.BuiltinKey, Name: row.Name, Description: row.Description,
+			Icon: row.Icon, Color: row.Color, HierarchyLevel: row.HierarchyLevel,
+			SortOrder: row.SortOrder, IsDefault: row.IsDefault})
+	}
+	return out, nil
 }
 
 // GetPriorities returns the priorities enabled for a workspace's configuration
 // set. When the workspace has no configuration set (or no priorities mapped to
 // it), all priorities are returned — mirroring GetItemTypes/GetStatuses.
 func (s *WorkspaceService) GetPriorities(workspaceID int) ([]PriorityResult, error) {
-	rows, err := s.db.Query(`
-		SELECT DISTINCT p.id, p.name, p.description, p.icon, p.color,
-		       p.sort_order, p.is_default
-		FROM priorities p
-		WHERE NOT EXISTS (
-			SELECT 1 FROM workspace_configuration_sets wcs
-			JOIN configuration_set_priorities csp ON wcs.configuration_set_id = csp.configuration_set_id
-			WHERE wcs.workspace_id = ?
-		)
-		OR EXISTS (
-			SELECT 1 FROM workspace_configuration_sets wcs
-			JOIN configuration_set_priorities csp ON wcs.configuration_set_id = csp.configuration_set_id
-			WHERE wcs.workspace_id = ? AND csp.priority_id = p.id
-		)
-		ORDER BY p.sort_order, p.name
-	`, workspaceID, workspaceID)
+	rows, err := repository.NewPriorityRepository(s.db).ListForWorkspace(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workspace priorities: %w", err)
 	}
-
-	return ScanPriorities(rows)
+	out := make([]PriorityResult, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, PriorityResult{ID: row.ID, BuiltinKey: row.BuiltinKey, Name: row.Name, Description: row.Description,
+			Icon: row.Icon, Color: row.Color, SortOrder: row.SortOrder, IsDefault: row.IsDefault})
+	}
+	return out, nil
 }

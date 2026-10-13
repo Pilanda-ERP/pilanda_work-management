@@ -222,12 +222,12 @@ func (r *PageLabelRepository) RemoveAssignment(pageID, labelID int) error {
 }
 
 // LoadForPages bulk-loads label rows for a slice of pages and attaches them
-// to each page's Labels field. Used by the page tree + detail endpoints to
+// to each page's Labels field. Used by the page list and detail endpoints to
 // avoid an N+1 lookup. Always leaves Labels non-nil so the JSON response is
 // `"labels": []` rather than `"labels": null` for pages without labels.
 //
-// Call this BEFORE BuildPageTree — BuildPageTree copies each Page into a
-// PageNode by value, and the copy needs to inherit the Labels slice header.
+// Call this before BuildPageTree so each PageNode copy inherits the Labels
+// slice header.
 func (r *PageLabelRepository) LoadForPages(pages []models.Page) error {
 	for i := range pages {
 		if pages[i].Labels == nil {
@@ -238,7 +238,7 @@ func (r *PageLabelRepository) LoadForPages(pages []models.Page) error {
 		return nil
 	}
 
-	pageIDs := make([]interface{}, len(pages))
+	pageIDs := make([]any, len(pages))
 	placeholders := make([]string, len(pages))
 	for i, page := range pages {
 		pageIDs[i] = page.ID

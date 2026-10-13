@@ -1,7 +1,9 @@
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import tailwindcss from '@tailwindcss/vite';
+import { svelteTesting } from '@testing-library/svelte/vite';
 import { visualizer } from 'rollup-plugin-visualizer';
 import { defineConfig } from 'vite';
+import { excalidrawAssetsPlugin } from './scripts/excalidraw-assets.js';
 
 // When PLUGIN_DEV_PORTS is set (e.g. "ldap-config=5561,saml-config=5562,..."),
 // add proxy rules that route plugin asset requests to individual Vite dev servers
@@ -29,7 +31,9 @@ export default defineConfig({
   base: './',
   plugins: [
     svelte(), // Uses svelte.config.js for preprocessors
+    svelteTesting(),
     tailwindcss(),
+    excalidrawAssetsPlugin(),
     ...(enableBundleAnalyzer
       ? [
           visualizer({
@@ -43,6 +47,16 @@ export default defineConfig({
       : []),
   ],
   optimizeDeps: {
+    // Pre-bundle the lazy editor stack instead of excluding it. Vite serves
+    // every dependency of an *excluded* package from source, and the Milkdown
+    // tree is not pure ESM: in dev micromark resolves its `development` export,
+    // which imports the CJS `debug` package, and unified imports CJS `extend`.
+    // Served from source those expose no default export, so the editor's dynamic
+    // import fails with "does not provide an export named 'default'".
+    // Pre-bundling also collapses ~1000 individual module requests into a
+    // handful of chunks, so the comment/page editor appears in under a second
+    // instead of waiting on an on-demand transform storm.
+    //
     // React + jsx-runtime are force-included so the dev optimizer emits all
     // exports (Fragment, jsx, jsxs) — needed by Excalidraw's auto-JSX output.
     // Excalidraw and its mermaid bridge are pre-bundled rather than excluded:
@@ -53,15 +67,17 @@ export default defineConfig({
     // The startup cost is bounded since both are only loaded behind a dynamic
     // import — the optimizer just makes sure the pre-bundle is well-formed.
     include: [
-      '@milkdown/core',
-      '@milkdown/kit',
-      '@milkdown/theme-nord',
       'react',
       'react-dom',
       'react/jsx-runtime',
       'react/jsx-dev-runtime',
       '@excalidraw/excalidraw',
       '@excalidraw/mermaid-to-excalidraw',
+      'debug',
+      'extend',
+      '@milkdown/kit',
+      '@milkdown/utils',
+      '@milkdown/theme-nord',
     ],
     // exclude deps that are only loaded via dynamic import() behind a
     // runtime guard (isTauri, route-level lazy loads). Pre-bundling them
@@ -103,18 +119,6 @@ export default defineConfig({
             {
               name: 'milkdown',
               test: /@milkdown/,
-            },
-            {
-              name: 'd3',
-              test: /d3-(scale|shape|time-format)/,
-            },
-            {
-              name: 'excalidraw',
-              test: /react|react-dom|@excalidraw\/excalidraw/,
-            },
-            {
-              name: 'svelteflow',
-              test: /@xyflow\/svelte/,
             },
             {
               name: 'dnd',

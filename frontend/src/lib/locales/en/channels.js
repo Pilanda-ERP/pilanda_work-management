@@ -1,15 +1,3 @@
-/**
- * English locale - Channels, Notifications, Portal, and Request Form translations
- *
- * This module contains translations for:
- * - notifications: Notification UI and email verification
- * - channels: Channel management and integration settings
- * - channel: Channel configuration (portal, webhook, email)
- * - portal: Customer portal settings and request types
- * - requestForm: Portal request submission form
- * - requestTypeFields: Field configuration for request types
- */
-
 export default {
   notifications: {
     title: 'Notifications',
@@ -72,6 +60,18 @@ export default {
     channelDeleted: 'Channel deleted successfully',
     cannotDeleteDefault: 'Cannot delete the default notification channel',
     searchChannels: 'Search channels...',
+    manager: {
+      subtitle: 'Manage the channels you are responsible for',
+      purpose: 'Purpose',
+      publishedAt: 'Published at {path}',
+      deliversTo: 'Delivers requests to {workspace}',
+      outboundNotifications: 'Sends outbound notifications',
+      outboundEvents: 'Delivers outbound events',
+      operational: 'Operational channel',
+      noChannels: 'No managed channels',
+      noChannelsDescription: 'Channels assigned to you will appear here.',
+      loadFailed: 'Failed to load channels',
+    },
     testWebhook: 'Test Webhook',
     webhookSent: 'Test webhook sent successfully!',
     webhookFailed: 'Webhook test failed',
@@ -142,6 +142,13 @@ export default {
     enableEmail: 'Enable Email Channel',
     emailIsActive: 'Email channel is active and processing emails',
     emailIsInactive: 'Email channel is currently disabled',
+    enableWebhook: 'Enable Webhook',
+    webhookIsActive: 'Webhook is active',
+    webhookIsInactive: 'Webhook is currently disabled',
+    enableSmtp: 'Enable SMTP',
+    smtpIsActive: 'SMTP is active',
+    smtpIsInactive: 'SMTP is currently disabled',
+    failedToLoad: 'Failed to load channel',
 
     // Webhook Configuration
     webhookConfiguration: 'Webhook Configuration',
@@ -212,19 +219,83 @@ export default {
     itemTypeRequired: 'Item type is required',
     selectItemType: 'Select item type...',
     selectWorkspaceFirst: 'Select a workspace first',
+    workspaceFieldResolution: 'Workspace field resolution',
     processingOptions: 'Processing Options',
     mailbox: 'Mailbox',
     mailboxHelp: 'The folder to poll for new emails',
+    rateLimitPerHour: 'Ticket rate limit per sender (per hour)',
+    rateLimitHelp:
+      'Maximum new tickets one sender can create per rolling hour. Empty = default (100), 0 = unlimited. Replies to existing tickets are never limited.',
+    rateLimitInvalid: 'Rate limit must be 0 (unlimited) or a positive number',
+    connectedPortalSection: 'Customer Portal',
+    connectedPortal: 'Connected portal',
+    connectedPortalNotConnected: 'Not connected',
+    connectedPortalUnknown: 'Portal #{id} (currently not manageable by you)',
+    connectedPortalHelp:
+      'Customers who email this address can see and continue their tickets in the selected portal, subject to that portal\'s access policy. Replies from the portal stay on the same ticket.',
+    portalConnectedMailboxes: 'Connected Intake Mailboxes',
+    portalConnectedMailboxesEmpty: 'No intake mailboxes are connected to this portal.',
+    portalConnectedMailboxesHelp:
+      'Email channels linked to this portal. Customers who email those addresses see their tickets here. Configure the link on each email channel.',
+    portalMailboxEnabled: 'Enabled',
+    portalMailboxDisabled: 'Disabled',
+    autoAppendOpenTickets: 'Continue open tickets by email',
+    autoAppendOpenTicketsHelp:
+      "When someone with an open ticket in this workspace emails in fresh (without replying), append their message to that ticket instead of creating a duplicate. Only applies when they created the ticket or replied before.",
     markAsRead: 'Mark as read after processing',
     markAsReadHelp: "Mark emails as read once they've been converted to items",
     deleteAfterProcess: 'Delete after processing',
     deleteAfterProcessHelp:
       'Remove emails from the mailbox after creating items (use with caution)',
+    processingDisposition: 'After processing',
+    dispositionLeave: 'Leave in mailbox',
+    dispositionMarkRead: 'Mark as read',
+    dispositionDelete: 'Delete after processing',
+    dispositionHelp: 'What to do with an email once it has been converted to an item.',
+    dispositionDeleteHelp:
+      'Remove the email from the mailbox after creating the item (use with caution).',
+    dispositionInherit: 'Use the mailbox default',
+    intakesTitle: 'Intakes',
+    intakesHelp:
+      'Each intake reads one folder on this mailbox and creates items in one workspace and item type. Link a portal to expose those requests to its customers. One mailbox can feed several intakes, but only via distinct folders. Creating an intake requires managing this mailbox, the target workspace, and any linked portal.',
+    intakesMailboxAddress: 'Monitoring {address}',
+    intakeLastUID: 'Last UID {uid}',
+    intakeRateLimited: '{count} held back',
+    intakesEmpty: 'No intakes yet. Add one so this mailbox creates items.',
+    intakeAdd: 'Add intake',
+    intakeFolder: 'Folder',
+    intakeFolderRequired: 'Folder is required',
+    intakeTargetType: 'Target type',
+    intakeTargetWorkspace: 'Workspace',
+    intakeTargetPortal: 'Portal',
+    intakeTargetRequired: 'Select a target',
+    intakeNoPortal: 'Internal (no portal)',
+    intakeWorkspaceRequired: 'Select a workspace',
+    intakeStatus: 'Status',
+    intakeStatusEnabled: 'Enabled',
+    intakeStatusDisabled: 'Disabled',
+    intakeStatusNeedsAttention: 'Needs attention',
+    intakeFeedsPortal: 'Feeds portal',
+    intakeFeedsWorkspace: 'Feeds workspace',
+    intakePortalRequestTypeHelp:
+      'Email from this folder uses the portal\u2019s system Email request type, so required form fields never block mail.',
+    intakePortalItemTypeHelp:
+      'New items from this folder use the selected item type. The portal\u2019s system Email request type still routes the mail.',
+    selectPortal: 'Select a portal',
+    intakeSendConfirmation: 'Send a submission receipt',
+    intakeSendConfirmationHint:
+      'Email the sender a confirmation that their request was received. The receipt includes a portal link when this intake is linked to a portal.',
+    intakeConfirmationOn: 'Receipt on',
+    intakeSaved: 'Intake saved',
+    intakeSaveFailed: 'Failed to save intake',
+    intakeDeleted: 'Intake deleted',
+    intakeDeleteFailed: 'Failed to delete intake',
+    intakeLoadFailed: 'Failed to load intakes',
     // Form Channel Configuration
     openForm: 'Open Form',
-    formConfiguration: 'Form Configuration',
-    formSlug: 'Form Slug',
-    formSlugHelp: 'URL-friendly identifier',
+    formConfiguration: 'Public page',
+    formSlug: 'Public URL',
+    formSlugHelp: 'Used in the share link',
     formSlugRequired: 'Form slug is required',
     formSlugInvalid: 'Slug must be 1–40 lowercase letters, numbers, or hyphens, and may not start or end with a hyphen or contain consecutive hyphens.',
     formBrandColorInvalid: 'Brand color must be a 6-digit hex code (e.g. #14b8a6).',
@@ -273,6 +344,9 @@ export default {
     smtpFromName: 'From Name',
     smtpFromNamePlaceholder: 'Display name for outgoing emails',
     smtpEncryption: 'Encryption',
+    smtpSkipTlsVerify: 'Skip certificate verification',
+    smtpSkipTlsVerifyDescription: 'Allow self-signed or untrusted certificates for this SMTP server only. This weakens connection security.',
+    smtpNoEncryptionWarning: 'Email contents and delivery metadata will be sent without encryption. Use this only with a trusted local SMTP relay.',
     noEncryption: 'None (not recommended)',
     authentication: 'Authentication',
     senderSettings: 'Sender Settings',
@@ -287,11 +361,14 @@ export default {
     testEmailFailed: 'Test email failed',
 
     // Processing Log
+    customerReplies: 'Customer replies',
     processingLog: 'Processing Log',
     emailLog: {
       syncStatus: 'Sync Status',
       lastChecked: 'Last checked',
       never: 'Never',
+      intakeLastUID: 'Last UID {uid}',
+      intakeLastPolled: 'Polled {time}',
       errors: 'Errors',
       noErrors: 'No errors',
       from: 'From',
@@ -301,9 +378,31 @@ export default {
       newItem: 'New item {key}',
       commentOn: 'Comment on {key}',
       noEmails: 'No emails processed yet',
+      noResults: 'No email log entries found',
       previous: 'Previous',
       next: 'Next',
       page: 'Page {page} of {total}',
+      rateLimited: 'Rate limited',
+      rateLimitedCount: '{count} message(s) held back by the per-sender rate limit and waiting for requeue.',
+      requeue: 'Requeue and retry',
+      requeueing: 'Requeueing...',
+      tabInbound: 'Inbound mail',
+      tabOutbox: 'Customer replies',
+      outboxDescription: 'Queued agent replies to customers. Failed sends retry with backoff.',
+      outboxTo: 'To',
+      outboxStatus: 'Status',
+      outboxNextAttempt: 'Next attempt',
+      outboxPending: 'Pending',
+      outboxDelivered: 'Delivered',
+      outboxDiscarded: 'Discarded',
+      outboxFailed: 'Retry scheduled ({count})',
+      outboxRetry: 'Retry now',
+      outboxRetrying: 'Retrying...',
+      outboxDiscard: 'Discard',
+      outboxDiscarding: 'Discarding...',
+      outboxEmpty: 'No customer replies queued',
+      outboxFilterPending: 'Pending',
+      outboxFilterAll: 'All',
     },
   },
 
@@ -311,6 +410,9 @@ export default {
     title: 'Portal',
     subtitle: 'Customer portal settings',
     portalTitle: 'Portal Title',
+    selectWorkspace: 'Select workspace',
+    workspaceFieldResolution: 'Workspace field resolution',
+    bindingLocked: 'Fixed after creation. Delete and recreate the request type to change it.',
 
     // Magic link authentication
     signInTitle: 'Sign in to your account',
@@ -338,6 +440,7 @@ export default {
 
     // Loading states
     loading: 'Loading portal...',
+    notFound: 'Portal not found',
     signInToAccess: 'Sign in to access the portal and submit requests',
     checkingAuth: 'Checking authentication...',
 
@@ -380,11 +483,11 @@ export default {
     assetSetHint: 'The asset set this report queries.',
     qlQuery: 'QL Query',
     qlQueryRequired: 'QL query is required',
-    qlQueryTokenRequired: 'Form-mode QL queries must reference at least one form field using {field_identifier} tokens',
+    qlQueryTokenRequired: 'Form-mode QL queries must reference at least one form field using ${field_identifier} tokens',
     qlQueryPlaceholder: 'status = "Active" AND category = "Hardware"',
     qlQueryHint: 'Filter assets using QL (Windshift Query Language).',
-    qlQueryFormPlaceholder: 'title = {title} AND status = {status}',
-    qlQueryFormHint: 'Use {field_identifier} tokens to reference values submitted by the form.',
+    qlQueryFormPlaceholder: 'title = ${title} AND status = ${status}',
+    qlQueryFormHint: 'Use ${field_identifier} tokens to reference values submitted by the form.',
     runMode: 'Run Mode',
     runModeDirect: 'Direct Table',
     runModeDirectHint: 'Display results inline as a full-width table in a section.',
@@ -398,12 +501,30 @@ export default {
     successMessage: 'Success message (optional)',
     successMessagePlaceholder: 'Here are the assets matching your criteria.',
     assetReportConfigureFieldsHint: 'Use the "Configure fields" action on the report card to select which form fields appear.',
+    assetReportActiveHint: 'Inactive reports are hidden from the portal.',
     assetReportFieldsAfterCreate: 'After creating, use "Configure fields" on the report card to pick which fields appear in the form.',
+    rowActions: 'Row actions',
+    addRowAction: 'Add row action',
+    rowActionsHint:
+      'Add a link to each result row that opens a request type with one field prefilled from that asset.',
+    noRowActions: 'No row actions configured.',
+    removeRowAction: 'Remove row action',
+    rowActionLabel: 'Link label',
+    rowActionLabelPlaceholder: 'e.g., Report an issue',
+    rowActionRequestType: 'Request type',
+    selectRequestType: 'Select request type...',
+    rowActionTargetField: 'Prefilled field',
+    selectField: 'Select field...',
+    rowActionSource: 'Value from asset',
+    rowActionSourceAssetId: 'Asset ID',
+    rowActionSourceAssetTag: 'Asset tag',
+    rowActionSourceTitle: 'Asset title',
+    rowActionIncomplete: 'Row action {index} is incomplete: {field} is required',
     runReport: 'Run Report',
     failedToRunReport: 'Failed to run report',
     fieldRequired: '{field} is required',
     noFieldsConfigured: 'No form fields configured yet. Use "Configure fields" on the report card to add some.',
-    resultsCount: '{total} result(s)',
+    resultsCount: '{total} results',
     editCriteria: 'Edit criteria',
     noAssetsFound: 'No assets match the criteria.',
     noFormFieldsConfigured: 'This report has no form fields configured yet.',
@@ -491,6 +612,9 @@ export default {
       navigationComingSoon: 'Navigation customization coming soon.',
       requestTypesDescription:
         'Drag and drop request types to reorder. Click the menu to edit, rename, or delete.',
+      systemRequestType: 'System',
+      systemRequestTypeHelp:
+        'Routes email intake into this portal. Its item type is editable; it is hidden from the public form.',
       creates: 'Creates',
       fields: 'Fields',
       addFields: 'Add Fields',
@@ -501,6 +625,8 @@ export default {
       addRequestType: 'Add Request Type',
       confirmDeleteRequestType:
         'Are you sure you want to delete this request type? This cannot be undone.',
+      confirmDeleteAssetReport:
+        'Are you sure you want to delete this asset report? This cannot be undone.',
       // Knowledge base section
       docmostKnowledgeBase: 'Docmost Knowledge Base',
       docmostDescription:
@@ -521,6 +647,26 @@ export default {
       docmostStep3: 'Enable public sharing',
       docmostStep4: 'Copy the share link',
       docmostStep5: 'Paste it above',
+      workspacePagesBadge: 'Workspace page',
+      workspacePagesTitle: 'Workspace Pages',
+      workspacePagesDescription:
+        'Publish a workspace\u2019s Pages tree as part of this knowledge base. Published pages are searchable here and are marked as publicly viewable in the page editor.',
+      workspacePagesNotice:
+        'This knowledge base exposes workspace pages ({count}). Published pages are searchable by portal users and marked as publicly viewable in the editor.',
+      workspacePagesEmpty: 'No workspace pages are published in this knowledge base yet.',
+      workspacePagesPickWorkspace: 'Workspace',
+      workspacePagesPickWorkspacePlaceholder: 'Choose a workspace\u2026',
+      workspacePagesNoEligible:
+        'No connected workspace is administered by you. Workspace administration rights are required to publish pages here.',
+      workspacePagesScope: 'Scope',
+      workspacePagesEntire: 'Entire pages tree',
+      workspacePagesSubtree: 'Sub-page (with its sub-pages)',
+      workspacePagesPickPage: 'Start page',
+      workspacePagesPickPagePlaceholder: 'Choose a start page\u2026',
+      workspacePagesAdd: 'Add to knowledge base',
+      workspacePagesRemove: 'Remove from knowledge base',
+      workspacePagesEntryEntire: '{workspace} \u2014 entire pages tree',
+      workspacePagesEntrySubtree: '{workspace} \u2014 sub-page \u201c{page}\u201d',
       // Logo section
       logo: 'Portal Logo',
       logoHelp:
@@ -572,6 +718,10 @@ export default {
     failedToLoadFields: 'Failed to load form fields',
     failedToSubmit: 'Failed to submit request',
     selectOption: 'Select an option...',
+    shareWithOrganisation: 'Share with my organisation',
+    shareWithOrganisationHint:
+      'Your organisation’s other contacts will be able to see and reply to this request.',
+    sharedWithOrganisationNote: 'This request will be visible to your organisation’s contacts.',
   },
 
   requestTypeFields: {
@@ -634,6 +784,10 @@ export default {
   // Form Builder translations
   forms: {
     title: 'Forms',
+    routing: {
+      title: 'Routing',
+      save: 'Save routing',
+    },
     createForm: 'Create Form',
     deleteForm: 'Delete Form',
     confirmDeleteForm: 'Are you sure you want to delete "{name}"? This action cannot be undone.',
@@ -657,13 +811,14 @@ export default {
       required: 'Required',
       optional: 'Optional',
       noForms: 'No forms configured yet',
-      addFormHint: 'Create request types for this channel to start building forms',
+      addFormHint: 'Create the first form and choose where its responses should go.',
       editFields: 'Edit Fields',
       backToFields: 'Back to Fields',
     },
     settings: {
       title: 'Form Settings',
       requireAuth: 'Require authentication',
+      allowAttachments: 'Allow attachments',
       submitButton: 'Submit Button Text',
       successMessage: 'Success Message',
       successMessagePlaceholder: 'Thank you for your submission!',
@@ -671,7 +826,7 @@ export default {
     },
     integration: {
       title: 'Integration',
-      hostedUrl: 'Hosted URL',
+      hostedUrl: 'Share link',
       iframe: 'iframe Embed',
       jsWidget: 'JS Widget',
       copyCode: 'Copy Code',
@@ -686,6 +841,7 @@ export default {
   hub: {
     loading: 'Loading hub...',
     error: 'Error loading hub',
+    section: 'Section',
     inbox: 'Inbox',
     inboxDescription: 'Requests from all portals',
     backToHub: 'Back to Hub',

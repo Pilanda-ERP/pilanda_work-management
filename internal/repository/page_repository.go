@@ -82,14 +82,18 @@ func scanPage(s rowScanner) (*models.Page, error) {
 	var parentID, updatedBy, archivedBy sql.NullInt64
 	var rank, fracIndex sql.NullString
 	var archivedAt sql.NullTime
+	// metadata is written as a bound Go string (TEXT storage class), which
+	// database/sql will not scan into *json.RawMessage — go through []byte.
+	var metadata []byte
 
 	if err := s.Scan(
-		&p.ID, &p.WorkspaceID, &parentID, &p.Title, &p.Slug, &p.Metadata, &p.Content, &p.ContentHash,
+		&p.ID, &p.WorkspaceID, &parentID, &p.Title, &p.Slug, &metadata, &p.Content, &p.ContentHash,
 		&p.Excerpt, &p.CreatedBy, &updatedBy, &archivedBy, &p.IsHome, &p.InheritPermissions,
 		&rank, &fracIndex, &p.Path, &p.Depth, &p.CreatedAt, &p.UpdatedAt, &archivedAt,
 	); err != nil {
 		return nil, err
 	}
+	p.Metadata = json.RawMessage(metadata)
 
 	applyPageNullables(&p, parentID, updatedBy, archivedBy, rank, fracIndex, archivedAt)
 	return &p, nil
@@ -103,14 +107,17 @@ func scanPageMeta(s rowScanner) (*models.Page, error) {
 	var parentID, updatedBy, archivedBy sql.NullInt64
 	var rank, fracIndex sql.NullString
 	var archivedAt sql.NullTime
+	// See scanPage: string-typed TEXT values cannot scan into *json.RawMessage.
+	var metadata []byte
 
 	if err := s.Scan(
-		&p.ID, &p.WorkspaceID, &parentID, &p.Title, &p.Slug, &p.Metadata,
+		&p.ID, &p.WorkspaceID, &parentID, &p.Title, &p.Slug, &metadata,
 		&p.CreatedBy, &updatedBy, &archivedBy, &p.IsHome, &p.InheritPermissions,
 		&rank, &fracIndex, &p.Path, &p.Depth, &p.CreatedAt, &p.UpdatedAt, &archivedAt,
 	); err != nil {
 		return nil, err
 	}
+	p.Metadata = json.RawMessage(metadata)
 
 	applyPageNullables(&p, parentID, updatedBy, archivedBy, rank, fracIndex, archivedAt)
 	return &p, nil
@@ -174,6 +181,24 @@ func (r *PageRepository) GetByID(id int) (*models.Page, error) {
 	return page, nil
 }
 
+// ValidateLivePageInWorkspace asserts that pageID is a non-archived page
+// inside workspaceID. Used as the channel-config guard for wiring a page
+// subtree into a portal knowledge base.
+func (r *PageRepository) ValidateLivePageInWorkspace(workspaceID, pageID int) error {
+	var archived sql.NullTime
+	err := r.db.QueryRow(`SELECT archived_at FROM pages WHERE id = ? AND workspace_id = ?`, pageID, workspaceID).Scan(&archived)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("page %d does not exist in workspace %d", pageID, workspaceID)
+	}
+	if err != nil {
+		return fmt.Errorf("check page %d: %w", pageID, err)
+	}
+	if archived.Valid {
+		return fmt.Errorf("page %d is archived", pageID)
+	}
+	return nil
+}
+
 // GetByIDs loads multiple pages in a single query. Missing ids are simply
 // absent from the result — the caller decides how to surface that. The slice
 // is ordered as returned by the database (callers that need a specific order
@@ -182,7 +207,7 @@ func (r *PageRepository) GetByIDs(ids []int) ([]models.Page, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	placeholders := ""
 	for i, id := range ids {
 		args[i] = id
@@ -273,7 +298,7 @@ func (r *PageRepository) UpdateTx(tx database.Tx, in UpdateInput) error {
 		    inherit_permissions = ?,
 		    updated_by = ?,
 		    updated_at = ?`
-	args := make([]interface{}, 0, 10)
+	args := make([]any, 0, 10)
 	args = append(args, in.Title, in.Slug, in.Content, in.ContentHash, in.Excerpt, in.InheritPermissions, in.UpdatedBy, now)
 	if in.Metadata != nil {
 		query += `,
@@ -347,6 +372,45 @@ func (r *PageRepository) MoveTx(tx database.Tx, pageID int, newParentID *int, ne
 	return nil
 }
 
+// MoveAcrossWorkspaceTx rewrites the workspace and hierarchy columns for one
+// row in a subtree move. Cross-workspace moves deliberately reset home status
+// and explicit ACL inheritance; workspace-scoped relations are reconciled by
+// PageService in the same transaction.
+func (r *PageRepository) MoveAcrossWorkspaceTx(tx database.Tx, pageID, destinationWorkspaceID int, newParentID *int, newPath string, newDepth, updatedBy int, newFracIndex *string) error {
+	now := time.Now().UTC()
+	query := `
+		UPDATE pages
+		SET workspace_id = ?,
+		    parent_id = ?,
+		    path = ?,
+		    depth = ?,
+		    is_home = false,
+		    inherit_permissions = true,
+		    updated_by = ?,
+		    updated_at = ?`
+	args := []any{destinationWorkspaceID, nullInt(newParentID), newPath, newDepth, updatedBy, now}
+	if newFracIndex != nil {
+		query += `,
+		    frac_index = ?`
+		args = append(args, *newFracIndex)
+	}
+	query += ` WHERE id = ?`
+	args = append(args, pageID)
+
+	res, err := tx.Exec(query, args...)
+	if err != nil {
+		if isUniqueConstraintError(err) {
+			return ErrDuplicateEntry
+		}
+		return fmt.Errorf("move page %d across workspaces: %w", pageID, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetFracIndexTx writes a frac_index for a single page. Used for one-shot
 // backfills when reordering exposes siblings whose frac_index is still NULL
 // (pages predating drag-and-drop). The caller is responsible for picking a
@@ -366,6 +430,28 @@ func (r *PageRepository) SetFracIndexTx(tx database.Tx, pageID int, fracIndex st
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearFracIndexesTx temporarily removes pages from the scoped frac_index
+// unique index before a sibling set is re-sequenced. Callers must assign final
+// keys in the same transaction so the temporary NULL values are never
+// committed.
+func (r *PageRepository) ClearFracIndexesTx(tx database.Tx, pageIDs []int) error {
+	if len(pageIDs) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(pageIDs))
+	args := make([]any, len(pageIDs))
+	for i, pageID := range pageIDs {
+		placeholders[i] = "?"
+		args[i] = pageID
+	}
+	query := "UPDATE pages SET frac_index = NULL WHERE id IN (" + strings.Join(placeholders, ",") + ")"
+	if _, err := tx.Exec(query, args...); err != nil {
+		return fmt.Errorf("clear page frac_index values: %w", err)
 	}
 	return nil
 }
@@ -393,11 +479,10 @@ func (r *PageRepository) ArchiveTx(tx database.Tx, pageID, archivedBy int) error
 	return nil
 }
 
-// SearchByTitle returns non-archived pages in the workspace whose title
-// matches a case-insensitive substring of query, ordered by title. Results
-// are capped at limit. The caller must filter the result through per-page
-// ACLs before returning to a user — workspace scoping alone isn't enough.
-func (r *PageRepository) SearchByTitle(workspaceID int, query string, limit int) ([]models.Page, error) {
+// SearchByKeyword returns non-archived pages in the workspace whose title or
+// Markdown body contains query, case-insensitively. Title matches sort first.
+// The caller must apply per-page ACLs before returning results to a user.
+func (r *PageRepository) SearchByKeyword(workspaceID int, query string, limit int) ([]models.Page, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -414,12 +499,18 @@ func (r *PageRepository) SearchByTitle(workspaceID int, query string, limit int)
 		FROM pages
 		WHERE workspace_id = ?
 		  AND archived_at IS NULL
-		  AND LOWER(title) LIKE LOWER(?) ESCAPE '\'
-		ORDER BY title ASC, id ASC
+		  AND (
+		    LOWER(title) LIKE LOWER(?) ESCAPE '\'
+		    OR LOWER(content) LIKE LOWER(?) ESCAPE '\'
+		  )
+		ORDER BY
+		  CASE WHEN LOWER(title) LIKE LOWER(?) ESCAPE '\' THEN 0 ELSE 1 END,
+		  title ASC,
+		  id ASC
 		LIMIT ?
-	`, workspaceID, like, limit)
+	`, workspaceID, like, like, like, limit)
 	if err != nil {
-		return nil, fmt.Errorf("search pages by title: %w", err)
+		return nil, fmt.Errorf("search pages by keyword: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -560,52 +651,11 @@ func (r *PageRepository) ListChildrenTx(tx database.Tx, workspaceID int, parentI
 	return out, rows.Err()
 }
 
-// GetAncestors returns all ancestors of a page (root first, direct parent
-// last), capped at MaxPageDepth so a stored cycle cannot loop the DB.
-// The original page is excluded from the result.
-func (r *PageRepository) GetAncestors(pageID int) ([]models.Page, error) {
-	rows, err := r.db.Query(`
-		WITH RECURSIVE ancestors AS (
-			SELECT `+pageColumns+`, 0 AS level
-			FROM pages
-			WHERE id = ?
-
-			UNION ALL
-
-			SELECT p.id, p.workspace_id, p.parent_id, p.title, p.slug, p.content, p.content_hash,
-			       p.excerpt, p.created_by, p.updated_by, p.archived_by, p.is_home, p.inherit_permissions,
-			       p.rank, p.frac_index, p.path, p.depth, p.created_at, p.updated_at, p.archived_at,
-			       a.level + 1 AS level
-			FROM pages p
-			JOIN ancestors a ON p.id = a.parent_id
-			WHERE a.level < ?
-		)
-		SELECT `+pageColumns+`
-		FROM ancestors
-		WHERE id != ?
-		ORDER BY level DESC
-	`, pageID, MaxPageDepth, pageID)
-	if err != nil {
-		return nil, fmt.Errorf("query ancestors: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var out []models.Page
-	for rows.Next() {
-		page, scanErr := scanPage(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("scan ancestor: %w", scanErr)
-		}
-		out = append(out, *page)
-	}
-	return out, rows.Err()
-}
-
-// ListSubtreeForArchiveTx returns the target page plus every descendant matched
+// ListSubtreeTx returns the target page plus every descendant matched
 // by the materialized-path prefix. When forUpdate is true (Postgres), rows are
 // locked until the caller's transaction commits so permission checks performed
 // by the service cannot race a concurrent insert/update in the archived subtree.
-func (r *PageRepository) ListSubtreeForArchiveTx(tx database.Tx, page *models.Page, forUpdate bool) ([]models.Page, error) {
+func (r *PageRepository) ListSubtreeTx(tx database.Tx, page *models.Page, forUpdate bool) ([]models.Page, error) {
 	prefix := page.Path + fmt.Sprintf("%d/", page.ID)
 	query := `
 		SELECT ` + pageColumns + `
@@ -617,7 +667,7 @@ func (r *PageRepository) ListSubtreeForArchiveTx(tx database.Tx, page *models.Pa
 	}
 	rows, err := tx.Query(query, page.ID, page.WorkspaceID, prefix+"%")
 	if err != nil {
-		return nil, fmt.Errorf("list archive subtree: %w", err)
+		return nil, fmt.Errorf("list page subtree: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -625,53 +675,17 @@ func (r *PageRepository) ListSubtreeForArchiveTx(tx database.Tx, page *models.Pa
 	for rows.Next() {
 		p, scanErr := scanPage(rows)
 		if scanErr != nil {
-			return nil, fmt.Errorf("scan archive subtree: %w", scanErr)
+			return nil, fmt.Errorf("scan page subtree: %w", scanErr)
 		}
 		out = append(out, *p)
 	}
 	return out, rows.Err()
 }
 
-// GetDescendants returns every descendant of a page up to maxDepth.
-// maxDepth <= 0 or > MaxPageDepth is clamped to MaxPageDepth.
-func (r *PageRepository) GetDescendants(pageID, maxDepth int) ([]models.Page, error) {
-	if maxDepth <= 0 || maxDepth > MaxPageDepth {
-		maxDepth = MaxPageDepth
-	}
-	rows, err := r.db.Query(`
-		WITH RECURSIVE descendants AS (
-			SELECT `+pageColumns+`, 1 AS sub_depth
-			FROM pages
-			WHERE parent_id = ?
-
-			UNION ALL
-
-			SELECT p.id, p.workspace_id, p.parent_id, p.title, p.slug, p.content, p.content_hash,
-			       p.excerpt, p.created_by, p.updated_by, p.archived_by, p.is_home, p.inherit_permissions,
-			       p.rank, p.frac_index, p.path, p.depth, p.created_at, p.updated_at, p.archived_at,
-			       d.sub_depth + 1
-			FROM pages p
-			JOIN descendants d ON p.parent_id = d.id
-			WHERE d.sub_depth < ?
-		)
-		SELECT `+pageColumns+`
-		FROM descendants
-		ORDER BY sub_depth ASC, COALESCE(frac_index, '') ASC, COALESCE(rank, '') ASC, title ASC, id ASC
-	`, pageID, maxDepth)
-	if err != nil {
-		return nil, fmt.Errorf("query descendants: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var out []models.Page
-	for rows.Next() {
-		page, scanErr := scanPage(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("scan descendant: %w", scanErr)
-		}
-		out = append(out, *page)
-	}
-	return out, rows.Err()
+// ListSubtreeForArchiveTx retains the archive-specific call site while the
+// same locked subtree primitive is shared with cross-workspace moves.
+func (r *PageRepository) ListSubtreeForArchiveTx(tx database.Tx, page *models.Page, forUpdate bool) ([]models.Page, error) {
+	return r.ListSubtreeTx(tx, page, forUpdate)
 }
 
 // WouldCreatePageCycleTx reports whether reparenting page pageID under
@@ -707,6 +721,9 @@ func (r *PageRepository) WouldCreatePageCycleTx(tx database.Tx, pageID, newParen
 const pageRevisionColumns = `id, page_id, revision_number, title, slug, content, content_hash,
 	excerpt, parent_id, path, depth, change_summary, change_type, created_by, created_at`
 
+const pageRevisionColumnsAliased = `pr.id, pr.page_id, pr.revision_number, pr.title, pr.slug, pr.content, pr.content_hash,
+	pr.excerpt, pr.parent_id, pr.path, pr.depth, pr.change_summary, pr.change_type, pr.created_by, pr.created_at`
+
 func scanPageRevision(s rowScanner) (*models.PageRevision, error) {
 	var rev models.PageRevision
 	var parentID sql.NullInt64
@@ -720,6 +737,38 @@ func scanPageRevision(s rowScanner) (*models.PageRevision, error) {
 	if parentID.Valid {
 		v := int(parentID.Int64)
 		rev.ParentID = &v
+	}
+	return &rev, nil
+}
+
+func scanPageRevisionWithAuthor(s rowScanner) (*models.PageRevision, error) {
+	var rev models.PageRevision
+	var parentID, authorID sql.NullInt64
+	var authorFirst, authorLast, authorUsername sql.NullString
+	var authorActive sql.NullBool
+	if err := s.Scan(
+		&rev.ID, &rev.PageID, &rev.RevisionNumber, &rev.Title, &rev.Slug, &rev.Content, &rev.ContentHash,
+		&rev.Excerpt, &parentID, &rev.Path, &rev.Depth, &rev.ChangeSummary, &rev.ChangeType,
+		&rev.CreatedBy, &rev.CreatedAt,
+		&authorID, &authorFirst, &authorLast, &authorUsername, &authorActive,
+	); err != nil {
+		return nil, err
+	}
+	if parentID.Valid {
+		v := int(parentID.Int64)
+		rev.ParentID = &v
+	}
+	if authorID.Valid {
+		name := strings.TrimSpace(authorFirst.String + " " + authorLast.String)
+		if name == "" {
+			name = authorUsername.String
+		}
+		rev.Author = &models.PageRevisionAuthor{
+			ID:       int(authorID.Int64),
+			Name:     name,
+			Username: authorUsername.String,
+			IsActive: authorActive.Valid && authorActive.Bool,
+		}
 	}
 	return &rev, nil
 }
@@ -793,10 +842,12 @@ func (r *PageRepository) ListRevisions(pageID, limit, offset int) ([]models.Page
 		offset = 0
 	}
 	rows, err := r.db.Query(`
-		SELECT `+pageRevisionColumns+`
-		FROM page_revisions
-		WHERE page_id = ?
-		ORDER BY revision_number DESC
+		SELECT `+pageRevisionColumnsAliased+`,
+		       u.id, u.first_name, u.last_name, u.username, COALESCE(u.is_active, FALSE)
+		FROM page_revisions pr
+		LEFT JOIN users u ON u.id = pr.created_by
+		WHERE pr.page_id = ?
+		ORDER BY pr.revision_number DESC
 		LIMIT ? OFFSET ?
 	`, pageID, limit, offset)
 	if err != nil {
@@ -806,13 +857,21 @@ func (r *PageRepository) ListRevisions(pageID, limit, offset int) ([]models.Page
 
 	var out []models.PageRevision
 	for rows.Next() {
-		rev, scanErr := scanPageRevision(rows)
+		rev, scanErr := scanPageRevisionWithAuthor(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scan revision: %w", scanErr)
 		}
 		out = append(out, *rev)
 	}
 	return out, rows.Err()
+}
+
+func (r *PageRepository) CountRevisions(pageID int) (int, error) {
+	var total int
+	if err := r.db.QueryRow("SELECT COUNT(*) FROM page_revisions WHERE page_id = ?", pageID).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count page revisions: %w", err)
+	}
+	return total, nil
 }
 
 // --- ACL ---
@@ -1206,14 +1265,14 @@ func (r *PageRepository) CountWorkspacePages(workspaceID int) (int, error) {
 
 // --- helpers ---
 
-func nullInt(v *int) interface{} {
+func nullInt(v *int) any {
 	if v == nil {
 		return nil
 	}
 	return *v
 }
 
-func nullString(v *string) interface{} {
+func nullString(v *string) any {
 	if v == nil {
 		return nil
 	}

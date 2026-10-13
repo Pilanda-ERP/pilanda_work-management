@@ -1,57 +1,43 @@
-/**
- * Internationalization (i18n) store for managing translations
- *
- * Supports:
- * - Multiple locales with lazy loading
- * - RTL support for Arabic
- * - String interpolation with {param} syntax
- * - Pluralization with _one, _other suffixes
- * - Backend error code translation
- * - localStorage persistence
- */
+/** Reactive i18n store with lazy locales, RTL, interpolation, pluralization,
+ * backend-error translation, and persisted selection. */
+
+import { getPluralCategory, negotiateLocale } from './i18n-utils.js';
 
 const STORAGE_KEY = 'windshift-locale';
 const DEFAULT_LOCALE = 'en';
 
-// Supported locales configuration
+// Supported locale metadata.
 export const SUPPORTED_LOCALES = [
   { code: 'en', name: 'English', direction: 'ltr' },
   { code: 'de', name: 'Deutsch', direction: 'ltr' },
   { code: 'es', name: 'Español', direction: 'ltr' },
   { code: 'ar', name: 'العربية', direction: 'rtl' },
   { code: 'pt-BR', name: 'Português (Brasil)', direction: 'ltr' },
+  { code: 'ru', name: 'Русский', direction: 'ltr' },
   { code: 'zh-CN', name: '简体中文', direction: 'ltr' },
+  { code: 'fr', name: 'Français', direction: 'ltr' },
+  { code: 'ko', name: '한국어', direction: 'ltr' },
 ];
 
-// Reactive state using Svelte 5 runes
+// Reactive locale state.
 let locale = $state(DEFAULT_LOCALE);
 let translations = $state({});
 let fallbackTranslations = $state({});
 let loading = $state(false);
 
-// Derived state
+// Derived direction state.
 const direction = $derived(SUPPORTED_LOCALES.find((l) => l.code === locale)?.direction || 'ltr');
 
 const isRTL = $derived(direction === 'rtl');
 
-/**
- * Get a nested value from an object using dot notation
- * @param {object} obj - Object to traverse
- * @param {string} path - Dot-notated path (e.g., 'common.save')
- * @returns {string|undefined}
- */
+/** Read a dot-notated value from an object. */
 function getNestedValue(obj, path) {
   return path.split('.').reduce((current, key) => {
     return current && typeof current === 'object' ? current[key] : undefined;
   }, obj);
 }
 
-/**
- * Interpolate parameters into a string
- * @param {string} str - String with {param} placeholders
- * @param {object} params - Parameters to interpolate
- * @returns {string}
- */
+/** Interpolate {param} placeholders. */
 function interpolate(str, params = {}) {
   if (!str || typeof str !== 'string') return str;
 
@@ -62,8 +48,14 @@ function interpolate(str, params = {}) {
 
 function getTranslationValue(source, key, params = {}) {
   if (params.count !== undefined) {
-    const pluralKey = params.count === 1 ? `${key}_one` : `${key}_other`;
-    return getNestedValue(source, pluralKey) ?? getNestedValue(source, key);
+    const category = getPluralCategory(locale, params.count);
+    const pluralKey = `${key}_${category}`;
+    const otherKey = `${key}_other`;
+    return (
+      getNestedValue(source, pluralKey) ??
+      getNestedValue(source, otherKey) ??
+      getNestedValue(source, key)
+    );
   }
 
   return getNestedValue(source, key);
@@ -191,10 +183,7 @@ async function init() {
 
   // Only fall back to browser language when no preference was explicitly saved
   if (!hasSavedPreference && typeof navigator !== 'undefined') {
-    const browserLang = navigator.language?.split('-')[0];
-    if (browserLang && SUPPORTED_LOCALES.some((l) => l.code === browserLang)) {
-      initialLocale = browserLang;
-    }
+    initialLocale = negotiateLocale(navigator.language, SUPPORTED_LOCALES, DEFAULT_LOCALE);
   }
 
   await loadTranslations(initialLocale);

@@ -1,8 +1,20 @@
 <script>
-  import { Plus, X, Package, ChevronDown } from '@lucide/svelte';
+  import { Plus, X, Package, ChevronDown, LoaderCircle } from '@lucide/svelte';
+  import { useEventListener } from 'runed';
+  import Button from '../../components/Button.svelte';
+  import Textarea from '../../components/Textarea.svelte';
+  import { portal } from '../../actions/portal.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { itemTypeIconMap, workspaceIconMap } from '../../utils/icons.js';
+  import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
+  import {
+    getDisplayString,
+    getShortcut,
+    matchesShortcut,
+  } from '../../utils/keyboardShortcuts.js';
   const iconMap = { ...workspaceIconMap, ...itemTypeIconMap };
+  const createShortcut = getShortcut('quickAdd', 'create');
+  const cancelShortcut = getShortcut('quickAdd', 'cancel');
 
   let {
     parentId,
@@ -18,15 +30,100 @@
   let selectedWorkspace = $derived(workspaces.find(w => w.id === formState.workspaceId));
   let selectedItemType = $derived(formState.availableTypes?.find(it => it.id === formState.itemTypeId));
 
-  // Dropdown management
+  // Dropdown management. Both menus are portalled to <body> and positioned
+  // against their trigger: the board clips swimlanes with overflow-hidden, so
+  // an absolutely-positioned menu is cut off at the lane boundary.
   let showWorkspaceDropdown = $state(false);
   let showItemTypeDropdown = $state(false);
+  let workspaceAnchor = $state(null);
+  let itemTypeAnchor = $state(null);
+  let workspaceMenuStyle = $state('');
+  let itemTypeMenuStyle = $state('');
+
+  // Search-to-narrow plus a render cap (WI-1445): at large workspace counts
+  // the dropdown mounts a bounded list instead of every workspace.
+  const MAX_VISIBLE_WORKSPACES = 50;
+  let workspaceFilter = $state('');
+  let filteredWorkspaces = $derived.by(() => {
+    const term = workspaceFilter.trim().toLowerCase();
+    if (!term) return workspaces;
+    return workspaces.filter(ws =>
+      ws.name?.toLowerCase().includes(term) || ws.key?.toLowerCase().includes(term)
+    );
+  });
+  let visibleWorkspaces = $derived(filteredWorkspaces.slice(0, MAX_VISIBLE_WORKSPACES));
+
+  const MENU_WIDTH = 192; // w-48
+  const MENU_MAX_HEIGHT = 240;
+  const VIEWPORT_MARGIN = 8;
+
+  function menuPositionStyle(anchor) {
+    if (!anchor) return '';
+    const rect = anchor.getBoundingClientRect();
+    const gap = 4;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const openUp = spaceBelow < MENU_MAX_HEIGHT && rect.top > spaceBelow;
+    const left = Math.max(
+      VIEWPORT_MARGIN,
+      Math.min(rect.left, window.innerWidth - MENU_WIDTH - VIEWPORT_MARGIN)
+    );
+    const vertical = openUp
+      ? `bottom: ${window.innerHeight - rect.top + gap}px; max-height: ${Math.min(MENU_MAX_HEIGHT, rect.top - gap - VIEWPORT_MARGIN)}px;`
+      : `top: ${rect.bottom + gap}px; max-height: ${Math.min(MENU_MAX_HEIGHT, spaceBelow - gap - VIEWPORT_MARGIN)}px;`;
+    return `left: ${left}px; width: ${MENU_WIDTH}px; ${vertical}`;
+  }
+
+  function repositionMenus() {
+    if (showWorkspaceDropdown) workspaceMenuStyle = menuPositionStyle(workspaceAnchor);
+    if (showItemTypeDropdown) itemTypeMenuStyle = menuPositionStyle(itemTypeAnchor);
+  }
+
+  function toggleWorkspaceDropdown() {
+    showItemTypeDropdown = false;
+    showWorkspaceDropdown = !showWorkspaceDropdown;
+    if (showWorkspaceDropdown) {
+      workspaceMenuStyle = menuPositionStyle(workspaceAnchor);
+      workspaceFilter = '';
+    }
+  }
+
+  function toggleItemTypeDropdown() {
+    showWorkspaceDropdown = false;
+    showItemTypeDropdown = !showItemTypeDropdown;
+    if (showItemTypeDropdown) itemTypeMenuStyle = menuPositionStyle(itemTypeAnchor);
+  }
+
+  function closeDropdowns() {
+    showWorkspaceDropdown = false;
+    showItemTypeDropdown = false;
+  }
+
+  // Portalled menus live outside this component's DOM, so dismissal and
+  // re-anchoring have to be handled on the window.
+  useEventListener(
+    () => window,
+    'pointerdown',
+    (event) => {
+      if (!showWorkspaceDropdown && !showItemTypeDropdown) return;
+      const target = /** @type {Element | null} */ (event.target);
+      if (target?.closest?.('[data-quick-add-menu], [data-quick-add-menu-anchor]')) return;
+      closeDropdowns();
+    },
+    { capture: true }
+  );
+  useEventListener(() => window, 'scroll', repositionMenus, { capture: true, passive: true });
+  useEventListener(() => window, 'resize', repositionMenus);
 
   function handleKeydown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (matchesShortcut(e, createShortcut)) {
       e.preventDefault();
       onCreate(parentId);
-    } else if (e.key === 'Escape') {
+    } else if (matchesShortcut(e, cancelShortcut)) {
+      // An open selector swallows the first cancel: dismiss it before the form.
+      if (showWorkspaceDropdown || showItemTypeDropdown) {
+        closeDropdowns();
+        return;
+      }
       onCancel(parentId);
     }
   }
@@ -42,217 +139,264 @@
   }
 </script>
 
-<div class="relative z-[100] rounded shadow-md border" style={cardBgStyle}>
+<div
+  class="relative z-[100] border {compact ? 'rounded shadow-md' : 'rounded-[4px] px-3 py-2.5'}"
+  style={cardBgStyle}
+>
   <!-- Textarea area -->
-  <div class="p-3 pb-2">
-    <textarea
+  <div class={compact ? 'p-3 pb-2' : ''}>
+    <Textarea
       value={formState.title}
+      data-testid={`quick-add-title-${parentId}`}
       data-quick-add-parent={parentId}
       oninput={(e) => onUpdateField(parentId, 'title', e.currentTarget.value)}
       onkeydown={handleKeydown}
       placeholder={t('collections.enterSummary')}
-      rows="2"
-      class="w-full px-0 py-0 text-sm resize-none border-0 focus:outline-none focus:ring-0"
+      rows={2}
+      class="w-full px-0 py-0 text-sm leading-5 resize-none border-0 focus:outline-none focus:ring-0"
       style="background-color: transparent; color: var(--ds-text); caret-color: var(--ds-text);"
-    ></textarea>
+    />
   </div>
 
-  <!-- Divider -->
-  <div class="border-t mx-3" style="border-color: var(--ctx-border, var(--ds-border));"></div>
+  <!-- Divider (compact layout only; the board layout mirrors the card footer instead) -->
+  {#if compact}
+    <div class="border-t mx-3" style="border-color: var(--ctx-border, var(--ds-border));"></div>
+  {/if}
 
   <!-- Actions Footer -->
-  <div class="p-3 pt-2 flex items-center gap-2" class:flex-wrap={!compact}>
-    <div class="flex items-center gap-2" class:flex-wrap={!compact}>
-      <!-- Workspace Selector -->
-      <div class="relative">
-        <button
-          type="button"
-          onclick={() => {
-            showWorkspaceDropdown = !showWorkspaceDropdown;
-            showItemTypeDropdown = false;
-          }}
-          class="{compact ? 'w-7 h-7' : 'w-8 h-8'} rounded-md flex items-center justify-center border overflow-hidden transition-all hover:scale-105"
-          style="{selectedWorkspace?.avatar_url ? '' : `background-color: ${selectedWorkspace?.color || 'var(--ds-interactive)'};`} border-color: var(--ds-border); box-sizing: border-box;"
-          title={selectedWorkspace?.name || 'Select workspace'}
-        >
-          {#if selectedWorkspace?.avatar_url}
-            <img src={selectedWorkspace.avatar_url} alt="{selectedWorkspace.name} avatar" class="w-full h-full object-cover" />
-          {:else if selectedWorkspace?.icon}
-            {@const WsIcon = iconMap[selectedWorkspace.icon] || Package}
-            <WsIcon class="{compact ? 'w-3 h-3' : 'w-3.5 h-3.5'} text-white" />
-          {:else}
-            <Package class="{compact ? 'w-3 h-3' : 'w-3.5 h-3.5'} text-white" />
-          {/if}
-        </button>
+  <div
+    class="flex items-center {compact ? 'p-3 pt-2 gap-2' : 'mt-2.5 pt-2 gap-1.5'}"
+    class:flex-wrap={compact}
+  >
+    <!-- Workspace Selector -->
+    <div class="relative" bind:this={workspaceAnchor} data-quick-add-menu-anchor>
+      <Button
+        variant="default"
+        size="small"
+        onclick={toggleWorkspaceDropdown}
+        class={compact ? '!size-7 !p-0' : '!size-6 !p-0 !rounded-[3px]'}
+        dataTestid="quick-add-workspace"
+        title={selectedWorkspace?.name || 'Select workspace'}
+      >
+        {#if selectedWorkspace?.avatar_url}
+          <img
+            src={selectedWorkspace.avatar_url}
+            alt="{selectedWorkspace.name} avatar"
+            class="{compact ? 'w-5 h-5' : 'w-4 h-4'} rounded object-cover"
+          />
+        {:else if selectedWorkspace?.icon}
+          {@const WsIcon = iconMap[selectedWorkspace.icon] || Package}
+          <WsIcon
+            class={compact ? 'w-4 h-4' : 'w-3.5 h-3.5'}
+            style="color: {selectedWorkspace?.color || 'var(--ds-icon)'};"
+          />
+        {:else}
+          <Package class={compact ? 'w-4 h-4' : 'w-3.5 h-3.5'} style="color: var(--ds-icon);" />
+        {/if}
+      </Button>
 
-        {#if showWorkspaceDropdown}
-          <div
-            class="absolute z-50 mt-1 w-48 rounded-md shadow-lg border py-1"
-            style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
+      {#if showWorkspaceDropdown}
+        <div
+          use:portal
+          data-quick-add-menu
+          class="fixed z-[1000] overflow-y-auto rounded-md shadow-lg border py-1"
+          style="{workspaceMenuStyle} background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
+        >
+          <div class="px-2 pt-1 pb-1.5 sticky top-0" style="background-color: var(--ds-surface-raised);">
+            <input
+              bind:value={workspaceFilter}
+              type="text"
+              data-testid="quick-add-workspace-search"
+              placeholder={t('nav.searchWorkspaces')}
+              class="w-full px-2 py-1.5 rounded text-sm outline-none"
+              style="background-color: var(--ds-background-input); border: 1px solid var(--ds-border); color: var(--ds-text);"
+            />
+          </div>
+          {#if filteredWorkspaces.length === 0}
+            <div class="px-3 py-2 text-sm" style="color: var(--ds-text-subtle);">{t('nav.noWorkspacesMatch')}</div>
+          {/if}
+          {#each visibleWorkspaces as ws}
+            <button
+              type="button"
+              onclick={() => selectWorkspace(ws.id)}
+              data-testid={`quick-add-workspace-option-${ws.id}`}
+              class="quick-add-option w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
+            >
+              {#if ws.avatar_url}
+                <img src={ws.avatar_url} alt="" class="w-5 h-5 rounded object-cover" />
+              {:else}
+                {@const WsDropdownIcon = iconMap[ws.icon] || Package}
+                <div
+                  class="w-5 h-5 rounded flex items-center justify-center"
+                  style="background-color: {ws.color || 'var(--ds-interactive)'};"
+                >
+                  <WsDropdownIcon class="w-3 h-3 text-white" />
+                </div>
+              {/if}
+              <span class="truncate">{ws.name}</span>
+            </button>
+          {/each}
+          {#if visibleWorkspaces.length < filteredWorkspaces.length}
+            <div data-testid="quick-add-workspace-more-hint" class="px-3 py-1.5 text-xs text-center" style="color: var(--ds-text-subtle);">
+              {t('pickers.showingOfTotal', { shown: visibleWorkspaces.length, total: filteredWorkspaces.length })}
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+
+    <!-- Item Type Selector -->
+    {#if formState.loadingTypes}
+      <Button
+        variant="default"
+        size="small"
+        class={compact ? '!size-7 !p-0' : '!h-6 !px-1.5 !gap-1 !rounded-[3px]'}
+        dataTestid="quick-add-type-loading"
+        title="Loading item types"
+        disabled
+      >
+        <LoaderCircle class="w-3.5 h-3.5 animate-spin" />
+        {#if !compact}<span class="text-xs">Loading types</span>{/if}
+      </Button>
+    {:else if formState.availableTypes?.length > 0}
+      <div class="relative" bind:this={itemTypeAnchor} data-quick-add-menu-anchor>
+        {#if compact}
+          <Button
+            variant="default"
+            size="small"
+            onclick={toggleItemTypeDropdown}
+            class="!size-7 !p-0"
+            title={selectedItemType?.name || 'Select type'}
           >
-            {#each workspaces as ws}
+            {#if selectedItemType}
+              <ItemTypeIcon
+                icon={selectedItemType.icon}
+                color={selectedItemType.color}
+              />
+            {:else}
+              <Package class="w-4 h-4" style="color: var(--ds-icon);" />
+            {/if}
+          </Button>
+        {:else}
+          <!-- Board layout: icon-only type badge (matches the card footer badge) + chevron -->
+          <Button
+            variant="default"
+            size="small"
+            onclick={toggleItemTypeDropdown}
+            class="!h-6 !px-1 !gap-0.5 !rounded-[3px]"
+            dataTestid="quick-add-type"
+            title={selectedItemType?.name || t('collections.selectType')}
+          >
+            {#if selectedItemType}
+              <ItemTypeIcon
+                icon={selectedItemType.icon}
+                color={selectedItemType.color}
+                title={selectedItemType.name}
+              />
+            {:else}
+              <span class="text-xs" style="color: var(--ds-text-subtle);">{t('collections.selectType')}</span>
+            {/if}
+            <ChevronDown class="w-3 h-3" style="color: var(--ds-text-subtle);" />
+          </Button>
+        {/if}
+
+        {#if showItemTypeDropdown}
+          <div
+            use:portal
+            data-quick-add-menu
+            class="fixed z-[1000] overflow-y-auto rounded-md shadow-lg border py-1"
+            style="{itemTypeMenuStyle} background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
+          >
+            {#each formState.availableTypes as itemType}
               <button
                 type="button"
-                onclick={() => selectWorkspace(ws.id)}
-                class="w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
-                style="color: var(--ds-text);"
-                onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-selected)'}
-                onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                onclick={() => selectItemType(itemType.id)}
+                data-testid={`quick-add-type-option-${itemType.id}`}
+                class="quick-add-option w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
               >
-                {#if ws.avatar_url}
-                  <img src={ws.avatar_url} alt="" class="w-5 h-5 rounded object-cover" />
-                {:else}
-                  {@const WsDropdownIcon = iconMap[ws.icon] || Package}
-                  <div
-                    class="w-5 h-5 rounded flex items-center justify-center"
-                    style="background-color: {ws.color || 'var(--ds-interactive)'};"
-                  >
-                    <WsDropdownIcon class="w-3 h-3 text-white" />
-                  </div>
-                {/if}
-                <span class="truncate">{ws.name}</span>
+                <ItemTypeIcon {itemType} />
+                <span class="truncate">{itemType.name}</span>
               </button>
             {/each}
           </div>
         {/if}
       </div>
+    {/if}
 
-      <!-- Item Type Selector -->
-      {#if formState.availableTypes?.length > 0}
-        <div class="relative">
-          {#if compact}
-            <button
-              type="button"
-              onclick={() => {
-                showItemTypeDropdown = !showItemTypeDropdown;
-                showWorkspaceDropdown = false;
-              }}
-              class="w-7 h-7 rounded-md flex items-center justify-center border overflow-hidden transition-all hover:scale-105"
-              style="background-color: {selectedItemType?.color || 'var(--ds-surface)'}; border-color: var(--ds-border);"
-              title={selectedItemType?.name || 'Select type'}
-            >
-              {#if selectedItemType}
-                {@const SelectedTypeIcon = iconMap[selectedItemType.icon] || Package}
-                <SelectedTypeIcon class="w-3 h-3 text-white" />
-              {:else}
-                <Package class="w-3 h-3" style="color: var(--ds-text-subtle);" />
-              {/if}
-            </button>
-          {:else}
-            <button
-              type="button"
-              onclick={() => {
-                showItemTypeDropdown = !showItemTypeDropdown;
-                showWorkspaceDropdown = false;
-              }}
-              class="h-8 px-2.5 rounded-md flex items-center gap-1.5 border text-sm leading-none transition-all hover:scale-105"
-              style="border-color: var(--ds-border); color: var(--ds-text); box-sizing: border-box;"
-              title={selectedItemType?.name || 'Select type'}
-            >
-              {#if selectedItemType}
-                {@const SelectedTypeSmallIcon = iconMap[selectedItemType.icon] || Package}
-                <div
-                  class="w-5 h-5 rounded flex items-center justify-center"
-                  style="background-color: {selectedItemType.color};"
-                >
-                  <SelectedTypeSmallIcon class="w-3 h-3 text-white" />
-                </div>
-                <span>{selectedItemType.name}</span>
-              {:else}
-                <span style="color: var(--ds-text-subtle);">{t('collections.selectType')}</span>
-              {/if}
-              <ChevronDown class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" />
-            </button>
-          {/if}
+    {#if !compact}
+      <span class="flex-1"></span>
+    {/if}
 
-          {#if showItemTypeDropdown}
-            <div
-              class="absolute z-50 mt-1 w-48 rounded-md shadow-lg border py-1"
-              style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
-            >
-              {#each formState.availableTypes as itemType}
-                {@const TypeDropdownIcon = iconMap[itemType.icon] || Package}
-                <button
-                  type="button"
-                  onclick={() => selectItemType(itemType.id)}
-                  class="w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
-                  style="color: var(--ds-text);"
-                  onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-selected)'}
-                  onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-                >
-                  <div
-                    class="w-5 h-5 rounded flex items-center justify-center"
-                    style="background-color: {itemType.color};"
-                  >
-                    <TypeDropdownIcon class="w-3 h-3 text-white" />
-                  </div>
-                  <span class="truncate">{itemType.name}</span>
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      {/if}
+    <!-- Cancel Button. The ghost variant inherits --ctx-text, which a gradient
+         background sets to white for the view chrome — inside this card the
+         surface stays light, so pin it to the card's own text color. -->
+    {#if compact}
+      <Button
+        variant="ghost"
+        size="small"
+        icon={X}
+        onclick={() => onCancel(parentId)}
+        class="!size-7 !p-0"
+        style="color: var(--ds-text);"
+        dataTestid="quick-add-cancel"
+        title={t('common.cancel')}
+      />
+    {:else}
+      <Button
+        variant="ghost"
+        size="small"
+        onclick={() => onCancel(parentId)}
+        class="!h-6 !px-2 !text-xs"
+        style="color: var(--ds-text);"
+        dataTestid="quick-add-cancel"
+        title="{t('common.cancel')} ({getDisplayString(cancelShortcut)})"
+      >
+        {t('common.cancel')}
+      </Button>
+    {/if}
 
-      <!-- Create Button -->
-      {#if compact}
-        <button
-          type="button"
-          onclick={() => onCreate(parentId)}
-          class="w-7 h-7 rounded-md font-medium text-white transition-colors flex items-center justify-center"
-          style="background-color: var(--ds-interactive);"
-          onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-interactive-hovered)'}
-          onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-interactive)'}
-          title={t('common.create')}
-        >
-          <Plus class="w-3.5 h-3.5" />
-        </button>
-      {:else}
-        <button
-          type="button"
-          onclick={() => onCreate(parentId)}
-          class="h-8 px-3 rounded-md text-sm leading-none font-medium text-white transition-colors flex items-center gap-1"
-          style="background-color: var(--ds-interactive); box-sizing: border-box;"
-          onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-interactive-hovered)'}
-          onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-interactive)'}
-        >
-          <Plus class="w-3.5 h-3.5" />
-          {t('common.create')}
-        </button>
-      {/if}
-
-      <!-- Cancel Button -->
-      {#if compact}
-        <button
-          type="button"
-          onclick={() => onCancel(parentId)}
-          class="w-7 h-7 rounded-md transition-colors flex items-center justify-center"
-          style="color: var(--ds-text-subtle);"
-          onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text)'}
-          onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
-          title={t('common.cancel')}
-        >
-          <X class="w-3.5 h-3.5" />
-        </button>
-      {:else}
-        <button
-          type="button"
-          onclick={() => onCancel(parentId)}
-          class="h-8 px-2 rounded-md text-sm transition-colors"
-          style="color: var(--ds-text-subtle);"
-          onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text)'}
-          onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
-        >
-          {t('common.cancel')}
-        </button>
-      {/if}
-    </div>
+    <!-- Create Button -->
+    {#if compact}
+      <!-- shortcut-guard-exempt: Enter is handled by the quick-add textarea; the compact icon-only layout intentionally omits its visible hint. -->
+      <Button
+        variant="primary"
+        size="small"
+        icon={Plus}
+        onclick={() => onCreate(parentId)}
+        class="!size-7 !p-0"
+        dataTestid="quick-add-create"
+        title={t('common.create')}
+        disabled={formState.loadingTypes || !formState.itemTypeId}
+      />
+    {:else}
+      <Button
+        variant="primary"
+        size="small"
+        keyboardHint={getDisplayString(createShortcut)}
+        onclick={() => onCreate(parentId)}
+        class="!h-6 !px-2 !text-xs !gap-1.5"
+        dataTestid="quick-add-create"
+        disabled={formState.loadingTypes || !formState.itemTypeId}
+      >
+        {t('common.create')}
+      </Button>
+    {/if}
   </div>
 
   <!-- Error message -->
   {#if formState.error}
-    <div class="px-3 pb-3 text-xs" style="color: var(--ds-text-danger);">
+    <div class="text-xs {compact ? 'px-3 pb-3' : 'mt-1.5'}" style="color: var(--ds-text-danger);">
       {formState.error}
     </div>
   {/if}
 </div>
+
+<style>
+  .quick-add-option {
+    color: var(--ds-text);
+  }
+
+  .quick-add-option:hover {
+    background-color: var(--ds-background-selected);
+  }
+</style>

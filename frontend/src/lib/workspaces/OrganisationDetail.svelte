@@ -1,7 +1,8 @@
 <script>
-  import { IconUsers as Users, IconMail as Mail, IconSearch as Search, IconGripVertical as GripVertical, IconPlus as Plus, IconEdit as Edit2, IconTrash as Trash2, IconDots as MoreHorizontal, IconFile as FileIcon, IconTicket as Ticket, IconFileText as FileText, IconNote as StickyNote, IconExternalLink as ExternalLink } from '@tabler/icons-svelte-runes';
+  import { IconUsers as Users, IconMail as Mail, IconSearch as Search, IconGripVertical as GripVertical, IconPlus as Plus, IconEdit as Edit2, IconTrash as Trash2, IconDots as MoreHorizontal, IconFile as FileIcon, IconTicket as Ticket, IconFileText as FileText, IconNote as StickyNote, IconExternalLink as ExternalLink, IconShare as Share } from '@tabler/icons-svelte-runes';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import Avatar from '../components/Avatar.svelte';
   import DropdownMenu from '../layout/DropdownMenu.svelte';
   import Card from '../components/Card.svelte';
@@ -11,6 +12,11 @@
   import Spinner from '../components/Spinner.svelte';
   import Lozenge from '../components/Lozenge.svelte';
   import DataTable from '../components/DataTable.svelte';
+  import ItemKey from '../components/ItemKey.svelte';
+  import Select from '../components/Select.svelte';
+  import Label from '../components/Label.svelte';
+  import Checkbox from '../components/Checkbox.svelte';
+  import { errorToast, successToast } from '../stores/toasts.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import { api } from '../api.js';
   import { logbook } from '../api/logbook.js';
@@ -32,6 +38,7 @@
     hasMoreCustomers = false,
     onLoadMore = () => {},
     buildCustomerActions = () => [],
+    onOrganisationUpdated = () => {},
   } = $props();
 
   let activeTab = $state('contacts');
@@ -40,62 +47,157 @@
   // logbook isn't configured server-side so users don't land on a misleading
   // empty state for an unsupported feature.
   let tabs = $derived([
-    { id: 'contacts', label: t('workspaces.customers.contacts') || 'Contacts', icon: Users },
+    { id: 'contacts', label: t('workspaces.customers.contacts') || 'Contacts', icon: Users, testid: 'org-detail-contacts-tab' },
     ...(capabilitiesStore.logbookAvailable
-      ? [{ id: 'files', label: t('common.files') || 'Files', icon: FileIcon }]
+      ? [{ id: 'files', label: t('common.files') || 'Files', icon: FileIcon, testid: 'org-detail-files-tab' }]
       : []),
-    { id: 'tickets', label: t('common.tickets') || 'Tickets', icon: Ticket },
+    { id: 'tickets', label: t('common.tickets') || 'Tickets', icon: Ticket, testid: 'org-detail-tickets-tab' },
+    ...(canManage ? [{ id: 'sharing', label: t('workspaces.customers.sharing') || 'Sharing', icon: Share, testid: 'org-detail-sharing-tab' }] : []),
   ]);
+
+  // Request sharing tab (WI-1139). Settings live in the organisation's flexible
+  // settings blob; only customers.manage holders see the tab.
+  let sharingMode = $state('disabled');
+  let sharingAudience = $state('organisation');
+  let sharingRoleIDs = $state([]);
+  let sharingSaving = $state(false);
+  let sharingSaved = $state(false);
+  let contactRoles = $state([]);
+  let contactRolesLoaded = $state(false);
+  let initializedSharingOrgID = $state(null);
+
+  $effect(() => {
+    if (!organisation?.id || organisation.id === initializedSharingOrgID) return;
+    initializedSharingOrgID = organisation.id;
+    const settings = organisation.settings || {};
+    sharingMode = settings.request_sharing || 'disabled';
+    sharingAudience = settings.request_sharing_audience || 'organisation';
+    sharingRoleIDs = Array.isArray(settings.request_visible_role_ids)
+      ? [...settings.request_visible_role_ids]
+      : [];
+  });
+
+  $effect(() => {
+    if (activeTab !== 'sharing' || contactRolesLoaded) return;
+    contactRolesLoaded = true;
+    api.contactRoles
+      .getAll()
+      .then((roles) => {
+        contactRoles = Array.isArray(roles) ? roles : (roles?.data ?? []);
+      })
+      .catch((err) => {
+        console.error('Failed to load contact roles:', err);
+        contactRoles = [];
+      });
+  });
+
+  let sharingModeOptions = $derived([
+    { value: 'disabled', label: t('workspaces.customers.sharingDisabled') || 'Disabled' },
+    { value: 'requester_choice', label: t('workspaces.customers.sharingRequesterChoice') || 'Contacts choose per request' },
+    { value: 'automatic', label: t('workspaces.customers.sharingAutomatic') || 'Always shared with the organisation' },
+  ]);
+
+  let sharingAudienceOptions = $derived([
+    { value: 'organisation', label: t('workspaces.customers.sharingAudienceOrganisation') || 'Everyone in the organisation' },
+    { value: 'roles', label: t('workspaces.customers.sharingAudienceRoles') || 'Only selected contact levels' },
+  ]);
+
+  function toggleSharingRole(roleID) {
+    sharingSaved = false;
+    sharingRoleIDs = sharingRoleIDs.includes(roleID)
+      ? sharingRoleIDs.filter((id) => id !== roleID)
+      : [...sharingRoleIDs, roleID];
+  }
+
+  async function saveSharing() {
+    if (sharingSaving || !organisation?.id) return;
+    sharingSaving = true;
+    sharingSaved = false;
+    try {
+      await api.customerOrganisations.setRequestSharing(organisation.id, {
+        request_sharing: sharingMode,
+        request_sharing_audience: sharingAudience,
+        visible_role_ids: sharingAudience === 'roles' ? sharingRoleIDs : [],
+      });
+      // Persist the saved values back into the organisation record so a revisit
+      // does not re-hydrate the form from stale settings.
+      onOrganisationUpdated(organisation.id, {
+        ...(organisation.settings || {}),
+        request_sharing: sharingMode,
+        request_sharing_audience: sharingAudience,
+        request_visible_role_ids: sharingAudience === 'roles' ? [...sharingRoleIDs] : [],
+      });
+      sharingSaved = true;
+      successToast(t('workspaces.customers.sharingSaved') || 'Request sharing updated');
+    } catch (err) {
+      errorToast(err?.message || t('workspaces.customers.sharingSaveFailed') || 'Failed to update request sharing');
+    } finally {
+      sharingSaving = false;
+    }
+  }
 
   // Files tab state
   let orgDocuments = $state([]);
   let orgDocsLoading = $state(false);
   let orgDocsLoaded = $state(false);
+  // Plain (non-reactive) guards so a late response for a previous organisation
+  // cannot populate the current one.
+  let orgDocsOrgID = null;
 
   // Tickets tab state
   let orgTickets = $state([]);
   let orgTicketsLoading = $state(false);
   let orgTicketsLoaded = $state(false);
+  let orgTicketsOrgID = null;
 
   $effect(() => {
-    if (activeTab === 'files' && organisation?.id) {
-      const orgId = organisation.id;
-      orgDocsLoading = true;
-      orgDocsLoaded = false;
-      logbook.listDocumentsByOrganisation(orgId)
-        .then((result) => {
-          orgDocuments = result?.data ?? result ?? [];
-          if (!Array.isArray(orgDocuments)) orgDocuments = [];
-        })
-        .catch((err) => {
-          console.error('Failed to load organisation documents:', err);
-          orgDocuments = [];
-        })
-        .finally(() => {
-          orgDocsLoading = false;
-          orgDocsLoaded = true;
-        });
-    }
+    if (activeTab !== 'files' || !organisation?.id) return;
+    const orgId = organisation.id;
+    orgDocsOrgID = orgId;
+    orgDocsLoading = true;
+    orgDocsLoaded = false;
+    logbook.listDocumentsByOrganisation(orgId)
+      .then((result) => {
+        if (orgDocsOrgID !== orgId) return;
+        const list = result?.data ?? result ?? [];
+        orgDocuments = Array.isArray(list) ? list : [];
+      })
+      .catch((err) => {
+        if (orgDocsOrgID !== orgId) return;
+        console.error('Failed to load organisation documents:', err);
+        orgDocuments = [];
+      })
+      .finally(() => {
+        if (orgDocsOrgID !== orgId) return;
+        orgDocsLoading = false;
+        orgDocsLoaded = true;
+      });
   });
 
   $effect(() => {
-    if (activeTab === 'tickets' && organisation?.id && !orgTicketsLoaded) {
-      const orgId = organisation.id;
-      orgTicketsLoading = true;
-      api.customerOrganisations.getTickets(orgId)
-        .then((result) => {
-          orgTickets = result?.data ?? result ?? [];
-          if (!Array.isArray(orgTickets)) orgTickets = [];
-        })
-        .catch((err) => {
-          console.error('Failed to load organisation tickets:', err);
-          orgTickets = [];
-        })
-        .finally(() => {
-          orgTicketsLoading = false;
-          orgTicketsLoaded = true;
-        });
-    }
+    if (activeTab !== 'tickets' || !organisation?.id) return;
+    const orgId = organisation.id;
+    if (orgId === orgTicketsOrgID) return;
+    orgTicketsOrgID = orgId;
+    orgTickets = [];
+    orgTicketsLoading = true;
+    orgTicketsLoaded = false;
+    api.customerOrganisations.getTickets(orgId)
+      .then((result) => {
+        if (orgTicketsOrgID !== orgId) return;
+        const list = result?.data ?? result ?? [];
+        orgTickets = Array.isArray(list) ? list : [];
+      })
+      .catch((err) => {
+        if (orgTicketsOrgID !== orgId) return;
+        console.error('Failed to load organisation tickets:', err);
+        orgTickets = [];
+      })
+      .finally(() => {
+        if (orgTicketsOrgID !== orgId) return;
+        orgTicketsLoading = false;
+        orgTicketsLoaded = true;
+      });
   });
 
   let ticketColumns = $derived([
@@ -131,7 +233,7 @@
 </script>
 
 <!-- Header -->
-<div class="flex items-center gap-4">
+<div class="flex items-center gap-4 mb-8">
   {#if organisation}
     <Avatar
       src={organisation.avatar_url}
@@ -141,8 +243,9 @@
       rounded="md"
     />
   {/if}
-  <div class="flex-1">
+  <div class="flex-1 min-w-0">
     <PageHeader
+      marginClass="mb-0"
       title={organisation ? organisation.name : (t('workspaces.customers.unassignedCustomers'))}
       subtitle={t('workspaces.customers.customerCount', { count: filteredCount })}
     >
@@ -170,12 +273,12 @@
     <div class="mb-4">
       <div class="relative max-w-md">
         <Search class="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4" style="color: var(--ds-text-subtle);" />
-        <input
+        <Input
           type="text"
           bind:value={customerSearch}
           placeholder={t('workspaces.customers.searchCustomers')}
-          class="w-full pl-10 pr-4 py-2 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-          style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+          class="pl-10"
+          size="small"
         />
       </div>
     </div>
@@ -197,6 +300,7 @@
         {#each customers as customer (customer.id)}
           <div
             data-customer-id={customer.id}
+            data-testid="portal-customer-row"
             class="p-4 hover:bg-opacity-50 transition-colors"
             style="background-color: transparent;"
           >
@@ -214,6 +318,15 @@
                 >
                   {customer.name}
                 </button>
+                {#if customer.deactivated_at}
+                  <span
+                    data-testid="customer-deactivated-badge"
+                    class="inline-flex items-center mt-1 px-2 py-0.5 rounded-full text-xs font-medium"
+                    style="background-color: var(--ds-surface-raised); color: var(--ds-text-subtle); border: 1px solid var(--ds-border);"
+                  >
+                    {t('workspaces.customers.deactivated')}
+                  </span>
+                {/if}
                 <div class="flex items-center gap-2 mt-1">
                   <Mail class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--ds-text-subtle);" />
                   <span class="text-sm truncate" style="color: var(--ds-text-subtle);">
@@ -271,10 +384,8 @@
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             onclick={() => window.open(logbook.getDocumentFileUrl(doc.id), '_blank')}
-            class="group text-left rounded-xl border transition-all duration-200 hover:shadow-md cursor-pointer overflow-hidden flex flex-col"
-            style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
-            onmouseenter={(e) => e.currentTarget.style.borderColor = 'var(--ds-border-focused)'}
-            onmouseleave={(e) => e.currentTarget.style.borderColor = 'var(--ds-border)'}
+            class="doc-card group text-left rounded-xl border transition-all duration-200 hover:shadow-md cursor-pointer overflow-hidden flex flex-col"
+            style="background-color: var(--ds-surface-raised);"
           >
             <div class="relative aspect-[210/297] w-full overflow-hidden" style="background-color: var(--ds-surface);">
               {#if doc.status === 'pending' || doc.status === 'processing'}
@@ -295,7 +406,7 @@
               {/if}
 
               <!-- Open in new tab button -->
-              <div class="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+              <div class="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity">
                 <button
                   onclick={(e) => { e.stopPropagation(); window.open(logbook.getDocumentFileUrl(doc.id), '_blank'); }}
                   class="p-1.5 rounded-lg shadow-sm border transition-colors hover:bg-opacity-90"
@@ -350,16 +461,16 @@
               <div class="font-medium truncate text-sm" style="color: var(--ds-text);">
                 {item.title}
               </div>
-              <div class="text-xs" style="color: var(--ds-text-subtle);">
-                {item.workspace_key}-{item.workspace_item_number}
+              <div class="text-xs">
+                <ItemKey item={item} clickable={false} />
               </div>
             </a>
           {:else}
             <div class="font-medium truncate text-sm" style="color: var(--ds-text);">
               {item.title}
             </div>
-            <div class="text-xs" style="color: var(--ds-text-subtle);">
-              {item.workspace_key}-{item.workspace_item_number}
+            <div class="text-xs">
+              <ItemKey item={item} />
             </div>
           {/if}
         {/snippet}
@@ -387,5 +498,71 @@
         {/snippet}
       </DataTable>
     {/if}
+  {:else if activeTab === 'sharing'}
+    <div class="max-w-xl space-y-5" data-testid="org-request-sharing">
+      <div class="space-y-2">
+        <Label for="org-sharing-mode">{t('workspaces.customers.sharingMode') || 'Request sharing'}</Label>
+        <Select id="org-sharing-mode" bind:value={sharingMode} options={sharingModeOptions} />
+        <p class="text-xs" style="color: var(--ds-text-subtle);">
+          {t('workspaces.customers.sharingModeHelp') ||
+            'Controls whether requests raised by this organisation\u2019s contacts are shared with the organisation.'}
+        </p>
+      </div>
+
+      {#if sharingMode !== 'disabled'}
+        <div class="space-y-2">
+          <Label for="org-sharing-audience">{t('workspaces.customers.sharingAudience') || 'Who can see shared requests'}</Label>
+          <Select id="org-sharing-audience" bind:value={sharingAudience} options={sharingAudienceOptions} />
+        </div>
+
+        {#if sharingAudience === 'roles'}
+          <div class="space-y-2">
+            <Label>{t('workspaces.customers.sharingRoles') || 'Allowed contact levels'}</Label>
+            {#if contactRoles.length === 0}
+              <p class="text-xs" style="color: var(--ds-text-subtle);">
+                {t('workspaces.customers.sharingNoRoles') || 'No contact levels defined yet.'}
+              </p>
+            {:else}
+              <div class="space-y-2">
+                {#each contactRoles as role (role.id)}
+                  <Checkbox
+                    checked={sharingRoleIDs.includes(role.id)}
+                    onchange={() => toggleSharingRole(role.id)}
+                    label={role.name}
+                    size="small"
+                    dataTestid={`org-sharing-role-${role.id}`}
+                  />
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      {/if}
+
+      <div class="flex items-center gap-3">
+        <Button
+          variant="primary"
+          size="small"
+          onclick={saveSharing}
+          disabled={sharingSaving}
+          dataTestid="org-sharing-save"
+        >
+          {sharingSaving ? (t('common.saving') || 'Saving…') : (t('common.save') || 'Save')}
+        </Button>
+        {#if sharingSaved}
+          <span class="text-xs" style="color: var(--ds-text-subtle);">{t('common.saved') || 'Saved'}</span>
+        {/if}
+      </div>
+    </div>
   {/if}
 </Tabs>
+
+<style>
+  .doc-card {
+    border-color: var(--ds-border);
+  }
+
+  .doc-card:hover {
+    border-color: var(--ds-border-focused);
+  }
+</style>

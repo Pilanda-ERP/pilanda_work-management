@@ -3,7 +3,10 @@
 package jira
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -36,6 +39,54 @@ type JiraProject struct {
 	AvatarURLs  map[string]string `json:"avatarUrls"`
 	Simplified  bool              `json:"simplified"`
 	Style       string            `json:"style"` // classic or next-gen
+}
+
+// JiraServiceDesk identifies a Jira Service Management portal and its backing
+// Jira project.
+type JiraServiceDesk struct {
+	ID          string `json:"id"`
+	ProjectID   string `json:"projectId"`
+	ProjectName string `json:"projectName"`
+	ProjectKey  string `json:"projectKey"`
+}
+
+// JiraServiceDeskRequestType is a customer-facing request type exposed in a
+// Jira Service Management portal.
+type JiraServiceDeskRequestType struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Description       string   `json:"description"`
+	HelpText          string   `json:"helpText"`
+	IssueTypeID       string   `json:"issueTypeId"`
+	ServiceDeskID     string   `json:"serviceDeskId"`
+	PortalID          string   `json:"portalId"`
+	GroupIDs          []string `json:"groupIds"`
+	RestrictionStatus string   `json:"restrictionStatus"`
+}
+
+// JiraServiceDeskOrganization is a customer organization associated with a
+// Jira Service Management service desk.
+type JiraServiceDeskOrganization struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	UUID        string `json:"uuid"`
+	SCIMManaged bool   `json:"scimManaged"`
+}
+
+// JiraServiceDeskPage is the common paginated envelope used by the JSM API.
+type JiraServiceDeskPage[T any] struct {
+	Size       int  `json:"size"`
+	Start      int  `json:"start"`
+	Limit      int  `json:"limit"`
+	IsLastPage bool `json:"isLastPage"`
+	Values     []T  `json:"values"`
+}
+
+// JiraServiceDeskComment carries the JSM-specific visibility metadata that is
+// absent from Jira Platform issue comment payloads.
+type JiraServiceDeskComment struct {
+	ID     string `json:"id"`
+	Public bool   `json:"public"`
 }
 
 // JiraIssueType represents a Jira issue type
@@ -76,6 +127,66 @@ type JiraFieldSchema struct {
 	CustomID int    `json:"customId"` // Numeric custom field ID
 }
 
+// CustomFieldConfigurationClient is an optional Jira Cloud capability for
+// reading the configuration behind a custom field. Jira Data Center does not
+// expose an equivalent stable REST contract, and Cloud credentials commonly
+// lack the required Jira-admin permission, so callers must treat
+// ErrCustomFieldConfigurationNotAvailable as a fidelity finding rather than a
+// fatal import error.
+type CustomFieldConfigurationClient interface {
+	GetCustomFieldConfiguration(
+		ctx context.Context,
+		fieldID string,
+		includeOptions bool,
+	) (*JiraCustomFieldConfiguration, error)
+}
+
+// JiraCustomFieldConfiguration preserves Jira's context-dependent field
+// contract. Windshift custom fields are global, so importers union configured
+// options for editability and retain the source contexts/defaults as
+// provenance instead of pretending the narrower Jira applicability is
+// enforced locally.
+type JiraCustomFieldConfiguration struct {
+	FieldID                   string                   `json:"field_id"`
+	Contexts                  []JiraCustomFieldContext `json:"contexts"`
+	DefaultsUnavailableReason string                   `json:"defaults_unavailable_reason,omitempty"`
+}
+
+// JiraCustomFieldContext is one Jira field context with its project and issue
+// type applicability, configured options, and defaults.
+type JiraCustomFieldContext struct {
+	ID                       string                         `json:"id"`
+	Name                     string                         `json:"name"`
+	Description              string                         `json:"description,omitempty"`
+	IsGlobal                 bool                           `json:"is_global"`
+	IsAnyIssueType           bool                           `json:"is_any_issue_type"`
+	ProjectIDs               []string                       `json:"project_ids,omitempty"`
+	IssueTypeIDs             []string                       `json:"issue_type_ids,omitempty"`
+	Options                  []JiraCustomFieldContextOption `json:"options,omitempty"`
+	OptionsUnavailableReason string                         `json:"options_unavailable_reason,omitempty"`
+	Defaults                 []JiraCustomFieldDefaultValue  `json:"defaults,omitempty"`
+}
+
+// JiraCustomFieldContextOption is a configured option. ParentOptionID is set
+// for cascading children; Disabled is retained even though Windshift currently
+// has no disabled-choice state.
+type JiraCustomFieldContextOption struct {
+	ID             string `json:"id"`
+	Value          string `json:"value"`
+	ParentOptionID string `json:"parent_option_id,omitempty"`
+	Disabled       bool   `json:"disabled,omitempty"`
+}
+
+// JiraCustomFieldDefaultValue is intentionally polymorphic. Jira emits
+// different value objects for text, numbers, users, versions, Forge fields,
+// and choices; preserving Value losslessly keeps that provenance useful even
+// when Windshift has no global custom-field default model.
+type JiraCustomFieldDefaultValue struct {
+	IssueTypeID    string `json:"issue_type_id,omitempty"`
+	IsAnyIssueType bool   `json:"is_any_issue_type"`
+	Value          any    `json:"value"`
+}
+
 // JiraStatus represents a Jira status
 type JiraStatus struct {
 	ID             string              `json:"id"`
@@ -110,45 +221,193 @@ type JiraWorkflowTransition struct {
 	ToStatus   *JiraStatus `json:"to"`
 }
 
+// WorkflowConfigurationClient is an optional Jira client capability. Jira
+// Cloud exposes the configured workflow graph through a read-only bulk API;
+// older Jira products and limited-permission credentials may only expose
+// status membership through Client.GetProjectIssueTypeStatuses.
+type WorkflowConfigurationClient interface {
+	GetProjectWorkflowConfiguration(
+		ctx context.Context,
+		projectID string,
+		issueTypeIDs []string,
+	) (*JiraProjectWorkflowConfiguration, error)
+}
+
+// JiraProjectWorkflowConfiguration contains the authoritative workflow chosen
+// by Jira for each requested project/issue-type pair.
+type JiraProjectWorkflowConfiguration struct {
+	IssueTypeWorkflowIDs map[string]string
+	Workflows            []JiraWorkflowConfiguration
+	// RulesComplete is true only when the source API proves that every
+	// configured condition/validator is represented in Transitions. Jira
+	// Cloud's current bulk workflow read omits condition trees, so its value is
+	// false and rules that are not exposed are omitted from the imported
+	// condition sets.
+	RulesComplete bool
+}
+
+// JiraWorkflowConfiguration is a source workflow definition. StatusIDs and
+// transition endpoints contain Jira status IDs, not Windshift database IDs.
+type JiraWorkflowConfiguration struct {
+	ID          string
+	Name        string
+	Description string
+	StatusIDs   []string
+	Transitions []JiraConfiguredWorkflowTransition
+}
+
+// JiraConfiguredWorkflowTransitionType is the topology Jira assigns to a
+// transition. Global transitions are expanded into explicit directed edges
+// during import because Windshift stores directed and initial transitions.
+type JiraConfiguredWorkflowTransitionType string
+
+const (
+	JiraWorkflowTransitionInitial  JiraConfiguredWorkflowTransitionType = "INITIAL"
+	JiraWorkflowTransitionDirected JiraConfiguredWorkflowTransitionType = "DIRECTED"
+	JiraWorkflowTransitionGlobal   JiraConfiguredWorkflowTransitionType = "GLOBAL"
+)
+
+// JiraConfiguredWorkflowTransition describes a transition returned by Jira's
+// workflow configuration API. Rule counts are retained so unsupported guarded
+// transitions can be reported and handled conservatively by the importer.
+type JiraConfiguredWorkflowTransition struct {
+	ID             string
+	Name           string
+	Description    string
+	Type           JiraConfiguredWorkflowTransitionType
+	FromStatusIDs  []string
+	ToStatusID     string
+	ValidatorCount int
+	ActionCount    int
+	TriggerCount   int
+	ConditionCount int
+}
+
+// ScreenConfigurationClient is an optional Jira client capability for
+// company-managed issue-type screen schemes and their configured fields.
+type ScreenConfigurationClient interface {
+	GetProjectScreenConfiguration(
+		ctx context.Context,
+		projectID string,
+		projectKey string,
+		issueTypeIDs []string,
+	) (*JiraProjectScreenConfiguration, error)
+}
+
+// JiraProjectScreenConfiguration contains effective create/edit/view screens
+// per Jira issue type plus the deduplicated source screen definitions.
+type JiraProjectScreenConfiguration struct {
+	IssueTypeScreens map[string]JiraIssueTypeScreens
+	Screens          []JiraScreenConfiguration
+}
+
+// JiraIssueTypeScreens contains effective Jira screen IDs after applying both
+// the issue-type default and the operation-level default screen.
+type JiraIssueTypeScreens struct {
+	CreateScreenID string
+	EditScreenID   string
+	ViewScreenID   string
+}
+
+// JiraScreenConfiguration is a Jira screen with tabs flattened in source
+// order. Windshift does not have a tab model, so TabCount is retained as
+// fidelity metadata.
+type JiraScreenConfiguration struct {
+	ID          string
+	Name        string
+	Description string
+	TabCount    int
+	Fields      []JiraScreenField
+}
+
+// JiraScreenField is one ordered field in a Jira screen.
+type JiraScreenField struct {
+	ID   string
+	Name string
+}
+
 // JiraIssue represents a Jira issue
 type JiraIssue struct {
-	ID             string                 `json:"id"`
-	Key            string                 `json:"key"`
-	Self           string                 `json:"self"`
-	Fields         JiraIssueFields        `json:"fields"`
-	Changelog      *JiraChangelog         `json:"changelog,omitempty"`
-	Renderedfields map[string]interface{} `json:"renderedFields,omitempty"`
+	ID             string          `json:"id"`
+	Key            string          `json:"key"`
+	Self           string          `json:"self"`
+	Fields         JiraIssueFields `json:"fields"`
+	Changelog      *JiraChangelog  `json:"changelog,omitempty"`
+	Renderedfields map[string]any  `json:"renderedFields,omitempty"`
 }
 
 // JiraIssueFields contains the fields of a Jira issue
 type JiraIssueFields struct {
-	Summary      string                 `json:"summary"`
-	Description  interface{}            `json:"description"` // Can be string or ADF
-	IssueType    *JiraIssueType         `json:"issuetype"`
-	Project      *JiraProject           `json:"project"`
-	Status       *JiraStatus            `json:"status"`
-	Priority     *JiraPriority          `json:"priority"`
-	Assignee     *JiraUser              `json:"assignee"`
-	Reporter     *JiraUser              `json:"reporter"`
-	Creator      *JiraUser              `json:"creator"`
-	Created      string                 `json:"created"`
-	Updated      string                 `json:"updated"`
-	Resolved     string                 `json:"resolutiondate"`
-	DueDate      string                 `json:"duedate"`
-	Labels       []string               `json:"labels"`
-	Components   []JiraComponent        `json:"components"`
-	FixVersions  []JiraVersion          `json:"fixVersions"`
-	Versions     []JiraVersion          `json:"versions"` // Affects versions
-	Parent       *JiraIssue             `json:"parent"`
-	Subtasks     []JiraIssue            `json:"subtasks"`
-	IssueLinks   []JiraIssueLink        `json:"issuelinks"`
-	Attachment   []JiraAttachment       `json:"attachment"`
-	Comment      *JiraCommentContainer  `json:"comment"`
-	Worklog      *JiraWorklogContainer  `json:"worklog"`
-	TimeTracking *JiraTimeTracking      `json:"timetracking"`
-	Sprint       interface{}            `json:"sprint"` // Can be object or customfield
-	Epic         *JiraIssue             `json:"epic"`   // Epic link for stories
-	CustomFields map[string]interface{} `json:"-"`      // Populated separately
+	Summary      string                  `json:"summary"`
+	Description  any                     `json:"description"` // Can be string or ADF
+	IssueType    *JiraIssueType          `json:"issuetype"`
+	Project      *JiraProject            `json:"project"`
+	Status       *JiraStatus             `json:"status"`
+	Priority     *JiraPriority           `json:"priority"`
+	Assignee     *JiraUser               `json:"assignee"`
+	Reporter     *JiraUser               `json:"reporter"`
+	Creator      *JiraUser               `json:"creator"`
+	Created      string                  `json:"created"`
+	Updated      string                  `json:"updated"`
+	Resolved     string                  `json:"resolutiondate"`
+	DueDate      string                  `json:"duedate"`
+	Labels       []string                `json:"labels"`
+	Components   []JiraComponent         `json:"components"`
+	FixVersions  []JiraVersion           `json:"fixVersions"`
+	Versions     []JiraVersion           `json:"versions"` // Affects versions
+	Parent       *JiraIssue              `json:"parent"`
+	Subtasks     []JiraIssue             `json:"subtasks"`
+	IssueLinks   []JiraIssueLink         `json:"issuelinks"`
+	Attachment   []JiraAttachment        `json:"attachment"`
+	Comment      *JiraCommentContainer   `json:"comment"`
+	Worklog      *JiraWorklogContainer   `json:"worklog"`
+	TimeTracking *JiraTimeTracking       `json:"timetracking"`
+	Watches      *JiraWatchSummary       `json:"watches"`
+	Votes        *JiraVoteSummary        `json:"votes"`
+	Security     *JiraIssueSecurityLevel `json:"security"`
+	Sprint       any                     `json:"sprint"` // Can be object or customfield
+	Epic         *JiraIssue              `json:"epic"`   // Epic link for stories
+	CustomFields map[string]any          `json:"-"`      // Populated separately
+	// Watchers is populated from the paged issue-watchers endpoint. The issue
+	// payload contains only Watches.Count and never the identities needed for
+	// first-class Windshift item_watches rows.
+	Watchers                   []JiraUser `json:"-"`
+	WatcherIdentitiesAvailable bool       `json:"-"`
+	WatcherFetchError          string     `json:"-"`
+}
+
+// IssueWatchersClient is the optional per-issue watcher capability shared by
+// Jira Cloud and Data Center. Jira can withhold watcher identities even when
+// it exposes a count; callers preserve that distinction in import metadata.
+type IssueWatchersClient interface {
+	GetIssueWatchers(ctx context.Context, issueKey string) (*JiraIssueWatchers, error)
+}
+
+type JiraWatchSummary struct {
+	Self       string `json:"self"`
+	WatchCount int    `json:"watchCount"`
+	IsWatching bool   `json:"isWatching"`
+}
+
+type JiraIssueWatchers struct {
+	Self       string     `json:"self"`
+	WatchCount int        `json:"watchCount"`
+	IsWatching bool       `json:"isWatching"`
+	Watchers   []JiraUser `json:"watchers"`
+}
+
+type JiraVoteSummary struct {
+	Self     string     `json:"self"`
+	Votes    int        `json:"votes"`
+	HasVoted bool       `json:"hasVoted"`
+	Voters   []JiraUser `json:"voters,omitempty"`
+}
+
+type JiraIssueSecurityLevel struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Self        string `json:"self"`
 }
 
 // UnmarshalJSON implements custom unmarshalling for JiraIssueFields.
@@ -173,10 +432,10 @@ func (f *JiraIssueFields) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	f.CustomFields = make(map[string]interface{})
+	f.CustomFields = make(map[string]any)
 	for key, val := range raw {
 		if strings.HasPrefix(key, "customfield_") {
-			var v interface{}
+			var v any
 			if err := json.Unmarshal(val, &v); err == nil {
 				f.CustomFields[key] = v
 			}
@@ -198,8 +457,9 @@ type JiraPriority struct {
 // Data Center uses Name or Key as the unique identifier
 type JiraUser struct {
 	AccountID    string            `json:"accountId"` // Cloud identifier
-	Name         string            `json:"name"`      // Data Center identifier (username)
-	Key          string            `json:"key"`       // Data Center identifier (user key)
+	AccountType  string            `json:"accountType"`
+	Name         string            `json:"name"` // Data Center identifier (username)
+	Key          string            `json:"key"`  // Data Center identifier (user key)
 	EmailAddress string            `json:"emailAddress"`
 	DisplayName  string            `json:"displayName"`
 	Active       bool              `json:"active"`
@@ -287,12 +547,15 @@ type JiraCommentContainer struct {
 
 // JiraComment represents a comment on an issue
 type JiraComment struct {
-	ID           string      `json:"id"`
-	Author       *JiraUser   `json:"author"`
-	Body         interface{} `json:"body"` // Can be string or ADF
-	Created      string      `json:"created"`
-	Updated      string      `json:"updated"`
-	UpdateAuthor *JiraUser   `json:"updateAuthor"`
+	ID           string    `json:"id"`
+	Author       *JiraUser `json:"author"`
+	Body         any       `json:"body"` // Can be string or ADF
+	Created      string    `json:"created"`
+	Updated      string    `json:"updated"`
+	UpdateAuthor *JiraUser `json:"updateAuthor"`
+	// ServiceDeskPublic is populated from the JSM request comment endpoint.
+	// A false value means an agent-only internal note.
+	ServiceDeskPublic *bool `json:"-"`
 	// Visibility scopes a comment to a role/group. Jira Cloud emits
 	// {"type":"group","value":"..."} (or "role"); Data Center uses the same
 	// shape. Windshift only models a private/internal toggle, so any
@@ -328,14 +591,14 @@ type JiraWorklogContainer struct {
 
 // JiraWorklog represents a worklog entry
 type JiraWorklog struct {
-	ID               string      `json:"id"`
-	Author           *JiraUser   `json:"author"`
-	Comment          interface{} `json:"comment"` // Can be string or ADF
-	Created          string      `json:"created"`
-	Updated          string      `json:"updated"`
-	Started          string      `json:"started"`
-	TimeSpent        string      `json:"timeSpent"`
-	TimeSpentSeconds int         `json:"timeSpentSeconds"`
+	ID               string    `json:"id"`
+	Author           *JiraUser `json:"author"`
+	Comment          any       `json:"comment"` // Can be string or ADF
+	Created          string    `json:"created"`
+	Updated          string    `json:"updated"`
+	Started          string    `json:"started"`
+	TimeSpent        string    `json:"timeSpent"`
+	TimeSpentSeconds int       `json:"timeSpentSeconds"`
 }
 
 // JiraTimeTracking represents time tracking info
@@ -397,70 +660,104 @@ type SearchOptions struct {
 // Jira Assets (Insight) Types
 // ================================================================
 
+// AssetTime decodes Assets timestamps, which arrive as epoch-millisecond
+// numbers on Cloud and as ISO date-time strings (or null) on Data Center.
+type AssetTime time.Time
+
+func (t *AssetTime) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*t = AssetTime(time.Time{})
+		return nil
+	}
+	var millis int64
+	if err := json.Unmarshal(data, &millis); err == nil {
+		*t = AssetTime(time.UnixMilli(millis))
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return fmt.Errorf("asset timestamp is neither epoch millis nor a string: %w", err)
+	}
+	// Cloud sends RFC 3339; Data Center uses Java-style offsets (+0000).
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05.000-0700", "2006-01-02T15:04:05-0700"} {
+		if parsed, err := time.Parse(layout, text); err == nil {
+			*t = AssetTime(parsed)
+			return nil
+		}
+	}
+	return fmt.Errorf("unrecognized asset timestamp format: %q", text)
+}
+
 // AssetObjectSchema represents a Jira Assets object schema
 type AssetObjectSchema struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	ObjectSchemaKey string    `json:"objectSchemaKey"`
-	Description     string    `json:"description"`
-	Created         time.Time `json:"created"`
-	Updated         time.Time `json:"updated"`
-	ObjectCount     int       `json:"objectCount"`
-	ObjectTypeCount int       `json:"objectTypeCount"`
+	ID              cloudFlexibleID `json:"id"`
+	Name            string          `json:"name"`
+	ObjectSchemaKey string          `json:"objectSchemaKey"`
+	Description     string          `json:"description"`
+	Created         AssetTime       `json:"created"`
+	Updated         AssetTime       `json:"updated"`
+	ObjectCount     int             `json:"objectCount"`
+	ObjectTypeCount int             `json:"objectTypeCount"`
 }
 
 // AssetObjectType represents an object type within a schema
 type AssetObjectType struct {
-	ID                 string                 `json:"id"`
+	ID                 cloudFlexibleID        `json:"id"`
 	Name               string                 `json:"name"`
 	Description        string                 `json:"description"`
 	Icon               *AssetIcon             `json:"icon"`
 	Position           int                    `json:"position"`
-	Created            time.Time              `json:"created"`
-	Updated            time.Time              `json:"updated"`
+	Created            AssetTime              `json:"created"`
+	Updated            AssetTime              `json:"updated"`
 	ObjectCount        int                    `json:"objectCount"`
-	ObjectSchemaID     string                 `json:"objectSchemaId"`
+	ObjectSchemaID     cloudFlexibleID        `json:"objectSchemaId"`
 	Inherited          bool                   `json:"inherited"`
 	AbstractObjectType bool                   `json:"abstractObjectType"`
-	ParentObjectTypeID string                 `json:"parentObjectTypeId,omitempty"`
+	ParentObjectTypeID cloudFlexibleID        `json:"parentObjectTypeId,omitempty"`
 	Attributes         []AssetObjectAttribute `json:"attributes,omitempty"`
 }
 
 // AssetIcon represents an icon for an object type
 type AssetIcon struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	URL16 string `json:"url16"`
-	URL48 string `json:"url48"`
+	ID    cloudFlexibleID `json:"id"`
+	Name  string          `json:"name"`
+	URL16 string          `json:"url16"`
+	URL48 string          `json:"url48"`
 }
 
 // AssetObjectAttribute represents an attribute definition for an object type
 type AssetObjectAttribute struct {
-	ID                  string `json:"id"`
-	Name                string `json:"name"`
-	Label               bool   `json:"label"`
-	Type                int    `json:"type"` // 0=Default, 1=ObjectRef, 2=User, 3=Confluence, etc.
-	TypeValue           string `json:"typeValue,omitempty"`
-	DefaultTypeID       int    `json:"defaultTypeId,omitempty"` // For type=0: 0=Text, 1=Integer, 2=Boolean, etc.
-	Description         string `json:"description"`
-	Editable            bool   `json:"editable"`
-	Hidden              bool   `json:"hidden"`
-	IncludeChildObjects bool   `json:"includeChildObjectTypes"`
-	UniqueAttribute     bool   `json:"uniqueAttribute"`
-	MinimumCardinality  int    `json:"minimumCardinality"`
-	MaximumCardinality  int    `json:"maximumCardinality"`
-	Removable           bool   `json:"removable"`
-	Position            int    `json:"position"`
+	ID                  cloudFlexibleID   `json:"id"`
+	Name                string            `json:"name"`
+	Label               bool              `json:"label"`
+	Type                int               `json:"type"` // 0=Default, 1=ObjectRef, 2=User, 3=Confluence, etc.
+	TypeValue           cloudFlexibleID   `json:"typeValue,omitempty"`
+	DefaultTypeID       int               `json:"defaultTypeId,omitempty"` // For type=0: 0=Text, 1=Integer, 2=Boolean, etc.
+	DefaultType         *AssetDefaultType `json:"defaultType,omitempty"`
+	Description         string            `json:"description"`
+	Editable            bool              `json:"editable"`
+	Hidden              bool              `json:"hidden"`
+	IncludeChildObjects bool              `json:"includeChildObjectTypes"`
+	UniqueAttribute     bool              `json:"uniqueAttribute"`
+	MinimumCardinality  int               `json:"minimumCardinality"`
+	MaximumCardinality  int               `json:"maximumCardinality"`
+	Removable           bool              `json:"removable"`
+	Position            int               `json:"position"`
+}
+
+type AssetDefaultType struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
 }
 
 // AssetObject represents an object instance in Assets
 type AssetObject struct {
-	ID           string                      `json:"id"`
+	ID           cloudFlexibleID             `json:"id"`
 	Label        string                      `json:"label"`
 	ObjectKey    string                      `json:"objectKey"`
 	ObjectType   *AssetObjectType            `json:"objectType"`
-	Created      time.Time                   `json:"created"`
-	Updated      time.Time                   `json:"updated"`
+	Created      AssetTime                   `json:"created"`
+	Updated      AssetTime                   `json:"updated"`
 	HasAvatar    bool                        `json:"hasAvatar"`
 	Timestamp    int64                       `json:"timestamp"`
 	Attributes   []AssetObjectAttributeValue `json:"attributes"`
@@ -470,27 +767,31 @@ type AssetObject struct {
 
 // AssetObjectAttributeValue represents an attribute value on an object
 type AssetObjectAttributeValue struct {
-	ID                    string                `json:"id"`
-	ObjectTypeAttributeID string                `json:"objectTypeAttributeId"`
+	ID                    cloudFlexibleID       `json:"id"`
+	ObjectTypeAttributeID cloudFlexibleID       `json:"objectTypeAttributeId"`
 	ObjectAttributeValues []AssetAttributeValue `json:"objectAttributeValues"`
 }
 
 // AssetAttributeValue represents a single value for an attribute
 type AssetAttributeValue struct {
-	Value          interface{}  `json:"value"`
-	DisplayValue   string       `json:"displayValue"`
-	SearchValue    string       `json:"searchValue"`
-	ReferencedType int          `json:"referencedType,omitempty"`
+	Value        any    `json:"value"`
+	DisplayValue string `json:"displayValue"`
+	SearchValue  string `json:"searchValue"`
+	// Jira Cloud currently returns a boolean here, while older Assets
+	// responses used a numeric reference type. The importer does not depend on
+	// this metadata, so retain either representation without rejecting the
+	// containing asset.
+	ReferencedType any          `json:"referencedType,omitempty"`
 	User           *JiraUser    `json:"user,omitempty"`
 	Status         *AssetStatus `json:"status,omitempty"`
 }
 
 // AssetStatus represents a status in Assets
 type AssetStatus struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Category    int    `json:"category"` // 0=Inactive, 1=Active, 2=Pending
+	ID          cloudFlexibleID `json:"id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Category    int             `json:"category"` // 0=Inactive, 1=Active, 2=Pending
 }
 
 // AssetExtendedInfo contains additional object info
@@ -597,15 +898,17 @@ type JiraBoardConfiguration struct {
 	Location     *JiraBoardLocation     `json:"location,omitempty"`
 	ColumnConfig *JiraBoardColumnConfig `json:"columnConfig,omitempty"`
 	SubQuery     *JiraBoardSubQuery     `json:"subQuery,omitempty"`
-	Ranking      map[string]interface{} `json:"ranking,omitempty"`
+	Ranking      map[string]any         `json:"ranking,omitempty"`
 }
 
-// JiraBoardFilter is the saved filter backing a board.
+// JiraBoardFilter is the saved filter backing a board. The agile API
+// serializes the filter id as a number on some deployments (WI-1156), so the
+// ID decodes flexibly like the other Jira ids.
 type JiraBoardFilter struct {
-	ID   string `json:"id"`
-	Self string `json:"self"`
-	Name string `json:"name,omitempty"`
-	JQL  string `json:"jql,omitempty"`
+	ID   cloudFlexibleID `json:"id"`
+	Self string          `json:"self"`
+	Name string          `json:"name,omitempty"`
+	JQL  string          `json:"jql,omitempty"`
 }
 
 // JiraBoardSubQuery preserves the board sub-query, if Jira exposes it.
@@ -672,14 +975,33 @@ type BulkFetchRequest struct {
 	Properties     []string `json:"properties,omitempty"`
 }
 
-// BulkFetchResponse is the response from POST /rest/api/3/issue/bulkfetch
+// BulkFetchResponse is the response from POST /rest/api/3/issue/bulkfetch.
+// Jira answers HTTP 200 with partial success: resolved issues land in Issues
+// and per-issue failures in IssueErrors.
 type BulkFetchResponse struct {
-	Issues []JiraIssue      `json:"issues"`
-	Errors []BulkFetchError `json:"errors,omitempty"`
+	Issues      []JiraIssue      `json:"issues"`
+	IssueErrors []BulkFetchError `json:"issueErrors,omitempty"`
 }
 
-// BulkFetchError represents an error when fetching a specific issue
+// BulkFetchError represents a per-issue failure in a bulk-fetch response.
 type BulkFetchError struct {
-	IssueIDOrKey string `json:"issueIdOrKey"`
-	ErrorMessage string `json:"errorMessage"`
+	IssueIDOrKey  string            `json:"issueIdOrKey"`
+	ErrorMessages []string          `json:"errorMessages,omitempty"`
+	Errors        map[string]string `json:"errors,omitempty"`
+}
+
+// Message renders the per-issue failure for logs and error accounting.
+func (e BulkFetchError) Message() string {
+	if len(e.ErrorMessages) > 0 {
+		return strings.Join(e.ErrorMessages, "; ")
+	}
+	if len(e.Errors) > 0 {
+		parts := make([]string, 0, len(e.Errors))
+		for field, message := range e.Errors {
+			parts = append(parts, field+": "+message)
+		}
+		sort.Strings(parts)
+		return strings.Join(parts, "; ")
+	}
+	return "unknown Jira bulk fetch error"
 }

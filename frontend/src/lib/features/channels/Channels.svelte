@@ -1,79 +1,73 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
   import { useEventListener } from 'runed';
   import { t } from '../../stores/i18n.svelte.js';
-  import { IconLifebuoy, IconPlus, IconTrash, IconSettings, IconSearch, IconTag, IconPower, IconFileText } from '@tabler/icons-svelte-runes';
+  import { IconLifebuoy, IconPlus, IconTrash, IconSettings, IconSearch, IconTag, IconPower, IconFileText, IconMail } from '@tabler/icons-svelte-runes';
   import { api } from '../../api.js';
   import { currentRoute, navigate } from '../../router.js';
   import { channelCategoriesStore } from '../../stores/channelCategories.js';
   import { toHotkeyString, getShortcutDisplay } from '../../utils/keyboardShortcuts.js';
   import Button from '../../components/Button.svelte';
   import Input from '../../components/Input.svelte';
-  import Select from '../../components/Select.svelte';
   import ItemPicker from '../../pickers/ItemPicker.svelte';
-  import Textarea from '../../components/Textarea.svelte';
   import Modal from '../../dialogs/Modal.svelte';
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
   import { confirm } from '../../composables/useConfirm.js';
   import { errorToast, successToast } from '../../stores/toasts.svelte.js';
   import Lozenge from '../../components/Lozenge.svelte';
   import DataTable from '../../components/DataTable.svelte';
-  import Spinner from '../../components/Spinner.svelte';
   import ChannelNavigation from './ChannelNavigation.svelte';
+  import TabStrip from '../../components/TabStrip.svelte';
   import { channelTypes as channelTypeDefs, allTypesEntry, getChannelTypeIcon } from './channelTypes.js';
+  import { channelAdminRoute } from './channelRoutes.js';
   import CategoryModal from '../../dialogs/CategoryModal.svelte';
   import ChannelConfigModal from '../../dialogs/ChannelConfigModal.svelte';
   import EmailLogModal from '../../dialogs/EmailLogModal.svelte';
   import Label from '../../components/Label.svelte';
   import DescriptionText from '../../components/DescriptionText.svelte';
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
+  import { isSystemAdmin } from '../../stores/permissions.svelte.js';
+	import TextField from '../../components/TextField.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
+	import SelectField from '../../components/SelectField.svelte';
 
   // Props
   let { embedded = false } = $props();
 
-  // Channel type definitions for embedded tab navigation
-  const channelTypes = [
-    { ...allTypesEntry, label: t('channels.allTypes', 'All') },
-    ...channelTypeDefs.map(ct => ({ ...ct, label: t(`channels.${ct.id}`, ct.id) }))
-  ];
+  // Channel type definitions for embedded tab navigation.
+  let channelTabs = $derived([
+    { id: 'all', label: t('channels.allTypes', 'All'), icon: allTypesEntry.icon },
+    ...channelTypeDefs.map(ct => ({ id: ct.id, label: t(`channels.${ct.id}`, ct.id), icon: ct.icon }))
+  ]);
 
   let channels = $state([]);
   let loading = $state(true);
   let error = $state(null);
   let channelSearch = $state('');
 
-  // Local state for embedded mode filters
-  let embeddedTypeFilter = $state(null);
-  let embeddedCategoryId = $state(null);
-
-  // Filters - use local state for embedded mode, URL for standalone
-  let activeCategoryId = $derived(embedded ? embeddedCategoryId : ($currentRoute.params?.categoryId || null));
-  let activeTypeFilter = $derived(embedded ? embeddedTypeFilter : ($currentRoute.params?.type || null));
+  // Filters are URL-backed in both layouts so deep links and picker/tab
+  // changes cannot disagree about which channels are visible.
+  let activeCategoryId = $derived($currentRoute.params?.categoryId || null);
+  let activeTypeFilter = $derived($currentRoute.params?.type || null);
 
   // Handlers for embedded tab navigation
   function handleTypeClick(typeId) {
-    if (embedded) {
-      embeddedTypeFilter = typeId;
+    if (typeId === null) {
+      navigate('/admin/channels');
     } else {
-      if (typeId === null) {
-        navigate('/admin/channels');
-      } else {
-        navigate(`/admin/channels/type/${typeId}`);
-      }
+      navigate(`/admin/channels/type/${typeId}`);
     }
   }
 
-  function handleCategoryChange(event) {
-    const value = event.target.value;
-    if (embedded) {
-      embeddedCategoryId = value === '' ? null : value;
-    } else {
-      if (value === '') {
-        navigate('/admin/channels');
-      } else {
-        navigate(`/admin/channels/category/${value}`);
-      }
+  async function deleteCategory(id) {
+    await channelCategoriesStore.delete(id);
+    if (Number(activeCategoryId) === Number(id)) {
+      navigate('/admin/channels');
     }
+    // The category FK is SET NULL server-side; refresh channel rows so an
+    // edit modal cannot retain the deleted ID in its local form state.
+    await loadChannels();
   }
 
   // Filtered channels based on type, category, and search
@@ -105,6 +99,8 @@
   let selectedChannel = $state(null);
   let showEmailLog = $state(false);
   let emailLogChannel = $state(null);
+  let emailLogInitialTab = $state('inbound');
+  let creating = $state(false);
 
 
   // Form data for new channel
@@ -137,18 +133,18 @@
     }
   }
 
-  function openEmailLog(channel) {
+  function openEmailLog(channel, initialTab = 'inbound') {
     emailLogChannel = channel;
+    emailLogInitialTab = initialTab;
     showEmailLog = true;
   }
 
   function getChannelActionItems(channel) {
     const items = [
       { title: 'Configure', icon: IconSettings, onClick: () => {
-        if (channel.type === 'form') {
-          navigate(`/admin/channels/${channel.id}/forms`);
-        } else if (channel.type === 'portal') {
-          navigate(`/admin/channels/${channel.id}/portal`);
+        const route = channelAdminRoute(channel);
+        if (route) {
+          navigate(route);
         } else {
           openConfigModal(channel);
         }
@@ -162,8 +158,16 @@
         onClick: () => openEmailLog(channel)
       });
     }
+    if (channel.type === 'email' || channel.type === 'portal') {
+      items.push({
+        title: t('channel.customerReplies', 'Customer replies'),
+        icon: IconMail,
+        testid: `channel-action-customer-replies`,
+        onClick: () => openEmailLog(channel, 'outbox')
+      });
+    }
 
-    if ((channel.type === 'email' || channel.type === 'portal' || channel.type === 'form') && !isPluginOwned(channel)) {
+    if (!isPluginOwned(channel)) {
       items.push({
         title: channel.status === 'enabled' ? 'Disable' : 'Enable',
         icon: IconPower,
@@ -171,8 +175,14 @@
       });
     }
 
-    if (!channel.is_default && !isPluginOwned(channel)) {
-      items.push({ title: 'Delete', icon: IconTrash, onClick: () => deleteChannel(channel), color: 'var(--ds-text-danger)' });
+    if ($isSystemAdmin && !channel.is_default && !isPluginOwned(channel)) {
+      items.push({
+        title: 'Delete',
+        icon: IconTrash,
+        onClick: () => deleteChannel(channel),
+        color: 'var(--ds-text-danger)',
+        testid: 'channel-delete',
+      });
     }
 
     return items;
@@ -184,6 +194,7 @@
 
     // Handle OAuth callback parameters (after channels are loaded)
     handleOAuthCallback();
+    openChannelFromRoute();
   });
 
   useEventListener(() => document, 'manage-channel-categories', handleManageCategories);
@@ -212,11 +223,30 @@
         'save_failed': 'Failed to save OAuth tokens',
         'channel_not_found': 'Channel not found',
         'invalid_config': 'Invalid channel configuration',
-        'unsupported_provider': 'Unsupported OAuth provider'
+        'unsupported_provider': 'Unsupported OAuth provider',
+        'decrypt_failed': 'Could not decrypt the OAuth client secret',
+        'identity_failed': 'Could not read the connected mailbox identity',
+        'authorization_failed': 'You no longer have permission to connect this channel',
+        'config_changed': 'The channel changed while OAuth was open. Review the latest settings and reconnect.'
       };
       errorToast(errorMessages[oauthError] || `OAuth error: ${oauthError}`);
       // Clear URL params
       window.history.replaceState({}, '', window.location.pathname);
+    }
+  }
+
+  function openChannelFromRoute() {
+    const match = window.location.pathname.match(/^\/admin\/channels\/(\d+)$/);
+    if (!match || showConfigModal) return;
+    const channel = channels.find(candidate => candidate.id === Number(match[1]));
+    if (channel) {
+      const route = channelAdminRoute(channel);
+      if (route) {
+        navigate(route);
+        return;
+      }
+      selectedChannel = channel;
+      showConfigModal = true;
     }
   }
 
@@ -228,7 +258,7 @@
     try {
       loading = true;
       error = null;
-      channels = await api.channels.getAll();
+      channels = await api.channels.getAll({ include_disabled: true });
     } catch (err) {
       console.error('Failed to load channels:', err);
       error = 'Failed to load channels';
@@ -264,9 +294,12 @@
   }
 
   function showAddChannelForm() {
+    const filteredType = channelTypeDefs.some(type => type.id === activeTypeFilter)
+      ? activeTypeFilter
+      : 'portal';
     channelFormData = {
       name: '',
-      type: 'portal',
+      type: filteredType,
       description: '',
       category_id: activeCategoryId ? parseInt(activeCategoryId) : null,
       slug: ''
@@ -286,7 +319,9 @@
   }
 
   async function handleChannelSubmit() {
+    if (creating) return;
     try {
+      creating = true;
       // Auto-determine direction based on type
       const directionMap = {
         'portal': 'inbound',
@@ -305,28 +340,21 @@
 
       const newChannel = await api.channels.create(channelData);
 
-      // Set initial config with slug for portal/form channels
-      if (channelFormData.type === 'portal' && channelFormData.slug) {
-        await api.channels.updateConfig(newChannel.id, {
-          portal_slug: channelFormData.slug,
-          portal_title: channelFormData.name
-        });
-      }
-      if (channelFormData.type === 'form' && channelFormData.slug) {
-        await api.channels.updateConfig(newChannel.id, {
-          form_slug: channelFormData.slug
-        });
-      }
-
       await loadChannels();
       cancelChannelForm();
 
-      // Open config modal for the new channel
-      selectedChannel = newChannel;
-      showConfigModal = true;
+      const route = channelAdminRoute(newChannel);
+      if (route) {
+        navigate(route);
+      } else {
+        selectedChannel = channels.find(channel => channel.id === newChannel.id) || newChannel;
+        showConfigModal = true;
+      }
     } catch (error) {
       console.error('Failed to save channel:', error);
       errorToast('Failed to save channel: ' + (error.message || error));
+    } finally {
+      creating = false;
     }
   }
 
@@ -340,8 +368,12 @@
     selectedChannel = null;
   }
 
-  function handleConfigSave() {
-    loadChannels();
+  async function handleConfigSave() {
+    const selectedID = selectedChannel?.id;
+    await loadChannels();
+    if (selectedID) {
+      selectedChannel = channels.find(channel => channel.id === selectedID) || selectedChannel;
+    }
   }
 
   async function deleteChannel(channel) {
@@ -353,9 +385,37 @@
       errorToast('Cannot delete a plugin-owned channel');
       return;
     }
+    let impact;
+    try {
+      impact = await api.channels.getDeleteImpact(channel.id);
+    } catch (error) {
+      console.error('Failed to load channel delete impact:', error);
+      errorToast('Could not verify what this deletion would remove. Please try again.');
+      return;
+    }
+    const impactLabels = [
+      ['request types', impact.request_types],
+      ['asset reports', impact.asset_reports],
+      ['customer access grants', impact.portal_customer_channels],
+      ['email log entries', impact.email_message_tracking],
+      ['queued email replies', impact.email_reply_outbox],
+      ['pending email authorizations', impact.email_oauth_states],
+      ['email credential leases', impact.email_credential_leases],
+      ['active mailbox-processing leases', impact.email_processing_leases],
+      ['mailbox sync states', impact.email_channel_state],
+      ['webhook delivery records', impact.webhook_deliveries],
+      ['manager assignments', impact.channel_managers],
+      ['in-progress portal drafts', impact.portal_request_drafts],
+      ['portal sign-in links', impact.portal_magic_links],
+      ['portal sessions', impact.portal_sessions],
+      ['linked items', impact.items]
+    ].filter(([, count]) => count > 0).map(([label, count]) => `${count} ${label}`);
+    const impactMessage = impactLabels.length > 0
+      ? ` This will affect ${impactLabels.join(', ')}.`
+      : '';
     const ok = await confirm({
       title: 'Delete Channel',
-      message: 'Are you sure you want to delete this channel? This action cannot be undone.',
+      message: `Are you sure you want to delete this channel?${impactMessage} This action cannot be undone.`,
       confirmText: 'Delete Channel',
       variant: 'danger',
     });
@@ -376,10 +436,9 @@
   }
 
   function handleRowClick(channel) {
-    if (channel.type === 'form') {
-      navigate(`/admin/channels/${channel.id}/forms`);
-    } else if (channel.type === 'portal') {
-      navigate(`/admin/channels/${channel.id}/portal`);
+    const route = channelAdminRoute(channel);
+    if (route) {
+      navigate(route);
     } else {
       openConfigModal(channel);
     }
@@ -387,58 +446,42 @@
 </script>
 
 <!-- Main container with sidebar layout -->
-<div class="flex min-h-screen" style="background-color: var(--ds-surface);">
+<div class="flex h-full min-h-0 overflow-hidden" style="background-color: var(--ds-surface);">
   <!-- Left Sidebar - Category Navigation (only when not embedded in Admin) -->
   {#if !embedded}
     <ChannelNavigation />
   {/if}
 
   <!-- Main Content -->
-  <div class="flex-1 {embedded ? '' : 'p-6'}">
+  <div class="flex-1 min-h-0 overflow-y-auto {embedded ? '' : 'p-6'}">
     <!-- Embedded Tab Navigation -->
     {#if embedded}
-      <div class="border-b mb-6" style="border-color: var(--ds-border);">
-        <!-- Type Tabs with Category filter and Manage button on right -->
-        <div class="flex items-center justify-between">
-          <div class="flex gap-1">
-            {#each channelTypes as type (type.id)}
-              {@const isActive = activeTypeFilter === type.id}
-              <button
-                onclick={() => handleTypeClick(type.id)}
-                class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors flex items-center gap-2"
-                style={isActive
-                  ? 'border-color: var(--ds-border-focused); color: var(--ds-text);'
-                  : 'border-color: transparent; color: var(--ds-text-subtle);'}
-                onmouseenter={(e) => { if (!isActive) e.currentTarget.style.color = 'var(--ds-text)'; }}
-                onmouseleave={(e) => { if (!isActive) e.currentTarget.style.color = 'var(--ds-text-subtle)'; }}
-              >
-                <type.icon class="w-4 h-4" />
-                {type.label}
-              </button>
-            {/each}
-          </div>
-          <div class="flex items-center gap-3 flex-shrink-0">
-            <span class="text-sm whitespace-nowrap" style="color: var(--ds-text-subtle);">{t('channels.category', 'Category')}:</span>
-            <ItemPicker
-              value={activeCategoryId ? parseInt(activeCategoryId) : null}
-              items={$channelCategoriesStore}
-              placeholder={t('channels.allCategories', 'All Categories')}
-              showUnassigned={true}
-              unassignedLabel={t('channels.allCategories', 'All Categories')}
-              allowClear={false}
-              class="w-48"
-              onSelect={(item) => {
-                if (embedded) {
-                  embeddedCategoryId = item ? item.id : null;
-                } else {
-                  if (!item) {
-                    navigate('/admin/channels');
-                  } else {
-                    navigate(`/admin/channels/category/${item.id}`);
-                  }
-                }
-              }}
-            />
+      <!-- Type Tabs with Category filter and Manage button on right -->
+      <TabStrip
+        tabs={channelTabs}
+        activeTab={activeTypeFilter ?? 'all'}
+        onTabChange={(id) => handleTypeClick(id === 'all' ? null : id)}
+        class="mb-6"
+      >
+        {#snippet trailing()}
+          <span class="text-sm whitespace-nowrap" style="color: var(--ds-text-subtle);">{t('channels.category', 'Category')}:</span>
+          <ItemPicker
+            value={activeCategoryId ? parseInt(activeCategoryId) : null}
+            items={$channelCategoriesStore}
+            placeholder={t('channels.allCategories', 'All Categories')}
+            showUnassigned={true}
+            unassignedLabel={t('channels.allCategories', 'All Categories')}
+            allowClear={false}
+            class="w-48"
+            onSelect={(item) => {
+              if (!item) {
+                navigate('/admin/channels');
+              } else {
+                navigate(`/admin/channels/category/${item.id}`);
+              }
+            }}
+          />
+          {#if $isSystemAdmin}
             <Button
               onclick={() => showCategoryModal = true}
               variant="ghost"
@@ -448,9 +491,9 @@
             >
               {t('channels.manageCategories', 'Manage')}
             </Button>
-          </div>
-        </div>
-      </div>
+          {/if}
+        {/snippet}
+      </TabStrip>
     {/if}
 
     <!-- Header -->
@@ -474,26 +517,29 @@
           <!-- Search Bar (embedded) -->
           <div class="relative w-64">
             <IconSearch class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style="color: var(--ds-text-subtle);" />
-            <input
+            <Input
               type="text"
               bind:value={channelSearch}
               placeholder={t('channels.searchChannels')}
-              class="w-full pl-9 pr-3 py-2 text-sm rounded-lg border"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+              class="pl-9"
+              size="small"
             />
           </div>
         {/if}
       </div>
-      <Button
-        onclick={showAddChannelForm}
-        variant="primary"
-        icon={IconPlus}
-        size="medium"
-        keyboardHint={getShortcutDisplay('channels', 'addChannel')}
-        hotkeyConfig={{ key: toHotkeyString('channels', 'addChannel'), guard: () => !showAddForm && !showConfigModal && !showCategoryModal }}
-      >
-        {t('channels.createChannel')}
-      </Button>
+      {#if $isSystemAdmin}
+        <Button
+          onclick={showAddChannelForm}
+          variant="primary"
+          icon={IconPlus}
+          size="medium"
+          dataTestid="channel-create-open"
+          keyboardHint={getShortcutDisplay('channels', 'addChannel')}
+          hotkeyConfig={{ key: toHotkeyString('channels', 'addChannel'), guard: () => !showAddForm && !showConfigModal && !showCategoryModal }}
+        >
+          {t('channels.createChannel')}
+        </Button>
+      {/if}
     </div>
 
     <!-- Search Bar (non-embedded) -->
@@ -501,12 +547,12 @@
       <div class="mb-6">
         <div class="relative max-w-md">
           <IconSearch class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style="color: var(--ds-text-subtle);" />
-          <input
+          <Input
             type="text"
             bind:value={channelSearch}
             placeholder={t('channels.searchChannels')}
-            class="w-full pl-9 pr-3 py-2 text-sm rounded-lg border"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+            class="pl-9"
+            size="small"
           />
         </div>
       </div>
@@ -514,12 +560,10 @@
 
     <!-- Data Table -->
     {#if loading}
-      <div class="flex items-center justify-center py-16">
-        <Spinner />
-      </div>
+      <StateDisplay type="loading" />
     {:else if error}
       <div class="text-center py-16">
-        <div class="text-red-600 text-sm font-medium mb-2">{error}</div>
+        <div class="text-ds-text-danger text-sm font-medium mb-2">{error}</div>
         <Button onclick={loadChannels} variant="default" size="small">
           {t('common.retry')}
         </Button>
@@ -533,7 +577,9 @@
         emptyDescription={channelSearch ? t('channels.noChannels') : t('channels.noChannels')}
         emptyIcon={IconLifebuoy}
         actionItems={getChannelActionItems}
+        actionTriggerTestid={(channel) => `channel-actions-${channel.id}`}
         onRowClick={handleRowClick}
+        rowAttrs={(channel) => ({ 'data-testid': `admin-channel-row-${channel.id}` })}
       >
         {#snippet name(item)}
           {@const ChannelIcon = getChannelTypeIcon(item.type)}
@@ -577,7 +623,7 @@
   onclose={cancelChannelForm}
   onSubmit={handleChannelSubmit}
   submitDisabled={!channelFormData.name.trim() ||
-    ((channelFormData.type === 'portal' || channelFormData.type === 'form') && !channelFormData.slug.trim())}
+    ((channelFormData.type === 'portal' || channelFormData.type === 'form') && !channelFormData.slug.trim()) || creating}
   maxWidth="max-w-xl"
   autoFocus={true}
 >
@@ -589,22 +635,25 @@
   <div class="p-6">
     <div class="space-y-4">
       <div>
-        <Label for="channelName" required color="default" class="mb-2">Channel Name</Label>
-        <Input
+        <TextField
+          label={"Channel Name"}
           id="channelName"
-          bind:value={channelFormData.name}
           required
+          labelColor="default"
           placeholder="e.g., Customer Support Portal"
+          bind:value={channelFormData.name}
         />
       </div>
 
       <div>
         <Label color="default" class="mb-2">Type</Label>
         <div class="flex flex-wrap gap-2">
-          {#each channelTypeDefs as option}
+          {#each channelTypeDefs as option (option.id)}
             <button
               type="button"
               onclick={() => channelFormData.type = option.id}
+              data-testid={`channel-type-${option.id}`}
+              aria-pressed={channelFormData.type === option.id}
               class="flex items-center gap-2 px-3 py-2 rounded-lg border transition-all"
               style={channelFormData.type === option.id
                 ? 'border-color: var(--ds-border-focused); background: var(--ds-surface-selected);'
@@ -619,34 +668,50 @@
 
       {#if channelFormData.type === 'portal' || channelFormData.type === 'form'}
         <div>
-          <Label for="channelSlug" required color="default" class="mb-2">Slug</Label>
+          <Label for="channelSlug" required color="default" class="mb-2">
+            {channelFormData.type === 'form' ? 'Public URL' : 'Slug'}
+          </Label>
           <Input
             id="channelSlug"
             bind:value={channelFormData.slug}
             required
-            pattern="[a-z0-9\-]+"
+            minlength={3}
+            maxlength={64}
+            pattern={'[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])'}
             placeholder="e.g., support"
           />
           <DescriptionText>
-            {channelFormData.type === 'portal' ? '/portal/' : '/forms/'}{channelFormData.slug || '...'}
+            {#if channelFormData.type === 'form'}
+              Forms will be shared at /forms/{channelFormData.slug || 'your-url'}.
+            {:else}
+              /portal/{channelFormData.slug || '...'}
+            {/if}
           </DescriptionText>
         </div>
       {/if}
 
-      <div>
-        <Label for="channelCategory" color="default" class="mb-2">Category</Label>
-        <Select id="channelCategory" bind:value={channelFormData.category_id} options={[{ value: null, label: 'No Category' }, ...$channelCategoriesStore.map(c => ({ value: c.id, label: c.name }))]} />
-      </div>
+      {#if channelFormData.type !== 'form'}
+        <div>
+          <SelectField
+            label={"Category"}
+            id="channelCategory"
+            labelColor="default"
+            options={[{ value: null, label: 'No Category' }, ...$channelCategoriesStore.map(c => ({ value: c.id, label: c.name }))]}
+            bind:value={channelFormData.category_id}
+          />
+        </div>
 
-      <div>
-        <Label for="channelDescription" color="default" class="mb-2">Description</Label>
-        <Textarea
-          id="channelDescription"
-          bind:value={channelFormData.description}
-          rows={3}
-          placeholder="Brief description of this channel's purpose"
-        />
-      </div>
+        <div>
+          <TextareaField
+            label={"Description"}
+            id="channelDescription"
+            labelColor="default"
+            rows={3}
+            placeholder="Brief description of this channel's purpose"
+            bind:value={channelFormData.description}
+          />
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -655,8 +720,9 @@
     onCancel={cancelChannelForm}
     onConfirm={handleChannelSubmit}
     confirmLabel={t('channels.createChannel')}
+    confirmTestid="channel-create-confirm"
     disabled={!channelFormData.name.trim() ||
-      ((channelFormData.type === 'portal' || channelFormData.type === 'form') && !channelFormData.slug.trim())}
+      ((channelFormData.type === 'portal' || channelFormData.type === 'form') && !channelFormData.slug.trim()) || creating}
     showKeyboardHint={true}
     confirmKeyboardHint={submitHint}
   />
@@ -670,7 +736,7 @@
   title="Manage Channel Categories"
   categories={$channelCategoriesStore}
   onAdd={async (data) => await channelCategoriesStore.add(data)}
-  onDelete={async (id) => await channelCategoriesStore.delete(id)}
+  onDelete={deleteCategory}
   showColorPicker={true}
 />
 
@@ -686,7 +752,7 @@
 <EmailLogModal
   isOpen={showEmailLog}
   channel={emailLogChannel}
+  initialTab={emailLogInitialTab}
   onClose={() => { showEmailLog = false; emailLogChannel = null; }}
 />
-
 

@@ -1,7 +1,15 @@
 // Main API barrel export - assembles all domain modules into single api object
 
 import { actions } from './actions.js';
-import { oauthClients, securitySettings, setup, system, themes } from './admin.js';
+import {
+  agentTemplates,
+  oauthClients,
+  securitySettings,
+  setup,
+  shellBootstrap,
+  system,
+  themes,
+} from './admin.js';
 import {
   actionCapabilities,
   actionCredentials,
@@ -10,6 +18,7 @@ import {
   llmConnections,
   llmProviders,
   runnerPools,
+  workItemStaleness,
 } from './ai.js';
 import { analytics } from './analytics.js';
 import { approvalSets } from './approvalSets.js';
@@ -24,10 +33,17 @@ import {
   itemLinkedAssets,
 } from './assets.js';
 import { auth } from './auth.js';
-import { assetReports, channelCategories, channels, requestTypes } from './channels.js';
+import {
+  assetReports,
+  channelCategories,
+  channelIntakes,
+  channels,
+  requestTypes,
+} from './channels.js';
 import { collectionCategories, collections } from './collections.js';
 import { conditionSets } from './conditionSets.js';
 import {
+  cannedResponses,
   configurationSets,
   customFields,
   hierarchyLevels,
@@ -36,18 +52,20 @@ import {
   links,
   linkTypes,
   priorities,
-  projectFieldRequirements,
   screens,
 } from './configuration.js';
 import { del, fetchAPI, get, post, put } from './core.js';
 import { emailTemplates } from './email-templates.js';
 import { forms } from './forms.js';
 import { hub } from './hub.js';
+import { itemIncidents } from './incidents.js';
 import {
   integrationProviders,
   itemIntegrationLinks,
   todoistSync,
   userIntegrations,
+  zammadConnections,
+  zammadTickets,
 } from './integrations.js';
 // Domain imports
 import { items } from './items.js';
@@ -67,8 +85,8 @@ import {
   getDiagrams,
   homepage,
   jiraImport,
+  labels,
   personalLabels,
-  projects,
   reviews,
   search,
   updateComment,
@@ -80,7 +98,9 @@ import {
   notifications,
 } from './notifications.js';
 import { oauth } from './oauth.js';
+import { objectTranslations } from './objectTranslations.js';
 import { onCallSchedules } from './oncall.js';
+import { packs } from './packs.js';
 import { pageLabels, pages } from './pages.js';
 import { groups, permissions } from './permissions.js';
 import {
@@ -91,9 +111,12 @@ import {
   portalCustomers,
   portalPasskey,
 } from './portal.js';
+import { queryLanguage } from './queryLanguage.js';
 import { recurrence } from './recurrence.js';
 import { issueSync, itemSCMLinks, scmProviders, userSCM, workspaceSCM } from './scm.js';
+import { sla } from './sla.js';
 import { sso } from './sso.js';
+import { support } from './support.js';
 import { teams } from './teams.js';
 import { tests } from './tests/index.js';
 import { time, timer } from './time.js';
@@ -109,11 +132,13 @@ import {
   deactivateUser,
   deleteMyAgent,
   deleteUser,
+  getAdminUsers,
   getAgentOwner,
   getApiToken,
   getApiTokens,
   getAssignableUsers,
   getMyAgents,
+  getScopeCatalog,
   getUser,
   getUserCredentials,
   getUsers,
@@ -122,6 +147,7 @@ import {
   resetUserPassword,
   revokeApiToken,
   startFIDORegistration,
+  updateMyAgent,
   updateUser,
   updateUserAvatar,
   updateUserRegionalSettings,
@@ -140,17 +166,18 @@ export const api = {
   delete: del,
 
   // Domain objects
-  projects,
   customFields,
-  projectFieldRequirements,
   workspaces,
   workspaceRoles,
+  packs,
   screens,
   items,
+  itemIncidents,
   configurationSets,
 
   // Users (standalone functions)
   getUsers,
+  getAdminUsers,
   getAssignableUsers,
   getUser,
   getAgentOwner,
@@ -170,6 +197,10 @@ export const api = {
   // Teams (cross-workspace orgs with on-call)
   teams,
 
+  // SLA configuration, reporting, and item state
+  sla,
+  support,
+
   // On-call schedules (per-team)
   onCallSchedules,
 
@@ -186,6 +217,7 @@ export const api = {
   // User-Managed Agents
   getMyAgents,
   createMyAgent,
+  updateMyAgent,
   deleteMyAgent,
 
   // CLI onboarding (consent page + capabilities probe)
@@ -197,6 +229,7 @@ export const api = {
   getApiToken,
   revokeApiToken,
   validateApiToken,
+  getScopeCatalog,
 
   // Status Categories
   statusCategories,
@@ -223,11 +256,17 @@ export const api = {
   // Search
   search,
 
+  // Query language metadata and value help
+  queryLanguage,
+
   // Milestone Categories
   milestoneCategories,
 
   // Channel Categories
   channelCategories,
+
+  // Mailbox intakes (WI-1644)
+  channelIntakes,
 
   // Milestones
   milestones,
@@ -240,6 +279,9 @@ export const api = {
 
   // Personal Labels
   personalLabels,
+
+  // Workspace Labels
+  labels,
 
   // Attachments
   attachments,
@@ -282,6 +324,9 @@ export const api = {
   itemTypes,
   itemTemplates,
 
+  // Canned responses (WI-1138)
+  cannedResponses,
+
   // Priorities
   priorities,
 
@@ -320,6 +365,9 @@ export const api = {
 
   // Notification Settings API
   notificationSettings,
+
+  // Instance-wide configurable-object translations
+  objectTranslations,
 
   // Email Templates API (admin-edited transactional emails)
   emailTemplates,
@@ -388,15 +436,26 @@ export const api = {
   // Item Integration Links
   itemIntegrationLinks,
 
+  // Zammad ticket integration
+  zammadConnections,
+  zammadTickets,
+
   // OAuth Clients (admin only) — third-party apps registered against the
   // generic OAuth 2.0 server (/api/oauth/authorize + /api/oauth/token)
   oauthClients,
+
+  // Agent template catalog (admin only) — system-admin overrides for the
+  // Agent Studio creation catalog (WI-922)
+  agentTemplates,
 
   // OAuth 2.0 server (consent flow — /authorize/{info,approve,deny})
   oauth,
 
   // Security Settings (admin only)
   securitySettings,
+
+  // Authenticated application-shell capability discovery
+  shellBootstrap,
 
   // Calendar Feed
   calendarFeed,
@@ -430,6 +489,9 @@ export const api = {
 
   // AI features config (admin)
   aiFeatures,
+
+  // Shared work item staleness threshold (admin)
+  workItemStaleness,
 
   // LLM connection management (admin)
   llmConnections,

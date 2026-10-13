@@ -1,6 +1,5 @@
 <script>
-  import { fade, scale } from 'svelte/transition';
-  import { backOut } from 'svelte/easing';
+  import { onDestroy } from 'svelte';
   import { getShortcut, matchesShortcut, getDisplayString } from '../utils/keyboardShortcuts.js';
   import { portal } from '../actions/portal.js';
 
@@ -14,9 +13,11 @@
     submitDisabled = false,
     zIndexClass = 'z-50',
     noBackdrop = false,
+    inline = false,
     closeOnBackdropClick = true,
     onclose = null,
     onKeydown = null,
+    dataTestid = undefined,
     children
   } = $props();
 
@@ -104,10 +105,37 @@
 
   let submitHint = $derived(hasTextarea ? getDisplayString(submitShortcut) : '↵');
 
+  // Auto-focus runs once per open. The effect below re-runs whenever the modal
+  // content is (re)mounted, so a timer scheduled inside it would keep resetting
+  // and could fire late — after the user has opened a dropdown — stealing focus
+  // back to the first field and scrolling the modal away from the control.
+  let autoFocusTimer = null;
+
+  onDestroy(() => {
+    if (autoFocusTimer !== null) clearTimeout(autoFocusTimer);
+  });
+
   $effect(() => {
-    if (isOpen && modalContentElement && backdropElement) {
-      const timer = setTimeout(() => {
+    if (!isOpen) {
+      if (autoFocusTimer !== null) {
+        clearTimeout(autoFocusTimer);
+        autoFocusTimer = null;
+      }
+      return;
+    }
+    if (!modalContentElement || !backdropElement) return;
+
+    if (autoFocusTimer === null) {
+      autoFocusTimer = setTimeout(() => {
+        autoFocusTimer = null;
+        if (!modalContentElement || !backdropElement) return;
         detectTextarea();
+        if (modalContentElement.contains(document.activeElement)) return;
+        // Never steal focus from an open portaled overlay (select listbox,
+        // menu, nested dialog). Those render outside the modal content, so the
+        // containment check above cannot see them.
+        const active = document.activeElement;
+        if (active && active !== document.body && active.closest?.('[data-escapee]')) return;
         backdropElement.focus();
         if (autoFocus) {
           const focusable = modalContentElement.querySelector(
@@ -118,23 +146,29 @@
           }
         }
       }, 100);
-      // A lazily-mounted editor may appear after the initial detect — keep the
-      // submit hint in sync as the modal's subtree changes.
-      const observer = new MutationObserver(detectTextarea);
-      observer.observe(modalContentElement, { childList: true, subtree: true });
-      return () => {
-        clearTimeout(timer);
-        observer.disconnect();
-      };
     }
+
+    // A lazily-mounted editor may appear after the initial detect — keep the
+    // submit hint in sync as the modal's subtree changes.
+    const observer = new MutationObserver(detectTextarea);
+    observer.observe(modalContentElement, { childList: true, subtree: true });
+    return () => observer.disconnect();
   });
 </script>
 
-{#if isOpen}
+{#if isOpen && inline}
+  <!-- Inline mode is used for long creation flows that need page-sized space
+       without dialog semantics, a backdrop, or scroll trapping. -->
+  <div
+    class="relative rounded-lg overflow-hidden w-full border"
+    style="background-color: var(--ds-surface-raised, var(--ds-surface, white)); border-color: var(--ds-border);"
+  >
+    {@render children?.(getDisplayString(submitShortcut))}
+  </div>
+{:else if isOpen}
   <!-- Backdrop -->
   <div
     use:portal
-    transition:fade={{ duration: 150 }}
     bind:this={backdropElement}
     class={`fixed inset-0 flex items-start justify-center pt-8 overflow-y-auto ${zIndexClass}`}
     style={noBackdrop ? '' : 'background-color: rgba(0, 0, 0, 0.4); backdrop-filter: blur(4px);'}
@@ -144,12 +178,11 @@
     onfocusin={detectTextarea}
     role="dialog"
     aria-modal="true"
+    data-testid={dataTestid}
   >
-    <!-- Modal with scale entrance animation -->
     <div
       bind:this={modalContentElement}
-      transition:scale={{ duration: 200, start: 0.95, easing: backOut }}
-      class="relative rounded-xl overflow-hidden {maxWidth} w-full mx-4 mb-8 {maxHeight ? 'flex flex-col' : ''}"
+      class="relative rounded-lg overflow-hidden {maxWidth} w-full mx-4 mb-8 {maxHeight ? 'flex flex-col' : ''}"
       style="background-color: var(--ds-surface-raised, var(--ds-surface, white)); box-shadow: var(--shadow-float, 0 20px 50px rgba(0, 0, 0, 0.18));{maxHeight ? ` max-height: ${maxHeight};` : ''}"
     >
       {@render children?.(submitHint)}

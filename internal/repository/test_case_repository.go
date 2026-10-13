@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"windshift/internal/database"
@@ -20,61 +21,123 @@ func NewTestCaseRepository(db database.Database) *TestCaseRepository {
 	return &TestCaseRepository{db: db}
 }
 
+// FindWorkspacesWithMatchingCases returns distinct workspace IDs containing
+// test cases matching the given search term, before caller-level permission
+// filtering is applied.
+func (r *TestCaseRepository) FindWorkspacesWithMatchingCases(query string) ([]int, error) {
+	searchTerm := "%" + query + "%"
+	rows, err := r.db.Query(`
+		SELECT DISTINCT workspace_id
+		FROM test_cases
+		WHERE title LIKE ? OR preconditions LIKE ?
+	`, searchTerm, searchTerm)
+	if err != nil {
+		return nil, fmt.Errorf("find workspaces with matching test cases: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var workspaceIDs []int
+	for rows.Next() {
+		var workspaceID int
+		if err := rows.Scan(&workspaceID); err != nil {
+			return nil, fmt.Errorf("scan test case workspace: %w", err)
+		}
+		workspaceIDs = append(workspaceIDs, workspaceID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate test case workspaces: %w", err)
+	}
+	return workspaceIDs, nil
+}
+
+// Search returns linkable test-case rows matching query within the given
+// workspaces. Callers must supply workspace IDs the user can access; an empty
+// set yields no rows.
+func (r *TestCaseRepository) Search(query string, workspaceIDs []int, limit int) ([]models.LinkableItem, error) {
+	if len(workspaceIDs) == 0 {
+		return []models.LinkableItem{}, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(workspaceIDs)), ",")
+	wsArgs := make([]any, len(workspaceIDs))
+	for i, id := range workspaceIDs {
+		wsArgs[i] = id
+	}
+
+	sqlQuery := fmt.Sprintf(`
+		SELECT id, title, COALESCE(preconditions, '') AS summary
+		FROM test_cases
+		WHERE (title LIKE ? OR preconditions LIKE ?)
+		  AND workspace_id IN (%s)
+		ORDER BY title
+		LIMIT ?
+	`, placeholders)
+
+	searchTerm := "%" + query + "%"
+	args := make([]any, 0, 3+len(wsArgs))
+	args = append(args, searchTerm, searchTerm)
+	args = append(args, wsArgs...)
+	args = append(args, limit)
+	rows, err := r.db.Query(sqlQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search test cases: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var items []models.LinkableItem
+	for rows.Next() {
+		var item models.LinkableItem
+		var summary sql.NullString
+
+		if err := rows.Scan(&item.ID, &item.Title, &summary); err != nil {
+			return nil, fmt.Errorf("scan test case search result: %w", err)
+		}
+
+		item.Description = summary.String
+		item.Type = "test_case"
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate test case search results: %w", err)
+	}
+
+	return items, nil
+}
+
 // TestCaseListParams contains parameters for listing test cases
 type TestCaseListParams struct {
 	WorkspaceID int
 	FolderID    *int // nil = root level, pointer to int = specific folder
 	All         bool // true = return all test cases in workspace
+	Limit       int
+	Offset      int
+	Search      string
+	LabelID     *int
 }
 
 // FindAll returns test cases with optional folder filtering
 func (r *TestCaseRepository) FindAll(params TestCaseListParams) ([]models.TestCase, error) {
-	var query string
-	var args []interface{}
+	query := `
+			SELECT tc.id, tc.workspace_id, tc.folder_id, tc.title,
+			       COALESCE(tc.preconditions, '') as preconditions,
+			       COALESCE(tc.format, 'steps') as format,
+			       COALESCE(tc.priority, 'medium') as priority,
+			       COALESCE(tc.status, 'active') as status,
+			       COALESCE(tc.estimated_duration, 0) as estimated_duration,
+			       tc.sort_order, tc.created_at, tc.updated_at, tf.name as folder_name
+			FROM test_cases tc
+			LEFT JOIN test_folders tf ON tc.folder_id = tf.id
+			WHERE tc.workspace_id = ?`
+	args := []any{params.WorkspaceID}
+	query, args = appendTestCaseListFilters(query, args, params)
 
-	switch {
-	case params.All:
-		query = `
-			SELECT tc.id, tc.workspace_id, tc.folder_id, tc.title,
-			       COALESCE(tc.preconditions, '') as preconditions,
-			       COALESCE(tc.priority, 'medium') as priority,
-			       COALESCE(tc.status, 'active') as status,
-			       COALESCE(tc.estimated_duration, 0) as estimated_duration,
-			       tc.sort_order, tc.created_at, tc.updated_at, tf.name as folder_name
-			FROM test_cases tc
-			LEFT JOIN test_folders tf ON tc.folder_id = tf.id
-			WHERE tc.workspace_id = ?
-			ORDER BY tf.sort_order, tc.sort_order, tc.title
-		`
-		args = append(args, params.WorkspaceID)
-	case params.FolderID == nil:
-		query = `
-			SELECT tc.id, tc.workspace_id, tc.folder_id, tc.title,
-			       COALESCE(tc.preconditions, '') as preconditions,
-			       COALESCE(tc.priority, 'medium') as priority,
-			       COALESCE(tc.status, 'active') as status,
-			       COALESCE(tc.estimated_duration, 0) as estimated_duration,
-			       tc.sort_order, tc.created_at, tc.updated_at, tf.name as folder_name
-			FROM test_cases tc
-			LEFT JOIN test_folders tf ON tc.folder_id = tf.id
-			WHERE tc.workspace_id = ? AND tc.folder_id IS NULL
-			ORDER BY tc.sort_order, tc.title
-		`
-		args = append(args, params.WorkspaceID)
-	default:
-		query = `
-			SELECT tc.id, tc.workspace_id, tc.folder_id, tc.title,
-			       COALESCE(tc.preconditions, '') as preconditions,
-			       COALESCE(tc.priority, 'medium') as priority,
-			       COALESCE(tc.status, 'active') as status,
-			       COALESCE(tc.estimated_duration, 0) as estimated_duration,
-			       tc.sort_order, tc.created_at, tc.updated_at, tf.name as folder_name
-			FROM test_cases tc
-			LEFT JOIN test_folders tf ON tc.folder_id = tf.id
-			WHERE tc.workspace_id = ? AND tc.folder_id = ?
-			ORDER BY tc.sort_order, tc.title
-		`
-		args = append(args, params.WorkspaceID, *params.FolderID)
+	if params.All {
+		query += " ORDER BY tf.sort_order, tc.sort_order, tc.title, tc.id"
+	} else {
+		query += " ORDER BY tc.sort_order, tc.title, tc.id"
+	}
+	if params.Limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, params.Limit, params.Offset)
 	}
 
 	rows, err := r.db.Query(query, args...)
@@ -90,7 +153,7 @@ func (r *TestCaseRepository) FindAll(params TestCaseListParams) ([]models.TestCa
 
 		err := rows.Scan(
 			&tc.ID, &tc.WorkspaceID, &tc.FolderID, &tc.Title, &tc.Preconditions,
-			&tc.Priority, &tc.Status, &tc.EstimatedDuration,
+			&tc.Format, &tc.Priority, &tc.Status, &tc.EstimatedDuration,
 			&tc.SortOrder, &tc.CreatedAt, &tc.UpdatedAt, &folderName,
 		)
 		if err != nil {
@@ -110,11 +173,74 @@ func (r *TestCaseRepository) FindAll(params TestCaseListParams) ([]models.TestCa
 	return testCases, nil
 }
 
+// Count returns the total for the same filters used by FindAll.
+func (r *TestCaseRepository) Count(params TestCaseListParams) (int, error) {
+	query := "SELECT COUNT(*) FROM test_cases tc WHERE tc.workspace_id = ?"
+	args := []any{params.WorkspaceID}
+	query, args = appendTestCaseListFilters(query, args, params)
+	var count int
+	if err := r.db.QueryRow(query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count test cases: %w", err)
+	}
+	return count, nil
+}
+
+func appendTestCaseListFilters(query string, args []any, params TestCaseListParams) (filteredQuery string, filteredArgs []any) {
+	if !params.All {
+		if params.FolderID == nil {
+			query += " AND tc.folder_id IS NULL"
+		} else {
+			query += " AND tc.folder_id = ?"
+			args = append(args, *params.FolderID)
+		}
+	}
+	if params.LabelID != nil {
+		query += " AND EXISTS (SELECT 1 FROM test_case_labels tcl WHERE tcl.test_case_id = tc.id AND tcl.label_id = ?)"
+		args = append(args, *params.LabelID)
+	}
+	if search := strings.TrimSpace(params.Search); search != "" {
+		pattern := "%" + strings.ToLower(search) + "%"
+		query += ` AND (
+			LOWER(tc.title) LIKE ? OR LOWER(COALESCE(tc.preconditions, '')) LIKE ? OR
+			LOWER(COALESCE(tc.priority, '')) LIKE ? OR LOWER(COALESCE(tc.status, '')) LIKE ? OR
+			EXISTS (SELECT 1 FROM test_case_labels search_tcl
+				JOIN test_labels search_tl ON search_tl.id = search_tcl.label_id
+				WHERE search_tcl.test_case_id = tc.id AND LOWER(search_tl.name) LIKE ?)
+		)`
+		args = append(args, pattern, pattern, pattern, pattern, pattern)
+	}
+	return query, args
+}
+
+// CountAll returns the number of test cases in a workspace without loading them.
+func (r *TestCaseRepository) CountAll(workspaceID int) (int, error) {
+	var count int
+	if err := r.db.QueryRow("SELECT COUNT(*) FROM test_cases WHERE workspace_id = ?", workspaceID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count test cases: %w", err)
+	}
+	return count, nil
+}
+
+// GetWorkspaceID resolves the owning workspace for a test case. Returns
+// ErrNotFound when the case is missing.
+func (r *TestCaseRepository) GetWorkspaceID(id int) (int, error) {
+	var workspaceID int
+	err := r.db.QueryRow(`SELECT workspace_id FROM test_cases WHERE id = ?`, id).Scan(&workspaceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("resolve test case workspace: %w", err)
+	}
+	return workspaceID, nil
+}
+
 // FindByID retrieves a single test case by ID
 func (r *TestCaseRepository) FindByID(id, workspaceID int) (*models.TestCase, error) {
 	query := `
 		SELECT tc.id, tc.workspace_id, tc.folder_id, tc.title,
 		       COALESCE(tc.preconditions, '') as preconditions,
+		       COALESCE(tc.format, 'steps') as format,
 		       COALESCE(tc.priority, 'medium') as priority,
 		       COALESCE(tc.status, 'active') as status,
 		       COALESCE(tc.estimated_duration, 0) as estimated_duration,
@@ -129,7 +255,7 @@ func (r *TestCaseRepository) FindByID(id, workspaceID int) (*models.TestCase, er
 
 	err := r.db.QueryRow(query, id, workspaceID).Scan(
 		&tc.ID, &tc.WorkspaceID, &tc.FolderID, &tc.Title, &tc.Preconditions,
-		&tc.Priority, &tc.Status, &tc.EstimatedDuration,
+		&tc.Format, &tc.Priority, &tc.Status, &tc.EstimatedDuration,
 		&tc.SortOrder, &tc.CreatedAt, &tc.UpdatedAt, &folderName,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -170,15 +296,42 @@ func (r *TestCaseRepository) GetMaxSortOrder(workspaceID int, folderID *int) (in
 	return int(maxSortOrder.Int64), nil
 }
 
+// GetMaxSortOrderTx is the transaction-scoped form used by atomic import
+// workflows.
+func (r *TestCaseRepository) GetMaxSortOrderTx(tx database.Tx, workspaceID int, folderID *int) (int, error) {
+	var maxSortOrder sql.NullInt64
+	var err error
+	if folderID != nil {
+		err = tx.QueryRow(
+			"SELECT MAX(sort_order) FROM test_cases WHERE workspace_id = ? AND folder_id = ?",
+			workspaceID,
+			*folderID,
+		).Scan(&maxSortOrder)
+	} else {
+		err = tx.QueryRow(
+			"SELECT MAX(sort_order) FROM test_cases WHERE workspace_id = ? AND folder_id IS NULL",
+			workspaceID,
+		).Scan(&maxSortOrder)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("failed to get max sort order: %w", err)
+	}
+	return int(maxSortOrder.Int64), nil
+}
+
 // Create inserts a new test case and returns its ID
 func (r *TestCaseRepository) Create(tx database.Tx, tc *models.TestCase) (int, error) {
+	format := tc.Format
+	if format == "" {
+		format = "steps"
+	}
 	query := `
-		INSERT INTO test_cases (workspace_id, folder_id, title, preconditions, priority, status, estimated_duration, sort_order, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+		INSERT INTO test_cases (workspace_id, folder_id, title, format, preconditions, priority, status, estimated_duration, sort_order, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
 	`
 
 	var id int64
-	err := tx.QueryRow(query, tc.WorkspaceID, tc.FolderID, tc.Title, tc.Preconditions,
+	err := tx.QueryRow(query, tc.WorkspaceID, tc.FolderID, tc.Title, format, tc.Preconditions,
 		tc.Priority, tc.Status, tc.EstimatedDuration,
 		tc.SortOrder, tc.CreatedAt, tc.UpdatedAt).Scan(&id)
 	if err != nil {
@@ -446,6 +599,32 @@ func (r *TestCaseRepository) FindLabelsByTestCaseID(testCaseID int) ([]models.Te
 	defer func() { _ = rows.Close() }()
 
 	return scanTestLabels(rows)
+}
+
+// FindLabelByNameTx returns a case-insensitive workspace label match within
+// the caller's transaction.
+func (r *TestCaseRepository) FindLabelByNameTx(tx database.Tx, workspaceID int, name string) (*models.TestLabel, error) {
+	var label models.TestLabel
+	err := tx.QueryRow(`
+		SELECT id, workspace_id, name, color, description, created_at, updated_at
+		FROM test_labels
+		WHERE workspace_id = ? AND LOWER(name) = LOWER(?)
+	`, workspaceID, name).Scan(
+		&label.ID,
+		&label.WorkspaceID,
+		&label.Name,
+		&label.Color,
+		&label.Description,
+		&label.CreatedAt,
+		&label.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find test label by name: %w", err)
+	}
+	return &label, nil
 }
 
 // CreateLabel creates a new test label

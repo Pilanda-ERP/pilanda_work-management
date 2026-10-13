@@ -9,7 +9,16 @@ import (
 // providerConfigVisionModeKey is the reserved provider_config key holding the
 // per-connection vision override. It is windshift-private — see
 // reservedProviderConfigKeys.
-const providerConfigVisionModeKey = "vision_mode"
+const (
+	providerConfigVisionModeKey  = "vision_mode"
+	providerConfigAPIContractKey = "api_contract"
+	providerConfigReasoningKey   = "reasoning"
+
+	APIContractAuto            = "auto"
+	APIContractResponses       = "responses"
+	APIContractChatCompletions = "chat_completions"
+	APIContractAnthropic       = "anthropic"
+)
 
 // reservedProviderConfigKeys are provider_config keys that windshift interprets
 // itself and must NOT be merged into the outbound provider request body. The
@@ -17,7 +26,19 @@ const providerConfigVisionModeKey = "vision_mode"
 // key like vision_mode would be sent to OpenAI/OpenRouter as an unknown request
 // field and could be rejected.
 var reservedProviderConfigKeys = map[string]bool{
-	providerConfigVisionModeKey: true,
+	providerConfigVisionModeKey:  true,
+	providerConfigAPIContractKey: true,
+	providerConfigReasoningKey:   true,
+}
+
+// ResponsesReasoningConfig contains the Responses reasoning controls that
+// Windshift accepts from a connection's provider_config. It is deliberately
+// limited to the request fields used by the Responses API so the private
+// connection setting cannot leak to another provider protocol.
+type ResponsesReasoningConfig struct {
+	Effort       string `json:"effort,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+	BudgetTokens int64  `json:"budget_tokens,omitempty"`
 }
 
 // ValidateProviderConfig verifies the per-connection provider_config blob.
@@ -45,7 +66,65 @@ func ValidateProviderConfig(raw string) error {
 			return fmt.Errorf("provider_config.vision_mode must be one of auto, on, off")
 		}
 	}
+	if rawContract, ok := cfg[providerConfigAPIContractKey]; ok {
+		var contract string
+		if err := json.Unmarshal(rawContract, &contract); err != nil {
+			return fmt.Errorf("provider_config.api_contract must be a string")
+		}
+		if !isValidAPIContract(strings.ToLower(strings.TrimSpace(contract))) {
+			return fmt.Errorf("provider_config.api_contract must be one of auto, responses, chat_completions")
+		}
+	}
+	if rawReasoning, ok := cfg[providerConfigReasoningKey]; ok {
+		var reasoningObject map[string]json.RawMessage
+		if err := json.Unmarshal(rawReasoning, &reasoningObject); err != nil || reasoningObject == nil {
+			return fmt.Errorf("provider_config.reasoning must be an object with string effort and summary fields")
+		}
+		var reasoning ResponsesReasoningConfig
+		if err := json.Unmarshal(rawReasoning, &reasoning); err != nil {
+			return fmt.Errorf("provider_config.reasoning must contain valid effort, summary, and budget_tokens fields")
+		}
+		if reasoning.BudgetTokens < 0 {
+			return fmt.Errorf("provider_config.reasoning.budget_tokens must be non-negative")
+		}
+	}
 	return nil
+}
+
+// ProviderConfigAPIContract returns the requested generation wire contract.
+// Auto lets the provider catalog choose while keeping custom OpenAI-compatible
+// gateways on Chat Completions for backward compatibility.
+func ProviderConfigAPIContract(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return APIContractAuto
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return APIContractAuto
+	}
+	rawContract, ok := cfg[providerConfigAPIContractKey]
+	if !ok {
+		return APIContractAuto
+	}
+	var contract string
+	if err := json.Unmarshal(rawContract, &contract); err != nil {
+		return APIContractAuto
+	}
+	contract = strings.ToLower(strings.TrimSpace(contract))
+	if !isValidAPIContract(contract) {
+		return APIContractAuto
+	}
+	return contract
+}
+
+func isValidAPIContract(contract string) bool {
+	switch contract {
+	case APIContractAuto, APIContractResponses, APIContractChatCompletions:
+		return true
+	default:
+		return false
+	}
 }
 
 // ProviderConfigVisionMode extracts the vision override from a provider_config
@@ -76,79 +155,30 @@ func ProviderConfigVisionMode(raw string) string {
 	return mode
 }
 
-// MergeProviderConfig adds provider_config fields to an in-memory request
-// body. Existing generated request fields win, so config cannot replace the
-// prompt, model, tools, or other fields already set by the caller.
-func MergeProviderConfig(body map[string]interface{}, raw string) error {
+// ProviderConfigResponsesReasoning extracts Responses reasoning controls from
+// provider_config. Invalid or incomplete input deliberately falls back to nil,
+// matching the permissive read behavior of the other provider config accessors.
+func ProviderConfigResponsesReasoning(raw string) *ResponsesReasoningConfig {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
 	}
 	var cfg map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
-		return fmt.Errorf("provider_config must be valid JSON: %w", err)
+		return nil
 	}
-	if cfg == nil {
-		return fmt.Errorf("provider_config must be a JSON object")
+	rawReasoning, ok := cfg[providerConfigReasoningKey]
+	if !ok {
+		return nil
 	}
-	for k, v := range cfg {
-		if reservedProviderConfigKeys[k] {
-			continue // windshift-private key, never forwarded to the provider
-		}
-		if _, exists := body[k]; exists {
-			continue
-		}
-		var decoded interface{}
-		if err := json.Unmarshal(v, &decoded); err != nil {
-			return fmt.Errorf("provider_config.%s must be valid JSON: %w", k, err)
-		}
-		body[k] = decoded
+	var reasoning ResponsesReasoningConfig
+	if err := json.Unmarshal(rawReasoning, &reasoning); err != nil {
+		return nil
 	}
-	return nil
-}
-
-// MergeProviderConfigJSON adds provider_config fields to a raw JSON request
-// body. It is used by the coding-agent proxy path, where the runner owns the
-// OpenAI-compatible request body and the broker only injects connection config.
-func MergeProviderConfigJSON(body []byte, raw string) ([]byte, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return body, nil
+	reasoning.Effort = strings.TrimSpace(reasoning.Effort)
+	reasoning.Summary = strings.TrimSpace(reasoning.Summary)
+	if reasoning.Effort == "" && reasoning.Summary == "" && reasoning.BudgetTokens == 0 {
+		return nil
 	}
-	var request map[string]json.RawMessage
-	if err := json.Unmarshal(body, &request); err != nil {
-		return nil, fmt.Errorf("request body must be a JSON object: %w", err)
-	}
-	if request == nil {
-		return nil, fmt.Errorf("request body must be a JSON object")
-	}
-	var cfg map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
-		return nil, fmt.Errorf("provider_config must be valid JSON: %w", err)
-	}
-	if cfg == nil {
-		return nil, fmt.Errorf("provider_config must be a JSON object")
-	}
-	for k, v := range cfg {
-		if reservedProviderConfigKeys[k] {
-			continue // windshift-private key, never forwarded to the provider
-		}
-		if _, exists := request[k]; exists {
-			continue
-		}
-		request[k] = v
-	}
-	merged, err := json.Marshal(request)
-	if err != nil {
-		return nil, fmt.Errorf("marshal provider-configured request: %w", err)
-	}
-	return merged, nil
-}
-
-func marshalWithProviderConfig(base interface{}, raw string) ([]byte, error) {
-	body, err := json.Marshal(base)
-	if err != nil {
-		return nil, err
-	}
-	return MergeProviderConfigJSON(body, raw)
+	return &reasoning
 }

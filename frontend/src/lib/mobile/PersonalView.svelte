@@ -1,192 +1,92 @@
 <script>
-  import { authStore } from '../stores';
   import { api } from '../api.js';
   import { navigate } from '../router.js';
-  import { Check } from '@lucide/svelte';
+  import { Command as CommandIcon } from '@lucide/svelte';
+  import TodoList from '../features/items/TodoList.svelte';
   import MobileHeader from './MobileHeader.svelte';
+  import { mobilePalette } from './mobilePalette.svelte.js';
+  import { t } from '../stores/i18n.svelte.js';
 
-  // Personal-workspace status ids: 1 = Open, 3 = Done (workspace default taxonomy).
-  const STATUS_OPEN = 1;
-  const STATUS_DONE = 3;
-
-  let tasks = $state([]);
-  let loading = $state(false);
-  let errored = $state(false);
+  // The Personal tab embeds the desktop TodoList (sections, quick-add,
+  // completed-range filter, status toggles) instead of keeping a parallel
+  // mobile checklist. Rows delegate to the mobile item detail route; only
+  // the workspace resolution and error state live here.
   let personalWorkspaceId = $state(null);
-  let toggling = $state(new Set());
-  let version = 0;
+  let loadFailed = $state(false);
+  // Bumping the nonce remounts the list: a task created in this tab (mobile
+  // create flow) doesn't broadcast to the posting tab, so refresh directly.
+  let listNonce = $state(0);
 
-  const currentUserId = $derived($authStore?.currentUser?.id ?? null);
-
-  function isDone(task) {
-    return Boolean(task.status_completed) || task.status_id === STATUS_DONE;
-  }
-
-  async function load() {
-    const v = ++version;
-    loading = true;
-    errored = false;
+  async function loadWorkspace() {
+    loadFailed = false;
     try {
-      if (!personalWorkspaceId) {
-        const ws = await api.workspaces.getOrCreatePersonal();
-        if (v !== version) return;
-        personalWorkspaceId = ws?.id ?? null;
-      }
-      if (!personalWorkspaceId) {
-        tasks = [];
-        return;
-      }
-      const res = await api.items.getAll({
-        ql: `workspace_id = ${personalWorkspaceId}`,
-        limit: 50,
-        order_by: 'updated_at',
-      });
-      if (v !== version) return;
-      tasks = Array.isArray(res) ? res : (res?.items ?? []);
+      const ws = await api.workspaces.getOrCreatePersonal();
+      personalWorkspaceId = ws?.id ?? null;
+      loadFailed = !personalWorkspaceId;
     } catch (err) {
-      if (v !== version) return;
-      console.error('Failed to load personal tasks:', err);
-      errored = true;
-      tasks = [];
-    } finally {
-      if (v === version) loading = false;
+      console.error('Failed to load personal workspace:', err);
+      personalWorkspaceId = null;
+      loadFailed = true;
     }
   }
 
-  async function toggleDone(task, e) {
-    e.stopPropagation();
-    if (toggling.has(task.id)) return;
-    toggling = new Set(toggling).add(task.id);
-    const target = isDone(task) ? STATUS_OPEN : STATUS_DONE;
-    try {
-      const updated = await api.items.transition(task.id, target);
-      tasks = tasks.map((t) => (t.id === task.id ? { ...t, ...updated } : t));
-    } catch (err) {
-      console.error('Failed to toggle personal task:', err);
-    } finally {
-      const next = new Set(toggling);
-      next.delete(task.id);
-      toggling = next;
-    }
-  }
-
-  let bootstrapped = false;
   $effect(() => {
-    if (!bootstrapped && currentUserId) {
-      bootstrapped = true;
-      load();
-    }
+    loadWorkspace();
   });
 
-  // A personal task created in this tab (mobile create dialog) won't be
-  // caught by the cross-tab BroadcastChannel, which excludes the posting
-  // tab. Refresh the list directly when one is added.
-  function onPersonalTaskCreated() {
-    load();
-  }
   $effect(() => {
-    window.addEventListener('personal-task-created', onPersonalTaskCreated);
-    return () => window.removeEventListener('personal-task-created', onPersonalTaskCreated);
+    const onCreated = () => (listNonce += 1);
+    window.addEventListener('personal-task-created', onCreated);
+    return () => window.removeEventListener('personal-task-created', onCreated);
   });
 </script>
 
-<MobileHeader title="Personal" />
+<MobileHeader title={t('workspaces.personal')}>
+  {#snippet right()}
+    <button class="hdr-palette" onclick={() => mobilePalette.open()} data-testid="mobile-palette-open" aria-label={t('mobile.palette.title')} type="button">
+      <CommandIcon size={20} />
+    </button>
+  {/snippet}
+</MobileHeader>
 
-<div class="list" data-testid="personal-list">
-  {#if loading && tasks.length === 0}
-    <div class="skeleton">
-      {#each Array(5) as _}<div class="sk-row"></div>{/each}
-    </div>
-  {:else if errored}
-    <p class="msg" data-testid="personal-error">Couldn't load your personal tasks.</p>
-  {:else if tasks.length === 0}
-    <p class="msg" data-testid="personal-empty">Your personal todo list is empty.</p>
-  {:else}
-    {#each tasks as task (task.id)}
-      {@const done = isDone(task)}
-      <div class="row" data-testid="personal-row">
-        <button
-          class="check"
-          class:checked={done}
-          onclick={(e) => toggleDone(task, e)}
-          disabled={toggling.has(task.id)}
-          data-testid="personal-toggle"
-          aria-label={done ? 'Mark not done' : 'Mark done'}
-          type="button"
-        >
-          {#if done}<Check size={14} strokeWidth={3} />{/if}
-        </button>
-        <button class="body" onclick={() => navigate(`/m/items/${task.id}`)} type="button">
-          <span class="title" class:done>{task.title}</span>
-        </button>
-      </div>
-    {/each}
-  {/if}
-</div>
+{#if loadFailed}
+  <div class="state" data-testid="personal-error">
+    <p>{t('mobile.personal.loadFailed')}</p>
+    <button class="retry" onclick={loadWorkspace} type="button">{t('common.retry')}</button>
+  </div>
+{:else if personalWorkspaceId}
+  {#key listNonce}
+    <TodoList
+      workspaceId={personalWorkspaceId}
+      onopen={(itemId) => navigate(`/m/items/${itemId}`)}
+    />
+  {/key}
+{/if}
 
 <style>
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.625rem 0.75rem;
-    border-bottom: 1px solid var(--ds-border);
-    min-height: 52px;
-  }
-
-  .check {
-    flex-shrink: 0;
-    width: 24px;
-    height: 24px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border: 2px solid var(--ds-border-bold, var(--ds-border));
-    border-radius: var(--radius-full, 9999px);
-    background: transparent;
-    color: #fff;
-    cursor: pointer;
-  }
-
-  .check.checked {
-    background-color: var(--ds-success, #4cb782);
-    border-color: var(--ds-success, #4cb782);
-  }
-
-  .body {
-    flex: 1 1 auto;
-    min-width: 0;
-    text-align: left;
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 0;
-  }
-
-  .title {
-    font-size: 0.9375rem;
-    color: var(--ds-text);
-  }
-
-  .title.done {
-    text-decoration: line-through;
-    color: var(--ds-text-subtlest, var(--ds-text-subtle));
-  }
-
-  .msg {
-    padding: 2rem 1.25rem;
+  .state {
+    padding: 3rem 1.25rem;
     text-align: center;
     color: var(--ds-text-subtle);
-    font-size: 0.875rem;
   }
+  .state p { margin: 0; }
+  .retry {
+    min-height: 40px;
+    margin-top: 0.75rem;
+    padding: 0.45rem 1rem;
+    border: 1px solid var(--ds-interactive);
+    border-radius: var(--radius-md, 6px);
+    background: var(--ds-interactive);
+    color: var(--ds-text-inverse, #fff);
+    font: inherit;
+    font-weight: var(--font-semibold, 600);
+    cursor: pointer;
+  }
+  .retry:disabled { opacity: 0.6; }
 
-  .skeleton { display: flex; flex-direction: column; }
-  .sk-row {
-    height: 52px;
-    border-bottom: 1px solid var(--ds-border);
-    background: linear-gradient(90deg, var(--ds-surface) 0%, var(--ds-background-neutral) 50%, var(--ds-surface) 100%);
-    background-size: 200% 100%;
-    animation: shimmer 1.2s ease-in-out infinite;
+  .hdr-palette {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 36px; height: 36px; border: none; background: transparent;
+    color: var(--ds-text); cursor: pointer;
   }
-  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 </style>

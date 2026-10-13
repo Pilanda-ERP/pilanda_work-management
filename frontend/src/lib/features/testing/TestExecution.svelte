@@ -1,19 +1,31 @@
 <script>
   import { onMount } from 'svelte';
+  import ModalBackdrop from '../../components/ModalBackdrop.svelte';
   import { currentRoute, navigate } from '../../router.js';
   import { api } from '../../api.js';
-  import { IconCheck, IconX, IconBug, IconArrowLeft, IconChevronRight, IconChevronLeft, IconAlertTriangle, IconPlus, IconLink, IconPlayerSkipForward } from '@tabler/icons-svelte-runes';
+  import { isExpectedBackgroundSyncError } from '../../utils/backgroundSync.js';
+  import { IconCheck, IconX, IconBug, IconArrowLeft, IconChevronRight, IconChevronLeft, IconPlus, IconLink, IconPlayerSkipForward } from '@tabler/icons-svelte-runes';
   import { confirm } from '../../composables/useConfirm.js';
   import Button from '../../components/Button.svelte';
-  import Spinner from '../../components/Spinner.svelte';
+  import Card from '../../components/Card.svelte';
+  import Panel from '../../components/Panel.svelte';
+  import Progress from '../../components/Progress.svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
+  import EmptyState from '../../components/EmptyState.svelte';
+  import AlertBox from '../../components/AlertBox.svelte';
+  import Lozenge from '../../components/Lozenge.svelte';
   import MilkdownEditor from '../../editors/LazyMilkdownEditor.svelte';
   import ItemPicker from '../../pickers/ItemPicker.svelte';
   import CreateModal from '../../dialogs/CreateModal.svelte';
   import Label from '../../components/Label.svelte';
   import Textarea from '../../components/Textarea.svelte';
-  import { getStatusBadgeCSS, getStatusLabel, getStatusButtonStyle } from '../../utils/statusColors.js';
+  import { getStatusLabel, getTestStatusColor } from '../../utils/statusColors.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { workspacePermissions } from '../../stores/index.js';
   import DescriptionText from '../../components/DescriptionText.svelte';
+  import { loadTestRunDetail } from './testRunDetailData.js';
+import BDDExampleExecution from './BDDExampleExecution.svelte';
+import { parseScenarioSpec, flattenExamples } from './bddSpec.js';
 
   let testRun = $state(null);
   let testCases = $state([]);
@@ -27,6 +39,10 @@
   let pendingLinkStepId = $state(null);
   let sidebarCollapsed = $state(false);
   let previewImage = $state(null);
+  // BDD execution state: frozen spec snapshots and example results, keyed by
+  // test case id. Both come with the run detail payload.
+  let bddSnapshots = $state({});
+  let bddExampleResults = $state({});
 
   function handleRenderedContentClick(event) {
     if (event.target.tagName === 'IMG') {
@@ -39,9 +55,14 @@
 
   let workspaceId = $derived($currentRoute.params.id);
   let runId = $derived($currentRoute.params.runId);
+  // Recording results and finishing a run are the test.execute tier (denied
+  // server-side with 404 otherwise); read-only users just follow along.
+  let canExecuteTests = $derived(workspacePermissions.canExecuteTests(workspaceId));
   let fromPage = $derived($currentRoute.query?.from);
   let currentCase = $derived((Array.isArray(testCases) && testCases[currentCaseIndex]) || null);
   let currentStep = $derived(currentCase?.test_steps?.[currentStepIndex] || null);
+  let currentCaseIsBdd = $derived(isBddCase(currentCase));
+  let currentExampleRows = $derived(currentCaseIsBdd ? bddRowsFor(currentCase) : []);
 
   function testPath(suffix = '') {
     const base = workspaceId ? `/workspaces/${workspaceId}/tests` : '/workspaces';
@@ -50,18 +71,20 @@
 
   onMount(async () => {
     if (runId) {
-      await loadTestRun(runId);
-      await loadWorkspaceItems();
+      await Promise.all([loadTestRun(runId), loadWorkspaceItems()]);
     }
   });
 
   async function loadWorkspaceItems() {
     try {
       const response = await api.items.getAll({ workspace_id: workspaceId });
-      // API returns { items: [], total_count, page, limit }
-      workspaceItems = response?.items || [];
+      workspaceItems = response?.data ?? [];
     } catch (error) {
-      console.error('Failed to load workspace items:', error);
+      // Navigating away aborts the in-flight fetch — expected control flow,
+      // not a failure to surface in the console.
+      if (!isExpectedBackgroundSyncError(error)) {
+        console.error('Failed to load workspace items:', error);
+      }
       workspaceItems = [];
     }
   }
@@ -70,55 +93,21 @@
     try {
       loading = true;
 
-      // Load test run details
-      testRun = await api.tests.testRuns.get(workspaceId, runId);
-      if (!testRun) {
-        throw new Error('Test run not found');
+      const detail = await loadTestRunDetail(api, workspaceId, runId);
+      testRun = detail.run;
+      bddSnapshots = detail.bddSnapshots;
+      const groupedExampleResults = {};
+      for (const result of detail.bddExampleResults) {
+        (groupedExampleResults[result.test_case_id] ??= []).push(result);
       }
-
-      // Load test cases for this run's test plan
-      const testSet = await api.tests.testSets.get(workspaceId, testRun.set_id);
-      if (!testSet) {
-        throw new Error('Test set not found');
-      }
-
-      const loadedTestCases = await api.tests.testSets.getTestCases(workspaceId, testRun.set_id);
-
-      // Ensure we have an array
-      if (!Array.isArray(loadedTestCases)) {
-        console.error('getTestCases did not return an array:', loadedTestCases);
-        testCases = [];
-        return;
-      }
-
-      // Load test steps for each test case
-      // Create a new array with steps to trigger proper reactivity
-      const testCasesWithSteps = [];
-      for (let testCase of loadedTestCases) {
-        try {
-          const steps = await api.tests.testCases.steps.getAll(workspaceId, testCase.id);
-          const testCaseWithSteps = {
-            ...testCase,
-            test_steps: Array.isArray(steps) ? steps : []
-          };
-          testCasesWithSteps.push(testCaseWithSteps);
-        } catch (error) {
-          console.error(`Failed to load steps for test case ${testCase.id}:`, error);
-          testCasesWithSteps.push({
-            ...testCase,
-            test_steps: []
-          });
-        }
-      }
-
-      // Update the testCases array all at once to trigger proper reactivity
-      testCases = testCasesWithSteps;
+      bddExampleResults = groupedExampleResults;
+      testCases = detail.testCases;
+      testResults = {};
+      stepResults = {};
 
       // Initialize results
       initializeResults();
-
-      // Load existing step results from database
-      await loadExistingResults();
+      applyExistingResults(detail.stepResults, detail.results);
 
     } catch (error) {
       console.error('Failed to load test run:', error);
@@ -168,53 +157,31 @@
     });
   }
 
-  async function loadExistingResults() {
-    try {
-      // Load step results from the database. Backend keys the response by
-      // `${testCaseID}_${stepID}` so the same step in two different test
-      // cases stays distinct; we remap to local step.id keys here (mirrors
-      // TestRunDetail.svelte). Reading `item_id` (not `defect_id`) matches
-      // the field the backend emits.
-      const existingStepResults = await api.tests.testRuns.getStepResults(workspaceId, runId);
-
-      testCases.forEach(testCase => {
-        (testCase.test_steps || []).forEach(step => {
-          const compositeKey = `${testCase.id}_${step.id}`;
-          const existingResult = existingStepResults[compositeKey];
-          if (!existingResult) return;
-          stepResults[step.id] = {
-            status: existingResult.status || 'not_run',
-            actual_result: existingResult.actual_result || '',
-            notes: existingResult.notes || '',
-            item_id: existingResult.item_id ?? null
-          };
-        });
+  function applyExistingResults(existingStepResults, resultRows) {
+    // Backend keys step results by `${testCaseID}_${stepID}`. Remap to the
+    // globally unique step id used by the execution UI.
+    testCases.forEach(testCase => {
+      (testCase.test_steps || []).forEach(step => {
+        const existingResult = existingStepResults[`${testCase.id}_${step.id}`];
+        if (!existingResult) return;
+        stepResults[step.id] = {
+          status: existingResult.status || 'not_run',
+          actual_result: existingResult.actual_result || '',
+          notes: existingResult.notes || '',
+          item_id: existingResult.item_id ?? null
+        };
       });
+    });
+    stepResults = { ...stepResults };
 
-      // Trigger reactivity
-      stepResults = { ...stepResults };
-
-      // Load per-test-case result rows so we know the test_result.id to attach
-      // screenshots to. The row is created when the run starts, so it always
-      // exists by the time we get here.
-      try {
-        const resultRows = await api.tests.testRuns.getResults(workspaceId, runId);
-        if (Array.isArray(resultRows)) {
-          for (const row of resultRows) {
-            testResults[row.test_case_id] = {
-              ...(testResults[row.test_case_id] ?? {}),
-              id: row.id,
-              status: row.status || testResults[row.test_case_id]?.status || 'not_run',
-            };
-          }
-          testResults = { ...testResults };
-        }
-      } catch (resultErr) {
-        console.error('Failed to load test_result rows for attachments:', resultErr);
-      }
-    } catch (error) {
-      console.error('Failed to load existing step results:', error);
+    for (const row of resultRows) {
+      testResults[row.test_case_id] = {
+        ...(testResults[row.test_case_id] ?? {}),
+        id: row.id,
+        status: row.status || testResults[row.test_case_id]?.status || 'not_run',
+      };
     }
+    testResults = { ...testResults };
   }
 
   function setInitialTestCasePosition() {
@@ -223,9 +190,20 @@
       return;
     }
 
-    // Find the first test case that has steps and incomplete work
+    // Find the first test case with incomplete work (steps or BDD examples)
     for (let caseIndex = 0; caseIndex < testCases.length; caseIndex++) {
       const testCase = testCases[caseIndex];
+
+      if (isBddCase(testCase)) {
+        const rows = bddExampleResults[testCase.id] || [];
+        const hasIncompleteExamples = rows.some(row => !row.status || row.status === 'not_run');
+        if (rows.length === 0 || hasIncompleteExamples) {
+          currentCaseIndex = caseIndex;
+          currentStepIndex = 0;
+          return;
+        }
+        continue;
+      }
 
       if (testCase.test_steps && testCase.test_steps.length > 0) {
         // Check if this test case has any incomplete steps
@@ -252,10 +230,10 @@
       }
     }
 
-    // If all test cases are complete or no steps found, find first case with steps
+    // If all test cases are complete, find first execution target
     for (let caseIndex = 0; caseIndex < testCases.length; caseIndex++) {
       const testCase = testCases[caseIndex];
-      if (testCase.test_steps && testCase.test_steps.length > 0) {
+      if (isExecutionTarget(testCase)) {
         currentCaseIndex = caseIndex;
         currentStepIndex = 0;
         return;
@@ -272,11 +250,54 @@
     currentStepIndex = 0;
   }
 
+  // A case is an execution target when it has steps (step format) or a
+  // frozen BDD spec with example rows (bdd format).
+  function isBddCase(testCase) {
+    return testCase?.format === 'bdd';
+  }
+
+  function bddStatusColor(status) {
+    switch (status) {
+      case 'passed': return 'var(--ds-status-success-solid)';
+      case 'failed': return 'var(--ds-status-danger-solid)';
+      case 'blocked': return 'var(--ds-status-warning-solid)';
+      case 'skipped': return 'var(--ds-status-neutral-solid)';
+      default: return 'var(--ds-progress-track)';
+    }
+  }
+
+  function isExecutionTarget(testCase) {
+    return isBddCase(testCase) || (testCase?.test_steps && testCase.test_steps.length > 0);
+  }
+
+  function bddRowsFor(testCase) {
+    return bddExampleResults[testCase?.id] || [];
+  }
+
+  function currentCaseSnapshot() {
+    return bddSnapshots[currentCase?.id] || null;
+  }
+
+  function handleBddResultsChange(updatedResults) {
+    bddExampleResults = {
+      ...bddExampleResults,
+      [currentCase.id]: updatedResults,
+    };
+  }
+
   function goToStep(index) {
     currentStepIndex = index;
   }
 
   function nextStep() {
+    // BDD cases execute as a whole; navigation is case-level.
+    if (isBddCase(currentCase)) {
+      if (currentCaseIndex < testCases.length - 1) {
+        currentCaseIndex++;
+        currentStepIndex = 0;
+      }
+      return;
+    }
     // If current case has steps and we're not at the last step
     if (currentCase?.test_steps?.length > 0 && currentStepIndex < currentCase.test_steps.length - 1) {
       currentStepIndex++;
@@ -286,7 +307,7 @@
         currentCaseIndex++;
         currentStepIndex = 0;
         // If the next test case has no steps, keep moving forward
-        while (currentCaseIndex < testCases.length && (!testCases[currentCaseIndex].test_steps || testCases[currentCaseIndex].test_steps.length === 0)) {
+        while (currentCaseIndex < testCases.length && !isExecutionTarget(testCases[currentCaseIndex])) {
           if (currentCaseIndex < testCases.length - 1) {
             currentCaseIndex++;
           } else {
@@ -298,13 +319,20 @@
   }
 
   function previousStep() {
+    if (isBddCase(currentCase)) {
+      if (currentCaseIndex > 0) {
+        currentCaseIndex--;
+        currentStepIndex = 0;
+      }
+      return;
+    }
     if (currentStepIndex > 0) {
       currentStepIndex--;
     } else if (currentCaseIndex > 0) {
       // Move to previous test case
       currentCaseIndex--;
       // If the previous test case has no steps, keep moving backward
-      while (currentCaseIndex >= 0 && (!testCases[currentCaseIndex].test_steps || testCases[currentCaseIndex].test_steps.length === 0)) {
+      while (currentCaseIndex >= 0 && !isExecutionTarget(testCases[currentCaseIndex])) {
         if (currentCaseIndex > 0) {
           currentCaseIndex--;
         } else {
@@ -313,7 +341,11 @@
       }
       // Set to last step of the previous test case, or 0 if no steps
       const prevCase = testCases[currentCaseIndex];
-      currentStepIndex = Math.max(0, (prevCase?.test_steps?.length || 1) - 1);
+      if (isBddCase(prevCase)) {
+        currentStepIndex = 0;
+      } else {
+        currentStepIndex = Math.max(0, (prevCase?.test_steps?.length || 1) - 1);
+      }
     }
   }
 
@@ -401,9 +433,20 @@
     }
   }
 
-  // Status colors now handled by imported utility (getStatusBadgeCSS, getStatusLabel)
+  // Status labels and button styles are shared with the other test views.
 
   function getCaseProgress(testCase, currentStepResults = stepResults) {
+    if (isBddCase(testCase)) {
+      const rows = bddExampleResults[testCase.id] || [];
+      const total = flattenExamples(parseScenarioSpec(bddSnapshots[testCase.id]?.spec))?.length || rows.length;
+      const completed = rows.filter(row => row.status && row.status !== 'not_run').length;
+      return {
+        completed,
+        total,
+        percent: total > 0 ? Math.round((completed / total) * 100) : 0
+      };
+    }
+
     const steps = testCase.test_steps || [];
     if (steps.length === 0) return { completed: 0, total: 0, percent: 0 };
     
@@ -455,11 +498,16 @@
 </script>
 
 {#if loading}
-  <div class="flex items-center justify-center h-96">
-    <Spinner size="lg" />
-  </div>
+  <StateDisplay type="loading" message={t('common.loading')} size="lg" />
 {:else if testRun && currentCase}
-  <div class="flex min-h-screen" style="background-color: var(--ds-surface-raised);">
+  <div
+    class="flex min-h-screen"
+    style="background-color: var(--ds-surface);"
+    data-testid="test-execution"
+    data-run-id={runId}
+    data-current-case-id={currentCase?.id}
+    data-current-step-id={currentStep?.id}
+  >
     <!-- Left Sidebar - Test Cases (Collapsible) -->
     <div class="{sidebarCollapsed ? 'w-14' : 'w-64'} border-r flex flex-col transition-all duration-200" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
       <!-- Header -->
@@ -468,10 +516,9 @@
           <div class="flex items-center gap-2 min-w-0">
             <button
               onclick={goBack}
-              class="p-1 rounded cursor-pointer flex-shrink-0"
+              data-testid="test-execution-back"
+              class="hover-bg p-1 rounded cursor-pointer flex-shrink-0"
               style="color: var(--ds-icon);"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
             >
               <IconArrowLeft class="w-4 h-4" />
             </button>
@@ -485,11 +532,9 @@
         {/if}
         <button
           onclick={() => sidebarCollapsed = !sidebarCollapsed}
-          class="p-1 rounded cursor-pointer flex-shrink-0"
+          class="hover-bg p-1 rounded cursor-pointer flex-shrink-0"
           style="color: var(--ds-icon);"
           title={sidebarCollapsed ? t('testing.expandSidebar') : t('testing.collapseSidebar')}
-          onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-          onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
         >
           <IconChevronLeft class="w-4 h-4 transition-transform {sidebarCollapsed ? 'rotate-180' : ''}" />
         </button>
@@ -504,10 +549,10 @@
             {@const isCollapsedActive = currentCaseIndex === index}
             <button
               type="button"
-              class="appearance-none bg-transparent border-none font-[inherit] text-[inherit] text-left w-full m-0 cursor-pointer mb-2 p-1 rounded-lg transition-all"
-              style={isCollapsedActive ? 'background: var(--ds-surface); box-shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);' : ''}
-              onmouseenter={(e) => { if (!isCollapsedActive) e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'; }}
-              onmouseleave={(e) => { if (!isCollapsedActive) e.currentTarget.style.background = ''; }}
+              data-testid={`test-execution-case-${testCase.id}`}
+              data-progress={progress.percent}
+              class="case-pill appearance-none bg-transparent border-none font-[inherit] text-[inherit] text-left w-full m-0 cursor-pointer mb-2 p-1 rounded-lg transition-all"
+              class:active={isCollapsedActive}
               onclick={() => goToCase(index)}
               title="{testCase.title} ({progress.percent}%)"
             >
@@ -526,10 +571,10 @@
             {@const isExpandedActive = currentCaseIndex === index}
             <button
               type="button"
-              class="appearance-none bg-transparent font-[inherit] text-[inherit] text-left w-full m-0 cursor-pointer p-3 mb-2 rounded-lg border transition-all"
-              style={isExpandedActive ? 'border-color: var(--ds-interactive); background: var(--ds-surface); box-shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);' : 'border-color: var(--ds-border);'}
-              onmouseenter={(e) => { if (!isExpandedActive) e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'; }}
-              onmouseleave={(e) => { if (!isExpandedActive) e.currentTarget.style.background = ''; }}
+              data-testid={`test-execution-case-${testCase.id}`}
+              data-progress={progress.percent}
+              class="case-card appearance-none bg-transparent font-[inherit] text-[inherit] text-left w-full m-0 cursor-pointer p-3 mb-2 rounded-lg border transition-all"
+              class:active={isExpandedActive}
               onclick={() => goToCase(index)}
             >
               <div class="font-medium text-sm mb-1 truncate" style="color: var(--ds-text);">
@@ -538,59 +583,60 @@
               <div class="text-xs mb-2" style="color: var(--ds-text-subtle);">
                 {t('testing.stepsProgress', { completed: progress.completed, total: progress.total, percent: progress.percent })}
               </div>
-              <div class="w-full rounded-full h-1" style="background-color: var(--ds-progress-track);">
-                <div
-                  class="h-1 rounded-full transition-all duration-300"
-                  style="width: {progress.percent}%; background-color: var(--ds-progress-fill);"
-                ></div>
-              </div>
+              <Progress value={progress.percent} size="sm" />
             </button>
           {/if}
         {/each}
       </div>
 
       <!-- Footer Actions -->
-      <div class="p-2 border-t" style="border-color: var(--ds-border);">
-        {#if sidebarCollapsed}
-          <Button
-            onclick={finishExecution}
-            variant="primary"
-            size="small"
-            class="w-full"
-            title={t('testing.finishExecution')}
-          >
-            <IconCheck class="w-4 h-4" />
-          </Button>
-        {:else}
-          <Button
-            onclick={finishExecution}
-            variant="primary"
-            size="medium"
-            class="w-full"
-          >
-            {t('testing.finishExecution')}
-          </Button>
-        {/if}
-      </div>
+      {#if canExecuteTests}
+        <div class="p-2 border-t" style="border-color: var(--ds-border);">
+          {#if sidebarCollapsed}
+            <Button
+              onclick={finishExecution}
+              variant="primary"
+              size="small"
+              class="w-full"
+              title={t('testing.finishExecution')}
+              dataTestid="test-execution-finish-sidebar"
+            >
+              <IconCheck class="w-4 h-4" />
+            </Button>
+          {:else}
+            <Button
+              onclick={finishExecution}
+              variant="primary"
+              size="medium"
+              class="w-full"
+              dataTestid="test-execution-finish-sidebar"
+            >
+              {t('testing.finishExecution')}
+            </Button>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     <!-- Main Content - Step Execution -->
-    <div class="flex-1 flex flex-col">
+    <div class="min-w-0 flex-1 flex flex-col">
       <!-- Step Header -->
       <div class="p-6 border-b" style="border-color: var(--ds-border);">
-        <div class="flex items-center justify-between mb-4">
-          <div>
+        <div class="flex items-center justify-between gap-6 mb-4">
+          <div class="min-w-0 flex-1 [overflow-wrap:anywhere]">
             <h1 class="text-xl font-semibold" style="color: var(--ds-text);">
               {currentCase.title}
             </h1>
             {#if currentCase.preconditions}
-              <div class="text-sm mt-2 px-3 py-2 rounded border-l-4" style="background-color: var(--ds-background-neutral); border-left-color: var(--ds-status-info-solid);">
-                <strong style="color: var(--ds-text);">{t('testing.preconditions')}</strong> <span style="color: var(--ds-text-subtle);">{currentCase.preconditions}</span>
-              </div>
+              <AlertBox variant="info" class="mt-3">
+                <strong>{t('testing.preconditions')}:</strong> {currentCase.preconditions}
+              </AlertBox>
             {/if}
           </div>
-          <div class="text-sm" style="color: var(--ds-text-subtle);">
-            {#if currentCase.test_steps && currentCase.test_steps.length > 0}
+          <div class="shrink-0 whitespace-nowrap text-sm" style="color: var(--ds-text-subtle);">
+            {#if currentCaseIsBdd}
+              {t('testing.examplesCount', { count: currentExampleRows.length })}
+            {:else if currentCase.test_steps && currentCase.test_steps.length > 0}
               {t('testing.stepOfTotal', { current: currentStepIndex + 1, total: currentCase.test_steps.length })}
             {:else}
               {t('testing.noStepsDefined')}
@@ -610,14 +656,24 @@
           </Button>
           
           <div class="flex-1 flex gap-1">
-            {#if currentCase.test_steps && currentCase.test_steps.length > 0}
+            {#if currentCaseIsBdd}
+              {#each currentExampleRows as row (row.example_index)}
+                <div
+                  class="step-seg flex-1 h-2 rounded"
+                  style={`background-color: ${bddStatusColor(row.status)}`}
+                  title={t('testing.exampleN', { n: row.example_index + 1 })}
+                ></div>
+              {/each}
+              {#if currentExampleRows.length === 0}
+                <div class="flex-1 h-2 rounded" style="background-color: var(--ds-progress-track);"></div>
+              {/if}
+            {:else if currentCase.test_steps && currentCase.test_steps.length > 0}
               {#each currentCase.test_steps as step, index}
                 <button
                   onclick={() => goToStep(index)}
-                  class="flex-1 h-2 rounded transition cursor-pointer"
-                  style="background-color: {currentStepIndex === index ? 'var(--ds-progress-fill)' : 'var(--ds-progress-track)'};"
-                  onmouseenter={(e) => { if (currentStepIndex !== index) e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'; }}
-                  onmouseleave={(e) => { if (currentStepIndex !== index) e.currentTarget.style.backgroundColor = 'var(--ds-progress-track)'; }}
+                  data-testid={`test-execution-step-${step.id}`}
+                  class="step-seg flex-1 h-2 rounded transition cursor-pointer"
+                  class:current={currentStepIndex === index}
                   aria-label="Step {index + 1}"
                 ></button>
               {/each}
@@ -637,8 +693,22 @@
         </div>
       </div>
 
-      <!-- Step Content -->
-      {#if currentStep}
+      <!-- Case Content -->
+      {#if currentCaseIsBdd}
+        <div class="flex-1 p-6 overflow-y-auto">
+          <div class="max-w-4xl">
+            <BDDExampleExecution
+              {workspaceId}
+              {runId}
+              testCase={currentCase}
+              snapshot={currentCaseSnapshot()}
+              initialResults={currentExampleRows}
+              canExecute={canExecuteTests}
+              onResultsChange={handleBddResultsChange}
+            />
+          </div>
+        </div>
+      {:else if currentStep}
         <div class="flex-1 p-6 overflow-y-auto">
           <div class="max-w-4xl">
             <!-- Step Details -->
@@ -647,42 +717,43 @@
                 <h3 class="font-medium mb-2" style="color: var(--ds-status-info-text);">{t('testing.action')}</h3>
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div class="p-4 border rounded test-step-rendered" style="border-color: var(--ds-border); background-color: var(--ds-background-neutral);" onclick={handleRenderedContentClick}>
+                <Panel padding="default" rounded="md" class="test-step-rendered" onclick={handleRenderedContentClick}>
                   <MilkdownEditor content={currentStep.action || ''} readonly={true} showToolbar={false} />
-                </div>
+                </Panel>
               </div>
 
               <div>
                 <h3 class="font-medium mb-2" style="color: var(--ds-accent-purple);">{t('testing.data')}</h3>
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div class="p-4 border rounded test-step-rendered" style="border-color: var(--ds-border); background-color: var(--ds-background-neutral);" onclick={handleRenderedContentClick}>
+                <Panel padding="default" rounded="md" class="test-step-rendered" onclick={handleRenderedContentClick}>
                   <MilkdownEditor content={currentStep.data || t('testing.noDataSpecified')} readonly={true} showToolbar={false} />
-                </div>
+                </Panel>
               </div>
 
               <div>
                 <h3 class="font-medium mb-2" style="color: var(--ds-status-success-text);">{t('testing.expected')}</h3>
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div class="p-4 border rounded test-step-rendered" style="border-color: var(--ds-border); background-color: var(--ds-background-neutral);" onclick={handleRenderedContentClick}>
+                <Panel padding="default" rounded="md" class="test-step-rendered" onclick={handleRenderedContentClick}>
                   <MilkdownEditor content={currentStep.expected || ''} readonly={true} showToolbar={false} />
-                </div>
+                </Panel>
               </div>
             </div>
 
             <!-- Result Recording -->
-            <div class="mb-6">
+            <Card variant="raised" padding="spacious" shadow class="mb-6">
               <h3 class="font-medium mb-4" style="color: var(--ds-text);">{t('testing.recordResult')}</h3>
-              
+
+              {#if canExecuteTests}
               <!-- Status Buttons -->
               <div class="flex gap-3 mb-4">
                 <button
                   onclick={() => markStepStatus(currentStep.id, 'passed')}
-                  class="flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
-                  style={getStatusButtonStyle('passed', stepResults[currentStep.id]?.status === 'passed')}
-                  onmouseenter={(e) => { if (stepResults[currentStep.id]?.status !== 'passed') e.currentTarget.style.backgroundColor = 'var(--ds-status-success-bg)'; }}
-                  onmouseleave={(e) => { if (stepResults[currentStep.id]?.status !== 'passed') e.currentTarget.style.backgroundColor = 'transparent'; }}
+                  data-testid="test-execution-status-passed"
+                  class="status-btn flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
+                  data-status="passed"
+                  class:selected={stepResults[currentStep.id]?.status === 'passed'}
                 >
                   <IconCheck class="w-4 h-4" />
                   {t('testing.pass')}
@@ -690,10 +761,10 @@
 
                 <button
                   onclick={() => markStepStatus(currentStep.id, 'failed')}
-                  class="flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
-                  style={getStatusButtonStyle('failed', stepResults[currentStep.id]?.status === 'failed')}
-                  onmouseenter={(e) => { if (stepResults[currentStep.id]?.status !== 'failed') e.currentTarget.style.backgroundColor = 'var(--ds-status-danger-bg)'; }}
-                  onmouseleave={(e) => { if (stepResults[currentStep.id]?.status !== 'failed') e.currentTarget.style.backgroundColor = 'transparent'; }}
+                  data-testid="test-execution-status-failed"
+                  class="status-btn flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
+                  data-status="failed"
+                  class:selected={stepResults[currentStep.id]?.status === 'failed'}
                 >
                   <IconX class="w-4 h-4" />
                   {t('testing.fail')}
@@ -701,10 +772,10 @@
 
                 <button
                   onclick={() => markStepStatus(currentStep.id, 'blocked')}
-                  class="flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
-                  style={getStatusButtonStyle('blocked', stepResults[currentStep.id]?.status === 'blocked')}
-                  onmouseenter={(e) => { if (stepResults[currentStep.id]?.status !== 'blocked') e.currentTarget.style.backgroundColor = 'var(--ds-status-warning-bg)'; }}
-                  onmouseleave={(e) => { if (stepResults[currentStep.id]?.status !== 'blocked') e.currentTarget.style.backgroundColor = 'transparent'; }}
+                  data-testid="test-execution-status-blocked"
+                  class="status-btn flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
+                  data-status="blocked"
+                  class:selected={stepResults[currentStep.id]?.status === 'blocked'}
                 >
                   <IconBug class="w-4 h-4" />
                   {t('testing.blocked')}
@@ -712,10 +783,10 @@
 
                 <button
                   onclick={() => markStepStatus(currentStep.id, 'skipped')}
-                  class="flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
-                  style={getStatusButtonStyle('skipped', stepResults[currentStep.id]?.status === 'skipped')}
-                  onmouseenter={(e) => { if (stepResults[currentStep.id]?.status !== 'skipped') e.currentTarget.style.backgroundColor = 'var(--ds-status-neutral-bg)'; }}
-                  onmouseleave={(e) => { if (stepResults[currentStep.id]?.status !== 'skipped') e.currentTarget.style.backgroundColor = 'transparent'; }}
+                  data-testid="test-execution-status-skipped"
+                  class="status-btn flex items-center gap-2 px-4 py-2 rounded transition cursor-pointer"
+                  data-status="skipped"
+                  class:selected={stepResults[currentStep.id]?.status === 'skipped'}
                 >
                   <IconPlayerSkipForward class="w-4 h-4" />
                   {t('testing.skip')}
@@ -727,9 +798,10 @@
                 <Label color="default" class="mb-2">{t('testing.actual')}</Label>
                 {#if testResults[currentCase.id]?.id}
                   {#key currentStep.id}
-                    <div class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
+                    <div data-testid="test-execution-actual-result" class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
                       <MilkdownEditor
                         content={stepResults[currentStep.id]?.actual_result || ''}
+                        testId="test-execution-actual-result-editor"
                         entityType="test_result"
                         entityId={testResults[currentCase.id].id}
                         showToolbar={true}
@@ -744,6 +816,7 @@
                     oninput={(e) => updateStepResult(currentStep.id, 'actual_result', e.target.value)}
                     rows={3}
                     placeholder={t('testing.actualResultPlaceholder')}
+                    data-testid="test-execution-actual-result"
                   />
                 {/if}
               </div>
@@ -753,9 +826,10 @@
                 <Label color="default" class="mb-2">{t('common.notes')}</Label>
                 {#if testResults[currentCase.id]?.id}
                   {#key `notes-${currentStep.id}`}
-                    <div class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 60px;">
+                    <div data-testid="test-execution-notes" class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 60px;">
                       <MilkdownEditor
                         content={stepResults[currentStep.id]?.notes || ''}
+                        testId="test-execution-notes-editor"
                         entityType="test_result"
                         entityId={testResults[currentCase.id].id}
                         showToolbar={true}
@@ -770,36 +844,41 @@
                     oninput={(e) => updateStepResult(currentStep.id, 'notes', e.target.value)}
                     rows={2}
                     placeholder={t('testing.notesPlaceholder')}
+                    data-testid="test-execution-notes"
                   />
                 {/if}
               </div>
 
               <!-- Link Issue (shown when failed) -->
               {#if stepResults[currentStep.id]?.status === 'failed'}
-                <div class="mb-4 p-4 rounded" style="background-color: var(--ds-status-danger-bg); border: 1px solid var(--ds-status-danger-border);">
+                <AlertBox variant="error" class="mb-4">
+                  <div class="w-full">
                   <div class="flex items-center gap-2 mb-3">
-                    <IconAlertTriangle class="w-4 h-4" style="color: var(--ds-status-danger-text);" />
                     <h4 class="font-medium" style="color: var(--ds-status-danger-text);">{t('testing.linkIssue')}</h4>
                   </div>
 
                   {#if stepResults[currentStep.id]?.item_id}
                     {@const linkedItem = workspaceItems.find(i => i.id === stepResults[currentStep.id]?.item_id)}
-                    <div class="p-3 rounded border" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
+                    <Panel padding="compact" rounded="md">
                       <div class="flex items-center justify-between">
                         <div>
-                          <div class="font-medium text-sm" style="color: var(--ds-text);">{linkedItem?.name || linkedItem?.title || t('testing.unknownItem')}</div>
+                          <a
+                            href={`/workspaces/${workspaceId}/items/${stepResults[currentStep.id].item_id}`}
+                            data-testid="test-execution-linked-item"
+                            class="font-medium text-sm hover:underline"
+                            style="color: var(--ds-text-link);"
+                          >
+                            {linkedItem?.name || linkedItem?.title || t('testing.unknownItem')}
+                          </a>
                           {#if linkedItem?.workspace_item_number}
                             <DescriptionText as="div">
                               #{linkedItem.workspace_item_number}
                             </DescriptionText>
                           {/if}
                         </div>
-                        <span class="px-2 py-1 text-xs rounded flex items-center gap-1" style="background-color: var(--ds-status-success-bg); color: var(--ds-status-success-text);">
-                          <IconLink class="w-3 h-3" />
-                          {t('testing.linked')}
-                        </span>
+                        <Lozenge color="green" icon={IconLink} text={t('testing.linked')} />
                       </div>
-                    </div>
+                    </Panel>
                   {:else}
                     <div class="space-y-3">
                       <div class="text-sm" style="color: var(--ds-status-danger-text);">{t('testing.stepFailedNoIssue')}</div>
@@ -810,6 +889,8 @@
                         <ItemPicker
                           items={workspaceItems}
                           placeholder={t('testing.searchItemsToLink')}
+                          searchTestid="test-execution-item-search"
+                          optionTestid={(option) => `test-execution-item-${option.value}`}
                           config={{
                             primary: { text: (item) => item.name || item.title || '' },
                             secondary: { text: (item) => item.workspace_item_number ? `#${item.workspace_item_number}` : '' },
@@ -831,13 +912,18 @@
                       </Button>
                     </div>
                   {/if}
-                </div>
+                  </div>
+                </AlertBox>
+              {/if}
               {/if}
 
               <!-- Quick Navigation -->
               <div class="flex justify-between items-center pt-4 border-t" style="border-color: var(--ds-border);">
-                <span class="text-sm px-2 py-1 rounded" style={getStatusBadgeCSS(stepResults[currentStep.id]?.status || 'not_run')}>
-                  {t('common.status')}: {getStatusLabel(stepResults[currentStep.id]?.status || 'not_run')}
+                <span data-testid="test-execution-current-status">
+                  <Lozenge
+                    color={getTestStatusColor(stepResults[currentStep.id]?.status || 'not_run')}
+                    text={`${t('common.status')}: ${getStatusLabel(stepResults[currentStep.id]?.status || 'not_run')}`}
+                  />
                 </span>
                 
                 {#if currentCaseIndex < testCases.length - 1 || (currentCase.test_steps?.length && currentStepIndex < currentCase.test_steps.length - 1)}
@@ -850,30 +936,27 @@
                   >
                     {t('testing.nextStep')}
                   </Button>
-                {:else}
+                {:else if canExecuteTests}
                   <Button
                     onclick={finishExecution}
                     variant="primary"
                     size="medium"
                     icon={IconChevronRight}
                     iconPosition="right"
+                    dataTestid="test-execution-finish-current"
                   >
                     {t('testing.finishExecution')}
                   </Button>
                 {/if}
               </div>
-            </div>
+            </Card>
           </div>
         </div>
       {:else if currentCase}
         <!-- No steps content -->
         <div class="flex-1 p-6 overflow-y-auto flex items-center justify-center">
-          <div class="max-w-md text-center">
-            <div class="text-6xl mb-4">📝</div>
-            <h3 class="text-lg font-medium mb-2" style="color: var(--ds-text);">{t('testing.noTestSteps')}</h3>
-            <p class="text-sm mb-6" style="color: var(--ds-text-subtle);">
-              {t('testing.noTestStepsDescription')}
-            </p>
+          <div class="max-w-md w-full">
+            <EmptyState icon={IconPlayerSkipForward} title={t('testing.noTestSteps')} description={t('testing.noTestStepsDescription')} />
               
             <!-- Navigation for cases without steps -->
             <div class="flex justify-center items-center gap-4 pt-4 border-t" style="border-color: var(--ds-border);">
@@ -900,7 +983,7 @@
                 >
                   {t('testing.nextCase')}
                 </Button>
-              {:else}
+              {:else if canExecuteTests}
                 <Button
                   onclick={finishExecution}
                   variant="primary"
@@ -918,17 +1001,13 @@
     </div>
   </div>
 {:else}
-  <div class="text-center py-12">
-    <div style="color: var(--ds-text-subtle);">{t('testing.testRunNotFound')}</div>
-    <Button
-      onclick={goBack}
-      variant="primary"
-      size="medium"
-      class="mt-4"
-    >
-      {t('testing.backToTestRuns')}
-    </Button>
-  </div>
+  <StateDisplay type="empty" title={t('testing.testRunNotFound')}>
+    {#snippet action()}
+      <Button onclick={goBack} variant="primary" size="medium">
+        {t('testing.backToTestRuns')}
+      </Button>
+    {/snippet}
+  </StateDisplay>
 {/if}
 
 <!-- Create Item Modal -->
@@ -940,17 +1019,12 @@
 
 
 <!-- Image Preview Modal -->
-{#if previewImage}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4"
-       role="presentation"
-       onclick={() => previewImage = null}>
-    <div class="relative max-w-4xl max-h-full">
-      <img src={previewImage.src} alt={previewImage.alt} class="max-w-full max-h-[90vh] object-contain rounded" />
-      <p class="text-white text-center mt-2 text-sm">{previewImage.alt}</p>
-    </div>
+<ModalBackdrop opacity={0.8} blur={0} bind:show={previewImage} onclose={() => (previewImage = null)}>
+  <div class="relative max-w-4xl max-h-full">
+    <img src={previewImage?.src} alt={previewImage?.alt} class="max-w-full max-h-[90vh] object-contain rounded" />
+    <p class="text-white text-center mt-2 text-sm">{previewImage?.alt}</p>
   </div>
-{/if}
+</ModalBackdrop>
 
 <style>
   :global(.test-step-rendered img) {
@@ -960,5 +1034,100 @@
     cursor: pointer;
     border-radius: 6px;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  }
+  .case-pill:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+  }
+
+  .case-card {
+    border-color: var(--ds-border);
+  }
+
+  .case-card:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+  }
+
+  .case-card.active {
+    border-color: var(--ds-interactive);
+    background: var(--ds-surface);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06);
+  }
+
+  .step-seg {
+    background-color: var(--ds-progress-track);
+  }
+
+  .step-seg.current {
+    background-color: var(--ds-progress-fill);
+  }
+
+  .step-seg:hover:not(.current) {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+
+  /* Step status buttons: tint with the status background while unselected. */
+  .status-btn {
+    background-color: transparent;
+    border: 1px solid;
+  }
+
+  .status-btn[data-status='passed'] {
+    color: var(--ds-status-success-text);
+    border-color: var(--ds-status-success-border);
+  }
+
+  .status-btn[data-status='failed'] {
+    color: var(--ds-status-danger-text);
+    border-color: var(--ds-status-danger-border);
+  }
+
+  .status-btn[data-status='blocked'] {
+    color: var(--ds-status-warning-text);
+    border-color: var(--ds-status-warning-border);
+  }
+
+  .status-btn[data-status='skipped'] {
+    color: var(--ds-status-neutral-text);
+    border-color: var(--ds-status-neutral-border);
+  }
+
+  .status-btn.selected {
+    color: white;
+  }
+
+  .status-btn[data-status='passed'].selected {
+    background-color: var(--ds-status-success-solid);
+    border-color: var(--ds-status-success-solid);
+  }
+
+  .status-btn[data-status='failed'].selected {
+    background-color: var(--ds-status-danger-solid);
+    border-color: var(--ds-status-danger-solid);
+  }
+
+  .status-btn[data-status='blocked'].selected {
+    background-color: var(--ds-status-warning-solid);
+    border-color: var(--ds-status-warning-solid);
+  }
+
+  .status-btn[data-status='skipped'].selected {
+    background-color: var(--ds-status-neutral-solid);
+    border-color: var(--ds-status-neutral-solid);
+  }
+
+  .status-btn[data-status='passed']:hover:not(.selected) {
+    background-color: var(--ds-status-success-bg);
+  }
+
+  .status-btn[data-status='failed']:hover:not(.selected) {
+    background-color: var(--ds-status-danger-bg);
+  }
+
+  .status-btn[data-status='blocked']:hover:not(.selected) {
+    background-color: var(--ds-status-warning-bg);
+  }
+
+  .status-btn[data-status='skipped']:hover:not(.selected) {
+    background-color: var(--ds-status-neutral-bg);
   }
 </style>

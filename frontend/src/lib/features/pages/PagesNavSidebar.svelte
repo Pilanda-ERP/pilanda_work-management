@@ -1,7 +1,8 @@
 <script>
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-  import { attachClosestEdge, extractClosestEdge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
+  import { attachInstruction, extractInstruction } from '@atlaskit/pragmatic-drag-and-drop-hitbox/tree-item';
+  import { isSelfOrDescendant, orderPagesDepthFirst } from './pageHierarchy.js';
   import { api } from '../../api.js';
   import { navigate, currentRoute } from '../../router.js';
   import { t } from '../../stores/i18n.svelte.js';
@@ -20,8 +21,10 @@
     IconArchive as Archive
   } from '@tabler/icons-svelte-runes';
   import DropdownMenu from '../../layout/DropdownMenu.svelte';
+  import ScrollableSidebar from '../../layout/ScrollableSidebar.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
   import Tooltip from '../../components/Tooltip.svelte';
+  import Input from '../../components/Input.svelte';
   import PageMoveDialog from './PageMoveDialog.svelte';
   import PagePermissionsDialog from './PagePermissionsDialog.svelte';
   import PageLabelPicker from './PageLabelPicker.svelte';
@@ -34,6 +37,10 @@
   let { workspaceId, embedded = false } = $props();
 
   let pages = $state([]);
+  // Caller's effective level per page id ('view'|'edit'|'admin'), loaded
+  // alongside the tree. Empty while loading or on failure; gates the row
+  // kebab so viewers don't see actions the server would reject.
+  let effectiveLevels = $state(/** @type {Map<number, string>} */ (new Map()));
   let loading = $state(true);
   let creating = $state(false);
   let moveDialogOpen = $state(false);
@@ -41,8 +48,8 @@
   let permsDialogOpen = $state(false);
   let permsDialogPage = $state(null);
   let dndState = $state(new Map());
-  let setupTimeout;
-  let setupCleanups = [];
+  let dwellExpandTimer;
+  let dwellExpandPageId = null;
 
   // Cache of workspace labels keyed by id. Populated lazily on first
   // page-tree load by walking the preloaded `labels` arrays on each page.
@@ -195,12 +202,8 @@
     return m;
   });
 
-  // Effective expanded set used for visibility. When a label or title
-  // filter is active, ancestors of every match are virtually expanded so
-  // the user actually sees their hits — but `expandedIds` itself is not
-  // mutated, so the user's saved collapse state returns once the filter
-  // clears. `visibleIds` already includes ancestors via the existing
-  // path walk in `labelVisibleIds` / `titleMatchIds`.
+  // Filters virtually expand matching ancestors without changing saved collapse
+  // state, which returns when the filter clears.
   let effectiveExpanded = $derived.by(() => {
     if (visibleIds === null) return expandedIds;
     const out = new Set(expandedIds);
@@ -217,14 +220,8 @@
     return false;
   }
 
-  // The rows that actually get a DOM node. Previously every page rendered
-  // an <li> and collapsed / filtered-out subtrees were only display:none,
-  // so 1000+ pages meant 1000+ live DOM nodes regardless of expand state.
-  // By filtering to the visible set here, collapsed subtrees and
-  // filter-excluded rows are never added to the DOM at all — the row count
-  // tracks what's on screen, not the workspace total. DnD wiring
-  // (querySelectorAll('[data-page-row]')) only ever sees these rows, which
-  // is correct: you can only drag/drop rows that are rendered.
+  // Render only visible rows, avoiding hidden subtree DOM nodes and ensuring
+  // drag/drop sees only draggable rows.
   let visibleRows = $derived.by(() => {
     const out = [];
     for (const page of pages) {
@@ -313,8 +310,35 @@
     $currentRoute?.params?.pageId ? Number($currentRoute.params.pageId) : null
   );
 
+  // Reveal the active page in the tree: navigating to a page (sidebar
+  // click, deep link, in-page link, search result) expands every ancestor
+  // so the highlighted row is actually visible. Runs once per navigation —
+  // the lastRevealedId guard keeps it from fighting the user if they
+  // manually collapse an ancestor while staying on the page.
+  let lastRevealedId = null;
+  $effect(() => {
+    const id = activePageId;
+    const lookup = pageById;
+    if (id == null || lastRevealedId === id) return;
+    const page = lookup.get(id);
+    if (!page) return; // tree not loaded yet, or page not in this workspace
+    lastRevealedId = id;
+    untrack(() => {
+      const ancestorIds = (page.path || '')
+        .split('/')
+        .filter(Boolean)
+        .map(Number)
+        .filter((a) => Number.isFinite(a) && !expandedIds.has(a));
+      if (ancestorIds.length === 0) return;
+      const next = new Set(expandedIds);
+      for (const a of ancestorIds) next.add(a);
+      expandedIds = next;
+      persistExpanded();
+    });
+  });
+
   onDestroy(() => {
-    cleanupDnd();
+    clearDwellExpand();
   });
 
   // Initial load + external refresh in one effect. Reading
@@ -340,24 +364,19 @@
     }
   });
 
-  // Re-wire DnD whenever the rendered tree changes. The timeout matches
-  // BoardConfigurationPage's pattern: the DOM nodes need to mount before
-  // pragmatic-drag-and-drop can attach. We depend on `visibleRows`, not
-  // `pages`, because expanding/collapsing a subtree (or filtering) now
-  // adds/removes rows from the DOM without changing `pages` itself — the
-  // newly-rendered rows need handlers wired too.
-  $effect(() => {
-    visibleRows;
-    if (typeof document === 'undefined') return;
-    if (setupTimeout) clearTimeout(setupTimeout);
-    setupTimeout = setTimeout(() => setupDnd(), 50);
-  });
-
   async function loadTree() {
     loading = true;
     try {
-      const resp = await api.pages.getTree(workspaceId);
-      pages = flattenDepthFirst(resp.tree || []);
+      const [tree, levels] = await Promise.all([
+        api.pages.getAll(workspaceId),
+        api.pages.getEffectiveLevels(workspaceId).catch(() => null),
+      ]);
+      pages = orderPagesDepthFirst(tree || []);
+      // A failed levels lookup degrades to hiding management actions for
+      // this pass; the server still enforces everything.
+      effectiveLevels = new Map(
+        Object.entries(levels || {}).map(([id, level]) => [Number(id), String(level)]),
+      );
       // Cache every label we encounter so the filter row can render names
       // + colors for active filters without an extra round-trip.
       for (const page of pages) {
@@ -370,8 +389,9 @@
       // Seed expanded state from localStorage; on a workspace's first
       // visit the seed is just the root ids so the tree opens with the
       // top level visible and every nested subtree collapsed.
-      const rootIds = (resp.tree || [])
-        .map((n) => n?.id)
+      const rootIds = pages
+        .filter((page) => page.parent_id == null)
+        .map((page) => page.id)
         .filter((id) => Number.isFinite(id));
       expandedIds = loadExpanded(workspaceId, rootIds);
     } catch (err) {
@@ -381,18 +401,13 @@
     }
   }
 
-  function flattenDepthFirst(nodes) {
-    const out = [];
-    for (const node of nodes) {
-      out.push(node);
-      if (node.children?.length) {
-        out.push(...flattenDepthFirst(node.children));
-      }
-    }
-    return out;
-  }
-
   function selectPage(id) {
+    // Selecting a page opens its own subtree so its direct children are
+    // immediately available. Descendant subtrees keep their existing state.
+    if ((childCountById.get(id) || 0) > 0 && !expandedIds.has(id)) {
+      expandedIds = new Set(expandedIds).add(id);
+      persistExpanded();
+    }
     navigate(`/workspaces/${workspaceId}/pages/${id}`);
   }
 
@@ -450,97 +465,162 @@
     pagesFocusTitle.request(page.id);
   }
 
+  // Effective level of a page for the current caller: 'view' | 'edit' |
+  // 'admin'. Levels lagging behind a failed lookup read as no access.
+  function levelOf(page) {
+    return effectiveLevels.get(page.id) || '';
+  }
+
   function kebabItems(page) {
-    return [
-      { id: 'add-child', type: 'regular', icon: Plus, title: t('pages.menuAddChild'), onClick: () => createPage(page.id) },
-      { id: 'rename', type: 'regular', title: t('pages.menuRename'), onClick: () => requestRename(page) },
-      { id: 'move', type: 'regular', title: t('pages.menuMove'), onClick: () => { moveDialogPage = page; moveDialogOpen = true; } },
-      { id: 'permissions', type: 'regular', title: t('pages.menuPermissions'), onClick: () => { permsDialogPage = page; permsDialogOpen = true; } },
-      { id: 'divider', type: 'divider' },
-      { id: 'archive', type: 'regular', title: t('pages.menuArchive'), color: 'var(--ds-text-danger)', onClick: () => archivePage(page) },
-    ];
+    // Mirror the server's write contract: rename/move need edit on the
+    // page, add-child needs a create-capable caller plus edit on the
+    // parent, permissions need admin, archive needs admin and page.delete.
+    const level = levelOf(page);
+    const canEdit = level === 'edit' || level === 'admin';
+    const canCreate = canEdit && workspacePermissions.canCreatePages(workspaceId);
+    const items = [];
+    if (canCreate) {
+      items.push({ id: 'add-child', type: 'regular', icon: Plus, title: t('pages.menuAddChild'), testid: 'page-kebab-add-child', onClick: () => createPage(page.id) });
+    }
+    if (canEdit) {
+      items.push({ id: 'rename', type: 'regular', title: t('pages.menuRename'), testid: 'page-kebab-rename', onClick: () => requestRename(page) });
+      items.push({ id: 'move', type: 'regular', title: t('pages.menuMove'), testid: 'page-kebab-move', onClick: () => { moveDialogPage = page; moveDialogOpen = true; } });
+    }
+    if (level === 'admin') {
+      items.push({ id: 'permissions', type: 'regular', title: t('pages.menuPermissions'), testid: 'page-kebab-permissions', onClick: () => { permsDialogPage = page; permsDialogOpen = true; } });
+    }
+    if (level === 'admin' && workspacePermissions.canDeletePages(workspaceId)) {
+      if (items.length > 0) items.push({ id: 'divider', type: 'divider' });
+      items.push({ id: 'archive', type: 'regular', title: t('pages.menuArchive'), color: 'var(--ds-text-danger)', testid: 'page-kebab-archive', onClick: () => archivePage(page) });
+    }
+    return items;
   }
 
   // --- DnD ---
 
-  function cleanupDnd() {
-    if (setupTimeout) clearTimeout(setupTimeout);
-    setupCleanups.forEach((fn) => fn());
-    setupCleanups = [];
-    dndState = new Map();
+  function clearDwellExpand(pageId = null) {
+    if (pageId != null && dwellExpandPageId !== pageId) return;
+    if (dwellExpandTimer) clearTimeout(dwellExpandTimer);
+    dwellExpandTimer = undefined;
+    dwellExpandPageId = null;
   }
 
-  function setupDnd() {
-    cleanupDnd();
-    const lookup = pageById;
-    /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-page-row]')).forEach((element) => {
-      const pageId = Number(element.dataset.pageRow);
-      const page = lookup.get(pageId);
-      if (!page) return;
+  function instructionDropMode(instruction) {
+    if (instruction?.type === 'reorder-above') return 'top';
+    if (instruction?.type === 'reorder-below') return 'bottom';
+    if (instruction?.type === 'make-child') return 'child';
+    return null;
+  }
 
-      dndState.set(pageId, { closestEdge: null, over: false });
+  function scheduleDwellExpand(pageId, dropMode) {
+    const canExpand =
+      dropMode === 'child' &&
+      (childCountById.get(pageId) || 0) > 0 &&
+      !expandedIds.has(pageId);
+    if (!canExpand) {
+      clearDwellExpand(pageId);
+      return;
+    }
+    if (dwellExpandPageId === pageId && dwellExpandTimer) return;
 
-      const dragCleanup = draggable({
-        element,
-        getInitialData: () => ({ type: 'page', pageId, parentId: page.parent_id ?? null }),
-        onDragStart: () => {
-          element.style.opacity = '0.5';
-        },
-        onDrop: () => {
-          element.style.opacity = '';
-          dndState = new Map();
-        },
-      });
+    clearDwellExpand();
+    dwellExpandPageId = pageId;
+    dwellExpandTimer = setTimeout(() => {
+      const next = new Set(expandedIds);
+      next.add(pageId);
+      expandedIds = next;
+      persistExpanded();
+      dwellExpandTimer = undefined;
+      dwellExpandPageId = null;
+    }, 500);
+  }
 
-      const dropCleanup = dropTargetForElements({
-        element,
-        canDrop: ({ source }) => {
-          if (source.data.type !== 'page') return false;
-          // Forbid dropping a page onto itself or any of its own descendants.
-          // Quick descendant check via the materialized `path` prefix that
-          // the backend returns on each PageNode.
-          if (source.data.pageId === pageId) return false;
-          const dragged = lookup.get(source.data.pageId);
-          if (dragged) {
-            const draggedPrefix = `${dragged.path}${dragged.id}/`;
-            if (page.path.startsWith(draggedPrefix)) return false;
-          }
-          return true;
-        },
-        getData: ({ input, element: el }) =>
-          attachClosestEdge({}, { input, element: el, allowedEdges: ['top', 'bottom'] }),
-        onDragEnter: ({ self }) => {
-          const closestEdge = extractClosestEdge(self.data);
-          dndState.set(pageId, { closestEdge, over: true });
-          dndState = new Map(dndState);
-        },
-        onDragLeave: () => {
-          dndState.set(pageId, { closestEdge: null, over: false });
-          dndState = new Map(dndState);
-        },
-        onDrop: ({ self, source }) => {
-          const closestEdge = extractClosestEdge(self.data);
-          dndState = new Map();
-          handleDrop(source.data.pageId, pageId, closestEdge);
-        },
-      });
+  function updateDropState(pageId, instruction) {
+    const dropMode = instructionDropMode(instruction);
+    dndState.set(pageId, { dropMode, over: dropMode !== null });
+    dndState = new Map(dndState);
+    scheduleDwellExpand(pageId, dropMode);
+  }
 
-      setupCleanups.push(() => {
+  function wirePageDnd(element, pageId) {
+    const dragCleanup = draggable({
+      element,
+      getInitialData: () => {
+        const page = pageById.get(pageId);
+        return { type: 'page', pageId, parentId: page?.parent_id ?? null };
+      },
+      onDragStart: () => {
+        element.style.opacity = '0.5';
+      },
+      onDrop: () => {
+        element.style.opacity = '';
+        clearDwellExpand();
+        dndState = new Map();
+      },
+    });
+
+    const dropCleanup = dropTargetForElements({
+      element,
+      canDrop: ({ source }) => {
+        if (source.data.type !== 'page') return false;
+        // Forbid dropping a page onto itself or any of its own descendants.
+        if (source.data.pageId === pageId) return false;
+        const page = pageById.get(pageId);
+        const dragged = pageById.get(source.data.pageId);
+        if (!page) return false;
+        // Source row not in the current tree slice: the self-check above
+        // is all we can enforce here, and the backend answers 409 on a
+        // cycle regardless.
+        return !dragged || !isSelfOrDescendant(page, dragged);
+      },
+      getData: ({ input, element: target }) => {
+        const page = pageById.get(pageId);
+        return attachInstruction({}, {
+          input,
+          element: target,
+          currentLevel: page?.depth ?? 0,
+          indentPerLevel: 12,
+          mode: 'standard',
+        });
+      },
+      onDragEnter: ({ self }) => {
+        updateDropState(pageId, extractInstruction(self.data));
+      },
+      onDrag: ({ self }) => {
+        updateDropState(pageId, extractInstruction(self.data));
+      },
+      onDragLeave: () => {
+        clearDwellExpand(pageId);
+        dndState.set(pageId, { dropMode: null, over: false });
+        dndState = new Map(dndState);
+      },
+      onDrop: ({ self, source }) => {
+        const dropMode = instructionDropMode(extractInstruction(self.data));
+        clearDwellExpand(pageId);
+        dndState = new Map();
+        handleDrop(source.data.pageId, pageId, dropMode);
+      },
+    });
+
+    return {
+      destroy() {
+        clearDwellExpand(pageId);
+        element.style.opacity = '';
         dragCleanup();
         dropCleanup();
-      });
-    });
+      },
+    };
   }
 
-  async function handleDrop(draggedId, targetId, closestEdge) {
-    if (draggedId === targetId) return;
+  async function handleDrop(draggedId, targetId, dropMode) {
+    if (draggedId === targetId || !dropMode) return;
     const target = pageById.get(targetId);
     if (!target) return;
     let newParentId;
     let prevSiblingId = null;
     let nextSiblingId = null;
 
-    if (closestEdge === 'top' || closestEdge === 'bottom') {
+    if (dropMode === 'top' || dropMode === 'bottom') {
       // Sibling drop: parent of dropped page becomes parent of target.
       newParentId = target.parent_id ?? null;
       // Identify the target's siblings (children of newParentId, in
@@ -550,7 +630,7 @@
       const siblings = pages.filter((p) => (p.parent_id ?? null) === newParentId);
       const targetIdx = siblings.findIndex((p) => p.id === targetId);
       if (targetIdx === -1) return;
-      if (closestEdge === 'top') {
+      if (dropMode === 'top') {
         nextSiblingId = target.id;
         prevSiblingId = targetIdx > 0 ? siblings[targetIdx - 1].id : null;
       } else {
@@ -563,8 +643,8 @@
       if (prevSiblingId === draggedId) prevSiblingId = null;
       if (nextSiblingId === draggedId) nextSiblingId = null;
     } else {
-      // Drop on the row body (no closest-edge match): make the dragged
-      // page a child of the target. Position is "end of list" — server
+      // Drop on the row body's middle band: make the dragged page a child
+      // of the target. Position is "end of list" — server
       // computes a frac_index after the last existing child.
       newParentId = targetId;
     }
@@ -581,7 +661,7 @@
   }
 </script>
 
-<aside class="pages-sidebar" class:pages-sidebar--embedded={embedded} data-testid="pages-nav-sidebar">
+{#snippet sidebarHeader()}
   <header class="header">
     <div class="title-row">
       <h2>{t('pages.treeHeading')}</h2>
@@ -636,18 +716,20 @@
             </button>
           </Tooltip>
         {/if}
-        <Tooltip content={t('pages.addPageAria')} placement="bottom" class="inline-flex">
-          <button
-            id="pages-add-button"
-            class="header-button"
-            type="button"
-            onclick={() => createPage(null)}
-            disabled={creating}
-            aria-label={t('pages.addPageAria')}
-          >
-            <Plus size={16} />
-          </button>
-        </Tooltip>
+        {#if workspacePermissions.canCreatePages(workspaceId)}
+          <Tooltip content={t('pages.addPageAria')} placement="bottom" class="inline-flex">
+            <button
+              id="pages-add-button"
+              class="header-button"
+              type="button"
+              onclick={() => createPage(null)}
+              disabled={creating}
+              aria-label={t('pages.addPageAria')}
+            >
+              <Plus size={16} />
+            </button>
+          </Tooltip>
+        {/if}
       </div>
     </div>
   </header>
@@ -655,14 +737,15 @@
   {#if searchOpen}
     <div class="search-row" data-testid="pages-search-row">
       <Search size={14} class="search-row__icon" aria-hidden="true" />
-      <input
-        bind:this={searchInputEl}
+      <Input
+        bind:inputRef={searchInputEl}
         bind:value={searchQuery}
         onkeydown={onSearchKeydown}
         type="text"
         class="search-input"
         placeholder={t('pages.searchPlaceholder')}
-        data-testid="pages-search-input"
+        dataTestid="pages-search-input"
+        size="small"
       />
       {#if searchQuery}
         <button
@@ -720,7 +803,16 @@
       </button>
     {/if}
   </div>
+{/snippet}
 
+<ScrollableSidebar
+  as="aside"
+  class="pages-sidebar {embedded ? 'pages-sidebar--embedded' : ''}"
+  data-testid="pages-nav-sidebar"
+  aria-label={t('pages.treeHeading')}
+  header={sidebarHeader}
+  scrollTestid="pages-navigation-scroll"
+>
   {#if loading}
     <p class="status">{t('pages.treeLoading')}</p>
   {:else if pages.length === 0}
@@ -734,7 +826,7 @@
   {:else}
     <ul class="tree" data-testid="page-tree">
       {#each visibleRows as page (page.id)}
-        {@const edge = dndState.get(page.id)?.closestEdge}
+        {@const dropMode = dndState.get(page.id)?.dropMode}
         {@const isOver = dndState.get(page.id)?.over}
         {@const hasChildren = (childCountById.get(page.id) || 0) > 0}
         {@const isExpanded = expandedIds.has(page.id)}
@@ -744,15 +836,17 @@
         <li
           class="tree-item"
           class:active={activePageId === page.id}
-          class:drop-top={edge === 'top'}
-          class:drop-bottom={edge === 'bottom'}
-          class:drop-on={isOver && !edge}
+          class:drop-top={dropMode === 'top'}
+          class:drop-bottom={dropMode === 'bottom'}
+          class:drop-on={dropMode === 'child'}
           class:dimmed
+          use:wirePageDnd={page.id}
           data-page-row={page.id}
-          data-testid="page-tree-item"
+          data-testid={`page-tree-item-${page.id}`}
           data-page-id={page.id}
           data-expanded={hasChildren ? String(isExpanded) : undefined}
-          style="padding-left: {0.25 + page.depth * 0.75}rem"
+          data-drop-mode={isOver ? dropMode : undefined}
+          style="padding-left: {1 + page.depth * 0.75}rem"
         >
           {#if hasChildren}
             <Tooltip
@@ -781,31 +875,38 @@
           {:else}
             <span class="chevron chevron--placeholder" aria-hidden="true"></span>
           {/if}
-          <button class="page-button" type="button" onclick={() => selectPage(page.id)}>
+          <button
+            class="page-button"
+            type="button"
+            onclick={() => selectPage(page.id)}
+            data-testid="page-tree-page"
+          >
             {#if PageIcon}
               <PageIcon size={14} class="page-button__icon" style="color: {pageColor};" aria-hidden="true" />
             {/if}
             <span class="page-button__title">{page.title}</span>
           </button>
           <span class="kebab-slot">
-            <Tooltip content={t('common.actions')} placement="bottom" class="inline-flex">
-              <DropdownMenu
-                triggerIcon={Dots}
-                triggerIconClass="w-4 h-4"
-                items={kebabItems(page)}
-                showChevron={false}
-                iconOnly={true}
-                placement="bottom-end"
-                triggerClass="kebab-trigger"
-                triggerTestid="page-kebab"
-              />
-            </Tooltip>
+            {#if kebabItems(page).length > 0}
+              <Tooltip content={t('common.actions')} placement="bottom" class="inline-flex">
+                <DropdownMenu
+                  triggerIcon={Dots}
+                  triggerIconClass="w-4 h-4"
+                  items={kebabItems(page)}
+                  showChevron={false}
+                  iconOnly={true}
+                  placement="bottom-end"
+                  triggerClass="kebab-trigger"
+                  triggerTestid="page-kebab"
+                />
+              </Tooltip>
+            {/if}
           </span>
         </li>
       {/each}
     </ul>
   {/if}
-</aside>
+</ScrollableSidebar>
 
 {#if moveDialogPage}
   <PageMoveDialog
@@ -826,16 +927,14 @@
 {/if}
 
 <style>
-  .pages-sidebar {
-    display: flex;
-    flex-direction: column;
+  :global(.pages-sidebar) {
     height: 100%;
     background: var(--ds-surface);
     border-right: 1px solid var(--ds-border);
-    overflow-y: auto;
+    --scrollable-sidebar-fade-color: var(--ds-surface);
   }
 
-  .pages-sidebar--embedded {
+  :global(.pages-sidebar--embedded) {
     height: 100%;
     min-height: 0;
     flex: 1;
@@ -904,29 +1003,13 @@
     display: flex;
     align-items: center;
     gap: 0.375rem;
-    padding: 0.5rem 0.75rem;
+    padding: 0.5rem 1rem;
     border-bottom: 1px solid var(--ds-border);
   }
 
   :global(.search-row__icon) {
     color: var(--ds-text-subtle);
     flex-shrink: 0;
-  }
-
-  .search-input {
-    flex: 1;
-    padding: 0.25rem 0.375rem;
-    border: 1px solid var(--ds-border);
-    border-radius: 0.25rem;
-    background: var(--ds-surface);
-    color: var(--ds-text);
-    font-size: 0.8125rem;
-    min-width: 0;
-  }
-
-  .search-input:focus {
-    outline: none;
-    border-color: var(--ds-accent-blue);
   }
 
   .search-row__clear {
@@ -952,7 +1035,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 0.375rem;
-    padding: 0.5rem 0.75rem;
+    padding: 0.5rem 1rem;
     border-bottom: 1px solid var(--ds-border);
   }
 

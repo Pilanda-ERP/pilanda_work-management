@@ -1,10 +1,10 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
   import {
-    GitBranch, Plus, Edit, Trash2, X, Check, RefreshCw,
-    AlertCircle, Settings, Power, PowerOff, Link, ExternalLink,
+    GitBranch, Plus, Edit, Trash2, RefreshCw,
     TestTube, CheckCircle, XCircle
   } from '@lucide/svelte';
   import { IconBrandGithub as Github } from '@tabler/icons-svelte-runes';
@@ -14,6 +14,7 @@
   import ModalHeader from '../dialogs/ModalHeader.svelte';
   import Spinner from '../components/Spinner.svelte';
   import Input from '../components/Input.svelte';
+  import Textarea from '../components/Textarea.svelte';
   import FormField from '../components/FormField.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import Lozenge from '../components/Lozenge.svelte';
@@ -45,26 +46,21 @@
   let testResult = $state(null);
   let testLoading = $state(false);
   let saving = $state(false);
-  let oauthLoading = $state(false);
 
   // Workspace restriction state
   let allowedWorkspaceIds = $state([]);
 
-
-  // Check for OAuth callback status in URL
-  let oauthStatus = $state(null);
-  let oauthMessage = $state(null);
-
-  // Provider types (only GitHub and Gitea supported)
+  // Provider types
   const providerTypes = [
     { value: 'github', label: 'GitHub', icon: Github },
+    { value: 'gitlab', label: 'GitLab', icon: GitBranch },
     { value: 'gitea', label: 'Gitea / Forgejo', icon: GitBranch },
   ];
 
   // Auth methods
   const authMethods = [
     { value: 'oauth', label: 'OAuth App', description: 'Users authorize via OAuth flow' },
-    { value: 'pat', label: 'Personal Access Token', description: 'Use a PAT for all operations' },
+    { value: 'pat', label: 'Access Token', description: 'Use an access token for all operations' },
     { value: 'github_app', label: 'GitHub App', description: 'Fine-grained permissions (GitHub only)' },
   ];
 
@@ -73,16 +69,10 @@
     m.value !== 'github_app' || formData.provider_type === 'github'
   ));
 
-  // Reset auth method if it becomes invalid for the selected provider
-  $effect(() => {
-    if (formData.auth_method === 'github_app' && formData.provider_type !== 'github') {
-      formData.auth_method = 'oauth';
-    }
-  });
-
   // Default OAuth scopes per provider type
   const defaultScopes = {
     github: 'repo read:user user:email',
+    gitlab: 'api',
     gitea: 'read:user read:repository write:repository',
   };
 
@@ -114,30 +104,23 @@
   let discoveringInstallations = $state(false);
   let discoveryError = $state(null);
 
-  // Update scopes when provider type changes (only if scopes is a default value)
-  $effect(() => {
-    if (formData.provider_type) {
-      const currentIsDefault = Object.values(defaultScopes).includes(formData.scopes);
-      if (currentIsDefault) {
-        formData.scopes = defaultScopes[formData.provider_type] || defaultScopes.github;
-      }
+  function handleProviderTypeChange(providerType) {
+    if (formData.auth_method === 'github_app' && providerType !== 'github') {
+      formData.auth_method = 'oauth';
     }
-  });
+    if (Object.values(defaultScopes).includes(formData.scopes)) {
+      formData.scopes = defaultScopes[providerType] || defaultScopes.github;
+    }
+  }
 
   onMount(async () => {
-    // Check for OAuth callback status
-    const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get('oauth') === 'success') {
-      oauthStatus = 'success';
-      oauthMessage = `Successfully connected to ${urlParams.get('provider') || 'provider'}`;
-      // Clean up URL
-      window.history.replaceState({}, '', window.location.pathname);
-    } else if (urlParams.get('oauth') === 'error') {
-      oauthStatus = 'error';
-      oauthMessage = urlParams.get('message') || 'OAuth connection failed';
+    // Surface OAuth callback errors redirected here by the backend
+    // (/admin/scm-providers?oauth=error&message=...), then clean the URL.
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('oauth') === 'error') {
+      error = params.get('message') || t('settings.scmProviders.oauthCallbackError');
       window.history.replaceState({}, '', window.location.pathname);
     }
-
     await loadProviders();
   });
 
@@ -201,7 +184,7 @@
       github_app_private_key: '',
       github_app_installation_id: provider.github_app_installation_id || '',
       github_org_id: provider.github_org_id || null,
-      scopes: provider.scopes || 'repo',
+      scopes: provider.scopes || defaultScopes[provider.provider_type] || defaultScopes.github,
       workspace_restriction_mode: provider.workspace_restriction_mode || 'unrestricted',
     };
     formErrors = {};
@@ -245,7 +228,7 @@
       }
     } else if (formData.auth_method === 'pat') {
       if (!editingProvider && !formData.personal_access_token) {
-        formErrors.personal_access_token = 'Personal Access Token is required';
+        formErrors.personal_access_token = 'Access Token is required';
       }
     } else if (formData.auth_method === 'github_app') {
       if (!formData.github_app_id) {
@@ -348,21 +331,6 @@
     }
   }
 
-  async function startOAuth(provider) {
-    oauthLoading = true;
-    try {
-      const result = await api.scmProviders.startOAuth(provider.slug);
-      if (result.auth_url) {
-        window.location.href = result.auth_url;
-      } else {
-        error = 'Failed to get OAuth URL';
-      }
-    } catch (err) {
-      error = err.message || 'Failed to start OAuth flow';
-      oauthLoading = false;
-    }
-  }
-
   async function discoverGitHubAppInstallations() {
     if (!formData.github_app_id || !formData.github_app_private_key) {
       discoveryError = 'App ID and Private Key are required for discovery';
@@ -415,9 +383,12 @@
     return providerType?.label || type;
   }
 
-  function dismissOAuthStatus() {
-    oauthStatus = null;
-    oauthMessage = null;
+  function getAccessTokenHelp() {
+    const helpKey = formData.provider_type === 'gitlab'
+      ? 'settings.scmProviders.gitlabAccessTokenHelp'
+      : 'settings.scmProviders.accessTokenHelp';
+    const help = t(helpKey);
+    return editingProvider ? `${help} ${t('settings.scmProviders.leaveEmptyToKeep')}` : help;
   }
 
   // Compute OAuth callback URL based on slug
@@ -435,23 +406,12 @@
   <!-- Header -->
   <PageHeader title={t('settings.scmProviders.title')} subtitle={t('settings.scmProviders.subtitle')} icon={GitBranch}>
     {#snippet actions()}
-      <Button variant="primary" onclick={openCreateModal} keyboardHint="A" hotkeyConfig={{ key: toHotkeyString('scmProviders', 'addProvider'), guard: () => !showCreateModal && !showEditModal }}>
+      <Button variant="primary" onclick={openCreateModal} keyboardHint="A" hotkeyConfig={{ key: toHotkeyString('scmProviders', 'addProvider'), guard: () => !showCreateModal && !showEditModal }} dataTestid="scm-provider-add">
         <Plus class="w-4 h-4 mr-2" />
         {t('settings.scmProviders.addProvider')}
       </Button>
     {/snippet}
   </PageHeader>
-
-  <!-- OAuth Status Messages -->
-  {#if oauthStatus}
-    <AlertBox
-      type={oauthStatus === 'success' ? 'success' : 'error'}
-      dismissible
-      ondismiss={dismissOAuthStatus}
-    >
-      {oauthMessage}
-    </AlertBox>
-  {/if}
 
   <!-- Error -->
   {#if error}
@@ -462,9 +422,7 @@
 
   <!-- Loading -->
   {#if loading}
-    <div class="flex items-center justify-center py-12">
-      <Spinner size="lg" />
-    </div>
+    <StateDisplay type="loading" size="lg" />
   {:else if providers.length === 0}
     <EmptyState
       icon={GitBranch}
@@ -480,9 +438,9 @@
   {:else}
     <!-- Providers List -->
     <Card shadow padding="none" class="divide-y">
-      {#each providers as provider}
+      {#each providers as provider (provider.id)}
         {@const ProviderIcon = getProviderIcon(provider.provider_type)}
-        <div class="p-4 flex items-center justify-between" style="border-color: var(--ds-border);">
+        <div class="p-4 flex items-center justify-between" style="border-color: var(--ds-border);" data-testid={`scm-provider-row-${provider.id}`}>
           <div class="flex items-center space-x-4">
             <div class="flex-shrink-0">
               <ProviderIcon class="h-8 w-8" style="color: var(--ds-text-subtle);" />
@@ -511,21 +469,9 @@
                   <span class="truncate max-w-xs">{provider.base_url}</span>
                 {/if}
               </div>
-              <!-- Connection Status -->
-              <div class="mt-1 flex items-center space-x-2 text-xs">
-                {#if provider.auth_method === 'oauth'}
-                  {#if provider.has_oauth_token}
-                    <span class="flex items-center" style="color: var(--ds-text-success);">
-                      <CheckCircle class="w-3 h-3 mr-1" />
-                      {t('settings.scmProviders.oauthConnected')}
-                    </span>
-                  {:else}
-                    <span class="flex items-center" style="color: var(--ds-text-warning);">
-                      <AlertCircle class="w-3 h-3 mr-1" />
-                      {t('settings.scmProviders.oauthNotConnected')}
-                    </span>
-                  {/if}
-                {:else if provider.auth_method === 'pat'}
+              {#if provider.auth_method === 'pat'}
+                <!-- PAT Configuration Status -->
+                <div class="mt-1 flex items-center space-x-2 text-xs">
                   {#if provider.has_pat}
                     <span class="flex items-center" style="color: var(--ds-text-success);">
                       <CheckCircle class="w-3 h-3 mr-1" />
@@ -537,35 +483,20 @@
                       {t('settings.scmProviders.patNotConfigured')}
                     </span>
                   {/if}
-                {/if}
-              </div>
+                </div>
+              {/if}
             </div>
           </div>
           <div class="flex items-center space-x-2">
-            {#if provider.auth_method === 'oauth' && !provider.has_oauth_token && provider.oauth_client_id}
-              <Button
-                variant="secondary"
-                size="sm"
-                onclick={() => startOAuth(provider)}
-                disabled={oauthLoading}
-              >
-                {#if oauthLoading}
-                  <Spinner size="sm" class="mr-1" />
-                {:else}
-                  <Link class="w-4 h-4 mr-1" />
-                {/if}
-                {t('settings.scmProviders.connect')}
-              </Button>
-            {/if}
             {#if provider.auth_method !== 'oauth'}
-              <Button variant="ghost" size="sm" onclick={() => testConnection(provider.id)} disabled={testLoading}>
+              <Button variant="ghost" size="sm" onclick={() => testConnection(provider.id)} disabled={testLoading} dataTestid={`scm-provider-test-${provider.id}`}>
                 <TestTube class="w-4 h-4" />
               </Button>
             {/if}
-            <Button variant="ghost" size="sm" onclick={() => openEditModal(provider)}>
+            <Button variant="ghost" size="sm" onclick={() => openEditModal(provider)} dataTestid={`scm-provider-edit-${provider.id}`}>
               <Edit class="w-4 h-4" />
             </Button>
-            <Button variant="danger-ghost" size="sm" icon={Trash2} title={t('common.delete')} onclick={() => deleteProvider(provider)}></Button>
+            <Button variant="danger-ghost" size="sm" icon={Trash2} title={t('common.delete')} onclick={() => deleteProvider(provider)} dataTestid={`scm-provider-delete-${provider.id}`}></Button>
           </div>
         </div>
       {/each}
@@ -589,12 +520,14 @@
             bind:value={formData.slug}
             placeholder="github-main"
             disabled={!!editingProvider}
+            dataTestid="scm-provider-slug"
           />
         </FormField>
         <FormField label={t('settings.scmProviders.name')} error={formErrors.name}>
           <Input
             bind:value={formData.name}
             placeholder={t('settings.scmProviders.namePlaceholder')}
+            dataTestid="scm-provider-name"
           />
         </FormField>
       </div>
@@ -609,6 +542,9 @@
             placeholder="Select provider type"
             getValue={(item) => item.value}
             getLabel={(item) => item.label}
+            onSelect={(item) => handleProviderTypeChange(item.value)}
+            inputTestid="scm-provider-type"
+            optionTestid={(item) => `scm-provider-type-option-${item.value}`}
           />
         </div>
         <div>
@@ -619,16 +555,25 @@
             placeholder="Select auth method"
             getValue={(item) => item.value}
             getLabel={(item) => item.label}
+            inputTestid="scm-provider-auth"
+            optionTestid={(item) => `scm-provider-auth-option-${item.value}`}
           />
         </div>
       </div>
 
-      <!-- Base URL (for self-hosted Gitea/Forgejo) -->
+      <!-- Base URL (for self-hosted Gitea/Forgejo; optional for GitLab) -->
       {#if formData.provider_type === 'gitea'}
         <FormField label={t('settings.scmProviders.baseUrl')} error={formErrors.base_url} helper={t('settings.scmProviders.baseUrlPlaceholder')}>
           <Input
             bind:value={formData.base_url}
             placeholder="https://gitea.example.com"
+          />
+        </FormField>
+      {:else if formData.provider_type === 'gitlab'}
+        <FormField label={t('settings.scmProviders.baseUrl')} error={formErrors.base_url} helper={t('settings.scmProviders.baseUrlOptionalGitlab')}>
+          <Input
+            bind:value={formData.base_url}
+            placeholder="https://gitlab.com"
           />
         </FormField>
       {/if}
@@ -655,7 +600,7 @@
             <p class="text-xs" style="color: var(--ds-text-subtle);">{t('settings.scmProviders.enterSlugForCallback')}</p>
           {/if}
           <DescriptionText variant="subtlest">
-            {t('settings.scmProviders.useThisUrl')} {formData.provider_type === 'github' ? 'GitHub' : 'Gitea'}
+            {t('settings.scmProviders.useThisUrl')} {getProviderLabel(formData.provider_type)}
           </DescriptionText>
         </div>
       {/snippet}
@@ -674,10 +619,10 @@
         </div>
       {/if}
 
-      <!-- PAT Settings -->
+      <!-- Access Token Settings (stored internally as PAT for API compatibility) -->
       {#if formData.auth_method === 'pat'}
-        <FormField label={t('settings.scmProviders.personalAccessToken')} error={formErrors.personal_access_token} helper={editingProvider ? t('settings.scmProviders.leaveEmptyToKeep') : ''}>
-          <Input type="password" bind:value={formData.personal_access_token} />
+        <FormField label={t('settings.scmProviders.accessToken')} error={formErrors.personal_access_token} helper={getAccessTokenHelp()}>
+          <Input type="password" bind:value={formData.personal_access_token} dataTestid="scm-provider-token" />
         </FormField>
       {/if}
 
@@ -690,13 +635,13 @@
         </FormField>
 
         <FormField label={t('settings.scmProviders.privateKeyPem')} error={formErrors.github_app_private_key} helper={editingProvider ? t('settings.scmProviders.leaveEmptyToKeep') : ''}>
-          <textarea
+          <Textarea
             bind:value={formData.github_app_private_key}
-            rows="4"
-            class="shadow-sm focus:ring-blue-500 focus:border-blue-500 block w-full sm:text-sm rounded-md font-mono text-xs border"
-            style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border);"
+            rows={4}
+            class="font-mono"
+            size="small"
             placeholder="-----BEGIN RSA PRIVATE KEY-----"
-          ></textarea>
+          />
         </FormField>
 
         <!-- Installation Discovery -->
@@ -732,10 +677,10 @@
             <div class="space-y-2">
               <p class="text-xs" style="color: var(--ds-text-subtle);">Select an organization:</p>
               <div class="grid gap-2">
-                {#each discoveredInstallations as installation}
+                {#each discoveredInstallations as installation (installation.id)}
                   <button
                     type="button"
-                    class="flex items-center p-2 rounded border hover:border-blue-500 transition-colors text-left w-full"
+                    class="flex items-center p-2 rounded border hover:border-ds-interactive transition-colors text-left w-full"
                     style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
                     onclick={() => selectInstallation(installation)}
                   >
@@ -847,7 +792,7 @@
           <Button type="button" variant="secondary" onclick={closeModals}>
             {t('common.cancel')}
           </Button>
-          <Button type="submit" variant="primary" disabled={saving} keyboardHint="⏎">
+          <Button type="submit" variant="primary" disabled={saving} keyboardHint="⏎" dataTestid="scm-provider-submit">
             {#if saving}
               <Spinner size="sm" class="mr-2" />
             {/if}
@@ -857,5 +802,3 @@
       </div>
     </form>
 </Modal>
-
-

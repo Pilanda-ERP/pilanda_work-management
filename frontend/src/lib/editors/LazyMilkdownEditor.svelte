@@ -9,7 +9,12 @@
     customUploadFn = null, downloadUrlBase = '/api/attachments', deferImageUploads = false,
     onDeferredImageUpload = null,
     enableDiagrams = false,
-    workspaceId = null
+    workspaceId = null,
+    enablePageLinks = false,
+    expectedContentHash = '',
+    onBeforeDiagramOpen = async () => {},
+    onDiagramPersisted = (_payload) => {},
+    testId = null
   } = $props();
 
   let MilkdownEditor = $state(null);
@@ -82,30 +87,43 @@
       editorInstance.insertImage(src, alt, title);
     }
   }
+
+  export function insertMarkdown(markdown) {
+    if (editorInstance?.insertMarkdown) {
+      editorInstance.insertMarkdown(markdown);
+    }
+  }
 </script>
 
 {#if MilkdownEditor}
-  <MilkdownEditor
-    bind:this={editorInstance}
-    bind:content
-    {placeholder}
-    {readonly}
-    {showToolbar}
-    {hideToolbarUntilFocus}
-    {itemId}
-    {entityType}
-    {entityId}
-    {onImageInsert}
-    {onContentChange}
-    {isPersonalWorkspace}
-    {compact}
-    {customUploadFn}
-    {downloadUrlBase}
-    {deferImageUploads}
-    {onDeferredImageUpload}
-    {enableDiagrams}
-    {workspaceId}
-  />
+  {#key readonly}
+    <MilkdownEditor
+      bind:this={editorInstance}
+      bind:content
+      {placeholder}
+      {readonly}
+      {showToolbar}
+      {hideToolbarUntilFocus}
+      {itemId}
+      {entityType}
+      {entityId}
+      {onImageInsert}
+      {onContentChange}
+      {isPersonalWorkspace}
+      {compact}
+      {customUploadFn}
+      {downloadUrlBase}
+      {deferImageUploads}
+      {onDeferredImageUpload}
+      {enableDiagrams}
+      {workspaceId}
+      {enablePageLinks}
+      {expectedContentHash}
+      {onBeforeDiagramOpen}
+      {onDiagramPersisted}
+      {testId}
+    />
+  {/key}
 {:else}
   <!-- Skeleton placeholder while loading -->
   <div

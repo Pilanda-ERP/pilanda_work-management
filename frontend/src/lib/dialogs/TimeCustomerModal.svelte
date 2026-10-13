@@ -1,9 +1,8 @@
 <script>
-  import { tick } from 'svelte';
   import Modal from './Modal.svelte';
   import Button from '../components/Button.svelte';
   import Input from '../components/Input.svelte';
-  import Textarea from '../components/Textarea.svelte';
+  import FileInput from '../components/FileInput.svelte';
   import CustomFieldRenderer from '../features/items/CustomFieldRenderer.svelte';
   import Label from '../components/Label.svelte';
   import Checkbox from '../components/Checkbox.svelte';
@@ -11,6 +10,8 @@
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast, warningToast } from '../stores/toasts.svelte.js';
+	import TextField from '../components/TextField.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
 
   // Props
   let {
@@ -33,7 +34,6 @@
   let uploadingAvatar = $state(false);
   let showAvatarUpload = $state(false);
   const nameInputId = 'customer-name-input';
-  let nameInputRef = $state(null);
 
   // Avatar upload functionality
   async function handleAvatarUpload(files) {
@@ -93,23 +93,6 @@
     oncancel();
   }
 
-  async function focusNameInput() {
-    await tick();
-    // Wait for Modal's own focus logic (100ms) to complete
-    setTimeout(() => {
-      const el = nameInputRef || document.getElementById(nameInputId);
-      if (el) {
-        el.focus();
-        el.select();
-      }
-    }, 120);
-  }
-
-  $effect(() => {
-    if (isOpen) {
-      focusNameInput();
-    }
-  });
 </script>
 
 {#if isOpen}
@@ -129,12 +112,11 @@
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
           <Label required class="mb-2">{t('organization.organizationName')}</Label>
-          <Input id={nameInputId} bind:inputRef={nameInputRef} bind:value={formData.name} required />
+          <Input id={nameInputId} bind:value={formData.name} required />
         </div>
 
         <div>
-          <Label class="mb-2">{t('organization.email')}</Label>
-          <Input type="email" bind:value={formData.email} />
+          <TextField label={t('organization.email')} type="email" bind:value={formData.email} />
         </div>
       </div>
 
@@ -196,15 +178,14 @@
         <!-- Upload Input (shown when toggled) -->
         {#if showAvatarUpload && attachmentsEnabled}
           <div class="mt-3 p-4 rounded border" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-            <input
-              type="file"
+            <FileInput
               accept="image/*"
               onchange={(e) => handleAvatarUpload(e.currentTarget.files)}
               disabled={uploadingAvatar}
-              class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
+              class="block w-full text-sm text-ds-text-subtle file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-ds-background-neutral file:text-ds-text-link hover:file:bg-ds-background-neutral-hovered disabled:opacity-50"
             />
             {#if uploadingAvatar}
-              <div class="mt-2 text-sm text-blue-600">{t('common.uploading')}</div>
+              <div class="mt-2 text-sm text-ds-interactive">{t('common.uploading')}</div>
             {/if}
             <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
               {t('organization.uploadRecommendation')}
@@ -214,8 +195,7 @@
       </div>
 
       <div class="mt-6">
-        <Label class="mb-2">{t('common.description')}</Label>
-        <Textarea bind:value={formData.description} rows={3} />
+        <TextareaField label={t('common.description')} rows={3} bind:value={formData.description} />
       </div>
 
       <div class="mt-6">
@@ -234,7 +214,7 @@
             {#each customerOrgFields as field}
               <CustomFieldRenderer
                 {field}
-                bind:value={formData.custom_field_values[field.name]}
+                value={formData.custom_field_values[field.name] ?? ''}
                 readonly={false}
                 onChange={(val) => {
                   formData.custom_field_values[field.name] = val;

@@ -32,12 +32,23 @@ CREATE TABLE IF NOT EXISTS milestones (
 CREATE TABLE IF NOT EXISTS milestone_releases (
 	id SERIAL PRIMARY KEY,
 	milestone_id INTEGER NOT NULL REFERENCES milestones(id) ON DELETE CASCADE,
+	idempotency_key TEXT,
+	state TEXT NOT NULL DEFAULT 'created',
+	last_error TEXT,
+	lease_token TEXT,
+	lease_expires_at TIMESTAMPTZ,
 	tag_name TEXT NOT NULL,
 	name TEXT,
 	body TEXT,
 	is_draft BOOLEAN NOT NULL DEFAULT false,
 	is_prerelease BOOLEAN NOT NULL DEFAULT false,
 	target_commitish TEXT,
+	workspace_repository_id INTEGER,
+	tag_url TEXT,
+	release_status TEXT NOT NULL DEFAULT 'tag_only',
+	released_at TIMESTAMPTZ,
+	assets_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+	last_synced_at TIMESTAMPTZ,
 	scm_connection_id INTEGER, -- FK added in scm_postgres.sql (circular dep: items→milestones→scm→items)
 	scm_repository TEXT,
 	scm_release_id TEXT,
@@ -64,12 +75,22 @@ CREATE INDEX IF NOT EXISTS idx_milestones_status ON milestones(status);
 CREATE INDEX IF NOT EXISTS idx_milestones_target_date ON milestones(target_date);
 CREATE INDEX IF NOT EXISTS idx_milestones_workspace_id ON milestones(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_milestones_is_global ON milestones(is_global);
--- Composite index supports the per-scope position ordering used by drag-and-drop reorder.
-CREATE INDEX IF NOT EXISTS idx_milestones_position ON milestones(is_global, workspace_id, category_id, position);
 CREATE INDEX IF NOT EXISTS idx_milestone_releases_milestone_id ON milestone_releases(milestone_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_milestone_releases_idempotency
+	ON milestone_releases(milestone_id, idempotency_key)
+	WHERE idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_milestone_releases_repository_tag
+	ON milestone_releases(workspace_repository_id, tag_name)
+	WHERE workspace_repository_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_item_milestones_item_id ON item_milestones(item_id);
 CREATE INDEX IF NOT EXISTS idx_item_milestones_milestone_id ON item_milestones(milestone_id);
 -- Partial unique index: one external_key per workspace, but NULLs are unconstrained.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_milestones_workspace_external_key
 	ON milestones(workspace_id, external_key)
 	WHERE external_key IS NOT NULL;
+
+-- Composite index supports the per-scope position ordering used by drag-and-drop
+-- reorder. Existing installs use milestones_existing_postgres.sql before
+-- catalog migrations, so this canonical fresh-install schema can include the
+-- index.
+CREATE INDEX IF NOT EXISTS idx_milestones_position ON milestones(is_global, workspace_id, category_id, position);

@@ -1,5 +1,5 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { publicBoard } from '../api/publicBoard.js';
   import { themeStore } from '../stores/theme.svelte.js';
   import { IconSun, IconMoon, IconClipboardList, IconAlertTriangle } from '@tabler/icons-svelte-runes';
@@ -12,7 +12,7 @@
   let board = $state(null);
   let loading = $state(true);
   let error = $state(null);
-  let refreshInterval;
+  let loadId = 0;
 
   // Card fields set for quick lookup
   let cardFieldSet = $derived(
@@ -28,21 +28,6 @@
     return cardFieldSet.has(fieldId);
   }
 
-  async function loadBoard() {
-    try {
-      board = await publicBoard.get(slug);
-      error = null;
-    } catch (err) {
-      if (err.status === 404) {
-        error = 'not_found';
-      } else {
-        error = 'error';
-      }
-    } finally {
-      loading = false;
-    }
-  }
-
   function toggleTheme() {
     const current = themeStore.resolvedTheme;
     themeStore.setColorMode(current === 'dark' ? 'light' : 'dark');
@@ -50,17 +35,60 @@
 
   onMount(() => {
     themeStore.init();
-    loadBoard();
-    // Auto-refresh every 60 seconds
-    refreshInterval = setInterval(loadBoard, 60000);
   });
 
-  onDestroy(() => {
-    if (refreshInterval) clearInterval(refreshInterval);
+  // The router reuses this component across public-board URLs, so a slug change
+  // must reset scope-owned state and start the new board immediately. Each load
+  // is bound to its slug generation: a superseded response, error or finally
+  // must never commit over the board the user is now looking at.
+  $effect(() => {
+    const activeSlug = slug;
+    const id = ++loadId;
+    const controller = new AbortController();
+    let inFlight = false;
+    let disposed = false;
+
+    board = null;
+    error = null;
+    loading = true;
+    selectedItemKey = null;
+
+    async function load(silent) {
+      if (inFlight || disposed) return;
+      inFlight = true;
+      if (!silent) loading = true;
+      try {
+        const result = await publicBoard.get(activeSlug, { signal: controller.signal });
+        if (disposed || id !== loadId) return;
+        board = result;
+        error = null;
+      } catch (err) {
+        if (disposed || id !== loadId || err?.name === 'AbortError') return;
+        error = err?.status === 404 ? 'not_found' : 'error';
+      } finally {
+        inFlight = false;
+        if (!disposed && id === loadId) loading = false;
+      }
+    }
+
+    load(false);
+    // Auto-refresh every 60 seconds without overlapping a slow request.
+    const refreshInterval = setInterval(() => load(true), 60000);
+
+    return () => {
+      disposed = true;
+      controller.abort();
+      clearInterval(refreshInterval);
+    };
   });
 </script>
 
-<div class="public-board" style="background-color: var(--ds-surface); color: var(--ds-text); min-height: 100vh; display: flex; flex-direction: column;">
+<div
+  class="public-board"
+  style="background-color: var(--ds-surface); color: var(--ds-text); min-height: 100vh; display: flex; flex-direction: column;"
+  data-testid="public-board-page"
+  data-ready={!loading}
+>
   <!-- Header -->
   <header class="public-board-header" style="background-color: var(--ds-surface-raised); border-bottom: 1px solid var(--ds-border); padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px;">
     <div style="display: flex; align-items: center; gap: 12px;">
@@ -90,14 +118,14 @@
   <!-- Content -->
   <main style="flex: 1; overflow-x: auto; padding: 20px 24px;">
     {#if loading}
-      <div style="display: flex; align-items: center; justify-content: center; height: 60vh;">
+      <div data-testid="public-board-loading" style="display: flex; align-items: center; justify-content: center; height: 60vh;">
         <div style="text-align: center;">
           <div class="spinner" style="width: 32px; height: 32px; border: 3px solid var(--ds-border); border-top-color: #2874BB; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px;"></div>
           <p style="color: var(--ds-text-subtle); font-size: 14px;">Loading board...</p>
         </div>
       </div>
     {:else if error === 'not_found'}
-      <div style="display: flex; align-items: center; justify-content: center; height: 60vh;">
+      <div data-testid="public-board-not-found" style="display: flex; align-items: center; justify-content: center; height: 60vh;">
         <div style="text-align: center;">
           <IconClipboardList class="w-10 h-10 mx-auto mb-4" style="color: var(--ds-icon-disabled);" />
           <h2 style="font-size: 20px; font-weight: 600; margin: 0 0 8px;">Board not found</h2>
@@ -105,7 +133,7 @@
         </div>
       </div>
     {:else if error}
-      <div style="display: flex; align-items: center; justify-content: center; height: 60vh;">
+      <div data-testid="public-board-error" style="display: flex; align-items: center; justify-content: center; height: 60vh;">
         <div style="text-align: center;">
           <IconAlertTriangle class="w-10 h-10 mx-auto mb-4" style="color: var(--ds-icon-danger);" />
           <h2 style="font-size: 20px; font-weight: 600; margin: 0 0 8px;">Something went wrong</h2>
@@ -113,9 +141,22 @@
         </div>
       </div>
     {:else if board}
+      {#if board.truncated}
+        <div
+          data-testid="public-board-truncated"
+          style="margin-bottom: 16px; padding: 10px 12px; border: 1px solid var(--ds-border-warning, #ca8a04); border-radius: 6px; background: var(--ds-background-warning, #fef9c3); color: var(--ds-text-warning, #854d0e); font-size: 13px;"
+        >
+          Showing the newest {board.loaded_items} of {board.total_items} matching items. Column counts are partial because this public board is limited to {board.item_limit} cards.
+        </div>
+      {/if}
       <div class="board-columns" style="display: flex; gap: 16px; min-height: calc(100vh - 160px);">
         {#each board.columns as column}
-          <div class="board-column" style="min-width: 280px; max-width: 320px; flex: 1; display: flex; flex-direction: column;">
+          <div
+            class="board-column"
+            style="min-width: 280px; max-width: 320px; flex: 1; display: flex; flex-direction: column;"
+            data-testid="public-board-column"
+            data-column-name={column.name}
+          >
             <!-- Column header -->
             <div style="padding: 10px 12px; margin-bottom: 8px; border-radius: 8px 8px 0 0; display: flex; align-items: center; justify-content: space-between; background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border); border-bottom: 3px solid {column.color || 'var(--ds-border)'};">
               <div style="display: flex; align-items: center; gap: 8px;">
@@ -142,6 +183,8 @@
                   onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectedItemKey = card.key; } }}
                   role="button"
                   tabindex="0"
+                  data-testid="public-board-card"
+                  data-item-key={card.key}
                 >
                   <!-- Key -->
                   {#if showField('key')}
@@ -149,7 +192,14 @@
                   {/if}
 
                   <!-- Title -->
-                  <div style="font-size: 13px; font-weight: 500; line-height: 1.4; margin-bottom: 8px;">{card.title}</div>
+                  {#if showField('title')}
+                    <div
+                      data-testid="public-board-card-title"
+                      style="font-size: 13px; font-weight: 500; line-height: 1.4; margin-bottom: 8px;"
+                    >
+                      {card.title}
+                    </div>
+                  {/if}
 
                   <!-- Meta row -->
                   <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
@@ -160,6 +210,16 @@
                         title={card.priority_name}
                       >
                         {card.priority_name}
+                      </span>
+                    {/if}
+
+                    <!-- Status -->
+                    {#if showField('status') && card.status_name}
+                      <span
+                        data-testid="public-board-card-status"
+                        style="font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--ds-surface-sunken); color: var(--ds-text-subtle);"
+                      >
+                        {card.status_name}
                       </span>
                     {/if}
 

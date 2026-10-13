@@ -6,8 +6,10 @@ package server
 import (
 	"bytes"
 	"context"
-	"database/sql"
+	"crypto/ed25519"
 	"embed"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -18,40 +20,108 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"windshift/internal/aitools"
 	"windshift/internal/auth"
+	"windshift/internal/authz"
 	"windshift/internal/config"
 	"windshift/internal/database"
 	"windshift/internal/email"
 	"windshift/internal/emailutil"
+	"windshift/internal/events"
 	"windshift/internal/handlers"
+	"windshift/internal/health"
+	"windshift/internal/itemevents"
 	"windshift/internal/ldap"
+	"windshift/internal/licensing"
 	"windshift/internal/llm"
 	"windshift/internal/logger"
 	mcpserver "windshift/internal/mcp"
+	appmetrics "windshift/internal/metrics"
 	"windshift/internal/middleware"
 	"windshift/internal/models"
+	"windshift/internal/objecttranslation"
 	"windshift/internal/plugins"
 	"windshift/internal/portalwebauthn"
 	"windshift/internal/repository"
 	"windshift/internal/restapi"
 	v1 "windshift/internal/restapi/v1"
+	v2 "windshift/internal/restapi/v2"
 	"windshift/internal/router"
 	"windshift/internal/routes"
 	"windshift/internal/scheduler"
 	"windshift/internal/scm"
 	"windshift/internal/services"
+	"windshift/internal/sla"
 	"windshift/internal/smtp"
+	"windshift/internal/sso"
+	"windshift/internal/standardagent"
 	"windshift/internal/utils"
 	"windshift/internal/webauthn"
 	"windshift/internal/webhook"
 )
 
+type planningReleaseProviderAdapter struct {
+	provider interface {
+		scm.ReleaseProvider
+		ListTags(context.Context, string, string, time.Time) ([]scm.Tag, error)
+	}
+}
+
+func (a planningReleaseProviderAdapter) CreateRelease(ctx context.Context, owner, repo string, input services.ExternalReleaseOptions) (*services.ExternalRelease, error) {
+	release, err := a.provider.CreateRelease(ctx, owner, repo, scm.CreateReleaseOptions{
+		TagName: input.TagName, TargetCommitish: input.TargetCommitish, Name: input.Name,
+		Body: input.Body, IsDraft: input.IsDraft, IsPrerelease: input.IsPrerelease,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return externalPlanningRelease(release), nil
+}
+
+func (a planningReleaseProviderAdapter) ListReleases(ctx context.Context, owner, repo string) ([]services.ExternalRelease, error) {
+	releases, err := a.provider.ListReleases(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]services.ExternalRelease, len(releases))
+	for i := range releases {
+		result[i] = *externalPlanningRelease(&releases[i])
+	}
+	return result, nil
+}
+
+func (a planningReleaseProviderAdapter) ListTags(ctx context.Context, owner, repo string) ([]services.ExternalTag, error) {
+	tags, err := a.provider.ListTags(ctx, owner, repo, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]services.ExternalTag, len(tags))
+	for i := range tags {
+		result[i] = services.ExternalTag{Name: tags[i].Name, URL: tags[i].URL}
+	}
+	return result, nil
+}
+
+func externalPlanningRelease(release *scm.Release) *services.ExternalRelease {
+	return &services.ExternalRelease{
+		ID: release.ID, URL: release.URL, TagName: release.TagName, TagURL: release.TagURL,
+		Name: release.Name, Body: release.Body, Status: release.Status, Assets: release.Assets,
+		IsDraft: release.IsDraft, IsPrerelease: release.IsPrerelease, ReleasedAt: release.ReleasedAt,
+	}
+}
+
 // Config is an alias to config.Config — the canonical, fully-resolved runtime
 // configuration. All resolution of env vars and CLI flags happens in
 // internal/config/Load; this package only consumes the result.
 type Config = config.Config
+
+const (
+	databasePoolBudgetWarningPercent = 90
+	maxRequestHeaderValueCount       = 128
+)
 
 // Server represents a windshift HTTP server instance.
 type Server struct {
@@ -60,61 +130,97 @@ type Server struct {
 	db         database.Database
 	listener   net.Listener
 
-	// Services that need cleanup
-	ldapHandler               *handlers.LDAPHandler
-	notificationManager       *handlers.NotificationManager
-	notificationService       *services.NotificationService
-	notificationScheduler     *scheduler.NotificationScheduler
-	recurrenceScheduler       *scheduler.RecurrenceScheduler
-	cfvCleanupScheduler       *scheduler.CFVCleanupScheduler
-	todoistSyncScheduler      *scheduler.TodoistSyncScheduler
-	runnerLeaseReaper         *scheduler.RunnerLeaseReaper
-	codingRunService          *services.RunService
-	workflowService           *services.WorkflowService
-	actionService             *services.ActionService
-	assetActionService        *services.AssetActionService
-	approvalEscalationSweeper *services.ApprovalEscalationSweeper
-	emailScheduler            *scheduler.EmailScheduler
-	emailTrackingRetention    *scheduler.EmailTrackingRetentionSweeper
-	briefingScheduler         *scheduler.BriefingScheduler
-	pluginScheduleScheduler   *scheduler.PluginScheduleScheduler
-	activityTracker           *services.ActivityTracker
-	tokenTracker              *services.TokenTracker
-	scmSyncStopChan           chan struct{}
-	issueSyncStopChan         chan struct{}
-	magicLinkStopChan         chan struct{}
-	cleanupStopChan           chan struct{}
-	jiraHostStopChan          chan struct{}
-	cleanupTicker             *time.Ticker
-	pluginManager             *plugins.Manager
+	permissionService *services.PermissionService
+	sessionManager    *auth.SessionManager
+	tokenManager      *auth.TokenManager
+	scimTokenManager  *auth.SCIMTokenManager
+	itemCache         *services.ItemCacheService
 
-	// Rate limiters that need cleanup
-	loginRateLimiter    *middleware.RateLimiter
-	fidoRateLimiter     *middleware.RateLimiter
-	authRateLimiter     *middleware.RateLimiter
-	scimRateLimiter     *middleware.RateLimiter
-	portalSubmitLimiter *middleware.RateLimiter
-	portalSearchLimiter *middleware.RateLimiter
-	emailVerifyLimiter  *middleware.RateLimiter
-	setupLimiter        *middleware.RateLimiter
-	ssoRateLimiter      *middleware.RateLimiter
-	portalAuthLimiter   *middleware.RateLimiter
-	aiRateLimiter       *middleware.RateLimiter
-	uploadLimiter       *middleware.RateLimiter
-	webhookLimiter      *middleware.RateLimiter
-	searchLimiter       *middleware.RateLimiter
-	calendarFeedLimiter *middleware.RateLimiter
-	userConcurrency     *middleware.UserConcurrencyLimiter
+	ldapHandler                  *handlers.LDAPHandler
+	notificationManager          *handlers.NotificationManager
+	notificationService          *services.NotificationService
+	notificationScheduler        *scheduler.NotificationScheduler
+	recurrenceScheduler          *scheduler.RecurrenceScheduler
+	cfvCleanupScheduler          *scheduler.CFVCleanupScheduler
+	todoistSyncScheduler         *scheduler.TodoistSyncScheduler
+	zammadSyncScheduler          *scheduler.ZammadSyncScheduler
+	runnerLeaseReaper            *scheduler.RunnerLeaseReaper
+	globalRankMigrationScheduler *scheduler.GlobalRankMigrationScheduler
+	codingRunService             *services.RunService
+	standardAgentDispatcher      *standardagent.Dispatcher
+	workflowService              *services.WorkflowService
+	actionService                *services.ActionService
+	assetActionService           *services.AssetActionService
+	eventEngine                  *events.Engine
+	approvalEscalationSweeper    *services.ApprovalEscalationSweeper
+	incidentEscalationSweeper    *services.IncidentEscalationSweeper
+	actionInactivitySweeper      *services.ActionInactivitySweeper
+	slaEngine                    *sla.Engine
+	slaLoop                      *sla.Loop
+	slaLoopCancel                context.CancelFunc
+	slaTestClock                 *sla.TestClock
+	emailScheduler               *scheduler.EmailScheduler
+	ticketImport                 *services.TicketImportService
+	emailTrackingRetention       *scheduler.EmailTrackingRetentionSweeper
+	portalAuthRetention          *scheduler.PortalAuthRetentionSweeper
+	kbEventsRetention            *scheduler.KBEventsRetentionSweeper
+	briefingScheduler            *scheduler.BriefingScheduler
+	pluginScheduleScheduler      *scheduler.PluginScheduleScheduler
+	activityTracker              *services.ActivityTracker
+	tokenTracker                 *services.TokenTracker
+	webhookSender                *webhook.WebhookSender
+	scmSyncStopChan              chan struct{}
+	issueSyncLoopMu              sync.Mutex
+	issueSyncLoopStop            chan struct{}
+	// secretEncryption is the at-rest secret cipher shared by the SCM and
+	// integration OAuth surfaces; set during wiring, used to revoke provider
+	// grants when a user is offboarded.
+	secretEncryption    *sso.SecretEncryption
+	issueSyncStopChan   chan struct{}
+	magicLinkStopChan   chan struct{}
+	cleanupStopChan     chan struct{}
+	jiraHostStopChan    chan struct{}
+	cleanupTicker       *time.Ticker
+	pluginManager       *plugins.Manager
+	databaseDiagRepo    *repository.DatabaseDiagnosticsRepository
+	databasePoolMonitor *services.DatabasePoolMonitor
+	channelService      *services.ChannelService
+	memoryBudget        config.MemoryBudget
+	metrics             *appmetrics.Metrics
 
-	// Server state
-	actualPort   int
-	started      bool
-	shuttingDown bool
+	loginRateLimiter      *middleware.RateLimiter
+	runnerRegisterLimiter *middleware.RateLimiter
+	fidoRateLimiter       *middleware.RateLimiter
+	authRateLimiter       *middleware.RateLimiter
+	scimRateLimiter       *middleware.RateLimiter
+	portalSubmitLimiter   *middleware.RateLimiter
+	portalSearchLimiter   *middleware.RateLimiter
+	emailVerifyLimiter    *middleware.RateLimiter
+	setupLimiter          *middleware.RateLimiter
+	ssoRateLimiter        *middleware.RateLimiter
+	portalAuthLimiter     *middleware.RateLimiter
+	oauthTokenLimiter     *middleware.RateLimiter
+	aiRateLimiter         *middleware.RateLimiter
+	uploadLimiter         *middleware.RateLimiter
+	webhookLimiter        *middleware.RateLimiter
+	searchLimiter         *middleware.RateLimiter
+	calendarFeedLimiter   *middleware.RateLimiter
+	publicBoardLimiter    *middleware.RateLimiter
+	userConcurrency       *middleware.UserConcurrencyLimiter
+
+	actualPort         int
+	started            bool
+	shuttingDown       bool
+	backgroundStopOnce sync.Once
 }
 
 // New creates a new Server instance with the given configuration.
 // It initializes all services and handlers but does not start listening.
 func New(cfg Config) (*Server, error) {
+	memoryBudget, err := config.ResolveMemoryBudget(cfg.Memory.LimitMB)
+	if err != nil {
+		return nil, fmt.Errorf("resolve memory budget: %w", err)
+	}
 	s := &Server{
 		config:            cfg,
 		scmSyncStopChan:   make(chan struct{}),
@@ -122,6 +228,7 @@ func New(cfg Config) (*Server, error) {
 		magicLinkStopChan: make(chan struct{}),
 		cleanupStopChan:   make(chan struct{}),
 		jiraHostStopChan:  make(chan struct{}),
+		memoryBudget:      memoryBudget,
 	}
 
 	if err := s.initialize(); err != nil {
@@ -133,18 +240,27 @@ func New(cfg Config) (*Server, error) {
 }
 
 // initialize sets up all services and handlers.
-func (s *Server) initialize() error {
-	// FIXME(human-review): This 1k+ line method wires database, services, routes,
-	// schedulers, plugins, and shutdown state. Split into focused builders plus a
-	// scheduler/lifecycle registry so start/stop wiring cannot drift silently.
-	cfg := s.config
+// newConfigSetConformanceService builds the conformance service with the
+// custom-field cleanup scheduler wired, so option-set repairs commit their
+// scrubbing jobs atomically (WI-1529).
+func newConfigSetConformanceService(db database.Database) *services.ConfigSetConformanceService {
+	svc := services.NewConfigSetConformanceService(db, repository.NewConfigurationSetRepository(db))
+	svc.SetOptionRemovalEnqueuer(scheduler.EnqueueOptionRemovalTx)
+	return svc
+}
 
-	// Suppress all logging in silent mode (for testing)
+func (s *Server) initialize() error {
+	// FIXME: split initialization into focused builders and lifecycle registries.
+	cfg := s.config
+	utils.SetSkipTLSVerify(cfg.OutboundTLS.SkipVerify)
+	if cfg.OutboundTLS.SkipVerify {
+		slog.Warn("outbound TLS certificate verification is disabled; self-signed certificates will be accepted without server identity verification")
+	}
+
 	if cfg.SilentMode {
 		logger.SetSilent(true)
 	}
 
-	// Determine which database to use
 	var err error
 	if cfg.DB.PostgresConn != "" {
 		slog.Info("connecting to PostgreSQL database")
@@ -162,114 +278,140 @@ func (s *Server) initialize() error {
 		slog.Info("SQLite database initialized", "max_read_conns", cfg.DB.MaxReadConns, "max_write_conns", cfg.DB.MaxWriteConns, "mode", "WAL")
 	}
 
+	s.databaseDiagRepo = repository.NewDatabaseDiagnosticsRepository(s.db)
+	if cfg.DB.PostgresConn != "" {
+		replicas := cfg.DB.ReplicaCount
+		if replicas <= 0 {
+			slog.Warn("invalid PostgreSQL replica count; capacity budget assumes one replica", "configured_replica_count", replicas)
+			replicas = 1
+		}
+		headroom := cfg.DB.ConnectionHeadroom
+		if headroom < 0 {
+			slog.Warn("invalid PostgreSQL connection headroom; capacity budget assumes zero", "configured_headroom", headroom)
+			headroom = 0
+		}
+		auxiliaryConnections := 0
+		if cfg.SSH.Enabled {
+			auxiliaryConnections = config.SSHDatabaseMaxConnections
+		}
+		budgetCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		budget, budgetErr := s.databaseDiagRepo.LoadPostgresCapacityBudget(
+			budgetCtx,
+			s.db,
+			replicas,
+			headroom,
+			auxiliaryConnections,
+		)
+		cancel()
+		if budgetErr != nil {
+			slog.Warn("unable to evaluate PostgreSQL connection capacity budget", "error", budgetErr)
+		} else {
+			logDatabaseCapacityBudget(budget)
+		}
+	}
+	s.databasePoolMonitor = services.NewDatabasePoolMonitor(s.databaseDiagRepo, services.DefaultDatabasePoolMonitorConfig())
+
 	if err = s.db.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
 	}
+	if err = database.ValidateCanonicalSchemaCheckpoint(s.db); err != nil {
+		return fmt.Errorf("database startup refused: %w", err)
+	}
+	// Shipped framework packs are embedded assets; a malformed one is a build
+	// defect, so refuse to start rather than fail at first apply.
+	if err = services.ValidateBuiltinPacks(); err != nil {
+		return fmt.Errorf("built-in packs startup refused: %w", err)
+	}
+	objectTranslationService := objecttranslation.NewService(s.db)
+	if err := objectTranslationService.SyncSystem(context.Background(), objecttranslation.ShippedSystemTranslations()); err != nil {
+		return fmt.Errorf("sync shipped object translations: %w", err)
+	}
+	s.eventEngine = events.NewEngine(s.db, events.DefaultConfig())
 
-	// Seed built-in email templates (idempotent). Lives outside Initialize
-	// so the database layer doesn't depend on the email domain.
 	if err = emailutil.SeedTemplates(s.db); err != nil {
 		slog.Warn("failed to seed default email templates", "error", err)
 	}
 
-	// Ensure default notification settings exist
 	if err = repository.NewNotificationSettingsRepository(s.db).EnsureDefault(); err != nil {
 		slog.Warn("failed to ensure notification settings", "error", err)
-	}
-
-	// Migrate legacy select field options to ID-based format
-	if err = database.MigrateSelectFieldOptions(s.db); err != nil {
-		slog.Warn("failed to migrate select field options", "error", err)
 	}
 
 	if cfg.RecoverUser != "" {
 		s.recoverUser(cfg.RecoverUser)
 	}
 
-	// Determine setup status
 	setupCompleted, err := checkSetupStatusWithRetry(s.db, 5, time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to determine setup status: %w", err)
 	}
 
-	// Initialize permission service
 	permService, err := services.NewPermissionService(s.db, services.PermissionCacheConfig{
 		TTL:          15 * time.Minute,
-		MaxCacheSize: 512,
+		MaxCacheSize: s.memoryBudget.PermissionCacheMB,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize permission service: %w", err)
 	}
+	s.permissionService = permService
 
 	// Shared channel service used by ChannelHandler, WebhookHandler,
 	// FormHandler, RequestTypeHandler, and AssetReportHandler for the
 	// "user manages channel C" gate.
 	channelService := services.NewChannelService(s.db, permService)
+	s.channelService = channelService
 
-	// Initialize activity tracker
-	s.activityTracker, err = services.NewActivityTracker(s.db, services.DefaultActivityTrackerConfig())
+	activityConfig := services.DefaultActivityTrackerConfig()
+	activityConfig.MaxCacheSize = s.memoryBudget.ActivityCacheMB
+	s.activityTracker, err = services.NewActivityTracker(s.db, activityConfig)
 	if err != nil {
 		return fmt.Errorf("failed to initialize activity tracker: %w", err)
 	}
 
-	// Start activity cleanup scheduler
 	s.cleanupTicker = time.NewTicker(24 * time.Hour)
 	go s.runActivityCleanup()
 
-	// Determine HTTPS mode
 	enableHTTPS := cfg.TLSCertPath != "" && cfg.TLSKeyPath != ""
 
-	// Parse additional proxies
 	var additionalProxyList []string
 	if cfg.AdditionalProxies != "" {
 		additionalProxyList = strings.Split(cfg.AdditionalProxies, ",")
 	}
 
-	// Create IP extractor
 	ipExtractor := utils.NewIPExtractor(cfg.UseProxy, additionalProxyList)
 
-	// Authentication management
-	sessionManager := auth.NewSessionManager(s.db, enableHTTPS, cfg.UseProxy, additionalProxyList, cfg.Auth.SessionSecret)
+	primarySessionCacheMB, _ := config.SplitSSHCacheBudget(s.memoryBudget.SessionCacheMB, cfg.SSH.Enabled)
+	sessionManager := auth.NewSessionManagerWithValidationCacheTTL(
+		s.db,
+		enableHTTPS,
+		cfg.UseProxy,
+		additionalProxyList,
+		cfg.Auth.SessionSecret,
+		cfg.Auth.SessionIPBinding,
+		cfg.Auth.SessionValidationCacheTTL,
+		primarySessionCacheMB,
+	)
+	s.sessionManager = sessionManager
 
-	// Determine effective port for CORS
 	effectivePort := cfg.Port
 	if cfg.AllowedPort != "" {
 		effectivePort = cfg.AllowedPort
 	}
 
-	// Initialize WebAuthn — RPID/RPName are pre-resolved by config.Load;
-	// webauthn only overrides RPID when in development mode.
+	// WebAuthn settings are resolved by config.Load; development may override RPID.
 	isDevelopment := cfg.DisableCSRF
-	rpID := cfg.WebAuthn.RPID
-	if isDevelopment {
-		rpID = ""
-	}
-	webAuthnConfig, err := webauthn.NewConfig(rpID, cfg.WebAuthn.RPName, nil, isDevelopment, cfg.AllowedHosts, effectivePort, enableHTTPS, cfg.UseProxy)
+	webAuthnConfig, portalWebAuthnConfig, err := initializeWebAuthnConfigs(cfg, isDevelopment, effectivePort, enableHTTPS)
 	if err != nil {
-		return fmt.Errorf("failed to initialize WebAuthn configuration: %w", err)
-	}
-	slog.Info("WebAuthn configuration initialized",
-		"rp_id", webAuthnConfig.RPID,
-		"rp_name", webAuthnConfig.RPName,
-		"development_mode", isDevelopment)
-
-	// Portal passkeys reuse the relying-party settings but require resident keys
-	// so customers can sign in passwordlessly (BeginDiscoverableLogin).
-	portalWebAuthnConfig, err := portalwebauthn.NewConfig(webAuthnConfig)
-	if err != nil {
-		return fmt.Errorf("failed to initialize portal WebAuthn configuration: %w", err)
+		return err
 	}
 
-	// Build options for user-keyed rate limiters (authenticated endpoints)
 	var userKeyedOpts []middleware.RateLimiterOption
 	userKeyedOpts = append(userKeyedOpts, middleware.WithUserKeyed())
 	if cfg.DisableIPRateLimit {
 		userKeyedOpts = append(userKeyedOpts, middleware.WithDisableIPLimit())
 	}
 
-	// Create rate limiters
-	// IP-only limiters (pre-auth / unauthenticated endpoints)
 	s.loginRateLimiter = middleware.NewRateLimiter(5.0/60.0, 10, cfg.UseProxy, additionalProxyList)
+	s.runnerRegisterLimiter = middleware.NewRateLimiter(5.0/60.0, 10, cfg.UseProxy, additionalProxyList)
 	s.fidoRateLimiter = middleware.NewRateLimiter(10.0/60.0, 15, cfg.UseProxy, additionalProxyList)
 	s.scimRateLimiter = middleware.NewRateLimiter(10.0, 100, cfg.UseProxy, additionalProxyList)
 	s.portalSubmitLimiter = middleware.NewRateLimiter(5.0/60.0, 10, cfg.UseProxy, additionalProxyList)
@@ -279,7 +421,15 @@ func (s *Server) initialize() error {
 	s.ssoRateLimiter = middleware.NewRateLimiter(10.0/60.0, 5, cfg.UseProxy, additionalProxyList)
 	s.portalAuthLimiter = middleware.NewRateLimiter(3.0/60.0, 3, cfg.UseProxy, additionalProxyList)
 	s.calendarFeedLimiter = middleware.NewRateLimiter(10.0/60.0, 15, cfg.UseProxy, additionalProxyList)
-	// User-keyed limiters (authenticated endpoints — key by user ID, optionally skip IP)
+	// Public boards are anonymous and can trigger substantial query and file IO.
+	// Keep this limiter IP-keyed even when authenticated IP limiting is disabled.
+	s.publicBoardLimiter = middleware.NewRateLimiter(30.0/60.0, 60, cfg.UseProxy, additionalProxyList)
+	// OAuth /token is unauthenticated (server-to-server), so it must stay
+	// IP-keyed and must NOT honor DisableIPRateLimit — otherwise enabling that
+	// flag for NAT deployments would silently remove all brute-force protection
+	// on client_secret/code guessing. Kept separate from the user-keyed
+	// authRateLimiter for exactly this reason.
+	s.oauthTokenLimiter = middleware.NewRateLimiter(20.0/60.0, 30, cfg.UseProxy, additionalProxyList)
 	s.authRateLimiter = middleware.NewRateLimiter(20.0/60.0, 30, cfg.UseProxy, additionalProxyList, userKeyedOpts...)
 	s.aiRateLimiter = middleware.NewRateLimiter(20.0/60.0, 30, cfg.UseProxy, additionalProxyList, userKeyedOpts...)
 	s.uploadLimiter = middleware.NewRateLimiter(10.0/60.0, 15, cfg.UseProxy, additionalProxyList, userKeyedOpts...)
@@ -290,21 +440,37 @@ func (s *Server) initialize() error {
 	// can't starve the others. Applied to the api group below.
 	s.userConcurrency = middleware.NewUserConcurrencyLimiter(cfg.MaxUserConcurrency)
 
-	// Initialize token tracker
+	if cfg.MaxTemplateSeedItems > 0 {
+		services.MaxTemplateSeedItems = cfg.MaxTemplateSeedItems
+	}
+
 	s.tokenTracker = services.NewTokenTracker(s.db, services.DefaultTokenTrackerConfig())
 
-	// Create token manager
-	tokenManager := auth.NewTokenManager(s.db, s.tokenTracker)
+	apiTokenCacheMB, _ := config.SplitSSHCacheBudget(s.memoryBudget.APITokenCacheMB, cfg.SSH.Enabled)
+	tokenManager := auth.NewTokenManager(s.db, s.tokenTracker, apiTokenCacheMB)
+	s.tokenManager = tokenManager
 	if cleaned, cleanupErr := tokenManager.CleanupExpiredTokens(); cleanupErr != nil {
 		slog.Warn("failed to cleanup expired api tokens on startup", "error", cleanupErr)
 	} else if cleaned > 0 {
 		slog.Info("cleaned expired api tokens on startup", "count", cleaned)
 	}
+	userDeactivationService := services.NewUserDeactivationService(
+		s.db,
+		services.UserDeactivationInvalidators{
+			Tokens:   tokenManager.InvalidateTokens,
+			Sessions: sessionManager.InvalidateUserSessionValidation,
+			Permissions: func(userID int) {
+				if err := permService.InvalidateUserCache(userID); err != nil {
+					slog.Warn("failed to invalidate permissions after user deactivation",
+						slog.Int("user_id", userID),
+						slog.Any("error", err))
+				}
+			},
+		},
+	)
 
-	// Create auth middleware
 	authMiddleware := middleware.NewAuthMiddleware(sessionManager, tokenManager, s.db, cfg.UseProxy, additionalProxyList, setupCompleted)
 
-	// Parse additional proxy IPs
 	var additionalProxyIPs []net.IP
 	for _, proxyStr := range additionalProxyList {
 		if ip := net.ParseIP(strings.TrimSpace(proxyStr)); ip != nil {
@@ -313,9 +479,14 @@ func (s *Server) initialize() error {
 	}
 
 	mux := http.NewServeMux()
+	healthHandler := health.NewHandler(s.db.GetDB())
+	mux.HandleFunc("GET /healthz", healthHandler.Liveness)
+	mux.HandleFunc("GET /readyz", healthHandler.Readiness)
+	s.metrics = appmetrics.New(s.db)
+	mux.Handle("GET /metrics", s.metrics.Handler())
 
-	// Initialize notification manager
 	nmCfg := handlers.DefaultNotificationManagerConfig()
+	nmCfg.MaxCacheSize = s.memoryBudget.NotificationCacheMB
 	if cfg.Notification.FlushInterval > 0 {
 		nmCfg.FlushInterval = cfg.Notification.FlushInterval
 	}
@@ -329,16 +500,20 @@ func (s *Server) initialize() error {
 	if err != nil {
 		return fmt.Errorf("failed to create notification manager: %w", err)
 	}
+	notificationAssetPermissions := services.NewAssetPermissionService(repository.NewAssetRepository(s.db), permService)
+	notificationAuthorizer := services.NewNotificationAuthorizer(s.db, permService, notificationAssetPermissions)
 
-	// Initialize notification service
 	s.notificationService = services.NewNotificationService(
 		s.db,
 		s.notificationManager,
 		permService,
 		services.DefaultNotificationServiceConfig(),
+		notificationAssetPermissions,
 	)
+	if err := services.PrepareDurableNotificationEngine(context.Background(), s.eventEngine, s.notificationService); err != nil {
+		return fmt.Errorf("prepare durable notification consumers: %w", err)
+	}
 
-	// Initialize SMTP and schedulers
 	smtpSender := smtp.NewNotificationSMTPSender(s.db)
 	s.notificationScheduler = scheduler.NewNotificationScheduler(s.db, smtpSender, cfg.Notification.BatchInterval, s.notificationService)
 	s.notificationScheduler.Start()
@@ -365,20 +540,32 @@ func (s *Server) initialize() error {
 		repository.NewRunnerRepository(s.db),
 	)
 	s.runnerLeaseReaper.Start()
+	globalRankHostname, hostnameErr := os.Hostname()
+	if hostnameErr != nil || globalRankHostname == "" {
+		globalRankHostname = "unknown-host"
+	}
+	globalRankOwner := fmt.Sprintf("global-rank-%s-%d", globalRankHostname, os.Getpid())
+	s.globalRankMigrationScheduler = scheduler.NewGlobalRankMigrationScheduler(s.db, globalRankOwner)
+	s.globalRankMigrationScheduler.Start()
+	slog.Info("global rank migration scheduler started", "owner", globalRankOwner)
 	slog.Info("recurrence scheduler started")
 
-	// Initialize shared execution chain store for cross-application loop prevention
 	chainStore := services.NewExecutionChainStore()
 
-	// Initialize action service
 	s.actionService = services.NewActionService(s.db, services.DefaultActionServiceConfig(), chainStore)
 	s.actionService.SetNotificationService(s.notificationService)
 	s.actionService.SetPermissionService(permService)
+	if err := services.PrepareDurableActionEngine(context.Background(), s.eventEngine, s.actionService, cfg.ActivateDurableActions); err != nil {
+		return fmt.Errorf("prepare durable action consumers: %w", err)
+	}
 	slog.Info("action service initialized")
 
-	// Initialize asset action service (shared chain store for cross-application loop prevention)
 	s.assetActionService = services.NewAssetActionService(s.db, services.DefaultActionServiceConfig(), chainStore)
 	s.assetActionService.SetNotificationService(s.notificationService)
+	s.assetActionService.SetPermissionService(permService)
+	if err := services.PrepareDurableAssetActionEngine(context.Background(), s.eventEngine, s.assetActionService, cfg.ActivateDurableAssetActions); err != nil {
+		return fmt.Errorf("prepare durable asset action consumers: %w", err)
+	}
 	slog.Info("asset action service initialized")
 
 	// Determine base URL — cfg.BaseURL is already resolved by config.Load
@@ -388,30 +575,27 @@ func (s *Server) initialize() error {
 	if baseURL == "" {
 		baseURL = fmt.Sprintf("http://localhost:%s%s", cfg.Port, cfg.ContextPath)
 	}
+	smtpSender.SetBaseURL(baseURL)
 
-	// Initialize email verification service
 	emailVerificationService := services.NewEmailVerificationService(s.db, smtpSender, baseURL)
 
-	// Initialize portal session manager
-	portalSessionManager := auth.NewPortalSessionManager(s.db, enableHTTPS, cfg.UseProxy, additionalProxyList, cfg.Auth.SessionSecret)
+	portalSessionManager := auth.NewPortalSessionManager(s.db, enableHTTPS, cfg.UseProxy, additionalProxyList, cfg.Auth.SessionSecret, cfg.Auth.SessionIPBinding)
 
-	// Initialize magic link service
 	magicLinkService := services.NewMagicLinkService(s.db, smtpSender, baseURL)
 
-	// Initialize invitation service
 	invitationService := services.NewInvitationService(s.db, smtpSender, baseURL)
 
-	// Initialize workspace key cache (resolves workspace keys to IDs without DB lookups)
 	workspaceKeyCache := handlers.NewWorkspaceKeyCache(repository.NewWorkspaceRepository(s.db))
+	authorizationCacheInvalidator := services.NewAuthorizationCacheInvalidator(permService, workspaceKeyCache)
 
-	// Initialize handlers
-	itemHandler := handlers.NewItemHandler(s.db, permService, s.activityTracker, s.notificationService)
+	transitionMatrixService := services.NewTransitionMatrixService(s.db)
+	bulkOperationMetrics := services.NewBulkOperationMetrics()
+	itemHandler := handlers.NewItemHandler(s.db, permService, s.activityTracker, s.notificationService, s.memoryBudget.ItemCacheMB)
+	s.itemCache = itemHandler.ItemCacheService()
 	customFieldHandler := handlers.NewCustomFieldHandler(s.db)
-	workspaceHandler := handlers.NewWorkspaceHandler(s.db, permService, s.activityTracker, workspaceKeyCache)
-	screenHandler := handlers.NewScreenHandler(s.db)
-	configSetHandler := handlers.NewConfigurationSetHandler(s.db, s.notificationService, permService)
-	itemTypeHandler := handlers.NewItemTypeHandler(s.db)
-	priorityHandler := handlers.NewPriorityHandler(s.db)
+	workspaceHandler := handlers.NewWorkspaceHandler(s.db, permService, s.activityTracker, workspaceKeyCache, authorizationCacheInvalidator)
+	screenHandler := handlers.NewScreenHandler(s.db).WithObjectTranslations(objectTranslationService)
+	configSetHandler := handlers.NewConfigurationSetHandler(s.db, s.notificationService, permService).WithObjectTranslations(objectTranslationService)
 
 	// Shared audit emitter for enum services
 	enumAuditEmit := services.AuditEmitFunc(func(db database.Database, r *http.Request, actionType, resourceType string, entityID int, entityName string) {
@@ -432,12 +616,12 @@ func (s *Server) initialize() error {
 		})
 	})
 
-	// Generic enum handlers
 	hierarchyLevelConfig := services.NewHierarchyLevelConfig()
 	hierarchyLevelConfig.AuditEmit = enumAuditEmit
+	hierarchyLevelEnumService := services.NewEnumService(s.db, hierarchyLevelConfig)
 	hierarchyLevelHandler := handlers.NewEnumHandler(
-		services.NewEnumService(s.db, hierarchyLevelConfig),
-		func() interface{} { return &models.HierarchyLevel{} })
+		hierarchyLevelEnumService,
+		func() any { return &models.HierarchyLevel{} }).WithObjectTranslations(objectTranslationService, "hierarchy_level")
 	requestTypeHandler := handlers.NewRequestTypeHandler(
 		repository.NewRequestTypeRepository(s.db),
 		repository.NewChannelRepository(s.db),
@@ -446,18 +630,7 @@ func (s *Server) initialize() error {
 		logger.NewAuditor(s.db),
 		channelService,
 	)
-	statusCategoryConfig := services.NewStatusCategoryConfig()
-	statusCategoryConfig.AuditEmit = enumAuditEmit
-	statusCategoryHandler := handlers.NewEnumHandler(
-		services.NewEnumService(s.db, statusCategoryConfig),
-		func() interface{} { return &models.StatusCategory{} })
-	statusHandler := handlers.NewEnumHandler(
-		services.NewEnumService(s.db, services.NewStatusConfig()),
-		func() interface{} { return &models.Status{} })
-	statusHandlerLegacy := handlers.NewStatusHandler(repository.NewStatusRepository(s.db), repository.NewItemRepository(s.db), logger.NewAuditor(s.db))
 	workflowService := s.workflowService
-	workflowHandler := handlers.NewWorkflowHandler(repository.NewWorkflowRepository(s.db), logger.NewAuditor(s.db))
-	workflowHandler.SetWorkflowService(workflowService)
 	userHandler := handlers.NewUserHandler(
 		repository.NewUserRepository(s.db),
 		logger.NewAuditor(s.db),
@@ -465,27 +638,36 @@ func (s *Server) initialize() error {
 		invitationService,
 		services.NewUserReadService(s.db),
 		func(id int) error {
-			tokenIDs, err := services.OffboardUser(s.db, id, s.notificationService)
-			if err != nil {
-				return err
+			result, err := services.OffboardUser(s.db, id, s.notificationService, authorizationCacheInvalidator)
+			if len(result.RevokedAPITokenIDs) > 0 {
+				tokenManager.InvalidateTokens(result.RevokedAPITokenIDs)
 			}
-			tokenManager.InvalidateTokens(tokenIDs)
-			return nil
-		},
-		func(id int) (services.AgentDeactivationResult, error) {
-			result, err := services.DeactivateOwnedAgentsAndTokens(s.db, id)
+			sessionManager.InvalidateUserSessionValidation(id)
 			if err == nil {
-				tokenManager.InvalidateTokens(result.RevokedAPITokens)
+				s.revokeUserRemoteGrants(result.RemoteRevocations)
 			}
-			return result, err
+			return err
+		},
+		userDeactivationService.DeactivateUser,
+		sessionManager.InvalidateUserSessionValidation,
+		func(id int, actor services.AuditActor, input services.UserErasureInput) (services.UserErasureEvidence, error) {
+			evidence, result, err := services.EraseUser(s.db, id, actor, input, s.notificationService, authorizationCacheInvalidator)
+			if len(result.RevokedAPITokenIDs) > 0 {
+				tokenManager.InvalidateTokens(result.RevokedAPITokenIDs)
+			}
+			sessionManager.InvalidateUserSessionValidation(id)
+			if err == nil {
+				s.revokeUserRemoteGrants(result.RemoteRevocations)
+			}
+			return evidence, err
 		},
 	)
-	groupHandler := handlers.NewGroupHandler(repository.NewGroupRepository(s.db), permService, logger.NewAuditor(s.db))
+	groupHandler := handlers.NewGroupHandler(repository.NewGroupRepository(s.db), permService, logger.NewAuditor(s.db), authorizationCacheInvalidator)
 	credentialHandler := handlers.NewCredentialHandler(repository.NewCredentialRepository(s.db), logger.NewAuditor(s.db), permService, cfg.SSH.Enabled)
-	webAuthnHandler := handlers.NewWebAuthnHandler(s.db, permService, sessionManager, webAuthnConfig, ipExtractor)
-	collectionHandler := handlers.NewCollectionHandler(s.db, permService)
-	boardConfigHandler := handlers.NewBoardConfigurationHandler(repository.NewBoardConfigurationRepository(s.db), repository.NewCollectionRepository(s.db), permService)
-	testCoverageHandler := handlers.NewTestCoverageHandler(repository.NewTestCoverageRepository(s.db), permService)
+	var webAuthnHandler *handlers.WebAuthnHandler
+	if webAuthnConfig != nil {
+		webAuthnHandler = handlers.NewWebAuthnHandler(s.db, permService, sessionManager, webAuthnConfig, ipExtractor)
+	}
 	publicBoardHandler := handlers.NewPublicBoardHandler(s.db, permService, cfg.AttachmentPath)
 	permissionHandler := handlers.NewPermissionHandlerWithCache(repository.NewPermissionRepository(s.db), permService, logger.NewAuditor(s.db))
 	apiTokenHandler := handlers.NewAPITokenHandler(
@@ -497,81 +679,63 @@ func (s *Server) initialize() error {
 	)
 	agentHandler := handlers.NewAgentHandler(s.db, permService)
 
-	// SCIM handlers
-	scimTokenManager := auth.NewSCIMTokenManager(s.db)
+	scimTokenManager := auth.NewSCIMTokenManager(s.db, s.memoryBudget.SCIMTokenCacheMB)
+	s.scimTokenManager = scimTokenManager
 	scimAuthMiddleware := middleware.NewSCIMAuthMiddleware(scimTokenManager)
 	scimHandler := handlers.NewSCIMHandler(
 		repository.NewSCIMRepository(s.db),
 		baseURL,
 		permService,
 		logger.NewAuditor(s.db),
-		func(id int) (services.AgentDeactivationResult, error) {
-			return services.DeactivateOwnedAgentsAndTokens(s.db, id)
-		},
+		userDeactivationService.InvalidateDeprovisionCaches,
 		func() ([]int, error) {
 			return services.ActiveSystemAdminIDs(s.db)
 		},
 		s.notificationService,
+		authorizationCacheInvalidator,
 	)
 	scimTokenHandler := handlers.NewSCIMTokenHandler(scimTokenManager, logger.NewAuditor(s.db))
 
 	permissionSetHandler := handlers.NewPermissionSetHandlerWithPool(repository.NewPermissionSetRepository(s.db), permService, logger.NewAuditor(s.db))
-	workspaceRoleHandler := handlers.NewWorkspaceRoleHandlerWithPool(repository.NewWorkspaceRoleRepository(s.db), permService, logger.NewAuditor(s.db))
+	workspaceRoleHandler := handlers.NewWorkspaceRoleHandlerWithPool(repository.NewWorkspaceRoleRepository(s.db), permService, logger.NewAuditor(s.db)).WithObjectTranslations(objectTranslationService)
 
-	// Time tracking handlers
 	timePermissionService := services.NewTimePermissionService(s.db, permService)
 	customerOrgPermissionService := services.NewCustomerOrganisationPermissionService(s.db, permService, timePermissionService)
 	timeCustomerHandler := handlers.NewTimeCustomerHandler(repository.NewCustomerOrganisationRepository(s.db), logger.NewAuditor(s.db), timePermissionService, customerOrgPermissionService)
-	timeProjectHandler := handlers.NewTimeProjectHandler(s.db, timePermissionService, customerOrgPermissionService, workspaceKeyCache)
-	timeProjectCategoryHandler := handlers.NewTimeProjectCategoryHandler(repository.NewTimeProjectCategoryRepository(s.db), logger.NewAuditor(s.db), timePermissionService)
-	timeWorklogHandler := handlers.NewTimeWorklogHandler(s.db, permService, timePermissionService)
+	timeProjectHandler := handlers.NewTimeProjectHandler(s.db, timePermissionService, customerOrgPermissionService)
+	timeWorklogService := services.NewTimeWorklogService(s.db)
 	activeTimerRepo := repository.NewActiveTimerRepository(s.db)
 	timerService := services.NewTimerService(activeTimerRepo, repository.NewItemRepository(s.db), timePermissionService, permService)
-	activeTimerHandler := handlers.NewActiveTimerHandler(activeTimerRepo, timerService)
-	timeProjectPermissionHandler := handlers.NewTimeProjectPermissionHandler(logger.NewAuditor(s.db), timePermissionService)
 	customerOrgPermissionHandler := handlers.NewCustomerOrganisationPermissionHandler(logger.NewAuditor(s.db), customerOrgPermissionService)
 
-	// Test management handlers
-	testFolderHandler := handlers.NewTestFolderHandler(services.NewTestFolderService(s.db), logger.NewAuditor(s.db))
-	testCaseHandler := handlers.NewTestCaseHandlerWithPool(services.NewTestCaseService(s.db), logger.NewAuditor(s.db))
-	workspaceResourceRepo := repository.NewWorkspaceResourceRepository(s.db)
-	testSetHandler := handlers.NewTestSetHandlerWithPool(repository.NewTestSetRepository(s.db), workspaceResourceRepo, logger.NewAuditor(s.db))
-	testRunTemplateHandler := handlers.NewTestRunTemplateHandlerWithPool(repository.NewTestRunTemplateRepository(s.db), workspaceResourceRepo)
-	testRunHandler := handlers.NewTestRunHandlerWithPool(services.NewTestRunService(s.db), repository.NewTestRunRepository(s.db), repository.NewItemRepository(s.db), logger.NewAuditor(s.db))
-	testSummaryHandler := handlers.NewTestSummaryHandlerWithPool(repository.NewTestSummaryRepository(s.db))
+	itemLinkService := services.NewItemLinkService(s.db).
+		WithPermissionService(permService).
+		WithNotificationEmitter(s.notificationService)
 
-	// Link management handlers
-	linkTypeHandler := handlers.NewLinkTypeHandler(repository.NewLinkTypeRepository(s.db), logger.NewAuditor(s.db))
-	itemLinkHandler := handlers.NewItemLinkHandler(s.db, s.notificationService, permService)
-
-	// Label handler
-	labelHandler := handlers.NewLabelHandler(repository.NewLabelRepository(s.db), repository.NewItemRepository(s.db), permService, logger.NewAuditor(s.db))
-
-	// Work item template handler (WI-438)
-	itemTemplateHandler := handlers.NewItemTemplateHandler(repository.NewTemplateRepository(s.db), permService, logger.NewAuditor(s.db))
-
-	// Knowledge pages handler (workspace-scoped wiki).
 	pageLabelRepo := repository.NewPageLabelRepository(s.db)
 	pageService := services.NewPageService(s.db)
 	pageService.SetPageLabelRepository(pageLabelRepo)
 	pagePermissionService := services.NewPagePermissionService(s.db, permService)
-	itemLinkHandler.SetPagePermissionChecker(pagePermissionService)
-	pageHandler := handlers.NewPageHandler(pageService, pagePermissionService, logger.NewAuditor(s.db))
+	itemLinkService.WithPagePermissionChecker(pagePermissionService)
+	pageApplication := services.NewPageApplicationService(pageService, pagePermissionService)
+	pageDiagramService := services.NewPageDiagramService(
+		s.db,
+		cfg.AttachmentPath,
+		pageApplication,
+		pagePermissionService,
+		permService,
+	)
 	knowledgeRetrieval := services.NewKnowledgeRetrievalService(s.db, pagePermissionService)
 	knowledgeSearchHandler := handlers.NewKnowledgeSearchHandler(knowledgeRetrieval)
-	pageLabelHandler := handlers.NewPageLabelHandler(pageLabelRepo, pagePermissionService, logger.NewAuditor(s.db))
+	knowledgePublication := services.NewKnowledgePublicationService(s.db)
+	pageLabelService := services.NewPageLabelService(pageLabelRepo, logger.NewAuditor(s.db))
 
-	// Recurrence handler
-	recurrenceHandler := handlers.NewRecurrenceHandler(repository.NewRecurrenceRepository(s.db), repository.NewItemRepository(s.db), s.recurrenceScheduler, permService)
+	recurrenceService := services.NewRecurrenceService(repository.NewRecurrenceRepository(s.db), s.recurrenceScheduler, logger.NewAuditor(s.db))
 
-	// Actions handler
 	actionsHandler := handlers.NewActionsHandler(
 		repository.NewActionRepository(s.db),
 		repository.NewActionCredentialRepository(s.db),
-		repository.NewItemRepository(s.db),
 		logger.NewAuditor(s.db),
-		s.actionService,
-		permService,
 		workspaceKeyCache,
 	)
 	actionCredentialService := services.NewActionCredentialService(repository.NewActionCredentialRepository(s.db), cfg.Auth.SessionSecret)
@@ -579,11 +743,7 @@ func (s *Server) initialize() error {
 	// Wire credential resolution into the action runtime so HTTP capabilities
 	// can reference tokens by ID. The service shares the same SSO_SECRET via
 	// a domain-separated HKDF label (ActionCredentialEncryptionInfo).
-	credentialSvc := services.NewActionCredentialService(
-		repository.NewActionCredentialRepository(s.db),
-		cfg.Auth.SessionSecret,
-	)
-	s.actionService.SetCredentialService(credentialSvc)
+	s.actionService.SetCredentialService(actionCredentialService)
 	// Lets container_run nodes dispatch to a remote runner pool (WI-146).
 	s.actionService.SetAgentRunRepository(repository.NewAgentRunRepository(s.db))
 	// One-shot scanner: warn about any legacy capability whose
@@ -597,35 +757,36 @@ func (s *Server) initialize() error {
 	onCallRepo := repository.NewOnCallRepository(s.db)
 	teamService := services.NewTeamService(s.db, teamRepo, leaveRepo)
 	onCallService := services.NewOnCallService(s.db, onCallRepo, leaveRepo)
-	teamHandler := handlers.NewTeamHandler(teamRepo, leaveRepo, permService, logger.NewAuditor(s.db))
+	itemRepo := repository.NewItemRepository(s.db)
+	cannedResponseService := services.NewCannedResponseService(
+		repository.NewCannedResponseRepository(s.db),
+		repository.NewUserRepository(s.db),
+		itemRepo,
+		logger.NewAuditor(s.db),
+	)
+	incidentService := services.NewIncidentService(s.db, onCallRepo, itemRepo, onCallService, teamRepo, s.notificationService)
+	teamHandler := handlers.NewTeamHandler(teamRepo, leaveRepo, repository.NewSLARepository(s.db), permService, logger.NewAuditor(s.db))
 	leaveHandler := handlers.NewLeaveHandler(leaveRepo, repository.NewUserRepository(s.db), permService)
-	onCallHandler := handlers.NewOnCallHandler(onCallRepo, teamRepo, onCallService, permService)
+	onCallHandler := handlers.NewOnCallHandler(onCallRepo, teamRepo, itemRepo, onCallService, incidentService, permService, logger.NewAuditor(s.db))
 	s.actionService.SetTeamService(teamService)
 
 	milestoneCategoryConfig := services.NewMilestoneCategoryConfig()
 	milestoneCategoryConfig.AuditEmit = enumAuditEmit
 	milestoneCategoryHandler := handlers.NewEnumHandler(
 		services.NewEnumService(s.db, milestoneCategoryConfig),
-		func() interface{} { return &models.MilestoneCategory{} })
+		func() any { return &models.MilestoneCategory{} }).WithGlobalMutationPermission(permService, models.PermissionMilestoneCreate)
 	channelCategoryConfig := services.NewChannelCategoryConfig()
 	channelCategoryConfig.AuditEmit = enumAuditEmit
 	channelCategoryHandler := handlers.NewEnumHandler(
 		services.NewEnumService(s.db, channelCategoryConfig),
-		func() interface{} { return &models.ChannelCategory{} })
-	collectionCategoryConfig := services.NewCollectionCategoryConfig()
-	collectionCategoryConfig.AuditEmit = enumAuditEmit
-	collectionCategoryHandler := handlers.NewEnumHandler(
-		services.NewEnumService(s.db, collectionCategoryConfig),
-		func() interface{} { return &models.CollectionCategory{} })
+		func() any { return &models.ChannelCategory{} })
 	iterationTypeConfig := services.NewIterationTypeConfig()
 	iterationTypeConfig.AuditEmit = enumAuditEmit
 	iterationTypeHandler := handlers.NewEnumHandler(
 		services.NewEnumService(s.db, iterationTypeConfig),
-		func() interface{} { return &models.IterationType{} })
-	iterationHandler := handlers.NewIterationHandler(services.NewPlanningService(s.db), permService, logger.NewAuditor(s.db))
+		func() any { return &models.IterationType{} }).WithGlobalMutationPermission(permService, models.PermissionIterationManage)
 	personalLabelHandler := handlers.NewPersonalLabelHandler(s.db, permService)
-	commentHandler := handlers.NewCommentHandler(s.db, permService, s.activityTracker, s.notificationService)
-	reviewHandler := handlers.NewReviewHandler(s.db)
+	reviewHandler := handlers.NewReviewHandler(s.db, permService)
 	calendarFeedHandler := handlers.NewCalendarFeedHandler(s.db, permService, cfg.BaseURL)
 	securitySettingsHandler := handlers.NewSecuritySettingsHandler(repository.NewSystemSettingRepository(s.db), logger.NewAuditor(s.db), cfg.Plugins.Disabled)
 
@@ -633,7 +794,6 @@ func (s *Server) initialize() error {
 	// constructor — see the block right after the SCM handlers are
 	// built, since scm.CredentialResolver needs scmProviderHandler.GetEncryption().
 
-	// Admin rate limiter
 	var adminRateLimiter *middleware.AdminFallbackRateLimiter
 	if cfg.EnableAdminFallback {
 		adminRateLimiter = middleware.NewAdminFallbackRateLimiter(s.db)
@@ -641,8 +801,10 @@ func (s *Server) initialize() error {
 	}
 
 	authPolicyHandler := handlers.NewAuthPolicyHandlerWithFallback(s.db, cfg.EnableAdminFallback, logger.NewAuditor(s.db))
+	if webAuthnHandler != nil {
+		webAuthnHandler.SetAuthPolicyHandler(authPolicyHandler)
+	}
 
-	// Initialize auth handler
 	authHandler := handlers.NewAuthHandler(
 		repository.NewUserRepository(s.db),
 		repository.NewCredentialRepository(s.db),
@@ -656,24 +818,31 @@ func (s *Server) initialize() error {
 		adminRateLimiter,
 	)
 
-	// Initialize invitation handler
 	invitationHandler := handlers.NewInvitationHandler(invitationService)
 
-	themeHandler := handlers.NewThemeHandler(services.NewThemeService(repository.NewThemeRepository(s.db)), logger.NewAuditor(s.db))
-	userPreferencesHandler := handlers.NewUserPreferencesHandler(services.NewUserPreferencesService(repository.NewUserPreferencesRepository(s.db), repository.NewThemeRepository(s.db)))
-	homepageHandler := handlers.NewHomepageHandler(repository.NewWorkspaceRepository(s.db), repository.NewItemRepository(s.db), s.activityTracker, permService)
+	themeHandler := handlers.NewThemeHandler(services.NewThemeService(repository.NewThemeRepository(s.db)), logger.NewAuditor(s.db)).WithObjectTranslations(objectTranslationService)
+	objectTranslationHandler := handlers.NewObjectTranslationHandler(objectTranslationService)
+	userPreferencesService := services.NewUserPreferencesService(repository.NewUserPreferencesRepository(s.db), repository.NewThemeRepository(s.db), permService)
+	userPreferencesHandler := handlers.NewUserPreferencesHandler(userPreferencesService)
+	homepageHandler := handlers.NewHomepageHandler(
+		repository.NewWorkspaceRepository(s.db),
+		repository.NewItemRepository(s.db),
+		services.NewItemCRUDService(s.db),
+		services.NewPlanningService(s.db),
+		s.activityTracker,
+		permService,
+		userPreferencesService,
+	)
 
-	// Notification handlers
-	notificationHandler := handlers.NewNotificationHandler(s.notificationManager, s.notificationService)
+	notificationHandler := handlers.NewNotificationHandler(s.notificationManager, s.notificationService, permService)
+	notificationHandler.SetNotificationAuthorizer(notificationAuthorizer)
 	emailTemplateHandler := handlers.NewEmailTemplateHandler(repository.NewEmailTemplateRepository(s.db), logger.NewAuditor(s.db))
 
-	// Web Push: store subscriptions + fan notifications out to them. The
-	// dispatcher is wired into the notification manager so every created
-	// notification (assignments, mentions, comments, …) triggers a push.
-	// VAPID keys are resolved env > persisted > auto-generated, so push works
-	// out of the box on a fresh deployment with no operator configuration.
+	// Push dispatches every notification; VAPID config resolves env, persisted,
+	// then generated keys.
 	pushCfg := services.ResolveVAPIDConfig(s.db, cfg.Push, slog.Default())
-	pushService := services.NewPushService(s.db, pushCfg)
+	pushService := services.NewPushService(s.db, pushCfg, permService)
+	pushService.SetNotificationAuthorizer(notificationAuthorizer)
 	pushHandler := handlers.NewPushHandler(pushService)
 	s.notificationManager.SetPushDispatcher(pushService)
 	if pushService.Enabled() {
@@ -682,42 +851,36 @@ func (s *Server) initialize() error {
 
 	permissionMiddleware := middleware.NewPermissionMiddleware(s.db, permService)
 
-	// Setup handler
 	setupHandler := handlers.NewSetupHandler(s.db, sessionManager, authMiddleware)
 
-	// SSO handler
 	ssoHandler := handlers.NewSSOHandler(s.db, sessionManager, permService, emailVerificationService, s.pluginManager, cfg.Auth.SessionSecret, baseURL, cfg.AllowedHosts, cfg.DisableCSRF, ipExtractor, cfg.UseProxy, additionalProxyList)
 
-	// SCM provider handler
 	scmProviderHandler := handlers.NewSCMProviderHandler(s.db, cfg.Auth.SessionSecret, baseURL)
-	scmWorkspaceHandler := handlers.NewSCMWorkspaceHandler(repository.NewSCMWorkspaceRepository(s.db), scmProviderHandler.GetEncryption(), scmProviderHandler, scm.NewCredentialResolver(s.db, scmProviderHandler.GetEncryption()), permService, baseURL)
-	scmItemLinksHandler := handlers.NewSCMItemLinksHandler(s.db, scmProviderHandler.GetEncryption(), permService)
+	s.secretEncryption = scmProviderHandler.GetEncryption()
+	scmWorkspaceRepo := repository.NewSCMWorkspaceRepository(s.db)
+	scmWorkspaceHandler := handlers.NewSCMWorkspaceHandler(scmWorkspaceRepo, scmProviderHandler.GetEncryption(), scmProviderHandler, scm.NewCredentialResolver(s.db, scmProviderHandler.GetEncryption()), permService, baseURL)
+	scmItemLinksHandler := handlers.NewSCMItemLinksHandler(s.db, scmProviderHandler.GetEncryption(), permService, baseURL)
 	userSCMTokenHandler := handlers.NewUserSCMTokenHandler(repository.NewUserSCMTokenRepository(s.db), scmProviderHandler.GetEncryption())
-	milestoneHandler := handlers.NewMilestoneHandler(services.NewPlanningService(s.db), permService, scm.NewCredentialResolver(s.db, scmProviderHandler.GetEncryption()), logger.NewAuditor(s.db))
+	milestonePlanningService := services.NewPlanningService(s.db)
+	milestonePlanningService.SetSCMWorkspaceRepository(scmWorkspaceRepo)
 
-	// WI-87/88/89/90 coding-agent harness stack. The acting-identity
-	// chokepoint (WI-87) is constructed first; both the workspace-binding
-	// service and the admin AgentSecurity handler share its repo handle.
-	// When CodingAgent.Enabled is set, the harness boots an orchestration-only
-	// RunService (WI-89): RunTokenService → AgentPRService (WI-90, opens draft
-	// PRs on GitHub or Gitea via scm.Provider). It queues runs, enriches remote
-	// claims, and finalizes remote results — but executes nothing on this host.
-	// All runs are dispatched to remote runner pools (windshift-runner). Without
-	// the flag the harness stays in observer mode — bindings can still be
-	// created, the trigger logs but no run starts.
+	// The optional coding-agent harness queues and finalizes remote runner-pool
+	// work; disabled mode retains bindings without starting runs.
 	agentSecurityRepo := repository.NewAgentSecurityRepository(s.db)
 	agentIdentitySvc, _ := services.NewAgentActingIdentityService(services.NewUserReadService(s.db), agentSecurityRepo)
 	agentBindingRepo := repository.NewWorkspaceAgentBindingRepository(s.db)
 	scmCredResolver := scm.NewCredentialResolver(s.db, scmProviderHandler.GetEncryption())
 
-	// Shared AI prompt store: embedded defaults overridable from cfg.LLM.PromptsDir
-	// (AI_PROMPTS_DIR). Built here so the coding-agent harness and the AI handlers
-	// below resolve the same overridable prompts.
+	// AI handlers and agents share embedded or configured prompt overrides.
 	promptStore := llm.NewPromptStore(cfg.LLM.PromptsDir)
+	// System-admin-overridable Agent Studio catalog (WI-922): configured rows
+	// overlay or disable embedded defaults.
+	agentTemplateCatalogRepo := repository.NewAgentTemplateCatalogRepository(s.db)
+	templateCatalog := llm.NewTemplateCatalog(promptStore, agentTemplateCatalogRepo)
+	agentTemplateCatalogHandler := handlers.NewAdminAgentTemplateCatalogHandler(agentTemplateCatalogRepo, permService, logger.NewAuditor(s.db))
+	agentTemplateCatalogHandler.SetDefaults(promptStore)
 
-	// Load LLM provider definitions before coding-agent bindings are wired: the
-	// binding trigger resolves per-binding llm_connection_id rows into agent runtime
-	// env, and that requires the same provider registry the AI handlers use.
+	// Bindings and AI handlers share the provider registry.
 	if cfg.LLM.ProvidersFile != "" {
 		if err := llm.LoadProviders(cfg.LLM.ProvidersFile); err != nil {
 			slog.Error("failed to load custom LLM providers file, falling back to built-in defaults", "path", cfg.LLM.ProvidersFile, "error", err)
@@ -751,57 +914,61 @@ func (s *Server) initialize() error {
 			)
 		}
 	}
-	// Kept on the Server so Shutdown can drain in-flight local runs instead
-	// of leaving them to be killed mid-flight with their rows stuck
-	// non-terminal (WI-332).
+	// Retain the service so shutdown can drain local runs.
 	s.codingRunService = codingRunSvc
 
 	agentAPIURL := cfg.CodingAgent.WSAPIURL
 	if agentAPIURL == "" {
-		// The agent-facing URL convention INCLUDES the mandatory /api suffix
-		// (see apiBaseURLFor); the broker URLs handed to agent containers
-		// (LLM_BASE_URL, git-proxy) are built directly on it. Falling back to
-		// the bare BASE_URL would send the agent's chat-completion POSTs to a
-		// path only the SPA catch-all matches — a 405 on every model call.
+		// Agent broker URLs require the API suffix, not the SPA base URL.
 		agentAPIURL = strings.TrimRight(baseURL, "/") + "/api"
 	}
 	agentSkillRepo := repository.NewWorkspaceAgentSkillRepository(s.db)
+	standardCapabilityGroups := aitools.StandardCapabilityGroups(aitools.Default)
+	standardCapabilityKeys := make([]string, 0, len(standardCapabilityGroups))
+	for _, group := range standardCapabilityGroups {
+		standardCapabilityKeys = append(standardCapabilityKeys, string(group.Key))
+	}
 	bindingSvc, _ := services.NewBindingService(services.BindingServiceOptions{
-		Repo:       agentBindingRepo,
-		Identity:   agentIdentitySvc,
-		Runs:       codingRunSvc,
-		SCMCreds:   &scmCredsAdapter{cr: scmCredResolver},
-		LLMRuntime: llmManager,
-		RunContext: agentBindingRepo,
-		Pools:      repository.NewActionRepository(s.db),
-		Skills:     agentSkillRepo,
-		// @mention on an item with an open linked PR continues that PR instead of
-		// opening a competing one (WI-426).
-		Continuations: &itemPRContinuationResolver{db: s.db, cr: scmCredResolver},
-		APIURL:        agentAPIURL,
+		DB:                       s.db,
+		Repo:                     agentBindingRepo,
+		Identity:                 agentIdentitySvc,
+		Permissions:              permService,
+		Prompts:                  templateCatalog,
+		StandardCapabilityGroups: standardCapabilityKeys,
+		Runs:                     codingRunSvc,
+		SCMCreds:                 &scmCredsAdapter{cr: scmCredResolver},
+		LLMRuntime:               llmManager,
+		RunContext:               agentBindingRepo,
+		Pools:                    repository.NewActionRepository(s.db),
+		Skills:                   agentSkillRepo,
+		Continuations:            &itemPRContinuationResolver{db: s.db, cr: scmCredResolver},
+		APIURL:                   agentAPIURL,
 	})
-	// Let the run service enrich remote claims from the binding (WI-195): a
-	// remote runner's claim mints the per-run token + grants the same way the
-	// local path does. Wired post-construction to break the service cycle.
+	// Wire remote-claim enrichment after construction to break the service cycle.
 	if codingRunSvc != nil && bindingSvc != nil {
 		codingRunSvc.SetBindingInputsResolver(bindingSvc)
 	}
 	agentBindingHandler := handlers.NewWorkspaceAgentBindingHandler(bindingSvc, agentIdentitySvc, permService, logger.NewAuditor(s.db))
 	agentBindingHandler.SetSkillsRepo(agentSkillRepo)
-	agentSkillHandler := handlers.NewAgentSkillHandler(agentSkillRepo, permService, logger.NewAuditor(s.db))
-	agentRunHandler := handlers.NewAgentRunHandler(repository.NewAgentRunRepository(s.db), codingRunSvc, permService, repository.NewItemRepository(s.db), bindingSvc)
-	agentRunHandler.SetUsageRepository(repository.NewLLMUsageRepository(s.db)) // per-run token/cost readout (WI-494)
+	agentBindingHandler.SetPromptStore(promptStore)
+	agentBindingHandler.SetTemplateCatalog(templateCatalog)
+	agentBindingHandler.SetInitialPrompt(promptStore.Get(llm.PromptCodingAgentInitial))
 	// Remote-runner control plane (WI-141). Constructed unconditionally;
 	// the handler 503s when the registry/run service is unavailable (i.e.
 	// CodingAgent.Enabled is off).
 	runnerRegistry := services.NewRunnerRegistryService(repository.NewRunnerRepository(s.db), nil)
 	runnerControlHandler := handlers.NewRunnerControlHandler(runnerRegistry, repository.NewAgentRunRepository(s.db), codingRunSvc, repository.NewActionRepository(s.db), nil, baseURL)
-	// Agent presence for assignment pickers (WI-272): binding → pool →
-	// heartbeat-fresh runner count, surfaced as online/offline/local/unbound.
-	userHandler.SetAgentPresenceService(services.NewAgentPresenceService(agentBindingRepo, repository.NewRunnerRepository(s.db)))
+	agentBindingHandler.SetRunnerOnboarding(runnerRegistry, baseURL)
+	// Agent presence for workspace rosters (WI-272): ready binding → pool →
+	// heartbeat-fresh runner count, surfaced as online/offline/local.
+	agentPresenceService := services.NewAgentPresenceService(agentBindingRepo, repository.NewRunnerRepository(s.db))
+	workspaceUsers := services.NewWorkspaceUserResolver(s.db, permService)
+	userHandler.SetWorkspaceUserResolver(workspaceUsers)
+	agentBindingHandler.SetPresenceService(agentPresenceService)
+	workspaceBootstrapHandler := handlers.NewWorkspaceBootstrapHandler(workspaceHandler, userHandler, milestonePlanningService, permService, timeProjectHandler)
 	// Secretless access layer (WI-144): brokers a granted credential to a
 	// running job without it ever living on the runner host.
-	runnerBrokerHandler := handlers.NewRunnerBrokerHandler(tokenManager, repository.NewAgentRunRepository(s.db), credentialSvc, llmManager, &scmCredsAdapter{cr: scmCredResolver})
+	runnerBrokerHandler := handlers.NewRunnerBrokerHandler(tokenManager, repository.NewAgentRunRepository(s.db), actionCredentialService, llmManager, &scmCredsAdapter{cr: scmCredResolver})
 	runnerBrokerHandler.SetUsageRepository(repository.NewLLMUsageRepository(s.db)) // meter LLM token/cost at the broker (WI-493)
 	if bindingSvc != nil {
 		// Registers the coding-agent assignee trigger inside the item
@@ -811,36 +978,49 @@ func (s *Server) initialize() error {
 		services.SetItemAssigneeTrigger(bindingSvc)
 	}
 
-	// Asset management handlers
 	assetHandler := handlers.NewAssetHandler(s.db, permService, cfg.AttachmentPath)
-	assetHandler.SetAssetActionService(s.assetActionService)
-	if n, err := assetHandler.ReconcileInterruptedImports(); err != nil {
+	assetApplication := services.NewAssetApplicationService(s.db, permService, assetHandler.AssetService(), assetHandler.AssetPermissionService()).
+		WithLinks(itemLinkService).
+		WithImportStorage(cfg.AttachmentPath)
+	s.actionService.SetAssetNodeServices(assetHandler.AssetService(), assetHandler.AssetPermissionService())
+	if n, err := assetApplication.ReconcileInterruptedImports(); err != nil {
 		slog.Warn("failed to reconcile interrupted asset imports", slog.Any("error", err))
 	} else if n > 0 {
 		slog.Info("reconciled interrupted asset imports", slog.Int("count", n))
 	}
-	itemLinkHandler.SetAssetPermissionChecker(assetHandler)
+	itemLinkService.WithAssetPermissionChecker(assetHandler)
 	assetRepo := repository.NewAssetRepository(s.db)
-	assetTypeHandler := handlers.NewAssetTypeHandler(assetRepo, assetHandler, logger.NewAuditor(s.db))
-	assetCategoryHandler := handlers.NewAssetCategoryHandler(assetRepo, assetHandler, logger.NewAuditor(s.db))
-	assetStatusHandler := handlers.NewAssetStatusHandler(assetRepo, assetHandler, logger.NewAuditor(s.db))
 	assetReportHandler := handlers.NewAssetReportHandler(
 		repository.NewAssetReportRepository(s.db),
 		repository.NewChannelRepository(s.db),
 		repository.NewScreenRepository(s.db),
 		logger.NewAuditor(s.db),
 		channelService,
+		services.NewAssetPermissionService(assetRepo, permService),
 	)
 	assetActionHandler := handlers.NewAssetActionHandler(repository.NewAssetActionRepository(s.db), assetHandler, s.assetActionService, logger.NewAuditor(s.db))
 
-	// Jira import handler
-	jiraImportHandler := handlers.NewJiraImportHandler(s.db, cfg.Auth.SessionSecret, cfg.Jira.CapturePayloadsDir)
+	jiraImportHandler := handlers.NewJiraImportHandler(s.db, cfg.Auth.SessionSecret, cfg.Jira.CapturePayloadsDir).
+		WithAuthorizationCacheInvalidator(authorizationCacheInvalidator)
+	if n, err := jiraImportHandler.ReconcileInterruptedImports(); err != nil {
+		slog.Warn("failed to reconcile interrupted Jira imports", slog.Any("error", err))
+	} else if n > 0 {
+		slog.Info("reconciled interrupted Jira imports", slog.Int("count", n))
+	}
 
-	// Email provider handler
-	emailProviderHandler := handlers.NewEmailProviderHandler(s.db, scmProviderHandler.GetEncryption(), baseURL)
-
-	// Email scheduler
+	// Share one credential manager so every in-process refresh/callback path
+	// uses the same per-channel lock and CAS config writer.
 	emailCredManager := email.NewCredentialManager(s.db, scmProviderHandler.GetEncryption())
+
+	emailProviderHandler := handlers.NewEmailProviderHandler(s.db, scmProviderHandler.GetEncryption(), baseURL, channelService)
+	emailProviderHandler.SetCredentialManager(emailCredManager)
+
+	s.ticketImport = services.NewTicketImportService(s.db, permService, cfg.AttachmentPath)
+	if n, err := s.ticketImport.ReconcileInterrupted(); err != nil {
+		slog.Warn("failed to reconcile interrupted ticket imports", slog.Any("error", err))
+	} else if n > 0 {
+		slog.Info("reconciled interrupted ticket imports", slog.Int("count", n))
+	}
 	s.emailScheduler = scheduler.NewEmailScheduler(s.db, emailCredManager, cfg.AttachmentPath)
 	s.emailScheduler.Start()
 	slog.Info("email scheduler started (IMAP polling)")
@@ -851,7 +1031,15 @@ func (s *Server) initialize() error {
 	s.emailTrackingRetention = scheduler.NewEmailTrackingRetentionSweeper(s.db)
 	s.emailTrackingRetention.Start()
 
-	// Integration provider handlers
+	// Daily retention sweeps for portal credential and analytics data:
+	// expired sessions and consumed magic links (system_settings windows,
+	// default 30 days) and kb_events analytics (per-channel override, default
+	// 365 days).
+	s.portalAuthRetention = scheduler.NewPortalAuthRetentionSweeper(s.db)
+	s.portalAuthRetention.Start()
+	s.kbEventsRetention = scheduler.NewKBEventsRetentionSweeper(s.db)
+	s.kbEventsRetention.Start()
+
 	integrationProviderHandler := handlers.NewIntegrationProviderHandler(repository.NewIntegrationProviderRepository(s.db), scmProviderHandler.GetEncryption(), logger.NewAuditor(s.db))
 	integrationOAuthHandler := handlers.NewIntegrationOAuthHandler(s.db, scmProviderHandler.GetEncryption(), baseURL)
 	integrationItemLinksHandler := handlers.NewIntegrationItemLinksHandler(s.db, scmProviderHandler.GetEncryption(), permService)
@@ -859,71 +1047,102 @@ func (s *Server) initialize() error {
 	s.todoistSyncScheduler = scheduler.NewTodoistSyncScheduler(s.db, scmProviderHandler.GetEncryption())
 	s.todoistSyncScheduler.Start()
 
-	// SCM sync service (started below once smart-commit dependencies exist)
 	scmSyncService := scm.NewSyncService(s.db, scmProviderHandler.GetEncryption())
 
-	// Issue sync service
 	issueSyncService := scm.NewIssueSyncService(s.db, scmProviderHandler.GetEncryption())
 	issueSyncService.SetUserService(services.NewUserReadService(s.db))
+	issueSyncHandler := handlers.NewIssueSyncHandler(issueSyncService, permService, logger.NewAuditor(s.db))
+	issueSyncHandler.SetSyncConfigChanged(func() { s.refreshIssueSyncLoop(issueSyncService) })
+	s.refreshIssueSyncLoop(issueSyncService)
 
-	// Start issue sync scheduler
-	go s.runIssueSync(issueSyncService)
-
-	// Start magic link cleanup scheduler
 	go s.runMagicLinkCleanup(magicLinkService)
 
-	// Webhook sender
-	webhookSender := webhook.NewWebhookSender(s.db)
+	webhookSender := webhook.NewWebhookSender(s.db, scmProviderHandler.GetEncryption())
+	s.webhookSender = webhookSender
 
-	// Event coordinator
 	eventCoordinator := services.NewEventCoordinator(s.db)
 	eventCoordinator.SetNotificationService(s.notificationService)
 	eventCoordinator.SetActivityTracker(s.activityTracker)
 	eventCoordinator.SetWebhookDispatcher(webhookSender)
+	incidentService.SetWebhookDispatcher(webhookSender)
 	eventCoordinator.SetActionService(s.actionService)
-	eventCoordinator.SetAssetActionService(s.assetActionService)
 	eventCoordinator.SetMagicLinkService(magicLinkService)
-	s.actionService.SetAssetActionService(s.assetActionService)
 	s.actionService.SetEventCoordinator(eventCoordinator)
-	s.actionService.SetAssetPermissionChecker(assetHandler)
+	s.assetActionService.SetAssetPermissionChecker(assetHandler)
 	s.assetActionService.SetEventCoordinator(eventCoordinator)
 	slog.Info("event coordinator initialized")
 
 	// Wire up services
 	itemHandler.SetWebhookSender(webhookSender)
 	itemHandler.SetEventCoordinator(eventCoordinator)
-	commentHandler.SetWebhookSender(webhookSender)
+	s.actionService.SetItemUpdateApplicationService(itemHandler.ItemUpdateApplicationService())
+	s.assetActionService.SetItemCreationService(itemHandler.ItemCreationService())
 
 	// Item live-update stream (WI-484): register the in-memory SSE hub as the
 	// process-wide item-change publisher (WI-483 installed a no-op default), and
 	// give the item handler the hub so GET /items/{id}/events can subscribe.
 	sseHub := services.NewSSEHub()
+	if os.Getenv("WINDSHIFT_E2E_TEST_HOOKS") == "1" {
+		// Parallel e2e workers share the admin user; rapid reloads briefly
+		// overlap streams and would trip the production per-user cap, turning a
+		// healthy reconnect into a spurious 429 console error.
+		sseHub.SetMaxUserStreams(256)
+	}
 	services.SetItemChangePublisher(sseHub)
+	services.SetWorkspaceChangePublisher(sseHub)
+	services.SetUserChangePublisher(sseHub)
 	itemHandler.SetSSEHub(sseHub)
+	notificationHandler.SetSSEHub(sseHub)
 
-	// Mention service
 	mentionService := services.NewMentionService(s.db, s.notificationService, permService)
+	mentionService.SetWorkspaceUserResolver(workspaceUsers)
 	itemHandler.SetMentionService(mentionService)
-	commentHandler.SetMentionService(mentionService)
 
-	// Comment service
 	commentService := services.NewCommentService(s.db)
 	commentService.SetActivityTracker(s.activityTracker)
 	commentService.SetNotificationService(s.notificationService)
 	commentService.SetMentionService(mentionService)
 	commentService.SetWebhookSender(webhookSender)
+	commentService.SetIssueSync(issueSyncService)
 	if bindingSvc != nil {
 		// @mentioning a binding's acting user in a comment starts a run
 		// (WI-264), same machinery as the assignee-change trigger.
 		commentService.SetAgentMentionTrigger(bindingSvc)
 	}
-	commentHandler.SetCommentService(commentService)
-	commentHandler.SetIssueSyncService(issueSyncService)
 	s.actionService.SetCommentService(commentService)
+	commentService.SetActionEventEmitter(s.actionService)
+	commentService.SetInactivityMarkClearer(repository.NewActionTriggerMarkRepository(s.db))
 
 	// Wire email reply service for bidirectional email threading
 	emailReplyService := services.NewEmailReplyService(s.db, smtpSender)
+	emailReplyService.SetBaseURL(baseURL)
+	if err := services.PrepareDurableEmailReplyEngine(context.Background(), s.eventEngine, emailReplyService); err != nil {
+		return fmt.Errorf("prepare durable email reply consumer: %w", err)
+	}
 	commentService.SetEmailReplyService(emailReplyService)
+	s.notificationScheduler.SetEmailReplyOutbox(emailReplyService)
+
+	// Dedicated @mention emails (WI-1726): carry the message body and
+	// re-authorize the recipient before SMTP delivery. mentionService was
+	// constructed above, before this notifier existed.
+	mentionEmailService := services.NewMentionEmailService(
+		s.db,
+		smtpSender,
+		s.notificationService,
+		services.NewNotificationAuthorizer(s.db, permService, nil),
+	)
+	mentionEmailService.SetBaseURL(baseURL)
+	mentionService.SetMentionEmailNotifier(mentionEmailService)
+	s.notificationScheduler.SetMentionEmailOutbox(mentionEmailService)
+
+	// External request participants (WI-1136): the reply service sends the
+	// customer-facing "you were added" notice.
+	participantService := services.NewItemParticipantService(s.db)
+	participantService.SetNotifier(emailReplyService)
+
+	// Wire the helpdesk automation nodes (WI-1132/WI-1138). The reply
+	// service doubles as the customer notifier for notify_customer.
+	s.actionService.RegisterHelpdeskNodeExecutors(cannedResponseService, commentService, emailReplyService)
 
 	// Wire CommentService into email processor for unified comment creation
 	s.emailScheduler.SetCommentService(commentService)
@@ -932,30 +1151,107 @@ func (s *Server) initialize() error {
 	// emit the same notifications/webhooks/action events as REST-created ones.
 	s.emailScheduler.SetEventCoordinator(eventCoordinator)
 
+	// Optional intake receipts reuse the reply service's SMTP + portal-link
+	// plumbing (WI-1712).
+	s.emailScheduler.SetConfirmationSender(emailReplyService)
+
 	slog.Info("comment service initialized")
 
-	// Wire up action service
 	itemHandler.SetActionService(s.actionService)
-	itemHandler.SetIssueSyncService(issueSyncService)
-	itemLinkHandler.SetActionService(s.actionService)
+	itemLinkService.WithActionEmitter(s.actionService)
 
-	// Wire up condition service for workflow transition conditions
 	scriptEngine := services.NewScriptEngine()
 	conditionService := services.NewConditionService(s.db, permService, scriptEngine)
-	itemHandler.SetConditionService(conditionService)
 
-	// Wire up approval service for status-bound approvals (sibling of conditions).
-	approvalService := services.NewApprovalService(s.db, permService, leaveRepo, workflowService)
+	approvalService := services.NewApprovalService(s.db, leaveRepo, workflowService)
 	approvalService.SetEventCoordinator(eventCoordinator)
 	approvalSetService := services.NewApprovalSetService(s.db)
-	itemHandler.SetApprovalService(approvalService)
-	commentHandler.SetApprovalService(approvalService)
+	commentService.SetApprovalService(approvalService)
 	s.actionService.SetApprovalService(approvalService)
 	workspaceRoleHandler.SetApprovalService(approvalService)
+
+	zammadService := services.NewZammadService(
+		s.db,
+		repository.NewZammadRepository(s.db),
+		actionCredentialService,
+		permService,
+		workflowService,
+		conditionService,
+		approvalService,
+	)
+	zammadService.SetEventCoordinator(eventCoordinator)
+	zammadService.SetOAuthEncryption(scmProviderHandler.GetEncryption())
+	zammadHandler := handlers.NewZammadHandler(repository.NewItemRepository(s.db), zammadService, permService, logger.NewAuditor(s.db))
+	integrationOAuthHandler.RegisterSystemOAuthFlow(models.IntegrationProviderZammad, zammadService, logger.NewAuditor(s.db))
+	s.zammadSyncScheduler = scheduler.NewZammadSyncScheduler(zammadService)
+	s.zammadSyncScheduler.Start()
+	zammadHandler.SetSyncAllTrigger(s.zammadSyncScheduler.TriggerSyncAll)
+
+	// Standard profiles execute in-process through the canonical aitools
+	// registry. Wiring is intentionally late because their final comments and
+	// approval tools use the fully configured application services above.
+	if bindingSvc != nil {
+		standardDispatcher, err := standardagent.New(standardagent.Options{
+			DB:                     s.db,
+			Runs:                   repository.NewAgentRunRepository(s.db),
+			Bindings:               agentBindingRepo,
+			LLMs:                   llmManager,
+			Permissions:            permService,
+			TimePermissions:        timePermissionService,
+			Timers:                 timerService,
+			Comments:               commentService,
+			Approvals:              approvalService,
+			Notifications:          s.notificationService,
+			ActionService:          s.actionService,
+			PageApplicationService: pageApplication,
+			PageDiagramService:     pageDiagramService,
+			Registry:               aitools.Default,
+		})
+		if err != nil {
+			return fmt.Errorf("construct Standard agent runtime: %w", err)
+		}
+		bindingSvc.SetStandardRunDispatcher(standardDispatcher)
+		s.standardAgentDispatcher = standardDispatcher
+		if err := standardDispatcher.Resume(context.Background()); err != nil {
+			return fmt.Errorf("resume Standard agent runtime: %w", err)
+		}
+	}
 
 	// Background sweeper drives time-based escalation for pending approval steps.
 	s.approvalEscalationSweeper = services.NewApprovalEscalationSweeper(s.db, approvalService, services.DefaultApprovalEscalationSweeperConfig())
 	s.approvalEscalationSweeper.Start()
+
+	// Drives time-based escalation for triggered on-call incidents.
+	s.incidentEscalationSweeper = services.NewIncidentEscalationSweeper(s.db, incidentService, services.DefaultIncidentEscalationSweeperConfig())
+	s.incidentEscalationSweeper.Start()
+
+	s.actionInactivitySweeper = services.NewActionInactivitySweeper(s.db, s.actionService, services.DefaultActionInactivitySweeperConfig())
+	s.actionInactivitySweeper.Start()
+
+	// SLA evaluation runs inline with item facts, and one process-wide
+	// goroutine fires deadline and recalculation jobs. Under the e2e test hook
+	// a manually advanced clock drives derivation and the loop stays off, so a
+	// browser test can prove display does not depend on background work.
+	s.slaEngine = sla.NewEngine(s.db)
+	slaClock := sla.Clock(sla.SystemClock{})
+	if os.Getenv("WINDSHIFT_E2E_TEST_HOOKS") == "1" {
+		s.slaTestClock = sla.NewTestClock(time.Now().UTC())
+		slaClock = s.slaTestClock
+	}
+	s.slaEngine.SetClock(slaClock)
+	s.slaEngine.SetSideEffectEmitter(services.NewSLASideEffectEmitter(s.db))
+	s.slaEngine.SetInlineObserver(s.metrics)
+	s.slaLoop = sla.NewLoop(repository.NewSLARepository(s.db), s.slaEngine, slaClock, nil, sla.LoopConfig{})
+	s.slaEngine.SetJobOwner(s.slaLoop.Owner())
+	s.slaEngine.SetNudge(s.slaLoop.Nudge)
+	itemevents.RegisterFactObserver(s.slaEngine)
+	slaLoopCtx, slaLoopCancel := context.WithCancel(context.Background())
+	s.slaLoopCancel = slaLoopCancel
+	if s.slaTestClock != nil {
+		slog.Warn("WINDSHIFT_E2E_TEST_HOOKS enabled — SLA due-work loop disabled; test clock controls evaluation")
+	} else {
+		go s.slaLoop.Run(slaLoopCtx)
+	}
 
 	// Wire smart-commit dependencies into the SCM sync service and start its
 	// scheduler. Must be done after commentService and conditionService exist.
@@ -977,10 +1273,13 @@ func (s *Server) initialize() error {
 	//     by external_key (with optional release attach + commit-issue
 	//     attachment via the scm.MilestoneAttacher adapter).
 	scmSyncService.SetActionEvents(s.actionService)
+	scmSyncService.SetDurableActionEvents(s.actionService)
+	milestoneItemUpdater := services.NewItemUpdateApplicationService(s.db, permService)
+	milestoneItemUpdater.SetEmitter(eventCoordinator)
 	milestoneAttacher := scm.NewMilestoneAttacher(
 		scmSyncService,
 		repository.NewMilestoneAttachRepository(s.db),
-	)
+	).WithItemUpdater(milestoneItemUpdater)
 	s.actionService.RegisterNodeExecutor(
 		services.NewCreateMilestoneExecutor(services.NewPlanningService(s.db), s.actionService).
 			WithCommitAttacher(milestoneAttacher),
@@ -990,7 +1289,6 @@ func (s *Server) initialize() error {
 	go s.runSCMLinkRefresh(scmSyncService)
 	go s.runSCMOAuthStateCleanup()
 
-	// Channel handler (reuses the shared channelService initialized earlier)
 	channelRepoForHandler := repository.NewChannelRepository(s.db)
 	channelHandler := handlers.NewChannelHandler(
 		channelRepoForHandler,
@@ -1001,10 +1299,12 @@ func (s *Server) initialize() error {
 		logger.NewAuditor(s.db),
 	)
 	channelHandler.SetEmailScheduler(s.emailScheduler)
+	channelHandler.SetEmailReplyService(emailReplyService)
 	channelHandler.SetEncryption(scmProviderHandler.GetEncryption())
 	channelHandler.SetBaseURL(baseURL)
+	channelHandler.SetKnowledgeBasePageValidator(repository.NewPageRepository(s.db).ValidateLivePageInWorkspace)
 	channelHandler.SetSMTPSender(smtpSender)
-	channelHandler.SetCredentialManager(email.NewCredentialManager(s.db, scmProviderHandler.GetEncryption()))
+	channelHandler.SetCredentialManager(emailCredManager)
 	// Wire at-rest decryption into the SMTP sender so dispatch can decrypt
 	// SMTPPassword before AUTH PLAIN. Done here (after scmProviderHandler is
 	// initialized) rather than at smtpSender construction time because the
@@ -1013,32 +1313,39 @@ func (s *Server) initialize() error {
 	smtpSender.SetEncryption(scmProviderHandler.GetEncryption())
 
 	// Webhook handler
-	webhookHandler := handlers.NewWebhookHandler(repository.NewChannelRepository(s.db), repository.NewItemRepository(s.db), webhookSender, permService, channelService)
+	webhookHandler := handlers.NewWebhookHandler(repository.NewChannelRepository(s.db), repository.NewItemRepository(s.db), webhookSender, permService, channelService, logger.NewAuditor(s.db))
 	portalHandler := handlers.NewPortalHandler(s.db, sessionManager, portalSessionManager, ipExtractor, cfg.AttachmentPath)
 	portalHandler.SetApprovalService(approvalService)
+	portalHandler.SetEventCoordinator(eventCoordinator)
+	portalHandler.SetChannelService(channelService)
+	portalHandler.SetKnowledgePublicationService(knowledgePublication)
+	portalHandler.SetKBSignalService(services.NewKBSignalService(s.db))
+	portalHandler.SetCommentService(commentService)
 	portalAuthHandler := handlers.NewPortalAuthHandler(repository.NewPortalAuthRepository(s.db), portalSessionManager, sessionManager, magicLinkService, ipExtractor)
-	portalWebAuthnHandler := handlers.NewPortalWebAuthnHandler(
-		portalSessionManager,
-		portalWebAuthnConfig,
-		portalwebauthn.NewSessionStore(s.db),
-		portalwebauthn.NewCredentialStore(s.db),
-		portalwebauthn.NewPortalLookupStore(s.db),
-		ipExtractor,
-	)
+	var portalWebAuthnHandler *handlers.PortalWebAuthnHandler
+	if portalWebAuthnConfig != nil {
+		portalWebAuthnHandler = handlers.NewPortalWebAuthnHandler(
+			portalSessionManager,
+			portalWebAuthnConfig,
+			portalwebauthn.NewSessionStore(s.db),
+			portalwebauthn.NewCredentialStore(s.db),
+			portalwebauthn.NewPortalLookupStore(s.db),
+			ipExtractor,
+		)
+	}
 	portalCustomersHandler := handlers.NewPortalCustomersHandler(s.db, permService, customerOrgPermissionService)
 	contactRoleConfig := services.NewContactRoleConfig()
 	contactRoleConfig.AuditEmit = enumAuditEmit
 	contactRolesHandler := handlers.NewEnumHandler(
 		services.NewEnumService(s.db, contactRoleConfig),
-		func() interface{} { return &models.ContactRole{} })
+		func() any { return &models.ContactRole{} })
 	hubHandler := handlers.NewHubHandler(s.db, permService, logger.NewAuditor(s.db))
 	formHandler := handlers.NewFormHandler(s.db, sessionManager, portalSessionManager, ipExtractor, channelService)
+	formHandler.SetEventCoordinator(eventCoordinator)
 
-	// Notification settings
-	notificationSettingsHandler := handlers.NewNotificationSettingsHandler(repository.NewNotificationSettingsRepository(s.db), logger.NewAuditor(s.db), s.notificationService)
+	notificationSettingsHandler := handlers.NewNotificationSettingsHandler(repository.NewNotificationSettingsRepository(s.db), logger.NewAuditor(s.db), s.notificationService).WithObjectTranslations(objectTranslationService)
 	configSetNotificationHandler := handlers.NewConfigurationSetNotificationHandler(repository.NewConfigurationSetRepository(s.db), s.notificationService, logger.NewAuditor(s.db))
 
-	// Attachment handlers
 	var attachmentHandler *handlers.AttachmentHandler
 	var attachmentSettingsHandler *handlers.AttachmentSettingsHandler
 	if cfg.AttachmentPath != "" {
@@ -1051,19 +1358,41 @@ func (s *Server) initialize() error {
 		if err := attachmentSettingsService.Initialize(cfg.AttachmentPath); err != nil {
 			slog.Warn("failed to initialize attachment settings", "error", err)
 		}
+		formHandler.SetItemAttachmentService(services.NewItemAttachmentService(s.db, cfg.AttachmentPath, permService))
 		attachmentSettingsHandler = handlers.NewAttachmentSettingsHandler(attachmentSettingsService, logger.NewAuditor(s.db))
 	} else {
 		slog.Info("attachments disabled (no attachment path specified)")
 	}
 
-	// Diagram handler
-	diagramHandler := handlers.NewDiagramHandler(repository.NewDiagramRepository(s.db), repository.NewItemRepository(s.db), permService)
+	itemDiagramService := services.NewItemDiagramService(repository.NewDiagramRepository(s.db))
 
-	// Plugin system
 	var pluginRouter *plugins.Router
+	var pluginLicenseVerifier plugins.LicenseVerifier
+	var instanceService *services.InstanceService
 	if !cfg.Plugins.Disabled {
 		var pluginOpts []plugins.Option
 		pluginOpts = append(pluginOpts, plugins.WithDatabase(s.db), plugins.WithSCMService(scmSyncService), plugins.WithCommentService(commentService))
+
+		// License enforcement: when a license public key is configured, a
+		// plugin only contributes capabilities if its license verifies against
+		// this install's instance ID.
+		if cfg.Plugins.LicensePubKey != "" {
+			licensePubKey, err := base64.StdEncoding.DecodeString(cfg.Plugins.LicensePubKey)
+			if err != nil || len(licensePubKey) != ed25519.PublicKeySize {
+				slog.Error("invalid PLUGIN_LICENSE_PUBKEY; license enforcement disabled", "error", err)
+			} else {
+				instanceService = services.NewInstanceService(repository.NewSystemSettingRepository(s.db))
+				instanceID, err := instanceService.GetOrCreate()
+				if err != nil {
+					slog.Error("failed to load instance id; license enforcement disabled", "error", err)
+					instanceService = nil
+				} else {
+					pluginLicenseVerifier = licensing.MakeVerifier(ed25519.PublicKey(licensePubKey), instanceID)
+					pluginOpts = append(pluginOpts, plugins.WithLicenseVerifier(pluginLicenseVerifier))
+					slog.Info("plugin license enforcement enabled", "instance_id", instanceID)
+				}
+			}
+		}
 
 		pluginDir := cfg.Plugins.Dir
 		if pluginDir == "" {
@@ -1111,36 +1440,68 @@ func (s *Server) initialize() error {
 	} else {
 		slog.Info("plugin system disabled")
 	}
+	ssoHandler.SetPluginManager(s.pluginManager)
 
 	pluginHandler := handlers.NewPluginHandler(s.pluginManager, repository.NewPluginRegistryRepository(s.db), logger.NewAuditor(s.db), cfg.Plugins.Disabled)
+	pluginHandler.SetLicensing(pluginLicenseVerifier, instanceService)
 
-	// Audit log handler
 	auditLogHandler := handlers.NewAuditLogHandler(repository.NewAuditLogRepository(s.db))
 
 	// LDAP handler — keep on Server so Shutdown can drain in-flight syncs.
-	ldapSyncService := ldap.NewSyncService(s.db, ssoHandler.GetEncryption())
+	ldapSyncService := ldap.NewSyncService(s.db, ssoHandler.GetEncryption(), func(userID int) error {
+		_, err := userDeactivationService.DeactivateUser(userID)
+		return err
+	})
 	s.ldapHandler = handlers.NewLDAPHandler(s.db, ldapSyncService, ssoHandler.GetEncryption())
 	ldapHandler := s.ldapHandler
 
-	// Features handler
 	featuresHandler := handlers.NewFeaturesHandler(s.pluginManager, cfg.SSH.Enabled, cfg.Logbook.Endpoint != "")
 
-	// System handler
 	shutdownChan := cfg.ShutdownChan
 	if shutdownChan == nil {
 		shutdownChan = make(chan os.Signal, 1)
 	}
 	systemHandler := handlers.NewSystemHandler(shutdownChan)
 
-	// LLM connection manager and AI handler
 	llmConnHandler := handlers.NewLLMConnectionHandler(llmManager, logger.NewAuditor(s.db), llmModelCache, llmModelRefresher)
-	aiHandler := handlers.NewAIHandler(s.db, llmManager, permService, timePermissionService, timerService, promptStore, s.actionService)
+	workItemStalenessHandler := handlers.NewWorkItemStalenessHandler(
+		services.NewWorkItemStalenessService(s.db),
+		logger.NewAuditor(s.db),
+	)
+	aiHandler := handlers.NewAIHandler(
+		s.db,
+		llmManager,
+		permService,
+		timePermissionService,
+		timerService,
+		promptStore,
+		s.actionService,
+		pageApplication,
+		pageDiagramService,
+	)
+	aiHandler.SetConversationDependencies(commentService, approvalService)
+	conversationRepo := repository.NewAgentConversationRepository(s.db)
+	if _, err := conversationRepo.FailInterruptedRuns(context.Background()); err != nil {
+		return fmt.Errorf("repair interrupted agent conversations: %w", err)
+	}
+	auditLogHandler.SetAgentTranscriptRepositories(
+		conversationRepo,
+		repository.NewAgentRunRepository(s.db),
+	)
+	shellBootstrapHandler := handlers.NewShellBootstrapHandler(
+		featuresHandler,
+		setupHandler,
+		attachmentSettingsHandler,
+		aiHandler,
+		assetApplication,
+		hubHandler,
+		channelService,
+		workItemStalenessHandler,
+	)
 
-	// Briefing scheduler (generates daily briefings for all users)
 	s.briefingScheduler = scheduler.NewBriefingScheduler(s.db, llmManager, permService, timePermissionService, services.NewUserReadService(s.db), promptStore)
 	s.briefingScheduler.Start()
 
-	// Logbook reverse proxy (optional sidecar)
 	if cfg.Logbook.Endpoint != "" {
 		proxyCfg := LogbookProxyConfig{
 			Endpoint:          cfg.Logbook.Endpoint,
@@ -1177,12 +1538,9 @@ func (s *Server) initialize() error {
 			// Node execution endpoint for logbook actions (create_item, create_asset on SQLite)
 			nodeExecHandler := handlers.NewLogbookNodeExecutionHandler(
 				ssoSecret,
-				eventCoordinator,
 				permService,
 				assetHandler,
-				func(params services.ItemCreationParams) (int64, error) { return services.CreateItem(s.db, params) },
-				repository.NewWorkspaceRepository(s.db),
-				repository.NewAssetRepository(s.db),
+				itemHandler.ItemCreationService(),
 			)
 			mux.Handle("POST /api/internal/logbook/execute-node", http.HandlerFunc(nodeExecHandler.HandleNodeExecution))
 			slog.Info("internal logbook node execution endpoint enabled")
@@ -1200,7 +1558,16 @@ func (s *Server) initialize() error {
 	csrfOrigins := buildAllowedOrigins(cfg.AllowedHosts, effectivePort, corsScheme, cfg.UseProxy)
 	corsMiddleware := createCORSMiddleware(cfg.AllowedHosts, effectivePort, corsScheme, cfg.DisableCSRF, cfg.UseProxy, cfg.AllowInsecureHTTP)
 	apiCORSMiddleware := createFormEmbedCORSMiddleware(cfg.FormEmbedOrigins, csrfOrigins, corsMiddleware)
-	apiMiddleware := router.MiddlewareChain{apiCORSMiddleware, authMiddleware.OptionalAuth}
+	apiMiddleware := router.MiddlewareChain{
+		apiCORSMiddleware,
+		authMiddleware.OptionalAuth,
+		middleware.LimitJSONRequestBody(
+			restapi.DefaultJSONRequestBodyLimit,
+			"/api/llm-proxy/",
+			"/api/http-proxy/",
+			"/api/git-proxy/",
+		),
+	}
 
 	if !cfg.DisableCSRF {
 		slog.Info("CSRF protection enabled (Sec-Fetch-Site + Origin/Referer fallback)", "allowed_origins", csrfOrigins)
@@ -1227,9 +1594,19 @@ func (s *Server) initialize() error {
 
 	// Create portal auth middleware (accepts both internal and portal sessions)
 	portalAuthMiddleware := middleware.NewPortalAuthMiddleware(sessionManager, portalSessionManager, cfg.UseProxy, additionalProxyList)
+	oauthHandler := handlers.NewOAuthHandler(
+		s.db,
+		agentHandler,
+		tokenManager,
+		apiTokenHandler,
+		permService,
+		handlers.OAuthServerConfig{IssuerURL: baseURL, MCPEnabled: cfg.MCPEnabled},
+	)
 
 	// Build route dependencies
+	slaHandler := handlers.NewSLAHandler(s.db, s.slaEngine, permService)
 	routeDeps := &routes.Deps{
+		SLA:       slaHandler,
 		API:       api,
 		SCIMGroup: scimGroup,
 		Mux:       mux,
@@ -1239,21 +1616,23 @@ func (s *Server) initialize() error {
 		SCIMAuthMiddleware:   scimAuthMiddleware,
 		PortalAuthMiddleware: portalAuthMiddleware,
 
-		LoginRateLimiter:    s.loginRateLimiter,
-		AuthRateLimiter:     s.authRateLimiter,
-		FIDORateLimiter:     s.fidoRateLimiter,
-		SSORateLimiter:      s.ssoRateLimiter,
-		SCIMRateLimiter:     s.scimRateLimiter,
-		PortalSubmitLimiter: s.portalSubmitLimiter,
-		PortalSearchLimiter: s.portalSearchLimiter,
-		PortalAuthLimiter:   s.portalAuthLimiter,
-		EmailVerifyLimiter:  s.emailVerifyLimiter,
-		SetupLimiter:        s.setupLimiter,
-		AIRateLimiter:       s.aiRateLimiter,
-		UploadLimiter:       s.uploadLimiter,
-		WebhookLimiter:      s.webhookLimiter,
-		SearchLimiter:       s.searchLimiter,
-		CalendarFeedLimiter: s.calendarFeedLimiter,
+		LoginRateLimiter:      s.loginRateLimiter,
+		RunnerRegisterLimiter: s.runnerRegisterLimiter,
+		AuthRateLimiter:       s.authRateLimiter,
+		FIDORateLimiter:       s.fidoRateLimiter,
+		SSORateLimiter:        s.ssoRateLimiter,
+		SCIMRateLimiter:       s.scimRateLimiter,
+		PortalSubmitLimiter:   s.portalSubmitLimiter,
+		PortalSearchLimiter:   s.portalSearchLimiter,
+		PortalAuthLimiter:     s.portalAuthLimiter,
+		OAuthTokenLimiter:     s.oauthTokenLimiter,
+		EmailVerifyLimiter:    s.emailVerifyLimiter,
+		SetupLimiter:          s.setupLimiter,
+		AIRateLimiter:         s.aiRateLimiter,
+		UploadLimiter:         s.uploadLimiter,
+		WebhookLimiter:        s.webhookLimiter,
+		CalendarFeedLimiter:   s.calendarFeedLimiter,
+		PublicBoardLimiter:    s.publicBoardLimiter,
 
 		Auth: routes.AuthHandlers{
 			Auth:       authHandler,
@@ -1271,45 +1650,26 @@ func (s *Server) initialize() error {
 			ItemLinks:     scmItemLinksHandler,
 			UserToken:     userSCMTokenHandler,
 			EmailProvider: emailProviderHandler,
-			IssueSync:     handlers.NewIssueSyncHandler(issueSyncService, permService, logger.NewAuditor(s.db)),
+			IssueSync:     issueSyncHandler,
 		},
 		Items: routes.ItemHandlers{
 			Item:               itemHandler,
-			Recurrence:         recurrenceHandler,
-			Comment:            commentHandler,
 			Attachment:         attachmentHandler,
 			AttachmentSettings: attachmentSettingsHandler,
-			Diagram:            diagramHandler,
-			ItemLink:           itemLinkHandler,
-			LinkType:           linkTypeHandler,
-			Label:              labelHandler,
-			ItemTemplate:       itemTemplateHandler,
 		},
 		Workspaces: routes.WorkspaceHandlers{
 			Workspace:             workspaceHandler,
+			Bootstrap:             workspaceBootstrapHandler,
 			Screen:                screenHandler,
 			ConfigSet:             configSetHandler,
 			ConfigSetNotification: configSetNotificationHandler,
 			NotificationSettings:  notificationSettingsHandler,
-			ItemType:              itemTypeHandler,
-			Priority:              priorityHandler,
 			HierarchyLevel:        hierarchyLevelHandler,
 			RequestType:           requestTypeHandler,
-			StatusCategory:        statusCategoryHandler,
-			Status:                statusHandler,
-			StatusLegacy:          statusHandlerLegacy,
-			Workflow:              workflowHandler,
 			Actions:               actionsHandler,
 			ActionCredentials:     actionCredentialsHandler,
-			ActionTemplates:       handlers.NewActionTemplatesHandler(services.NewActionTemplateService(s.db), s.actionService, workspaceKeyCache, logger.NewAuditor(s.db)),
 			Analytics:             handlers.NewAnalyticsHandler(services.NewAnalyticsService(s.db), permService, workspaceKeyCache),
-			ConditionSet:          handlers.NewConditionSetHandler(s.db),
-			ApprovalSet:           handlers.NewApprovalSetHandler(approvalSetService, logger.NewAuditor(s.db)),
-			Approval:              handlers.NewApprovalHandler(permService, approvalService, repository.NewItemRepository(s.db), logger.NewAuditor(s.db)),
-			TransitionGovernance:  handlers.NewTransitionGovernanceHandler(repository.NewTransitionRepository(s.db), approvalSetService),
 			AgentBinding:          agentBindingHandler,
-			AgentSkill:            agentSkillHandler,
-			AgentRun:              agentRunHandler,
 			RunnerControl:         runnerControlHandler,
 			RunnerBroker:          runnerBrokerHandler,
 		},
@@ -1323,7 +1683,7 @@ func (s *Server) initialize() error {
 			APIToken:      apiTokenHandler,
 			Agent:         agentHandler,
 			CLIAuth:       handlers.NewCLIAuthHandler(repository.NewCLIAuthRepository(s.db), logger.NewAuditor(s.db), agentHandler, tokenManager, apiTokenHandler, permService),
-			OAuth:         handlers.NewOAuthHandler(s.db, agentHandler, tokenManager, apiTokenHandler, permService),
+			OAuth:         oauthHandler,
 		},
 		Admin: routes.AdminHandlers{
 			SecuritySettings: securitySettingsHandler,
@@ -1337,8 +1697,11 @@ func (s *Server) initialize() error {
 			AuditLog:         auditLogHandler,
 			LDAP:             ldapHandler,
 			Features:         featuresHandler,
+			ShellBootstrap:   shellBootstrapHandler,
 			OAuthClients:     handlers.NewAdminOAuthClientHandler(s.db, tokenManager, permService),
 			Diagnostics: handlers.NewDiagnosticsHandler(
+				sessionManager,
+				s.databaseDiagRepo,
 				repository.NewActionRepository(s.db),
 				repository.NewWebhookDeliveryRepository(s.db),
 				repository.NewSchedulerRunRepository(s.db),
@@ -1349,6 +1712,15 @@ func (s *Server) initialize() error {
 				logger.NewAuditor(s.db),
 				repository.NewRunnerRepository(s.db),
 				repository.NewAgentRunRepository(s.db),
+				s.webhookSender,
+				transitionMatrixService,
+				bulkOperationMetrics,
+				repository.NewRecurrenceRepository(s.db),
+				repository.NewSystemSettingRepository(s.db),
+				s.globalRankMigrationScheduler,
+				s.memoryBudget,
+				s.eventEngine.Store(),
+				repository.NewSCMHealthRepository(s.db),
 			),
 			AgentSecurity: handlers.NewAgentSecurityHandler(
 				agentSecurityRepo,
@@ -1356,30 +1728,18 @@ func (s *Server) initialize() error {
 				permService,
 				logger.NewAuditor(s.db),
 			),
+			AgentTemplateCatalog: agentTemplateCatalogHandler,
+			ObjectTranslation:    objectTranslationHandler,
 		},
 		Planning: routes.PlanningHandlers{
 			MilestoneCategory: milestoneCategoryHandler,
-			Milestone:         milestoneHandler,
 			IterationType:     iterationTypeHandler,
-			Iteration:         iterationHandler,
 			PersonalLabel:     personalLabelHandler,
 		},
 		TimeTracking: routes.TimeTrackingHandlers{
 			Customer:           timeCustomerHandler,
-			ProjectCategory:    timeProjectCategoryHandler,
 			Project:            timeProjectHandler,
-			Worklog:            timeWorklogHandler,
-			ActiveTimer:        activeTimerHandler,
-			ProjectPermission:  timeProjectPermissionHandler,
 			CustomerPermission: customerOrgPermissionHandler,
-		},
-		TestMgmt: routes.TestManagementHandlers{
-			Folder:      testFolderHandler,
-			Case:        testCaseHandler,
-			Set:         testSetHandler,
-			RunTemplate: testRunTemplateHandler,
-			Run:         testRunHandler,
-			Summary:     testSummaryHandler,
 		},
 		Channels: routes.ChannelHandlers{
 			ChannelCategory: channelCategoryHandler,
@@ -1399,22 +1759,14 @@ func (s *Server) initialize() error {
 			Form:           formHandler,
 		},
 		Assets: routes.AssetHandlers{
-			Asset:    assetHandler,
-			Type:     assetTypeHandler,
-			Category: assetCategoryHandler,
-			Status:   assetStatusHandler,
-			Action:   assetActionHandler,
+			Asset:  assetHandler,
+			Action: assetActionHandler,
 		},
 		PublicBoard: publicBoardHandler,
-		Collections: routes.CollectionHandlers{
-			Category:     collectionCategoryHandler,
-			Collection:   collectionHandler,
-			BoardConfig:  boardConfigHandler,
-			TestCoverage: testCoverageHandler,
-		},
 		AI: routes.AIHandlers{
-			AI:            aiHandler,
-			LLMConnection: llmConnHandler,
+			AI:                aiHandler,
+			LLMConnection:     llmConnHandler,
+			WorkItemStaleness: workItemStalenessHandler,
 		},
 		Misc: routes.MiscHandlers{
 			Homepage:      homepageHandler,
@@ -1433,11 +1785,10 @@ func (s *Server) initialize() error {
 			OAuth:       integrationOAuthHandler,
 			ItemLinks:   integrationItemLinksHandler,
 			TodoistSync: todoistSyncHandler,
+			Zammad:      zammadHandler,
 		},
 		Pages: routes.PageHandlers{
-			Page:            pageHandler,
 			KnowledgeSearch: knowledgeSearchHandler,
-			PageLabel:       pageLabelHandler,
 		},
 		Push: pushHandler,
 	}
@@ -1451,6 +1802,10 @@ func (s *Server) initialize() error {
 	if os.Getenv("WINDSHIFT_E2E_TEST_HOOKS") == "1" {
 		mux.Handle("POST /api/test/scm/setup-mock-repo", handlers.NewTestSetupMockRepo(services.NewTestSCMHookService(s.db, nil)))
 		mux.Handle("POST /api/test/scm/inject-ref", handlers.NewTestSCMInjectRef(services.NewTestSCMHookService(s.db, s.actionService)))
+		mux.Handle("POST /api/test/history/backdate", handlers.NewTestHistoryBackdate(services.NewTestHistoryHookService(s.db)))
+		if s.slaTestClock != nil {
+			mux.Handle("POST /api/test/sla/clock", handlers.NewTestSLAClock(s.slaTestClock))
+		}
 		slog.Warn("WINDSHIFT_E2E_TEST_HOOKS enabled — test hook routes are mounted; never enable in production")
 	}
 
@@ -1459,30 +1814,217 @@ func (s *Server) initialize() error {
 		pluginRouter.RegisterRoutes(mux)
 	}
 
+	// Workspace creation wiring: the v2 application service, the v1 and
+	// session create handlers, and the pack apply service share one
+	// create-from-template-pack provisioner. PackApplyService depends on the
+	// application service for name-based workspace creation, so it is wired
+	// after construction.
+	v2Access := authz.New(s.db, permService)
+	workspaceAppService := services.NewWorkspaceApplicationService(s.db, v2Access, authorizationCacheInvalidator)
+	workspaceBundleImportService := services.NewWorkspaceBundleImportService(
+		s.db,
+		repository.NewConfigurationSetRepository(s.db),
+		repository.NewItemTypeRepository(s.db),
+		repository.NewLabelRepository(s.db),
+		repository.NewBoardConfigurationRepository(s.db),
+		pageApplication,
+		pageLabelService,
+		itemHandler.ItemCreationService(),
+		itemLinkService,
+		permService,
+		services.NewSLACalendarService(s.db, s.slaEngine),
+		services.NewSLAMetricService(s.db, s.slaEngine),
+	)
+	packApplyService := services.NewPackApplyService(
+		s.db,
+		workspaceAppService,
+		repository.NewConfigurationSetRepository(s.db),
+		newConfigSetConformanceService(s.db),
+		workspaceBundleImportService,
+	)
+	workspaceAppService.SetPackProvisioner(packApplyService)
+
 	// REST API v1
 	restapi.SetupRoutes(restapi.Deps{
-		Mux:                    mux,
-		DB:                     s.db,
-		TokenManager:           tokenManager,
-		PermissionService:      permService,
-		ActionService:          s.actionService,
-		AttachmentPath:         cfg.AttachmentPath,
-		ItemLinkService:        itemLinkHandler.LinkService(),
-		AssetPermissionService: assetHandler.AssetPermissionService(),
-		AssetService:           assetHandler.AssetService(),
-		CommentService:         commentService,
+		Mux:                            mux,
+		DB:                             s.db,
+		TokenManager:                   tokenManager,
+		PermissionService:              permService,
+		ActionService:                  s.actionService,
+		AttachmentPath:                 cfg.AttachmentPath,
+		ItemLinkService:                itemLinkService,
+		AssetPermissionService:         assetHandler.AssetPermissionService(),
+		AssetService:                   assetHandler.AssetService(),
+		CommentService:                 commentService,
+		ItemCreationService:            itemHandler.ItemCreationService(),
+		ItemUpdateApplicationService:   itemHandler.ItemUpdateApplicationService(),
+		ItemDeletionApplicationService: itemHandler.ItemDeletionApplicationService(),
+		PageApplicationService:         pageApplication,
+		PageDiagramService:             pageDiagramService,
+		ObjectTranslationService:       objectTranslationService,
+		AuthorizationCacheInvalidator:  authorizationCacheInvalidator,
+		PackProvisioner:                packApplyService,
+		AI:                             aiHandler,
+		AIRateLimiter:                  s.aiRateLimiter,
 	}, v1.RegisterRoutes)
+	v2CSRF := middleware.NewDisabledCSRFValidator()
+	if !cfg.DisableCSRF {
+		v2CSRF = middleware.NewCSRFValidator(csrfOrigins)
+	}
+	planningCredentialResolver := scm.NewCredentialResolver(s.db, scmProviderHandler.GetEncryption())
+	planningApplication := services.NewPlanningApplicationService(
+		milestonePlanningService,
+		permService,
+		services.NewIterationCompletionService(s.db),
+		func(ctx context.Context, connectionID, userID int) (services.PlanningReleaseProvider, error) {
+			provider, err := planningCredentialResolver.GetProviderForUser(ctx, connectionID, userID)
+			if err != nil {
+				return nil, err
+			}
+			releaseProvider, ok := provider.(interface {
+				scm.ReleaseProvider
+				ListTags(context.Context, string, string, time.Time) ([]scm.Tag, error)
+			})
+			if !ok {
+				return nil, errors.New("SCM provider does not support releases")
+			}
+			return planningReleaseProviderAdapter{provider: releaseProvider}, nil
+		},
+	)
+	agentRunApplication := services.NewAgentRunReadService(
+		repository.NewItemRepository(s.db),
+		repository.NewAgentRunRepository(s.db),
+		permService,
+	).WithRuntime(codingRunSvc, bindingSvc).WithUsage(repository.NewLLMUsageRepository(s.db))
+	actionApplication := services.NewActionApplicationService(
+		s.db,
+		repository.NewActionRepository(s.db),
+		repository.NewItemRepository(s.db),
+		permService,
+		s.actionService,
+		assetHandler.AssetService(),
+	)
+	itemApplication := services.NewItemApplicationService(
+		s.db,
+		permService,
+		itemHandler.ItemCreationService(),
+		itemHandler.ItemUpdateApplicationService(),
+		itemHandler.ItemDeletionApplicationService(),
+	).WithReads(s.activityTracker, approvalService).
+		WithCache(itemHandler.ItemCacheService()).
+		WithWorkflow(conditionService, eventCoordinator, issueSyncService).
+		WithMutationEffects(mentionService).
+		WithClock(slaClock)
+	itemDetailApplication := services.NewItemDetailApplicationService(s.db, itemApplication, itemLinkService, permService).
+		WithContextReaders(screenHandler, requestTypeHandler, actionApplication).
+		WithStoryPointRollups(repository.NewItemRepository(s.db))
+	catalogMutations := services.NewCatalogMutationService(s.db, permService, workflowService)
+	governanceApplication := services.NewGovernanceApplicationService(s.db, permService, approvalSetService, approvalService)
+	if err := v2.RegisterRoutes(v2.Deps{
+		Mux:                mux,
+		Tokens:             tokenManager,
+		SLA:                s.slaEngine,
+		SLACalendars:       services.NewSLACalendarService(s.db, s.slaEngine),
+		SLASettings:        services.NewSLASettingsService(s.db, s.slaEngine),
+		SLATeamBindings:    services.NewSLATeamBindingService(s.db, permService),
+		SLAMetrics:         services.NewSLAMetricService(s.db, s.slaEngine),
+		Users:              services.NewUserReadService(s.db),
+		Statuses:           services.NewStatusService(s.db),
+		Teams:              teamRepo,
+		Workflows:          workflowService,
+		Configuration:      services.NewConfigReadService(s.db),
+		ObjectTranslations: objectTranslationService,
+		Catalog:            services.NewCatalogReadService(s.db, permService, v2Access, s.activityTracker),
+		CatalogMutations:   catalogMutations,
+		CustomFieldProvisioning: services.NewCustomFieldProvisioningService(s.db, services.CustomFieldProvisioningHooks{
+			EnqueueOptionRemoval:     scheduler.EnqueueOptionRemoval,
+			EnqueueFieldCleanup:      scheduler.EnqueueFieldCleanup,
+			EnqueueIndexBuild:        scheduler.EnqueueIndexBuild,
+			CancelPendingIndexBuilds: scheduler.CancelPendingIndexBuilds,
+		}),
+		Screens:                      services.NewScreenProvisioningService(s.db),
+		WorkspaceRoles:               services.NewWorkspaceRoleProvisioningService(s.db, repository.NewWorkspaceRoleRepository(s.db), permService, approvalService),
+		ConfigurationSetProvisioning: services.NewConfigurationSetProvisioningService(s.db, repository.NewConfigurationSetRepository(s.db), permService, s.notificationService),
+		ConfigurationSetExport:       services.NewConfigSetExportService(s.db, repository.NewConfigurationSetRepository(s.db)),
+		ConfigSetConformance:         newConfigSetConformanceService(s.db),
+		WorkspaceBundleExport:        services.NewWorkspaceBundleExportService(s.db, services.NewConfigSetExportService(s.db, repository.NewConfigurationSetRepository(s.db))),
+		PackApply:                    packApplyService,
+		WorkspaceBundleImport:        workspaceBundleImportService,
+		StoryPointRollup:             repository.NewItemRepository(s.db),
+		HierarchyLevels:              hierarchyLevelEnumService,
+		Workspaces:                   workspaceAppService,
+		ItemTemplates:                services.NewItemTemplateApplicationService(s.db, v2Access),
+		Labels:                       services.NewLabelApplicationService(s.db),
+		Participants:                 participantService,
+		Items:                        repository.NewItemRepository(s.db),
+		Access:                       v2Access,
+		Preferences:                  userPreferencesService,
+		Recurrence:                   recurrenceService,
+		ItemDiagrams:                 itemDiagramService,
+		Pages:                        pageService,
+		PageApplication:              pageApplication,
+		PageDiagrams:                 pageDiagramService,
+		PageAccess:                   pagePermissionService,
+		PageLabels:                   pageLabelService,
+		CannedResponses:              cannedResponseService,
+		PagePublication:              knowledgePublication,
+		Worklogs:                     timeWorklogService,
+		TimeAccess:                   timePermissionService,
+		TimeProjects:                 services.NewTimeProjectApplicationService(s.db, timePermissionService, v2Access),
+		Timers:                       timerService,
+		SystemAdmins:                 permService,
+		GlobalPermission:             permService,
+		Groups:                       groupHandler.Application(),
+		AdminUsers:                   services.NewUserReadService(s.db),
+		AuditLogs:                    repository.NewAuditLogRepository(s.db),
+		AdminTokens:                  tokenManager,
+		AdminAuditor:                 logger.NewAuditor(s.db),
+		AdminTranslations:            objectTranslationService,
+		Comments:                     commentService,
+		CommentAccess:                permService,
+		Attachments:                  services.NewItemAttachmentService(s.db, cfg.AttachmentPath, permService),
+		PageAttachments:              services.NewPageAttachmentUploadService(s.db, cfg.AttachmentPath, permService, pagePermissionService),
+		Collections:                  services.NewCollectionApplicationService(s.db, permService),
+		Planning:                     planningApplication,
+		Links:                        itemLinkService,
+		AgentRuns:                    agentRunApplication,
+		AgentSkills:                  services.NewAgentSkillApplicationService(s.db, permService),
+		ConditionSets:                services.NewConditionSetApplicationService(s.db, permService),
+		Governance:                   governanceApplication,
+		Actions:                      actionApplication,
+		TestManagement:               services.NewTestManagementApplicationService(s.db, permService),
+		Assets:                       assetApplication,
+		ItemApplication:              itemApplication,
+		ItemDetail:                   itemDetailApplication,
+		ItemLifecycle:                services.NewItemLifecycleService(s.db, permService),
+		TicketImport:                 services.NewTicketImportService(s.db, permService, cfg.AttachmentPath),
+		SessionMiddleware:            authMiddleware.OptionalAuth,
+		SearchAllowed:                s.searchLimiter.AllowRequest,
+		DBRequestTimeout:             s.config.DB.RequestTimeout,
+		CORS:                         v2.NewCORS(csrfOrigins, cfg.DisableCSRF, !cfg.DisableCSRF),
+		CSRF:                         v2CSRF,
+		Concurrency:                  s.userConcurrency,
+	}); err != nil {
+		return fmt.Errorf("register REST API v2: %w", err)
+	}
 
 	// MCP Server (Model Context Protocol) — opt-in via --mcp or MCP_ENABLED=true
 	if cfg.MCPEnabled {
 		mcpServer := mcpserver.NewMCPServer(mcpserver.Deps{
-			DB:                    s.db,
-			TokenManager:          tokenManager,
-			PermissionService:     permService,
-			TimePermissionService: timePermissionService,
-			TimerService:          timerService,
-			CommentService:        commentService,
-			ActionService:         s.actionService,
+			DB:           s.db,
+			TokenManager: tokenManager,
+			Auth: mcpserver.AuthConfig{
+				ResourceURI:         oauthHandler.MCPResourceURI(),
+				ResourceMetadataURI: oauthHandler.MCPProtectedResourceMetadataURI(),
+			},
+			PermissionService:      permService,
+			TimePermissionService:  timePermissionService,
+			TimerService:           timerService,
+			CommentService:         commentService,
+			ItemDeletionService:    itemHandler.ItemDeletionApplicationService(),
+			PageApplicationService: pageApplication,
+			PageDiagramService:     pageDiagramService,
+			ActionService:          s.actionService,
 		})
 		mux.Handle("GET /mcp", mcpServer.Handler())
 		mux.Handle("POST /mcp", mcpServer.Handler())
@@ -1516,6 +2058,9 @@ func (s *Server) initialize() error {
 			mux.Handle("GET /windshift-3.svg", revalidatingAssets)
 			mux.Handle("GET /favicon-32x32.png", revalidatingAssets)
 			mux.Handle("GET /apple-touch-icon.png", revalidatingAssets)
+			mux.Handle("GET /apple-touch-startup-image-1170x2532.png", revalidatingAssets)
+			mux.Handle("GET /apple-touch-startup-image-1290x2796.png", revalidatingAssets)
+			mux.Handle("GET /apple-touch-startup-image-2048x2732.png", revalidatingAssets)
 			mux.Handle("GET /forms/widget.js", revalidatingAssets)
 			mux.Handle("GET /embed/", revalidatingAssets)
 
@@ -1577,33 +2122,109 @@ func (s *Server) initialize() error {
 	jiraHosts := NewJiraHostAllowlist(s.db, 60*time.Second)
 	go jiraHosts.Start(s.jiraHostStopChan)
 
-	// Apply middleware (recovery is outermost to catch all panics)
-	securityMiddleware := createSecurityHeaders(enableHTTPS, cfg.UseProxy, additionalProxyIPs, jiraHosts.Allowed)
+	// Recovery converts panics before the metrics layer records the final status.
+	securityMiddleware := createSecurityHeaders(enableHTTPS, cfg.UseProxy, additionalProxyIPs, jiraHosts.Allowed, securitySettingsHandler.ExternalImagesAllowed)
 	compressionMiddleware := middleware.CreateCompressionMiddleware(cfg.UseProxy)
-	handler := middleware.Recovery(compressionMiddleware(securityMiddleware(mux)))
+	applicationHandler := middleware.Recovery(compressionMiddleware(securityMiddleware(s.metrics.CaptureRoutePattern(mux))))
+	handler := s.metrics.Instrument(applicationHandler)
 	handler = withContextPath(handler, cfg.ContextPath)
 
 	// Create HTTP server
 	s.httpServer = &http.Server{
-		Handler:        handler,
-		ReadTimeout:    15 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    60 * time.Second,
-		MaxHeaderBytes: 1 << 20,
+		Handler:             handler,
+		ReadTimeout:         15 * time.Second,
+		WriteTimeout:        30 * time.Second,
+		IdleTimeout:         60 * time.Second,
+		MaxHeaderBytes:      1 << 20,
+		MaxHeaderValueCount: maxRequestHeaderValueCount,
+	}
+	if err := s.eventEngine.Start(context.Background()); err != nil {
+		return fmt.Errorf("start domain event engine: %w", err)
 	}
 
 	return nil
+}
+
+// initializeWebAuthnConfigs builds the internal and portal passkey
+// configurations. Passkeys are optional, so a relying party that cannot be
+// described by the current settings disables them and returns nil
+// configurations rather than stopping an otherwise healthy installation.
+// Remaining errors stay fatal because they indicate a broken WebAuthn setup.
+func initializeWebAuthnConfigs(cfg Config, isDevelopment bool, effectivePort string, enableHTTPS bool) (internalConfig *webauthn.Config, portalConfig *portalwebauthn.Config, err error) {
+	rpID := cfg.WebAuthn.RPID
+	if isDevelopment {
+		rpID = ""
+	}
+
+	webAuthnConfig, err := webauthn.NewConfig(webauthn.Options{
+		RPID:          rpID,
+		RPName:        cfg.WebAuthn.RPName,
+		BaseURL:       cfg.BaseURL,
+		AllowedHosts:  cfg.AllowedHosts,
+		Port:          effectivePort,
+		IsDevelopment: isDevelopment,
+		EnableHTTPS:   enableHTTPS,
+		UseProxy:      cfg.UseProxy,
+	})
+	if err != nil {
+		var invalidRPIDErr *webauthn.InvalidRPIDError
+		var missingOriginsErr *webauthn.MissingOriginsError
+
+		switch {
+		// A single-label hostname is common in Docker, homelab DNS, and local
+		// test installations, but it cannot be used as an RP ID by the current
+		// WebAuthn implementation. Keep the application healthy and make the
+		// limitation actionable; passkeys remain available when the operator
+		// uses localhost, an IP address, or a dotted hostname.
+		case errors.As(err, &invalidRPIDErr):
+			slog.Warn("WebAuthn disabled because the configured RP ID is not valid; set BASE_URL or WEBAUTHN_RP_ID to localhost, an IP address, or a dotted hostname to enable passkeys",
+				"rp_id", invalidRPIDErr.RPID,
+				"error", invalidRPIDErr)
+		case errors.As(err, &missingOriginsErr):
+			slog.Warn("WebAuthn disabled because no browser-visible origin is configured; set BASE_URL to the URL users open to enable passkeys",
+				"error", missingOriginsErr)
+		default:
+			return nil, nil, fmt.Errorf("failed to initialize WebAuthn configuration: %w", err)
+		}
+
+		return nil, nil, nil
+	}
+
+	// Log the origins: a passkey ceremony that fails in the browser is almost
+	// always an origin the relying party does not accept, and this is the only
+	// place the resolved list is visible to an operator.
+	slog.Info("WebAuthn configuration initialized",
+		"rp_id", webAuthnConfig.RPID,
+		"rp_name", webAuthnConfig.RPName,
+		"rp_origins", webAuthnConfig.RPOrigins,
+		"development_mode", isDevelopment)
+
+	// Portal passkeys reuse the relying-party settings but require resident
+	// keys so customers can sign in passwordlessly (BeginDiscoverableLogin).
+	portalWebAuthnConfig, err := portalwebauthn.NewConfig(webAuthnConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize portal WebAuthn configuration: %w", err)
+	}
+
+	return webAuthnConfig, portalWebAuthnConfig, nil
 }
 
 func (s *Server) recoverUser(username string) {
 	var id int
 	var userEmail string
 	var isActive bool
+	var offboarded bool
 	err := s.db.QueryRow(
-		`SELECT id, email, is_active FROM users WHERE username = ?`, username,
-	).Scan(&id, &userEmail, &isActive)
+		`SELECT id, email, is_active, offboarded_at IS NOT NULL FROM users WHERE username = ?`, username,
+	).Scan(&id, &userEmail, &isActive, &offboarded)
 	if err != nil {
 		slog.Error("RECOVER_USER: user not found", "username", username)
+		return
+	}
+	if offboarded {
+		// Offboarding is irreversible; the recovery tool must not resurrect
+		// an anonymized account.
+		slog.Error("RECOVER_USER: refusing to re-enable offboarded user", "username", username, "id", id)
 		return
 	}
 	if isActive {
@@ -1633,6 +2254,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 	s.listener = listener
+	s.databasePoolMonitor.Start()
 
 	// Get actual port (important for port 0)
 	tcpAddr := listener.Addr().(*net.TCPAddr) //nolint:errcheck // Type assertion is safe; net.Listen("tcp", ...) always returns *net.TCPAddr
@@ -1669,33 +2291,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.shuttingDown = true
 
 	slog.Info("starting graceful shutdown")
-
-	// Stop schedulers first - use safeClose helper to avoid panics on already-closed channels
-	safeClose := func(ch chan struct{}) {
-		if ch != nil {
-			defer func() { recover() }() //nolint:errcheck // Intentionally ignoring recover() return; used to suppress panics from closing already-closed channels
-			close(ch)
-		}
+	if s.databasePoolMonitor != nil {
+		s.databasePoolMonitor.Stop()
 	}
 
-	safeClose(s.scmSyncStopChan)
-	s.scmSyncStopChan = nil
-
-	safeClose(s.issueSyncStopChan)
-	s.issueSyncStopChan = nil
-
-	safeClose(s.magicLinkStopChan)
-	s.magicLinkStopChan = nil
-
-	if s.cleanupTicker != nil {
-		s.cleanupTicker.Stop()
-		s.cleanupTicker = nil
-	}
-	safeClose(s.cleanupStopChan)
-	s.cleanupStopChan = nil
-
-	safeClose(s.jiraHostStopChan)
-	s.jiraHostStopChan = nil
+	s.stopBackgroundLoops()
 
 	if s.notificationScheduler != nil {
 		slog.Info("stopping notification scheduler")
@@ -1717,9 +2317,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.todoistSyncScheduler.Stop()
 	}
 
+	if s.zammadSyncScheduler != nil {
+		slog.Info("stopping Zammad sync scheduler")
+		s.zammadSyncScheduler.Stop()
+	}
+
 	if s.runnerLeaseReaper != nil {
 		slog.Info("stopping runner lease reaper")
 		s.runnerLeaseReaper.Stop()
+	}
+
+	if s.globalRankMigrationScheduler != nil {
+		slog.Info("stopping global rank migration scheduler")
+		s.globalRankMigrationScheduler.Stop()
 	}
 
 	if s.codingRunService != nil {
@@ -1742,6 +2352,22 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.approvalEscalationSweeper.Stop()
 	}
 
+	if s.incidentEscalationSweeper != nil {
+		slog.Info("stopping incident escalation sweeper")
+		s.incidentEscalationSweeper.Stop()
+	}
+
+	if s.actionInactivitySweeper != nil {
+		slog.Info("stopping action inactivity sweeper")
+		s.actionInactivitySweeper.Stop()
+	}
+
+	if s.slaLoopCancel != nil {
+		slog.Info("stopping SLA due-work loop")
+		s.slaLoopCancel()
+		itemevents.ClearFactObserver()
+	}
+
 	if s.assetActionService != nil {
 		slog.Info("stopping asset action service")
 		s.assetActionService.Stop()
@@ -1757,6 +2383,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.emailTrackingRetention.Stop()
 	}
 
+	if s.portalAuthRetention != nil {
+		slog.Info("stopping portal auth retention sweeper")
+		s.portalAuthRetention.Stop()
+	}
+
+	if s.kbEventsRetention != nil {
+		slog.Info("stopping kb events retention sweeper")
+		s.kbEventsRetention.Stop()
+	}
+
 	if s.briefingScheduler != nil {
 		slog.Info("stopping briefing scheduler")
 		s.briefingScheduler.Stop()
@@ -1765,6 +2401,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.pluginScheduleScheduler != nil {
 		slog.Info("stopping plugin schedule scheduler")
 		s.pluginScheduleScheduler.Stop()
+	}
+
+	if s.standardAgentDispatcher != nil {
+		slog.Info("draining Standard agent runtime")
+		if err := s.standardAgentDispatcher.Close(ctx); err != nil {
+			slog.Warn("Standard agent runtime did not drain in time", "error", err)
+		}
 	}
 
 	if s.notificationService != nil {
@@ -1784,6 +2427,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		if err := s.httpServer.Shutdown(ctx); err != nil {
 			slog.Warn("HTTP server shutdown timed out, forcing close", "error", err)
 			_ = s.httpServer.Close()
+		}
+	}
+
+	if s.webhookSender != nil {
+		slog.Info("draining webhook dispatch queue")
+		if err := s.webhookSender.Shutdown(ctx); err != nil {
+			slog.Warn("webhook dispatch queue did not drain in time", "error", err)
+		}
+	}
+
+	if s.eventEngine != nil {
+		slog.Info("stopping domain event engine")
+		if err := s.eventEngine.Shutdown(ctx); err != nil {
+			slog.Warn("domain event engine did not stop in time", "error", err)
 		}
 	}
 
@@ -1809,9 +2466,33 @@ func isAPIPath(p string) bool {
 
 // cleanup releases all resources.
 func (s *Server) cleanup() {
+	// New also calls cleanup after a partially completed initialize. Signal any
+	// loops already started there, even when Shutdown was never reachable.
+	s.stopBackgroundLoops()
+	if s.databasePoolMonitor != nil {
+		s.databasePoolMonitor.Stop()
+	}
+	if s.eventEngine != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.eventEngine.Shutdown(ctx); err != nil {
+			slog.Warn("domain event engine cleanup did not stop in time", "error", err)
+		}
+		cancel()
+	}
+	// initialize may fail after this scheduler has started. Stop and join it
+	// before closing the database so an in-flight rank batch cannot race cleanup.
+	if s.globalRankMigrationScheduler != nil {
+		s.globalRankMigrationScheduler.Stop()
+	}
+	if s.zammadSyncScheduler != nil {
+		s.zammadSyncScheduler.Stop()
+	}
 	// Stop rate limiters
 	if s.loginRateLimiter != nil {
 		s.loginRateLimiter.Stop()
+	}
+	if s.runnerRegisterLimiter != nil {
+		s.runnerRegisterLimiter.Stop()
 	}
 	if s.fidoRateLimiter != nil {
 		s.fidoRateLimiter.Stop()
@@ -1840,6 +2521,9 @@ func (s *Server) cleanup() {
 	if s.portalAuthLimiter != nil {
 		s.portalAuthLimiter.Stop()
 	}
+	if s.oauthTokenLimiter != nil {
+		s.oauthTokenLimiter.Stop()
+	}
 	if s.aiRateLimiter != nil {
 		s.aiRateLimiter.Stop()
 	}
@@ -1854,6 +2538,9 @@ func (s *Server) cleanup() {
 	}
 	if s.calendarFeedLimiter != nil {
 		s.calendarFeedLimiter.Stop()
+	}
+	if s.publicBoardLimiter != nil {
+		s.publicBoardLimiter.Stop()
 	}
 
 	// Stop notification manager (flush cached notifications to DB)
@@ -1872,19 +2559,85 @@ func (s *Server) cleanup() {
 		_ = s.tokenTracker.Close()
 	}
 
+	// These caches are owned by this HTTP server, including on partial startup.
+	// Close them after consumers have stopped, before releasing the shared DB.
+	if s.permissionService != nil {
+		_ = s.permissionService.Close()
+	}
+	if s.sessionManager != nil {
+		_ = s.sessionManager.Close()
+	}
+	if s.tokenManager != nil {
+		_ = s.tokenManager.Close()
+	}
+	if s.scimTokenManager != nil {
+		_ = s.scimTokenManager.Close()
+	}
+	if s.itemCache != nil {
+		_ = s.itemCache.Close()
+	}
+
 	// Close database
 	if s.db != nil {
 		_ = s.db.Close()
 	}
 }
 
-// BaseURL returns the server's base URL.
-// deadcode-keep: called by core-tests/tests/helpers.go
-func (s *Server) BaseURL() string {
-	if s.actualPort == 0 {
-		return fmt.Sprintf("http://localhost:%s%s", s.config.Port, s.config.ContextPath)
+func (s *Server) stopBackgroundLoops() {
+	s.backgroundStopOnce.Do(func() {
+		s.issueSyncLoopMu.Lock()
+		defer s.issueSyncLoopMu.Unlock()
+		if s.issueSyncLoopStop != nil {
+			close(s.issueSyncLoopStop)
+			s.issueSyncLoopStop = nil
+		}
+		// Do not nil these fields: workers read them concurrently.
+		if s.cleanupTicker != nil {
+			s.cleanupTicker.Stop()
+		}
+		for _, ch := range []chan struct{}{
+			s.scmSyncStopChan, s.issueSyncStopChan, s.magicLinkStopChan,
+			s.cleanupStopChan, s.jiraHostStopChan,
+		} {
+			if ch != nil {
+				close(ch)
+			}
+		}
+	})
+}
+
+// RegisterDatabasePool makes a process-local auxiliary SQL pool visible to
+// admin diagnostics and threshold monitoring.
+func (s *Server) RegisterDatabasePool(name string, db database.Database) error {
+	if s.databaseDiagRepo == nil {
+		return fmt.Errorf("database diagnostics are not initialized")
 	}
-	return fmt.Sprintf("http://localhost:%d%s", s.actualPort, s.config.ContextPath)
+	return s.databaseDiagRepo.RegisterPool(name, db)
+}
+
+func logDatabaseCapacityBudget(budget repository.DatabaseCapacityBudget) {
+	args := []any{
+		"component", "database_pool",
+		"event", "database_pool_capacity_budget",
+		"server_max_connections", budget.ServerMaxConnections,
+		"main_connections_per_replica", budget.MainConnectionsPerReplica,
+		"auxiliary_connections_per_replica", budget.AuxiliaryConnectionsPerReplica,
+		"connections_per_replica", budget.ConnectionsPerReplica,
+		"replica_count", budget.ReplicaCount,
+		"headroom_connections", budget.HeadroomConnections,
+		"required_connections", budget.RequiredConnections,
+		"remaining_connections", budget.RemainingConnections,
+		"utilization_percent", budget.UtilizationPercent,
+	}
+	if !budget.Safe {
+		slog.Warn("declared PostgreSQL pool budget exceeds server capacity", args...)
+		return
+	}
+	if budget.UtilizationPercent >= databasePoolBudgetWarningPercent {
+		slog.Warn("declared PostgreSQL pool budget leaves little server headroom", args...)
+		return
+	}
+	slog.Info("PostgreSQL connection capacity budget", args...)
 }
 
 // Port returns the actual port the server is listening on.
@@ -1954,7 +2707,10 @@ func (s *Server) runSCMRepoSync(scmSyncService *scm.SyncService) {
 		select {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-			if err := scmSyncService.SyncAllRepositories(ctx); err != nil {
+			started := time.Now()
+			err := scmSyncService.SyncAllRepositories(ctx)
+			s.metrics.ObserveSCMPoll("repository_sync", time.Since(started), err)
+			if err != nil {
 				slog.Error("SCM sync error", "error", err)
 			}
 			cancel()
@@ -1977,7 +2733,10 @@ func (s *Server) runSCMLinkRefresh(scmSyncService *scm.SyncService) {
 		select {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			if err := scmSyncService.RefreshAllPRLinkStates(ctx); err != nil {
+			started := time.Now()
+			err := scmSyncService.RefreshAllPRLinkStates(ctx)
+			s.metrics.ObserveSCMPoll("pull_request_refresh", time.Since(started), err)
+			if err != nil {
 				slog.Error("PR state refresh error", "error", err)
 			}
 			cancel()
@@ -1988,19 +2747,22 @@ func (s *Server) runSCMLinkRefresh(scmSyncService *scm.SyncService) {
 	}
 }
 
-// runSCMOAuthStateCleanup periodically deletes expired rows from
-// scm_oauth_state. Postgres has a stored function defined for this but
-// nothing in the code or schema schedules it; SQLite has a probabilistic
-// AFTER INSERT trigger that fires on ~1% of inserts. A unified Go-side
-// periodic covers both backends and bounds table growth on Postgres.
+// runSCMOAuthStateCleanup expires OAuth state and restores reconnecting email
+// channels across both database backends.
 func (s *Server) runSCMOAuthStateCleanup() {
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	slog.Info("SCM OAuth state cleanup scheduler started (1-hour interval)")
+	slog.Info("OAuth state cleanup scheduler started (1-minute interval)")
 	for {
 		select {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := s.restoreExpiredEmailOAuthChannels(ctx); err != nil {
+				slog.Error("expired email OAuth channel restore failed", slog.Any("error", err))
+			}
+			if _, err := s.db.ExecWriteContext(ctx, `DELETE FROM email_oauth_state WHERE expires_at < CURRENT_TIMESTAMP`); err != nil {
+				slog.Error("email_oauth_state cleanup failed", slog.Any("error", err))
+			}
 			res, err := s.db.ExecWriteContext(ctx, `DELETE FROM scm_oauth_state WHERE expires_at < CURRENT_TIMESTAMP`)
 			cancel()
 			if err != nil {
@@ -2011,14 +2773,101 @@ func (s *Server) runSCMOAuthStateCleanup() {
 				slog.Debug("scm_oauth_state cleanup", slog.Int64("deleted", n))
 			}
 		case <-s.scmSyncStopChan:
-			slog.Info("SCM OAuth state cleanup scheduler stopped")
+			slog.Info("OAuth state cleanup scheduler stopped")
 			return
 		}
 	}
 }
 
-// runIssueSync runs periodic GitHub Issue synchronization.
-func (s *Server) runIssueSync(issueSyncService *scm.IssueSyncService) {
+// restoreExpiredEmailOAuthChannels restores only currently ingestion-ready channels.
+func (s *Server) restoreExpiredEmailOAuthChannels(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT channel_id
+		FROM email_oauth_state
+		WHERE expires_at < CURRENT_TIMESTAMP
+		  AND restore_channel_enabled = true
+		  AND channel_id IS NOT NULL
+	`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var channelIDs []int
+	for rows.Next() {
+		var channelID int
+		if err := rows.Scan(&channelID); err != nil {
+			return err
+		}
+		channelIDs = append(channelIDs, channelID)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, channelID := range channelIDs {
+		channel, err := s.channelService.GetByID(ctx, channelID)
+		if errors.Is(err, repository.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		configJSON, err := s.channelService.GetConfig(ctx, channelID)
+		if err != nil {
+			return err
+		}
+		var channelConfig models.ChannelConfig
+		if err := json.Unmarshal([]byte(configJSON), &channelConfig); err != nil {
+			slog.Warn("invalid email config while restoring expired OAuth state", "channel_id", channelID, "error", err)
+			continue
+		}
+		if err := email.ValidateConfigForEnable(channel, &channelConfig); err != nil {
+			slog.Warn("expired OAuth left email channel disabled because config is not ready", "channel_id", channelID, "error", err)
+			continue
+		}
+		updated, err := s.channelService.SetStatusIfConfigUnchanged(ctx, channelID, "enabled", configJSON)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			slog.Warn("email config changed during expired OAuth restoration; leaving disabled", "channel_id", channelID)
+		}
+	}
+	return nil
+}
+
+func (s *Server) refreshIssueSyncLoop(issueSyncService *scm.IssueSyncService) {
+	s.issueSyncLoopMu.Lock()
+	defer s.issueSyncLoopMu.Unlock()
+	select {
+	case <-s.issueSyncStopChan:
+		return
+	default:
+	}
+
+	enabled, err := issueSyncService.HasEnabledSyncConfig(context.Background())
+	if err != nil {
+		slog.Error("failed to check issue sync configuration", "error", err)
+		return
+	}
+	if !enabled {
+		if s.issueSyncLoopStop != nil {
+			close(s.issueSyncLoopStop)
+			s.issueSyncLoopStop = nil
+		}
+		return
+	}
+	if s.issueSyncLoopStop != nil {
+		return
+	}
+
+	s.issueSyncLoopStop = make(chan struct{})
+	go s.runIssueSync(issueSyncService, s.issueSyncLoopStop)
+}
+
+// runIssueSync runs periodic GitHub Issue synchronization while enabled.
+func (s *Server) runIssueSync(issueSyncService *scm.IssueSyncService, stop <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	slog.Info("Issue sync scheduler started (5-minute interval)")
@@ -2026,10 +2875,16 @@ func (s *Server) runIssueSync(issueSyncService *scm.IssueSyncService) {
 		select {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			if err := issueSyncService.SyncAll(ctx); err != nil {
+			started := time.Now()
+			err := issueSyncService.SyncAll(ctx)
+			s.metrics.ObserveSCMPoll("issue_sync", time.Since(started), err)
+			if err != nil {
 				slog.Error("Issue sync error", "error", err)
 			}
 			cancel()
+		case <-stop:
+			slog.Info("Issue sync scheduler stopped because no sync configs are enabled")
+			return
 		case <-s.issueSyncStopChan:
 			slog.Info("Issue sync scheduler stopped")
 			return
@@ -2037,22 +2892,12 @@ func (s *Server) runIssueSync(issueSyncService *scm.IssueSyncService) {
 	}
 }
 
-// scmCredsAdapter wraps scm.CredentialResolver into the interfaces the
-// coding-agent services expect, so the services layer doesn't have to
-// import scm directly (which would create a cycle).
+// scmCredsAdapter avoids a services-to-scm import cycle.
 type scmCredsAdapter struct {
 	cr *scm.CredentialResolver
 }
 
-// ResolveForRun implements services.SCMCredentialResolver — used by
-// BindingService to embed an access token in the remote URL at run-start
-// time so both `git fetch` and the agent's `git push` authenticate
-// transparently. Resolution order matches what the scm.Provider would
-// pick for HTTP traffic: OAuth access token → personal access token →
-// GitHub App installation token (minted on demand via the App's JWT
-// flow). Works for GitHub OAuth, GitHub PAT, GitHub App, Gitea OAuth,
-// and Gitea PAT identically; the URL form `oauth2:<token>@host/...` is
-// provider-agnostic on the git side.
+// ResolveForRun resolves SCM credentials for run-start Git authentication.
 func (a *scmCredsAdapter) ResolveForRun(ctx context.Context, connectionID int) (token, providerType, baseURL string, err error) {
 	creds, err := a.cr.GetCredentialsByConnectionID(ctx, connectionID)
 	if err != nil {
@@ -2061,15 +2906,8 @@ func (a *scmCredsAdapter) ResolveForRun(ctx context.Context, connectionID int) (
 	return a.tokenFromCreds(ctx, connectionID, creds)
 }
 
-// ResolveForRunAsUser implements the user-principal variant of
-// services.SCMCredentialResolver (WI-275): credentials are resolved with
-// scm.CredentialResolver.GetCredentialsForUser, so an OAuth-method
-// connection yields the triggering user's personal token — or fails with
-// services.ErrTriggerUserSCMNotConnected in the chain when the user has
-// not connected an account (deliberately no fallback to the workspace
-// credential). PAT and GitHub App connections resolve identically to
-// ResolveForRun because GetCredentialsForUser falls back to the
-// impersonal connection-level credential for those auth methods.
+// ResolveForRunAsUser requires a triggering user's OAuth token while retaining
+// PAT and GitHub App connection-level resolution.
 func (a *scmCredsAdapter) ResolveForRunAsUser(ctx context.Context, connectionID, userID int) (token, providerType, baseURL string, err error) {
 	creds, err := a.cr.GetCredentialsForUser(ctx, connectionID, userID)
 	if err != nil {
@@ -2081,10 +2919,7 @@ func (a *scmCredsAdapter) ResolveForRunAsUser(ctx context.Context, connectionID,
 	return a.tokenFromCreds(ctx, connectionID, creds)
 }
 
-// tokenFromCreds picks the git-auth token out of resolved credentials.
-// Resolution order matches what the scm.Provider would pick for HTTP
-// traffic: OAuth access token → personal access token → GitHub App
-// installation token (minted on demand via the App's JWT flow).
+// tokenFromCreds selects OAuth, PAT, then GitHub App credentials.
 func (a *scmCredsAdapter) tokenFromCreds(ctx context.Context, connectionID int, creds *scm.ProviderCredentials) (token, providerType, baseURL string, err error) {
 	switch {
 	case creds.OAuthAccessToken != "":
@@ -2092,12 +2927,7 @@ func (a *scmCredsAdapter) tokenFromCreds(ctx context.Context, connectionID int, 
 	case creds.PersonalAccessToken != "":
 		token = creds.PersonalAccessToken
 	case creds.GitHubAppID != "" && creds.GitHubAppPrivateKey != "" && creds.GitHubAppInstallationID != "":
-		// GitHub App-backed connection: mint a short-lived installation
-		// access token via the App JWT flow. scm.GitHubProvider does
-		// the cryptography; we just feed it the provider config and ask
-		// for a token. Note: installation tokens expire after ~1h; the
-		// per-run lifetime is well within that, so we don't bother
-		// caching or refreshing.
+		// Per-run GitHub App tokens need no cache or refresh.
 		t, terr := a.mintGitHubAppToken(ctx, creds)
 		if terr != nil {
 			return "", "", "", fmt.Errorf("mint GitHub App installation token: %w", terr)
@@ -2189,16 +3019,7 @@ func openPRViaCredentialResolver(cr *scm.CredentialResolver) services.OpenPRFn {
 		if err != nil {
 			return nil, fmt.Errorf("resolve connection %d: %w", req.ConnectionID, err)
 		}
-		provider, err := scm.NewProvider(scm.ProviderConfig{
-			ProviderType:        creds.ProviderType,
-			AuthMethod:          creds.AuthMethod,
-			BaseURL:             creds.BaseURL,
-			OAuthAccessToken:    creds.OAuthAccessToken,
-			OAuthRefreshToken:   creds.OAuthRefreshToken,
-			PersonalAccessToken: creds.PersonalAccessToken,
-			OAuthClientID:       creds.OAuthClientID,
-			OAuthClientSecret:   creds.OAuthClientSecret,
-		})
+		provider, err := cr.CreateProvider(creds)
 		if err != nil {
 			return nil, fmt.Errorf("build provider: %w", err)
 		}
@@ -2244,16 +3065,7 @@ func commentPRViaCredentialResolver(cr *scm.CredentialResolver) services.Comment
 		if err != nil {
 			return fmt.Errorf("resolve connection %d: %w", req.ConnectionID, err)
 		}
-		provider, err := scm.NewProvider(scm.ProviderConfig{
-			ProviderType:        creds.ProviderType,
-			AuthMethod:          creds.AuthMethod,
-			BaseURL:             creds.BaseURL,
-			OAuthAccessToken:    creds.OAuthAccessToken,
-			OAuthRefreshToken:   creds.OAuthRefreshToken,
-			PersonalAccessToken: creds.PersonalAccessToken,
-			OAuthClientID:       creds.OAuthClientID,
-			OAuthClientSecret:   creds.OAuthClientSecret,
-		})
+		provider, err := cr.CreateProvider(creds)
 		if err != nil {
 			return fmt.Errorf("build provider: %w", err)
 		}
@@ -2277,74 +3089,72 @@ type itemPRContinuationResolver struct {
 }
 
 func (r *itemPRContinuationResolver) ContinuationForItem(ctx context.Context, itemID int) (*services.ContinuationTarget, error) {
-	var externalID, repoName string
-	var connectionID int
-	err := r.db.QueryRowContext(ctx, `
+	return r.ContinuationForItemAsUser(ctx, itemID, 0, nil)
+}
+
+func (r *itemPRContinuationResolver) ContinuationForItemAsUser(ctx context.Context, itemID, userID int, allowedRepoSlugs []string) (*services.ContinuationTarget, error) {
+	rows, err := r.db.QueryContext(ctx, `
 		SELECT l.external_id, wr.repository_name, wr.workspace_scm_connection_id
 		FROM item_scm_links l
 		JOIN workspace_repositories wr ON l.workspace_repository_id = wr.id
 		WHERE l.item_id = ? AND l.link_type = 'pull_request' AND lower(l.state) = 'open'
 		ORDER BY l.updated_at DESC
-		LIMIT 1
-	`, itemID).Scan(&externalID, &repoName, &connectionID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil // no open PR — caller starts a fresh run
-	}
+	`, itemID)
 	if err != nil {
-		return nil, fmt.Errorf("query open PR link: %w", err)
+		return nil, fmt.Errorf("query open PR links: %w", err)
 	}
-	number, err := strconv.Atoi(externalID)
-	if err != nil {
-		return nil, fmt.Errorf("PR link external_id %q is not a number: %w", externalID, err)
+	defer func() { _ = rows.Close() }()
+	allowed := make(map[string]bool, len(allowedRepoSlugs))
+	for _, slug := range allowedRepoSlugs {
+		allowed[slug] = true
 	}
-	owner, repo, ok := strings.Cut(repoName, "/")
-	if !ok || owner == "" || repo == "" {
-		return nil, fmt.Errorf("repository_name %q is not owner/repo", repoName)
+	for rows.Next() {
+		var externalID, repoName string
+		var connectionID int
+		if err := rows.Scan(&externalID, &repoName, &connectionID); err != nil {
+			return nil, err
+		}
+		if len(allowed) > 0 && !allowed[repoName] {
+			continue
+		}
+		number, err := strconv.Atoi(externalID)
+		if err != nil {
+			continue
+		}
+		owner, repo, ok := strings.Cut(repoName, "/")
+		if !ok || owner == "" || repo == "" {
+			continue
+		}
+		var creds *scm.ProviderCredentials
+		if userID > 0 {
+			creds, err = r.cr.GetCredentialsForUser(ctx, connectionID, userID)
+		} else {
+			creds, err = r.cr.GetCredentialsByConnectionID(ctx, connectionID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve connection %d: %w", connectionID, err)
+		}
+		provider, err := r.cr.CreateProvider(creds)
+		if err != nil {
+			return nil, fmt.Errorf("build provider: %w", err)
+		}
+		pr, err := provider.GetPullRequest(ctx, owner, repo, number)
+		if err != nil {
+			return nil, fmt.Errorf("get PR %s/%s#%d: %w", owner, repo, number, err)
+		}
+		if pr.IsMerged || strings.EqualFold(pr.State, "closed") || pr.HeadBranch == "" {
+			continue
+		}
+		return &services.ContinuationTarget{PRNumber: number, RepoSlug: repoName, HeadBranch: pr.HeadBranch}, nil
 	}
-	creds, err := r.cr.GetCredentialsByConnectionID(ctx, connectionID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve connection %d: %w", connectionID, err)
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	provider, err := scm.NewProvider(scm.ProviderConfig{
-		ProviderType:        creds.ProviderType,
-		AuthMethod:          creds.AuthMethod,
-		BaseURL:             creds.BaseURL,
-		OAuthAccessToken:    creds.OAuthAccessToken,
-		OAuthRefreshToken:   creds.OAuthRefreshToken,
-		PersonalAccessToken: creds.PersonalAccessToken,
-		OAuthClientID:       creds.OAuthClientID,
-		OAuthClientSecret:   creds.OAuthClientSecret,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("build provider: %w", err)
-	}
-	pr, err := provider.GetPullRequest(ctx, owner, repo, number)
-	if err != nil {
-		return nil, fmt.Errorf("get PR %s/%s#%d: %w", owner, repo, number, err)
-	}
-	// The link said open but the provider is authoritative: a since-closed/merged
-	// PR is not continuable, and an empty head branch can't be checked out.
-	if pr.IsMerged || strings.EqualFold(pr.State, "closed") || pr.HeadBranch == "" {
-		return nil, nil
-	}
-	return &services.ContinuationTarget{
-		PRNumber:   number,
-		RepoSlug:   repoName,
-		HeadBranch: pr.HeadBranch,
-	}, nil
+	return nil, nil
 }
 
-// bootCodingAgentRunService builds the orchestration-only WI-89 + WI-90
-// RunService when cfg.CodingAgent.Enabled is set: initialPrompt is the static
-// coding-agent operational prompt the remote runner hands the agent as its
-// first message (per-binding suffixes append to it); the per-run token minter and
-// the post-run hook that opens a draft PR (via either GitHub or Gitea,
-// transparently) and writes back an item_scm_links row. The service queues
-// runs, enriches remote claims (PrepareRemoteClaim), and finalizes remote
-// results (FinalizeRemote) — but runs no in-process worker pool, so no agent
-// executes on the orchestrator host. All runs are dispatched to remote runner
-// pools (windshift-runner). Returns an error for any misconfig so the rest of
-// the server still comes up with the harness disabled.
+// bootCodingAgentRunService configures token minting, PR hooks, and remote-run
+// orchestration without an in-process worker. Errors leave the harness disabled.
 func bootCodingAgentRunService(
 	db database.Database,
 	tm *auth.TokenManager,
@@ -2357,10 +3167,7 @@ func bootCodingAgentRunService(
 		return nil, fmt.Errorf("coding-agent token service: %w", err)
 	}
 
-	// PR-creation post-run hook. cr is the same CredentialResolver
-	// BindingService uses for URL embedding; binding lookups go through
-	// the shared bindings repo so the hook sees the exact row the
-	// trigger fired on. It fires for remote runs via FinalizeRemote.
+	// The post-run hook shares binding and SCM resolution with run startup.
 	prSvc, err := services.NewAgentPRService(services.AgentPRServiceOptions{
 		Bindings:  bindings,
 		OpenPR:    openPRViaCredentialResolver(cr),
@@ -2372,12 +3179,7 @@ func bootCodingAgentRunService(
 	}
 
 	runRepo := repository.NewAgentRunRepository(db)
-	// Boot reconciliation (WI-332): local runs exist only in a previous
-	// process's in-memory queue, so any local run still queued/running in the
-	// DB was orphaned by a crash or kill and no worker will ever pick it up
-	// again. Fail them before the new service starts accepting work. (With the
-	// in-process loop removed, no new local runs are created — this only clears
-	// rows left over from an older build.)
+	// Fail queued local runs orphaned by a previous in-process worker.
 	if n, recErr := runRepo.ReapOrphanedLocalRuns(context.Background(), time.Now().UTC()); recErr != nil {
 		slog.Warn("coding-agent: reconcile orphaned local runs",
 			slog.String("component", "coding-agent"),
@@ -2389,7 +3191,6 @@ func bootCodingAgentRunService(
 			slog.Int("count", n),
 		)
 	}
-	// Orchestration-only: no Runner, so NewRunService starts no worker pool.
 	runSvc, err := services.NewRunService(runRepo, services.RunServiceOptions{
 		Tokens:        tokens,
 		PostRunHook:   prSvc,

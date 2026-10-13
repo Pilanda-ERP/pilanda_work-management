@@ -1,6 +1,74 @@
 import { api } from '../../api.js';
 
 /**
+ * Builds the PATCH payload for associating a collection with a workspace.
+ * Association is not publishing, so public-sharing fields are intentionally
+ * omitted: an owner without public_board.manage must still be able to move the
+ * collection. A workspace association also clears any category, which is only
+ * valid for global collections.
+ */
+export function buildCollectionAssociationUpdate({
+  collection,
+  qlQuery,
+  filterState,
+  workspaceId,
+}) {
+  return {
+    name: collection.name,
+    description: collection.description || null,
+    ql_query: qlQuery,
+    filter_state: filterState,
+    workspace_id: workspaceId ?? null,
+    category_id: workspaceId ? null : (collection.category_id ?? null),
+    is_private: collection.is_private ?? false,
+  };
+}
+
+/**
+ * Collection-specific list-column configuration is owned by the collection
+ * creator; workspace-default configuration is owned by workspace admins. The
+ * API enforces the same split, so a collection owner without workspace.admin
+ * must still be able to configure their collection's columns.
+ */
+export function canConfigureListColumns({
+  collectionId,
+  collectionOwnerId,
+  currentUserId,
+  canAdminWorkspace,
+}) {
+  if (collectionId) {
+    return (
+      collectionOwnerId != null &&
+      currentUserId != null &&
+      String(collectionOwnerId) === String(currentUserId)
+    );
+  }
+  return Boolean(canAdminWorkspace);
+}
+
+function collectionPagination(pagination) {
+  if (!pagination) return null;
+  // Store continuations use limit; v2 responses name the effective size page_size.
+  return { ...pagination, limit: pagination.page_size };
+}
+
+// Use the authorized item query without view filters, fetching only one summary.
+export async function fetchCollectionTotal(workspaceId, collectionId) {
+  const scope = collectionId ? { collection_id: collectionId } : { workspace_id: workspaceId };
+  const response = await api.items.getAll({
+    ...scope,
+    page: 1,
+    limit: 1,
+    omit_descriptions: true,
+    include_watermark: true,
+  });
+  return {
+    total: response?.pagination?.total_items ?? null,
+    watermark: response?.meta?.watermark ?? 0,
+  };
+}
+
+/**
  * Fetches items for a collection (or all workspace items if no collection).
  * Handles QL query resolution and correct API parameter naming.
  * @param {string|number} workspaceId
@@ -22,6 +90,7 @@ export async function fetchCollectionItems(
   // markdown/TipTap descriptions for every loaded item; item detail fetches
   // still retrieve the full description on demand.
   filters.omit_descriptions = true;
+  filters.include_watermark = true;
 
   if (collectionId) {
     // Reuse a collection the caller already fetched this load cycle (one board
@@ -40,13 +109,14 @@ export async function fetchCollectionItems(
   }
 
   const response = await api.items.getAll(filters);
-  const items = response?.items ?? (Array.isArray(response) ? response : []);
-  const pagination = response?.pagination ?? null;
-  const sortableFields = response?.sortable_fields ?? [];
+  const items = response?.data ?? [];
+  const pagination = collectionPagination(response?.pagination);
+  const sortableFields = response?.meta?.sortable_fields ?? [];
+  const watermark = response?.meta?.watermark ?? 0;
 
   const publicSlug =
     collection?.is_public && collection?.public_slug ? collection.public_slug : null;
-  return { items, collectionName, pagination, sortableFields, publicSlug };
+  return { items, collectionName, pagination, sortableFields, publicSlug, watermark };
 }
 
 /**
@@ -75,10 +145,12 @@ export async function fetchCollectionBacklog(
     limit,
     sub_ql,
     omit_descriptions: true,
+    include_watermark: true,
   });
-  const items = response?.items ?? (Array.isArray(response) ? response : []);
-  const pagination = response?.pagination ?? null;
-  return { items, collectionName, pagination };
+  const items = response?.data ?? [];
+  const pagination = collectionPagination(response?.pagination);
+  const watermark = response?.meta?.watermark ?? 0;
+  return { items, collectionName, pagination, watermark };
 }
 
 /**
@@ -141,7 +213,7 @@ export async function checkItemVisibility(itemId, filters) {
     const response = await api.items.getAll(filtersWithId);
 
     // Handle paginated response
-    const items = response?.items || response || [];
+    const items = response?.data ?? [];
 
     // Check if the item is in the results
     return items.some((item) => item.id === itemId);

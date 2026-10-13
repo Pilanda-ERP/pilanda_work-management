@@ -8,16 +8,20 @@
 					icon TEXT DEFAULT 'FileText',
 					color TEXT DEFAULT '#6b7280',
 					display_order INTEGER DEFAULT 0,
-					is_active BOOLEAN DEFAULT 1,
+					is_active BOOLEAN DEFAULT TRUE,
 					config TEXT DEFAULT NULL,
 					visibility_group_ids TEXT DEFAULT NULL,
 					visibility_org_ids TEXT DEFAULT NULL,
 					workspace_id INTEGER DEFAULT NULL,
 					title_template TEXT NOT NULL DEFAULT '',
+					kind TEXT NOT NULL DEFAULT '', -- System intake role: '' for admin-created, 'email' for the per-portal system Email request type (WI-1644)
 					created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 					updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 					FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
 					FOREIGN KEY (item_type_id) REFERENCES item_types(id) ON DELETE RESTRICT,
-					FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
+					FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
 				);
 			
+
+-- migration: 0000_baseline
+-- migration: 20261015_request_types_kind

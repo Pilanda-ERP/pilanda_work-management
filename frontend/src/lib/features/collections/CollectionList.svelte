@@ -1,16 +1,18 @@
 <script>
-  import { untrack } from 'svelte';
   import { useEventListener } from 'runed';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
-  import { api } from '../../api.js';
-  import { navigate } from '../../router.js';
-  import { collectionStore, reloadCollection } from '../../stores/collectionContext.js';
+  import { applyCollectionItem, collectionStore, refreshCollectionDeltas, reloadCollection } from '../../stores/collectionContext.js';
+  import { useCollectionEventStream } from '../../composables/useCollectionEventStream.svelte.js';
   import { createDeleteItemHandler, createItemActionsBuilder } from '../../utils/workItemTableHelpers.js';
-  import { getSystemFieldName } from '../../stores/fieldConfig.js';
+  import {
+    getListColumnLabel,
+    listGridMinWidth,
+    listGridTemplateColumns,
+  } from '../../utils/workItemListColumns.js';
   import { useGradientStyles } from '../../stores/workspaceGradient.svelte.js';
   import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
-  import { workspaceDataStore } from '../../stores/index.js';
+  import { collectionEditorOptions, collectionFieldLinks, itemModalStore, workspaceDataStore } from '../../stores/index.js';
   import { MoreHorizontal, ArrowUp, ArrowDown, ArrowUpDown } from '@lucide/svelte';
   import { draggable } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
   import SearchInput from '../../components/SearchInput.svelte';
@@ -24,6 +26,8 @@
   import ColumnSelector from './ColumnSelector.svelte';
   import SubFilterBar from './SubFilterBar.svelte';
   import LazyRender from '../../components/LazyRender.svelte';
+  import { checkItemVisibility } from './collectionService.js';
+  import { useListColumnConfig } from './listColumnConfig.svelte.js';
 
   let { workspaceId, collectionId = null } = $props();
 
@@ -43,9 +47,9 @@
   let workItems = $derived(collectionStore.items);
   let itemsPagination = $derived(collectionStore.itemsPagination);
 
-  // Board configuration for list columns
-  let boardConfig = $state(null);
-  let listColumns = $state([]);
+  // List columns from the board configuration (shared with the tree view)
+  const columnConfig = useListColumnConfig(() => ({ workspaceId, collectionId }));
+  let listColumns = $derived(columnConfig.columns);
 
   let loading = $state(true);
   let loadingItems = $state(false);
@@ -70,73 +74,58 @@
     collectionStore.setSorting(sortKey, sortDirection);
   }
 
-  // Default column configuration
-  const defaultColumns = [
-    { field_identifier: 'key', field_type: 'system', display_order: 0, width: 1 },
-    { field_identifier: 'title', field_type: 'system', display_order: 1, width: 4 },
-    { field_identifier: 'status', field_type: 'system', display_order: 2, width: 2 },
-    { field_identifier: 'priority', field_type: 'system', display_order: 3, width: 2 },
-    { field_identifier: 'created_at', field_type: 'system', display_order: 4, width: 2 }
-  ];
-
   // Centralized gradient styling
   const styles = useGradientStyles();
 
-  // Computed: Check if user can edit items
-  let canEdit = $derived(workspacePermissions.canEdit(workspaceId));
-
-  // Computed: Check if user can configure columns (workspace admin)
-  let canConfigureColumns = $derived(workspacePermissions.canAdminWorkspace(workspaceId));
-
-  // Computed: Calculate total grid columns (sum of widths + 1 for actions)
-  let totalGridColumns = $derived(
-    listColumns.reduce((sum, col) => sum + col.width, 0) + 1
-  );
-
-  // Computed: Generate grid-template-columns CSS
-  // Per-column baselines (rem) — what "M" looks like today.
-  // S/L/XL scale around this so the size picker has visible effect.
-  const baseFixedWidths = {
-    status: 8,
-    priority: 7,
-    assignee: 9,
-    milestone: 12,
-    iteration: 9,
-    due_date: 7,
-    created_at: 7,
-    project: 9,
-  };
-
-  // width values: 1=S, 2=M, 3=L, 4=XL
-  const widthScale = { 1: 0.75, 2: 1, 3: 1.5, 4: 2 };
-
-  function columnTrack(col) {
-    if (col.field_identifier === 'key') return 'max-content';
-    const base = baseFixedWidths[col.field_identifier];
-    if (base !== undefined) {
-      const scale = widthScale[col.width] ?? 1;
-      return `${base * scale}rem`;
-    }
-    return `${col.width}fr`;
-  }
-
-  let gridTemplateColumns = $derived(
-    listColumns.map(columnTrack).join(' ') + ' auto'
-  );
-
-
-  useEventListener(() => window, 'refresh-work-items', () => reloadCollection());
-
-  // Board config depends only on the viewed collection/workspace, not on the
-  // item set or load state — fetch it when the view changes, not every time
-  // the collection reloads (which toggles collectionStore.loading).
-  let viewSignature = $derived(`${collectionId ?? ''}|${workspaceId ?? ''}`);
+  // A workspace-scoped list already has these option sets in the shared
+  // workspace store. Prime the row-editor cache so opening a cell does not
+  // repeat those requests. Global collections deliberately skip this: their
+  // rows can belong to different workspaces and must resolve independently.
   $effect(() => {
-    viewSignature;
-    if (collectionId || workspaceId) {
-      untrack(() => loadBoardConfiguration());
+    const id = Number(workspaceId);
+    if (
+      !Number.isInteger(id) ||
+      id <= 0 ||
+      !workspaceDataStore.initialized ||
+      Number(workspaceDataStore.workspaceId) !== id
+    ) {
+      return;
     }
+
+    collectionEditorOptions.prime(id, {
+      statuses,
+      users,
+      milestones,
+      iterations,
+      projects,
+    });
   });
+
+  // Computed: Generate grid-template-columns CSS via the shared list grid
+  // helpers (also used by the support queue's list-shaped table).
+  let gridTemplateColumns = $derived(listGridTemplateColumns(listColumns));
+
+  let gridMinWidth = $derived(listGridMinWidth(listColumns));
+
+  useEventListener(() => window, 'refresh-work-items', async (/** @type {CustomEvent} */ event) => {
+    const item = event.detail?.item;
+    if (!item) {
+      reloadCollection();
+      return;
+    }
+    const belongsToView = collectionId
+      ? await checkItemVisibility(item.id, { collection_id: collectionId })
+      : Number(item.workspace_id) === Number(workspaceId);
+    if (belongsToView) applyCollectionItem(item);
+  });
+
+  // Scoped SSE invalidations (WI-1624): any frame runs the existing delta fetch,
+  // and a reconnect reconciles. Without this the list kept showing items that
+  // were deleted from the item detail modal, unlike the board views.
+  useCollectionEventStream(
+    () => (collectionId ? { kind: 'collection', id: collectionId } : { kind: 'workspace', id: workspaceId }),
+    { onInvalidate: () => refreshCollectionDeltas() }
+  );
 
   // Sync collection name + clear local loading from the central store.
   $effect(() => {
@@ -145,104 +134,6 @@
       loading = false;
     }
   });
-
-  // Setup drag for list rows (enables drag-to-terminal)
-  let dragCleanups = [];
-  $effect(() => {
-    // Re-run when filteredItems change
-    const items = filteredItems;
-    // Clean up previous
-    dragCleanups.forEach(fn => fn());
-    dragCleanups = [];
-
-    // Wait for DOM to render
-    requestAnimationFrame(() => {
-      /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-item-row]')).forEach(element => {
-        const itemId = element.getAttribute('data-item-id');
-        const item = items.find(i => String(i.id) === itemId);
-        if (!item) return;
-
-        const cleanup = draggable({
-          element,
-          getInitialData: () => ({
-            item,
-            type: 'work-item'
-          }),
-          onDragStart: () => {
-            element.style.opacity = '0.5';
-          },
-          onDrop: () => {
-            element.style.opacity = '';
-          }
-        });
-        dragCleanups.push(cleanup);
-      });
-    });
-
-    return () => {
-      dragCleanups.forEach(fn => fn());
-      dragCleanups = [];
-    };
-  });
-
-  async function loadBoardConfiguration() {
-    try {
-      // Try to load collection-specific config, or workspace default
-      const config = await api.collections.getBoardConfiguration(collectionId, workspaceId);
-      boardConfig = config;
-      listColumns = config.list_columns && config.list_columns.length > 0
-        ? [...config.list_columns].sort((a, b) => a.display_order - b.display_order)
-        : [...defaultColumns];
-    } catch (error) {
-      boardConfig = null;
-      listColumns = [...defaultColumns];
-    }
-  }
-
-  async function saveBoardConfiguration(newColumns) {
-    try {
-      const configData = {
-        columns: boardConfig?.columns || [],
-        backlog_status_ids: boardConfig?.backlog_status_ids || [],
-        list_columns: newColumns,
-        card_fields: boardConfig?.card_fields || [],
-        roadmap_config: boardConfig?.roadmap_config || null,
-        show_rightmost_column_last_50: Boolean(boardConfig?.show_rightmost_column_last_50)
-      };
-
-      if (boardConfig?.id) {
-        // Update existing config
-        const updated = await api.collections.updateBoardConfiguration(
-          collectionId,
-          boardConfig.id,
-          configData
-        );
-        boardConfig = updated;
-        listColumns = updated.list_columns && updated.list_columns.length > 0
-          ? [...updated.list_columns].sort((a, b) => a.display_order - b.display_order)
-          : [...defaultColumns];
-      } else {
-        // Create new config - pass raw collectionId so API can detect workspace-level config
-        const created = await api.collections.createBoardConfiguration(
-          collectionId,
-          workspaceId,
-          configData
-        );
-        boardConfig = created;
-        listColumns = created.list_columns && created.list_columns.length > 0
-          ? [...created.list_columns].sort((a, b) => a.display_order - b.display_order)
-          : [...defaultColumns];
-      }
-    } catch (error) {
-      console.error('Failed to save board configuration:', error);
-      errorToast(t('dialogs.alerts.failedToSave', { error: error.message || error }));
-    }
-  }
-
-  function handleColumnChange(data) {
-    const { columns: newColumns } = data;
-    saveBoardConfiguration(newColumns);
-  }
 
   async function loadWorkItems(page = 1, limit = itemsPerPage) {
     currentPage = page;
@@ -271,13 +162,57 @@
       return false;
     });
   });
+  let filteredItemsById = $derived(new Map(filteredItems.map((item) => [item.id, item])));
+
+  // Resolve only the assignees the visible rows reference instead of waiting
+  // for the whole directory before the list can render.
+  $effect(() => {
+    const ids = filteredItems.map((item) => item.assignee_id).filter(Boolean);
+    if (ids.length > 0) void workspaceDataStore.hydrateUsers(ids);
+  });
+
+  function registerListRow(element, itemId) {
+    const cleanup = draggable({
+      element,
+      getInitialData: () => ({
+        item: filteredItemsById.get(itemId),
+        type: 'work-item'
+      }),
+      onDragStart: () => {
+        element.style.opacity = '0.5';
+      },
+      onDrop: () => {
+        element.style.opacity = '';
+      }
+    });
+    return {
+      destroy() {
+        element.style.opacity = '';
+        cleanup();
+      }
+    };
+  }
+
+  // Linking fields live in item_links rather than custom_field_values. Hydrate
+  // all visible rows through the bounded batch endpoint so adding one linking
+  // column does not issue one request per row.
+  $effect(() => {
+    const linkingFieldIds = new Set(
+      customFieldDefinitions
+        .filter((field) => field.field_type === 'linking')
+        .map((field) => String(field.id)),
+    );
+    const hasLinkingColumn = listColumns.some(
+      (column) =>
+        column.field_type === 'custom' && linkingFieldIds.has(String(column.field_identifier)),
+    );
+    if (hasLinkingColumn) {
+      collectionFieldLinks.loadForItems(filteredItems.map((item) => item.id));
+    }
+  });
 
   function viewItem(item) {
-    const wsId = workspaceId || item.workspace_id;
-    const url = collectionId && workspaceId
-      ? `/workspaces/${workspaceId}/collections/${collectionId}/items/${item.id}`
-      : `/workspaces/${wsId}/items/${item.id}`;
-    navigate(url);
+    itemModalStore.open(item.id, item.workspace_id ?? workspaceId);
   }
 
   const deleteItem = createDeleteItemHandler({
@@ -287,9 +222,8 @@
 
   const buildItemActions = createItemActionsBuilder({ viewItem, deleteItem });
 
-  // Handle inline editing events — reload from server to get fresh data
   function handleItemUpdated(data) {
-    reloadCollection();
+    applyCollectionItem(data.item);
   }
 
   function handleUpdateError(data) {
@@ -298,15 +232,6 @@
     errorToast(t('dialogs.alerts.failedToUpdate', { error: `${field}: ${error}` }));
   }
 
-
-  // Get column header name
-  function getColumnHeaderName(column) {
-    if (column.field_type === 'system') {
-      return getSystemFieldName(column.field_identifier);
-    }
-    const customField = customFieldDefinitions.find(f => String(f.id) === column.field_identifier);
-    return customField?.name || column.field_identifier;
-  }
 
 </script>
 
@@ -326,7 +251,8 @@
           workspaceName={workspace?.name || ''}
           collection={currentCollectionName}
           viewName="List"
-          itemCount={itemsPagination?.total ?? workItems.length}
+          itemCount={collectionStore.collectionTotal}
+          shownCount={collectionStore.loading ? null : filteredItems.length}
         />
       </div>
 
@@ -346,8 +272,8 @@
           <ColumnSelector
             columns={listColumns}
             {customFieldDefinitions}
-            canConfigure={canConfigureColumns}
-            onchange={handleColumnChange}
+            canConfigure={columnConfig.canConfigure}
+            onchange={({ columns }) => columnConfig.save(columns)}
           />
         </div>
       </div>
@@ -370,29 +296,31 @@
           />
         {/if}
       {:else}
-        <div class="rounded-xl border shadow-sm overflow-hidden" style="{styles.tableStyle(12)} border-color: var(--ctx-border, var(--ds-border));">
+        <div class="rounded-xl border shadow-sm overflow-x-auto" style="{styles.tableStyle(12)} border-color: var(--ctx-border, var(--ds-border));">
           <!-- Table Header -->
           <TableHeaderBar
             columns={gridTemplateColumns}
+            minWidth={gridMinWidth}
             style={styles.tableHeaderStyle}
           >
             {#each listColumns as column (column.field_identifier)}
               {#if sortableFields.has(column.field_identifier)}
                 <button
+                  data-testid={`list-sort-${column.field_identifier}`}
                   class="group inline-flex items-center gap-1 cursor-pointer select-none"
                   onclick={() => toggleSort(column.field_identifier)}
                 >
-                  {getColumnHeaderName(column)}
+                  {getListColumnLabel(column, customFieldDefinitions)}
                   {#if sortKey === column.field_identifier && sortDirection === 'asc'}
                     <ArrowUp class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" />
                   {:else if sortKey === column.field_identifier && sortDirection === 'desc'}
                     <ArrowDown class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" />
                   {:else}
-                    <ArrowUpDown class="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 transition-opacity" style="color: var(--ds-text-subtlest);" />
+                    <ArrowUpDown class="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity" style="color: var(--ds-text-subtlest);" />
                   {/if}
                 </button>
               {:else}
-                <div>{getColumnHeaderName(column)}</div>
+                <div>{getListColumnLabel(column, customFieldDefinitions)}</div>
               {/if}
             {/each}
             <div>{t('common.actions')}</div>
@@ -401,21 +329,20 @@
           <!-- Table Body -->
           <div>
             {#each filteredItems as item (item.id)}
-              <div class="px-4 py-3 list-row transition-colors" style="border-top: 1px solid var(--ds-border);" data-item-row data-item-id={item.id}>
+              <div use:registerListRow={item.id} class="px-4 py-3 list-row transition-colors" style="border-top: 1px solid var(--ds-border);" data-item-row data-item-id={item.id} data-testid={`workspace-item-row-${item.id}`}>
                 <LazyRender>
                   {#snippet children()}
                     <div
                       class="grid gap-4 items-center"
-                      style="grid-template-columns: {gridTemplateColumns};"
+                      style="grid-template-columns: {gridTemplateColumns}; min-width: {gridMinWidth};"
                     >
                       {#each listColumns as column (column.field_identifier)}
-                        <div class="min-w-0">
+                        <div class="min-w-0 overflow-hidden">
                           <ListCellRenderer
                             {item}
                             {column}
                             {workspace}
-                            {collectionId}
-                            {canEdit}
+                            canEdit={workspacePermissions.canEdit(item.workspace_id)}
                             {statuses}
                             {statusCategories}
                             {priorities}
@@ -449,11 +376,11 @@
         </div>
 
         <!-- Pagination -->
-        {#if itemsPagination && itemsPagination.total > 0 && workItems.length > 0}
+        {#if itemsPagination && itemsPagination.total_items > 0 && workItems.length > 0}
           <div class="mt-6">
             <Pagination
               currentPage={itemsPagination.page}
-              totalItems={itemsPagination.total}
+              totalItems={itemsPagination.total_items}
               itemsPerPage={itemsPagination.limit}
               maxItems={10000}
               onpageChange={handlePageChange}

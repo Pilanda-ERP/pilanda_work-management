@@ -17,6 +17,7 @@ import (
 	"windshift/internal/auth"
 	"windshift/internal/database"
 	"windshift/internal/fileserve"
+	"windshift/internal/itemevents"
 	"windshift/internal/middleware"
 	"windshift/internal/models"
 	"windshift/internal/repository"
@@ -44,9 +45,45 @@ type PortalHandler struct {
 	portalSessionManager *auth.PortalSessionManager
 	ipExtractor          *utils.IPExtractor
 	portalService        *services.PortalService
+	portalAuthRepo       *repository.PortalAuthRepository
 	approvalService      *services.ApprovalService
 	draftRepo            *repository.PortalDraftRepository
 	attachmentPath       string
+	attachments          *services.ItemAttachmentService
+	eventCoordinator     *services.EventCoordinator
+	publication          *services.KnowledgePublicationService
+	kbSignals            *services.KBSignalService
+	channelService       *services.ChannelService
+}
+
+// SetKnowledgePublicationService wires the resolver for workspace pages
+// published through portal knowledge bases.
+func (h *PortalHandler) SetKnowledgePublicationService(s *services.KnowledgePublicationService) {
+	h.publication = s
+}
+
+// SetKBSignalService wires the knowledge-base usage-signal recorder. Optional
+// — when unset the KB endpoints serve normally but record no events.
+func (h *PortalHandler) SetKBSignalService(s *services.KBSignalService) {
+	h.kbSignals = s
+}
+
+// portalKBPageLinkResolver maps page:<id> anchors in portal-visible HTML to
+// in-portal article URLs. Only pages published through this portal's KB
+// wiring resolve; everything else returns false so the anchor is stripped to
+// plain text and the portal never renders a dead link or leaks the existence
+// of an unpublished/restricted page. Links carry source=ticket so the view
+// signal attributes them to the assisted (ticket) context.
+func (h *PortalHandler) portalKBPageLinkResolver(config models.ChannelConfig) func(pageID int) (string, bool) {
+	return func(pageID int) (string, bool) {
+		if h.publication == nil || len(config.KnowledgeBasePageSources) == 0 {
+			return "", false
+		}
+		if _, err := h.publication.PublishedPageForPortal(config, pageID); err != nil {
+			return "", false
+		}
+		return fmt.Sprintf("/portal/%s/kb/%d?source=ticket", config.PortalSlug, pageID), true
+	}
 }
 
 // SetApprovalService wires the approval service so portal customers can
@@ -56,8 +93,28 @@ func (h *PortalHandler) SetApprovalService(s *services.ApprovalService) {
 	h.approvalService = s
 }
 
+// SetCommentService wires the application comment service so portal replies
+// notify staff and dispatch webhooks through the standard pipeline.
+func (h *PortalHandler) SetCommentService(cs *services.CommentService) {
+	h.portalService.SetCommentService(cs)
+}
+
+// SetEventCoordinator wires the shared item-created side-effect pipeline.
+func (h *PortalHandler) SetEventCoordinator(ec *services.EventCoordinator) {
+	h.eventCoordinator = ec
+}
+
+// SetChannelService wires channel-manager lookups so the portal snapshot can
+// report whether the viewer may customize this portal.
+func (h *PortalHandler) SetChannelService(s *services.ChannelService) {
+	h.channelService = s
+}
+
 // getClientIP extracts the client IP with proxy validation
 func (h *PortalHandler) getClientIP(r *http.Request) string {
+	if h.ipExtractor == nil {
+		return r.RemoteAddr
+	}
 	return h.ipExtractor.GetClientIP(r)
 }
 
@@ -65,7 +122,7 @@ func (h *PortalHandler) getClientIP(r *http.Request) string {
 // 1. A direct portal customer session (magic link auth)
 // 2. An internal user session with a linked portal customer (backward compatible)
 // Returns the portal customer ID and an error if authentication fails
-func (h *PortalHandler) getPortalCustomerID(ctx context.Context, r *http.Request) (*int, error) {
+func (h *PortalHandler) getPortalCustomerID(ctx context.Context, r *http.Request, channelID int) (*int, error) {
 	clientIP := h.getClientIP(r)
 
 	// First, try portal customer session (direct magic link auth)
@@ -73,7 +130,7 @@ func (h *PortalHandler) getPortalCustomerID(ctx context.Context, r *http.Request
 		portalToken, err := h.portalSessionManager.GetPortalSessionFromRequest(r)
 		if err == nil && portalToken != "" {
 			portalSession, err := h.portalSessionManager.ValidatePortalSession(portalToken, clientIP)
-			if err == nil && portalSession != nil {
+			if err == nil && portalSession != nil && portalSession.ChannelID != nil && *portalSession.ChannelID == channelID {
 				slog.Debug("portal customer authenticated via portal session", slog.String("component", "portal"), slog.Int("portal_customer_id", portalSession.PortalCustomerID))
 				return &portalSession.PortalCustomerID, nil
 			}
@@ -86,7 +143,7 @@ func (h *PortalHandler) getPortalCustomerID(ctx context.Context, r *http.Request
 		return nil, fmt.Errorf("authentication required")
 	}
 
-	session, err := h.sessionManager.ValidateSession(sessionToken, clientIP)
+	session, err := h.sessionManager.ValidateSessionContext(r.Context(), sessionToken, clientIP)
 	if err != nil || session == nil {
 		return nil, fmt.Errorf("invalid or expired session")
 	}
@@ -108,19 +165,18 @@ func (h *PortalHandler) getPortalCustomerID(ctx context.Context, r *http.Request
 // getInternalUserGroupIDs returns the group IDs for an internal user
 // Returns nil if not an internal user or if no groups found
 func (h *PortalHandler) getInternalUserGroupIDs(ctx context.Context, r *http.Request) []int {
-	clientIP := h.getClientIP(r)
-	sessionToken, err := h.sessionManager.GetSessionFromRequest(r)
-	if err != nil {
-		return nil
-	}
-
-	session, err := h.sessionManager.ValidateSession(sessionToken, clientIP)
-	if err != nil || session == nil {
+	session := h.internalSessionFromRequest(r)
+	if session == nil {
 		return nil
 	}
 
 	// Get user's group memberships
-	rows, err := h.db.QueryContext(ctx, `SELECT group_id FROM group_members WHERE user_id = ?`, session.UserID)
+	rows, err := h.db.QueryContext(ctx, `
+		SELECT gm.group_id
+		FROM group_members gm
+		JOIN groups g ON g.id = gm.group_id
+		WHERE gm.user_id = ? AND g.is_active = true
+	`, session.UserID)
 	if err != nil {
 		return nil
 	}
@@ -138,6 +194,24 @@ func (h *PortalHandler) getInternalUserGroupIDs(ctx context.Context, r *http.Req
 		return nil
 	}
 	return groupIDs
+}
+
+func (h *PortalHandler) internalSessionFromRequest(r *http.Request) *auth.Session {
+	if session, ok := r.Context().Value(middleware.ContextKeySession).(*auth.Session); ok && session != nil {
+		return session
+	}
+	if h.sessionManager == nil {
+		return nil
+	}
+	sessionToken, err := h.sessionManager.GetSessionFromRequest(r)
+	if err != nil {
+		return nil
+	}
+	session, err := h.sessionManager.ValidateSessionContext(r.Context(), sessionToken, h.getClientIP(r))
+	if err != nil {
+		return nil
+	}
+	return session
 }
 
 // getAuthFromContext extracts auth info from context (set by RequirePortalAuth middleware)
@@ -172,8 +246,10 @@ func (h *PortalHandler) getPortalCustomerOrgID(ctx context.Context, portalCustom
 	return &result
 }
 
-// portalVisibilityContext holds the computed visibility context used for filtering
-// request types, asset reports, and other portal resources by visibility rules.
+// portalVisibilityContext holds the audience context used by normal portal
+// endpoints. Management/customization endpoints are separate authenticated
+// surfaces; being a channel manager must not change what the public portal
+// lists or accepts.
 type portalVisibilityContext struct {
 	userGroupIDs  []int
 	customerOrgID *int
@@ -182,15 +258,10 @@ type portalVisibilityContext struct {
 
 // getPortalVisibilityContext builds the visibility context needed for filtering
 // portal resources. It resolves the user's group memberships, portal customer
-// organisation ID, and admin status in a single call, eliminating the identical
-// block of code previously duplicated in GetRequestTypes and GetAssetReports.
-//
-// Admin status is scoped to the specific portal channel: a user is an admin
-// for this portal if they are a system admin OR a channel manager for this
-// channel (via channel_managers). Before scoping to the channel, the check
-// granted admin to anyone with channels.manage globally — a permission that
-// does not exist — so the branch was effectively dead code beyond system
-// admins, while intent was to allow channel managers to preview.
+// organisation ID. isAdmin intentionally remains false: callers on this public
+// surface must use the same audience contract for list, fields, drafts, and
+// submission. The frontend switches to channel-management APIs explicitly
+// while the customization panel is open.
 func (h *PortalHandler) getPortalVisibilityContext(ctx context.Context, r *http.Request, channelID int) portalVisibilityContext {
 	vc := portalVisibilityContext{
 		userGroupIDs: h.getInternalUserGroupIDs(ctx, r),
@@ -199,38 +270,17 @@ func (h *PortalHandler) getPortalVisibilityContext(ctx context.Context, r *http.
 	// Get portal customer org ID if authenticated as portal customer. Sessions
 	// minted on a different portal are ignored so a cookie from portal A
 	// cannot bias visibility filtering on portal B.
-	if h.portalSessionManager != nil {
+	if portalSession, ok := r.Context().Value(middleware.ContextKeyPortalSession).(*auth.PortalSession); ok && portalSession != nil {
+		if portalSession.ChannelID != nil && *portalSession.ChannelID == channelID {
+			vc.customerOrgID = h.getPortalCustomerOrgID(ctx, portalSession.PortalCustomerID)
+		}
+	} else if h.portalSessionManager != nil {
 		portalToken, err := h.portalSessionManager.GetPortalSessionFromRequest(r)
 		if err == nil && portalToken != "" {
 			clientIP := h.getClientIP(r)
 			portalSession, err := h.portalSessionManager.ValidatePortalSession(portalToken, clientIP)
 			if err == nil && portalSession != nil && portalSession.ChannelID != nil && *portalSession.ChannelID == channelID {
 				vc.customerOrgID = h.getPortalCustomerOrgID(ctx, portalSession.PortalCustomerID)
-			}
-		}
-	}
-
-	// Check if this is an admin viewing for customization (has internal session)
-	if sessionToken, err := h.sessionManager.GetSessionFromRequest(r); err == nil {
-		clientIP := h.getClientIP(r)
-		if session, err := h.sessionManager.ValidateSession(sessionToken, clientIP); err == nil && session != nil {
-			var isAdmin bool
-			err := h.db.QueryRowContext(ctx, `
-				SELECT EXISTS(
-					SELECT 1 FROM user_global_permissions ugp
-					JOIN permissions p ON ugp.permission_id = p.id
-					WHERE ugp.user_id = ? AND p.permission_key = 'system.admin'
-				) OR EXISTS(
-					SELECT 1 FROM channel_managers cm
-					WHERE cm.channel_id = ?
-					AND ((cm.manager_type = 'user' AND cm.manager_id = ?)
-						 OR (cm.manager_type = 'group' AND cm.manager_id IN (
-							 SELECT group_id FROM group_members WHERE user_id = ?
-						 )))
-				)
-			`, session.UserID, channelID, session.UserID, session.UserID).Scan(&isAdmin)
-			if err == nil && isAdmin {
-				vc.isAdmin = true
 			}
 		}
 	}
@@ -245,7 +295,7 @@ func (h *PortalHandler) getRequestTypeWithVisibility(ctx context.Context, reques
 	err := h.db.QueryRowContext(ctx, `
 		SELECT id, channel_id, name, description, item_type_id, icon, color, display_order, is_active,
 		       visibility_group_ids, visibility_org_ids, title_template, created_at, updated_at
-		FROM request_types WHERE id = ? AND is_active = true
+		FROM request_types WHERE id = ? AND is_active = true AND kind != 'email'
 	`, requestTypeID).Scan(
 		&rt.ID, &rt.ChannelID, &rt.Name, &rt.Description, &rt.ItemTypeID, &rt.Icon, &rt.Color,
 		&rt.DisplayOrder, &rt.IsActive, &visibilityGroupIDs, &visibilityOrgIDs, &rt.TitleTemplate,
@@ -255,45 +305,59 @@ func (h *PortalHandler) getRequestTypeWithVisibility(ctx context.Context, reques
 		return nil, err
 	}
 
-	applyRequestTypeVisibility(&rt, visibilityGroupIDs, visibilityOrgIDs)
+	if err := applyRequestTypeVisibility(&rt, visibilityGroupIDs, visibilityOrgIDs); err != nil {
+		return nil, err
+	}
 	return &rt, nil
 }
 
 // unmarshalIntIDs decodes a JSON-encoded []int stored in a nullable string
-// column, returning nil if the column is NULL, empty, or malformed.
-func unmarshalIntIDs(n sql.NullString) []int {
+// column. Malformed access-control data is an error so public endpoints can
+// fail closed instead of turning a restricted row into an unrestricted one.
+func unmarshalIntIDs(n sql.NullString) ([]int, error) {
 	if !n.Valid || n.String == "" {
-		return nil
+		return nil, nil
 	}
 	var ids []int
 	if err := json.Unmarshal([]byte(n.String), &ids); err != nil {
-		return nil
+		return nil, err
 	}
-	return ids
+	return ids, nil
 }
 
 // applyRequestTypeVisibility populates rt.VisibilityGroupIDs / VisibilityOrgIDs
 // from the JSON-encoded nullable string columns that the schema uses for
 // per-row visibility lists.
-func applyRequestTypeVisibility(rt *models.RequestType, groups, orgs sql.NullString) {
-	if ids := unmarshalIntIDs(groups); ids != nil {
-		rt.VisibilityGroupIDs = ids
+func applyRequestTypeVisibility(rt *models.RequestType, groups, orgs sql.NullString) error {
+	groupIDs, err := unmarshalIntIDs(groups)
+	if err != nil {
+		return fmt.Errorf("parse request type %d visibility groups: %w", rt.ID, err)
 	}
-	if ids := unmarshalIntIDs(orgs); ids != nil {
-		rt.VisibilityOrgIDs = ids
+	orgIDs, err := unmarshalIntIDs(orgs)
+	if err != nil {
+		return fmt.Errorf("parse request type %d visibility organizations: %w", rt.ID, err)
 	}
+	rt.VisibilityGroupIDs = groupIDs
+	rt.VisibilityOrgIDs = orgIDs
+	return nil
 }
 
 // NewPortalHandler creates a new portal handler
 func NewPortalHandler(db database.Database, sessionManager *auth.SessionManager, portalSessionManager *auth.PortalSessionManager, ipExtractor *utils.IPExtractor, attachmentPath string) *PortalHandler {
+	var attachments *services.ItemAttachmentService
+	if attachmentPath != "" {
+		attachments = services.NewItemAttachmentService(db, attachmentPath, nil)
+	}
 	return &PortalHandler{
 		db:                   db,
 		sessionManager:       sessionManager,
 		portalSessionManager: portalSessionManager,
 		ipExtractor:          ipExtractor,
 		portalService:        services.NewPortalService(db),
+		portalAuthRepo:       repository.NewPortalAuthRepository(db),
 		draftRepo:            repository.NewPortalDraftRepository(db),
 		attachmentPath:       attachmentPath,
+		attachments:          attachments,
 	}
 }
 
@@ -302,34 +366,30 @@ func (h *PortalHandler) findChannelByPortalSlug(ctx context.Context, slug string
 	return findChannelBySlug(ctx, h.db, "portal", slug, func(c *models.ChannelConfig) string { return c.PortalSlug })
 }
 
-// grantChannelAccess grants a portal customer access to a channel if not already granted
-func (h *PortalHandler) grantChannelAccess(ctx context.Context, customerID, channelID int) {
-	var accessID int
-	err := h.db.QueryRowContext(ctx, `SELECT id FROM portal_customer_channels WHERE portal_customer_id = ? AND channel_id = ?`, customerID, channelID).Scan(&accessID)
-
-	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := h.db.ExecWriteContext(ctx, `
-			INSERT INTO portal_customer_channels (portal_customer_id, channel_id, created_at)
-			VALUES (?, ?, ?)
-		`, customerID, channelID, time.Now()); err != nil {
-			slog.Warn("failed to grant channel access to portal customer", slog.String("component", "portal"), slog.Int("customer_id", customerID), slog.Int("channel_id", channelID), slog.Any("error", err))
-		}
-	}
+// grantChannelAccess grants a portal customer access to a channel if not
+// already granted. A single upsert avoids the SELECT/INSERT race between two
+// concurrent first submissions.
+func (h *PortalHandler) grantChannelAccess(ctx context.Context, customerID, channelID int) error {
+	_, err := h.db.ExecWriteContext(ctx, `
+		INSERT INTO portal_customer_channels (portal_customer_id, channel_id, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(portal_customer_id, channel_id) DO NOTHING
+	`, customerID, channelID, time.Now())
+	return err
 }
 
 // customerHasChannelAccess returns true if the portal customer already has an
 // access row for the given channel. Used by SubmitToPortal in manual-
 // registration mode to refuse silent auto-grants for customers who have not
 // been pre-provisioned.
-func (h *PortalHandler) customerHasChannelAccess(ctx context.Context, customerID, channelID int) bool {
+func (h *PortalHandler) customerHasChannelAccess(ctx context.Context, customerID, channelID int) (bool, error) {
 	var exists bool
 	if err := h.db.QueryRowContext(ctx, `
 		SELECT EXISTS(SELECT 1 FROM portal_customer_channels WHERE portal_customer_id = ? AND channel_id = ?)
 	`, customerID, channelID).Scan(&exists); err != nil {
-		slog.Error("failed to check portal customer channel access", slog.String("component", "portal"), slog.Int("customer_id", customerID), slog.Int("channel_id", channelID), slog.Any("error", err))
-		return false
+		return false, err
 	}
-	return exists
+	return exists, nil
 }
 
 // verifyPortalSessionBinding writes 401 and returns false if a portal session
@@ -365,9 +425,16 @@ func (h *PortalHandler) verifyPortalSessionBinding(w http.ResponseWriter, r *htt
 // portal is not found. Callers always defer the returned cancel (a no-op on
 // failure).
 func (h *PortalHandler) resolvePortalBySlug(w http.ResponseWriter, r *http.Request) (context.Context, context.CancelFunc, models.Channel, models.ChannelConfig, bool) {
+	return h.resolvePortalBySlugTimeout(w, r, 10*time.Second)
+}
+
+// resolvePortalEntryBySlugTimeout resolves the portal without granting access
+// to its protected content. The anonymous bootstrap uses this to render the
+// branded sign-in shell.
+func (h *PortalHandler) resolvePortalEntryBySlugTimeout(w http.ResponseWriter, r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc, models.Channel, models.ChannelConfig, bool) {
 	slug := r.PathValue("slug")
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 
 	portalResult, err := h.findChannelByPortalSlug(ctx, slug)
 	if err != nil {
@@ -382,15 +449,102 @@ func (h *PortalHandler) resolvePortalBySlug(w http.ResponseWriter, r *http.Reque
 	return ctx, cancel, portalResult.channel, portalResult.config, true
 }
 
-// GetPortal returns the portal configuration for public display
+// portalChannelAccessAllowed applies the portal-level policy before object
+// visibility. Internal users may enter any portal. Portal customers may enter
+// open portals, while manual portals require a current channel grant.
+func (h *PortalHandler) portalChannelAccessAllowed(ctx context.Context, r *http.Request, channelID int, config models.ChannelConfig) (bool, error) {
+	internalUserID, portalCustomerID := h.getAuthFromContext(r)
+	if internalUserID != nil {
+		return true, nil
+	}
+	if portalCustomerID == nil {
+		return false, nil
+	}
+
+	switch config.PortalRegistrationMode {
+	case "", "open":
+		return true, nil
+	case "manual":
+		return h.customerHasChannelAccess(ctx, *portalCustomerID, channelID)
+	default:
+		return false, nil
+	}
+}
+
+// resolvePortalBySlugTimeout is resolvePortalBySlug with an explicit context
+// deadline for handlers whose work needs more than the default 10 seconds.
+func (h *PortalHandler) resolvePortalBySlugTimeout(w http.ResponseWriter, r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc, models.Channel, models.ChannelConfig, bool) {
+	ctx, cancel, channel, config, ok := h.resolvePortalEntryBySlugTimeout(w, r, timeout)
+	if !ok {
+		return nil, cancel, models.Channel{}, models.ChannelConfig{}, false
+	}
+	allowed, err := h.portalChannelAccessAllowed(ctx, r, channel.ID, config)
+	if err != nil {
+		cancel()
+		respondInternalError(w, r, err)
+		return nil, func() {}, models.Channel{}, models.ChannelConfig{}, false
+	}
+	if !allowed {
+		cancel()
+		respondUnauthorized(w, r)
+		return nil, func() {}, models.Channel{}, models.ChannelConfig{}, false
+	}
+	return ctx, cancel, channel, config, true
+}
+
+// callerVisibility resolves the group and organisation IDs that gate request
+// type and asset report visibility for the current caller (internal user
+// groups, plus the org when the caller is a portal customer).
+func (h *PortalHandler) callerVisibility(ctx context.Context, r *http.Request) (userGroupIDs []int, customerOrgID *int) {
+	_, portalCustomerID := h.getAuthFromContext(r)
+	userGroupIDs = h.getInternalUserGroupIDs(ctx, r)
+	if portalCustomerID != nil {
+		customerOrgID = h.getPortalCustomerOrgID(ctx, *portalCustomerID)
+	}
+	return userGroupIDs, customerOrgID
+}
+
+// resolveVisibleRequestType loads a request type and enforces the channel and
+// visibility gates shared by field loading, drafts, and submission. It writes
+// a 404 (not 403) on every failure so hidden request types cannot be
+// enumerated by guessing IDs.
+func (h *PortalHandler) resolveVisibleRequestType(ctx context.Context, w http.ResponseWriter, r *http.Request, channelID, requestTypeID int) (*models.RequestType, bool) {
+	rt, err := h.getRequestTypeWithVisibility(ctx, requestTypeID)
+	if err != nil || rt.ChannelID != channelID {
+		respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Request type not found"))
+		return nil, false
+	}
+	userGroupIDs, customerOrgID := h.callerVisibility(ctx, r)
+	if !rt.IsVisibleTo(userGroupIDs, customerOrgID) {
+		respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Request type not found"))
+		return nil, false
+	}
+	return rt, true
+}
+
+// GetPortal returns the complete portal configuration to an authorized caller.
 func (h *PortalHandler) GetPortal(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel, channel, config, ok := h.resolvePortalBySlug(w, r)
 	if !ok {
 		return
 	}
 	defer cancel()
+	response, err := h.loadPortalData(ctx, r, channel, config)
+	if errors.Is(err, repository.ErrNotFound) {
+		respondNotFound(w, r, "workspace")
+		return
+	}
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	respondJSONOK(w, response)
+}
 
-	// Get workspace info (use first workspace for backward compatibility)
+func (h *PortalHandler) loadPortalData(ctx context.Context, r *http.Request, channel models.Channel, config models.ChannelConfig) (map[string]any, error) {
+	response := h.loadPortalEntryData(ctx, config)
+
+	// The first configured workspace remains the compatibility value for older clients.
 	var workspace models.Workspace
 	var workspaceID int
 	if len(config.PortalWorkspaceIDs) > 0 {
@@ -401,12 +555,65 @@ func (h *PortalHandler) GetPortal(w http.ResponseWriter, r *http.Request) {
 		if err := h.db.QueryRowContext(ctx, `SELECT id, name, key FROM workspaces WHERE id = ?`, workspaceID).Scan(
 			&workspace.ID, &workspace.Name, &workspace.Key,
 		); err != nil {
-			respondNotFound(w, r, "workspace")
-			return
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, repository.ErrNotFound
+			}
+			return nil, err
 		}
 	}
 
-	// Get hub logo as fallback (for portals without their own logo)
+	response["channel_id"] = channel.ID
+	response["workspace_ids"] = config.PortalWorkspaceIDs
+	response["workspace_id"] = workspaceID // First workspace for backward compatibility
+	response["workspace"] = workspace
+	response["search_placeholder"] = config.PortalSearchPlaceholder
+	response["search_hint"] = config.PortalSearchHint
+	response["footer_columns"] = config.PortalFooterColumns
+	response["sections"] = config.PortalSections
+	response["knowledge_base_share_link"] = config.KnowledgeBaseShareLink
+	response["knowledge_base_url"] = config.KnowledgeBaseURL
+	response["knowledge_base_share_id"] = config.KnowledgeBaseShareID
+	// Workspace-pages wiring is part of the authenticated portal contract so
+	// the customize panel and the KB itself can mark the exposure.
+	response["knowledge_base_page_sources"] = knowledgeBasePageSourcesResponse(config.KnowledgeBasePageSources)
+	// Internal viewers need to know whether they may edit this portal before
+	// the customize UI is offered; portal customers never can.
+	response["can_manage"] = h.canManagePortal(ctx, r, channel.ID)
+
+	return response, nil
+}
+
+// canManagePortal reports whether the current internal caller holds channel
+// management rights for the portal. Anonymous and portal-customer callers
+// always return false.
+func (h *PortalHandler) canManagePortal(ctx context.Context, r *http.Request, channelID int) bool {
+	if h.channelService == nil {
+		return false
+	}
+	internalUserID, _ := h.getAuthFromContext(r)
+	if internalUserID == nil {
+		return false
+	}
+	canManage, err := h.channelService.UserCanManage(ctx, *internalUserID, channelID)
+	if err != nil {
+		slog.Warn("portal can-manage check failed", "channel_id", channelID, "error", err)
+		return false
+	}
+	return canManage
+}
+
+// knowledgeBasePageSourcesResponse always serializes the wiring as an array.
+func knowledgeBasePageSourcesResponse(sources []models.KnowledgeBasePageSource) []models.KnowledgeBasePageSource {
+	if sources == nil {
+		return []models.KnowledgeBasePageSource{}
+	}
+	return sources
+}
+
+// loadPortalEntryData returns only the branding needed to identify a portal
+// and present its sign-in screen. Catalogs, routing IDs, sections, and
+// knowledge-base configuration remain behind portal authentication.
+func (h *PortalHandler) loadPortalEntryData(ctx context.Context, config models.ChannelConfig) map[string]any {
 	var hubLogoURL string
 	var hubConfigJSON string
 	if err := h.db.QueryRowContext(ctx, `SELECT value FROM system_settings WHERE key = 'portal_hub_config'`).Scan(&hubConfigJSON); err == nil && hubConfigJSON != "" {
@@ -416,103 +623,95 @@ func (h *PortalHandler) GetPortal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Return portal info with customization settings
-	response := map[string]interface{}{
-		"channel_id":    channel.ID,
-		"slug":          config.PortalSlug,
-		"title":         config.PortalTitle,
-		"description":   config.PortalDescription,
-		"workspace_ids": config.PortalWorkspaceIDs,
-		"workspace_id":  workspaceID, // First workspace for backward compatibility
-		"workspace":     workspace,
-		// Customization fields
-		"gradient":                  config.PortalGradient,
-		"theme":                     config.PortalTheme,
-		"search_placeholder":        config.PortalSearchPlaceholder,
-		"search_hint":               config.PortalSearchHint,
-		"footer_columns":            config.PortalFooterColumns,
-		"sections":                  config.PortalSections,
-		"knowledge_base_share_link": config.KnowledgeBaseShareLink,
-		"knowledge_base_url":        config.KnowledgeBaseURL,
-		"knowledge_base_share_id":   config.KnowledgeBaseShareID,
-		"background_image_url":      config.PortalBackgroundImageURL,
-		"logo_url":                  config.PortalLogoURL,
-		"hub_logo_url":              hubLogoURL,
+	return map[string]any{
+		"slug":                 config.PortalSlug,
+		"title":                config.PortalTitle,
+		"description":          config.PortalDescription,
+		"gradient":             config.PortalGradient,
+		"theme":                config.PortalTheme,
+		"background_image_url": config.PortalBackgroundImageURL,
+		"logo_url":             config.PortalLogoURL,
+		"hub_logo_url":         hubLogoURL,
 	}
-
-	respondJSONOK(w, response)
 }
 
-// GetRequestTypes returns request types for a portal, filtered by visibility
-// For admin users viewing in customize mode, returns all request types
-// For portal customers and regular users, filters by visibility rules
+// GetRequestTypes returns request types for a normal portal view, filtered by
+// the same visibility rules as field loading, drafts, and submission.
 func (h *PortalHandler) GetRequestTypes(w http.ResponseWriter, r *http.Request) {
-	slug := r.PathValue("slug")
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	// Find channel by portal slug
-	portalResult, err := h.findChannelByPortalSlug(ctx, slug)
-	if err != nil {
-		respondNotFound(w, r, "portal")
+	ctx, cancel, channel, _, ok := h.resolvePortalBySlug(w, r)
+	if !ok {
 		return
 	}
-	channel := portalResult.channel
+	defer cancel()
 
-	// Query all request types for this channel
+	vc := h.getPortalVisibilityContext(ctx, r, channel.ID)
+	requestTypes, err := h.loadPortalRequestTypes(ctx, channel.ID, vc)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	respondJSONOK(w, requestTypes)
+}
+
+func (h *PortalHandler) loadPortalRequestTypes(ctx context.Context, channelID int, vc portalVisibilityContext) ([]models.RequestType, error) {
 	query := `
 		SELECT rt.id, rt.channel_id, rt.name, rt.description, rt.item_type_id,
 		       rt.icon, rt.color, rt.display_order, rt.is_active,
 		       rt.visibility_group_ids, rt.visibility_org_ids,
 		       rt.created_at, rt.updated_at,
 		       it.name as item_type_name,
+		       rt.workspace_id, ws.name as workspace_name, ws.key as workspace_key,
 		       (SELECT COUNT(*) FROM request_type_fields rtf WHERE rtf.request_type_id = rt.id) AS field_count
 		FROM request_types rt
 		LEFT JOIN item_types it ON rt.item_type_id = it.id
-		WHERE rt.channel_id = ? AND rt.is_active = true
+		LEFT JOIN workspaces ws ON rt.workspace_id = ws.id
+		WHERE rt.channel_id = ? AND rt.is_active = true AND rt.kind != 'email'
 		ORDER BY rt.display_order, rt.name`
 
-	rows, err := h.db.QueryContext(ctx, query, channel.ID)
+	rows, err := h.db.QueryContext(ctx, query, channelID)
 	if err != nil {
-		respondInternalError(w, r, err)
-		return
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	// Get visibility context for filtering
-	vc := h.getPortalVisibilityContext(ctx, r, channel.ID)
-
-	var requestTypes []models.RequestType
+	requestTypes := []models.RequestType{}
 	for rows.Next() {
 		var rt models.RequestType
 		var visibilityGroupIDs, visibilityOrgIDs sql.NullString
+		var workspaceID sql.NullInt64
+		var workspaceName, workspaceKey sql.NullString
 		err := rows.Scan(&rt.ID, &rt.ChannelID, &rt.Name, &rt.Description, &rt.ItemTypeID,
 			&rt.Icon, &rt.Color, &rt.DisplayOrder, &rt.IsActive,
 			&visibilityGroupIDs, &visibilityOrgIDs,
 			&rt.CreatedAt, &rt.UpdatedAt,
-			&rt.ItemTypeName, &rt.FieldCount)
+			&rt.ItemTypeName,
+			&workspaceID, &workspaceName, &workspaceKey,
+			&rt.FieldCount)
 		if err != nil {
+			return nil, err
+		}
+
+		if workspaceID.Valid {
+			wsID := int(workspaceID.Int64)
+			rt.WorkspaceID = &wsID
+		}
+		rt.WorkspaceName = workspaceName.String
+		rt.WorkspaceKey = workspaceKey.String
+
+		if err := applyRequestTypeVisibility(&rt, visibilityGroupIDs, visibilityOrgIDs); err != nil {
+			slog.Error("hiding request type with invalid visibility configuration",
+				slog.String("component", "portal"), slog.Int("request_type_id", rt.ID), slog.Any("error", err))
 			continue
 		}
 
-		applyRequestTypeVisibility(&rt, visibilityGroupIDs, visibilityOrgIDs)
-
-		// Admin users see all request types; others see only visible ones
-		if vc.isAdmin || rt.IsVisibleTo(vc.userGroupIDs, vc.customerOrgID) {
+		if rt.IsVisibleTo(vc.userGroupIDs, vc.customerOrgID) {
 			requestTypes = append(requestTypes, rt)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		respondInternalError(w, r, err)
-		return
+		return nil, err
 	}
-
-	if requestTypes == nil {
-		requestTypes = []models.RequestType{}
-	}
-
-	respondJSONOK(w, requestTypes)
+	return requestTypes, nil
 }
 
 // SubmitToPortal handles portal item submissions (requires authentication)
@@ -523,16 +722,20 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cancel()
 
-	// Parse submission
+	// Bound and sanitize untrusted submission data before authorization and persistence.
 	r.Body = http.MaxBytesReader(w, r.Body, portalSubmissionMaxBytes)
 	var submission struct {
-		RequestTypeID *int                   `json:"request_type_id"`
-		Title         string                 `json:"title"`
-		Description   string                 `json:"description"`
-		CustomFields  map[string]interface{} `json:"custom_fields"`
+		RequestTypeID *int           `json:"request_type_id"`
+		Title         string         `json:"title"`
+		Description   string         `json:"description"`
+		CustomFields  map[string]any `json:"custom_fields"`
+		// ShareWithOrganisation is the creator's opt-in to org sharing
+		// (WI-1139). Applied only when the org is in requester_choice mode;
+		// automatic ignores it and disabled never shares.
+		ShareWithOrganisation bool `json:"share_with_organisation"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&submission); err != nil {
 		if isRequestBodyTooLarge(err) {
 			respondRequestTooLarge(w, r)
 			return
@@ -541,33 +744,17 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sanitize user input to prevent XSS
 	submission.Title = sanitize.PlainTextField.Sanitize(submission.Title)
 	submission.Description = sanitize.Comment.Sanitize(submission.Description)
 
-	// Get auth info from context (middleware already validated)
 	authenticatedUserID, portalCustomerID := h.getAuthFromContext(r)
 
-	// For portal customers, grant channel access. In manual-registration
-	// mode the auto-grant is suppressed — only admin-managed customers with
-	// pre-existing access can submit. Without this gate, a customer with
-	// any portal session who reached this route (e.g. via cross-portal
-	// session reuse before the binding check was added, or via a future
-	// regression) would silently gain access to a manual-mode portal.
-	// Internal users don't need portal customer records - they're tracked via user_id.
-	if portalCustomerID != nil {
-		if config.PortalRegistrationMode == "manual" {
-			if !h.customerHasChannelAccess(ctx, *portalCustomerID, channel.ID) {
-				slog.Warn("manual-mode portal blocked submit from customer without channel access",
-					slog.String("component", "portal"),
-					slog.Int("portal_customer_id", *portalCustomerID),
-					slog.Int("channel_id", channel.ID),
-				)
-				respondUnauthorized(w, r)
-				return
-			}
-		} else {
-			h.grantChannelAccess(ctx, *portalCustomerID, channel.ID)
+	// Manual access was enforced while resolving the portal. Open portals add
+	// the customer grant on first submission so request tracking stays scoped.
+	if portalCustomerID != nil && (config.PortalRegistrationMode == "" || config.PortalRegistrationMode == "open") {
+		if accessErr := h.grantChannelAccess(ctx, *portalCustomerID, channel.ID); accessErr != nil {
+			respondInternalError(w, r, accessErr)
+			return
 		}
 	}
 
@@ -576,36 +763,13 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 	// title field is hidden from the form.
 	var requestType *models.RequestType
 	if submission.RequestTypeID != nil {
-		var err error
-		requestType, err = h.getRequestTypeWithVisibility(ctx, *submission.RequestTypeID)
-		if err != nil {
-			respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Request type not found"))
-			return
-		}
-
-		// Verify the request type belongs to this channel
-		if requestType.ChannelID != channel.ID {
-			respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Request type not found"))
-			return
-		}
-
-		// Get user context for visibility check
-		userGroupIDs := h.getInternalUserGroupIDs(ctx, r)
-		var customerOrgID *int
-		if portalCustomerID != nil {
-			customerOrgID = h.getPortalCustomerOrgID(ctx, *portalCustomerID)
-		}
-
-		// Check visibility — return 404 (not 403) to avoid leaking the
-		// existence of request types the user can't see, matching the
-		// not-found / wrong-channel branches above.
-		if !requestType.IsVisibleTo(userGroupIDs, customerOrgID) {
-			respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Request type not found"))
+		var ok bool
+		requestType, ok = h.resolveVisibleRequestType(ctx, w, r, channel.ID, *submission.RequestTypeID)
+		if !ok {
 			return
 		}
 	}
 
-	// Validate and separate fields
 	validationResult, err := services.ValidateAndSeparateRequestFields(ctx, h.db, submission.RequestTypeID, submission.Title, submission.Description, submission.CustomFields)
 	if err != nil {
 		respondValidationError(w, r, err.Error())
@@ -616,7 +780,7 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 	// form, render its title_template. Items have a NOT NULL title, so we
 	// reject when the template is missing or renders to empty.
 	if requestType != nil && !validationResult.TitleFieldInForm {
-		rendered := h.renderPortalTitle(ctx, requestType, submission.Description, submission.CustomFields, authenticatedUserID, portalCustomerID)
+		rendered := h.renderPortalTitle(ctx, requestType, submission.Description, validationResult.CustomFieldValues, authenticatedUserID, portalCustomerID)
 		if rendered == "" {
 			respondValidationError(w, r, "request type is misconfigured: title field is hidden but no title template is set")
 			return
@@ -624,14 +788,37 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 		submission.Title = sanitize.PlainTextField.Sanitize(rendered)
 	}
 
-	// Get target workspace (use first workspace for submission)
+	// Resolve the target workspace. A request type pins its workspace at
+	// creation and that binding is the source of truth. A generic submission
+	// (no request type) on a portal serving multiple workspaces is ambiguous —
+	// reject rather than silently routing to the first workspace.
 	if len(config.PortalWorkspaceIDs) == 0 {
 		respondInternalError(w, r, fmt.Errorf("portal has no configured workspaces"))
 		return
 	}
-	targetWorkspaceID := config.PortalWorkspaceIDs[0]
+	var targetWorkspaceID int
+	if submission.RequestTypeID != nil {
+		if validationResult.WorkspaceID == nil {
+			respondValidationError(w, r, "request type is misconfigured: no target workspace")
+			return
+		}
+		targetWorkspaceID = *validationResult.WorkspaceID
+		// The request type's workspace must be one the portal actually serves.
+		// A mismatch means the channel's workspace list drifted away from the
+		// request type's routing target; refuse rather than create an item the
+		// portal can't surface.
+		if !containsID(config.PortalWorkspaceIDs, targetWorkspaceID) {
+			respondValidationError(w, r, "request type is misconfigured: its workspace is not served by this portal")
+			return
+		}
+	} else {
+		if len(config.PortalWorkspaceIDs) > 1 {
+			respondValidationError(w, r, "this portal serves multiple workspaces; select a request type so the submission can be routed")
+			return
+		}
+		targetWorkspaceID = config.PortalWorkspaceIDs[0]
+	}
 
-	// Determine initial status from workflow if item type is specified
 	initialStatus := defaultItemStatus // Default fallback status
 	if validationResult.ItemTypeID != nil {
 		var status string
@@ -642,8 +829,35 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 			initialStatus = status
 		}
 	}
+	customFieldsJSON, err := json.Marshal(validationResult.CustomFieldValues)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	virtualFieldsJSON, err := json.Marshal(validationResult.VirtualFieldValues)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
 
-	// Create item using centralized service
+	eventMetadata := itemevents.System("portal")
+	if portalCustomerID != nil {
+		eventMetadata = itemevents.PortalCustomer(*portalCustomerID, "portal")
+	} else if authenticatedUserID != nil {
+		eventMetadata = itemevents.User(*authenticatedUserID, "portal")
+	}
+	// Org sharing (WI-1139): the creator's opt-in is applied only in
+	// requester_choice mode. The item flag is written once and never updated.
+	portalOrgShared := false
+	if portalCustomerID != nil && submission.ShareWithOrganisation {
+		sharing, err := h.portalService.PortalCustomerOrgRequestSharing(ctx, *portalCustomerID)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		portalOrgShared = sharing.RequestSharing == models.OrgRequestSharingRequesterChoice
+	}
+
 	itemID, err := services.CreateItem(h.db, services.ItemCreationParams{
 		WorkspaceID:             targetWorkspaceID,
 		Title:                   submission.Title,
@@ -655,17 +869,29 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 		CreatorPortalCustomerID: portalCustomerID, // nil for internal users, set for portal customers
 		ChannelID:               &channel.ID,
 		RequestTypeID:           submission.RequestTypeID,
+		PortalOrgShared:         portalOrgShared,
+		CustomFieldValuesJSON:   string(customFieldsJSON),
+		VirtualFieldDataJSON:    string(virtualFieldsJSON),
+		EventMetadata:           eventMetadata,
 	})
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 
-	// Store custom and virtual field values
-	services.StoreCustomFieldValues(ctx, h.db, "portal", itemID, validationResult.CustomFieldValues)
-	services.StoreVirtualFieldValues(ctx, h.db, "portal", itemID, validationResult.VirtualFieldValues)
+	if h.eventCoordinator != nil {
+		fullItem, fetchErr := repository.NewItemRepository(h.db).FindByIDWithDetailsContext(ctx, int(itemID))
+		if fetchErr != nil {
+			slog.Error("failed to hydrate portal-created item for side effects", slog.Int64("item_id", itemID), slog.Any("error", fetchErr))
+		} else {
+			actorID := 0
+			if authenticatedUserID != nil {
+				actorID = *authenticatedUserID
+			}
+			h.eventCoordinator.EmitItemCreated(fullItem, actorID)
+		}
+	}
 
-	// Update channel last activity
 	if _, err := h.db.ExecWriteContext(ctx, `UPDATE channels SET last_activity = ? WHERE id = ?`, time.Now(), channel.ID); err != nil {
 		slog.Warn("failed to update channel last_activity", slog.String("component", "portal"), slog.Int("channel_id", channel.ID), slog.Any("error", err))
 	}
@@ -674,48 +900,42 @@ func (h *PortalHandler) SubmitToPortal(w http.ResponseWriter, r *http.Request) {
 	// submitted, so the saved state is no longer interesting. Best-effort:
 	// failure here doesn't affect the successful submission.
 	if submission.RequestTypeID != nil {
-		h.deleteDraftAfterSubmit(ctx, *submission.RequestTypeID, repository.DraftIdentity{
+		h.deleteDraftAfterSubmit(ctx, channel.ID, *submission.RequestTypeID, repository.DraftIdentity{
 			PortalCustomerID: portalCustomerID,
 			UserID:           authenticatedUserID,
 		})
 	}
 
-	// Return success response
-	respondJSONCreated(w, map[string]interface{}{
+	respondJSONCreated(w, map[string]any{
 		"success": true,
 		"item_id": itemID,
 		"message": "Submission received successfully",
 	})
 }
 
-// SearchKnowledgeBase proxies knowledge base search requests to Docmost
+// SearchKnowledgeBase handles portal knowledge-base search. Results come
+// from the connected Docmost share (if configured) plus the workspace pages
+// the channel manager wired into the knowledge base.
 func (h *PortalHandler) SearchKnowledgeBase(w http.ResponseWriter, r *http.Request) {
-	slug := r.PathValue("slug")
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	// Find channel by portal slug
-	portalResult, err := h.findChannelByPortalSlug(ctx, slug)
-	if err != nil {
-		respondNotFound(w, r, "portal")
+	ctx, cancel, channel, config, ok := h.resolvePortalBySlug(w, r)
+	if !ok {
 		return
 	}
-	config := portalResult.config
+	defer cancel()
 
-	// Check if knowledge base is configured
-	if config.KnowledgeBaseURL == "" || config.KnowledgeBaseShareID == "" {
+	docmostConfigured := config.KnowledgeBaseURL != "" && config.KnowledgeBaseShareID != ""
+	pagesWired := h.publication != nil && len(config.KnowledgeBasePageSources) > 0
+	if !docmostConfigured && !pagesWired {
 		respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Knowledge base not configured for this portal"))
 		return
 	}
 
-	// Parse search request
 	r.Body = http.MaxBytesReader(w, r.Body, portalSearchMaxBytes)
 	var searchRequest struct {
 		Query string `json:"query"`
 	}
 
-	if err = json.NewDecoder(r.Body).Decode(&searchRequest); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&searchRequest); err != nil {
 		if isRequestBodyTooLarge(err) {
 			respondRequestTooLarge(w, r)
 			return
@@ -734,36 +954,91 @@ func (h *PortalHandler) SearchKnowledgeBase(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Defense in depth: re-validate the URL before making the request
-	if err := utils.ValidateExternalURL(config.KnowledgeBaseURL); err != nil {
-		respondError(w, r, restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Failed to connect to knowledge base"))
-		return
+	data := []map[string]any{}
+	var docmostErr *restapi.APIError
+	if docmostConfigured {
+		docmostErr = h.searchDocmostKnowledgeBase(ctx, config, searchRequest.Query, &data)
+		if docmostErr != nil && !pagesWired {
+			respondError(w, r, docmostErr)
+			return
+		}
+		if docmostErr != nil {
+			slog.Warn("docmost knowledge base search failed; serving workspace page results only",
+				slog.String("component", "portal"), slog.Any("error", docmostErr))
+		}
+	}
+	if pagesWired {
+		if err := h.appendWorkspacePageHits(config, searchRequest.Query, &data); err != nil {
+			slog.Error("failed to search published workspace pages",
+				slog.String("component", "portal"), slog.Any("error", err))
+		}
 	}
 
-	// Prepare Docmost API request
+	h.recordKBSearch(r, channel.ID, searchRequest.Query, len(data))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+}
+
+// recordKBSearch records the search/no_result signal for one knowledge-base
+// query. Only portal-customer sessions are attributed — staff previews
+// record nothing. Failures are logged, never surfaced: analytics must not
+// break the user-facing path.
+func (h *PortalHandler) recordKBSearch(r *http.Request, channelID int, query string, hitCount int) {
+	if h.kbSignals == nil {
+		return
+	}
+	_, customerID := h.getAuthFromContext(r)
+	if customerID == nil {
+		return
+	}
+	eventType := services.KBEventSearch
+	if hitCount == 0 {
+		eventType = services.KBEventNoResult
+	}
+	err := h.kbSignals.RecordKBEvent(r.Context(), services.KBEventInput{
+		ChannelID:        channelID,
+		PortalCustomerID: customerID,
+		EventType:        eventType,
+		Query:            query,
+	})
+	if err != nil {
+		slog.Warn("failed to record knowledge-base search signal", slog.Any("error", err))
+	}
+}
+
+// knowledgeBasePageSearchLimit caps how many published workspace pages one
+// search returns.
+const knowledgeBasePageSearchLimit = 25
+
+// searchDocmostKnowledgeBase proxies a search to the connected Docmost
+// share and appends its result items (tagged source "docmost") to data.
+// A non-2xx or oversized response is a BAD_GATEWAY APIError.
+func (h *PortalHandler) searchDocmostKnowledgeBase(ctx context.Context, config models.ChannelConfig, query string, data *[]map[string]any) *restapi.APIError {
+	if err := utils.ValidateExternalURL(config.KnowledgeBaseURL); err != nil {
+		return restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Failed to connect to knowledge base")
+	}
+
 	docmostURL := fmt.Sprintf("%s/api/search/share-search", config.KnowledgeBaseURL)
 	requestBody, err := json.Marshal(map[string]string{
-		"query":   searchRequest.Query,
+		"query":   query,
 		"shareId": config.KnowledgeBaseShareID,
 	})
 	if err != nil {
-		respondInternalError(w, r, err)
-		return
+		return restapi.NewAPIError(http.StatusInternalServerError, "INTERNAL", "Internal server error")
 	}
 
-	// Make request to Docmost
 	req, err := http.NewRequestWithContext(ctx, "POST", docmostURL, bytes.NewBuffer(requestBody))
 	if err != nil {
-		respondInternalError(w, r, err)
-		return
+		return restapi.NewAPIError(http.StatusInternalServerError, "INTERNAL", "Internal server error")
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	client := utils.NewSSRFSafeHTTPClient(10 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
-		respondError(w, r, restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Failed to connect to knowledge base"))
-		return
+		return restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Failed to connect to knowledge base")
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -771,22 +1046,184 @@ func (h *PortalHandler) SearchKnowledgeBase(w http.ResponseWriter, r *http.Reque
 	// snippets; anything larger is either misconfigured or an attempted
 	// memory-exhaustion vector via this public, unauthenticated endpoint.
 	const maxKBResponseBytes = 2 << 20
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxKBResponseBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxKBResponseBytes+1))
+	if err != nil {
+		return restapi.NewAPIError(http.StatusInternalServerError, "INTERNAL", "Internal server error")
+	}
+	if len(body) > maxKBResponseBytes {
+		return restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Knowledge base response was too large")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Knowledge base search failed")
+	}
+
+	var parsed struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Knowledge base search failed")
+	}
+	for _, item := range parsed.Data {
+		if item != nil {
+			item["source"] = "docmost"
+			*data = append(*data, item)
+		}
+	}
+	return nil
+}
+
+// appendWorkspacePageHits searches the workspace pages wired into this
+// portal's knowledge base and appends them to data marked with the
+// workspace_page source. The config scopes the search to this portal's
+// wiring; other portals' sources are never included.
+func (h *PortalHandler) appendWorkspacePageHits(config models.ChannelConfig, query string, data *[]map[string]any) error {
+	hits, err := h.publication.SearchPublishedPagesForPortal(config, query, knowledgeBasePageSearchLimit)
+	if err != nil {
+		return err
+	}
+	for _, hit := range hits {
+		item := map[string]any{
+			"source":       "workspace_page",
+			"page_id":      hit.PageID,
+			"workspace_id": hit.WorkspaceID,
+			"title":        hit.Title,
+			"highlight":    hit.Snippet,
+		}
+		if hit.HeadingPath != "" {
+			item["heading_path"] = hit.HeadingPath
+		}
+		*data = append(*data, item)
+	}
+	return nil
+}
+
+// ListKnowledgeBasePages serves the browse listing of published workspace
+// pages for one portal's knowledge base: titles and hierarchy only — page
+// bodies stay behind the per-page endpoint. Mirrors the search and detail
+// endpoints' scoping: only this portal's wiring, live pages only, and 404
+// when the portal has no workspace-pages wiring at all.
+func (h *PortalHandler) ListKnowledgeBasePages(w http.ResponseWriter, r *http.Request) {
+	_, cancel, _, config, ok := h.resolvePortalBySlug(w, r)
+	if !ok {
+		return
+	}
+	defer cancel()
+
+	if h.publication == nil || len(config.KnowledgeBasePageSources) == 0 {
+		respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Page not found"))
+		return
+	}
+	pages, err := h.publication.PublishedPagesForPortal(config)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
+	result := make([]map[string]any, 0, len(pages))
+	for _, page := range pages {
+		result = append(result, map[string]any{
+			"source":       "workspace_page",
+			"page_id":      page.ID,
+			"workspace_id": page.WorkspaceID,
+			"title":        page.Title,
+			"parent_id":    page.ParentID,
+			"depth":        page.Depth,
+			"updated_at":   page.UpdatedAt,
+		})
+	}
+	respondJSONOK(w, result)
+}
 
-	// Check response status
-	if resp.StatusCode != http.StatusOK {
-		respondError(w, r, restapi.NewAPIError(http.StatusBadGateway, "BAD_GATEWAY", "Knowledge base search failed"))
+// GetKnowledgeBasePage serves one published workspace page to portal
+// callers. The page must be inside a subtree (or whole-workspace wiring)
+// this portal's knowledge base publishes; anything else is 404.
+func (h *PortalHandler) GetKnowledgeBasePage(w http.ResponseWriter, r *http.Request) {
+	_, cancel, channel, config, ok := h.resolvePortalBySlug(w, r)
+	if !ok {
+		return
+	}
+	defer cancel()
+
+	if h.publication == nil || len(config.KnowledgeBasePageSources) == 0 {
+		respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Page not found"))
+		return
+	}
+	pageID, err := strconv.Atoi(r.PathValue("pageId"))
+	if err != nil {
+		respondInvalidID(w, r, "pageId")
 		return
 	}
 
-	// Forward response to client
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	page, err := h.publication.PublishedPageForPortal(config, pageID)
+	if err != nil {
+		respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Page not found"))
+		return
+	}
+	h.recordKBPageView(r, channel.ID, page)
+	respondJSONOK(w, map[string]any{
+		"source":       "workspace_page",
+		"page_id":      page.ID,
+		"workspace_id": page.WorkspaceID,
+		"title":        page.Title,
+		"content":      page.Content,
+		"updated_at":   page.UpdatedAt,
+	})
+}
+
+// recordKBPageView records the view signal for one served article, plus the
+// deflection signal under the v1 rule: an authenticated portal customer who
+// reaches the article through self-service (search or browse) while having no
+// open requests on this portal counts as deflected. Views opened from a
+// ticket conversation are assisted reads, not self-service; staff previews
+// record nothing.
+func (h *PortalHandler) recordKBPageView(r *http.Request, channelID int, page *models.Page) {
+	if h.kbSignals == nil {
+		return
+	}
+	_, customerID := h.getAuthFromContext(r)
+	if customerID == nil {
+		return
+	}
+	source := normalizedKBViewSource(r.URL.Query().Get("source"))
+	pageID := page.ID
+	workspaceID := page.WorkspaceID
+	input := services.KBEventInput{
+		ChannelID:        channelID,
+		PortalCustomerID: customerID,
+		EventType:        services.KBEventView,
+		PageID:           &pageID,
+		WorkspaceID:      &workspaceID,
+		Source:           source,
+	}
+	if err := h.kbSignals.RecordKBEvent(r.Context(), input); err != nil {
+		slog.Warn("failed to record knowledge-base view signal", slog.Any("error", err))
+		return
+	}
+	if source == services.KBViewSourceTicket {
+		return
+	}
+	open, err := h.kbSignals.PortalCustomerHasOpenRequests(r.Context(), channelID, *customerID)
+	if err != nil {
+		slog.Warn("failed to check open requests for deflection signal", slog.Any("error", err))
+		return
+	}
+	if open {
+		return
+	}
+	input.EventType = services.KBEventDeflection
+	if err := h.kbSignals.RecordKBEvent(r.Context(), input); err != nil {
+		slog.Warn("failed to record knowledge-base deflection signal", slog.Any("error", err))
+	}
+}
+
+// normalizedKBViewSource maps the frontend-reported navigation origin onto
+// the known sources; anything unrecognized counts as browse.
+func normalizedKBViewSource(raw string) string {
+	switch raw {
+	case services.KBViewSourceSearch, services.KBViewSourceTicket:
+		return raw
+	default:
+		return services.KBViewSourceBrowse
+	}
 }
 
 // DownloadPortalAttachment serves portal branding attachments (logos, backgrounds) without authentication
@@ -822,15 +1259,15 @@ func (h *PortalHandler) DownloadPortalAttachment(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Security check: Only allow portal branding attachments (logos, backgrounds)
+	// Require both fields to identify a public branding asset; category alone is caller-controlled.
 	allowedPortalAssetTypes := map[string]bool{
 		"portal_logo":       true,
 		"portal_background": true,
 		"hub_logo":          true,
+		"theme_logo":        true,
 	}
 
 	if !allowedPortalAssetTypes[entityType] || category != entityType {
-		// Return 404 to prevent enumeration of non-portal attachments
 		respondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Attachment not found"))
 		return
 	}
@@ -852,7 +1289,6 @@ func (h *PortalHandler) DownloadPortalAttachment(w http.ResponseWriter, r *http.
 	}
 	defer func() { _ = file.Close() }()
 
-	// Set headers
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
 	w.Header().Set("X-Content-Type-Options", "nosniff")

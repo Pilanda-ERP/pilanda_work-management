@@ -48,7 +48,11 @@ const (
 	FieldTypeMilestone   WindshiftFieldType = "milestone"
 	FieldTypeIteration   WindshiftFieldType = "iteration"
 	FieldTypeAsset       WindshiftFieldType = "asset"
-	FieldTypeUnmapped    WindshiftFieldType = "unmapped"
+	FieldTypeBoolean     WindshiftFieldType = "boolean"
+	// FieldTypeCheckbox is retained as a source-compatible name for callers
+	// that present the canonical boolean field as a checkbox control.
+	FieldTypeCheckbox WindshiftFieldType = FieldTypeBoolean
+	FieldTypeUnmapped WindshiftFieldType = "unmapped"
 )
 
 // FieldMappingSuggestion contains a suggested mapping for a Jira field
@@ -60,6 +64,7 @@ type FieldMappingSuggestion struct {
 	CanMap             bool               `json:"can_map"`
 	Notes              string             `json:"notes,omitempty"`
 	Options            []string           `json:"options,omitempty"` // For select fields
+	PreserveRaw        bool               `json:"preserve_raw,omitempty"`
 }
 
 // jiraFieldTypeMap maps Jira field type keys to Windshift field types
@@ -70,6 +75,7 @@ var jiraFieldTypeMap = map[string]WindshiftFieldType{
 	"number":    FieldTypeNumber,
 	"date":      FieldTypeDate,
 	"datetime":  FieldTypeDate,
+	"boolean":   FieldTypeBoolean,
 	"user":      FieldTypeUser,
 	"array":     FieldTypeMultiselect, // Depends on items type
 	"option":    FieldTypeSelect,
@@ -87,6 +93,7 @@ var jiraFieldTypeMap = map[string]WindshiftFieldType{
 	"com.atlassian.jira.plugin.system.customfieldtypes:multiselect":      FieldTypeMultiselect,
 	"com.atlassian.jira.plugin.system.customfieldtypes:radiobuttons":     FieldTypeSelect,
 	"com.atlassian.jira.plugin.system.customfieldtypes:multicheckboxes":  FieldTypeMultiselect,
+	"com.atlassian.jira.plugin.system.customfieldtypes:boolean":          FieldTypeBoolean,
 	"com.atlassian.jira.plugin.system.customfieldtypes:datepicker":       FieldTypeDate,
 	"com.atlassian.jira.plugin.system.customfieldtypes:datetime":         FieldTypeDate,
 	"com.atlassian.jira.plugin.system.customfieldtypes:url":              FieldTypeText,
@@ -116,7 +123,7 @@ var jiraFieldTypeMap = map[string]WindshiftFieldType{
 
 	// Service Management fields
 	"com.atlassian.servicedesk:sd-request-participants":   FieldTypeMultiselect,
-	"com.atlassian.servicedesk:vp-origin":                 FieldTypeText,
+	"com.atlassian.servicedesk:vp-origin":                 FieldTypeUnmapped,
 	"com.atlassian.servicedesk:sd-customer-organizations": FieldTypeMultiselect,
 
 	// Assets/Insight fields
@@ -124,8 +131,10 @@ var jiraFieldTypeMap = map[string]WindshiftFieldType{
 	"com.atlassian.jira.plugins.cmdb:cmdb-object-cftype":                           FieldTypeAsset,
 }
 
-// IsKnownFieldType returns true if the field's custom type is in our mapping table
-// Fields with unknown types (e.g., third-party extensions) should be filtered out
+// IsKnownFieldType reports whether a field has an explicit plugin-type mapping.
+// Unknown plugin keys must still be offered by SuggestFieldMappings because
+// Jira's schema type can often provide a safe native or raw-preservation
+// fallback.
 func IsKnownFieldType(field JiraCustomField) bool {
 	if field.Schema == nil || field.Schema.Custom == "" {
 		return false
@@ -159,9 +168,26 @@ func MapJiraFieldToWindshift(field JiraCustomField) FieldMappingSuggestion {
 	// Look up in the mapping table
 	if windshiftType, ok := jiraFieldTypeMap[fieldTypeKey]; ok {
 		suggestion.WindshiftFieldType = windshiftType
+		if field.Schema != nil && field.Schema.Type == "array" && field.Schema.Items == "user" {
+			suggestion.WindshiftFieldType = FieldTypeMultiUser
+			suggestion.Notes = "Jira schema items=user; values map to Windshift users."
+		}
 		if windshiftType == FieldTypeUnmapped {
 			suggestion.CanMap = false
-			suggestion.Notes = "This field type cannot be directly mapped and will be skipped"
+			switch fieldTypeKey {
+			case "com.atlassian.servicedesk:vp-origin":
+				suggestion.Notes = "Imported as the item's first-class portal request type"
+			case "com.pyxis.greenhopper.jira:gh-lexo-rank":
+				suggestion.Notes = "Used to order issue creation; Windshift fractional indexes are generated in Jira Rank order"
+			default:
+				suggestion.Notes = "This field type cannot be directly mapped and will be skipped"
+			}
+		} else {
+			addJiraChoiceMappingNote(&suggestion)
+		}
+		if jiraFieldIsDateTime(field) {
+			suggestion.Notes = strings.TrimSpace(suggestion.Notes +
+				" Jira datetime values are stored in the date field as a calendar date; the original RFC3339 timestamp is retained in the item's Jira custom-field metadata, but time-of-day editing in the date field is lossy.")
 		}
 		return suggestion
 	}
@@ -171,39 +197,56 @@ func MapJiraFieldToWindshift(field JiraCustomField) FieldMappingSuggestion {
 		switch field.Schema.Type {
 		case "string":
 			suggestion.WindshiftFieldType = FieldTypeText
+			suggestion.Notes = "Inferred from Jira schema type string."
 		case "number":
 			suggestion.WindshiftFieldType = FieldTypeNumber
+			suggestion.Notes = "Inferred from Jira schema type number."
 		case "date", "datetime":
 			suggestion.WindshiftFieldType = FieldTypeDate
+			suggestion.Notes = "Inferred from Jira schema; a datetime is stored as a calendar date and its original timestamp is retained in item metadata."
 		case "user":
 			suggestion.WindshiftFieldType = FieldTypeUser
+			suggestion.Notes = "Inferred from Jira schema type user."
 		case "array":
 			// Array type depends on items
 			switch field.Schema.Items {
-			case "option":
+			case "option", "option2", "option-with-child":
 				suggestion.WindshiftFieldType = FieldTypeMultiselect
+				suggestion.Notes = "Inferred from Jira schema array of option values."
 			case "user":
 				suggestion.WindshiftFieldType = FieldTypeMultiUser
-				suggestion.Notes = "Multi-user field will be stored as an array of user IDs"
+				suggestion.Notes = "Inferred from Jira schema; values map to Windshift users."
 			case "string":
 				suggestion.WindshiftFieldType = FieldTypeMultiselect
+				suggestion.Notes = "Inferred from Jira schema array items=string."
 			default:
 				suggestion.WindshiftFieldType = FieldTypeTextarea
-				suggestion.Notes = "Complex array field will be stored as JSON text"
+				suggestion.PreserveRaw = true
+				suggestion.Notes = "Complex Jira array has no native equivalent and will be preserved as JSON text."
 			}
 		case "option":
 			suggestion.WindshiftFieldType = FieldTypeSelect
+			suggestion.Notes = "Inferred from Jira schema type option."
+		case "option2", "option-with-child":
+			suggestion.WindshiftFieldType = FieldTypeSelect
+			suggestion.Notes = "Jira option structure is flattened to its display path."
 		default:
-			// Unknown type, default to text
-			suggestion.WindshiftFieldType = FieldTypeText
-			suggestion.Notes = "Unknown Jira field type, defaulting to text"
+			suggestion.WindshiftFieldType = FieldTypeTextarea
+			suggestion.PreserveRaw = true
+			suggestion.Notes = "App-owned Jira value has no proven native shape and will be preserved as JSON text."
+		}
+		addJiraChoiceMappingNote(&suggestion)
+		if jiraFieldIsDateTime(field) {
+			suggestion.Notes = strings.TrimSpace(suggestion.Notes +
+				" Jira datetime values are stored in the date field as a calendar date; the original RFC3339 timestamp is retained in the item's Jira custom-field metadata, but time-of-day editing in the date field is lossy.")
 		}
 		return suggestion
 	}
 
-	// Default fallback
-	suggestion.WindshiftFieldType = FieldTypeText
-	suggestion.Notes = "Could not determine field type, defaulting to text"
+	// Preserve rather than hide a field whose definition has no usable schema.
+	suggestion.WindshiftFieldType = FieldTypeTextarea
+	suggestion.PreserveRaw = true
+	suggestion.Notes = "Jira did not expose a usable schema; populated values will be preserved as JSON text."
 	return suggestion
 }
 
@@ -211,13 +254,26 @@ func MapJiraFieldToWindshift(field JiraCustomField) FieldMappingSuggestion {
 func SuggestFieldMappings(fields []JiraCustomField) []FieldMappingSuggestion {
 	suggestions := make([]FieldMappingSuggestion, 0, len(fields))
 	for _, field := range fields {
-		// Skip fields with unknown types (e.g., third-party extensions like ari:cloud:ecosystem::extension/...)
-		if !IsKnownFieldType(field) {
-			continue
-		}
 		suggestions = append(suggestions, MapJiraFieldToWindshift(field))
 	}
 	return suggestions
+}
+
+func addJiraChoiceMappingNote(suggestion *FieldMappingSuggestion) {
+	if suggestion == nil ||
+		(suggestion.WindshiftFieldType != FieldTypeSelect && suggestion.WindshiftFieldType != FieldTypeMultiselect) {
+		return
+	}
+	const note = " Populated option labels will be normalized to stable Windshift option IDs before issue import."
+	suggestion.Notes = strings.TrimSpace(suggestion.Notes + note)
+}
+
+func jiraFieldIsDateTime(field JiraCustomField) bool {
+	if field.Schema == nil {
+		return false
+	}
+	return strings.EqualFold(field.Schema.Type, "datetime") ||
+		strings.EqualFold(field.Schema.Custom, "com.atlassian.jira.plugin.system.customfieldtypes:datetime")
 }
 
 // StatusCategoryColorMap maps Jira status category colors to hex codes
@@ -340,7 +396,7 @@ func isImageMimeType(mimeType string) bool {
 // MentionResolver is consulted for every `mention` node so the output uses
 // Windshift's `@username` syntax — picked up later by MentionService and
 // by the rendered comment view.
-func ConvertADFToMarkdownWithUsers(adf interface{}, resolver MentionResolver) string {
+func ConvertADFToMarkdownWithUsers(adf any, resolver MentionResolver) string {
 	return ConvertADFToMarkdown(adf, resolver, nil)
 }
 
@@ -349,18 +405,18 @@ func ConvertADFToMarkdownWithUsers(adf interface{}, resolver MentionResolver) st
 // nodes as Windshift `@username`s; mediaResolver links `media` nodes to the
 // imported attachments where possible (otherwise they fall back to a
 // placeholder). Either may be nil.
-func ConvertADFToMarkdown(adf interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+func ConvertADFToMarkdown(adf any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
 	if adf == nil {
 		return ""
 	}
 	if str, ok := adf.(string); ok {
 		return str
 	}
-	adfMap, ok := adf.(map[string]interface{})
+	adfMap, ok := adf.(map[string]any)
 	if !ok {
 		return ""
 	}
-	content, ok := adfMap["content"].([]interface{})
+	content, ok := adfMap["content"].([]any)
 	if !ok {
 		return ""
 	}
@@ -374,8 +430,8 @@ func ConvertADFToMarkdown(adf interface{}, mentionResolver MentionResolver, medi
 
 // convertADFNode converts a single ADF node to Markdown,
 // consulting the resolvers (when non-nil) for `mention` and `media` nodes.
-func convertADFNode(node interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
-	nodeMap, ok := node.(map[string]interface{})
+func convertADFNode(node any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+	nodeMap, ok := node.(map[string]any)
 	if !ok {
 		return ""
 	}
@@ -388,7 +444,7 @@ func convertADFNode(node interface{}, mentionResolver MentionResolver, mediaReso
 	case "heading":
 		// Guard each step: a missing or non-map attrs would otherwise nil-deref,
 		// and a non-float64 level would silently produce a heading with zero "#".
-		attrs, _ := nodeMap["attrs"].(map[string]interface{})
+		attrs, _ := nodeMap["attrs"].(map[string]any)
 		levelF, _ := attrs["level"].(float64)
 		level := int(levelF)
 		if level < 1 || level > 6 {
@@ -402,7 +458,7 @@ func convertADFNode(node interface{}, mentionResolver MentionResolver, mediaReso
 		return convertADFOrderedList(nodeMap, mentionResolver, mediaResolver)
 	case "codeBlock":
 		lang := ""
-		if attrs, ok := nodeMap["attrs"].(map[string]interface{}); ok {
+		if attrs, ok := nodeMap["attrs"].(map[string]any); ok {
 			lang, _ = attrs["language"].(string)
 		}
 		return "```" + lang + "\n" + convertADFContent(nodeMap, mentionResolver, mediaResolver) + "\n```\n\n"
@@ -438,9 +494,9 @@ func convertADFNode(node interface{}, mentionResolver MentionResolver, mediaReso
 	case "text":
 		text, _ := nodeMap["text"].(string)
 		// Apply marks (bold, italic, etc.)
-		if marks, ok := nodeMap["marks"].([]interface{}); ok {
+		if marks, ok := nodeMap["marks"].([]any); ok {
 			for _, mark := range marks {
-				markMap, _ := mark.(map[string]interface{})
+				markMap, _ := mark.(map[string]any)
 				markType, _ := markMap["type"].(string)
 				switch markType {
 				case "strong":
@@ -452,7 +508,7 @@ func convertADFNode(node interface{}, mentionResolver MentionResolver, mediaReso
 				case "strike":
 					text = "~~" + text + "~~"
 				case "link":
-					if attrs, ok := markMap["attrs"].(map[string]interface{}); ok {
+					if attrs, ok := markMap["attrs"].(map[string]any); ok {
 						href, _ := attrs["href"].(string)
 						text = "[" + text + "](" + href + ")"
 					}
@@ -463,7 +519,7 @@ func convertADFNode(node interface{}, mentionResolver MentionResolver, mediaReso
 	case "hardBreak":
 		return "\n"
 	case "mention":
-		attrs, ok := nodeMap["attrs"].(map[string]interface{})
+		attrs, ok := nodeMap["attrs"].(map[string]any)
 		if !ok {
 			return ""
 		}
@@ -490,25 +546,25 @@ func convertADFNode(node interface{}, mentionResolver MentionResolver, mediaReso
 	}
 }
 
-func convertADFTable(nodeMap map[string]interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
-	rowsRaw, ok := nodeMap["content"].([]interface{})
+func convertADFTable(nodeMap map[string]any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+	rowsRaw, ok := nodeMap["content"].([]any)
 	if !ok || len(rowsRaw) == 0 {
 		return ""
 	}
 
 	rows := make([][]string, 0, len(rowsRaw))
 	for _, rowRaw := range rowsRaw {
-		rowMap, ok := rowRaw.(map[string]interface{})
+		rowMap, ok := rowRaw.(map[string]any)
 		if !ok {
 			continue
 		}
-		cellsRaw, ok := rowMap["content"].([]interface{})
+		cellsRaw, ok := rowMap["content"].([]any)
 		if !ok {
 			continue
 		}
 		row := make([]string, 0, len(cellsRaw))
 		for _, cellRaw := range cellsRaw {
-			cellMap, ok := cellRaw.(map[string]interface{})
+			cellMap, ok := cellRaw.(map[string]any)
 			if !ok {
 				continue
 			}
@@ -569,9 +625,9 @@ func writeMarkdownTableRow(out *strings.Builder, cells []string) {
 	out.WriteString(" |\n")
 }
 
-func convertADFPanel(nodeMap map[string]interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+func convertADFPanel(nodeMap map[string]any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
 	panelType := "info"
-	if attrs, ok := nodeMap["attrs"].(map[string]interface{}); ok {
+	if attrs, ok := nodeMap["attrs"].(map[string]any); ok {
 		if raw, _ := attrs["panelType"].(string); raw != "" {
 			panelType = raw
 		}
@@ -592,19 +648,19 @@ func convertADFPanel(nodeMap map[string]interface{}, mentionResolver MentionReso
 	return out.String()
 }
 
-func convertADFTaskList(nodeMap map[string]interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
-	items, ok := nodeMap["content"].([]interface{})
+func convertADFTaskList(nodeMap map[string]any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+	items, ok := nodeMap["content"].([]any)
 	if !ok {
 		return ""
 	}
 	var out strings.Builder
 	for _, item := range items {
-		itemMap, ok := item.(map[string]interface{})
+		itemMap, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
 		state := "TODO"
-		if attrs, ok := itemMap["attrs"].(map[string]interface{}); ok {
+		if attrs, ok := itemMap["attrs"].(map[string]any); ok {
 			state, _ = attrs["state"].(string)
 		}
 		checkbox := "[ ]"
@@ -621,8 +677,8 @@ func convertADFTaskList(nodeMap map[string]interface{}, mentionResolver MentionR
 	return out.String()
 }
 
-func convertADFCard(nodeMap map[string]interface{}) string {
-	attrs, ok := nodeMap["attrs"].(map[string]interface{})
+func convertADFCard(nodeMap map[string]any) string {
+	attrs, ok := nodeMap["attrs"].(map[string]any)
 	if !ok {
 		return ""
 	}
@@ -633,8 +689,8 @@ func convertADFCard(nodeMap map[string]interface{}) string {
 	return "[" + url + "](" + url + ")"
 }
 
-func convertADFMedia(nodeMap map[string]interface{}, mediaResolver MediaResolver) string {
-	attrs, ok := nodeMap["attrs"].(map[string]interface{})
+func convertADFMedia(nodeMap map[string]any, mediaResolver MediaResolver) string {
+	attrs, ok := nodeMap["attrs"].(map[string]any)
 	if !ok {
 		return "[media]"
 	}
@@ -655,9 +711,49 @@ func convertADFMedia(nodeMap map[string]interface{}, mediaResolver MediaResolver
 	return "[media: " + alt + "]"
 }
 
-func convertADFExpand(nodeMap map[string]interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+// IsADFDocument reports whether a decoded Jira field value is an Atlassian
+// Document Format document rather than a plain string or option object.
+func IsADFDocument(value any) bool {
+	doc, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	nodeType, _ := doc["type"].(string)
+	return nodeType == "doc"
+}
+
+// CollectADFMediaIDs returns every Jira attachment id referenced by `media`
+// nodes in an ADF document. Callers use it to decide which imported
+// attachments are linked from a body a portal customer can see.
+func CollectADFMediaIDs(adf any) map[string]bool {
+	ids := make(map[string]bool)
+	collectADFMediaIDs(adf, ids)
+	return ids
+}
+
+func collectADFMediaIDs(node any, ids map[string]bool) {
+	switch typed := node.(type) {
+	case []any:
+		for _, child := range typed {
+			collectADFMediaIDs(child, ids)
+		}
+	case map[string]any:
+		if nodeType, _ := typed["type"].(string); nodeType == "media" {
+			if attrs, ok := typed["attrs"].(map[string]any); ok {
+				if id, _ := attrs["id"].(string); id != "" {
+					ids[id] = true
+				}
+			}
+		}
+		if content, ok := typed["content"].([]any); ok {
+			collectADFMediaIDs(content, ids)
+		}
+	}
+}
+
+func convertADFExpand(nodeMap map[string]any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
 	title := "Details"
-	if attrs, ok := nodeMap["attrs"].(map[string]interface{}); ok {
+	if attrs, ok := nodeMap["attrs"].(map[string]any); ok {
 		if raw, _ := attrs["title"].(string); strings.TrimSpace(raw) != "" {
 			title = strings.TrimSpace(raw)
 		}
@@ -669,8 +765,8 @@ func convertADFExpand(nodeMap map[string]interface{}, mentionResolver MentionRes
 	return "<details>\n<summary>" + title + "</summary>\n\n" + content + "\n\n</details>\n\n"
 }
 
-func convertADFStatus(nodeMap map[string]interface{}) string {
-	attrs, ok := nodeMap["attrs"].(map[string]interface{})
+func convertADFStatus(nodeMap map[string]any) string {
+	attrs, ok := nodeMap["attrs"].(map[string]any)
 	if !ok {
 		return ""
 	}
@@ -681,16 +777,16 @@ func convertADFStatus(nodeMap map[string]interface{}) string {
 	return "[" + strings.TrimSpace(text) + "]"
 }
 
-func convertADFEmoji(nodeMap map[string]interface{}) string {
-	attrs, ok := nodeMap["attrs"].(map[string]interface{})
+func convertADFEmoji(nodeMap map[string]any) string {
+	attrs, ok := nodeMap["attrs"].(map[string]any)
 	if !ok {
 		return ""
 	}
 	return firstADFAttrString(attrs, "text", "shortName", "id")
 }
 
-func convertADFDate(nodeMap map[string]interface{}) string {
-	attrs, ok := nodeMap["attrs"].(map[string]interface{})
+func convertADFDate(nodeMap map[string]any) string {
+	attrs, ok := nodeMap["attrs"].(map[string]any)
 	if !ok {
 		return ""
 	}
@@ -705,7 +801,7 @@ func convertADFDate(nodeMap map[string]interface{}) string {
 	return time.UnixMilli(millis).UTC().Format("2006-01-02")
 }
 
-func firstADFAttrString(attrs map[string]interface{}, keys ...string) string {
+func firstADFAttrString(attrs map[string]any, keys ...string) string {
 	for _, key := range keys {
 		if raw, _ := attrs[key].(string); strings.TrimSpace(raw) != "" {
 			return strings.TrimSpace(raw)
@@ -726,8 +822,8 @@ func collapseMarkdownWhitespace(value string) string {
 	return strings.Join(clean, " ")
 }
 
-func convertADFContent(nodeMap map[string]interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
-	content, ok := nodeMap["content"].([]interface{})
+func convertADFContent(nodeMap map[string]any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+	content, ok := nodeMap["content"].([]any)
 	if !ok {
 		// Check for direct text
 		if text, ok := nodeMap["text"].(string); ok {
@@ -743,15 +839,15 @@ func convertADFContent(nodeMap map[string]interface{}, mentionResolver MentionRe
 	return result.String()
 }
 
-func convertADFList(nodeMap map[string]interface{}, prefix string, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
-	items, ok := nodeMap["content"].([]interface{})
+func convertADFList(nodeMap map[string]any, prefix string, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+	items, ok := nodeMap["content"].([]any)
 	if !ok {
 		return ""
 	}
 
 	var result strings.Builder
 	for _, item := range items {
-		itemMap, ok := item.(map[string]interface{})
+		itemMap, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -760,15 +856,15 @@ func convertADFList(nodeMap map[string]interface{}, prefix string, mentionResolv
 	return result.String() + "\n"
 }
 
-func convertADFOrderedList(nodeMap map[string]interface{}, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
-	items, ok := nodeMap["content"].([]interface{})
+func convertADFOrderedList(nodeMap map[string]any, mentionResolver MentionResolver, mediaResolver MediaResolver) string {
+	items, ok := nodeMap["content"].([]any)
 	if !ok {
 		return ""
 	}
 
 	var result strings.Builder
 	for i, item := range items {
-		itemMap, ok := item.(map[string]interface{})
+		itemMap, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}

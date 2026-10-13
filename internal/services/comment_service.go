@@ -6,18 +6,29 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
+	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
-	"windshift/internal/sanitize"
+	"windshift/internal/validation"
 )
 
 // WebhookDispatcher is an interface for dispatching webhook events.
 // This avoids an import cycle with the webhook package.
 type WebhookDispatcher interface {
 	DispatchEvent(eventType string, item *models.Item)
+}
+
+// InactivityMarkClearer re-arms item_inactive triggers after comment
+// activity (WI-1132).
+type InactivityMarkClearer interface {
+	ClearItemMarks(itemID int) error
 }
 
 // EmailReplyHandler is an interface for handling outbound email replies on comment creation.
@@ -36,6 +47,42 @@ type HandleCommentParams struct {
 	IsPrivate        bool
 }
 
+const (
+	DefaultCommentFeedLimit = 25
+	MaxCommentFeedLimit     = 100
+)
+
+// CommentFeedCursor identifies one row in the merged comments/approval feed.
+// IDs are signed because approval decision comments use negative IDs.
+type CommentFeedCursor struct {
+	CreatedAt time.Time
+	ID        int
+}
+
+// CommentFeedOptions controls bounded reads from the merged comment feed.
+// Before pages toward older rows. Since reads only rows newer than the cursor.
+type CommentFeedOptions struct {
+	Limit  int
+	Before *CommentFeedCursor
+	Since  *CommentFeedCursor
+}
+
+// CommentFeedPage is a bounded slice of the merged comment feed. HasMore
+// applies in the requested direction: older for default/before reads and newer
+// for since reads.
+type CommentFeedPage struct {
+	Comments []models.Comment
+	HasMore  bool
+}
+
+// ItemCommentSummary is the bounded comment projection used to assemble an
+// item briefing without exposing comment persistence to HTTP handlers.
+type ItemCommentSummary struct {
+	Content   string
+	Author    string
+	CreatedAt time.Time
+}
+
 // AgentMentionTrigger is the coding-agent harness's interest in new
 // comments (WI-264): @mentions of a binding's acting user start a run on
 // the commented item. Kept as an interface so CommentService stays
@@ -44,16 +91,70 @@ type AgentMentionTrigger interface {
 	MaybeStartRunsForMentions(ctx context.Context, workspaceID, itemID int, mentionedUserIDs []int, commentAuthorID int, commentBody string, commentID int) error
 }
 
+// CommentIssueSync mirrors committed public comments to linked external issues.
+type CommentIssueSync interface {
+	PushCommentToGitHub(context.Context, int, int, int, string)
+	PushCommentUpdateToGitHub(context.Context, int, int, string)
+}
+
 // CommentService encapsulates comment creation logic used by both HTTP handlers
 // and action automation service.
 type CommentService struct {
 	db                  database.Database
+	itemRepo            *repository.ItemRepository
+	approvalService     *ApprovalService
 	activityTracker     *ActivityTracker
 	notificationService *NotificationService
 	mentionService      *MentionService
 	webhookSender       WebhookDispatcher
+	actionEvents        ActionEventEmitter
+	inactivityMarks     InactivityMarkClearer
 	emailReplyService   EmailReplyHandler
 	agentMentionTrigger AgentMentionTrigger
+	issueSync           CommentIssueSync
+}
+
+type CaptureComment struct {
+	ID             int
+	AuthorUsername string
+	Content        string
+	CreatedAt      string
+}
+
+// ListCaptureComments returns mapped comments that still belong to the item.
+func (s *CommentService) ListCaptureComments(itemID int, commentIDs []int) ([]CaptureComment, error) {
+	if len(commentIDs) == 0 {
+		return []CaptureComment{}, nil
+	}
+	placeholders := make([]string, len(commentIDs))
+	args := make([]any, 0, len(commentIDs)+1)
+	args = append(args, itemID)
+	for i, id := range commentIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	rows, err := s.db.Query(`
+		SELECT c.id, COALESCE(u.username, ''), COALESCE(c.content, ''), CAST(c.created_at AS TEXT)
+		FROM comments c
+		LEFT JOIN users u ON u.id = c.author_id
+		WHERE c.item_id = ? AND c.id IN (`+strings.Join(placeholders, ",")+`)
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list capture comments: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []CaptureComment{}
+	for rows.Next() {
+		var comment CaptureComment
+		if err := rows.Scan(&comment.ID, &comment.AuthorUsername, &comment.Content, &comment.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan capture comment: %w", err)
+		}
+		out = append(out, comment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate capture comments: %w", err)
+	}
+	return out, nil
 }
 
 // CreateCommentParams contains the parameters for creating a comment.
@@ -67,6 +168,8 @@ type CreateCommentParams struct {
 	CreatedAt             *time.Time // Optional: override created_at (e.g. for imports preserving original timestamps)
 	UpdatedAt             *time.Time // Optional: override updated_at (imports preserving original timestamps); defaults to created_at
 	SuppressNotifications bool       // Skip notifications, mentions, webhooks, and email replies (e.g. plugin-created comments)
+	SuppressActionEvents  bool       // Skip the comment_created automation trigger (WI-1142 loop guard for automation-authored comments)
+	EventMetadata         itemevents.Metadata
 }
 
 // CreateCommentResult contains the result of creating a comment.
@@ -78,13 +181,111 @@ type CreateCommentResult struct {
 // NewCommentService creates a new CommentService.
 func NewCommentService(db database.Database) *CommentService {
 	return &CommentService{
-		db: db,
+		db:       db,
+		itemRepo: repository.NewItemRepository(db),
 	}
+}
+
+// MoveCommentsToItem re-parents every comment of one ticket onto another
+// within the caller's transaction — the merge primitive. When makePrivate is
+// set (requesters differ), moved comments become internal so the destination
+// ticket's requester is never exposed to another customer's content in the
+// portal; agents keep the full thread with per-comment attribution. The
+// caller owns the surrounding transaction and the item-change publication for
+// both items.
+func (s *CommentService) MoveCommentsToItem(tx database.Tx, fromItemID, toItemID int64, makePrivate bool) (int64, error) {
+	query := `UPDATE comments SET item_id = ?, is_private = TRUE WHERE item_id = ?`
+	if !makePrivate {
+		query = `UPDATE comments SET item_id = ? WHERE item_id = ?`
+	}
+	res, err := tx.Exec(query, toItemID, fromItemID)
+	if err != nil {
+		return 0, fmt.Errorf("move comments from item %d to %d: %w", fromItemID, toItemID, err)
+	}
+	return res.RowsAffected()
+}
+
+// MoveCommentsByID re-parents the selected comments from fromItemID onto
+// toItemID within the caller's transaction — the split primitive. moved must
+// equal len(commentIDs); a mismatch means some comments do not belong to
+// fromItemID and the caller should fail the transaction. The caller owns the
+// surrounding transaction and the item-change publication for both items.
+func (s *CommentService) MoveCommentsByID(tx database.Tx, fromItemID, toItemID int64, commentIDs []int64) (int64, error) {
+	if len(commentIDs) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.Repeat("?,", len(commentIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, len(commentIDs)+2)
+	args = append(args, toItemID, fromItemID)
+	for _, id := range commentIDs {
+		args = append(args, id)
+	}
+	res, err := tx.Exec(
+		`UPDATE comments SET item_id = ? WHERE item_id = ? AND id IN (`+placeholders+`)`,
+		args...,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("move %d comments from item %d to item %d: %w", len(commentIDs), fromItemID, toItemID, err)
+	}
+	return res.RowsAffected()
+}
+
+// ListRecentSummaries returns the newest comments for an item.
+func (s *CommentService) ListRecentSummaries(itemID, limit int) ([]ItemCommentSummary, error) {
+	if limit <= 0 {
+		return []ItemCommentSummary{}, nil
+	}
+	rows, err := s.db.Query(`
+		SELECT c.content,
+		       COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), 'Unknown'),
+		       c.created_at
+		FROM comments c
+		LEFT JOIN users u ON c.author_id = u.id
+		WHERE c.item_id = ?
+		ORDER BY c.created_at DESC
+		LIMIT ?
+	`, itemID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent comments for item %d: %w", itemID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]ItemCommentSummary, 0)
+	for rows.Next() {
+		var summary ItemCommentSummary
+		if err := rows.Scan(&summary.Content, &summary.Author, &summary.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan recent comment for item %d: %w", itemID, err)
+		}
+		out = append(out, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent comments for item %d: %w", itemID, err)
+	}
+	return out, nil
 }
 
 // SetActivityTracker sets the activity tracker for tracking comment activity.
 func (s *CommentService) SetActivityTracker(tracker *ActivityTracker) {
 	s.activityTracker = tracker
+}
+
+// SetApprovalService wires the approval domain backing the merged comment
+// feed's decision rows. Optional: nil keeps the feed human-only.
+func (s *CommentService) SetApprovalService(as *ApprovalService) {
+	s.approvalService = as
+}
+
+func (s *CommentService) approvalReader() *ApprovalService {
+	if s.approvalService != nil {
+		return s.approvalService
+	}
+	return NewApprovalService(s.db, nil, nil)
+}
+
+// UserCanReadItemAsApprover reports whether an active approval assignment grants comment context access.
+func (s *CommentService) UserCanReadItemAsApprover(ctx context.Context, userID, itemID int) (bool, error) {
+	return s.approvalReader().UserHasActivePoolMembershipOnItem(ctx, userID, itemID, nil)
 }
 
 // SetNotificationService sets the notification service for emitting comment events.
@@ -102,6 +303,18 @@ func (s *CommentService) SetWebhookSender(ws WebhookDispatcher) {
 	s.webhookSender = ws
 }
 
+// SetActionEventEmitter wires the comment_created automation trigger.
+func (s *CommentService) SetActionEventEmitter(e ActionEventEmitter) {
+	s.actionEvents = e
+}
+
+// SetInactivityMarkClearer wires inactivity re-arming on comment activity.
+func (s *CommentService) SetInactivityMarkClearer(c InactivityMarkClearer) {
+	if c != nil {
+		s.inactivityMarks = c
+	}
+}
+
 // SetEmailReplyService sets the email reply service for sending threaded replies to portal customers.
 func (s *CommentService) SetEmailReplyService(ers EmailReplyHandler) {
 	s.emailReplyService = ers
@@ -113,47 +326,154 @@ func (s *CommentService) SetAgentMentionTrigger(trigger AgentMentionTrigger) {
 	s.agentMentionTrigger = trigger
 }
 
-// Create creates a new comment with all associated side effects:
-// activity tracking, notifications, mentions, and webhooks.
-// Comment-table SQL lives here and nowhere else: every comment write in the
-// codebase (internal, v1, portal, GitHub sync, email, import, agent) goes
-// through CommentService, so the after-commit item-change publish (WI-483)
-// cannot be bypassed. A guard test fails if a direct comments-table write
-// appears outside this file.
+// SetIssueSync wires optional external issue comment mirroring.
+func (s *CommentService) SetIssueSync(sync CommentIssueSync) {
+	s.issueSync = sync
+}
+
+// All comment writes use CommentService so side effects and post-commit item changes cannot be bypassed.
 const (
-	insertCommentAuthorSQL = `INSERT INTO comments (item_id, author_id, content, is_private, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
-	insertCommentPortalSQL = `INSERT INTO comments (item_id, portal_customer_id, content, is_private, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
-	updateCommentSQL       = `UPDATE comments SET content = ?, updated_at = ? WHERE id = ?`
-	deleteCommentSQL       = `DELETE FROM comments WHERE id = ?`
+	insertCommentAuthorSQL   = `INSERT INTO comments (item_id, author_id, content, is_private, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
+	insertCommentPortalSQL   = `INSERT INTO comments (item_id, portal_customer_id, content, is_private, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id`
+	updateCommentSQL         = `UPDATE comments SET content = ?, updated_at = ? WHERE id = ?`
+	updateImportedCommentSQL = `UPDATE comments
+		SET item_id = ?, author_id = NULLIF(?, 0), portal_customer_id = ?,
+		    content = ?, is_private = ?,
+		    created_at = COALESCE(?, created_at),
+		    updated_at = COALESCE(?, updated_at)
+		WHERE id = ?`
+	deleteCommentSQL = `DELETE FROM comments WHERE id = ?`
 )
 
+// UpdateImportedCommentParams is the complete mutable contract for a comment
+// being reconciled from an external system. It intentionally bypasses
+// notifications and mentions while retaining the comment write chokepoint and
+// publishing the committed item change.
+type UpdateImportedCommentParams struct {
+	CommentID        int
+	ItemID           int
+	AuthorID         int
+	PortalCustomerID *int
+	Content          string
+	IsPrivate        bool
+	CreatedAt        *time.Time
+	UpdatedAt        *time.Time
+}
+
+func (s *CommentService) UpdateImported(params UpdateImportedCommentParams) error {
+	params.Content = normalizeImportedCommentSource(params.Content)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin imported comment update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.Exec(
+		updateImportedCommentSQL,
+		params.ItemID,
+		params.AuthorID,
+		params.PortalCustomerID,
+		params.Content,
+		params.IsPrivate,
+		params.CreatedAt,
+		params.UpdatedAt,
+		params.CommentID,
+	)
+	if err != nil {
+		return fmt.Errorf("update imported comment: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return fmt.Errorf("imported comment %d no longer exists", params.CommentID)
+	}
+	activityAt := time.Now()
+	if params.UpdatedAt != nil {
+		activityAt = *params.UpdatedAt
+	}
+	if err := repository.NewItemRepository(s.db).TouchActivity(tx, params.ItemID, activityAt); err != nil {
+		return fmt.Errorf("touch imported comment item activity: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit imported comment update: %w", err)
+	}
+	PublishItemChange(params.ItemID)
+	return nil
+}
+
 // CreateInTx inserts a comment row inside an existing transaction and returns
-// its id, with NO side-effects (no notifications, activity bump, or publish).
+// its id, with no post-commit side effects. The canonical domain fact is part
+// of the caller-owned transaction.
 // Callers that must write a comment atomically with other rows — GitHub issue
 // sync writes its tracking rows in the same tx — use this and publish
 // themselves after they commit. authorID == 0 inserts a system (NULL author)
 // comment.
-func (s *CommentService) CreateInTx(ctx context.Context, tx database.Tx, itemID, authorID int, content string, createdAt time.Time) (int64, error) {
-	var author interface{}
+func (s *CommentService) CreateInTx(ctx context.Context, tx database.Tx, itemID, authorID int, content string, createdAt time.Time, eventMetadata ...itemevents.Metadata) (int64, error) {
+	content = normalizeImportedCommentSource(content)
+	var author any
 	if authorID != 0 {
 		author = authorID
 	}
 	var id int64
-	err := tx.QueryRowContext(ctx, insertCommentAuthorSQL, itemID, author, sanitize.Comment.Sanitize(content), false, createdAt, createdAt).Scan(&id)
+	err := tx.QueryRowContext(ctx, insertCommentAuthorSQL, itemID, author, content, false, createdAt, createdAt).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	var workspaceID int
+	if err := tx.QueryRowContext(ctx, "SELECT workspace_id FROM items WHERE id = ?", itemID).Scan(&workspaceID); err != nil {
+		return 0, fmt.Errorf("load comment item workspace: %w", err)
+	}
+	metadata := itemevents.System("external_sync")
+	if authorID > 0 {
+		metadata = itemevents.User(authorID, "external_sync")
+	}
+	metadata.OccurredAt = createdAt
+	if len(eventMetadata) > 0 {
+		metadata = mergeItemEventMetadata(eventMetadata[0], metadata)
+	}
+	var authorIDPtr *int
+	if authorID > 0 {
+		authorIDPtr = &authorID
+	}
+	_, err = itemevents.NewRecorder(s.db).CommentCreated(ctx, tx, workspaceID, itemevents.CommentCreatedV1{
+		ItemID: itemID, CommentID: id, AuthorID: authorIDPtr, SuppressSideEffects: true,
+	}, metadata)
+	if err == nil && authorID > 0 {
+		err = repository.NewItemSupportEventRepository(s.db).RecordFirstResponse(tx, itemID, createdAt)
+	}
 	return id, err
 }
 
 // UpdateContentInTx updates a comment's content inside an existing transaction,
 // with no side-effects/publish (the caller publishes after it commits).
 func (s *CommentService) UpdateContentInTx(ctx context.Context, tx database.Tx, commentID int, content string, updatedAt time.Time) error {
-	_, err := tx.ExecContext(ctx, updateCommentSQL, sanitize.Comment.Sanitize(content), updatedAt, commentID)
+	content = normalizeImportedCommentSource(content)
+	_, err := tx.ExecContext(ctx, updateCommentSQL, content, updatedAt, commentID)
 	return err
 }
 
 func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResult, error) {
-	// 1. Sanitize content (XSS prevention — strips HTML tags + dangerous Markdown URLs)
-	sanitizedContent := sanitize.Comment.Sanitize(params.Content)
+	if err := validateCommentSource(params.Content); err != nil {
+		return nil, err
+	}
+	return s.create(params)
+}
 
+// CreateImported creates a comment from an external system without rejecting
+// the surrounding import when its source needs UTF-8 repair or truncation.
+func (s *CommentService) CreateImported(params CreateCommentParams) (*CreateCommentResult, error) {
+	params.Content = normalizeImportedCommentSource(params.Content)
+	if params.EventMetadata.SourceKind == "" {
+		params.EventMetadata.SourceKind = "import"
+	}
+	return s.create(params)
+}
+
+// isPublicAgentComment reports whether a comment counts as the
+// customer-visible response for support metrics (WI-1133): not private and
+// written by a user rather than a portal customer or the system.
+func isPublicAgentComment(isPrivate bool, authorID int, portalCustomerID *int) bool {
+	return !isPrivate && authorID > 0 && portalCustomerID == nil
+}
+
+func (s *CommentService) create(params CreateCommentParams) (*CreateCommentResult, error) {
 	// 2. Get item details for notifications and the webhook payload
 	item, err := repository.NewItemRepository(s.db).FindByIDWithDetails(params.ItemID)
 	if err != nil {
@@ -161,6 +481,11 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 			return nil, fmt.Errorf("item not found: %d", params.ItemID)
 		}
 		return nil, fmt.Errorf("failed to fetch item details: %w", err)
+	}
+	// A merged duplicate is a read-only redirect: comments belong on the
+	// canonical ticket (WI-1528).
+	if mergedInto, err := repository.NewItemRepository(s.db).MergedIntoItemID(context.Background(), params.ItemID); err == nil && mergedInto != nil {
+		return nil, NewServiceError(409, fmt.Sprintf("item %d was merged into item %d; comment on the canonical ticket instead", params.ItemID, *mergedInto))
 	}
 
 	// 3. Insert into DB
@@ -173,35 +498,75 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 		updatedAt = *params.UpdatedAt
 	}
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin comment transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var commentID int64
 	if params.PortalCustomerID != nil && params.AuthorID == 0 {
 		// Portal customer without linked user — insert with portal_customer_id
-		err = s.db.QueryRow(insertCommentPortalSQL,
-			params.ItemID, *params.PortalCustomerID, sanitizedContent, params.IsPrivate, now, updatedAt).Scan(&commentID)
+		err = tx.QueryRow(insertCommentPortalSQL,
+			params.ItemID, *params.PortalCustomerID, params.Content, params.IsPrivate, now, updatedAt).Scan(&commentID)
 	} else {
 		// Internal user or portal customer with linked user; AuthorID == 0 with no
 		// portal customer inserts a system (NULL author) comment.
-		var authorID interface{}
+		var authorID any
 		if params.AuthorID != 0 {
 			authorID = params.AuthorID
 		}
-		err = s.db.QueryRow(insertCommentAuthorSQL,
-			params.ItemID, authorID, sanitizedContent, params.IsPrivate, now, updatedAt).Scan(&commentID)
+		err = tx.QueryRow(insertCommentAuthorSQL,
+			params.ItemID, authorID, params.Content, params.IsPrivate, now, updatedAt).Scan(&commentID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create comment: %w", err)
 	}
+	if err := repository.NewItemRepository(s.db).TouchActivity(tx, params.ItemID, now); err != nil {
+		return nil, fmt.Errorf("failed to record comment activity: %w", err)
+	}
+	fallback := itemevents.System("application")
+	var authorID *int
+	switch {
+	case params.PortalCustomerID != nil && params.AuthorID == 0:
+		fallback = itemevents.PortalCustomer(*params.PortalCustomerID, "portal")
+	case params.ActorUserID > 0:
+		fallback = itemevents.User(params.ActorUserID, "application")
+	case params.AuthorID > 0:
+		fallback = itemevents.User(params.AuthorID, "application")
+	}
+	if params.AuthorID > 0 {
+		authorID = &params.AuthorID
+	}
+	fallback.OccurredAt = now
+	metadata := mergeItemEventMetadata(params.EventMetadata, fallback)
+	if _, err := itemevents.NewRecorder(s.db).CommentCreated(context.Background(), tx, item.WorkspaceID, itemevents.CommentCreatedV1{
+		ItemID: params.ItemID, CommentID: commentID, AuthorID: authorID,
+		PortalCustomerID: params.PortalCustomerID, IsPrivate: params.IsPrivate,
+		SuppressSideEffects: params.SuppressNotifications,
+	}, metadata); err != nil {
+		return nil, err
+	}
+	if isPublicAgentComment(params.IsPrivate, params.AuthorID, params.PortalCustomerID) {
+		if err := repository.NewItemSupportEventRepository(s.db).RecordFirstResponse(tx, params.ItemID, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit comment: %w", err)
+	}
 
-	// 3b. Bump the item's recency so it floats to the top of the board's Bubble
-	// Mode sort. Every comment entry point (internal, v1, email, portal, agent)
-	// flows through here, so this is the single choke point. Best-effort: a
-	// failed bump must not fail the comment write.
-	if err := repository.NewItemRepository(s.db).TouchActivity(s.db, params.ItemID, now); err != nil {
-		slog.Warn("failed to bump item last_active_at on comment",
-			slog.String("component", "comment_service"),
-			slog.Int("item_id", params.ItemID),
-			slog.Any("error", err),
-		)
+	// Agent replies on customer-facing tickets are the helpdesk communication
+	// history (WI-1142); internal notes, internal items, and portal replies
+	// are not audited here.
+	if isPublicAgentComment(params.IsPrivate, params.AuthorID, params.PortalCustomerID) &&
+		(item.ChannelID != nil || item.CreatorPortalCustomerID != nil) {
+		commentID := int(commentID)
+		emitServiceAudit(s.db, AuditActor{UserID: params.ActorUserID, Username: ""},
+			logger.ActionCommentCreate, logger.ResourceComment, &commentID, "", map[string]any{
+				"item_id": params.ItemID,
+				"kind":    "customer_reply",
+			})
 	}
 
 	// 4. Track activity (if activityTracker != nil)
@@ -218,23 +583,18 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 
 	// Steps 5-8: notifications, mentions, webhooks, and email replies (skipped when SuppressNotifications is true)
 	if !params.SuppressNotifications {
-		// 4b. Auto-subscribe the commenter so they're notified of replies
-		// (GitHub/Jira-style "follow on comment"). Without this a user who
-		// joins a thread by commenting never learns of later replies unless
-		// they happen to be the assignee/creator. AddWatch is an idempotent
-		// upsert keyed on (user_id, item_id), so repeat comments are cheap and
-		// a previously-unwatched item is re-followed. ActorUserID 0 means a
-		// portal customer with no user row to watch with — skip those.
-		// Agents are watched too but never receive notifications: the recipient
-		// fan-out filters is_agent users (notification_service.agentOrUnknownUsers).
+		// Idempotently follow internal commenters for reply notifications. Portal
+		// customers have no user watch; agent recipients are filtered downstream.
 		if s.activityTracker != nil && params.ActorUserID > 0 {
-			if err := s.activityTracker.AddWatch(params.ActorUserID, params.ItemID, "Commented on item"); err != nil {
+			if err := s.itemRepo.Watch(params.ActorUserID, params.ItemID, "Commented on item"); err != nil {
 				slog.Warn("failed to auto-subscribe commenter to item",
 					slog.String("component", "comment_service"),
 					slog.Int("item_id", params.ItemID),
 					slog.Int("actor_user_id", params.ActorUserID),
 					slog.Any("error", err),
 				)
+			} else {
+				_ = s.activityTracker.InvalidateUserCache(params.ActorUserID)
 			}
 		}
 
@@ -276,7 +636,7 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 				AssigneeID:  item.AssigneeID,
 				CreatorID:   item.CreatorID,
 				Title:       "New Comment Added",
-				TemplateData: map[string]interface{}{
+				TemplateData: map[string]any{
 					"item.title": item.Title,
 					"item.key":   itemKey,
 					"item.id":    params.ItemID,
@@ -304,30 +664,19 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 			}
 		}
 
-		// 6b. Coding-agent @mention trigger (WI-264). Create-only by
-		// construction: this hook lives here and not in ProcessMentions,
-		// which also runs on comment EDITS — adding an @ by editing must
-		// not re-trigger. Portal-customer comments (ActorUserID 0) are
-		// skipped: the trigger needs a real user as the run's credential
-		// principal (WI-275). Failures are logged, never surfaced — a
-		// refused run must not block the comment.
+		// Create-only agent mention triggers require an internal credential principal;
+		// logged trigger failures never block comments.
 		if s.agentMentionTrigger != nil && s.mentionService != nil && params.ActorUserID > 0 {
-			if ids, err := s.mentionService.ResolveMentionedUserIDs(params.Content); err != nil {
+			if ids, err := s.mentionService.ResolveActionableMentionedUserIDs(params.Content, item.WorkspaceID); err != nil {
 				slog.Warn("failed to resolve mentions for agent trigger",
 					slog.String("component", "comment_service"),
 					slog.Int64("comment_id", commentID),
 					slog.Any("error", err),
 				)
 			} else if len(ids) > 0 {
-				// Background context: the run outlives the comment request,
-				// and a client disconnect must not abort run admission.
-				//
-				// Resolve mentions from the original body (above) but feed the
-				// run instruction the SANITIZED, capped content — the same text
-				// the stored comment shows. Passing params.Content here let a
-				// commenter smuggle oversized/unsafe prompt payloads into
-				// agent_runs.trigger_json that diverged from the visible comment.
-				if err := s.agentMentionTrigger.MaybeStartRunsForMentions(context.Background(), item.WorkspaceID, params.ItemID, ids, params.ActorUserID, sanitizedContent, int(commentID)); err != nil {
+				// Admission outlives client disconnects and uses the stored source so
+				// agent instructions cannot diverge from the visible comment.
+				if err := s.agentMentionTrigger.MaybeStartRunsForMentions(context.Background(), item.WorkspaceID, params.ItemID, ids, params.ActorUserID, params.Content, int(commentID)); err != nil {
 					slog.Warn("coding-agent mention trigger failed",
 						slog.String("component", "comment_service"),
 						slog.Int("item_id", params.ItemID),
@@ -340,7 +689,38 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 
 		// 7. Dispatch webhook (if webhookSender != nil)
 		if s.webhookSender != nil {
-			go s.webhookSender.DispatchEvent("comment.created", item)
+			s.webhookSender.DispatchEvent("comment.created", item)
+		}
+
+		// 7b. Dispatch the comment_created automation trigger (WI-1132).
+		// Admission outlives the request; failures never block comments.
+		// Automation-authored comments never re-enter the trigger: a rule
+		// that posts an agent comment must not be able to trigger itself or
+		// its siblings, which is the one unbounded helpdesk loop (WI-1142).
+		if s.actionEvents != nil && !params.SuppressActionEvents {
+			fromCustomer := params.PortalCustomerID != nil
+			s.actionEvents.EmitActionEvent(&models.ActionEvent{
+				EventType:   models.ActionTriggerCommentCreated,
+				WorkspaceID: item.WorkspaceID,
+				ItemID:      params.ItemID,
+				ActorUserID: params.ActorUserID,
+				ItemTypeID:  item.ItemTypeID,
+				NewValues: map[string]any{
+					"comment_id":            int(commentID),
+					"comment_is_private":    params.IsPrivate,
+					"comment_from_customer": fromCustomer,
+				},
+			})
+		}
+		// Fresh comment activity re-arms item_inactive triggers for the item.
+		if s.inactivityMarks != nil {
+			if err := s.inactivityMarks.ClearItemMarks(params.ItemID); err != nil {
+				slog.Warn("failed to clear inactivity marks",
+					slog.String("component", "comment_service"),
+					slog.Int("item_id", params.ItemID),
+					slog.Any("error", err),
+				)
+			}
 		}
 
 		// 8. Handle outbound email reply (if emailReplyService != nil)
@@ -350,7 +730,7 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 				ItemID:           params.ItemID,
 				AuthorID:         params.AuthorID,
 				PortalCustomerID: params.PortalCustomerID,
-				Content:          sanitizedContent,
+				Content:          params.Content,
 				IsPrivate:        params.IsPrivate,
 			}); err != nil {
 				slog.Warn("failed to handle email reply for comment",
@@ -364,12 +744,33 @@ func (s *CommentService) Create(params CreateCommentParams) (*CreateCommentResul
 
 	// Live-update publish (WI-483): the comment row is committed. Refresh the
 	// item's comment list for anyone viewing it.
-	PublishItemChange(params.ItemID, ItemChangeComment)
+	PublishItemChange(params.ItemID)
+
+	if s.issueSync != nil && !params.IsPrivate && !params.SuppressNotifications && params.AuthorID > 0 {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			s.issueSync.PushCommentToGitHub(ctx, params.ItemID, int(commentID), params.AuthorID, params.Content)
+		}()
+	}
 
 	// 9. Return created comment
 	return &CreateCommentResult{
 		CommentID: commentID,
 	}, nil
+}
+
+// UpdateCommentParams carries transport-neutral actor context for a comment edit.
+type UpdateCommentParams struct {
+	CommentID int
+	Content   string
+	Actor     AuditActor
+}
+
+// DeleteCommentParams carries transport-neutral actor context for a comment deletion.
+type DeleteCommentParams struct {
+	CommentID int
+	Actor     AuditActor
 }
 
 // CommentWithDetails contains a comment with its related details
@@ -383,12 +784,14 @@ type CommentWithDetails struct {
 func (s *CommentService) Get(commentID int) (*CommentWithDetails, error) {
 	var comment CommentWithDetails
 	var authorID, portalCustomerID sql.NullInt64
-	var authorName, authorEmail sql.NullString
+	var authorName, authorEmail, authorAvatar sql.NullString
 
 	err := s.db.QueryRow(`
-		SELECT c.id, c.item_id, c.author_id, c.portal_customer_id, c.content, c.is_private, c.created_at, c.updated_at,
+		SELECT c.id, c.item_id, c.author_id, c.portal_customer_id, c.content, c.is_private,
+		       c.created_at AS feed_created_at, c.updated_at,
 		       COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), pc.name) AS author_name,
 		       COALESCE(u.email, pc.email) AS author_email,
+		       u.avatar_url, 'human' AS source, COALESCE(u.is_agent, FALSE) AS is_agent,
 		       i.workspace_id, i.title
 		FROM comments c
 		LEFT JOIN users u ON c.author_id = u.id
@@ -398,12 +801,12 @@ func (s *CommentService) Get(commentID int) (*CommentWithDetails, error) {
 	`, commentID).Scan(
 		&comment.ID, &comment.ItemID, &authorID, &portalCustomerID, &comment.Content, &comment.IsPrivate,
 		&comment.CreatedAt, &comment.UpdatedAt,
-		&authorName, &authorEmail,
+		&authorName, &authorEmail, &authorAvatar, &comment.Source, &comment.IsAgent,
 		&comment.WorkspaceID, &comment.ItemTitle,
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("comment not found: %d", commentID)
+		return nil, fmt.Errorf("comment %d: %w", commentID, repository.ErrNotFound)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch comment: %w", err)
@@ -423,31 +826,309 @@ func (s *CommentService) Get(commentID int) (*CommentWithDetails, error) {
 	if authorEmail.Valid {
 		comment.AuthorEmail = authorEmail.String
 	}
+	if authorAvatar.Valid {
+		comment.AuthorAvatar = authorAvatar.String
+	}
 
 	return &comment, nil
 }
 
+// GetFeedByItemID returns a bounded cookie-auth comment feed for an item. In
+// addition to ordinary comments it projects approval decision comments into
+// the same model so every HTTP surface reads comment data through this
+// service. Human rows are cursor-filtered and limited in SQL (the dominant
+// population); approval rows come from ApprovalService and are merged in Go so
+// both sources share one stable ordering. Agent-owner attribution is
+// permission-filtered by the caller.
+func (s *CommentService) GetFeedByItemID(itemID int, includeAgentOwner bool, options CommentFeedOptions) (*CommentFeedPage, error) {
+	limit := normalizeCommentFeedLimit(options.Limit)
+	options.Limit = limit
+
+	query := `
+		SELECT c.id AS feed_id, c.item_id, c.author_id, c.portal_customer_id, c.content, c.is_private,
+		       c.created_at AS feed_created_at, c.updated_at,
+		       COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), pc.name, 'Unknown User') AS author_name,
+		       COALESCE(u.email, pc.email) AS author_email, u.avatar_url,
+		       'human' AS source, COALESCE(u.is_agent, FALSE) AS is_agent,
+		       COALESCE(NULLIF(TRIM(COALESCE(owner.first_name, '') || ' ' || COALESCE(owner.last_name, '')), ''), owner.username, '') AS agent_owner_name
+		FROM comments c
+		LEFT JOIN users u ON c.author_id = u.id
+		LEFT JOIN users owner ON owner.id = u.agent_owner_user_id
+		LEFT JOIN portal_customers pc ON c.portal_customer_id = pc.id
+		WHERE c.item_id = ?
+	`
+	args := []any{itemID}
+	order := "DESC"
+	switch {
+	case options.Before != nil:
+		query += ` AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))`
+		args = append(args, options.Before.CreatedAt, options.Before.CreatedAt, options.Before.ID)
+	case options.Since != nil:
+		query += ` AND (c.created_at > ? OR (c.created_at = ? AND c.id > ?))`
+		args = append(args, options.Since.CreatedAt, options.Since.CreatedAt, options.Since.ID)
+		// Return the earliest unseen rows first. If a burst exceeds the limit,
+		// advancing the since cursor cannot skip the rows still to be fetched.
+		order = "ASC"
+	}
+	query += fmt.Sprintf(" ORDER BY c.created_at %s, c.id %s LIMIT ?", order, order)
+	args = append(args, limit+1)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get comment feed for item %d: %w", itemID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	comments := make([]models.Comment, 0, limit+1)
+	for rows.Next() {
+		var comment models.Comment
+		var authorID, portalCustomerID sql.NullInt64
+		var authorName, authorEmail, authorAvatar, agentOwnerName sql.NullString
+		if err := rows.Scan(
+			&comment.ID, &comment.ItemID, &authorID, &portalCustomerID, &comment.Content, &comment.IsPrivate,
+			&comment.CreatedAt, &comment.UpdatedAt, &authorName, &authorEmail, &authorAvatar,
+			&comment.Source, &comment.IsAgent, &agentOwnerName,
+		); err != nil {
+			return nil, fmt.Errorf("scan comment feed for item %d: %w", itemID, err)
+		}
+		if authorID.Valid {
+			id := int(authorID.Int64)
+			comment.AuthorID = &id
+		}
+		if portalCustomerID.Valid {
+			id := int(portalCustomerID.Int64)
+			comment.PortalCustomerID = &id
+		}
+		comment.AuthorName = authorName.String
+		comment.AuthorEmail = authorEmail.String
+		comment.AuthorAvatar = authorAvatar.String
+		if includeAgentOwner {
+			comment.AgentOwnerName = agentOwnerName.String
+		}
+		comments = append(comments, comment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read comment feed for item %d: %w", itemID, err)
+	}
+
+	// Each source applies the same cursor and limit before the bounded results
+	// are merged. Fetching limit+1 from each is sufficient to produce the first
+	// limit+1 rows of their combined ordering.
+	approvalRows, err := s.approvalReader().GetDecisionCommentsForItem(itemID, includeAgentOwner, options)
+	if err != nil {
+		return nil, err
+	}
+	return mergeCommentFeed(comments, approvalRows, limit, order == "ASC"), nil
+}
+
+// mergeCommentFeed combines human and approval comment rows into one stable
+// ordering truncated to limit. asc sorts oldest-first for since cursors;
+// the default is newest-first.
+func mergeCommentFeed(human, approval []models.Comment, limit int, asc bool) *CommentFeedPage {
+	comments := make([]models.Comment, 0, len(human)+len(approval))
+	comments = append(comments, human...)
+	comments = append(comments, approval...)
+	sort.SliceStable(comments, func(i, j int) bool {
+		if comments[i].CreatedAt.Equal(comments[j].CreatedAt) {
+			if asc {
+				return comments[i].ID < comments[j].ID
+			}
+			return comments[i].ID > comments[j].ID
+		}
+		if asc {
+			return comments[i].CreatedAt.Before(comments[j].CreatedAt)
+		}
+		return comments[i].CreatedAt.After(comments[j].CreatedAt)
+	})
+
+	hasMore := len(comments) > limit
+	if hasMore {
+		comments = comments[:limit]
+	}
+	return &CommentFeedPage{Comments: comments, HasMore: hasMore}
+}
+
+// GetFeedByItemIDs returns the newest bounded feed page for each requested
+// item, merging approval decision comments per item exactly like
+// GetFeedByItemID. Cursor options are ignored: every page is the newest one,
+// newest first. Every requested ID gets an entry; items without comments
+// carry an empty page.
+func (s *CommentService) GetFeedByItemIDs(itemIDs []int, includeAgentOwner bool, options CommentFeedOptions) (map[int]*CommentFeedPage, error) {
+	limit := normalizeCommentFeedLimit(options.Limit)
+
+	seen := make(map[int]struct{}, len(itemIDs))
+	ids := make([]int, 0, len(itemIDs))
+	for _, id := range itemIDs {
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	pages := make(map[int]*CommentFeedPage, len(ids))
+	for _, id := range ids {
+		pages[id] = &CommentFeedPage{Comments: []models.Comment{}}
+	}
+	if len(ids) == 0 {
+		return pages, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	// One window query replaces per-item feed queries: rn bounds each item to
+	// its own newest limit+1 rows before the approval merge applies the shared
+	// limit.
+	query := fmt.Sprintf(`
+		SELECT feed_id, item_id, author_id, portal_customer_id, content, is_private,
+		       feed_created_at, updated_at, author_name, author_email, avatar_url,
+		       source, is_agent, agent_owner_name
+		FROM (
+			SELECT c.id AS feed_id, c.item_id, c.author_id, c.portal_customer_id, c.content, c.is_private,
+			       c.created_at AS feed_created_at, c.updated_at,
+			       COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), pc.name, 'Unknown User') AS author_name,
+			       COALESCE(u.email, pc.email) AS author_email, u.avatar_url,
+			       'human' AS source, COALESCE(u.is_agent, FALSE) AS is_agent,
+			       COALESCE(NULLIF(TRIM(COALESCE(owner.first_name, '') || ' ' || COALESCE(owner.last_name, '')), ''), owner.username, '') AS agent_owner_name,
+			       ROW_NUMBER() OVER (PARTITION BY c.item_id ORDER BY c.created_at DESC, c.id DESC) AS rn
+			FROM comments c
+			LEFT JOIN users u ON c.author_id = u.id
+			LEFT JOIN users owner ON owner.id = u.agent_owner_user_id
+			LEFT JOIN portal_customers pc ON c.portal_customer_id = pc.id
+			WHERE c.item_id IN (%s)
+		) ranked
+		WHERE rn <= ?
+	`, strings.Join(placeholders, ","))
+	args = append(args, limit+1)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get comment feeds for %d items: %w", len(ids), err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var comment models.Comment
+		var authorID, portalCustomerID sql.NullInt64
+		var authorName, authorEmail, authorAvatar, agentOwnerName sql.NullString
+		if err := rows.Scan(
+			&comment.ID, &comment.ItemID, &authorID, &portalCustomerID, &comment.Content, &comment.IsPrivate,
+			&comment.CreatedAt, &comment.UpdatedAt, &authorName, &authorEmail, &authorAvatar,
+			&comment.Source, &comment.IsAgent, &agentOwnerName,
+		); err != nil {
+			return nil, fmt.Errorf("scan comment feed row: %w", err)
+		}
+		if authorID.Valid {
+			id := int(authorID.Int64)
+			comment.AuthorID = &id
+		}
+		if portalCustomerID.Valid {
+			id := int(portalCustomerID.Int64)
+			comment.PortalCustomerID = &id
+		}
+		comment.AuthorName = authorName.String
+		comment.AuthorEmail = authorEmail.String
+		comment.AuthorAvatar = authorAvatar.String
+		if includeAgentOwner {
+			comment.AgentOwnerName = agentOwnerName.String
+		}
+		page := pages[comment.ItemID]
+		page.Comments = append(page.Comments, comment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read comment feeds: %w", err)
+	}
+
+	for _, id := range ids {
+		page := pages[id]
+		options.Limit = limit
+		approvalRows, err := s.approvalReader().GetDecisionCommentsForItem(id, includeAgentOwner, options)
+		if err != nil {
+			return nil, err
+		}
+		merged := mergeCommentFeed(page.Comments, approvalRows, limit, false)
+		page.Comments = merged.Comments
+		page.HasMore = merged.HasMore
+	}
+	return pages, nil
+}
+
+// CountFeedByItemID counts ordinary comments and approval decision comments in
+// the merged item feed.
+func (s *CommentService) CountFeedByItemID(itemID int) (int, error) {
+	var commentCount int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM comments WHERE item_id = ?`, itemID).Scan(&commentCount)
+	if err != nil {
+		return 0, fmt.Errorf("count comment feed for item %d: %w", itemID, err)
+	}
+	approvalCount, err := s.approvalReader().CountDecisionCommentsForItem(itemID)
+	if err != nil {
+		return 0, err
+	}
+	return commentCount + approvalCount, nil
+}
+
+func normalizeCommentFeedLimit(limit int) int {
+	if limit <= 0 {
+		return DefaultCommentFeedLimit
+	}
+	if limit > MaxCommentFeedLimit {
+		return MaxCommentFeedLimit
+	}
+	return limit
+}
+
+func validateCommentSource(content string) error {
+	return validation.ValidateMarkdownSource("content", content, validation.MarkdownMaxBytes, true)
+}
+
+func normalizeImportedCommentSource(content string) string {
+	content = strings.ToValidUTF8(content, "\uFFFD")
+	if len(content) <= validation.MarkdownMaxBytes {
+		return content
+	}
+
+	content = content[:validation.MarkdownMaxBytes]
+	for content != "" && !utf8.ValidString(content) {
+		content = content[:len(content)-1]
+	}
+	return content
+}
+
 // Update updates a comment's content
 func (s *CommentService) Update(commentID int, content string, userID int) (*models.Comment, error) {
-	// Sanitize content (strips HTML tags + dangerous Markdown URLs)
-	sanitizedContent := sanitize.Comment.Sanitize(content)
+	if err := validateCommentSource(content); err != nil {
+		return nil, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin comment transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 
 	// Check if comment exists. Portal-authored comments have a NULL author_id,
 	// so existence must not depend on scanning author_id into a non-null int.
-	var exists bool
-	err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM comments WHERE id = ?)", commentID).Scan(&exists)
+	var itemID int
+	err = tx.QueryRow("SELECT item_id FROM comments WHERE id = ?", commentID).Scan(&itemID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("comment %d: %w", commentID, repository.ErrNotFound)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to check comment: %w", err)
-	}
-	if !exists {
-		return nil, fmt.Errorf("comment not found: %d", commentID)
 	}
 
 	// Update the comment
 	now := time.Now()
-	_, err = s.db.ExecWrite(updateCommentSQL, sanitizedContent, now, commentID)
+	_, err = tx.ExecWrite(updateCommentSQL, content, now, commentID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update comment: %w", err)
+	}
+	if err := repository.NewItemRepository(s.db).TouchActivity(tx, itemID, now); err != nil {
+		return nil, fmt.Errorf("failed to record comment activity: %w", err)
 	}
 
 	// Fetch and return the updated comment
@@ -455,7 +1136,7 @@ func (s *CommentService) Update(commentID int, content string, userID int) (*mod
 	var authorName, authorEmail sql.NullString
 	var authorIDNull, portalCustomerID sql.NullInt64
 
-	err = s.db.QueryRow(`
+	err = tx.QueryRow(`
 		SELECT c.id, c.item_id, c.author_id, c.portal_customer_id, c.content, c.is_private, c.created_at, c.updated_at,
 		       COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), pc.name) AS author_name,
 		       COALESCE(u.email, pc.email) AS author_email
@@ -486,35 +1167,128 @@ func (s *CommentService) Update(commentID int, content string, userID int) (*mod
 	if authorEmail.Valid {
 		comment.AuthorEmail = authorEmail.String
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit comment update: %w", err)
+	}
 
 	// Live-update publish (WI-483): the comment edit committed.
-	PublishItemChange(comment.ItemID, ItemChangeComment)
+	PublishItemChange(comment.ItemID)
 
 	return &comment, nil
 }
 
+// UpdateWithEffects updates a comment and emits every post-commit integration effect.
+func (s *CommentService) UpdateWithEffects(params UpdateCommentParams) (*models.Comment, error) {
+	before, err := s.Get(params.CommentID)
+	if err != nil {
+		return nil, err
+	}
+	updated, err := s.Update(params.CommentID, params.Content, params.Actor.UserID)
+	if err != nil {
+		return nil, err
+	}
+	item, err := s.itemRepo.FindByIDWithDetails(before.ItemID)
+	if err != nil {
+		slog.Warn("failed to load item after comment update", slog.Int("comment_id", params.CommentID), slog.Any("error", err))
+		return updated, nil
+	}
+	if s.notificationService != nil {
+		s.notificationService.EmitEvent(&NotificationEvent{
+			EventType: models.EventCommentUpdated, WorkspaceID: item.WorkspaceID,
+			ActorUserID: params.Actor.UserID, ItemID: item.ID, AssigneeID: item.AssigneeID, CreatorID: item.CreatorID,
+			Title: "Comment Updated", TemplateData: map[string]any{"item.title": item.Title, "item.id": item.ID, "user.name": params.Actor.Username},
+		})
+	}
+	if s.mentionService != nil {
+		if err := s.mentionService.ProcessMentions(ProcessMentionsParams{
+			SourceType: "comment", SourceID: params.CommentID, Content: params.Content,
+			ItemID: item.ID, WorkspaceID: item.WorkspaceID, ActorUserID: params.Actor.UserID,
+		}); err != nil {
+			slog.Warn("failed to process updated comment mentions", slog.Int("comment_id", params.CommentID), slog.Any("error", err))
+		}
+	}
+	if s.webhookSender != nil {
+		s.webhookSender.DispatchEvent("comment.updated", item)
+	}
+	if s.issueSync != nil && !updated.IsPrivate && before.AuthorID != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			s.issueSync.PushCommentUpdateToGitHub(ctx, params.CommentID, *before.AuthorID, params.Content)
+		}()
+	}
+	return updated, nil
+}
+
 // Delete removes a comment
 func (s *CommentService) Delete(commentID int) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin comment transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	// Capture the parent item id BEFORE the destructive write (this doubles as
 	// the existence check) so we can refresh the item's comment list afterwards
 	// (WI-483).
 	var itemID int
-	err := s.db.QueryRow("SELECT item_id FROM comments WHERE id = ?", commentID).Scan(&itemID)
+	err = tx.QueryRow("SELECT item_id FROM comments WHERE id = ?", commentID).Scan(&itemID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("comment not found: %d", commentID)
+			return fmt.Errorf("comment %d: %w", commentID, repository.ErrNotFound)
 		}
 		return fmt.Errorf("failed to check comment: %w", err)
 	}
 
-	_, err = s.db.ExecWrite(deleteCommentSQL, commentID)
+	_, err = tx.ExecWrite(deleteCommentSQL, commentID)
 	if err != nil {
 		return fmt.Errorf("failed to delete comment: %w", err)
 	}
+	now := time.Now()
+	if err := repository.NewItemRepository(s.db).TouchActivity(tx, itemID, now); err != nil {
+		return fmt.Errorf("failed to record comment activity: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit comment deletion: %w", err)
+	}
 
 	// Live-update publish (WI-483): the delete committed.
-	PublishItemChange(itemID, ItemChangeComment)
+	PublishItemChange(itemID)
 
+	return nil
+}
+
+// DeleteWithEffects deletes a comment and emits every post-commit integration effect.
+func (s *CommentService) DeleteWithEffects(params DeleteCommentParams) error {
+	comment, err := s.Get(params.CommentID)
+	if err != nil {
+		return err
+	}
+	item, err := s.itemRepo.FindByIDWithDetails(comment.ItemID)
+	if err != nil {
+		return err
+	}
+	if err := s.Delete(params.CommentID); err != nil {
+		return err
+	}
+	emitServiceAudit(s.db, params.Actor, logger.ActionCommentDelete, logger.ResourceComment, &params.CommentID, "", map[string]any{
+		"item_id": item.ID, "workspace_id": item.WorkspaceID, "comment_author_user_id": comment.AuthorID,
+	})
+	if s.mentionService != nil {
+		if err := s.mentionService.DeleteMentionsForSource("comment", params.CommentID); err != nil {
+			slog.Warn("failed to delete comment mentions", slog.Int("comment_id", params.CommentID), slog.Any("error", err))
+		}
+	}
+	if s.notificationService != nil {
+		s.notificationService.EmitEvent(&NotificationEvent{
+			EventType: models.EventCommentDeleted, WorkspaceID: item.WorkspaceID,
+			ActorUserID: params.Actor.UserID, ItemID: item.ID, AssigneeID: item.AssigneeID, CreatorID: item.CreatorID,
+			Title: "Comment Deleted", TemplateData: map[string]any{"item.title": item.Title, "item.id": item.ID, "user.name": params.Actor.Username},
+		})
+	}
+	if s.webhookSender != nil {
+		s.webhookSender.DispatchEvent("comment.deleted", item)
+	}
 	return nil
 }
 
@@ -574,6 +1348,71 @@ func (s *CommentService) GetByItemID(itemID int) ([]models.Comment, error) {
 		comments = []models.Comment{}
 	}
 
+	return comments, nil
+}
+
+// GetByItemIDPaginated retrieves one offset-based page for the public v1 API.
+func (s *CommentService) GetByItemIDPaginated(itemID, limit, offset int, sortAsc bool) ([]models.Comment, int, error) {
+	order := "DESC"
+	if sortAsc {
+		order = "ASC"
+	}
+
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM comments WHERE item_id = ?`, itemID).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count comments for item %d: %w", itemID, err)
+	}
+
+	rows, err := s.db.Query(fmt.Sprintf(`
+		SELECT c.id, c.item_id, c.author_id, c.portal_customer_id, c.content, c.is_private, c.created_at, c.updated_at,
+		       COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), pc.name) AS author_name,
+		       COALESCE(u.email, pc.email) AS author_email
+		FROM comments c
+		LEFT JOIN users u ON c.author_id = u.id
+		LEFT JOIN portal_customers pc ON c.portal_customer_id = pc.id
+		WHERE c.item_id = ?
+		ORDER BY c.created_at %s, c.id %s
+		LIMIT ? OFFSET ?
+	`, order, order), itemID, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("fetch comment page for item %d: %w", itemID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	comments, err := scanComments(rows)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read comment page for item %d: %w", itemID, err)
+	}
+	return comments, total, nil
+}
+
+func scanComments(rows *sql.Rows) ([]models.Comment, error) {
+	comments := make([]models.Comment, 0)
+	for rows.Next() {
+		var comment models.Comment
+		var authorID, portalCustomerID sql.NullInt64
+		var authorName, authorEmail sql.NullString
+		if err := rows.Scan(
+			&comment.ID, &comment.ItemID, &authorID, &portalCustomerID, &comment.Content, &comment.IsPrivate,
+			&comment.CreatedAt, &comment.UpdatedAt, &authorName, &authorEmail,
+		); err != nil {
+			return nil, err
+		}
+		if authorID.Valid {
+			id := int(authorID.Int64)
+			comment.AuthorID = &id
+		}
+		if portalCustomerID.Valid {
+			id := int(portalCustomerID.Int64)
+			comment.PortalCustomerID = &id
+		}
+		comment.AuthorName = authorName.String
+		comment.AuthorEmail = authorEmail.String
+		comments = append(comments, comment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return comments, nil
 }
 

@@ -1,6 +1,7 @@
 <script>
   import { Plus, Trash2 } from '@lucide/svelte';
   import { t } from '../../../stores/i18n.svelte.js';
+  import Input from '../../../components/Input.svelte';
 
   let {
     // Header map as stored in the node config: { "Header-Name": "value" }.
@@ -17,7 +18,9 @@
 
   // Internal row state so a half-typed or temporarily-empty key doesn't drop
   // the row out of the map mid-edit. We rebuild the object on every change.
+  // svelte-ignore state_referenced_locally
   let rows = $state(objectToRows(headers));
+  // svelte-ignore state_referenced_locally
   let seededFor = nodeId;
 
   $effect(() => {
@@ -54,21 +57,23 @@
 <div class="space-y-2">
   {#each rows as row, index}
     <div class="flex items-center gap-2">
-      <input
+      <Input
         type="text"
-        class="flex-1 px-2 py-1.5 border rounded text-xs config-input"
+        class="flex-1 text-xs"
         value={row.key}
         oninput={(e) => updateRow(index, 'key', e.currentTarget.value)}
         placeholder={t('actions.config.headerName')}
-        data-testid={`http-header-key-${index}`}
+        dataTestid={`http-header-key-${index}`}
+        size="small"
       />
-      <input
+      <Input
         type="text"
-        class="flex-1 px-2 py-1.5 border rounded text-xs config-input"
+        class="flex-1 text-xs"
         value={row.value}
         oninput={(e) => updateRow(index, 'value', e.currentTarget.value)}
         placeholder={t('actions.config.headerValue')}
-        data-testid={`http-header-value-${index}`}
+        dataTestid={`http-header-value-${index}`}
+        size="small"
       />
       <button
         onclick={() => removeRow(index)}
@@ -92,17 +97,6 @@
 </div>
 
 <style>
-  .config-input {
-    background-color: var(--ds-surface);
-    border-color: var(--ds-border);
-    color: var(--ds-text);
-  }
-
-  .config-input:focus {
-    border-color: var(--ds-interactive);
-    outline: none;
-  }
-
   .add-header-btn {
     color: var(--ds-text-subtle);
     border-color: var(--ds-border);

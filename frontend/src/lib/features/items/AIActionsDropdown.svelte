@@ -1,6 +1,7 @@
 <script>
-  import { Sparkles, BookOpen, Search, GitBranch, ChevronDown } from '@lucide/svelte';
+  import { BookOpen, Search, GitBranch, ChevronDown } from '@lucide/svelte';
   import { onClickOutside } from 'runed';
+  import WindshiftAiIcon from '../../components/WindshiftAiIcon.svelte';
 
   let {
     item = null,
@@ -34,7 +35,7 @@
     onclick={(e) => { e.stopPropagation(); showMenu = !showMenu; }}
     title="AI Actions"
   >
-    <Sparkles class="w-4 h-4 flex-shrink-0" />
+    <WindshiftAiIcon class="w-4 h-4 flex-shrink-0" />
     <span class="action-label">AI</span>
     <ChevronDown class="w-3 h-3 ml-0.5" />
   </button>
@@ -42,10 +43,7 @@
   {#if showMenu}
     <div class="absolute left-0 top-full mt-1 z-50 min-w-[220px] rounded-md shadow-lg py-1" style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);">
       <button
-        class="w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
-        style="color: var(--ds-text);"
-        onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-        onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+        class="ai-action-item w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
         onclick={() => handleAction('catch-me-up')}
       >
         <BookOpen class="w-4 h-4 flex-shrink-0" style="color: var(--ds-interactive);" />
@@ -53,10 +51,7 @@
       </button>
 
       <button
-        class="w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
-        style="color: var(--ds-text);"
-        onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-        onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+        class="ai-action-item w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
         onclick={() => handleAction('find-similar')}
       >
         <Search class="w-4 h-4 flex-shrink-0" style="color: var(--ds-interactive);" />
@@ -65,10 +60,7 @@
 
       {#if showDecompose}
         <button
-          class="w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
-          style="color: var(--ds-text);"
-          onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-          onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+          class="ai-action-item w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
           onclick={() => handleAction('decompose')}
         >
           <GitBranch class="w-4 h-4 flex-shrink-0" style="color: var(--ds-interactive);" />
@@ -87,6 +79,14 @@
   .action-btn:hover {
     color: var(--ds-text-subtle);
   }
+
+  .ai-action-item {
+    color: var(--ds-text);
+  }
+
+  .ai-action-item:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
   .action-label {
     max-width: 0;
     opacity: 0;
@@ -99,3 +99,5 @@
     opacity: 1;
   }
 </style>
+
+

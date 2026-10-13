@@ -11,12 +11,11 @@
   } from '@tabler/icons-svelte-runes';
   import DataTable from '../../components/DataTable.svelte';
   import Button from '../../components/Button.svelte';
+  import Toggle from '../../components/Toggle.svelte';
   import Modal from '../../dialogs/Modal.svelte';
-  import ModalHeader from '../../dialogs/ModalHeader.svelte';
   import CategoryModal from '../../dialogs/CategoryModal.svelte';
   import MilestoneNavigation from './MilestoneNavigation.svelte';
   import MilestoneReleaseModal from './MilestoneReleaseModal.svelte';
-  import Textarea from '../../components/Textarea.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
   import { categoriesStore } from '../../stores/categories.js';
   import { milestonesStore } from '../../stores/milestones.js';
@@ -24,16 +23,19 @@
   import { currentRoute } from '../../router.js';
   import { formatDateShort } from '../../utils/dateFormatter.js';
   import { api } from '../../api.js';
+  import { workspacesStore } from '../../stores/workspaces.svelte.js';
   import { permissionStore, isSystemAdmin } from '../../stores/permissions.svelte.js';
   import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
   import ColorDot from '../../components/ColorDot.svelte';
-  import Label from '../../components/Label.svelte';
-  import BasePicker from '../../pickers/BasePicker.svelte';
-  import DialogFooter from '../../dialogs/DialogFooter.svelte';
+  import MilestoneFormDialog from './MilestoneFormDialog.svelte';
   import { toHotkeyString } from '../../utils/keyboardShortcuts.js';
   import EmptyState from '../../components/EmptyState.svelte';
   import PageHeader from '../../layout/PageHeader.svelte';
   import { useEventListener } from 'runed';
+  import { loadMilestoneTestStatistics } from './milestoneStatisticsData.js';
+  import {
+    preservePlanningScope
+  } from '../../utils/planningScope.js';
 
   // Props for workspace-scoped view (optional)
   let { workspaceId = null } = $props();
@@ -68,8 +70,8 @@
   // preference survives reloads; a missing key means ON (default).
   const HIDE_COMPLETED_KEY = 'milestones.hideCompleted';
   let hideCompleted = $state(localStorage.getItem(HIDE_COMPLETED_KEY) !== 'false');
-  function toggleHideCompleted() {
-    hideCompleted = !hideCompleted;
+  function handleHideCompletedChange(checked) {
+    hideCompleted = checked;
     try {
       localStorage.setItem(HIDE_COMPLETED_KEY, String(hideCompleted));
     } catch {
@@ -119,15 +121,14 @@
   async function loadData() {
     try {
       // In workspace view, filter milestones by workspace_id and include global
-      const filters = isGlobalView ? {} : { workspace_id: workspaceId, include_global: true };
-      const [_, milestones, ws] = await Promise.all([
+      const filters = isGlobalView ? { is_global: true } : { workspace_id: workspaceId, include_global: true };
+      const [_, milestones] = await Promise.all([
         categoriesStore.init(),
-        api.milestones.getAll(filters),
-        api.workspaces.getAll()
+        api.milestones.getAll(filters)
       ]);
       // Update the store with filtered milestones
       milestonesStore.set(milestones || []);
-      workspaces = ws || [];
+      workspaces = await workspacesStore.load();
     } catch (error) {
       console.error('Failed to load data:', error);
     }
@@ -135,28 +136,10 @@
 
   async function loadTestStatistics() {
     try {
-      const milestones = $milestonesStore;
-      const statsPromises = milestones.map(async (milestone) => {
-        try {
-          const stats = await api.milestones.getTestStatistics(milestone.id);
-          return { milestoneId: milestone.id, stats };
-        } catch (error) {
-          console.error(`Failed to load test stats for milestone ${milestone.id}:`, error);
-          return { milestoneId: milestone.id, stats: null };
-        }
-      });
-      
-      const results = await Promise.all(statsPromises);
-      const newTestStatistics = {};
-      results.forEach(({ milestoneId, stats }) => {
-        if (stats) {
-          newTestStatistics[milestoneId] = stats;
-        }
-      });
-      
-      testStatistics = newTestStatistics;
+      testStatistics = await loadMilestoneTestStatistics(api, $milestonesStore);
     } catch (error) {
       console.error('Failed to load test statistics:', error);
+      testStatistics = {};
     }
   }
 
@@ -202,10 +185,13 @@
   async function saveMilestone() {
     try {
       // Convert empty strings to null for optional date fields
-      const dataToSave = {
-        ...formData,
-        target_date: formData.target_date || null
-      };
+      const dataToSave = preservePlanningScope(
+        {
+          ...formData,
+          target_date: formData.target_date || null
+        },
+        editingMilestone
+      );
       if (dataToSave.is_global) {
         dataToSave.workspace_id = null;
       }
@@ -288,7 +274,7 @@
     showReleaseModal = false;
     releasingMilestone = null;
     // Refresh milestones to show updated status
-    const filters = isGlobalView ? {} : { workspace_id: workspaceId, include_global: true };
+    const filters = isGlobalView ? { is_global: true } : { workspace_id: workspaceId, include_global: true };
     try {
       const milestones = await api.milestones.getAll(filters);
       milestonesStore.set(milestones || []);
@@ -327,15 +313,6 @@
 
   async function handleDeleteCategory(categoryId) {
     await categoriesStore.delete(categoryId);
-  }
-
-  function toggleScope() {
-    formData.is_global = !formData.is_global;
-    if (formData.is_global) {
-      formData.workspace_id = null;
-    } else {
-      formData.workspace_id = workspaceId ? parseInt(workspaceId, 10) : null;
-    }
   }
 
   // Filter milestones based on active category (only applies in global view)
@@ -504,18 +481,18 @@
       : [],
     {
       key: 'status',
-      label: 'Status',
+      label: t('milestones.columnStatus'),
       width: 'w-40',
       slot: 'status'
     },
     { 
       key: 'name', 
-      label: 'Milestone', 
+      label: t('milestones.columnMilestone'),
       slot: 'name'
     },
     { 
       key: 'target_date', 
-      label: 'Target Date', 
+      label: t('milestones.columnTargetDate'),
       width: 'w-40',
       render: (milestone) => {
         return formatDateShort(milestone.target_date) || '-';
@@ -523,13 +500,13 @@
     },
     { 
       key: 'days_remaining', 
-      label: 'Timeline', 
+      label: t('milestones.columnTimeline'),
       width: 'w-48',
       slot: 'days_remaining'
     },
     ...$moduleSettings.test_management_enabled ? [{
       key: 'tests',
-      label: 'Tests',
+      label: t('milestones.columnTests'),
       width: 'w-24',
       slot: 'tests'
     }] : [],
@@ -542,14 +519,14 @@
 </script>
 
 <!-- Main container with two-panel layout -->
-<div class="flex min-h-screen" style="background-color: var(--ds-surface);">
+<div class="flex h-full min-h-0 overflow-hidden" style="background-color: var(--ds-surface);">
   <!-- Left Sidebar - Navigation (only in global view) -->
   {#if isGlobalView}
     <MilestoneNavigation />
   {/if}
 
   <!-- Main Content -->
-  <div class="flex-1">
+  <div class="flex-1 min-h-0 overflow-y-auto">
     <div class="p-6">
       <!-- Header -->
       <PageHeader
@@ -560,34 +537,33 @@
           : t('milestones.workspaceMilestones')}
         subtitle={!isGlobalView
           ? `${localMilestones.length} ${t('milestones.local').toLowerCase()}, ${globalMilestones.length} ${t('milestones.global').toLowerCase()}`
-          : `${visibleMilestones.length} milestone${visibleMilestones.length !== 1 ? 's' : ''}${activeCategoryId ? ' in this category' : ''}`}
+          : activeCategoryId
+            ? t('milestones.visibleInCategory', { count: visibleMilestones.length })
+            : t('milestones.visibleCount', { count: visibleMilestones.length })}
       >
         {#snippet actions()}
-          <button
-            type="button"
-            onclick={toggleHideCompleted}
-            class="px-3 py-1.5 text-sm rounded border transition-colors"
-            style="border-color: var(--ds-border); color: {hideCompleted ? 'var(--ds-interactive)' : 'var(--ds-text-subtle)'}; background-color: {hideCompleted ? 'var(--ds-surface-selected)' : 'transparent'};"
-            title={t('milestones.hideCompletedHelp')}
-            data-testid="milestone-hide-completed-toggle"
-          >
-            {#if hideCompleted}
-              <CheckCircle class="w-4 h-4 inline-block mr-1.5 -mt-0.5" />
+          <div class="flex items-center gap-2">
+            <div data-testid="milestone-hide-completed-toggle" title={t('milestones.hideCompletedHelp')}>
+              <Toggle
+                checked={hideCompleted}
+                label={t('milestones.hideCompleted')}
+                labelPosition="left"
+                onchange={handleHideCompletedChange}
+              />
+            </div>
+            {#if canCreate}
+              <Button
+                variant="primary"
+                icon={Plus}
+                onclick={startCreate}
+                keyboardHint="A"
+                hotkeyConfig={{ key: toHotkeyString('milestones', 'add'), guard: () => !showCreateForm }}
+                dataTestid="milestone-create-button"
+              >
+                {t('milestones.addMilestone')}
+              </Button>
             {/if}
-            {t('milestones.hideCompleted')}
-          </button>
-          {#if canCreate}
-            <Button
-              variant="primary"
-              icon={Plus}
-              onclick={startCreate}
-              keyboardHint="A"
-              hotkeyConfig={{ key: toHotkeyString('milestones', 'add'), guard: () => !showCreateForm }}
-              dataTestid="milestone-create-button"
-            >
-              {t('milestones.addMilestone')}
-            </Button>
-          {/if}
+          </div>
         {/snippet}
       </PageHeader>
 
@@ -641,7 +617,7 @@
               <ColorDot color={category.color} size="md" />
               <span class="text-sm">{category.name}</span>
             {:else}
-              <span class="text-sm text-gray-500">{t('milestones.noCategory')}</span>
+              <span class="text-sm text-ds-text-subtle">{t('milestones.noCategory')}</span>
             {/if}
           {/key}
         {/if}
@@ -671,11 +647,11 @@
                 {/if}
               </div>
             {:else}
-              <span class="text-gray-400">—</span>
+              <span class="text-ds-text-subtlest">—</span>
             {/if}
           {/key}
         {:else}
-          <span class="text-gray-400">—</span>
+          <span class="text-ds-text-subtlest">—</span>
         {/if}
       {/snippet}
 
@@ -773,126 +749,17 @@
 </div>
 
 <!-- Create/Edit Milestone Modal -->
-<Modal
-  isOpen={showCreateForm}
+<MilestoneFormDialog
+  bind:isOpen={showCreateForm}
+  bind:formData
+  {editingMilestone}
+  {isGlobalView}
+  {workspaceId}
+  canManageGlobal={canManageGlobal}
+  canManageWorkspace={!isGlobalView && canCreate}
   onclose={cancelForm}
   onSubmit={saveMilestone}
-  submitDisabled={!formData.name.trim()}
-  maxWidth="max-w-2xl"
->
-  {#snippet children(submitHint)}
-  <!-- Modal header -->
-  <ModalHeader title={editingMilestone ? t('common.edit') : t('common.create')} showCloseButton={false} />
-
-  <!-- Modal content -->
-  <div class="px-6 py-4">
-    <form onsubmit={(e) => { e.preventDefault(); saveMilestone(); }}>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div>
-          <Label for="milestone-name" required class="mb-2">{t('milestones.milestoneName')}</Label>
-          <input
-            id="milestone-name"
-            type="text"
-            bind:value={formData.name}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            placeholder={t('milestones.milestoneNamePlaceholder')}
-            required
-          />
-        </div>
-
-        <div>
-          <Label for="milestone-target-date" class="mb-2">{t('milestones.targetDate')}</Label>
-          <input
-            id="milestone-target-date"
-            type="date"
-            bind:value={formData.target_date}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-          />
-        </div>
-
-        <div>
-          <Label for="milestone-category" class="mb-2">{t('common.category')}</Label>
-          <BasePicker
-            bind:value={formData.category_id}
-            items={$categoriesStore}
-            placeholder={t('milestones.noCategory')}
-            showUnassigned={true}
-            unassignedLabel={t('milestones.noCategory')}
-            getValue={(item) => item.id}
-            getLabel={(item) => item.name}
-          />
-        </div>
-
-        <div>
-          <Label for="milestone-status-picker" class="mb-2">{t('common.status')}</Label>
-          <BasePicker
-            id="milestone-status-picker"
-            bind:value={formData.status}
-            items={statusOptions}
-            placeholder={t('milestones.selectStatus')}
-            getValue={(item) => item.value}
-            getLabel={(item) => item.label}
-          />
-        </div>
-
-        {#if !isGlobalView && canManageGlobal}
-          <!-- Scope Toggle -->
-          <div class="md:col-span-2">
-            <div class="p-4 rounded border" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-              <div class="flex items-center justify-between">
-                <div class="flex items-center gap-3">
-                  {#if formData.is_global}
-                    <Globe class="w-5 h-5" style="color: var(--ds-interactive);" />
-                    <div>
-                      <p class="font-medium text-sm" style="color: var(--ds-text);">{t('milestones.globalMilestone')}</p>
-                      <p class="text-xs" style="color: var(--ds-text-subtle);">{t('milestones.globalMilestoneDescription')}</p>
-                    </div>
-                  {:else}
-                    <Building2 class="w-5 h-5" style="color: var(--ds-interactive);" />
-                    <div>
-                      <p class="font-medium text-sm" style="color: var(--ds-text);">{t('milestones.localMilestone')}</p>
-                      <p class="text-xs" style="color: var(--ds-text-subtle);">{t('milestones.localMilestoneDescription')}</p>
-                    </div>
-                  {/if}
-                </div>
-                <button
-                  type="button"
-                  class="px-3 py-1.5 text-sm rounded border transition-colors"
-                  style="border-color: var(--ds-border); color: var(--ds-interactive);"
-                  onclick={toggleScope}
-                >
-                  {t('milestones.switchTo', { scope: formData.is_global ? t('milestones.local') : t('milestones.global') })}
-                </button>
-              </div>
-            </div>
-          </div>
-        {/if}
-
-        <div class="md:col-span-2">
-          <Label for="milestone-description" class="mb-2">{t('common.description')}</Label>
-          <Textarea
-            id="milestone-description"
-            bind:value={formData.description}
-            rows={3}
-            placeholder={t('milestones.descriptionPlaceholder')}
-          />
-        </div>
-      </div>
-    </form>
-  </div>
-
-  <DialogFooter
-    onCancel={cancelForm}
-    onConfirm={saveMilestone}
-    confirmLabel={editingMilestone ? t('common.update') : t('common.create')}
-    disabled={!formData.name.trim()}
-    showKeyboardHint={true}
-    confirmKeyboardHint={submitHint}
-  />
-  {/snippet}
-</Modal>
+/>
 
 <!-- Release Modal -->
 {#if showReleaseModal && releasingMilestone}
@@ -921,4 +788,3 @@
   onDelete={handleDeleteCategory}
   showColorPicker={true}
 />
-

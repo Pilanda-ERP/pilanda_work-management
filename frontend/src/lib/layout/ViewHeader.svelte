@@ -1,5 +1,6 @@
 <script>
   import { t } from '../stores/i18n.svelte.js';
+  import { formatItemCount } from '../utils/itemCount.js';
   import BaseHeader from './BaseHeader.svelte';
 
   let {
@@ -7,17 +8,17 @@
     collection = '',
     viewName = '',
     itemCount = null,
+    shownCount = null,
     actionButtons = null,
     hasGradient = false,
     textStyle = '',
     subtleTextStyle = '',
     actions = null,
+    marginClass = 'mb-4'
   } = $props();
 
-  // Build subtitle from workspace and item count
-  let subtitle = $derived(
-    workspaceName + (itemCount !== null ? ` • ${itemCount} ${t('layout.items')}` : '')
-  );
+  let countText = $derived(formatItemCount(itemCount, shownCount, t));
+  let subtitle = $derived([workspaceName, countText].filter(Boolean).join(' • '));
 </script>
 
 <BaseHeader
@@ -30,5 +31,5 @@
   icon={null}
   count={null}
   children={null}
-  marginClass="mb-4"
+  {marginClass}
 />

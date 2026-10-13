@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/services"
@@ -20,6 +21,7 @@ type WebhookHandler struct {
 	webhookSender     *webhook.WebhookSender
 	permissionService *services.PermissionService
 	channelService    *services.ChannelService
+	auditor           *logger.Auditor
 }
 
 // NewWebhookHandler creates a new webhook handler
@@ -29,6 +31,7 @@ func NewWebhookHandler(
 	webhookSender *webhook.WebhookSender,
 	permissionService *services.PermissionService,
 	channelService *services.ChannelService,
+	auditor *logger.Auditor,
 ) *WebhookHandler {
 	return &WebhookHandler{
 		channelRepo:       channelRepo,
@@ -36,6 +39,7 @@ func NewWebhookHandler(
 		webhookSender:     webhookSender,
 		permissionService: permissionService,
 		channelService:    channelService,
+		auditor:           auditor,
 	}
 }
 
@@ -57,8 +61,7 @@ func (h *WebhookHandler) TriggerWebhook(w http.ResponseWriter, r *http.Request) 
 	var request struct {
 		ItemID int `json:"item_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		respondBadRequest(w, r, "Invalid JSON")
+	if !decodeChannelRequest(w, r, &request, false) {
 		return
 	}
 
@@ -120,7 +123,9 @@ func (h *WebhookHandler) TriggerWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	h.auditor.LogWithDetails(r, user, logger.ActionWebhookTrigger, logger.ResourceWebhook, &webhookID, "", map[string]any{"item_id": request.ItemID})
+
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"message": "Webhook triggered successfully",
 	})
@@ -174,6 +179,14 @@ func (h *WebhookHandler) GetWebhooksForItem(w http.ResponseWriter, r *http.Reque
 
 	webhooks := make([]WebhookInfo, 0, len(channels))
 	for _, c := range channels {
+		canManage, manageErr := h.channelService.UserCanManage(ctx, user.ID, c.ID)
+		if manageErr != nil {
+			respondInternalError(w, r, manageErr)
+			return
+		}
+		if !canManage {
+			continue
+		}
 		var config models.ChannelConfig
 		if err := json.Unmarshal([]byte(c.Config), &config); err != nil {
 			continue

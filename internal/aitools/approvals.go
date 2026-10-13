@@ -52,6 +52,9 @@ type getItemApprovalsOut struct {
 func init() {
 	Register(Default, Tool[getItemApprovalsArgs]{
 		Name:        "get_item_approvals",
+		Group:       CapabilityUsersApprovals,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "Get the approval state and history for a work item: the current pending approval request (if any), step status, who can approve, and the full audit trail of approve/reject/comment/cancel decisions with their comments.",
 		Scopes:      []string{auth.ScopeItemsRead}, // item-scoped content; no dedicated v1 route, gate like other item reads
 		Run: func(ctx context.Context, env *Env, args getItemApprovalsArgs) (any, error) {
@@ -99,7 +102,7 @@ func init() {
 					}
 				}
 			}
-			names := resolveUserNames(env.DB, userIDs)
+			names := services.NewIDResolverService(env.DB).ResolveUserNames(userIDs)
 			resolveName := func(id *int) string {
 				if id == nil {
 					return ""
@@ -172,40 +175,4 @@ func resolveItemID(db database.Database, itemID int, itemKey string) (int, error
 		return 0, errors.New("item not found")
 	}
 	return id, nil
-}
-
-// resolveUserNames batches one SELECT to map user IDs → display names,
-// preferring "first last" then username then email.
-func resolveUserNames(db database.Database, ids map[int]struct{}) map[int]string {
-	names := map[int]string{}
-	if len(ids) == 0 {
-		return names
-	}
-	placeholders := make([]string, 0, len(ids))
-	args := make([]interface{}, 0, len(ids))
-	for id := range ids {
-		placeholders = append(placeholders, "?")
-		args = append(args, id)
-	}
-	rows, err := db.Query(fmt.Sprintf(
-		`SELECT id, COALESCE(NULLIF(TRIM(first_name || ' ' || last_name), ''), username, email, '') FROM users WHERE id IN (%s)`,
-		strings.Join(placeholders, ",")),
-		args...,
-	)
-	if err != nil {
-		return names
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var id int
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
-			continue
-		}
-		names[id] = name
-	}
-	if err := rows.Err(); err != nil {
-		return names
-	}
-	return names
 }

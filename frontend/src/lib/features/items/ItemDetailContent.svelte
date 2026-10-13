@@ -1,14 +1,18 @@
 <script>
-  import { onMount } from 'svelte';
-  import { useEventListener } from 'runed';
   import { AlertCircle } from '@lucide/svelte';
+  import { api } from '../../api.js';
+  import { confirm } from '../../composables/useConfirm.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { errorToast, successToast } from '../../stores/toasts.svelte.js';
   import ItemDetailBreadcrumbs from '../items/ItemDetailBreadcrumbs.svelte';
   import ItemDetailHeader from '../items/ItemDetailHeader.svelte';
   import ItemDetailDescription from '../items/ItemDetailDescription.svelte';
+  import ItemIncidentPanel from '../items/ItemIncidentPanel.svelte';
+  import ItemSLAPanel from '../items/ItemSLAPanel.svelte';
   import ItemDetailLinks from './ItemDetailLinks.svelte';
   import ItemDetailTabs from '../items/ItemDetailTabs.svelte';
   import ItemDetailSidebar from '../items/ItemDetailSidebar.svelte';
+  import SidebarResizeHandle from '../../layout/SidebarResizeHandle.svelte';
 
   // All the props that the content needs
   let {
@@ -19,11 +23,11 @@
     parentHierarchy = [],
     currentItemType = null,
     currentHierarchyLevel = null,
-    iconMap = {},
     workspaceId = null,
     editingTitle = $bindable(false),
     editTitle = $bindable(''),
     saving = false,
+    canEdit = false,
     dropdownItems = [],
     statusOptions = [],
     pendingApproval = null,
@@ -34,6 +38,7 @@
     loadingLinks = false,
     availableSubIssueTypes = [],
     childItems = [],
+    storyPointsRollup = null,
     loadingChildItems = false,
     itemTypes = [],
     tab = 'comments',
@@ -68,7 +73,6 @@
     attachments = [],
     attachmentPagination = null,
     diagrams = [],
-    loadingDiagrams = false,
     manualActions = [],
     // Callback props
     onnavigate = null,
@@ -106,6 +110,7 @@
     onexecuteAction = null,
     onaiAction = null,
     onreorderChildren = null,
+    onrelatedStatusChanged = null,
     canCreate = false,
     onclose = null,
     recurrenceRule = null,
@@ -113,30 +118,14 @@
     oneditRecurrence = null,
     onapprovalsChanged = null,
     onitemtypechange = null,
+    onrequestmerge = null,
   } = $props();
 
-  // Lazy-load DiagramModal with background preload (Excalidraw is ~1.2MB)
+  // Keep the editor bundle off the network until the user opens it.
   let DiagramModal = $state(null);
   let diagramPromise = $state(null);
 
-  onMount(() => {
-    // Preload in background after component mounts
-    const preload = () => {
-      diagramPromise = import('../../components/DiagramModal.svelte');
-      diagramPromise.then(module => {
-        DiagramModal = module.default;
-      });
-    };
-
-    if ('requestIdleCallback' in window) {
-      requestIdleCallback(preload);
-    } else {
-      setTimeout(preload, 1000); // Fallback: preload after 1s
-    }
-  });
-
   // Component references
-  let diagramListComponent = $state(null);
   let descriptionComponent = $state(null);
 
   // Diagram modal state
@@ -145,30 +134,10 @@
 
   // Panel resizing state
   let panelWidth = $state(320);
-  let isResizing = $state(false);
-  let resizeStartX = $state(0);
-  let resizeStartWidth = $state(0);
-
-  function startResize(event) {
-    isResizing = true;
-    resizeStartX = event.clientX;
-    resizeStartWidth = panelWidth;
-    event.preventDefault();
+  function updatePanelWidth(width) {
+    panelWidth = width;
+    document.documentElement.style.setProperty('--panel-width', `${width}px`);
   }
-
-  function handleResizeMove(event) {
-    const deltaX = resizeStartX - event.clientX;
-    const newWidth = Math.max(280, Math.min(600, resizeStartWidth + deltaX));
-    panelWidth = newWidth;
-    document.documentElement.style.setProperty('--panel-width', `${newWidth}px`);
-  }
-
-  function handleResizeUp() {
-    isResizing = false;
-  }
-
-  useEventListener(() => isResizing ? document : undefined, 'mousemove', handleResizeMove);
-  useEventListener(() => isResizing ? document : undefined, 'mouseup', handleResizeUp);
 
   function handleNavigate(path) {
     onnavigate?.({ path });
@@ -280,20 +249,19 @@
   }
 
   // Diagram handlers
+  async function ensureDiagramModal() {
+    diagramPromise ??= import('../../components/DiagramModal.svelte');
+    DiagramModal ??= (await diagramPromise).default;
+  }
+
   async function handleNewDiagram() {
-    // Ensure DiagramModal is loaded
-    if (!DiagramModal && diagramPromise) {
-      DiagramModal = (await diagramPromise).default;
-    }
+    await ensureDiagramModal();
     editingDiagram = null;
     showDiagramModal = true;
   }
 
   async function handleEditDiagram(diagram) {
-    // Ensure DiagramModal is loaded
-    if (!DiagramModal && diagramPromise) {
-      DiagramModal = (await diagramPromise).default;
-    }
+    await ensureDiagramModal();
     editingDiagram = diagram;
     showDiagramModal = true;
   }
@@ -304,17 +272,26 @@
   }
 
   function handleSaveDiagram() {
-    // Refresh the diagram list
-    if (diagramListComponent) {
-      diagramListComponent.refresh();
-    }
     ondiagramSaved?.();
   }
 
-  function handleDeleteDiagram() {
-    // Refresh the diagram list
-    if (diagramListComponent) {
-      diagramListComponent.refresh();
+  async function handleDeleteDiagram(diagram) {
+    if (!diagram?.id) return;
+    const confirmed = await confirm({
+      title: t('common.delete'),
+      message: t('components.diagram.confirmDelete'),
+      confirmText: t('common.delete'),
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+
+    try {
+      await api.deleteDiagram(diagram.id);
+      await ondiagramSaved?.();
+      successToast(t('editors.diagramDeleted'));
+    } catch (err) {
+      console.error('Failed to delete diagram:', err);
+      errorToast(t('components.diagram.deleteError'));
     }
   }
 
@@ -324,6 +301,10 @@
 
   function handleReorderChildren() {
     onreorderChildren?.();
+  }
+
+  function handleRelatedStatusChanged(data) {
+    return onrelatedStatusChanged?.(data);
   }
 
   function handleAIAction(data) {
@@ -350,19 +331,19 @@
 {:else if error}
   <!-- Error State -->
   <div class="p-8 text-center" style="background-color: var(--ds-surface);">
-    <AlertCircle class="w-12 h-12 text-red-500 mx-auto mb-4" />
+    <AlertCircle class="w-12 h-12 text-ds-icon-danger mx-auto mb-4" />
     <h1 class="text-xl font-semibold mb-2" style="color: var(--ds-text);">{t('items.errorLoadingWorkItem')}</h1>
     <p class="mb-6" style="color: var(--ds-text-subtle);">{error}</p>
     <button
       onclick={() => onclose?.()}
-      class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+      class="px-4 py-2 bg-ds-interactive text-white rounded hover:bg-ds-interactive-hovered transition-colors"
     >
       {t('common.close')}
     </button>
   </div>
 {:else if item && workspace}
   <!-- Main Content -->
-  <div class="flex-1 min-h-0 {isModal ? '' : 'min-h-screen'}" style="background-color: var(--ds-surface-raised);">
+  <div data-testid="item-detail-ready" class="flex-1 min-h-0 {isModal ? '' : 'min-h-screen'}" style="background-color: var(--ds-surface-raised);">
     <div class="flex flex-col {isModal ? 'h-full' : 'min-h-screen'}">
       <!-- Content -->
       <div class="flex flex-1 relative {isModal ? 'h-full' : 'min-h-screen'} w-full overflow-hidden">
@@ -375,7 +356,6 @@
             {currentItemType}
             {currentHierarchyLevel}
             {item}
-            {iconMap}
             {workspaceId}
             onnavigate={handleNavigate}
             onparentChanged={handleParentChanged}
@@ -390,6 +370,7 @@
             bind:editingTitle
             bind:editTitle
             {saving}
+            {canEdit}
             onsavefield={handleSaveField}
             oncanceledit={handleCancelEdit}
           />
@@ -404,6 +385,7 @@
             {diagrams}
             {manualActions}
             {canCreate}
+            {canEdit}
             onsavefield={handleSaveField}
             oncanceledit={handleCancelEdit}
             onstartEditingDescription={() => onstartEditingDescription?.()}
@@ -419,6 +401,10 @@
             onexecuteAction={handleExecuteAction}
             onaiaction={handleAIAction}
           />
+
+          <ItemIncidentPanel itemId={item.id} {item} {canEdit} />
+
+          <ItemSLAPanel itemId={item.id} />
 
           <ItemDetailLinks
             {item}
@@ -440,6 +426,7 @@
             onviewtestcase={handleViewTestCase}
             onshowlinkmodal={handleShowLinkModal}
             onreorderchildren={handleReorderChildren}
+            onstatuschanged={handleRelatedStatusChanged}
           />
 
           <br />
@@ -462,15 +449,16 @@
 
         <!-- Resizable Right Panel -->
         <div class="flex-shrink-0 relative {isModal ? 'h-full' : ''}" style="width: var(--panel-width, 320px); min-width: 280px; max-width: 600px;">
-          <!-- Resize Handle -->
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div
-            class="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize transition-colors opacity-0 hover:opacity-100"
-            style="background-color: var(--ds-border);"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = '#3b82f6'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-border)'}
-            onmousedown={startResize}
-          ></div>
+          <SidebarResizeHandle
+            width={panelWidth}
+            minWidth={280}
+            maxWidth={600}
+            defaultWidth={320}
+            edge="left"
+            label="Resize item details"
+            title="Drag to resize, double-click to reset"
+            onresize={updatePanelWidth}
+          />
           
           <!-- Panel Content -->
           <ItemDetailSidebar
@@ -504,6 +492,7 @@
             {dropdownItems}
             onsaveField={onsaveField}
             oncancelEdit={oncancelEdit}
+            {storyPointsRollup}
             onstartEditingAssignee={onstartEditingAssignee}
             onstartEditingMilestone={onstartEditingMilestone}
             onstartEditingIteration={onstartEditingIteration}
@@ -517,6 +506,7 @@
             {recurrenceRule}
             onsetupRecurrence={onsetupRecurrence}
             oneditRecurrence={oneditRecurrence}
+            {onrequestmerge}
           />
         </div>
       </div>
@@ -528,7 +518,7 @@
     <h1 class="text-xl font-semibold mb-4" style="color: var(--ds-text);">{t('items.workItemNotFound')}</h1>
     <button
       onclick={() => onclose?.()}
-      class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+      class="px-4 py-2 bg-ds-interactive text-white rounded hover:bg-ds-interactive-hovered transition-colors"
     >
       {t('common.close')}
     </button>

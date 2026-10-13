@@ -5,14 +5,27 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
+	"windshift/internal/logger"
 	"windshift/internal/repository"
+)
+
+var (
+	// ErrIterationCompletionRequired prevents generic CRUD paths from skipping
+	// the atomic completion workflow that moves incomplete work and records its
+	// history.
+	ErrIterationCompletionRequired = errors.New("iteration must be completed through the completion endpoint")
+	// ErrIterationLifecycleConflict protects terminal iteration states from
+	// being reopened through an ordinary metadata update.
+	ErrIterationLifecycleConflict = errors.New("iteration status transition is not allowed")
 )
 
 // iterationScanner is satisfied by both *sql.Row and *sql.Rows.
 type iterationScanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }
 
 // parseDate tries date-only format first, then falls back to RFC3339.
@@ -39,6 +52,12 @@ func scanIterationRow(sc iterationScanner) (IterationResult, error) {
 	}
 
 	iter.Description = description.String
+	if start, parseErr := parseDate(iter.StartDate); parseErr == nil {
+		iter.StartDate = start.Format("2006-01-02")
+	}
+	if end, parseErr := parseDate(iter.EndDate); parseErr == nil {
+		iter.EndDate = end.Format("2006-01-02")
+	}
 	iter.TypeName = typeName.String
 	iter.TypeColor = typeColor.String
 	iter.WorkspaceName = workspaceName.String
@@ -94,72 +113,39 @@ type IterationListParams struct {
 	Limit         int
 	Offset        int
 	WorkspaceID   *int   // Filter by workspace
+	WorkspaceIDs  []int  // Caller-visible local workspaces for an unscoped list
 	TypeID        *int   // Filter by type
 	Status        string // Filter by status
 	IncludeGlobal bool   // Include global iterations
+	IsGlobal      bool   // Restricts an unscoped list to global iterations only
+	SortBy        string
+	SortOrder     string
+}
+
+// FindIterationByName returns a local workspace iteration by exact name.
+func (s *PlanningService) FindIterationByName(workspaceID int, name string) (*IterationResult, error) {
+	var id int
+	err := s.db.QueryRow(`
+		SELECT id FROM iterations
+		WHERE workspace_id = ? AND is_global = false AND name = ?
+	`, workspaceID, name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, repository.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find iteration by name: %w", err)
+	}
+	return s.GetIteration(id)
 }
 
 // ListIterations retrieves iterations with pagination and filtering.
 func (s *PlanningService) ListIterations(params IterationListParams) ([]IterationResult, int, error) {
-	query := `
-		SELECT i.id, i.name, i.description, i.start_date, i.end_date, i.status,
-		       i.type_id, it.name as type_name, it.color as type_color,
-		       i.is_global, i.workspace_id, w.name as workspace_name,
-		       i.created_at, i.updated_at
-		FROM iterations i
-		LEFT JOIN iteration_types it ON i.type_id = it.id
-		LEFT JOIN workspaces w ON i.workspace_id = w.id
-		WHERE 1=1`
-
-	countQuery := "SELECT COUNT(*) FROM iterations i WHERE 1=1"
-	var args []interface{}
-	var countArgs []interface{}
-
-	// Filter by workspace - show local iterations for this workspace + optionally global iterations
-	if params.WorkspaceID != nil {
-		if params.IncludeGlobal {
-			query += " AND (i.workspace_id = ? OR i.is_global = ?)"
-			countQuery += " AND (i.workspace_id = ? OR i.is_global = ?)"
-			args = append(args, *params.WorkspaceID, true)
-			countArgs = append(countArgs, *params.WorkspaceID, true)
-		} else {
-			query += " AND i.workspace_id = ?"
-			countQuery += " AND i.workspace_id = ?"
-			args = append(args, *params.WorkspaceID)
-			countArgs = append(countArgs, *params.WorkspaceID)
-		}
-	} else if params.IncludeGlobal {
-		// If no workspace specified but include_global, only show global iterations
-		query += " AND i.is_global = ?"
-		countQuery += " AND i.is_global = ?"
-		args = append(args, true)
-		countArgs = append(countArgs, true)
-	}
-
-	// Filter by type
-	if params.TypeID != nil {
-		if *params.TypeID == 0 {
-			query += " AND i.type_id IS NULL"
-			countQuery += " AND i.type_id IS NULL"
-		} else {
-			query += " AND i.type_id = ?"
-			countQuery += " AND i.type_id = ?"
-			args = append(args, *params.TypeID)
-			countArgs = append(countArgs, *params.TypeID)
-		}
-	}
-
-	// Filter by status
-	if params.Status != "" {
-		query += " AND i.status = ?"
-		countQuery += " AND i.status = ?"
-		args = append(args, params.Status)
-		countArgs = append(countArgs, params.Status)
-	}
-
-	query += " ORDER BY i.start_date DESC, i.name"
-	query += " LIMIT ? OFFSET ?"
-	args = append(args, params.Limit, params.Offset)
+	params.Status = normalizePlanningStatus(params.Status)
+	list := newPlanningListQuery(iterationSelectQuery+"\nWHERE 1=1", "SELECT COUNT(*) FROM iterations i WHERE 1=1")
+	list.addWorkspaceScope("i.workspace_id", "i.is_global", params.WorkspaceID, params.WorkspaceIDs, params.IncludeGlobal)
+	list.addNullableIDFilter("i.type_id", params.TypeID)
+	list.addStringFilter("i.status", params.Status)
+	query, args := list.paginated(iterationOrderByClause(params.SortBy, params.SortOrder), params.Limit, params.Offset)
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -170,29 +156,35 @@ func (s *PlanningService) ListIterations(params IterationListParams) ([]Iteratio
 	iterations, _ := scanIterations(rows)
 
 	var total int
-	if err := s.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+	if err := s.db.QueryRow(list.countQuery, list.countArgs...).Scan(&total); err != nil {
 		slog.Warn("failed to get iteration pagination count", slog.Any("error", err))
 	}
 
 	return iterations, total, nil
 }
 
+func iterationOrderByClause(sortBy, sortOrder string) string {
+	direction := "ASC"
+	if strings.EqualFold(sortOrder, "desc") {
+		direction = "DESC"
+	}
+	switch sortBy {
+	case "start_date", "end_date", "name", "status", "created_at", "updated_at":
+		// The id tie-break follows the primary direction and is always the
+		// final key, so equal values never fall back to alphabetical name order.
+		return " ORDER BY i." + sortBy + " " + direction + ", i.id " + direction
+	default:
+		return " ORDER BY i.start_date DESC, i.id DESC"
+	}
+}
+
 // GetIteration retrieves an iteration by ID.
 func (s *PlanningService) GetIteration(id int) (*IterationResult, error) {
-	row := s.db.QueryRow(`
-		SELECT i.id, i.name, i.description, i.start_date, i.end_date, i.status,
-		       i.type_id, it.name as type_name, it.color as type_color,
-		       i.is_global, i.workspace_id, w.name as workspace_name,
-		       i.created_at, i.updated_at
-		FROM iterations i
-		LEFT JOIN iteration_types it ON i.type_id = it.id
-		LEFT JOIN workspaces w ON i.workspace_id = w.id
-		WHERE i.id = ?
-	`, id)
+	row := s.db.QueryRow(iterationSelectQuery+"\nWHERE i.id = ?", id)
 
 	iter, err := scanIterationRow(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("iteration not found: %d", id)
+		return nil, fmt.Errorf("iteration not found: %d: %w", id, repository.ErrNotFound)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get iteration: %w", err)
@@ -201,12 +193,32 @@ func (s *PlanningService) GetIteration(id int) (*IterationResult, error) {
 	return &iter, nil
 }
 
+// FindIterationIDByName resolves an iteration by exact (case-insensitive)
+// name, preferring the workspace's own iteration over a same-named global one.
+// Returns nil when nothing matches.
+func (s *PlanningService) FindIterationIDByName(workspaceID int, name string) (*int, error) {
+	var id int
+	err := s.db.QueryRow(`
+		SELECT id FROM iterations
+		WHERE LOWER(name) = LOWER(?) AND (workspace_id = ? OR is_global = true)
+		ORDER BY CASE WHEN workspace_id = ? THEN 0 ELSE 1 END
+		LIMIT 1
+	`, name, workspaceID, workspaceID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve iteration by name: %w", err)
+	}
+	return &id, nil
+}
+
 // IsIterationGlobal checks if an iteration is global and returns its workspace_id.
 func (s *PlanningService) IsIterationGlobal(id int) (isGlobal bool, workspaceID *int, err error) {
 	var wsID sql.NullInt64
 	err = s.db.QueryRow("SELECT is_global, workspace_id FROM iterations WHERE id = ?", id).Scan(&isGlobal, &wsID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil, fmt.Errorf("iteration not found: %d", id)
+		return false, nil, fmt.Errorf("iteration not found: %d: %w", id, repository.ErrNotFound)
 	}
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to check iteration: %w", err)
@@ -228,25 +240,37 @@ type CreateIterationParams struct {
 	TypeID      *int
 	IsGlobal    bool
 	WorkspaceID *int
+	AuditActor  *AuditActor
 }
 
 // CreateIteration creates a new iteration.
 func (s *PlanningService) CreateIteration(params CreateIterationParams) (*IterationResult, error) {
-	status := params.Status
-	if status == "" {
-		status = "planned"
+	if params.Status == "" {
+		params.Status = "planned"
+	}
+	params.Status = normalizePlanningStatus(params.Status)
+	if err := s.validateIterationMutation(params); err != nil {
+		return nil, err
 	}
 
 	var id int64
 	err := s.db.QueryRow(`
 		INSERT INTO iterations (name, description, start_date, end_date, status, type_id, is_global, workspace_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
-	`, params.Name, params.Description, params.StartDate, params.EndDate, status, params.TypeID, params.IsGlobal, params.WorkspaceID).Scan(&id)
+	`, params.Name, params.Description, params.StartDate, params.EndDate, params.Status, params.TypeID, params.IsGlobal, params.WorkspaceID).Scan(&id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create iteration: %w", err)
 	}
 
-	return s.GetIteration(int(id))
+	created, err := s.GetIteration(int(id))
+	if err != nil {
+		return nil, err
+	}
+	if params.AuditActor != nil {
+		resourceID := created.ID
+		emitServiceAudit(s.db, *params.AuditActor, logger.ActionIterationCreate, logger.ResourceIteration, &resourceID, created.Name, nil)
+	}
+	return created, nil
 }
 
 // UpdateIterationParams contains parameters for updating an iteration.
@@ -262,45 +286,130 @@ type UpdateIterationParams struct {
 	Status      string
 	TypeID      *int
 	WorkspaceID *int // nil = global iteration
+	AuditActor  *AuditActor
 }
 
 // UpdateIteration updates an existing iteration within its declared scope.
 func (s *PlanningService) UpdateIteration(params UpdateIterationParams) (*IterationResult, error) {
+	params.Status = normalizePlanningStatus(params.Status)
+	if err := s.validateIterationMutation(CreateIterationParams{
+		Name:        params.Name,
+		Description: params.Description,
+		StartDate:   params.StartDate,
+		EndDate:     params.EndDate,
+		Status:      params.Status,
+		TypeID:      params.TypeID,
+		IsGlobal:    params.WorkspaceID == nil,
+		WorkspaceID: params.WorkspaceID,
+	}); err != nil {
+		return nil, err
+	}
+	currentStatus, err := s.iterationStatusInScope(params.ID, params.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateIterationStatusTransition(currentStatus, params.Status); err != nil {
+		return nil, err
+	}
+
 	var (
-		res sql.Result
-		err error
+		res       sql.Result
+		updateErr error
 	)
 	if params.WorkspaceID == nil {
-		res, err = s.db.ExecWrite(`
+		res, updateErr = s.db.ExecWrite(`
 			UPDATE iterations SET name = ?, description = ?, start_date = ?, end_date = ?,
 			       status = ?, type_id = ?, updated_at = CURRENT_TIMESTAMP
-			WHERE id = ? AND is_global = true
-		`, params.Name, params.Description, params.StartDate, params.EndDate, params.Status, params.TypeID, params.ID)
+			WHERE id = ? AND is_global = true AND status = ?
+		`, params.Name, params.Description, params.StartDate, params.EndDate, params.Status, params.TypeID, params.ID, currentStatus)
 	} else {
-		res, err = s.db.ExecWrite(`
+		res, updateErr = s.db.ExecWrite(`
 			UPDATE iterations SET name = ?, description = ?, start_date = ?, end_date = ?,
 			       status = ?, type_id = ?, updated_at = CURRENT_TIMESTAMP
-			WHERE id = ? AND workspace_id = ? AND is_global = false
-		`, params.Name, params.Description, params.StartDate, params.EndDate, params.Status, params.TypeID, params.ID, *params.WorkspaceID)
+			WHERE id = ? AND workspace_id = ? AND is_global = false AND status = ?
+		`, params.Name, params.Description, params.StartDate, params.EndDate, params.Status, params.TypeID, params.ID, *params.WorkspaceID, currentStatus)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to update iteration: %w", err)
+	if updateErr != nil {
+		return nil, fmt.Errorf("failed to update iteration: %w", updateErr)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read update result: %w", err)
 	}
 	if n == 0 {
-		return nil, fmt.Errorf("iteration not found: %d", params.ID)
+		// The scoped row existed when its lifecycle was checked. A zero-row
+		// conditional update means another writer changed the state meanwhile;
+		// never overwrite that transition with stale data.
+		return nil, ErrIterationLifecycleConflict
 	}
-	return s.GetIteration(params.ID)
+	updated, err := s.GetIteration(params.ID)
+	if err != nil {
+		return nil, err
+	}
+	if params.AuditActor != nil {
+		resourceID := updated.ID
+		emitServiceAudit(s.db, *params.AuditActor, logger.ActionIterationUpdate, logger.ResourceIteration, &resourceID, updated.Name, nil)
+	}
+	return updated, nil
 }
 
-// DeleteIteration deletes an iteration.
-func (s *PlanningService) DeleteIteration(id int) error {
+func (s *PlanningService) iterationStatusInScope(id int, workspaceID *int) (string, error) {
+	var (
+		status string
+		err    error
+	)
+	if workspaceID == nil {
+		err = s.db.QueryRow("SELECT status FROM iterations WHERE id = ? AND is_global = true", id).Scan(&status)
+	} else {
+		err = s.db.QueryRow("SELECT status FROM iterations WHERE id = ? AND workspace_id = ? AND is_global = false", id, *workspaceID).Scan(&status)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("iteration not found: %d: %w", id, repository.ErrNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to load iteration status: %w", err)
+	}
+	return status, nil
+}
+
+func validateIterationStatusTransition(current, next string) error {
+	valid := func(status string) bool {
+		switch status {
+		case "planned", "active", "completed", iterationStatusCancelled:
+			return true
+		default:
+			return false
+		}
+	}
+	if !valid(current) || !valid(next) {
+		return fmt.Errorf("%w: %q to %q", ErrIterationLifecycleConflict, current, next)
+	}
+	if next == "completed" && current != "completed" {
+		return ErrIterationCompletionRequired
+	}
+	if (current == "completed" || current == iterationStatusCancelled) && next != current {
+		return fmt.Errorf("%w: terminal iteration cannot be reopened", ErrIterationLifecycleConflict)
+	}
+	return nil
+}
+
+// DeleteIteration deletes an iteration and optionally records the user-driven
+// mutation once for any transport that supplied an actor.
+func (s *PlanningService) DeleteIteration(id int, auditActors ...AuditActor) error {
+	var resourceName string
+	if len(auditActors) > 0 {
+		existing, err := s.GetIteration(id)
+		if err != nil {
+			return err
+		}
+		resourceName = existing.Name
+	}
 	_, err := s.db.ExecWrite("DELETE FROM iterations WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("failed to delete iteration: %w", err)
+	}
+	if actor := optionalAuditActor(auditActors); actor != nil {
+		emitServiceAudit(s.db, *actor, logger.ActionIterationDelete, logger.ResourceIteration, &id, resourceName, nil)
 	}
 	return nil
 }
@@ -322,7 +431,7 @@ type IterationProgressReport struct {
 }
 
 // GetIterationProgress retrieves progress report for an iteration.
-func (s *PlanningService) GetIterationProgress(iterationID int) (*IterationProgressReport, error) {
+func (s *PlanningService) GetIterationProgress(iterationID int, workspaceIDs []int) (*IterationProgressReport, error) {
 	var report IterationProgressReport
 	report.IterationID = iterationID
 	// Get iteration details
@@ -335,7 +444,7 @@ func (s *PlanningService) GetIterationProgress(iterationID int) (*IterationProgr
 	`, iterationID).Scan(&report.IterationName, &description, &report.StartDate, &report.EndDate, &report.Status, &typeColor)
 
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("iteration not found: %d", iterationID)
+		return nil, fmt.Errorf("iteration not found: %d: %w", iterationID, repository.ErrNotFound)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get iteration: %w", err)
@@ -345,7 +454,7 @@ func (s *PlanningService) GetIterationProgress(iterationID int) (*IterationProgr
 	report.TypeColor = typeColor.String
 
 	// Get status breakdown and items grouped by status category
-	acc, err := s.buildProgressReport(repository.ItemFilters{IterationID: &iterationID})
+	acc, err := s.buildProgressReport(repository.ItemFilters{IterationID: &iterationID}, workspaceIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get iteration progress: %w", err)
 	}
@@ -361,10 +470,13 @@ func (s *PlanningService) GetIterationProgress(iterationID int) (*IterationProgr
 
 // BurndownDataPoint represents a single day's burndown data.
 type BurndownDataPoint struct {
-	Date      string `json:"date"`
-	Remaining int    `json:"remaining"`
-	Completed int    `json:"completed"`
-	Ideal     int    `json:"ideal"`
+	RemainingPoints float64 `json:"remaining_points"`
+	CompletedPoints float64 `json:"completed_points"`
+	IdealPoints     float64 `json:"ideal_points"`
+	Date            string  `json:"date"`
+	Remaining       int     `json:"remaining"`
+	Completed       int     `json:"completed"`
+	Ideal           int     `json:"ideal"`
 }
 
 // IterationBurndownData represents the full burndown chart data.
@@ -376,15 +488,18 @@ type IterationBurndownData struct {
 	DataPoints  []BurndownDataPoint `json:"data_points"`
 }
 
-// GetIterationBurndown calculates burndown data for an iteration by replaying item history.
-func (s *PlanningService) GetIterationBurndown(iterationID int) (*IterationBurndownData, error) {
-	// Get iteration details
+// GetIterationBurndown reconstructs daily membership, status, and estimates from history.
+// Unestimated items contribute zero story points.
+// TotalItems is the number of distinct visible items that belonged to the
+// iteration on at least one reported day. The ideal line is based on the
+// end-of-first-day commitment and is intentionally unaffected by later scope
+// additions or removals, making scope change visible instead of rewriting the
+// original plan.
+func (s *PlanningService) GetIterationBurndown(iterationID int, workspaceIDs []int) (*IterationBurndownData, error) {
 	iter, err := s.GetIteration(iterationID)
 	if err != nil {
 		return nil, err
 	}
-
-	// Parse dates
 	startDate, err := parseDate(iter.StartDate)
 	if err != nil {
 		return nil, fmt.Errorf("invalid start date: %w", err)
@@ -394,215 +509,247 @@ func (s *PlanningService) GetIterationBurndown(iterationID int) (*IterationBurnd
 		return nil, fmt.Errorf("invalid end date: %w", err)
 	}
 
-	// Get all items in this iteration with their current status category
+	type historicalItemState struct {
+		storyPoints float64
+		createdAt   time.Time
+		iterationID sql.NullInt64
+		statusID    sql.NullInt64
+	}
+	workspaceClause, workspaceArgs := planningWorkspaceFilter("i.workspace_id", workspaceIDs)
+	iterationValue := fmt.Sprintf("%d", iterationID)
+	itemArgs := make([]any, 0, 3+len(workspaceArgs))
+	itemArgs = append(itemArgs, iterationID, iterationValue, iterationValue)
+	itemArgs = append(itemArgs, workspaceArgs...)
 	rows, err := s.db.Query(`
-		SELECT i.id, COALESCE(sc.is_completed, false) as is_completed
+		SELECT i.id, i.iteration_id, i.status_id, i.created_at, COALESCE(i.story_points, 0)
 		FROM items i
-		LEFT JOIN statuses st ON i.status_id = st.id
-		LEFT JOIN status_categories sc ON st.category_id = sc.id
-		WHERE i.iteration_id = ?
-	`, iterationID)
+		WHERE (
+			i.iteration_id = ?
+			OR EXISTS (
+				SELECT 1 FROM item_history ih
+				WHERE ih.item_id = i.id
+				  AND ih.field_name = 'iteration_id'
+				  AND (ih.old_value = ? OR ih.new_value = ?)
+			)
+		)`+workspaceClause+`
+	`, itemArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get iteration items: %w", err)
+		return nil, fmt.Errorf("failed to get historical iteration items: %w", err)
 	}
 	defer rows.Close()
 
-	// Build map of item IDs to their current completed state
-	itemStates := make(map[int]bool) // itemID -> isCompleted
+	itemStates := make(map[int]*historicalItemState)
 	for rows.Next() {
-		var itemID int
-		var isCompleted bool
-		if err = rows.Scan(&itemID, &isCompleted); err != nil {
-			continue
+		var (
+			itemID       int
+			createdValue any
+			state        historicalItemState
+		)
+		if err := rows.Scan(&itemID, &state.iterationID, &state.statusID, &createdValue, &state.storyPoints); err != nil {
+			return nil, fmt.Errorf("failed to scan historical iteration item: %w", err)
 		}
-		itemStates[itemID] = isCompleted
+		createdAt, ok := analyticsDBTime(createdValue)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse creation time for item %d", itemID)
+		}
+		state.createdAt = createdAt
+		itemStates[itemID] = &state
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate iteration items: %w", err)
+		return nil, fmt.Errorf("failed to iterate historical iteration items: %w", err)
 	}
-
-	totalItems := len(itemStates)
-	if totalItems == 0 {
-		// Return empty data if no items
+	if len(itemStates) == 0 {
 		return &IterationBurndownData{
 			IterationID: iterationID,
 			StartDate:   iter.StartDate,
 			EndDate:     iter.EndDate,
-			TotalItems:  0,
 			DataPoints:  []BurndownDataPoint{},
 		}, nil
 	}
 
-	// Get all status changes for items in this iteration within the date range
-	// We need to work backwards from current state using history
+	type historyChange struct {
+		itemID    int
+		changedAt time.Time
+		fieldName string
+		oldValue  sql.NullString
+		newValue  sql.NullString
+	}
+	historyArgs := make([]any, 0, 4+len(workspaceArgs))
+	historyArgs = append(historyArgs, startDate, iterationID, iterationValue, iterationValue)
+	historyArgs = append(historyArgs, workspaceArgs...)
 	historyRows, err := s.db.Query(`
-		SELECT ih.item_id, ih.changed_at, ih.old_value, ih.new_value
+		SELECT ih.item_id, ih.changed_at, ih.field_name, ih.old_value, ih.new_value
 		FROM item_history ih
-		JOIN items i ON ih.item_id = i.id
-		WHERE i.iteration_id = ?
-		  AND ih.field_name = 'status_id'
+		JOIN items i ON i.id = ih.item_id
+		WHERE ih.field_name IN ('iteration_id', 'status_id', 'story_points')
 		  AND ih.changed_at >= ?
-		ORDER BY ih.changed_at DESC
-	`, iterationID, startDate.Format("2006-01-02"))
+		  AND (
+			i.iteration_id = ?
+			OR EXISTS (
+				SELECT 1 FROM item_history membership
+				WHERE membership.item_id = i.id
+				  AND membership.field_name = 'iteration_id'
+				  AND (membership.old_value = ? OR membership.new_value = ?)
+			)
+		  )`+workspaceClause+`
+		ORDER BY ih.changed_at ASC, ih.id ASC
+	`, historyArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get item history: %w", err)
+		return nil, fmt.Errorf("failed to get iteration membership history: %w", err)
 	}
 	defer historyRows.Close()
 
-	// Collect all status change events
-	type statusChange struct {
-		ItemID    int
-		ChangedAt time.Time
-		OldValue  sql.NullString
-		NewValue  sql.NullString
-	}
-	var changes []statusChange
-
+	var changes []historyChange
 	for historyRows.Next() {
-		var c statusChange
-		var changedAtStr string
-		if err = historyRows.Scan(&c.ItemID, &changedAtStr, &c.OldValue, &c.NewValue); err != nil {
-			continue
+		var change historyChange
+		var changedValue any
+		if err := historyRows.Scan(
+			&change.itemID, &changedValue, &change.fieldName, &change.oldValue, &change.newValue,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan iteration history: %w", err)
 		}
-		// Parse the datetime
-		c.ChangedAt, _ = time.Parse("2006-01-02 15:04:05", changedAtStr)
-		if c.ChangedAt.IsZero() {
-			c.ChangedAt, _ = time.Parse(time.RFC3339, changedAtStr)
+		changedAt, ok := analyticsDBTime(changedValue)
+		if !ok {
+			return nil, fmt.Errorf("failed to parse iteration history time for item %d", change.itemID)
 		}
-		changes = append(changes, c)
+		change.changedAt = changedAt
+		changes = append(changes, change)
 	}
 	if err := historyRows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate item history: %w", err)
+		return nil, fmt.Errorf("failed to iterate iteration history: %w", err)
 	}
 
-	// Get status_id -> is_completed mapping
-	statusCompletedMap := make(map[int]bool)
+	parseNullableID := func(value sql.NullString) sql.NullInt64 {
+		if !value.Valid || value.String == "" {
+			return sql.NullInt64{}
+		}
+		var id int64
+		if _, scanErr := fmt.Sscanf(value.String, "%d", &id); scanErr != nil {
+			return sql.NullInt64{}
+		}
+		return sql.NullInt64{Int64: id, Valid: true}
+	}
+	applyValue := func(state *historicalItemState, fieldName string, value sql.NullString) {
+		switch fieldName {
+		case "iteration_id":
+			state.iterationID = parseNullableID(value)
+		case "status_id":
+			state.statusID = parseNullableID(value)
+		case "story_points":
+			state.storyPoints, _ = strconv.ParseFloat(value.String, 64)
+		}
+	}
+
+	// Rewind current state to immediately before the iteration start. This
+	// includes carry-over changes made after the iteration ended.
+	for i := len(changes) - 1; i >= 0; i-- {
+		if state := itemStates[changes[i].itemID]; state != nil {
+			applyValue(state, changes[i].fieldName, changes[i].oldValue)
+		}
+	}
+
+	statusCompleted := make(map[int64]bool)
 	statusRows, err := s.db.Query(`
-		SELECT s.id, COALESCE(sc.is_completed, false)
-		FROM statuses s
-		LEFT JOIN status_categories sc ON s.category_id = sc.id
+		SELECT st.id, COALESCE(sc.is_completed, false)
+		FROM statuses st
+		LEFT JOIN status_categories sc ON sc.id = st.category_id
 	`)
-	if err == nil {
-		defer statusRows.Close()
-		for statusRows.Next() {
-			var statusID int
-			var isCompleted bool
-			if err := statusRows.Scan(&statusID, &isCompleted); err == nil {
-				statusCompletedMap[statusID] = isCompleted
-			}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get burndown statuses: %w", err)
+	}
+	defer statusRows.Close()
+	for statusRows.Next() {
+		var statusID int64
+		var completed bool
+		if err := statusRows.Scan(&statusID, &completed); err != nil {
+			return nil, fmt.Errorf("failed to scan burndown status: %w", err)
 		}
-		if err := statusRows.Err(); err != nil {
-			return nil, fmt.Errorf("failed to iterate statuses: %w", err)
-		}
+		statusCompleted[statusID] = completed
+	}
+	if err := statusRows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate burndown statuses: %w", err)
 	}
 
-	// Helper to check if a status_id string represents a completed status
-	isStatusCompleted := func(statusIDStr string) bool {
-		if statusIDStr == "" {
-			return false
-		}
-		var statusID int
-		if _, err := fmt.Sscanf(statusIDStr, "%d", &statusID); err != nil {
-			return false
-		}
-		return statusCompletedMap[statusID]
-	}
-
-	// Build daily data points
-	var dataPoints []BurndownDataPoint
-	today := time.Now().Truncate(24 * time.Hour)
+	now := time.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	effectiveEndDate := endDate
-	if today.Before(endDate) {
+	if today.Before(effectiveEndDate) {
 		effectiveEndDate = today
 	}
-
-	totalDays := int(endDate.Sub(startDate).Hours()/24) + 1
-
-	// Start with current state and work backwards through history to build daily snapshots
-	// Clone current state for simulation
-	dayStates := make(map[int]bool)
-	for id, completed := range itemStates {
-		dayStates[id] = completed
+	if effectiveEndDate.Before(startDate) {
+		return &IterationBurndownData{
+			IterationID: iterationID,
+			StartDate:   iter.StartDate,
+			EndDate:     iter.EndDate,
+			DataPoints:  []BurndownDataPoint{},
+		}, nil
 	}
 
-	// Build data for each day from end to start
-	type dayData struct {
-		date      string
-		remaining int
-		completed int
-	}
-	var dailyData []dayData
-
-	for d := effectiveEndDate; !d.Before(startDate); d = d.AddDate(0, 0, -1) {
-		dateStr := d.Format("2006-01-02")
-
-		// Apply any history changes that happened after this day (reverse them)
-		for _, c := range changes {
-			changeDate := c.ChangedAt.Truncate(24 * time.Hour)
-			if changeDate.Equal(d.AddDate(0, 0, 1)) || changeDate.After(d.AddDate(0, 0, 1)) {
-				// This change happened after our current day, so reverse it
-				// (set the item to its old state)
-				if _, exists := dayStates[c.ItemID]; exists {
-					dayStates[c.ItemID] = isStatusCompleted(c.OldValue.String)
-				}
+	var dataPoints []BurndownDataPoint
+	everMembers := make(map[int]struct{})
+	changeIndex := 0
+	for day := startDate; !day.After(effectiveEndDate); day = day.AddDate(0, 0, 1) {
+		dayEnd := day.AddDate(0, 0, 1)
+		for changeIndex < len(changes) && changes[changeIndex].changedAt.Before(dayEnd) {
+			change := changes[changeIndex]
+			if state := itemStates[change.itemID]; state != nil {
+				applyValue(state, change.fieldName, change.newValue)
 			}
+			changeIndex++
 		}
 
-		// Filter changes to only those not yet processed
-		var remainingChanges []statusChange
-		for _, c := range changes {
-			changeDate := c.ChangedAt.Truncate(24 * time.Hour)
-			if changeDate.Before(d.AddDate(0, 0, 1)) {
-				remainingChanges = append(remainingChanges, c)
+		remaining, completed := 0, 0
+		remainingPoints, completedPoints := 0.0, 0.0
+		for itemID, state := range itemStates {
+			if !state.createdAt.Before(dayEnd) ||
+				!state.iterationID.Valid ||
+				int(state.iterationID.Int64) != iterationID {
+				continue
 			}
-		}
-		changes = remainingChanges
-
-		// Count completed and remaining
-		completed := 0
-		for _, isCompleted := range dayStates {
-			if isCompleted {
+			everMembers[itemID] = struct{}{}
+			if state.statusID.Valid && statusCompleted[state.statusID.Int64] {
 				completed++
+				completedPoints += state.storyPoints
+			} else {
+				remaining++
+				remainingPoints += state.storyPoints
 			}
 		}
-		remaining := totalItems - completed
-
-		dailyData = append(dailyData, dayData{
-			date:      dateStr,
-			remaining: remaining,
-			completed: completed,
+		dataPoints = append(dataPoints, BurndownDataPoint{
+			Date:            day.Format("2006-01-02"),
+			RemainingPoints: remainingPoints,
+			CompletedPoints: completedPoints,
+			Remaining:       remaining,
+			Completed:       completed,
 		})
 	}
 
-	// Reverse to get chronological order
-	for i := len(dailyData) - 1; i >= 0; i-- {
-		dd := dailyData[i]
-		dayIndex := 0
-		d, _ := parseDate(dd.date)
-		dayIndex = int(d.Sub(startDate).Hours() / 24)
-
-		// Calculate ideal remaining for this day
-		ideal := totalItems
+	committedItems := 0
+	if len(dataPoints) > 0 {
+		committedItems = dataPoints[0].Remaining + dataPoints[0].Completed
+	}
+	totalDays := int(endDate.Sub(startDate).Hours()/24) + 1
+	for i := range dataPoints {
+		ideal := committedItems
 		if totalDays > 1 {
-			ideal = totalItems - (dayIndex * totalItems / (totalDays - 1))
+			ideal = committedItems - (i * committedItems / (totalDays - 1))
 			if ideal < 0 {
 				ideal = 0
 			}
 		}
-
-		dataPoints = append(dataPoints, BurndownDataPoint{
-			Date:      dd.date,
-			Remaining: dd.remaining,
-			Completed: dd.completed,
-			Ideal:     ideal,
-		})
+		dataPoints[i].Ideal = ideal
+		committedPoints := dataPoints[0].RemainingPoints + dataPoints[0].CompletedPoints
+		dataPoints[i].IdealPoints = committedPoints
+		if totalDays > 1 {
+			dataPoints[i].IdealPoints = committedPoints * float64(totalDays-1-i) / float64(totalDays-1)
+		}
 	}
 
 	return &IterationBurndownData{
 		IterationID: iterationID,
 		StartDate:   iter.StartDate,
 		EndDate:     iter.EndDate,
-		TotalItems:  totalItems,
+		TotalItems:  len(everMembers),
 		DataPoints:  dataPoints,
 	}, nil
 }

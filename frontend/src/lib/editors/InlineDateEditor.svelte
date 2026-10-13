@@ -2,18 +2,19 @@
   import { tick } from 'svelte';
   import { Calendar } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
-  import { formatDate, formatDateShort } from '../utils/dateFormatter.js';
+  import { dateOnlyKey, formatDateOnly } from '../utils/dateFormatter.js';
   import BaseInlineEditor from './BaseInlineEditor.svelte';
+  import Input from '../components/Input.svelte';
 
   let {
     value = '', placeholder = '', disabled = false, required = false,
-    className = '', editingClass = 'border-blue-500 ring-1 ring-blue-500',
+    className = '', editingClass = 'border-ds-interactive ring-1 ring-ds-border-focused',
     displayClass = 'hover-bg cursor-text', enableSingleClick = false,
     enableDoubleClick = false, onsave = null, onclick: onclickProp = null
   } = $props();
 
   const effectivePlaceholder = $derived(placeholder || t('editors.selectDate'));
-  const displayValue = $derived(value ? (formatDateShort(value) || value) : '');
+  const displayValue = $derived(value ? (formatDateOnly(value) || value) : '');
 
   let baseEditor;
   let editValue = $state('');
@@ -21,7 +22,7 @@
 
   function formatInputDate(dateStr) {
     if (!dateStr) return '';
-    try { return formatDate(new Date(dateStr)); } catch { return ''; }
+    return dateOnlyKey(dateStr);
   }
 
   function handleStartEdit() {
@@ -39,8 +40,7 @@
       return;
     }
     baseEditor.setSaving(true);
-    const dateValue = editValue ? new Date(editValue).toISOString() : '';
-    onsave?.({ value: dateValue });
+    onsave?.({ value: editValue });
   }
 
   export function confirmSave(newValue) {
@@ -64,12 +64,11 @@
   onstartedit={handleStartEdit}
 >
   {#snippet editingInput({ saving, error, onkeydown, onblur })}
-    <input
-      bind:this={inputElement}
+    <Input
+      bind:inputRef={inputElement}
       bind:value={editValue}
       type="date"
-      class="w-full px-2 py-1 text-sm border rounded {editingClass} {className}"
-      class:border-red-500={error}
+      class="w-full px-2 py-1 text-sm border rounded {editingClass} {className} {error ? 'border-ds-border-danger' : ''}"
       disabled={saving}
       {onkeydown}
       {onblur}
@@ -77,11 +76,12 @@
   {/snippet}
   {#snippet displayContent()}
     <span
-      class="block text-left w-full px-2 py-1 text-sm rounded transition-colors flex items-center gap-2 {displayClass} {className}"
+      class="flex items-center gap-2 text-left w-full px-2 py-1 text-sm rounded whitespace-nowrap transition-colors {displayClass} {className}"
       style={!value ? 'color: var(--ds-text-subtle);' : ''}
+      data-testid="inline-date-display"
     >
-      <Calendar class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-      {displayValue || effectivePlaceholder}
+      <Calendar class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+      <span data-testid="inline-date-value">{displayValue || effectivePlaceholder}</span>
     </span>
   {/snippet}
 </BaseInlineEditor>

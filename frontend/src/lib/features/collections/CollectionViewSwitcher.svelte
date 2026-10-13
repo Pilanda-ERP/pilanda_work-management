@@ -1,8 +1,10 @@
 <script>
   import { navigate } from '../../router.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { viewSettingsStore } from '../../stores/viewSettings.svelte.js';
+  import { collectionStore } from '../../stores/collectionContext.svelte.js';
+  import { authStore } from '../../stores/auth.svelte.js';
   import { SquareKanban, Inbox, Settings, Globe } from '@lucide/svelte';
-  import { backlogStore } from '../../stores/index.js';
   import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
 
   // Props
@@ -13,16 +15,29 @@
     publicSlug = null,
   } = $props();
 
-  // Configure view writes the workspace-default board configuration, which
-  // the backend gates to `workspace.admin` — hide the entry point for
-  // non-admins so they don't reach a page they can't save.
-  let canConfigure = $derived(workspacePermissions.canAdminWorkspace(workspaceId));
+  // Keep the enabled-views lookup warm; board/backlog hide when disabled.
+  $effect(() => {
+    if (workspaceId || collectionId) {
+      viewSettingsStore.load(workspaceId, collectionId);
+    }
+  });
+  const boardEnabled = $derived(viewSettingsStore.enabledViewIds(workspaceId, collectionId).includes('board'));
+  const backlogEnabled = $derived(viewSettingsStore.enabledViewIds(workspaceId, collectionId).includes('backlog'));
+
+  // Views follow collection-editing rights: the workspace-default context is
+  // workspace-admin territory, while a collection's views belong to whoever
+  // can edit the collection (its creator) — mirroring the backend gates.
+  const isCollectionCreator = $derived(Boolean(
+    collectionStore.boardCollection &&
+      authStore.currentUser?.id != null &&
+      String(collectionStore.boardCollection.created_by) === String(authStore.currentUser.id)
+  ));
+  let canConfigure = $derived(
+    collectionId ? isCollectionCreator : workspacePermissions.canAdminWorkspace(workspaceId)
+  );
 
   // Styles use --ctx-* CSS vars cascaded from parent collection view
   const containerStyle = 'background-color: var(--ctx-surface, var(--ds-background-neutral)); backdrop-filter: var(--ctx-backdrop, none);';
-  const activeButtonStyle = 'color: var(--ds-text); background-color: var(--ctx-surface-raised, var(--ds-surface-raised));';
-  const inactiveButtonStyle = 'color: var(--ds-text);';
-  const hoverBgStyle = 'var(--ctx-surface, var(--ds-background-neutral-hovered))';
 
   // Navigation functions
   function goToBoard() {
@@ -45,16 +60,23 @@
       : `/collections/${collectionId}/board/configure`;
     navigate(url);
   }
+
+  function goToNavConfig() {
+    const url = workspaceId
+      ? `/workspaces/${workspaceId}/collections/${collectionId}/nav-config`
+      : `/collections/${collectionId}/nav-config`;
+    navigate(url);
+  }
 </script>
 
-<div class="flex rounded p-1" style={containerStyle}>
+<div class="flex rounded p-1" style={containerStyle} data-testid="board-view-switcher">
   <!-- Board Button -->
+  {#if boardEnabled}
   <button
-    class="px-3 py-1.5 text-sm font-medium rounded transition-colors"
+    class="view-btn px-3 py-1.5 text-sm font-medium rounded transition-colors"
     class:shadow-sm={activeView === 'board'}
-    style={activeView === 'board' ? activeButtonStyle : inactiveButtonStyle}
-    onmouseenter={(e) => activeView !== 'board' && (e.currentTarget.style.backgroundColor = hoverBgStyle)}
-    onmouseleave={(e) => activeView !== 'board' && (e.currentTarget.style.backgroundColor = '')}
+    class:active={activeView === 'board'}
+    data-testid="switcher-view-board"
     onclick={activeView !== 'board' ? goToBoard : undefined}
   >
     <div class="flex items-center gap-2">
@@ -62,35 +84,30 @@
       {t('collections.board')}
     </div>
   </button>
+  {/if}
 
   <!-- Backlog Button -->
+  {#if backlogEnabled}
   <button
-    class="px-3 py-1.5 text-sm font-medium rounded transition-colors"
+    class="view-btn px-3 py-1.5 text-sm font-medium rounded transition-colors"
     class:shadow-sm={activeView === 'backlog'}
-    style={activeView === 'backlog' ? activeButtonStyle : inactiveButtonStyle}
-    onmouseenter={(e) => activeView !== 'backlog' && (e.currentTarget.style.backgroundColor = hoverBgStyle)}
-    onmouseleave={(e) => activeView !== 'backlog' && (e.currentTarget.style.backgroundColor = '')}
+    class:active={activeView === 'backlog'}
+    data-testid="switcher-view-backlog"
     onclick={activeView !== 'backlog' ? goToBacklog : undefined}
   >
     <div class="flex items-center gap-2">
       <Inbox class="w-4 h-4" />
       {t('collections.backlog')}
-      {#if backlogStore.count > 0}
-        <span class="px-1.5 py-0.5 rounded-full text-xs" style="background-color: var(--ds-accent-blue-subtle); color: var(--ds-text-info);">
-          {backlogStore.count}
-        </span>
-      {/if}
     </div>
   </button>
+  {/if}
 
   <!-- Configure Button -->
   {#if canConfigure}
     <button
-      class="px-3 py-1.5 text-sm font-medium rounded transition-colors"
+      class="view-btn px-3 py-1.5 text-sm font-medium rounded transition-colors"
       class:shadow-sm={activeView === 'configure'}
-      style={activeView === 'configure' ? activeButtonStyle : inactiveButtonStyle}
-      onmouseenter={(e) => activeView !== 'configure' && (e.currentTarget.style.backgroundColor = hoverBgStyle)}
-      onmouseleave={(e) => activeView !== 'configure' && (e.currentTarget.style.backgroundColor = '')}
+      class:active={activeView === 'configure'}
       onclick={activeView !== 'configure' ? goToConfigure : undefined}
     >
       <div class="flex items-center gap-2">
@@ -100,17 +117,30 @@
     </button>
   {/if}
 
+  <!-- Navigation visibility entry point for collection scopes. -->
+  {#if collectionId && canConfigure}
+    <button
+      class="view-btn px-2 py-1.5 text-sm font-medium rounded transition-colors"
+      title={t('navConfig.configureTitle')}
+      aria-label={t('navConfig.configureTitle')}
+      data-testid="collection-nav-config-button"
+      onclick={goToNavConfig}
+    >
+      <div class="flex items-center gap-2">
+        <Settings class="w-4 h-4" />
+        <span class="sr-only">{t('navConfig.configureTitle')}</span>
+      </div>
+    </button>
+  {/if}
+
   {#if publicSlug}
     <a
       href="/board/{publicSlug}"
       target="_blank"
       rel="noopener noreferrer"
-      class="px-3 py-1.5 text-sm font-medium rounded transition-colors"
-      style={inactiveButtonStyle}
+      class="view-btn px-3 py-1.5 text-sm font-medium rounded transition-colors"
       title={t('collections.publicBoard')}
       onclick={(e) => { e.stopPropagation(); window.open(`/board/${publicSlug}`, '_blank'); e.preventDefault(); }}
-      onmouseenter={(e) => e.currentTarget.style.backgroundColor = hoverBgStyle}
-      onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
     >
       <div class="flex items-center gap-2">
         <Globe class="w-4 h-4" />
@@ -119,3 +149,17 @@
     </a>
   {/if}
 </div>
+
+<style>
+  .view-btn {
+    color: var(--ds-text);
+  }
+
+  .view-btn:hover:not(.active) {
+    background-color: var(--ctx-surface, var(--ds-background-neutral-hovered));
+  }
+
+  .view-btn.active {
+    background-color: var(--ctx-surface-raised, var(--ds-surface-raised));
+  }
+</style>

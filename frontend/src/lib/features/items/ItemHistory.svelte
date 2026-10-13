@@ -1,14 +1,22 @@
 <script>
 	import { onMount } from 'svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
 	import { api } from '../../api.js';
 	import { authStore } from '../../stores';
 	import { formatHistoryTimestamp, formatRelativeTime, getUserTimezone } from '../../utils/dateFormatter.js';
 	import { Clock, User, Bot } from '@lucide/svelte';
-	import Spinner from '../../components/Spinner.svelte';
 	import AlertBox from '../../components/AlertBox.svelte';
 	import EmptyState from '../../components/EmptyState.svelte';
 	import Tooltip from '../../components/Tooltip.svelte';
 	import { t } from '../../stores/i18n.svelte.js';
+	import { formatCostUSD, hasMeteredUsage } from '../../utils/llmUsage.js';
+	import { agentRuns } from '../../api/agentRuns.js';
+	import {
+		agentOwnerName,
+		historyTelemetryRunIDs,
+		isAIChatAttributed,
+		loadAttributedItemHistory
+	} from './activityAttributionData.js';
 
 	let { itemId } = $props();
 
@@ -16,11 +24,11 @@
 	let loading = $state(true);
 	let error = $state('');
 
-	// Per-author cache of agent owner info, keyed by user_id. Mirrors the
-	// pattern in Comments.svelte: null means "we already asked and the
-	// requester isn't allowed to see this agent's owner" so we fall back to
-	// the generic tooltip instead of re-fetching.
-	let agentOwnerCache = $state({});
+	// Metered telemetry is fetched per run on demand, keyed by run id. A run
+	// that failed or has no usage resolves to null so we do not retry it on
+	// every hover; `undefined` means "not attempted yet".
+	let runTelemetry = $state({});
+	let runTelemetryLoading = $state({});
 
 	// Get user's timezone
 	let timezone = $derived(getUserTimezone(authStore.currentUser));
@@ -33,8 +41,7 @@
 		loading = true;
 		error = '';
 		try {
-			history = await api.items.getHistory(itemId);
-			prefetchAgentOwners(history);
+			history = await loadAttributedItemHistory(api, itemId);
 		} catch (err) {
 			error = err.message || 'Failed to load item history';
 			console.error('Error loading item history:', err);
@@ -43,37 +50,58 @@
 		}
 	}
 
-	async function ensureAgentOwnerLoaded(userId) {
-		if (userId == null || userId in agentOwnerCache) return;
-		agentOwnerCache = { ...agentOwnerCache, [userId]: undefined };
-		try {
-			const info = await api.getAgentOwner(userId);
-			agentOwnerCache = { ...agentOwnerCache, [userId]: info };
-		} catch {
-			agentOwnerCache = { ...agentOwnerCache, [userId]: null };
+	function agentTooltipContent(entry) {
+		// AI-chat attribution is checked first: a chat-driven change is the
+		// more specific fact, and its owner is simply the human whose name is
+		// already on the row, so the connected-agent copy would be misleading.
+		if (isAIChatAttributed(entry)) {
+			return t('history.viaAIChat');
 		}
-	}
-
-	function prefetchAgentOwners(list) {
-		const seen = new Set();
-		for (const entry of list) {
-			if (!entry.is_agent || entry.user_id == null) continue;
-			if (seen.has(entry.user_id)) continue;
-			seen.add(entry.user_id);
-			ensureAgentOwnerLoaded(entry.user_id);
-		}
-	}
-
-	function agentTooltipContent(userId) {
-		const info = agentOwnerCache[userId];
-		if (info?.owner_name) {
-			return t('comments.agentOwnedBy', { owner: info.owner_name });
+		const owner = agentOwnerName(entry);
+		if (owner) {
+			return t('comments.agentOwnedBy', { owner });
 		}
 		return t('comments.agentAuthored');
 	}
 
 	// Group history entries by timestamp (changes made at the same time)
 	let groupedHistory = $derived(groupByTimestamp(history));
+
+	// The newest runs this view is allowed to fetch telemetry for. Computed
+	// from the rendered groups so the cap tracks what the user can actually
+	// hover, and evaluated before any request is issued.
+	let telemetryRunIDs = $derived(new Set(historyTelemetryRunIDs(groupedHistory)));
+
+	// Fetch a run's metered model/tokens/cost once, on first hover. Runs beyond
+	// the cap (or already attempted) are ignored so a long history cannot fan
+	// out into a request per agent row.
+	async function loadRunTelemetry(runId) {
+		if (!runId || !telemetryRunIDs.has(runId)) return;
+		if (runTelemetry[runId] !== undefined || runTelemetryLoading[runId]) return;
+		runTelemetryLoading = { ...runTelemetryLoading, [runId]: true };
+		try {
+			const usage = await agentRuns.usage(runId);
+			runTelemetry = { ...runTelemetry, [runId]: usage };
+		} catch {
+			runTelemetry = { ...runTelemetry, [runId]: null };
+		} finally {
+			runTelemetryLoading = { ...runTelemetryLoading, [runId]: false };
+		}
+	}
+
+	// The metered detail behind an AI-chat change, once it has loaded. Null
+	// until then (or when the run recorded no usage), so the tooltip can render
+	// the attribution without waiting on the network.
+	function agentRunDetail(group) {
+		if (!isAIChatAttributed(group) || !group?.agent_run_id) return null;
+		const usage = runTelemetry[group.agent_run_id];
+		if (!usage || !hasMeteredUsage(usage)) return null;
+		return {
+			model: usage.model || '',
+			tokens: Number(usage.total_tokens) || 0,
+			cost: formatCostUSD(usage.cost_usd)
+		};
+	}
 
 	function groupByTimestamp(entries) {
 		if (!entries || entries.length === 0) return [];
@@ -92,10 +120,34 @@
 					user_id: entry.user_id,
 					user_name: entry.user_name,
 					user_email: entry.user_email,
-					is_agent: entry.is_agent,
+					is_agent: false,
+					agent_owner_name: '',
+					source: '',
+					agent_run_id: null,
+					actor_kind: entry.actor_kind || 'user',
+					portal_customer_name: entry.portal_customer_name || '',
+					portal_customer_email: entry.portal_customer_email || '',
 					changes: []
 				};
 				groups.push(currentGroup);
+			}
+
+			// Attribution is OR-ed across the whole group rather than taken from
+			// the first row: one agentic write emits many field rows sharing a
+			// single timestamp, and trusting the first would drop the marker
+			// whenever that row happened to carry no stamp.
+			currentGroup.is_agent = currentGroup.is_agent || !!entry.is_agent;
+			if (isAIChatAttributed(entry)) {
+				currentGroup.source = entry.source;
+			}
+			// Keep the run link from whichever row carries it. The link is on every
+			// row a turn wrote, but a group can also hold rows from a direct edit
+			// made in the same second, and those have none.
+			if (!currentGroup.agent_run_id && entry.agent_run_id) {
+				currentGroup.agent_run_id = entry.agent_run_id;
+			}
+			if (!currentGroup.agent_owner_name && entry.agent_owner_name) {
+				currentGroup.agent_owner_name = entry.agent_owner_name;
 			}
 
 			currentGroup.changes.push({
@@ -108,6 +160,21 @@
 		});
 
 		return groups;
+	}
+
+	// Display name for a history group: internal user, portal customer, or
+	// System (system/integration actors have no stored reference).
+	function groupActorName(group) {
+		if (group.user_id && group.user_name) return group.user_name;
+		if (group.actor_kind === 'portal_customer') return group.portal_customer_name || 'Portal customer';
+		if (group.user_name) return group.user_name;
+		return 'System';
+	}
+
+	function groupActorEmail(group) {
+		if (group.user_id) return group.user_email;
+		if (group.actor_kind === 'portal_customer') return group.portal_customer_email;
+		return group.user_email;
 	}
 
 	// Approval-engine events are merged into the history feed server-side as
@@ -215,9 +282,7 @@
 
 <div class="item-history">
 	{#if loading}
-		<div class="flex items-center justify-center py-8">
-			<Spinner />
-		</div>
+		<StateDisplay type="loading" />
 	{:else if error}
 		<AlertBox message={error} />
 	{:else if groupedHistory.length === 0}
@@ -233,22 +298,57 @@
 					<div class="rail">
 						<div
 							class="avatar"
-							style="background-color: {getUserColor(group.user_name)};"
-							title={group.user_email || group.user_name}
+							style="background-color: {getUserColor(groupActorName(group))};"
+							title={groupActorEmail(group) || groupActorName(group)}
 						>
-							{getUserInitials(group.user_name)}
+							{getUserInitials(groupActorName(group))}
 						</div>
 						<div class="line"></div>
 					</div>
 					<div class="body">
 						<div class="header">
-							{#if group.is_agent}
-								<Tooltip content={agentTooltipContent(group.user_id)} placement="top">
-									<Bot class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" />
-								</Tooltip>
+							{#if group.is_agent || isAIChatAttributed(group)}
+								{#if isAIChatAttributed(group) && group.agent_run_id}
+									{@const runDetail = agentRunDetail(group)}
+									<Tooltip placement="top" contentClass="px-2 py-1.5 text-xs max-w-xs">
+										{#snippet tip()}
+											<div class="agent-detail">
+												<div class="agent-detail-title">{t('history.viaAIChat')}</div>
+												{#if runDetail}
+													{#if runDetail.model}
+														<div class="agent-detail-row">
+															<span>{t('history.model')}</span>
+															<span class="agent-detail-value">{runDetail.model}</span>
+														</div>
+													{/if}
+													{#if runDetail.tokens}
+														<div class="agent-detail-row">
+															<span>{t('history.tokens')}</span>
+															<span class="agent-detail-value">{runDetail.tokens.toLocaleString()}</span>
+														</div>
+													{/if}
+													<div class="agent-detail-row">
+														<span>{t('history.cost')}</span>
+														<span class="agent-detail-value">{runDetail.cost || t('history.costUnknown')}</span>
+													</div>
+												{/if}
+											</div>
+										{/snippet}
+										<span role="presentation" onmouseenter={() => loadRunTelemetry(group.agent_run_id)}>
+											<Bot class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" data-testid="item-history-agent-marker" />
+										</span>
+									</Tooltip>
+								{:else}
+									<Tooltip content={agentTooltipContent(group)} placement="top">
+										<Bot class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" data-testid="item-history-agent-marker" />
+									</Tooltip>
+								{/if}
 							{/if}
-							<span class="user">{group.user_name || 'Unknown'}</span>
-							<span class="time" title={formatHistoryTimestamp(group.changed_at, timezone)}>
+							<span class="user" data-testid="item-history-actor">{groupActorName(group)}</span>
+							{#if group.actor_kind === 'portal_customer'}
+								<span class="actor-badge" data-testid="item-history-portal-actor">portal</span>
+							{/if}
+							<span data-testid="item-history-time" class="time" title={formatHistoryTimestamp(group.changed_at, timezone)}>
 								{formatRelativeTime(group.changed_at)}
 							</span>
 						</div>
@@ -347,6 +447,16 @@
 		color: var(--ds-text);
 	}
 
+	.actor-badge {
+		font-size: 0.6875rem;
+		line-height: 1;
+		padding: 0.1875rem 0.375rem;
+		border-radius: 999px;
+		background: var(--ds-surface-hovered);
+		color: var(--ds-text-subtle);
+		white-space: nowrap;
+	}
+
 	.time {
 		font-size: 0.75rem;
 		color: var(--ds-text-subtlest);
@@ -384,5 +494,27 @@
 	.quote {
 		font-style: italic;
 		color: var(--ds-text);
+	}
+
+	/* Hover detail for an agent-authored change: which turn wrote it, and what
+	   it cost. Laid out as label/value rows so a long model id cannot push the
+	   numbers out of the popover. */
+	:global(.agent-detail) {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 11rem;
+	}
+	:global(.agent-detail-title) {
+		font-weight: 600;
+		margin-bottom: 2px;
+	}
+	:global(.agent-detail-row) {
+		display: flex;
+		justify-content: space-between;
+		gap: 0.75rem;
+	}
+	:global(.agent-detail-value) {
+		font-weight: 500;
 	}
 </style>

@@ -4,18 +4,21 @@
 		username TEXT UNIQUE NOT NULL,
 		first_name TEXT NOT NULL,
 		last_name TEXT NOT NULL,
-		is_active BOOLEAN DEFAULT 1,
+		is_active BOOLEAN DEFAULT TRUE,
 		avatar_url TEXT,
 		password_hash TEXT, -- bcrypt hashed password
-		requires_password_reset BOOLEAN DEFAULT 0,
+		requires_password_reset BOOLEAN DEFAULT FALSE,
 		timezone TEXT,
 		language TEXT DEFAULT 'en',
-		email_verified BOOLEAN DEFAULT 1, -- Default true for backwards compatibility
+		email_verified BOOLEAN DEFAULT TRUE, -- Default true for backwards compatibility
 		email_verification_token TEXT, -- Token for email verification flow
 		email_verification_expires DATETIME, -- Expiry time for verification token
 		scim_external_id TEXT, -- SCIM externalId from identity provider
 		scim_managed BOOLEAN DEFAULT false, -- If true, user is managed via SCIM
-		is_agent BOOLEAN DEFAULT 0, -- If true, user is a non-human agent (API-only; cannot log in)
+		scim_deleted_at DATETIME, -- Set when the IdP deprovisioned the user via SCIM DELETE; row retained but hidden from every SCIM query (RFC 7644 §3.6)
+		offboarded_at DATETIME, -- Set when the account is administratively offboarded; never cleared, every activation path must reject it
+		erased_at DATETIME, -- Set when the account completed Article 17 erasure; implies offboarded_at and is never cleared
+		is_agent BOOLEAN DEFAULT FALSE, -- If true, user is a non-human agent (API-only; cannot log in)
 		agent_owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, -- NULL = service user (admin-provisioned); non-NULL = owned agent (inherits owner permissions)
 		-- Distinguishes how an agent row got created. 'user' covers both the
 		-- profile-page agent UI and CLI onboarding (both are gated by
@@ -121,7 +124,7 @@
 		credential_name TEXT NOT NULL, -- User-friendly name for the credential
 		credential_data TEXT NOT NULL, -- JSON data specific to credential type
 		public_key_fingerprint TEXT, -- SHA256 fingerprint for SSH keys (indexed)
-		is_active BOOLEAN DEFAULT 1,
+		is_active BOOLEAN DEFAULT TRUE,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		last_used_at DATETIME,
@@ -139,8 +142,9 @@
 		expires_at DATETIME NOT NULL,
 		ip_address TEXT,
 		user_agent TEXT,
-		is_active BOOLEAN DEFAULT 1,
-		enrollment_required BOOLEAN DEFAULT 0,
+		is_active BOOLEAN DEFAULT TRUE,
+		enrollment_required BOOLEAN DEFAULT FALSE,
+		auth_pending_type TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
@@ -162,3 +166,27 @@ CREATE TABLE IF NOT EXISTS user_invitations (
 CREATE INDEX IF NOT EXISTS idx_user_invitations_token ON user_invitations(token);
 CREATE INDEX IF NOT EXISTS idx_user_invitations_user_id ON user_invitations(user_id);
 
+-- DSAR completion evidence: one row per Article 17 erasure execution. The
+-- user row itself is pseudonymized (never deleted), so records persist.
+CREATE TABLE IF NOT EXISTS user_erasure_records (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id INTEGER NOT NULL,
+	requested_by TEXT NOT NULL, -- DSAR intake reference: subject email/channel reference
+	requested_at DATETIME NOT NULL, -- when the erasure request was received
+	approved_by INTEGER NOT NULL, -- admin user who approved execution
+	executed_at DATETIME NOT NULL, -- when erasure completed
+	policy_version TEXT NOT NULL, -- erasure policy version applied
+	notes TEXT,
+	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_erasure_records_user_id ON user_erasure_records(user_id);
+
+
+-- migration: 20260914_users_erased_at
+-- migration: 20260914_user_erasure_records
+
+-- migration: 20260911_users_scim_deleted_at
+-- migration: 20260911_users_offboarded_at
+
+-- migration: 0014_users_is_agent

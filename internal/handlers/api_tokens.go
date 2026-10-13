@@ -3,10 +3,10 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"windshift/internal/auth"
@@ -19,7 +19,7 @@ import (
 )
 
 // defaultAPITokenLifetime is the expiry applied to non-admin tokens that omit
-// expires_at. Caps the credential's lifetime so a forgotten token in CI logs
+// expires_on. Caps the credential's lifetime so a forgotten token in CI logs
 // or a stale dev machine eventually stops working without admin intervention.
 // Admins keep the never-expiring option for service tokens that need it.
 const defaultAPITokenLifetime = 90 * 24 * time.Hour
@@ -73,6 +73,21 @@ func (ath *APITokenHandler) CreateToken(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	if request.ExpiresAt != nil {
+		respondValidationError(w, r, "expires_at is not accepted; use expires_on in YYYY-MM-DD format")
+		return
+	}
+	if request.ExpiresOn != nil {
+		_, location := services.ResolveTimezoneOrUTC(user.Timezone)
+		date, err := services.ParseCivilDate(*request.ExpiresOn, location)
+		if err != nil {
+			respondValidationError(w, r, "expires_on must use YYYY-MM-DD format")
+			return
+		}
+		// The token expires when the next day starts for the caller.
+		expiry := date.AddDate(0, 0, 1).UTC()
+		request.ExpiresAt = &expiry
+	}
 	sanitize.Apply(&request.Name, sanitize.PlainTextField)
 
 	// Validate required fields
@@ -111,7 +126,7 @@ func (ath *APITokenHandler) CreateToken(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Default expiry for non-admin callers when omitted. Admins can still mint
-	// never-expiring tokens by omitting expires_at — needed for some service
+	// never-expiring tokens by omitting expires_on — needed for some service
 	// integrations.
 	if request.ExpiresAt == nil {
 		isAdmin, _ := ath.permissionService.IsSystemAdmin(user.ID)
@@ -121,15 +136,8 @@ func (ath *APITokenHandler) CreateToken(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Determine which user ID to use for token creation.
-	//
-	// Rules:
-	//   1. Caller can always mint a token for themselves.
-	//   2. A system admin may mint a token for any agent (service users
-	//      included).
-	//   3. A non-admin may mint a token only for an agent they own (the new
-	//      user-managed-agents flow).
-	// Anything else is a 403 + audit.
+	// Callers mint for themselves; admins may mint for any agent, and non-admins
+	// only for owned agents. Other requests are forbidden and audited.
 	targetUserID := user.ID
 	if request.UserID != nil && *request.UserID != user.ID {
 		isSystemAdmin, err := ath.permissionService.IsSystemAdmin(user.ID)
@@ -170,7 +178,7 @@ func (ath *APITokenHandler) CreateToken(w http.ResponseWriter, r *http.Request) 
 			if ownership.IsAgent && !isSystemAdmin {
 				reason = "not_agent_owner"
 			}
-			ath.auditor.LogFailure(r, user, logger.ActionAPITokenCreate, logger.ResourceAPIToken, nil, request.Name, "not authorized to create token for target user", map[string]interface{}{
+			ath.auditor.LogFailure(r, user, logger.ActionAPITokenCreate, logger.ResourceAPIToken, nil, request.Name, "not authorized to create token for target user", map[string]any{
 				"reason":         reason,
 				"target_user_id": *request.UserID,
 			})
@@ -201,7 +209,7 @@ func (ath *APITokenHandler) CreateToken(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	details := map[string]interface{}{
+	details := map[string]any{
 		"token_prefix": tokenResponse.APIToken.TokenPrefix,
 	}
 	if targetUserID != user.ID {
@@ -321,7 +329,7 @@ func (ath *APITokenHandler) RevokeToken(w http.ResponseWriter, r *http.Request) 
 func tokenRequestsPageScope(scopes []string) bool {
 	for _, scope := range scopes {
 		switch scope {
-		case "read", "write", "admin", auth.ScopePagesRead, auth.ScopePagesWrite, auth.ScopePagesDelete:
+		case auth.ScopePagesRead, auth.ScopePagesWrite, auth.ScopePagesDelete:
 			return true
 		}
 	}
@@ -385,7 +393,7 @@ func (ath *APITokenHandler) ValidateToken(w http.ResponseWriter, r *http.Request
 	apiToken, _ := r.Context().Value("api_token").(*models.APIToken)
 	authMethod, _ := r.Context().Value("auth_method").(string)
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"valid":       true,
 		"user_id":     user.ID,
 		"username":    user.Username,
@@ -415,12 +423,12 @@ func (ath *APITokenHandler) CleanupExpiredTokens(w http.ResponseWriter, r *http.
 
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
-		ath.auditor.LogWithDetails(r, currentUser, logger.ActionAPITokenCleanup, logger.ResourceAPIToken, nil, "", map[string]interface{}{
+		ath.auditor.LogWithDetails(r, currentUser, logger.ActionAPITokenCleanup, logger.ResourceAPIToken, nil, "", map[string]any{
 			"cleaned_count": count,
 		})
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"cleaned_count": count,
 		"message":       "Successfully cleaned up expired tokens",
 	}
@@ -468,7 +476,7 @@ func (ath *APITokenHandler) ListAllTokens(w http.ResponseWriter, r *http.Request
 		totalPages++
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"tokens":      tokens,
 		"total":       total,
 		"page":        page,
@@ -493,7 +501,7 @@ func (ath *APITokenHandler) AdminRevokeToken(w http.ResponseWriter, r *http.Requ
 	}
 
 	if err := ath.tokenManager.AdminRevokeToken(tokenID); err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, auth.ErrTokenNotFound) {
 			respondNotFound(w, r, "token")
 			return
 		}
@@ -505,12 +513,24 @@ func (ath *APITokenHandler) AdminRevokeToken(w http.ResponseWriter, r *http.Requ
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
 		tid := tokenID
-		ath.auditor.LogWithDetails(r, currentUser, logger.ActionAPITokenAdminRevoke, logger.ResourceAPIToken, &tid, token.Name, map[string]interface{}{
+		ath.auditor.LogWithDetails(r, currentUser, logger.ActionAPITokenAdminRevoke, logger.ResourceAPIToken, &tid, token.Name, map[string]any{
 			"revoked_user_id": token.UserID,
 		})
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// GetScopeCatalog returns the full catalog of grantable token scopes, with the
+// label, description and grouping each picker renders. Serving it from
+// auth.ScopeCatalog keeps the token UI, the agent-token UI, the OAuth client
+// admin UI and the consent screens in step with the server allowlist instead
+// of each maintaining a hand-written copy that drifts (WI-961).
+func (ath *APITokenHandler) GetScopeCatalog(w http.ResponseWriter, r *http.Request) {
+	if _, ok := RequireAuth(w, r); !ok {
+		return
+	}
+	respondJSONOK(w, auth.ScopeCatalog())
 }
 
 // GetAPIKeyPolicy returns whether the current user can create API keys.
@@ -537,7 +557,7 @@ func (ath *APITokenHandler) GetAPIKeyPolicy(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"can_create": canCreate,
 		"policy":     policy,
 	})

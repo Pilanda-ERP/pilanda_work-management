@@ -13,7 +13,6 @@
   let loading = $state(false);
   let error = $state(null);
   let currentWorkspaceId = $state(null);
-  let refreshInFlight = $state(false);
   let activeFetchId = $state(0);
 
   function isActiveIteration(iteration) {
@@ -40,11 +39,10 @@
     const fetchId = ++activeFetchId;
     loading = true;
     error = null;
-    refreshInFlight = true;
 
     try {
       const allIterations = await api.iterations.getAll({ workspace_id: workspaceId });
-      const iterationList = Array.isArray(allIterations) ? allIterations : (allIterations?.iterations ?? []);
+      const iterationList = allIterations || [];
 
       const relevant = iterationList
         .filter(isRelevantIteration)
@@ -85,21 +83,21 @@
     } finally {
       if (fetchId === activeFetchId) {
         loading = false;
-        refreshInFlight = false;
       }
     }
   }
 
   function handleRefresh() {
-    if (!refreshInFlight) {
+    if (!loading) {
       loadIterations();
     }
   }
 
   function getStatusLabel(iteration) {
-    if (isActiveIteration(iteration)) return 'Active';
-    if (iteration.status === 'planned' || iteration.status === 'pending') return 'Planned';
-    return iteration.status || 'Planned';
+    if (isActiveIteration(iteration)) return t('widgets.iterationTimeline.active');
+    if (iteration.status === 'planned' || iteration.status === 'pending') return t('widgets.iterationTimeline.planned');
+    if (iteration.status === 'completed' || iteration.status === 'done') return t('widgets.iterationTimeline.completed');
+    return iteration.status || t('widgets.iterationTimeline.planned');
   }
 
   function getPercentComplete(progress) {
@@ -169,10 +167,10 @@
               </div>
               <span
                 class="text-xs font-medium px-2 py-0.5 rounded whitespace-nowrap"
-                class:bg-green-100={active}
-                class:text-green-700={active}
-                class:bg-gray-100={!active}
-                class:text-gray-600={!active}
+                class:bg-ds-success-subtle={active}
+                class:text-ds-text-success={active}
+                class:bg-ds-background-neutral={!active}
+                class:text-ds-text-subtle={!active}
               >
                 {getStatusLabel(iteration)}
               </span>

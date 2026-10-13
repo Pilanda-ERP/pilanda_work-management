@@ -2,7 +2,9 @@
   import { X, ChevronDown } from '@lucide/svelte';
   import { onClickOutside } from 'runed';
   import Label from '../components/Label.svelte';
+  import Input from '../components/Input.svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import { controlSizeClasses } from '../utils/controlSizes.js';
 
   let {
     categories = [],
@@ -89,7 +91,7 @@
             <span>{category.name}</span>
             <button
               onclick={() => removeCategory(categoryId)}
-              class="ml-1 hover:bg-gray-200 rounded-full p-0.5 transition-colors"
+              class="ml-1 hover:bg-ds-background-neutral-hovered rounded-full p-0.5 transition-colors"
               title={t('pickers.removeCategory')}
             >
               <X class="w-3 h-3" />
@@ -105,7 +107,7 @@
     type="button"
     onclick={toggleDropdown}
     {disabled}
-    class="w-full flex items-center justify-between px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+    class="w-full flex items-center justify-between {controlSizeClasses('medium')} rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-ds-border-focused disabled:opacity-50 disabled:cursor-not-allowed"
     style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
   >
     <span>
@@ -125,12 +127,11 @@
       
       <!-- Search Input -->
       <div class="p-3 border-b" style="border-color: var(--ds-border);">
-        <input
+        <Input
           type="text"
           bind:value={searchInput}
           placeholder={t('pickers.searchCategories')}
-          class="w-full px-3 py-2 text-sm border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-          style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+          size="small"
         />
       </div>
 
@@ -143,14 +144,14 @@
           <button
             type="button"
             onclick={() => addCategory(category.id)}
-            class="w-full px-3 py-2 text-left text-sm hover:bg-gray-50 flex items-center gap-3 transition-colors"
+            class="w-full px-3 py-2 text-left text-sm hover:bg-ds-background-neutral-hovered flex items-center gap-3 transition-colors"
             style="hover:background-color: var(--ds-background-hover);"
           >
             <div class="w-3 h-3 rounded-full flex-shrink-0"
               style="background-color: {hexColor};"></div>
             <span class="flex-1" style="color: var(--ds-text);">{category.name}</span>
             {#if isSelected}
-              <div class="w-4 h-4 rounded bg-blue-500 flex items-center justify-center">
+              <div class="w-4 h-4 rounded bg-ds-interactive flex items-center justify-center">
                 <svg class="w-3 h-3 text-white" fill="currentColor" viewBox="0 0 20 20">
                   <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/>
                 </svg>

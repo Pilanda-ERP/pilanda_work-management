@@ -5,7 +5,27 @@
     <link rel="icon" type="image/svg+xml" href="/windshift-3.svg" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <link rel="preload" as="image" href="/windshift-3.svg" type="image/svg+xml" />
+    <link
+      rel="apple-touch-startup-image"
+      href="/apple-touch-startup-image-1170x2532.png"
+      media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3)"
+    />
+    <link
+      rel="apple-touch-startup-image"
+      href="/apple-touch-startup-image-1290x2796.png"
+      media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3)"
+    />
+    <link
+      rel="apple-touch-startup-image"
+      href="/apple-touch-startup-image-2048x2732.png"
+      media="(device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2)"
+    />
+    <!-- interactive-widget=resizes-content: Android/Chromium shrinks the layout
+         viewport when the keyboard opens so focused inputs in sheets and
+         editors scroll into view instead of being covered (WI-1325). iOS
+         handles this natively and ignores the hint. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <!-- PWA: installable mobile surface (start_url = /m). Relative href so the
          link resolves against the injected <base href> on context-path deploys. -->
     <link rel="manifest" href="manifest.webmanifest" />
@@ -15,19 +35,194 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Windshift" />
+    <meta
+      name="description"
+      content="Windshift is a self-hosted work management app for teams, with boards, workflows, time tracking, and notifications."
+    />
+    <link rel="canonical" href="/m" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Windshift - Work Management" />
+    <meta
+      property="og:description"
+      content="Self-hosted work management for teams, with boards, workflows, time tracking, and notifications."
+    />
+    <meta property="og:image" content="./apple-touch-icon.png" />
     <title>Windshift - Work Management</title>
+    <style>
+      /* Static recovery UI for failures that happen before Svelte can mount.
+         It stays in normal document flow and never overlays application UI. */
+      body {
+        margin: 0;
+      }
+      #windshift-boot {
+        display: grid;
+        min-height: 100dvh;
+        box-sizing: border-box;
+        place-items: center;
+        padding: 1.5rem;
+        background: #fff;
+        color: #172b4d;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        text-align: center;
+      }
+      #windshift-boot .boot-logo {
+        display: block;
+        width: 4rem;
+        height: 4rem;
+        margin: 0 auto 1rem;
+        animation: windshift-boot-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      }
+      #windshift-boot p {
+        margin: 0;
+        color: #44546f;
+        font-size: 0.8125rem;
+        line-height: 1.5;
+      }
+      #windshift-boot .boot-detail {
+        margin-top: 0.35rem;
+        font-size: 0.875rem;
+      }
+      #windshift-boot button {
+        min-height: 2.75rem;
+        margin-top: 1rem;
+        padding: 0.65rem 1.25rem;
+        border: 0;
+        border-radius: 0.5rem;
+        background: #0c66e4;
+        color: #fff;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #windshift-boot [hidden] {
+        display: none;
+      }
+      @keyframes windshift-boot-pulse {
+        50% {
+          opacity: 0.5;
+        }
+      }
+      /* Keyed off the mode the inline script below resolves (stored
+         preference first, OS only as the fallback) — not the raw OS
+         setting, which renders a dark box for a light-mode user. */
+      html[data-color-mode="dark"] #windshift-boot {
+        background: #1d2125;
+        color: #f7f8f9;
+      }
+      html[data-color-mode="dark"] #windshift-boot p {
+        color: #b6c2cf;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #windshift-boot .boot-logo {
+          animation: none;
+        }
+      }
+    </style>
     <script>
-      // Flash prevention: apply theme before CSS loads
-                                          (() => {
-                                            const stored = localStorage.getItem('windshift-color-mode');
-                                            const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-                                            const mode = stored === 'dark' || (stored === 'system' && prefersDark) || (!stored && prefersDark) ? 'dark' : 'light';
-                                            document.documentElement.dataset.colorMode = mode;
-                                          })();
+      // Flash prevention: apply theme before CSS loads.
+      (() => {
+        let storedColorMode = null;
+        let storedLocale = null;
+        try {
+          storedColorMode = localStorage.getItem('windshift-color-mode');
+          storedLocale = localStorage.getItem('windshift-locale');
+        } catch {
+          // Storage can be unavailable in hardened/private browser contexts.
+        }
+
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const colorMode =
+          storedColorMode === 'dark' ||
+          (storedColorMode === 'system' && prefersDark) ||
+          (!storedColorMode && prefersDark)
+            ? 'dark'
+            : 'light';
+        document.documentElement.dataset.colorMode = colorMode;
+
+        const bootTranslations = {
+          en: {
+            starting: 'Starting Windshift…',
+            slow: 'This is taking longer than expected. Check your connection or server.',
+            retry: 'Retry'
+          },
+          de: {
+            starting: 'Windshift wird gestartet…',
+            slow: 'Dies dauert länger als erwartet. Überprüfen Sie Ihre Verbindung oder den Server.',
+            retry: 'Erneut versuchen'
+          },
+          es: {
+            starting: 'Iniciando Windshift…',
+            slow: 'Esto está tardando más de lo esperado. Comprueba tu conexión o el servidor.',
+            retry: 'Reintentar'
+          },
+          ar: {
+            starting: 'جارٍ تشغيل Windshift…',
+            slow: 'يستغرق هذا وقتًا أطول من المتوقع. تحقق من اتصالك أو الخادم.',
+            retry: 'إعادة المحاولة'
+          },
+          'pt-BR': {
+            starting: 'Iniciando o Windshift…',
+            slow: 'Isso está demorando mais do que o esperado. Verifique sua conexão ou o servidor.',
+            retry: 'Tentar novamente'
+          },
+          ru: {
+            starting: 'Запуск Windshift…',
+            slow: 'Это занимает больше времени, чем ожидалось. Проверьте подключение или сервер.',
+            retry: 'Повторить'
+          },
+          'zh-CN': {
+            starting: '正在启动 Windshift…',
+            slow: '所需时间超出预期。请检查网络连接或服务器。',
+            retry: '重试'
+          }
+        };
+        const supportedLocales = Object.keys(bootTranslations);
+        const browserLocale = navigator.language || 'en';
+        const locale =
+          (storedLocale && supportedLocales.includes(storedLocale) && storedLocale) ||
+          supportedLocales.find((candidate) => candidate.toLowerCase() === browserLocale.toLowerCase()) ||
+          supportedLocales.find(
+            (candidate) => candidate.split('-')[0] === browserLocale.toLowerCase().split('-')[0]
+          ) ||
+          'en';
+        const messages = bootTranslations[locale];
+        document.documentElement.lang = locale;
+        document.documentElement.dir = locale === 'ar' ? 'rtl' : 'ltr';
+
+        window.addEventListener('DOMContentLoaded', () => {
+          const boot = document.getElementById('windshift-boot');
+          const starting = document.getElementById('windshift-boot-starting');
+          const retry = document.getElementById('windshift-boot-retry');
+          const detail = document.getElementById('windshift-boot-detail');
+          if (!boot || !starting || !retry || !detail) return;
+
+          starting.textContent = messages.starting;
+          detail.textContent = messages.slow;
+          retry.textContent = messages.retry;
+          retry.addEventListener('click', () => location.reload());
+          window.setTimeout(() => {
+            // main.js removes the placeholder before mounting App.
+            if (!document.getElementById('windshift-boot')) return;
+            detail.hidden = false;
+            retry.hidden = false;
+          }, 10_000);
+        });
+      })();
     </script>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <div id="windshift-boot" role="status" aria-live="polite">
+        <div>
+          <img class="boot-logo" src="windshift-3.svg" alt="Windshift" width="64" height="64" />
+          <p id="windshift-boot-starting">Starting Windshift…</p>
+          <p id="windshift-boot-detail" class="boot-detail" hidden>
+            This is taking longer than expected. Check your connection or server.
+          </p>
+          <button id="windshift-boot-retry" type="button" hidden>Retry</button>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

@@ -1,7 +1,8 @@
 <script>
   import { jiraImport } from './JiraImportStore.svelte.js';
+  import ColorDot from '../components/ColorDot.svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import Modal from '../dialogs/Modal.svelte';
-  import ModalHeader from '../dialogs/ModalHeader.svelte';
   import DialogFooter from '../dialogs/DialogFooter.svelte';
   import Button from '../components/Button.svelte';
   import Spinner from '../components/Spinner.svelte';
@@ -11,13 +12,14 @@
   import {
     Cloud, Server, ChevronRight, ChevronLeft, ArrowRight,
     Briefcase, FileText, Activity, Hash, Box, AlertCircle,
-    ExternalLink, Eye, EyeOff, Plus, Users, Paperclip, Flag, Check
+    ExternalLink, Eye, EyeOff, Plus, Users, Paperclip, Flag, Check, X
   } from '@lucide/svelte';
   import Stepper from '../components/Stepper.svelte';
   import { addToast } from '../stores/toasts.svelte.js';
   import { attachmentStatus } from '../stores/attachmentStatus.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import Checkbox from '../components/Checkbox.svelte';
+  import Select from '../components/Select.svelte';
   import DescriptionText from '../components/DescriptionText.svelte';
 
   let {
@@ -35,9 +37,7 @@
   let showNewConnectionForm = $state(false);
 
   // Computed labels based on deployment type
-  let emailLabel = $derived(deploymentType === 'datacenter' ? t('jiraImport.form.username') : t('jiraImport.form.email'));
-  let emailPlaceholder = $derived(deploymentType === 'datacenter' ? 'your.username' : 'your.email@company.com');
-  let tokenLabel = $derived(deploymentType === 'datacenter' ? t('jiraImport.form.password') : t('jiraImport.form.apiToken'));
+  let tokenLabel = $derived(deploymentType === 'datacenter' ? t('jiraImport.form.personalAccessToken') : t('jiraImport.form.apiToken'));
   let tokenHelpText = $derived(deploymentType === 'datacenter'
     ? t('jiraImport.form.tokenHelpDatacenter')
     : t('jiraImport.form.tokenHelpCloud'));
@@ -54,9 +54,11 @@
   let modalSubtitle = $derived(connection.instanceInfo?.display_name || (deploymentType === 'datacenter' ? t('jiraImport.subtitle.datacenter') : t('jiraImport.subtitle.cloud')));
   let projects = $derived(jiraImport.projects);
   let analysis = $derived(jiraImport.analysis);
+  let xray = $derived(jiraImport.xray);
   let mappings = $derived(jiraImport.mappings);
   let wizard = $derived(jiraImport.wizard);
   let importData = $derived(jiraImport.import);
+  let mappingTargets = $derived(jiraImport.mappingTargets);
 
   let currentStep = $derived(wizard.currentStep);
   let steps = $derived(wizard.steps);
@@ -219,17 +221,128 @@
     }
     return true;
   }
+
+  // Each mapping row exposes one select whose value encodes the choice:
+  // "create", "skip", or "existing:<id>" / "map:<id>".
+  function existingValue(id) {
+    return `existing:${id}`;
+  }
+
+  function createOrExistingOptions(createLabel, targets, labelFor = (target) => target.name) {
+    return [
+      { value: 'create', label: createLabel },
+      ...targets.map((target) => ({ value: existingValue(target.id), label: labelFor(target) })),
+    ];
+  }
+
+  function mappingChoiceValue(mapping) {
+    if (mapping.createNew || mapping.windshiftId == null) return 'create';
+    return existingValue(mapping.windshiftId);
+  }
+
+  function applyMappingChoice(setter, value) {
+    if (value === 'create') {
+      setter(null, true);
+      return;
+    }
+    setter(Number(value.slice('existing:'.length)), false);
+  }
+
+  function workspaceTargetOptions() {
+    return createOrExistingOptions(
+      t('jiraImport.mapping.createNewWorkspace'),
+      mappingTargets.workspaces,
+      (workspace) => `${workspace.name} (${workspace.key})`
+    );
+  }
+
+  function handleWorkspaceTargetChange(mapping, value) {
+    if (value === 'create') {
+      jiraImport.setWorkspaceMapping(mapping.jiraKey, { createNew: true, windshiftId: null });
+      return;
+    }
+    jiraImport.setWorkspaceMapping(mapping.jiraKey, {
+      createNew: false,
+      windshiftId: Number(value.slice('existing:'.length)),
+    });
+  }
+
+  function workspaceTargetName(id) {
+    return mappingTargets.workspaces.find((workspace) => workspace.id === id)?.name || '';
+  }
+
+  function customFieldChoiceValue(mapping) {
+    if (mapping.action === 'map' && mapping.windshiftId != null) return `map:${mapping.windshiftId}`;
+    return mapping.action;
+  }
+
+  // Mirrors the backend's compatibility rule: text/textarea are
+  // interchangeable, every other type must match so the stored value keeps the
+  // shape the target field expects.
+  function customFieldTypesCompatible(targetType, sourceType) {
+    const canonical = (type) => (type === 'checkbox' ? 'boolean' : type);
+    const target = canonical(targetType);
+    const source = canonical(sourceType);
+    if (target === source) return true;
+    const textish = (type) => type === 'text' || type === 'textarea';
+    return textish(target) && textish(source);
+  }
+
+  function customFieldOptions(mapping) {
+    return [
+      { value: 'create', label: t('jiraImport.mapping.create') },
+      { value: 'skip', label: t('jiraImport.mapping.skip') },
+      ...mappingTargets.custom_fields
+        .filter((field) => customFieldTypesCompatible(field.field_type, mapping.windshiftType))
+        .map((field) => ({
+          value: `map:${field.id}`,
+          label: `${field.name} (${field.field_type})`,
+        })),
+    ];
+  }
+
+  function handleCustomFieldChoice(mapping, value) {
+    if (value.startsWith('map:')) {
+      jiraImport.setFieldAction(mapping.jiraId, 'map', Number(value.slice('map:'.length)));
+      return;
+    }
+    jiraImport.setFieldAction(mapping.jiraId, value, null);
+  }
 </script>
 
 <Modal bind:isOpen maxWidth="max-w-4xl" onclose={handleClose}>
-  <div class="flex flex-col max-h-[90vh]">
+  <div class="flex flex-col max-h-[90vh]" data-testid="jira-import-wizard">
     <!-- Header -->
-    <ModalHeader
-      title={modalTitle}
-      subtitle={modalSubtitle}
-      icon={deploymentType === 'datacenter' ? Server : Cloud}
-      onClose={handleClose}
-    />
+    <div
+      class="flex items-center gap-2.5 border-b px-5 py-3"
+      style="border-color: var(--ds-border);"
+    >
+      {#if deploymentType === 'datacenter'}
+        <Server class="h-5 w-5 shrink-0" style="color: var(--ds-interactive);" />
+      {:else}
+        <Cloud class="h-5 w-5 shrink-0" style="color: var(--ds-interactive);" />
+      {/if}
+      <div class="min-w-0 flex-1">
+        <h2 class="truncate text-base font-semibold leading-5" style="color: var(--ds-text);">
+          {modalTitle}
+        </h2>
+        {#if modalSubtitle}
+          <p class="mt-0.5 truncate text-xs leading-4" style="color: var(--ds-text-subtle);">
+            {modalSubtitle}
+          </p>
+        {/if}
+      </div>
+      <button
+        type="button"
+        data-testid="jira-import-close"
+        class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)] focus:outline-none focus:ring-2 focus:ring-[var(--ds-border-focused)]"
+        style="color: var(--ds-text-subtle);"
+        onclick={handleClose}
+        aria-label={t('aria.close')}
+      >
+        <X class="h-[18px] w-[18px]" />
+      </button>
+    </div>
 
     <!-- Step indicator -->
     <div class="px-6 w-full py-3 border-b overflow-x-auto" style="border-color: var(--ds-border);">
@@ -243,7 +356,7 @@
     </div>
 
     <!-- Content area -->
-    <div class="p-6 overflow-y-auto flex-1 min-h-0">
+    <div class="p-6 overflow-y-auto flex-1 min-h-0" data-testid={`jira-import-step-${currentStepId}`}>
       {#if currentStepId === 'connect'}
         <!-- Connect Step -->
         <div class="space-y-6">
@@ -281,17 +394,16 @@
                       {isDataCenter ? t('jiraImport.deploymentType.datacenter') : t('jiraImport.deploymentType.cloud')}
                     </span>
                   </div>
-                  <p class="text-sm" style="color: var(--ds-text-subtle);">{connection.email}</p>
+                  {#if !isDataCenter && connection.email}
+                    <p class="text-sm" style="color: var(--ds-text-subtle);">{connection.email}</p>
+                  {/if}
                 </div>
               </div>
             </div>
           {:else if savedConnections.items.length > 0 && !showNewConnectionForm}
             <!-- Show saved connections -->
             {#if isLoadingSavedConnection}
-              <div class="flex flex-col items-center justify-center py-12">
-                <Spinner size="lg" />
-                <p class="mt-4 text-sm" style="color: var(--ds-text-subtle);">{t('projects.loadingProjects')}</p>
-              </div>
+              <StateDisplay type="loading" size="lg" message={t('projects.loadingProjects')} />
             {:else}
               <AlertBox variant="info" message={t('jiraImport.messages.selectConnection')} />
 
@@ -300,7 +412,7 @@
                   {@const isDataCenter = conn.deployment_type === 'datacenter'}
                   <button
                     type="button"
-                    class="w-full p-4 rounded-lg border text-left transition-all hover:border-blue-400"
+                    class="w-full p-4 rounded-lg border text-left transition-all hover:border-ds-interactive"
                     style="border-color: var(--ds-border); background: var(--ds-surface);"
                     onclick={() => selectSavedConnection(conn)}
                   >
@@ -323,7 +435,9 @@
                             {isDataCenter ? t('jiraImport.deploymentType.datacenter') : t('jiraImport.deploymentType.cloud')}
                           </span>
                         </div>
-                        <p class="text-sm" style="color: var(--ds-text-subtle);">{conn.email}</p>
+                        {#if !isDataCenter && conn.email}
+                          <p class="text-sm" style="color: var(--ds-text-subtle);">{conn.email}</p>
+                        {/if}
                       </div>
                       <ChevronRight size={16} style="color: var(--ds-text-subtle);" />
                     </div>
@@ -353,6 +467,7 @@
             <div class="flex gap-2 mb-4">
               <button
                 type="button"
+                data-testid="jira-import-deployment-cloud"
                 class="flex-1 p-3 rounded-lg border text-left transition-all flex items-center gap-3"
                 style="border-color: {deploymentType === 'cloud' ? 'var(--ds-border-focused)' : 'var(--ds-border)'}; background: {deploymentType === 'cloud' ? 'var(--ds-background-selected)' : 'transparent'};"
                 onclick={() => deploymentType = 'cloud'}
@@ -371,6 +486,7 @@
               </button>
               <button
                 type="button"
+                data-testid="jira-import-deployment-datacenter"
                 class="flex-1 p-3 rounded-lg border text-left transition-all flex items-center gap-3"
                 style="border-color: {deploymentType === 'datacenter' ? 'var(--ds-border-focused)' : 'var(--ds-border)'}; background: {deploymentType === 'datacenter' ? 'var(--ds-background-selected)' : 'transparent'};"
                 onclick={() => deploymentType = 'datacenter'}
@@ -396,26 +512,31 @@
             <FormField label={deploymentType === 'datacenter' ? t('jiraImport.form.urlDatacenter') : t('jiraImport.form.urlCloud')} required>
               <Input
                 bind:value={jiraUrl}
+                dataTestid="jira-import-url"
                 placeholder={urlPlaceholder}
                 disabled={connection.isConnecting}
               />
             </FormField>
 
-            <FormField label={emailLabel} required>
-              <Input
-                bind:value={email}
-                type={deploymentType === 'datacenter' ? 'text' : 'email'}
-                placeholder={emailPlaceholder}
-                disabled={connection.isConnecting}
-              />
-            </FormField>
+            {#if deploymentType === 'cloud'}
+              <FormField label={t('jiraImport.form.email')} required>
+                <Input
+                  bind:value={email}
+                  dataTestid="jira-import-email"
+                  type="email"
+                  placeholder="your.email@company.com"
+                  disabled={connection.isConnecting}
+                />
+              </FormField>
+            {/if}
 
             <FormField label={tokenLabel} required>
               <div class="relative">
                 <Input
                   bind:value={apiToken}
+                  dataTestid="jira-import-api-token"
                   type={showToken ? 'text' : 'password'}
-                  placeholder={deploymentType === 'datacenter' ? 'Your password or token' : 'Your Jira API token'}
+                  placeholder={deploymentType === 'datacenter' ? 'Your Jira personal access token' : 'Your Jira API token'}
                   disabled={connection.isConnecting}
                 />
                 <button
@@ -471,6 +592,7 @@
                style="border-color: var(--ds-border); background: var(--ds-surface);">
             <Checkbox
               checked={projects.openIssuesOnly}
+              dataTestid="jira-import-open-issues-only"
               onchange={async () => {
                 jiraImport.toggleOpenIssuesOnly();
                 await jiraImport.reloadProjectsWithFilter();
@@ -483,6 +605,7 @@
 
           <Input
             bind:value={projectSearch}
+            dataTestid="jira-import-project-search"
             placeholder="Search projects..."
           />
 
@@ -494,7 +617,7 @@
                   <Button
                     variant="primary"
                     size="small"
-                    onclick={() => jiraImport.goToStep(0)}
+                    onclick={() => jiraImport.goToStepId('connect')}
                   >
                     Back to Connect
                   </Button>
@@ -512,20 +635,21 @@
           {/if}
 
           {#if projects.isLoading}
-            <div class="flex items-center justify-center py-12">
-              <Spinner size="lg" />
-            </div>
+            <StateDisplay type="loading" size="lg" />
           {:else}
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-96 overflow-y-auto">
               {#each filteredProjects as project}
                 {@const isSelected = projects.selected.includes(project.key)}
-                {@const isDisabled = project.is_team_managed}
                 <button
                   type="button"
+                  data-testid={`jira-import-project-${project.key}`}
+                  data-project-type={project.project_type}
+                  data-team-managed={project.is_team_managed ? 'true' : 'false'}
+                  data-configuration-mode={project.is_team_managed ? 'conservative' : 'authoritative'}
+                  data-issue-count={project.issue_count ?? ''}
                   class="p-4 rounded-lg border text-left transition-all"
-                  style="border-color: {isSelected ? 'var(--ds-border-focused)' : 'var(--ds-border)'}; background: {isSelected ? 'var(--ds-background-selected)' : 'transparent'}; opacity: {isDisabled ? '0.5' : '1'};"
-                  onclick={() => !isDisabled && jiraImport.toggleProject(project.key)}
-                  disabled={isDisabled}
+                  style="border-color: {isSelected ? 'var(--ds-border-focused)' : 'var(--ds-border)'}; background: {isSelected ? 'var(--ds-background-selected)' : 'transparent'};"
+                  onclick={() => jiraImport.toggleProject(project.key)}
                 >
                   <div class="flex items-start gap-3">
                     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -533,8 +657,7 @@
                     <div onclick={(e) => e.stopPropagation()} class="mt-1">
                       <Checkbox
                         checked={isSelected}
-                        disabled={isDisabled}
-                        onchange={() => !isDisabled && jiraImport.toggleProject(project.key)}
+                        onchange={() => jiraImport.toggleProject(project.key)}
                         size="small"
                       />
                     </div>
@@ -546,7 +669,7 @@
                         <span class="font-medium truncate" style="color: var(--ds-text);">
                           {project.name}
                         </span>
-                        {#if isDisabled}
+                        {#if project.is_team_managed}
                           <span class="text-xs px-1.5 py-0.5 rounded" style="background: var(--ds-background-warning-subtle); color: var(--ds-text-warning);">
                             {t('jiraImport.projects.teamManaged')}
                           </span>
@@ -571,6 +694,91 @@
           {/if}
         </div>
 
+      {:else if currentStepId === 'xray'}
+        <div class="space-y-5" data-testid="jira-import-xray-options">
+          <div
+            class="p-5 rounded-lg border"
+            style="border-color: var(--ds-border); background: var(--ds-surface);"
+          >
+            <div class="flex items-start gap-3">
+              <Check size={22} style="color: var(--ds-text-success);" class="mt-0.5 flex-shrink-0" />
+              <div class="space-y-1">
+                <h3 class="font-medium" style="color: var(--ds-text);">
+                  Xray test cases found
+                </h3>
+                <p class="text-sm" style="color: var(--ds-text-subtle);">
+                  Windshift positively identified {xray.totalTests.toLocaleString()} Xray
+                  {xray.totalTests === 1 ? ' Test' : ' Tests'} in the selected projects using
+                  Xray-owned metadata.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <Checkbox
+            checked={xray.importTests}
+            dataTestid="jira-import-xray-enabled"
+            onchange={(enabled) => xray.importTests = enabled}
+            label="Import Xray Tests into Windshift Test Management"
+            hint="When enabled, Xray Test issues become test cases instead of ordinary work items. Leave off to use the normal issue mapping."
+          />
+
+          {#if xray.importTests && xray.requiresCredential}
+            <div
+              class="space-y-4 p-4 rounded-lg border"
+              style="border-color: var(--ds-border); background: var(--ds-background-neutral-subtle);"
+              data-testid="jira-import-xray-cloud-credentials"
+            >
+              <AlertBox variant="info">
+                <p class="text-sm">
+                  Xray Cloud stores test steps outside Jira. Supply an Xray API client ID and
+                  client secret; these credentials are used only for this import.
+                </p>
+              </AlertBox>
+
+              <FormField label="Xray Cloud region">
+                <Select
+                  id="jira-import-xray-region"
+                  value={xray.region}
+                  options={[
+                    { value: 'global', label: 'Global' },
+                    { value: 'us', label: 'United States' },
+                    { value: 'eu', label: 'European Union' },
+                    { value: 'au', label: 'Australia' },
+                  ]}
+                  onchange={(value) => xray.region = value}
+                />
+              </FormField>
+
+              <FormField label="Xray client ID">
+                <Input
+                  bind:value={xray.clientId}
+                  dataTestid="jira-import-xray-client-id"
+                  autocomplete="off"
+                  placeholder="Client ID"
+                />
+              </FormField>
+
+              <FormField label="Xray client secret">
+                <Input
+                  type="password"
+                  bind:value={xray.clientSecret}
+                  dataTestid="jira-import-xray-client-secret"
+                  autocomplete="new-password"
+                  placeholder="Client secret"
+                />
+              </FormField>
+            </div>
+          {:else if xray.importTests}
+            <AlertBox variant="info">
+              <p class="text-sm">
+                Xray Data Center test definitions will be read through Raven using the existing
+                Jira credentials.
+              </p>
+            </AlertBox>
+          {/if}
+        </div>
+
       {:else if currentStepId === 'mapping'}
         <!-- Consolidated Mapping Step -->
         <div class="space-y-6">
@@ -588,7 +796,11 @@
             </p>
             <div class="space-y-2">
               {#each mappings.workspaces as mapping}
-                <div class="p-3 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface);">
+                <div
+                  class="p-3 rounded-lg border"
+                  data-testid={`jira-import-workspace-mapping-${mapping.jiraKey}`}
+                  style="border-color: var(--ds-border); background: var(--ds-surface);"
+                >
                   <div class="flex items-center gap-3">
                     <div class="flex-1 min-w-0">
                       <div class="flex items-center gap-2">
@@ -603,14 +815,73 @@
                       </div>
                     </div>
                     <ArrowRight size={14} style="color: var(--ds-text-subtle);" />
-                    <div class="w-48 flex-shrink-0">
-                      <Input
-                        bind:value={mapping.newWorkspaceName}
-                        placeholder="Workspace name"
+                    <div class="w-64 flex-shrink-0 space-y-2">
+                      <Select
+                        id={`jira-import-workspace-target-${mapping.jiraKey}`}
+                        value={mapping.createNew ? 'create' : existingValue(mapping.windshiftId)}
+                        options={workspaceTargetOptions()}
+                        onchange={(value) => handleWorkspaceTargetChange(mapping, value)}
+                        size="small"
+                      />
+                      {#if mapping.createNew}
+                        <Input
+                          bind:value={mapping.newWorkspaceName}
+                          dataTestid={`jira-import-workspace-name-${mapping.jiraKey}`}
+                          placeholder="Workspace name"
+                          size="small"
+                        />
+                      {/if}
+                    </div>
+                  </div>
+                  {#if !mapping.createNew}
+                    <p class="mt-2 text-xs" style="color: var(--ds-text-subtle);">
+                      Importing into the existing workspace
+                      <strong>{workspaceTargetName(mapping.windshiftId)}</strong>.
+                      Its workflows, screens, and fields are reused where possible.
+                    </p>
+                  {:else if mapping.workspaceKeyCollisionFound}
+                    <div
+                      class="mt-3 space-y-3"
+                      data-testid={`jira-import-workspace-key-collision-${mapping.jiraKey}`}
+                    >
+                      <AlertBox variant="warning">
+                        <p class="text-sm">
+                          Workspace key <strong>{mapping.jiraKey}</strong> is already in use.
+                          This Jira project will be created as a separate workspace with the
+                          alias <strong>{mapping.newWorkspaceKey}</strong>. The existing
+                          workspace will not be changed or merged.
+                        </p>
+                      </AlertBox>
+                      <Checkbox
+                        checked={mapping.keyAliasAcknowledged}
+                        dataTestid={`jira-import-workspace-key-alias-ack-${mapping.jiraKey}`}
+                        onchange={(checked) =>
+                          jiraImport.setWorkspaceKeyAliasAcknowledged(mapping.jiraKey, checked)}
+                        label={`Use ${mapping.newWorkspaceKey} for this imported Jira workspace`}
+                        hint="I acknowledge that links and imported work-item keys will use this workspace alias."
                         size="small"
                       />
                     </div>
-                  </div>
+                  {:else}
+                    <p class="mt-2 text-xs" style="color: var(--ds-text-subtle);">
+                      Windshift workspace key: <strong>{mapping.newWorkspaceKey}</strong>
+                    </p>
+                  {/if}
+                  {#if mapping.isTeamManaged}
+                    <div
+                      class="mt-3"
+                      data-testid={`jira-import-team-managed-limits-${mapping.jiraKey}`}
+                    >
+                      <AlertBox variant="warning">
+                        <p class="text-sm">
+                          Issue data and observed custom fields will import. Jira does not expose
+                          company-managed workflow and screen schemes for this team-managed project,
+                          so Windshift will create a conservative initial workflow and default screens
+                          and report that configuration boundary.
+                        </p>
+                      </AlertBox>
+                    </div>
+                  {/if}
                 </div>
               {/each}
             </div>
@@ -628,17 +899,31 @@
             <p class="text-xs" style="color: var(--ds-text-subtle);">
               {t('jiraImport.mapping.issueTypesDesc')}
             </p>
-            <div class="flex flex-wrap gap-2">
+            <div class="space-y-2 max-h-72 overflow-y-auto">
               {#each mappings.issueTypes as mapping}
-                <div class="px-3 py-1.5 rounded-lg border inline-flex items-center gap-2"
+                <div data-testid="jira-import-issue-type-mapping"
+                     data-jira-ids={mapping.jiraIds.join(',')}
+                     data-mapping-action={mappingChoiceValue(mapping) === 'create' ? 'create' : 'map'}
+                     class="p-2 rounded-lg border flex items-center gap-3"
                      style="border-color: var(--ds-border); background: var(--ds-surface);">
-                  <span class="text-sm" style="color: var(--ds-text);">{mapping.jiraName}</span>
-                  {#if mapping.isSubtask}
-                    <span class="text-xs px-1 py-0.5 rounded"
-                          style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);">
-                      {t('jiraImport.mapping.subtask')}
-                    </span>
-                  {/if}
+                  <div class="flex-1 min-w-0 flex items-center gap-2">
+                    <span class="text-sm truncate" style="color: var(--ds-text);">{mapping.jiraName}</span>
+                    {#if mapping.isSubtask}
+                      <span class="text-xs px-1 py-0.5 rounded flex-shrink-0"
+                            style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);">
+                        {t('jiraImport.mapping.subtask')}
+                      </span>
+                    {/if}
+                  </div>
+                  <div class="w-64 flex-shrink-0">
+                    <Select
+                      id={`jira-import-issue-type-target-${mapping.jiraIds[0] ?? mapping.jiraName}`}
+                      value={mappingChoiceValue(mapping)}
+                      options={createOrExistingOptions(t('jiraImport.mapping.createNewItemType'), mappingTargets.item_types)}
+                      onchange={(value) => applyMappingChoice((id, createNew) => jiraImport.setIssueTypeMapping(mapping.jiraName, id, createNew), value)}
+                      size="small"
+                    />
+                  </div>
                 </div>
               {/each}
             </div>
@@ -656,18 +941,32 @@
             <p class="text-xs" style="color: var(--ds-text-subtle);">
               {t('jiraImport.mapping.statusesDesc')}
             </p>
-            <div class="flex flex-wrap gap-2">
+            <div class="space-y-2 max-h-72 overflow-y-auto">
               {#each mappings.statuses as mapping}
-                <div class="px-3 py-1.5 rounded-lg border inline-flex items-center gap-2"
+                <div data-testid="jira-import-status-mapping"
+                     data-jira-ids={mapping.jiraIds.join(',')}
+                     data-mapping-action={mappingChoiceValue(mapping) === 'create' ? 'create' : 'map'}
+                     class="p-2 rounded-lg border flex items-center gap-3"
                      style="border-color: var(--ds-border); background: var(--ds-surface);">
-                  {#if mapping.color}
-                    <div class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background: {mapping.color};"></div>
-                  {/if}
-                  <span class="text-sm" style="color: var(--ds-text);">{mapping.jiraName}</span>
-                  <span class="text-xs px-1 py-0.5 rounded"
-                        style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);">
-                    {mapping.categoryName}
-                  </span>
+                  <div class="flex-1 min-w-0 flex items-center gap-2">
+                    {#if mapping.color}
+                      <ColorDot size="md" color={mapping.color} class="flex-shrink-0" />
+                    {/if}
+                    <span class="text-sm truncate" style="color: var(--ds-text);">{mapping.jiraName}</span>
+                    <span class="text-xs px-1 py-0.5 rounded flex-shrink-0"
+                          style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);">
+                      {mapping.categoryName}
+                    </span>
+                  </div>
+                  <div class="w-64 flex-shrink-0">
+                    <Select
+                      id={`jira-import-status-target-${mapping.jiraIds[0] ?? mapping.jiraName}`}
+                      value={mappingChoiceValue(mapping)}
+                      options={createOrExistingOptions(t('jiraImport.mapping.createNewStatus'), mappingTargets.statuses)}
+                      onchange={(value) => applyMappingChoice((id, createNew) => jiraImport.setStatusMapping(mapping.jiraName, id, createNew), value)}
+                      size="small"
+                    />
+                  </div>
                 </div>
               {/each}
             </div>
@@ -688,7 +987,8 @@
               </p>
               <div class="flex flex-wrap gap-2">
                 {#each mappings.versions as version}
-                  <div class="px-3 py-1.5 rounded-lg border inline-flex items-center gap-2"
+                  <div data-testid="jira-import-version-mapping"
+                       class="px-3 py-1.5 rounded-lg border inline-flex items-center gap-2"
                        style="border-color: var(--ds-border); background: var(--ds-surface);">
                     <span class="text-sm" style="color: var(--ds-text);">{version.jiraName}</span>
                     {#if version.released}
@@ -714,7 +1014,7 @@
                 <Hash size={18} style="color: var(--ds-text-accent-orange);" />
                 <h3 class="font-medium" style="color: var(--ds-text);">{t('jiraImport.mapping.customFields')}</h3>
                 <span class="text-xs px-1.5 py-0.5 rounded ml-auto" style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);">
-                  {mappings.customFields.filter(f => f.canMap).length} / {mappings.customFields.length}
+                  {mappings.customFields.filter(f => f.action !== 'skip').length} / {mappings.customFields.length}
                 </span>
               </div>
               <p class="text-xs" style="color: var(--ds-text-subtle);">
@@ -722,7 +1022,9 @@
               </p>
               <div class="space-y-2 max-h-48 overflow-y-auto">
                 {#each mappings.customFields as mapping}
-                  <div class="p-2 rounded-lg border flex items-center gap-3"
+                  <div data-testid="jira-import-custom-field-mapping"
+                       data-mapping-action={mapping.canMap ? mapping.action : 'skip'}
+                       class="p-2 rounded-lg border flex items-center gap-3"
                        style="border-color: var(--ds-border); background: var(--ds-surface);">
                     <div class="flex-1 min-w-0">
                       <div class="flex items-center gap-2">
@@ -738,12 +1040,35 @@
                         </p>
                       {/if}
                     </div>
-                    <div class="flex-shrink-0">
+                    <div class="flex-shrink-0 flex items-center gap-2">
+                      {#if mapping.canMap && mapping.windshiftType === 'asset' && mapping.action !== 'map'}
+                        <div class="w-64" data-testid="jira-import-asset-field-mapping" data-jira-field-id={mapping.jiraId}>
+                          <Select
+                            id={`jira-import-asset-field-schema-${mapping.jiraId}`}
+                            value={mapping.assetSchemaId}
+                            options={[
+                              { value: 'auto', label: 'Detect from issue values' },
+                              ...(analysis.result?.asset_schemas || []).map((schema) => ({
+                                value: schema.id,
+                                label: schema.set_name,
+                              })),
+                              { value: 'text', label: 'Preserve as text' },
+                            ]}
+                            onchange={(value) => jiraImport.setAssetFieldSchema(mapping.jiraId, value)}
+                            size="small"
+                          />
+                        </div>
+                      {/if}
                       {#if mapping.canMap}
-                        <span class="text-xs px-2 py-1 rounded"
-                              style="background: var(--ds-background-success-bold); color: white;">
-                          {t('jiraImport.mapping.create')}
-                        </span>
+                        <div class="w-64" data-testid={`jira-import-field-target-${mapping.jiraId}`}>
+                          <Select
+                            id={`jira-import-field-target-select-${mapping.jiraId}`}
+                            value={customFieldChoiceValue(mapping)}
+                            options={customFieldOptions(mapping)}
+                            onchange={(value) => handleCustomFieldChoice(mapping, value)}
+                            size="small"
+                          />
+                        </div>
                       {:else}
                         <span class="text-xs px-2 py-1 rounded"
                               style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);">
@@ -752,6 +1077,139 @@
                       {/if}
                     </div>
                   </div>
+                  {#if mapping.canMap && mapping.windshiftType === 'asset'}
+                    <p class="px-2 text-xs" style="color: var(--ds-text-subtle);">
+                      Jira configures this field against one Assets schema even when it is used by multiple projects.
+                      Automatic detection checks every populated imported issue; choose a schema explicitly when the field is empty.
+                    </p>
+                  {/if}
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if analysis.result?.asset_schemas?.length > 0}
+            <div
+              class="space-y-3 p-4 rounded-lg border"
+              data-testid="jira-import-assets-mapping"
+              style="border-color: var(--ds-border); background: var(--ds-surface);"
+            >
+              <div class="flex items-center gap-2">
+                <Box size={18} style="color: var(--ds-text-accent-yellow);" />
+                <h3 class="font-medium" style="color: var(--ds-text);">Jira Assets schemas</h3>
+                <span
+                  class="text-xs px-1.5 py-0.5 rounded ml-auto"
+                  style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);"
+                >
+                  {analysis.result.asset_schemas.length}
+                </span>
+              </div>
+              <p class="text-xs" style="color: var(--ds-text-subtle);">
+                Each accessible Jira Assets schema becomes a Windshift asset set. Object types, attributes, and objects are recreated inside that set.
+              </p>
+              <div class="space-y-2">
+                {#each analysis.result.asset_schemas as schema}
+                  <div
+                    class="flex items-center justify-between px-3 py-2 rounded"
+                    data-testid="jira-import-asset-schema"
+                    data-schema-name={schema.name}
+                    data-schema-key={schema.key}
+                    data-set-name={schema.set_name}
+                    data-object-count={schema.object_count}
+                    data-type-count={schema.type_count}
+                    style="background: var(--ds-background-neutral);"
+                  >
+                    <span class="text-sm font-medium" style="color: var(--ds-text);">
+                      {schema.name}
+                      {#if schema.key}
+                        <span class="text-xs font-normal ml-1" style="color: var(--ds-text-subtle);">({schema.key})</span>
+                      {/if}
+                    </span>
+                    <span class="text-xs" style="color: var(--ds-text-subtle);">
+                      {schema.object_count} {schema.object_count === 1 ? 'object' : 'objects'}
+                      · {schema.type_count} {schema.type_count === 1 ? 'type' : 'types'}
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if analysis.result?.service_management_projects?.length > 0}
+            <div
+              class="space-y-3 p-4 rounded-lg border"
+              data-testid="jira-import-service-management"
+              style="border-color: var(--ds-border); background: var(--ds-surface);"
+            >
+              <div class="flex items-center gap-2">
+                <Users size={18} style="color: var(--ds-text-accent-blue);" />
+                <h3 class="font-medium" style="color: var(--ds-text);">Jira Service Management portals</h3>
+              </div>
+              <p class="text-xs" style="color: var(--ds-text-subtle);">
+                Each service project becomes a Windshift portal. Its request types are created before requests and portal customers are imported.
+              </p>
+              <div class="space-y-2">
+                {#each analysis.result.service_management_projects as project}
+                  <div
+                    class="flex items-center justify-between px-3 py-2 rounded"
+                    data-testid="jira-import-service-management-project"
+                    data-project-key={project.project_key}
+                    data-request-type-count={project.request_type_count}
+                    style="background: var(--ds-background-neutral);"
+                  >
+                    <span class="text-sm font-medium" style="color: var(--ds-text);">{project.project_key}</span>
+                    <span class="text-xs" style="color: var(--ds-text-subtle);">
+                      {project.request_type_count} request {project.request_type_count === 1 ? 'type' : 'types'}
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if analysis.result?.service_management_projects?.some(project => project.organization_count > 0)}
+            {@const serviceProjects = analysis.result.service_management_projects}
+            {@const organizationCount = serviceProjects.reduce((total, project) => total + project.organization_count, 0)}
+            {@const organizationMemberCount = serviceProjects.reduce((total, project) => total + project.organization_member_count, 0)}
+            <div
+              class="space-y-3 p-4 rounded-lg border"
+              data-testid="jira-import-service-management-organizations"
+              data-organization-count={organizationCount}
+              data-organization-member-count={organizationMemberCount}
+              style="border-color: var(--ds-border); background: var(--ds-surface);"
+            >
+              <div class="flex items-center gap-2">
+                <Users size={18} style="color: var(--ds-text-accent-blue);" />
+                <h3 class="font-medium" style="color: var(--ds-text);">Jira Service Management organizations</h3>
+                <span
+                  class="text-xs px-1.5 py-0.5 rounded ml-auto"
+                  style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);"
+                >
+                  {organizationCount}
+                </span>
+              </div>
+              <p class="text-xs" style="color: var(--ds-text-subtle);">
+                We found {organizationCount} customer {organizationCount === 1 ? 'organization' : 'organizations'}
+                with {organizationMemberCount} member {organizationMemberCount === 1 ? 'account' : 'accounts'}.
+                Windshift portal customers are imported either way.
+              </p>
+              <Checkbox
+                checked={mappings.serviceManagement.importOrganizations}
+                dataTestid="jira-import-import-organizations"
+                onchange={(checked) => jiraImport.setImportServiceManagementOrganizations(checked)}
+                label="Create Windshift customer organizations"
+                hint="Also assign imported portal customers to their Jira Service Management organization. Leave off to import customers without organizations."
+                size="small"
+              />
+              <div class="flex flex-wrap gap-2">
+                {#each serviceProjects.flatMap(project => project.organizations) as organization}
+                  <span
+                    class="text-xs px-2 py-1 rounded"
+                    data-testid="jira-import-discovered-organization"
+                    style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);"
+                  >
+                    {organization.name} ({organization.customer_count})
+                  </span>
                 {/each}
               </div>
             </div>
@@ -764,7 +1222,7 @@
           <AlertBox variant="warning" message={t('jiraImport.messages.reviewSummary')} />
 
           <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
-            <div class="p-4 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
+            <div data-testid="jira-import-preview-workspaces" class="p-4 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
               <div class="flex items-center gap-3">
                 <div class="w-10 h-10 rounded-lg flex items-center justify-center"
                      style="background: var(--ds-background-accent-blue-subtler);">
@@ -779,7 +1237,7 @@
               </div>
             </div>
 
-            <div class="p-4 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
+            <div data-testid="jira-import-preview-items" class="p-4 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
               <div class="flex items-center gap-3">
                 <div class="w-10 h-10 rounded-lg flex items-center justify-center"
                      style="background: var(--ds-background-accent-green-subtler);">
@@ -787,12 +1245,38 @@
                 </div>
                 <div>
                   <p class="text-2xl font-semibold" style="color: var(--ds-text);">
-                    {analysis.result?.total_issues?.toLocaleString() || 0}
+                    {Math.max(
+                      0,
+                      (analysis.result?.total_issues || 0) - (xray.importTests ? xray.totalTests : 0)
+                    ).toLocaleString()}
                   </p>
                   <p class="text-sm" style="color: var(--ds-text-subtle);">{t('jiraImport.preview.workItems')}</p>
                 </div>
               </div>
             </div>
+
+            {#if xray.importTests}
+              <div
+                data-testid="jira-import-preview-xray-tests"
+                class="p-4 rounded-lg border"
+                style="border-color: var(--ds-border); background: var(--ds-surface-raised);"
+              >
+                <div class="flex items-center gap-3">
+                  <div
+                    class="w-10 h-10 rounded-lg flex items-center justify-center"
+                    style="background: var(--ds-background-accent-green-subtler);"
+                  >
+                    <Check class="w-5 h-5" style="color: var(--ds-text-accent-green);" />
+                  </div>
+                  <div>
+                    <p class="text-2xl font-semibold" style="color: var(--ds-text);">
+                      {xray.totalTests.toLocaleString()}
+                    </p>
+                    <p class="text-sm" style="color: var(--ds-text-subtle);">Xray test cases</p>
+                  </div>
+                </div>
+              </div>
+            {/if}
 
             <div class="p-4 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
               <div class="flex items-center gap-3">
@@ -832,7 +1316,7 @@
                 </div>
                 <div>
                   <p class="text-2xl font-semibold" style="color: var(--ds-text);">
-                    {mappings.customFields.filter(f => f.canMap).length}
+                    {mappings.customFields.filter(f => f.action !== 'skip').length}
                   </p>
                   <p class="text-sm" style="color: var(--ds-text-subtle);">{t('jiraImport.preview.customFields')}</p>
                 </div>
@@ -880,8 +1364,39 @@
               </div>
             {/if}
 
+            {#if analysis.result?.service_management_projects?.some(project => project.organization_count > 0)}
+              <div
+                data-testid="jira-import-preview-organizations"
+                data-import-enabled={mappings.serviceManagement.importOrganizations ? 'true' : 'false'}
+                class="p-4 rounded-lg border"
+                style="border-color: var(--ds-border); background: var(--ds-surface-raised);"
+              >
+                <div class="flex items-center gap-3">
+                  <div class="w-10 h-10 rounded-lg flex items-center justify-center"
+                       style="background: var(--ds-background-accent-blue-subtler);">
+                    <Users class="w-5 h-5" style="color: var(--ds-text-accent-blue);" />
+                  </div>
+                  <div>
+                    <p class="text-2xl font-semibold" style="color: var(--ds-text);">
+                      {mappings.serviceManagement.importOrganizations
+                        ? analysis.result.service_management_projects.reduce((total, project) => total + project.organization_count, 0)
+                        : 0}
+                    </p>
+                    <p class="text-sm" style="color: var(--ds-text-subtle);">
+                      Customer organizations
+                    </p>
+                  </div>
+                </div>
+              </div>
+            {/if}
+
             {#if analysis.result?.total_assets > 0}
-              <div class="p-4 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
+              <div
+                data-testid="jira-import-preview-assets"
+                data-asset-count={analysis.result.total_assets}
+                class="p-4 rounded-lg border"
+                style="border-color: var(--ds-border); background: var(--ds-surface-raised);"
+              >
                 <div class="flex items-center gap-3">
                   <div class="w-10 h-10 rounded-lg flex items-center justify-center"
                        style="background: var(--ds-background-accent-yellow-subtler);">
@@ -902,7 +1417,8 @@
           <div class="space-y-2">
             <h3 class="font-medium" style="color: var(--ds-text);">{t('jiraImport.preview.projectsToImport')}</h3>
             {#each analysis.result?.projects || [] as project}
-              <div class="p-3 rounded-lg border flex items-center justify-between"
+              <div data-testid={`jira-import-preview-project-${project.key}`}
+                   class="p-3 rounded-lg border flex items-center justify-between"
                    style="border-color: var(--ds-border); background: var(--ds-surface);">
                 <div class="flex items-center gap-2">
                   <Briefcase size={16} style="color: var(--ds-text-subtle);" />
@@ -935,20 +1451,30 @@
                     <div>
                       <p class="font-medium" style="color: var(--ds-text);">Previous Jira import data exists</p>
                       <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
-                        Close this wizard, use Import History to delete the previous import data, then start the import again. This protects against accidentally duplicating projects and deleting multiple workspaces without review.
+                        Re-import updates issues matched by their stable Jira ID, reuses imported comments, worklogs, and attachments, and keeps Jira Rank order. You can still close the wizard and delete the previous import data from Import History for a clean replacement.
                       </p>
                     </div>
                   </div>
                   {#if importData.conflictingImports?.length}
                     <div class="space-y-2">
                       {#each importData.conflictingImports as conflict}
-                        <div class="rounded border px-3 py-2" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
+                        <div
+                          class="rounded border px-3 py-2"
+                          data-testid={`jira-import-conflict-${conflict.job_id}`}
+                          data-configuration-drift={conflict.configuration_drift ? 'true' : 'false'}
+                          style="border-color: var(--ds-border); background: var(--ds-surface-raised);"
+                        >
                           <div class="flex items-center justify-between gap-3">
                             <span class="font-mono text-xs" style="color: var(--ds-text);">{conflict.job_id}</span>
-                            <span class="text-xs capitalize" style="color: var(--ds-text-subtle);">{conflict.status?.replace('_', ' ')}</span>
+                            <span class="text-xs capitalize" style="color: var(--ds-text-subtle);">{conflict.status?.replaceAll('_', ' ')}</span>
                           </div>
                           {#if conflict.project_keys?.length}
                             <p class="text-xs mt-1" style="color: var(--ds-text-subtle);">Projects: {conflict.project_keys.join(', ')}</p>
+                          {/if}
+                          {#if conflict.configuration_drift}
+                            <p class="text-xs mt-1" style="color: var(--ds-text-warning);">
+                              The selected scope or mapping configuration has changed since this import.
+                            </p>
                           {/if}
                         </div>
                       {/each}
@@ -956,12 +1482,21 @@
                   {/if}
                 </div>
                 <div class="flex justify-center gap-3">
+                  <Button
+                    variant="primary"
+                    dataTestid="jira-import-force-reimport"
+                    onclick={() => jiraImport.startImport(true)}
+                  >
+                    Re-import and update
+                  </Button>
                   <Button variant="secondary" onclick={handleClose}>Close and manage imports</Button>
-                  <Button variant="ghost" onclick={() => jiraImport.goToStep(3)}>Back to preview</Button>
+                  <Button variant="ghost" onclick={() => jiraImport.goToStepId('preview')}>Back to preview</Button>
                 </div>
               </div>
             {:else}
-              <AlertBox variant="error" message={importData.error} />
+              <div data-testid="jira-import-error">
+                <AlertBox variant="error" message={importData.error} />
+              </div>
               <div class="mt-4">
                 <Button variant="secondary" onclick={() => jiraImport.startImport()}>
                   {t('jiraImport.buttons.retryImport')}
@@ -969,22 +1504,64 @@
               </div>
             {/if}
           {:else if importData.result}
-            <div class="text-center">
-              <Check class="w-16 h-16 mx-auto" style="color: var(--ds-text-success);" />
+            <div
+              class="text-center"
+              data-testid="jira-import-complete"
+              data-total-issues={importData.progress?.total_issues || 0}
+              data-imported-issues={importData.progress?.imported_issues || 0}
+              data-total-comments={importData.progress?.total_comments || 0}
+              data-imported-comments={importData.progress?.imported_comments || 0}
+              data-total-attachments={importData.progress?.total_attachments || 0}
+              data-imported-attachments={importData.progress?.imported_attachments || 0}
+            >
+              {#if importData.result.status === 'completed_with_errors'}
+                <AlertCircle class="w-16 h-16 mx-auto" style="color: var(--ds-text-warning);" />
+              {:else}
+                <Check class="w-16 h-16 mx-auto" style="color: var(--ds-text-success);" />
+              {/if}
               <p class="text-lg font-medium mt-4" style="color: var(--ds-text);">
-                {t('jiraImport.import.complete')}
+                {importData.result.status === 'completed_with_errors'
+                  ? t('jiraImport.import.completeWithErrors')
+                  : t('jiraImport.import.complete')}
               </p>
               <p class="text-sm mt-2" style="color: var(--ds-text-subtle);">
                 {t('jiraImport.import.success', { count: importData.progress?.imported_issues || 0 })}
               </p>
+              {#if xray.importTests}
+                <p
+                  class="text-sm mt-1"
+                  style="color: var(--ds-text-subtle);"
+                  data-testid="jira-import-xray-imported-count"
+                >
+                  Imported {importData.progress?.imported_tests || 0} Xray test
+                  {(importData.progress?.imported_tests || 0) === 1 ? ' case' : ' cases'}.
+                </p>
+              {/if}
               {#if importData.progress?.failed_issues > 0}
-                <p class="text-sm mt-1 text-amber-600">
+                <p class="text-sm mt-1 text-ds-text-warning" data-testid="jira-import-failed-count">
                   {t('jiraImport.import.failed', { count: importData.progress.failed_issues })}
+                </p>
+              {/if}
+              {#if importData.progress?.failed_tests > 0}
+                <p class="text-sm mt-1 text-ds-text-warning" data-testid="jira-import-xray-failed-count">
+                  {importData.progress.failed_tests} Xray test
+                  {importData.progress.failed_tests === 1 ? ' case failed' : ' cases failed'} to import.
+                </p>
+              {/if}
+              {#if importData.progress?.failed_projects > 0}
+                <p class="text-sm mt-1 text-ds-text-warning" data-testid="jira-import-failed-project-count">
+                  {importData.progress.failed_projects} Jira
+                  {importData.progress.failed_projects === 1 ? ' project failed' : ' projects failed'} to import.
+                </p>
+              {/if}
+              {#if importData.progress?.failed_links > 0}
+                <p class="text-sm mt-1 text-ds-text-warning" data-testid="jira-import-failed-link-count">
+                  Jira issue links could not be imported.
                 </p>
               {/if}
             </div>
           {:else if importData.isImporting || importData.jobId}
-            <div class="text-center">
+            <div class="text-center" data-testid="jira-import-progress">
               <Spinner size="lg" class="mx-auto" />
               <p class="text-lg font-medium mt-4" style="color: var(--ds-text);">
                 {t('jiraImport.import.importing')}
@@ -1005,6 +1582,12 @@
                     ></div>
                   </div>
                 </div>
+                {#if xray.importTests}
+                  <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
+                    Xray tests: {importData.progress.imported_tests || 0} /
+                    {importData.progress.total_tests || 0}
+                  </p>
+                {/if}
               {/if}
             </div>
           {:else}
@@ -1014,7 +1597,12 @@
                 {t('jiraImport.import.ready')}
               </p>
               <p class="text-sm mt-2" style="color: var(--ds-text-subtle);">
-                {t('jiraImport.import.readyDesc', { count: analysis.result?.total_issues || 0 })}
+                {t('jiraImport.import.readyDesc', {
+                  count: Math.max(
+                    0,
+                    (analysis.result?.total_issues || 0) - (xray.importTests ? xray.totalTests : 0)
+                  )
+                })}
               </p>
               <div class="mt-6">
                 <Button variant="primary" onclick={() => jiraImport.startImport()}>
@@ -1030,7 +1618,9 @@
     <!-- Footer with navigation -->
     <DialogFooter
       showCancel={false}
+      confirmTestid="jira-import-next"
       confirmLabel={getConfirmLabel()}
+      showKeyboardHint={true}
       loading={connection.isConnecting || isAnalyzing || isContinueLoading || isLoadingSavedConnection}
       disabled={
         connection.isConnecting ||
@@ -1038,14 +1628,18 @@
         isContinueLoading ||
         isLoadingSavedConnection ||
         isNavigating ||
-        (currentStepId === 'connect' && !connection.isConnected && (!jiraUrl || !email || !apiToken)) ||
-        (currentStepId === 'projects' && projects.selected.length === 0)
+        (currentStepId === 'connect' && !connection.isConnected &&
+          (!jiraUrl || !apiToken || (deploymentType === 'cloud' && !email))) ||
+        (currentStepId === 'projects' && projects.selected.length === 0) ||
+        (currentStepId === 'xray' && !jiraImport.canProceed()) ||
+        (currentStepId === 'mapping' && !jiraImport.canProceed())
       }
       onConfirm={shouldShowConfirmButton() ? handleNext : null}
     >
       {#snippet extra()}
         <Button
           variant="ghost"
+          dataTestid="jira-import-back"
           onclick={() => currentStep > 0 ? jiraImport.prevStep() : handleClose()}
           disabled={connection.isConnecting || isAnalyzing}
         >

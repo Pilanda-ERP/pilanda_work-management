@@ -1,27 +1,32 @@
 <script>
   import { onMount } from 'svelte';
   import { untrack } from 'svelte';
-  import { fly } from 'svelte/transition';
   import { t } from '../../stores/i18n.svelte.js';
   import { api } from '../../api.js';
-  import { resolveScreenId } from '../../utils/screenResolution.js';
   import { navigate } from '../../router.js';
-  import { collectionStore, reloadCollection, refreshCollectionItem } from '../../stores/collectionContext.js';
+  import { collectionStore, refreshCollectionDeltas, reloadCollection, refreshCollectionItem } from '../../stores/collectionContext.js';
+  import { findOrphansByMissingParent, indexCollectionHierarchy, mergeAncestorContext } from './collectionHierarchy.js';
   import { useGradientStyles, loadWorkspaceGradient } from '../../stores/workspaceGradient.svelte.js';
-  import { workspaceDataStore } from '../../stores/index.js';
+  import { workspaceDataStore, itemModalStore } from '../../stores/index.js';
   import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
   import ViewHeader from '../../layout/ViewHeader.svelte';
   import StaticViewBackground from '../../layout/StaticViewBackground.svelte';
   import SubFilterBar from './SubFilterBar.svelte';
   import Select from '../../components/Select.svelte';
-  import ItemDetail from '../items/ItemDetail.svelte';
-  import { Settings, ChevronLeft, ChevronRight, Diamond, ChevronDown, Circle, GitBranch } from '@lucide/svelte';
+  import Toggle from '../../components/Toggle.svelte';
+  import RoadmapItemPreview from './RoadmapItemPreview.svelte';
+  import { useCollectionEventStream } from '../../composables/useCollectionEventStream.svelte.js';
+  import { buildHierarchyDatePatches, projectHierarchyDates } from './roadmapHierarchyDates.js';
+  import { boardColumnsForSave } from '../../utils/workItemListColumns.js';
+  import { Settings, ChevronLeft, ChevronRight, Diamond, ChevronDown, CalendarClock, RotateCcw } from '@lucide/svelte';
   import { getVisibleColor } from '../../utils/colorUtils.js';
-  import { itemTypeIconMap } from '../../utils/icons.js';
+  import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
+  import ItemKey from '../../components/ItemKey.svelte';
   import { SYSTEM_FIELDS } from '../../stores/fieldConfig.js';
   import Button from '../../components/Button.svelte';
   import LazyRender from '../../components/LazyRender.svelte';
-  import { useEventListener } from 'runed';
+  import { errorToast } from '../../stores/toasts.svelte.js';
+  import { useEventListener, useResizeObserver } from 'runed';
 
   // Props
   let { workspaceId, collectionId = null } = $props();
@@ -46,12 +51,21 @@
   let loading = $state(true);
   let currentCollectionName = $state('Default');
 
+  // Ancestor context for hierarchy gaps: with "hide completed" enabled a
+  // finished parent is filtered out of the loaded page, but its active
+  // children still need it visible above them. Mirrors CollectionTree.
+  let ancestorsByParent = $state({});
+  let ancestorsRequestInFlight = false;
+  let ancestorsRerunPending = false;
+
   // Settings panel toggle
   let settingsOpen = $state(false);
   let settingsPanel = $state(null);
   let settingsButton = $state(null);
 
   function onSettingsClickOutside(e) {
+    const portalOwner = e.target?.closest?.('[data-popover-owner]')?.dataset?.popoverOwner;
+    if (portalOwner === 'roadmap-settings') return;
     if (settingsPanel && !settingsPanel.contains(e.target) && settingsButton && !settingsButton.contains(e.target)) {
       settingsOpen = false;
     }
@@ -65,9 +79,89 @@
   let boardConfig = $state(null);
   let boardConfigId = $state(null);
   let roadmapConfig = $state({ start_field_id: 'due_date', end_field_id: '', dependency_link_type_id: null });
+  let roadmapCardFields = $derived(boardConfig?.card_fields || []);
   let linkTypes = $state([]);
   let customFields = $state([]);
   let screenFields = $state([]);
+
+  // Hierarchy scheduling is a local roadmap view mode. It only uses the
+  // canonical scheduling fields and never writes merely because it is enabled.
+  let hierarchyMode = $state('off');
+  let adjustHierarchyDates = $state(false);
+  let hierarchyDateItems = $state([]);
+  let hierarchyDatesLoading = $state(false);
+  let hierarchyDatesLoaded = $state(false);
+  let hierarchyDatesError = $state('');
+  let hierarchyLoadGeneration = 0;
+
+  let hierarchyFieldsReady = $derived(
+    roadmapConfig.start_field_id === 'start_date' && roadmapConfig.end_field_id === 'end_date'
+  );
+  let hierarchyProjectionActive = $derived(
+    hierarchyMode !== 'off' && hierarchyFieldsReady && hierarchyDatesLoaded && !hierarchyDatesError
+  );
+  let hierarchyProjection = $derived.by(() =>
+    hierarchyProjectionActive
+      ? projectHierarchyDates(hierarchyDateItems, hierarchyMode)
+      : new Map()
+  );
+
+  function setHierarchyMode(mode) {
+    if (mode !== 'off' && !hierarchyFieldsReady) return;
+    hierarchyMode = mode;
+  }
+
+  async function loadHierarchyDates(rootIds) {
+    const generation = ++hierarchyLoadGeneration;
+    hierarchyDatesLoading = true;
+    hierarchyDatesLoaded = false;
+    hierarchyDatesError = '';
+    try {
+      const result = await api.items.getRoadmapHierarchyDates(rootIds);
+      if (generation !== hierarchyLoadGeneration) return;
+      if (result?.truncated) {
+        hierarchyDateItems = [];
+        adjustHierarchyDates = false;
+        hierarchyDatesError = t('collections.roadmapHierarchyTruncated');
+        return;
+      }
+      hierarchyDateItems = result?.items || [];
+      hierarchyDatesLoaded = true;
+    } catch (err) {
+      if (generation !== hierarchyLoadGeneration) return;
+      hierarchyDateItems = [];
+      adjustHierarchyDates = false;
+      hierarchyDatesError = t('collections.roadmapHierarchyLoadError');
+      console.error('Failed to load roadmap hierarchy dates:', err);
+    } finally {
+      if (generation === hierarchyLoadGeneration) hierarchyDatesLoading = false;
+    }
+  }
+
+  $effect(() => {
+    const enabled = hierarchyMode !== 'off' && hierarchyFieldsReady && !collectionStore.loading;
+    const roots = enabled
+      ? allItemsSorted
+          .filter((item) => item?.id != null)
+          .map((item) => item.id)
+      : [];
+    // Include visible dates so an external item refresh reloads the full projection.
+    const signature = enabled
+      ? allItemsSorted
+          .map((item) => `${item.id}:${item.parent_id ?? ''}:${item.start_date ?? ''}:${item.end_date ?? ''}`)
+          .join('|')
+      : '';
+    if (!enabled) {
+      hierarchyLoadGeneration++;
+      hierarchyDateItems = [];
+      hierarchyDatesLoaded = false;
+      hierarchyDatesLoading = false;
+      hierarchyDatesError = '';
+      return;
+    }
+    void signature;
+    untrack(() => loadHierarchyDates(roots));
+  });
 
   // Zoom: 'week' | 'month' | 'quarter'
   let zoom = $state('month');
@@ -78,17 +172,16 @@
   // Drag state (bar move/resize)
   let dragInfo = $state(null);
 
-  // Item detail modal
-  let showItemModal = $state(false);
-  let selectedItemId = $state(null);
-
   // Links/dependencies
   let itemLinks = $state({});
-  const ROADMAP_LINK_CHUNK = 200; // ids per batched /links/batch request (server cap 500)
+  const ROADMAP_LINK_CHUNK = 100;
 
   // Timeline computation
-  let timelineContainer = $state(null);
   let containerWidth = $state(1200);
+  let timelineScrollLeft = $state(0);
+
+  const QUARTER_PLANNING_MONTHS = 60;
+  const ZOOM_COLUMN_WIDTHS = { week: 40, month: 60, quarter: 80 };
 
   // --- Tree panel state ---
   let treePanelWidth = $state(280);
@@ -96,7 +189,8 @@
   let resizeStartX = $state(0);
   let resizeStartWidth = $state(0);
   let expandedItems = $state(new Set());
-  let scheduleDragInfo = $state(null); // { itemId, itemTitle, startX, startY, currentX, currentY, active }
+  let schedulePreview = $state(null);
+  let schedulingItemIds = $state(new Set());
   let treeScrollContainer = $state(null);
   let timelineScrollContainer = $state(null);
 
@@ -105,8 +199,6 @@
   useEventListener(() => (dragInfo ? window : null), 'pointerup', onDragEnd);
   useEventListener(() => (isResizingPanel ? window : null), 'pointermove', onPanelResizeMove);
   useEventListener(() => (isResizingPanel ? window : null), 'pointerup', onPanelResizeEnd);
-  useEventListener(() => (scheduleDragInfo ? window : null), 'pointermove', onScheduleDragMove);
-  useEventListener(() => (scheduleDragInfo ? window : null), 'pointerup', onScheduleDragEnd);
 
   // Derived: date field options from screen-configured fields
   let dateFieldOptions = $derived.by(() => {
@@ -135,11 +227,19 @@
     return opts;
   });
 
-  // Zoom config
+  // Zoom config. The quarter view keeps a five-year planning horizon and all
+  // views add columns until the timeline fills its available width.
   let zoomConfig = $derived.by(() => {
-    if (zoom === 'week') return { columnDays: 1, headerFormat: 'week', visibleColumns: 42 };
-    if (zoom === 'quarter') return { columnDays: 30, headerFormat: 'quarter', visibleColumns: 12 };
-    return { columnDays: 7, headerFormat: 'month', visibleColumns: 20 };
+    const base = zoom === 'week'
+      ? { columnDays: 1, headerFormat: 'week', baseVisibleColumns: 42, navigationColumns: 21 }
+      : zoom === 'quarter'
+        ? { columnDays: 30, headerFormat: 'quarter', baseVisibleColumns: QUARTER_PLANNING_MONTHS, navigationColumns: 6 }
+        : { columnDays: 7, headerFormat: 'month', baseVisibleColumns: 20, navigationColumns: 10 };
+    const viewportColumns = Math.ceil(containerWidth / ZOOM_COLUMN_WIDTHS[zoom]);
+    return {
+      ...base,
+      visibleColumns: Math.max(base.baseVisibleColumns, viewportColumns),
+    };
   });
 
   // Snap granularity in days: week/month zoom → 1 day, quarter zoom → 7 days
@@ -170,16 +270,15 @@
     let prependCount = 0;
 
     if (!collectionStore.loading && roadmapConfig.start_field_id) {
-      for (const item of collectionStore.items) {
-        const startVal = getDateValue(item, roadmapConfig.start_field_id);
-        const endVal = roadmapConfig.end_field_id ? getDateValue(item, roadmapConfig.end_field_id) : null;
+      for (const item of allItemsSorted) {
+        const { start: startVal, end: endVal } = getEffectiveDateRange(item);
         if (startVal) {
-          const pos = dateToColPos(new Date(startVal));
+          const pos = dateToColPos(parseRoadmapDate(startVal));
           if (pos < -prependCount) prependCount = Math.ceil(Math.abs(pos)) + 1;
         }
         const farVal = endVal || startVal;
         if (farVal) {
-          const d = new Date(farVal);
+          const d = parseRoadmapDate(farVal);
           d.setDate(d.getDate() + 1);
           const pos = dateToColPos(d);
           if (pos > rightCount - 1) rightCount = Math.ceil(pos) + 2;
@@ -336,20 +435,83 @@
   // --- Tree helpers ---
   let allItemsSorted = $derived.by(() => {
     if (collectionStore.loading) return [];
-    return [...collectionStore.items].sort((a, b) => (a.level || 0) - (b.level || 0) || a.id - b.id);
+    return [...mergeAncestorContext(collectionStore.items, ancestorsByParent)].sort(
+      (a, b) => (a.level || 0) - (b.level || 0) || a.id - b.id
+    );
+  });
+  let hierarchyIndex = $derived(indexCollectionHierarchy(allItemsSorted));
+
+  // Load ancestor chains for items whose parent is not in the loaded page so
+  // filtered or paginated children do not render as stray roots.
+  $effect(() => {
+    const items = collectionStore.items;
+    untrack(() => void syncAncestorContext(items));
   });
 
+  async function syncAncestorContext(items) {
+    const orphansByParent = findOrphansByMissingParent(items);
+    const neededParents = new Set(orphansByParent.keys());
+
+    // Drop cached chains whose gap the store has since filled itself.
+    const kept = {};
+    let pruned = false;
+    for (const [parentId, chain] of Object.entries(ancestorsByParent)) {
+      if (neededParents.has(Number(parentId))) {
+        kept[parentId] = chain;
+      } else {
+        pruned = true;
+      }
+    }
+    if (pruned) ancestorsByParent = kept;
+
+    const parentByOrphanId = new Map();
+    for (const [parentId, orphans] of orphansByParent) {
+      parentByOrphanId.set(orphans[0].id, parentId);
+    }
+    const orphanIds = [...parentByOrphanId.keys()].filter(
+      (orphanId) => !kept[String(parentByOrphanId.get(orphanId))]
+    );
+    if (orphanIds.length === 0) return;
+    if (ancestorsRequestInFlight) {
+      // A newer page may need different chains; rerun when the current
+      // request settles.
+      ancestorsRerunPending = true;
+      return;
+    }
+    ancestorsRequestInFlight = true;
+    try {
+      const entries = await api.items.getManyAncestors(orphanIds);
+      for (const { item_id: orphanId, ancestors } of entries) {
+        // The gap may have closed while the request was in flight.
+        const parentId = parentByOrphanId.get(orphanId);
+        if (!ancestors?.length || parentId == null || !neededParents.has(parentId)) continue;
+        ancestorsByParent = { ...ancestorsByParent, [String(parentId)]: ancestors };
+        for (const ancestor of ancestors) {
+          expandedItems.add(ancestor.id);
+        }
+      }
+      expandedItems = new Set(expandedItems);
+    } catch (error) {
+      console.error('[CollectionRoadmap] Failed to load ancestor context:', error);
+    } finally {
+      ancestorsRequestInFlight = false;
+    }
+    if (ancestorsRerunPending) {
+      ancestorsRerunPending = false;
+      await syncAncestorContext(collectionStore.items);
+    }
+  }
+
   function getRootItems() {
-    const itemIds = new Set(allItemsSorted.map(i => i.id));
-    return allItemsSorted.filter(item => item.parent_id === null || !itemIds.has(item.parent_id));
+    return hierarchyIndex.roots;
   }
 
   function getItemsByParent(parentId) {
-    return allItemsSorted.filter(item => item.parent_id === parentId);
+    return hierarchyIndex.childrenByParent.get(parentId) || [];
   }
 
   function hasChildren(itemId) {
-    return allItemsSorted.some(item => item.parent_id === itemId);
+    return hierarchyIndex.childrenByParent.has(itemId);
   }
 
   function toggleExpanded(itemId) {
@@ -366,25 +528,27 @@
   }
 
   function getItemTypeInfo(item) {
-    if (!item.item_type_id || !itemTypes.length) {
-      const fallback = [
-        { icon: GitBranch, color: '#9333ea', label: 'Epic' },
-        { icon: Circle, color: '#2563eb', label: 'Feature' },
-        { icon: Circle, color: '#16a34a', label: 'Story' },
-        { icon: Circle, color: '#ea580c', label: 'Task' },
-        { icon: Circle, color: '#6b7280', label: 'Subtask' }
-      ];
-      return fallback[Math.min(item.level || 0, fallback.length - 1)];
-    }
-    const it = itemTypes.find(type => type.id === item.item_type_id);
-    if (it) {
+    const itemType = item.item_type_id
+      ? itemTypes.find((type) => type.id === item.item_type_id)
+      : null;
+    // Prefer the icon carried on the row: the workspace-scoped itemTypes list
+    // omits types excluded from the effective configuration set.
+    const iconName = item.item_type_icon || itemType?.icon;
+    if (iconName) {
       return {
-        icon: itemTypeIconMap[it.icon] || itemTypeIconMap.FileText || Circle,
-        color: it.color,
-        label: it.name
+        iconName,
+        color: item.item_type_color || itemType?.color || '#6b7280',
+        label: item.item_type_name || itemType?.name || 'Unknown'
       };
     }
-    return { icon: Circle, color: '#6b7280', label: 'Unknown' };
+    const fallback = [
+      { iconName: 'GitBranch', color: '#9333ea', label: 'Epic' },
+      { iconName: 'Circle', color: '#2563eb', label: 'Feature' },
+      { iconName: 'Circle', color: '#16a34a', label: 'Story' },
+      { iconName: 'Circle', color: '#ea580c', label: 'Task' },
+      { iconName: 'Circle', color: '#6b7280', label: 'Subtask' }
+    ];
+    return fallback[Math.min(item.level || 0, fallback.length - 1)];
   }
 
   function renderTreeItems(parentId = null, level = 0, result = []) {
@@ -408,14 +572,17 @@
   });
 
   function itemHasDate(item) {
-    const start = getDateValue(item, roadmapConfig.start_field_id);
-    const end = roadmapConfig.end_field_id ? getDateValue(item, roadmapConfig.end_field_id) : null;
+    const { start, end } = getEffectiveDateRange(item);
     return !!(start || end);
   }
 
+  let unscheduledItemCount = $derived(
+    collectionStore.loading ? 0 : allItemsSorted.filter((item) => !itemHasDate(item)).length,
+  );
+
   // Auto-expand root items with children on first load
   $effect(() => {
-    if (!collectionStore.loading && collectionStore.items.length > 0) {
+    if (!collectionStore.loading && allItemsSorted.length > 0) {
       untrack(() => {
         if (expandedItems.size === 0) {
           const roots = getRootItems();
@@ -433,19 +600,16 @@
   let roadmapItems = $derived.by(() => {
     if (!roadmapConfig.start_field_id) return [];
 
-    const sourceItems = collectionStore.loading ? [] : collectionStore.items;
+    const sourceItems = collectionStore.loading ? [] : allItemsSorted;
     return sourceItems
       .map(item => {
-        const start = getDateValue(item, roadmapConfig.start_field_id);
-        const end = roadmapConfig.end_field_id ? getDateValue(item, roadmapConfig.end_field_id) : null;
+        const effectiveRange = getEffectiveDateRange(item);
+        const { start, end } = effectiveRange;
 
         if (!start && !end) return null;
 
-        const startDate = start ? new Date(start) : null;
-        const endDate = end ? new Date(end) : null;
-
-        if (startDate) startDate.setHours(0, 0, 0, 0);
-        if (endDate) endDate.setHours(0, 0, 0, 0);
+        const startDate = start ? parseRoadmapDate(start) : null;
+        const endDate = end ? parseRoadmapDate(end) : null;
 
         let barStart, barEnd, isMilestone;
 
@@ -473,8 +637,10 @@
           barEnd,
           isMilestone,
           statusColor: color,
-          startDate: startDate?.toISOString()?.split('T')[0],
-          endDate: endDate?.toISOString()?.split('T')[0],
+          startDate: startDate ? formatDateValue(startDate) : null,
+          endDate: endDate ? formatDateValue(endDate) : null,
+          hierarchyAdjusted: effectiveRange.adjusted,
+          isSummary: effectiveRange.summary,
         };
       })
       .filter(Boolean)
@@ -483,6 +649,12 @@
 
   // O(1) lookup map for scheduled items
   let roadmapItemMap = $derived(new Map(roadmapItems.map(i => [i.id, i])));
+
+  // Hydrate only the assignees the scheduled bars reference.
+  $effect(() => {
+    const ids = roadmapItems.map((item) => item.assignee_id).filter(Boolean);
+    if (ids.length > 0) void workspaceDataStore.hydrateUsers(ids);
+  });
 
   // Dependency arrows data
   let dependencyArrows = $derived.by(() => {
@@ -513,25 +685,56 @@
     return item[fieldId] ?? null;
   }
 
+  function getEffectiveDateRange(item) {
+    if (hierarchyProjectionActive) {
+      const projected = hierarchyProjection.get(Number(item.id));
+      if (projected) {
+        return {
+          start: projected.startDate,
+          end: projected.endDate,
+          adjusted: projected.adjusted,
+          summary: projected.summary,
+        };
+      }
+    }
+    return {
+      start: getDateValue(item, roadmapConfig.start_field_id),
+      end: roadmapConfig.end_field_id ? getDateValue(item, roadmapConfig.end_field_id) : null,
+      adjusted: false,
+      summary: false,
+    };
+  }
+
+  function parseRoadmapDate(value) {
+    const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (match) return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+    const date = new Date(value);
+    date.setHours(0, 0, 0, 0);
+    return date;
+  }
+
   // Column width in pixels
-  let colWidth = $derived.by(() => {
-    if (zoom === 'week') return 40;
-    if (zoom === 'month') return 60;
-    return 80;
-  });
+  let colWidth = $derived(ZOOM_COLUMN_WIDTHS[zoom]);
 
   let totalWidth = $derived(colWidth * columns.length);
 
   // Row height
   const ROW_HEIGHT = 40;
+  const DEFAULT_SCHEDULE_DAYS = 7;
 
   // Sync collection name and load links when items change
   $effect(() => {
     if (!collectionStore.loading) {
       currentCollectionName = collectionStore.collectionName;
-      untrack(() => loadLinksForItems(collectionStore.items));
+      untrack(() => loadLinksForItems(allItemsSorted));
     }
   });
+
+  // Scoped SSE invalidations (WI-1624): any frame runs the existing delta fetch.
+  useCollectionEventStream(
+    () => (collectionId ? { kind: 'collection', id: collectionId } : { kind: 'workspace', id: workspaceId }),
+    { onInvalidate: () => refreshCollectionDeltas() }
+  );
 
   // Load links for visible items in batched requests instead of one per item.
   async function loadLinksForItems(items) {
@@ -588,15 +791,10 @@
       customFields = cf?.data || cf || [];
 
       // Load screen fields to determine available date fields. The roadmap
-      // is workspace-scoped (not bound to a single item-type), so resolve
-      // against the config-set defaults; mode='edit' falls back through
-      // create_screen_id when no edit screen is configured.
-      let screenId = null;
-      if (workspace?.configuration_set_id) {
-        const configSet = await api.configurationSets.get(workspace.configuration_set_id);
-        screenId = resolveScreenId(configSet, null, 'edit');
-      }
-      if (!screenId) screenId = 1;
+      // is workspace-scoped (not bound to a single item-type), so resolve the
+      // effective edit screen through the workspace's shared config cache.
+      const config = await workspaceDataStore.screenConfig(null);
+      const screenId = config?.edit_screen?.id ?? 1;
       const screen = await api.screens.get(screenId);
       screenFields = screen?.fields || [];
     } catch (e) {
@@ -607,7 +805,7 @@
   // Save roadmap config
   async function saveConfig() {
     const payload = {
-      columns: boardConfig?.columns || [],
+      columns: boardColumnsForSave(boardConfig?.columns),
       backlog_status_ids: boardConfig?.backlog_status_ids || [],
       list_columns: boardConfig?.list_columns || [],
       card_fields: boardConfig?.card_fields || [],
@@ -617,11 +815,12 @@
         dependency_link_type_id: roadmapConfig.dependency_link_type_id ? Number(roadmapConfig.dependency_link_type_id) : null,
       },
       show_rightmost_column_last_50: Boolean(boardConfig?.show_rightmost_column_last_50),
+      completed_item_retention_days: boardConfig?.completed_item_retention_days ?? null,
     };
 
     try {
       if (boardConfigId) {
-        await api.collections.updateBoardConfiguration(collectionId, boardConfigId, payload);
+        await api.collections.updateBoardConfiguration(collectionId, boardConfigId, payload, workspaceId);
       } else {
         const result = await api.collections.createBoardConfiguration(collectionId, workspaceId, payload);
         boardConfigId = result.id;
@@ -633,42 +832,51 @@
 
   function onStartFieldChange(val) {
     roadmapConfig.start_field_id = val;
+    if (val !== 'start_date') {
+      hierarchyMode = 'off';
+      adjustHierarchyDates = false;
+    }
     saveConfig();
   }
 
   function onEndFieldChange(val) {
     roadmapConfig.end_field_id = val;
+    if (val !== 'end_date') {
+      hierarchyMode = 'off';
+      adjustHierarchyDates = false;
+    }
     saveConfig();
   }
 
   function onLinkTypeChange(val) {
     roadmapConfig.dependency_link_type_id = val || null;
     saveConfig();
-    if (val) loadLinksForItems(collectionStore.items);
+    if (val) loadLinksForItems(allItemsSorted);
   }
 
   // Navigation
   function scrollLeft() {
-    scrollOffset -= Math.floor(zoomConfig.visibleColumns / 2);
+    scrollOffset -= zoomConfig.navigationColumns;
   }
 
   function scrollRight() {
-    scrollOffset += Math.floor(zoomConfig.visibleColumns / 2);
+    scrollOffset += zoomConfig.navigationColumns;
   }
 
   function goToToday() {
     scrollOffset = 0;
+    timelineScrollLeft = 0;
+    if (timelineScrollContainer) timelineScrollContainer.scrollLeft = 0;
   }
 
   // Item click
   function openItem(itemId) {
-    selectedItemId = itemId;
-    showItemModal = true;
+    itemModalStore.open(itemId, workspaceId);
   }
 
   // --- Bar drag handlers (existing move/resize) ---
   function onBarPointerDown(e, item, mode) {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || (hierarchyMode === 'rollup' && item.isSummary)) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -707,24 +915,24 @@
 
     if (mode === 'move' || mode === 'resize-left') {
       if (origStartDate) {
-        const newStart = new Date(origStartDate);
+        const newStart = parseRoadmapDate(origStartDate);
         newStart.setDate(newStart.getDate() + actualDays);
         setDateUpdate(updateData, roadmapConfig.start_field_id, newStart);
       } else if (mode === 'resize-left' && origEndDate && roadmapConfig.start_field_id) {
         // Milestone with only end date → expand left: set start = end - |days|
-        const newStart = new Date(origEndDate);
+        const newStart = parseRoadmapDate(origEndDate);
         newStart.setDate(newStart.getDate() + actualDays);
         setDateUpdate(updateData, roadmapConfig.start_field_id, newStart);
       }
     }
     if (mode === 'move' || mode === 'resize-right') {
       if (origEndDate) {
-        const newEnd = new Date(origEndDate);
+        const newEnd = parseRoadmapDate(origEndDate);
         newEnd.setDate(newEnd.getDate() + actualDays);
         setDateUpdate(updateData, roadmapConfig.end_field_id, newEnd);
       } else if (mode === 'resize-right' && origStartDate && roadmapConfig.end_field_id) {
         // Milestone with only start date → expand right: set end = start + days
-        const newEnd = new Date(origStartDate);
+        const newEnd = parseRoadmapDate(origStartDate);
         newEnd.setDate(newEnd.getDate() + actualDays);
         setDateUpdate(updateData, roadmapConfig.end_field_id, newEnd);
       }
@@ -732,17 +940,25 @@
 
     if (Object.keys(updateData).length > 0) {
       try {
-        await api.items.update(itemId, updateData);
-        reloadCollection();
+        await persistRoadmapDateEdit(itemId, updateData);
       } catch (e) {
         console.error('Failed to update item dates:', e);
+        errorToast(e?.message || t('collections.roadmapDateUpdateError'));
         reloadCollection();
       }
     }
   }
 
+  function formatDateValue(date) {
+    return [
+      date.getFullYear(),
+      String(date.getMonth() + 1).padStart(2, '0'),
+      String(date.getDate()).padStart(2, '0'),
+    ].join('-');
+  }
+
   function setDateUpdate(data, fieldId, date) {
-    const dateStr = date.toISOString().split('T')[0];
+    const dateStr = formatDateValue(date);
     if (fieldId?.startsWith('cf_')) {
       const cfId = fieldId.replace('cf_', '');
       if (!data.custom_field_values) data.custom_field_values = {};
@@ -750,6 +966,29 @@
     } else {
       data[fieldId] = dateStr;
     }
+  }
+
+  async function persistRoadmapDateEdit(itemId, updateData) {
+    if (adjustHierarchyDates && hierarchyMode !== 'off' && hierarchyFieldsReady) {
+      if (!hierarchyProjectionActive) {
+        throw new Error(t('collections.roadmapHierarchyNotReady'));
+      }
+      const fields = {};
+      if (Object.hasOwn(updateData, 'start_date')) fields.start_date = updateData.start_date;
+      if (Object.hasOwn(updateData, 'end_date')) fields.end_date = updateData.end_date;
+      const patches = buildHierarchyDatePatches({
+        items: hierarchyDateItems,
+        editedItemId: itemId,
+        fields,
+        mode: hierarchyMode,
+      });
+      await api.items.bulkPatch(patches);
+      reloadCollection();
+      await loadHierarchyDates(allItemsSorted.map((item) => item.id));
+      return;
+    }
+    await api.items.update(itemId, updateData);
+    reloadCollection();
   }
 
   function getDragOffset(item) {
@@ -792,85 +1031,90 @@
     isResizingPanel = false;
   }
 
-  // --- Drag-to-schedule handlers ---
-  function onTreeItemDragStart(e, item) {
-    if (e.button !== 0) return;
-    if (itemHasDate(item)) return; // Only drag unscheduled items
-    e.preventDefault();
-
-    scheduleDragInfo = {
-      itemId: item.id,
-      itemTitle: item.title,
-      startX: e.clientX,
-      startY: e.clientY,
-      currentX: e.clientX,
-      currentY: e.clientY,
-      active: false,
-    };
-  }
-
-  function onScheduleDragMove(e) {
-    if (!scheduleDragInfo) return;
-    const dx = e.clientX - scheduleDragInfo.startX;
-    const dy = e.clientY - scheduleDragInfo.startY;
-
-    // Activate after 5px threshold
-    if (!scheduleDragInfo.active && Math.sqrt(dx * dx + dy * dy) > 5) {
-      scheduleDragInfo.active = true;
-    }
-
-    if (scheduleDragInfo.active) {
-      scheduleDragInfo = { ...scheduleDragInfo, currentX: e.clientX, currentY: e.clientY };
-    }
-  }
-
-  async function onScheduleDragEnd(e) {
-    if (!scheduleDragInfo || !scheduleDragInfo.active) {
-      scheduleDragInfo = null;
-      return;
-    }
-
-    const { itemId } = scheduleDragInfo;
-    scheduleDragInfo = null;
-
-    // Determine drop position relative to the timeline
-    if (!timelineScrollContainer) return;
-    const timelineRect = timelineScrollContainer.getBoundingClientRect();
-    const dropX = e.clientX - timelineRect.left + timelineScrollContainer.scrollLeft;
-
-    if (dropX < 0) return; // Dropped outside timeline
-
-    const dayOffset = dropX / colWidth - gridOffset;
-    const dropDate = new Date(referenceDate);
+  // --- Click-to-schedule handlers ---
+  function dateAtTimelineX(timelineX) {
+    const dayOffset = timelineX / colWidth - gridOffset;
+    const date = new Date(referenceDate);
     if (zoom === 'quarter') {
       const monthOffset = Math.floor(dayOffset);
       const frac = dayOffset - monthOffset;
-      dropDate.setMonth(dropDate.getMonth() + monthOffset);
-      const nextM = new Date(dropDate.getFullYear(), dropDate.getMonth() + 1, 1);
-      const dim = (nextM.getTime() - new Date(dropDate.getFullYear(), dropDate.getMonth(), 1).getTime()) / (1000 * 60 * 60 * 24);
-      dropDate.setDate(1 + Math.round(frac * dim / snapDays) * snapDays);
+      date.setMonth(date.getMonth() + monthOffset);
+      const nextMonth = new Date(date.getFullYear(), date.getMonth() + 1, 1);
+      const monthStart = new Date(date.getFullYear(), date.getMonth(), 1);
+      const daysInMonth = (nextMonth.getTime() - monthStart.getTime()) / (1000 * 60 * 60 * 24);
+      date.setDate(1 + Math.floor(frac * daysInMonth / snapDays) * snapDays);
     } else {
-      dropDate.setDate(dropDate.getDate() + Math.round(dayOffset * zoomConfig.columnDays));
+      const days = Math.floor(dayOffset * zoomConfig.columnDays / snapDays) * snapDays;
+      date.setDate(date.getDate() + days);
     }
+    return date;
+  }
+
+  function scheduleRange(startDate) {
+    const start = new Date(startDate);
+    const end = roadmapConfig.end_field_id ? new Date(startDate) : null;
+    if (end) end.setDate(end.getDate() + DEFAULT_SCHEDULE_DAYS - 1);
+
+    const endExclusive = new Date(end || start);
+    endExclusive.setDate(endExclusive.getDate() + 1);
+
+    return {
+      start,
+      end,
+      leftPx: (dateToColPos(start) + gridOffset) * colWidth,
+      widthPx: Math.max((dateToColPos(endExclusive) - dateToColPos(start)) * colWidth, 8),
+    };
+  }
+
+  function scheduleRangeAtPointer(e) {
+    const rowRect = e.currentTarget.getBoundingClientRect();
+    return scheduleRange(dateAtTimelineX(e.clientX - rowRect.left));
+  }
+
+  function onSchedulePointerMove(e, item) {
+    if (e.pointerType === 'touch' || itemHasDate(item) || schedulingItemIds.has(item.id)) return;
+    schedulePreview = { itemId: item.id, ...scheduleRangeAtPointer(e) };
+  }
+
+  function onSchedulePointerLeave(itemId) {
+    if (schedulePreview?.itemId === itemId) schedulePreview = null;
+  }
+
+  async function scheduleItem(item, range) {
+    if (itemHasDate(item) || schedulingItemIds.has(item.id)) return;
 
     const updateData = {};
-    setDateUpdate(updateData, roadmapConfig.start_field_id, dropDate);
+    setDateUpdate(updateData, roadmapConfig.start_field_id, range.start);
 
-    // If end field is configured, default span = 7 days
-    if (roadmapConfig.end_field_id) {
-      const endDate = new Date(dropDate);
-      endDate.setDate(endDate.getDate() + 7);
-      setDateUpdate(updateData, roadmapConfig.end_field_id, endDate);
-    }
+    if (range.end) setDateUpdate(updateData, roadmapConfig.end_field_id, range.end);
 
     if (Object.keys(updateData).length > 0) {
+      schedulingItemIds = new Set(schedulingItemIds).add(item.id);
+      schedulePreview = null;
       try {
-        await api.items.update(itemId, updateData);
-        reloadCollection();
+        await persistRoadmapDateEdit(item.id, updateData);
+        await refreshCollectionItem(item.id);
       } catch (err) {
         console.error('Failed to schedule item:', err);
+        errorToast(err?.message || t('collections.roadmapDateUpdateError'));
+        reloadCollection();
+      } finally {
+        const nextSchedulingIds = new Set(schedulingItemIds);
+        nextSchedulingIds.delete(item.id);
+        schedulingItemIds = nextSchedulingIds;
       }
     }
+  }
+
+  function onScheduleClick(e, item) {
+    if (itemHasDate(item) || schedulingItemIds.has(item.id)) return;
+    if (e.detail !== 0) {
+      scheduleItem(item, schedulePreview?.itemId === item.id ? schedulePreview : scheduleRangeAtPointer(e));
+      return;
+    }
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    scheduleItem(item, scheduleRange(today));
   }
 
   // --- Scroll sync ---
@@ -881,10 +1125,18 @@
   }
 
   function syncTimelineScroll(e) {
+    timelineScrollLeft = e.target.scrollLeft;
     if (treeScrollContainer && treeScrollContainer.scrollTop !== e.target.scrollTop) {
       treeScrollContainer.scrollTop = e.target.scrollTop;
     }
   }
+
+  let isAwayFromToday = $derived(scrollOffset !== 0 || timelineScrollLeft > 0);
+
+  useResizeObserver(() => timelineScrollContainer, (entries) => {
+    const entry = entries[0];
+    if (entry) containerWidth = entry.contentRect.width;
+  });
 
   onMount(async () => {
     if (workspaceId) {
@@ -893,8 +1145,6 @@
     } else {
       await workspaceDataStore.initializeGlobal();
     }
-    // Keep this aligned with the collection store default page size.
-    await collectionStore.setItemsPage(1, 250);
     await Promise.all([loadConfig(), loadReferenceData()]);
     loading = false;
   });
@@ -914,26 +1164,27 @@
   <StaticViewBackground
     backgroundStyle={styles.backgroundStyle}
     contextVars={styles.contextVars}
-    class="h-screen flex flex-col overflow-hidden {isResizingPanel || scheduleDragInfo?.active ? 'roadmap-dragging' : ''}"
-    contentClass="p-6 flex-1 flex flex-col min-h-0"
-    rootStyle="overscroll-behavior: none;"
+    class="h-screen flex flex-col overflow-hidden {isResizingPanel ? 'roadmap-dragging' : ''}"
+    contentClass="p-6 flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden"
+    rootStyle="width: 100%; min-width: 0; max-width: 100%; overscroll-behavior: none;"
+    testid="roadmap-view"
   >
       <!-- Header -->
       <div class="relative z-50 mb-6">
         <ViewHeader
           workspaceName={workspace?.name || ''}
-          collection={currentCollectionName}
+          collection={currentCollectionName === 'Default' ? t('common.default') : currentCollectionName}
           viewName={t('collections.roadmap')}
-          itemCount={treeData.length}
+          itemCount={collectionStore.collectionTotal}
+          shownCount={collectionStore.loading ? null : treeData.length}
         >
           {#snippet actions()}
             <div class="relative flex rounded" style="background-color: var(--ctx-surface, var(--ds-background-neutral)); backdrop-filter: var(--ctx-backdrop, none);">
               <button
                 bind:this={settingsButton}
                 onclick={() => settingsOpen = !settingsOpen}
-                disabled={!canConfigure}
-                title={!canConfigure ? t('workspace.accessDeniedDescription') : ''}
-                class="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                data-testid="roadmap-settings-button"
+                class="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded transition-colors"
                 style="color: var(--ds-text); background-color: var(--ctx-surface, var(--ds-surface));"
               >
                 <Settings class="w-4 h-4" />
@@ -943,35 +1194,98 @@
                 <div
                   bind:this={settingsPanel}
                   class="absolute right-0 top-full mt-1 rounded-lg shadow-xl z-[60] p-4"
-                  style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border); min-width: 260px;"
-                  transition:fly={{ y: -4, duration: 150 }}
+                  style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border); min-width: 300px;"
+                  data-testid="roadmap-settings-panel"
                 >
                   <div class="flex flex-col gap-3">
                     <div>
                       <div class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('collections.roadmapStartField')}</div>
                       <Select
+                        id="roadmap-start-field"
                         value={roadmapConfig.start_field_id}
                         options={dateFieldOptions}
                         size="small"
+                        disabled={!canConfigure}
+                        portalOwner="roadmap-settings"
                         onchange={onStartFieldChange}
                       />
                     </div>
                     <div>
                       <div class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('collections.roadmapEndField')}</div>
                       <Select
+                        id="roadmap-end-field"
                         value={roadmapConfig.end_field_id}
                         options={[{ value: '', label: t('collections.roadmapNone') }, ...dateFieldOptions]}
                         size="small"
+                        disabled={!canConfigure}
+                        portalOwner="roadmap-settings"
                         onchange={onEndFieldChange}
                       />
                     </div>
                     <div>
                       <div class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('collections.roadmapDependencyLinkType')}</div>
                       <Select
+                        id="roadmap-dependency-link-type"
                         value={roadmapConfig.dependency_link_type_id ? String(roadmapConfig.dependency_link_type_id) : ''}
                         options={linkTypeOptions}
                         size="small"
+                        disabled={!canConfigure}
+                        portalOwner="roadmap-settings"
                         onchange={onLinkTypeChange}
+                      />
+                    </div>
+                    <div class="pt-3" style="border-top: 1px solid var(--ds-border);">
+                      <div class="block text-xs font-medium mb-2" style="color: var(--ds-text-subtle);">
+                        {t('collections.roadmapHierarchyMode')}
+                      </div>
+                      <div class="grid grid-cols-3 gap-1" role="group" aria-label={t('collections.roadmapHierarchyMode')}>
+                        {#each [
+                          ['off', t('collections.roadmapHierarchyOff')],
+                          ['rollup', t('collections.roadmapRollup')],
+                          ['rolldown', t('collections.roadmapRolldown')]
+                        ] as [mode, label]}
+                          <button
+                            type="button"
+                            data-testid="roadmap-hierarchy-{mode}"
+                            aria-pressed={hierarchyMode === mode}
+                            disabled={mode !== 'off' && !hierarchyFieldsReady}
+                            class="rounded px-2 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                            style={hierarchyMode === mode
+                              ? 'background-color: var(--ds-accent-blue-subtle); color: var(--ds-text-info); border: 1px solid var(--ds-border-focused);'
+                              : 'background-color: var(--ds-background-neutral); color: var(--ds-text-subtle); border: 1px solid transparent;'}
+                            onclick={() => setHierarchyMode(mode)}
+                          >
+                            {label}
+                          </button>
+                        {/each}
+                      </div>
+                      {#if !hierarchyFieldsReady}
+                        <p class="mt-2 text-xs leading-4" style="color: var(--ds-text-subtle);">
+                          {t('collections.roadmapHierarchyCanonicalHint')}
+                        </p>
+                      {:else if hierarchyDatesError}
+                        <p class="mt-2 text-xs leading-4" style="color: var(--ds-text-danger);" role="alert">
+                          {hierarchyDatesError}
+                        </p>
+                      {/if}
+                    </div>
+                    <div class="flex items-start justify-between gap-4">
+                      <div>
+                        <div class="text-sm" style="color: var(--ds-text);">
+                          {t('collections.roadmapAdjustRelatedDates')}
+                        </div>
+                        <p class="mt-0.5 text-xs leading-4" style="color: var(--ds-text-subtle);">
+                          {hierarchyMode === 'rolldown'
+                            ? t('collections.roadmapRolldownAdjustmentHint')
+                            : t('collections.roadmapRollupAdjustmentHint')}
+                        </p>
+                      </div>
+                      <Toggle
+                        bind:checked={adjustHierarchyDates}
+                        size="small"
+                        id="roadmap-adjust-related-dates"
+                        dataTestid="roadmap-adjust-related-dates"
+                        disabled={hierarchyMode === 'off' || hierarchyDatesLoading || Boolean(hierarchyDatesError)}
                       />
                     </div>
                   </div>
@@ -994,6 +1308,7 @@
           <div class="flex rounded overflow-hidden" style="border: 1px solid var(--ctx-border, var(--ds-border)); background-color: var(--ctx-surface, var(--ds-surface));">
             {#each [['week', t('collections.roadmapZoomWeek')], ['month', t('collections.roadmapZoomMonth')], ['quarter', t('collections.roadmapZoomQuarter')]] as [z, label]}
               <button
+                data-testid="roadmap-zoom-{z}"
                 class="px-3 py-1.5 text-xs font-medium transition-colors"
                 style={zoom === z ? 'background-color: var(--ds-accent-blue-subtle); color: var(--ds-text-info);' : `color: var(--ds-text-subtle);`}
                 onclick={() => zoom = z}
@@ -1005,6 +1320,7 @@
 
           <!-- Navigation -->
           <button
+            data-testid="roadmap-scroll-left"
             class="p-1.5 rounded transition-colors"
             style="color: var(--ctx-text-subtle, var(--ds-text-subtle));"
             onclick={scrollLeft}
@@ -1019,6 +1335,7 @@
             {t('collections.roadmapToday')}
           </button>
           <button
+            data-testid="roadmap-scroll-right"
             class="p-1.5 rounded transition-colors"
             style="color: var(--ctx-text-subtle, var(--ds-text-subtle));"
             onclick={scrollRight}
@@ -1027,7 +1344,34 @@
           </button>
         </div>
 
+        <div class="flex items-center justify-end">
+          {#if isAwayFromToday}
+            <button
+              data-testid="roadmap-return-today"
+              class="inline-flex items-center gap-1.5 rounded px-2 py-1.5 text-xs font-medium transition-colors"
+              style="color: var(--ds-text-subtle); border: 1px solid var(--ds-border-subtle, var(--ds-border)); background-color: transparent;"
+              title={t('collections.roadmapToday')}
+              aria-label={t('collections.roadmapToday')}
+              onclick={goToToday}
+            >
+              <RotateCcw class="h-3.5 w-3.5" />
+              {t('collections.roadmapToday')}
+            </button>
+          {/if}
+        </div>
+
       </div>
+
+      {#if roadmapConfig.start_field_id && unscheduledItemCount > 0}
+        <div
+          class="mb-4 flex items-center gap-2 rounded-md px-3 py-2 text-xs"
+          style="background-color: var(--ds-background-neutral-hovered); color: var(--ctx-text, var(--ds-text));"
+          data-testid="roadmap-unscheduled-hint"
+        >
+          <CalendarClock class="h-4 w-4 shrink-0" />
+          <span>{t('collections.roadmapUnscheduledHint', { count: unscheduledItemCount })}</span>
+        </div>
+      {/if}
 
 
       <!-- No config state -->
@@ -1038,8 +1382,6 @@
             class="mt-3 px-4 py-2 text-sm font-medium rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             style="background-color: var(--ds-accent-blue-subtle); color: var(--ds-text-info);"
             onclick={() => settingsOpen = true}
-            disabled={!canConfigure}
-            title={!canConfigure ? t('workspace.accessDeniedDescription') : ''}
           >
             {t('collections.roadmapSettings')}
           </button>
@@ -1047,7 +1389,7 @@
       {:else}
         <!-- Split layout: Tree Panel + Resize Handle + Timeline -->
         <div
-          class="rounded-lg overflow-hidden flex flex-1 min-h-0"
+          class="rounded-lg overflow-hidden flex flex-1 min-h-0 min-w-0 w-full"
           style="border: 1px solid var(--ctx-border, var(--ds-border)); background-color: var(--ctx-surface, var(--ds-surface)); backdrop-filter: var(--ctx-backdrop, none);"
         >
           <!-- Left: Tree Panel -->
@@ -1061,7 +1403,7 @@
               style="height: 29px; border-bottom: 1px solid var(--ds-border);"
             >
               <span class="text-xs font-medium" style="color: var(--ds-text-subtle);">
-                Items ({treeData.length})
+                {t('collections.roadmapItems', { count: treeData.length })}
               </span>
             </div>
             <!-- Tree header row 2 (column labels height) -->
@@ -1078,12 +1420,11 @@
               {#each treeData as item (item.id)}
                 {@const typeInfo = getItemTypeInfo(item)}
                 {@const scheduled = itemHasDate(item)}
-                {@const TypeIcon = typeInfo.icon}
                 <button
+                  data-testid="roadmap-item-{item.id}"
                   class="flex items-center gap-1.5 w-full text-left group/tree-row"
                   style="height: {ROW_HEIGHT}px; padding-left: calc(8px + {getIndentLevel(item.treeLevel)}); padding-right: 8px; border-bottom: 1px solid var(--ds-border-subtle, var(--ds-border));"
                   onclick={() => openItem(item.id)}
-                  onpointerdown={(e) => onTreeItemDragStart(e, item)}
                 >
                   <LazyRender height={ROW_HEIGHT} class="flex items-center gap-1.5 w-full">
                     {#snippet children()}
@@ -1092,6 +1433,7 @@
                         <span
                           class="shrink-0 flex items-center justify-center w-4 h-4 rounded transition-colors"
                           style="color: var(--ds-text-subtle);"
+                          data-testid="roadmap-toggle-{item.id}"
                           role="button"
                           tabindex="-1"
                           onclick={(e) => { e.stopPropagation(); toggleExpanded(item.id); }}
@@ -1108,13 +1450,15 @@
                       {/if}
 
                       <!-- Type icon -->
-                      <span class="shrink-0 flex items-center justify-center w-4 h-4" style="color: {typeInfo.color};">
-                        <TypeIcon class="w-3.5 h-3.5" />
-                      </span>
+                      <ItemTypeIcon
+                        icon={typeInfo.iconName}
+                        color={typeInfo.color}
+                        title={typeInfo.label}
+                      />
 
                       <!-- Item key -->
                       {#if item.item_key}
-                        <span class="text-xs shrink-0" style="color: var(--ds-text-subtle);">{item.item_key}</span>
+                        <ItemKey itemKey={item.item_key} />
                       {/if}
 
                       <!-- Title -->
@@ -1145,10 +1489,11 @@
             <div
               class="flex-1 overflow-x-auto overflow-y-auto timeline-scroll"
               style="touch-action: pan-x pan-y;"
+              data-testid="roadmap-timeline-scroll"
               bind:this={timelineScrollContainer}
               onscroll={syncTimelineScroll}
             >
-              <div style="min-width: {totalWidth}px;">
+              <div data-testid="roadmap-timeline-content" style="min-width: {totalWidth}px;">
                 <!-- Header row: month/quarter groups -->
                 <div class="relative sticky top-0 z-30" style="height: 29px; border-bottom: 1px solid var(--ctx-border, var(--ds-border)); background-color: var(--ctx-surface, var(--ds-surface));">
                   {#each monthGroups as group}
@@ -1207,6 +1552,18 @@
                             ></div>
                           {/if}
 
+                          {#if !roadmapItem}
+                            <button
+                              type="button"
+                              data-testid="roadmap-schedule-row-{item.id}"
+                              class="absolute inset-0 w-full roadmap-schedule-row"
+                              aria-label={t('collections.roadmapScheduleItem', { title: item.title })}
+                              onpointermove={(e) => onSchedulePointerMove(e, item)}
+                              onpointerleave={() => onSchedulePointerLeave(item.id)}
+                              onclick={(e) => onScheduleClick(e, item)}
+                            ></button>
+                          {/if}
+
                           <!-- Bar / milestone (only if item is scheduled) -->
                           {#if roadmapItem}
                             {@const offset = getDragOffset(roadmapItem)}
@@ -1218,29 +1575,74 @@
 
                             {#if roadmapItem.isMilestone && !roadmapConfig.end_field_id}
                               <!-- Diamond milestone (no end field configured, can't expand) -->
-                              <div
-                                class="absolute flex items-center justify-center"
-                                style="left: {barLeftPx + barWidthPx / 2 - 8}px; top: {(ROW_HEIGHT - 16) / 2}px; width: 16px; height: 16px; transform: rotate(45deg); background-color: {visibleColor}; border-radius: 2px; z-index: 10; cursor: grab;"
-                                role="button"
-                                tabindex="0"
+                              <RoadmapItemPreview
+                                item={roadmapItem}
+                                workspace={workspace}
+                                itemTypes={itemTypes}
+                                cardFields={roadmapCardFields}
+                                priorities={workspaceDataStore.priorities}
+                                statuses={statuses}
+                                iterations={workspaceDataStore.iterations}
+                                projects={workspaceDataStore.projects}
+                                labels={workspaceDataStore.labels}
+                                customFieldDefinitions={customFields}
+                                users={workspaceDataStore.users}
                                 onpointerdown={(e) => onBarPointerDown(e, roadmapItem, 'move')}
-                              ></div>
+                                onopen={openItem}
+                              >
+                                {#snippet children()}
+                                  <div
+                                    data-testid="roadmap-bar-{item.id}"
+                                    data-start-date={roadmapItem.startDate || ''}
+                                    data-end-date={roadmapItem.endDate || ''}
+                                    data-hierarchy-summary={roadmapItem.isSummary ? 'true' : 'false'}
+                                    data-hierarchy-adjusted={roadmapItem.hierarchyAdjusted ? 'true' : 'false'}
+                                    class="absolute flex items-center justify-center"
+                                    style="left: {barLeftPx + barWidthPx / 2 - 8}px; top: {(ROW_HEIGHT - 16) / 2}px; width: 16px; height: 16px; transform: rotate(45deg); background-color: {visibleColor}; border-radius: 2px; z-index: 10; cursor: {roadmapItem.isSummary ? 'default' : 'grab'};"
+                                    role="button"
+                                    tabindex="0"
+                                  ></div>
+                                {/snippet}
+                              </RoadmapItemPreview>
                             {:else}
                               <!-- Range bar OR expandable milestone (thin bar with resize handles) -->
-                              <div
-                                class="absolute flex items-center rounded group/bar"
-                                style="left: {barLeftPx}px; width: {barWidthPx}px; top: {(ROW_HEIGHT - 24) / 2}px; height: 24px; background-color: {visibleColor}; opacity: 0.85; z-index: 10; cursor: grab;"
-                                role="button"
-                                tabindex="0"
+                              <RoadmapItemPreview
+                                item={roadmapItem}
+                                workspace={workspace}
+                                itemTypes={itemTypes}
+                                cardFields={roadmapCardFields}
+                                priorities={workspaceDataStore.priorities}
+                                statuses={statuses}
+                                iterations={workspaceDataStore.iterations}
+                                projects={workspaceDataStore.projects}
+                                labels={workspaceDataStore.labels}
+                                customFieldDefinitions={customFields}
+                                users={workspaceDataStore.users}
                                 onpointerdown={(e) => onBarPointerDown(e, roadmapItem, 'move')}
+                                onopen={openItem}
                               >
-                                <div
-                                  class="absolute left-0 top-0 bottom-0 w-2 cursor-col-resize opacity-0 group-hover/bar:opacity-100 rounded-l"
-                                  style="background-color: rgba(0,0,0,0.2);"
-                                  role="separator"
-                                  tabindex="-1"
-                                  onpointerdown={(e) => { e.stopPropagation(); onBarPointerDown(e, roadmapItem, 'resize-left'); }}
-                                ></div>
+                                {#snippet children()}
+                                  <div
+                                    data-testid="roadmap-bar-{item.id}"
+                                    data-start-date={roadmapItem.startDate || ''}
+                                    data-end-date={roadmapItem.endDate || ''}
+                                    data-hierarchy-summary={roadmapItem.isSummary ? 'true' : 'false'}
+                                    data-hierarchy-adjusted={roadmapItem.hierarchyAdjusted ? 'true' : 'false'}
+                                    class="absolute flex items-center rounded group/bar"
+                                    style="left: {barLeftPx}px; width: {barWidthPx}px; top: {(ROW_HEIGHT - 24) / 2}px; height: 24px; background-color: {visibleColor}; opacity: {roadmapItem.isSummary ? '0.65' : '0.85'}; z-index: 10; cursor: {roadmapItem.isSummary ? 'default' : 'grab'}; border: {roadmapItem.isSummary ? '1px dashed currentColor' : 'none'};"
+                                    role="button"
+                                    tabindex="0"
+                                  >
+                                {#if !roadmapItem.isSummary}
+                                  <div
+                                    data-testid="roadmap-resize-left-{item.id}"
+                                    class="absolute left-0 top-0 bottom-0 w-2 cursor-col-resize opacity-0 group-hover/bar:opacity-100 rounded-l"
+                                    style="background-color: rgba(0,0,0,0.2);"
+                                    role="separator"
+                                    tabindex="-1"
+                                    onpointerdown={(e) => { e.stopPropagation(); onBarPointerDown(e, roadmapItem, 'resize-left'); }}
+                                  ></div>
+                                {/if}
 
                                 <span class="text-xs font-medium px-2 truncate" style="color: white; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">
                                   {#if barWidthPx > 60}
@@ -1248,15 +1650,33 @@
                                   {/if}
                                 </span>
 
-                                <div
-                                  class="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize opacity-0 group-hover/bar:opacity-100 rounded-r"
-                                  style="background-color: rgba(0,0,0,0.2);"
-                                  role="separator"
-                                  tabindex="-1"
-                                  onpointerdown={(e) => { e.stopPropagation(); onBarPointerDown(e, roadmapItem, 'resize-right'); }}
-                                ></div>
-                              </div>
+                                {#if !roadmapItem.isSummary}
+                                  <div
+                                    data-testid="roadmap-resize-right-{item.id}"
+                                    class="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize opacity-0 group-hover/bar:opacity-100 rounded-r"
+                                    style="background-color: rgba(0,0,0,0.2);"
+                                    role="separator"
+                                    tabindex="-1"
+                                    onpointerdown={(e) => { e.stopPropagation(); onBarPointerDown(e, roadmapItem, 'resize-right'); }}
+                                  ></div>
+                                {/if}
+                                  </div>
+                                {/snippet}
+                              </RoadmapItemPreview>
                             {/if}
+                          {:else if schedulePreview?.itemId === item.id}
+                            {@const previewColor = getVisibleColor(statuses.find(s => s.id === item.status_id)?.color || '#6b7280')}
+                            {@const previewStart = schedulePreview.start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                            {@const previewEnd = schedulePreview.end?.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                            <div
+                              data-testid="roadmap-schedule-preview-{item.id}"
+                              data-start-date={formatDateValue(schedulePreview.start)}
+                              data-end-date={schedulePreview.end ? formatDateValue(schedulePreview.end) : ''}
+                              class="absolute rounded schedule-preview"
+                              style="left: {schedulePreview.leftPx}px; width: {schedulePreview.widthPx}px; top: {(ROW_HEIGHT - 24) / 2}px; height: 24px; border-color: {previewColor}; background-color: color-mix(in srgb, {previewColor} 22%, transparent);"
+                              aria-label={previewEnd ? `${previewStart} – ${previewEnd}` : previewStart}
+                              title={previewEnd ? `${previewStart} – ${previewEnd}` : previewStart}
+                            ></div>
                           {/if}
                         {/snippet}
                       </LazyRender>
@@ -1301,29 +1721,6 @@
   </StaticViewBackground>
 {/if}
 
-<!-- Drag-to-schedule ghost -->
-{#if scheduleDragInfo?.active}
-  <div
-    class="fixed pointer-events-none z-50 px-3 py-1.5 rounded shadow-lg text-xs font-medium truncate max-w-[200px]"
-    style="left: {scheduleDragInfo.currentX + 12}px; top: {scheduleDragInfo.currentY - 8}px; background-color: var(--ds-accent-blue); color: white;"
-  >
-    {scheduleDragInfo.itemTitle}
-  </div>
-{/if}
-
-<!-- Item Detail Modal -->
-{#if showItemModal && selectedItemId}
-  <ItemDetail
-    itemId={selectedItemId}
-    isModal={true}
-    onclose={() => {
-      const id = selectedItemId;
-      showItemModal = false;
-      selectedItemId = null;
-      refreshCollectionItem(id);
-    }}
-  />
-{/if}
 
 <style>
   /* Custom scrollbar for timeline */
@@ -1355,6 +1752,27 @@
   .resize-handle:active {
     background-color: var(--ds-accent-blue) !important;
     opacity: 0.5;
+  }
+
+  .roadmap-schedule-row {
+    cursor: crosshair;
+    z-index: 1;
+    border: 0;
+    background: transparent;
+  }
+
+  .roadmap-schedule-row:focus-visible {
+    outline: 2px solid var(--ds-accent-blue);
+    outline-offset: -2px;
+  }
+
+  .schedule-preview {
+    z-index: 9;
+    pointer-events: none;
+    border-width: 1px;
+    border-style: dashed;
+    opacity: 0.9;
+    transition: left 80ms ease-out;
   }
 
   /* Disable text selection during drag/resize */

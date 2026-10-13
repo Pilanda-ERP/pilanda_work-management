@@ -6,21 +6,27 @@
   import { IconTrash, IconPlayerPlay, IconEye } from '@tabler/icons-svelte-runes';
   import { escapeHtml } from '../../utils/sanitize.ts';
   import Button from '../../components/Button.svelte';
-  import PageHeader from '../../layout/PageHeader.svelte';
   import Input from '../../components/Input.svelte';
   import Select from '../../components/Select.svelte';
   import { confirm } from '../../composables/useConfirm.js';
-  import MilestoneCombobox from '../../pickers/MilestoneCombobox.svelte';
   import DataTable from '../../components/DataTable.svelte';
   import Modal from '../../dialogs/Modal.svelte';
-  import Label from '../../components/Label.svelte';
+  import ModalHeader from '../../dialogs/ModalHeader.svelte';
+  import DialogFooter from '../../dialogs/DialogFooter.svelte';
+  import FormField from '../../components/FormField.svelte';
   import UserPicker from '../../pickers/UserPicker.svelte';
-  import { renderStatusBadge } from '../../utils/statusColors.js';
+  import Lozenge from '../../components/Lozenge.svelte';
+  import { getStatusLabel, getTestStatusColor } from '../../utils/statusColors.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { workspacePermissions } from '../../stores/index.js';
   import { errorToast, warningToast } from '../../stores/toasts.svelte.js';
-  import { useEventListener } from 'runed';
+  import { formatAuthenticatedDateTime } from '../../utils/authenticatedDateFormatter.js';
+  import TestManagementHeader from './TestManagementHeader.svelte';
 
   let { workspaceId = null } = $props();
+
+  // Run creation belongs to the test.execute tier (denied with 404 otherwise).
+  let canExecuteTests = $derived(workspacePermissions.canExecuteTests(workspaceId));
 
   const testSets = writable([]);
   const testRuns = writable([]);
@@ -38,34 +44,23 @@
 
   onMount(async () => {
     await loadData();
-
-    // Check for URL parameters
-    const urlParams = new URLSearchParams(window.location.search);
-    const milestoneParam = urlParams.get('milestone');
-    if (milestoneParam) {
-      selectedMilestoneFilter = parseInt(milestoneParam);
-    }
   });
-
-  useEventListener(() => document, 'keydown', (e) => {
-    if ((/** @type {HTMLElement} */ (e.target)).tagName === 'INPUT' || (/** @type {HTMLElement} */ (e.target)).tagName === 'TEXTAREA' || (/** @type {HTMLElement} */ (e.target)).tagName === 'SELECT') return;
-    if (e.key === 'a' || e.key === 'A') { e.preventDefault(); showAddForm(); }
-  });
-  useEventListener(() => window, 'trigger-test-run-form', () => showAddForm());
 
   async function loadData() {
     try {
       // Build query params for assignee filter
       const params = {};
-      if (selectedAssigneeFilter) {
+      if (selectedAssigneeFilter === 'unassigned') {
+        params.unassigned = true;
+      } else if (selectedAssigneeFilter) {
         params.assignee_id = selectedAssigneeFilter;
       }
 
       const [sets, runs, milestonesData, usersData] = await Promise.all([
-        api.tests.testSets.getAll(workspaceId),
-        api.tests.testRuns.getAll(workspaceId, params),
-        api.milestones.getAll(),
-        api.getUsers()
+        api.tests.testPlans.getAll(workspaceId, { page_size: 200 }),
+        api.tests.testRuns.getAll(workspaceId, { ...params, page_size: 200 }),
+        api.milestones.getAll({ workspace_id: workspaceId }),
+        api.getAssignableUsers(workspaceId)
       ]);
       const safeSets = sets || [];
       const safeRuns = runs || [];
@@ -80,6 +75,7 @@
   }
 
   function showAddForm() {
+    if (!canExecuteTests) return;
     showForm = true;
     selectedSetId = '';
     runName = '';
@@ -99,7 +95,7 @@
 
     try {
       await api.tests.testRuns.create(workspaceId, {
-        set_id: parseInt(selectedSetId),
+        plan_id: parseInt(selectedSetId),
         name: runName,
         assignee_id: selectedAssigneeId || null
       });
@@ -115,10 +111,7 @@
   async function handleAssigneeFilterChange(event) {
     selectedAssigneeFilter = event.currentTarget.value;
     await loadData();
-    updateURL();
   }
-
-  // Status rendering now handled by imported utility (renderStatusBadge)
 
   function viewRunDetails(run) {
     navigate(testPath(`/runs/${run.id}?from=runs`));
@@ -182,22 +175,14 @@
     {
       key: 'started_at',
       label: t('testing.started'),
-      render: (run) => run.started_at ? new Date(run.started_at).toLocaleString() : '-'
+      render: (run) => run.started_at ? formatAuthenticatedDateTime(run.started_at) : '-'
     },
     {
       key: 'ended_at',
       label: t('testing.ended'),
-      render: (run) => run.ended_at ? new Date(run.ended_at).toLocaleString() : '-'
+      render: (run) => run.ended_at ? formatAuthenticatedDateTime(run.ended_at) : '-'
     },
-    {
-      key: 'status',
-      label: t('common.status'),
-      html: true,
-      render: (run) => {
-        const status = run.ended_at ? 'completed' : 'in_progress';
-        return renderStatusBadge(status);
-      }
-    },
+    { key: 'status', label: t('common.status'), width: 'w-32', slot: 'statusCell' },
     { key: 'actions', label: t('common.actions'), width: 'w-16', align: 'text-right' }
   ]);
 
@@ -225,6 +210,7 @@
     if (!run.ended_at) {
       items.push({
         id: 'continue',
+        testid: `test-run-continue-${run.id}`,
         type: 'regular',
         icon: IconPlayerPlay,
         title: t('testing.continueExecution'),
@@ -236,6 +222,7 @@
     // Add "View" option
     items.push({
       id: 'view',
+      testid: `test-run-view-${run.id}`,
       type: 'regular',
       icon: IconEye,
       title: run.ended_at ? t('testing.viewResults') : t('testing.viewDetails'),
@@ -261,54 +248,38 @@
     const filteredSetIds = new Set(filteredTestSets.map(s => s.id));
 
     return $testRuns
-      .filter(run => !selectedMilestoneFilter || filteredSetIds.has(run.set_id))
+      .filter(run => !selectedMilestoneFilter || filteredSetIds.has(run.plan_id))
       .map(run => {
-        const set = $testSets.find(s => s.id === run.set_id);
+        const set = $testSets.find(s => s.id === run.plan_id);
         const milestone = set ? $milestones.find(m => m.id === set.milestone_id) : null;
         return {
           ...run,
           testSetName: set?.name || 'Unknown',
-          testSetId: run.set_id,
+          testSetId: run.plan_id,
           milestoneName: milestone?.name || 'No milestone',
           milestoneId: set?.milestone_id
         };
       });
   });
 
-  // Handle milestone selection and update URL
-  function handleMilestoneSelect(result) {
-    selectedMilestoneFilter = result.value;
-    updateURL();
-  }
-
-  function updateURL() {
-    const url = new URL(window.location.href);
-    if (selectedMilestoneFilter) {
-      url.searchParams.set('milestone', selectedMilestoneFilter.toString());
-    } else {
-      url.searchParams.delete('milestone');
-    }
-    window.history.replaceState({}, '', url);
-  }
 </script>
 
-<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface-raised);">
-  <PageHeader
+<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface);">
+  <TestManagementHeader
+    {workspaceId}
     title={t('testing.testRuns')}
     subtitle={t('testing.testRunsSubtitle')}
+    bind:milestoneFilter={selectedMilestoneFilter}
+    oncreate={showAddForm}
+    createEvent="trigger-test-run-form"
   >
-    {#snippet actions()}
-      <div class="flex items-center gap-3">
-        <div class="w-40">
-          <Select value={selectedAssigneeFilter} onchange={handleAssigneeFilterChange} options={[{ value: '', label: t('common.allAssignees') }, { value: 'unassigned', label: t('common.unassigned') }, ...$users.map(user => ({ value: user.id, label: `${user.first_name} ${user.last_name}` }))]} />
-        </div>
-        <div class="w-48">
-          <MilestoneCombobox
-            bind:value={selectedMilestoneFilter}
-            placeholder={t('milestones.allMilestones')}
-            onSelect={handleMilestoneSelect}
-          />
-        </div>
+    {#snippet leadingActions()}
+      <div class="w-40">
+        <Select value={selectedAssigneeFilter} onchange={handleAssigneeFilterChange} options={[{ value: '', label: t('common.allAssignees') }, { value: 'unassigned', label: t('common.unassigned') }, ...$users.map(user => ({ value: user.id, label: `${user.first_name} ${user.last_name}` }))]} />
+      </div>
+    {/snippet}
+    {#snippet primaryAction()}
+      {#if canExecuteTests}
         <Button
           onclick={showAddForm}
           variant="primary"
@@ -318,9 +289,9 @@
         >
           {t('testing.createTestRun')}
         </Button>
-      </div>
+      {/if}
     {/snippet}
-  </PageHeader>
+  </TestManagementHeader>
 
   {#if showForm}
     <Modal
@@ -329,72 +300,62 @@
       onSubmit={createRun}
       submitDisabled={!selectedSetId || !runName}
     >
-      <div class="p-6 space-y-6">
-        <div class="flex items-start justify-between">
-          <div>
-            <h3 class="text-xl font-semibold" style="color: var(--ds-text);">{t('testing.createTestRun')}</h3>
-            <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">{t('testing.createTestRunSubtitle')}</p>
-          </div>
-        </div>
-
+      <ModalHeader
+        title={t('testing.createTestRun')}
+        subtitle={t('testing.createTestRunSubtitle')}
+        showCloseButton={false}
+      />
+      <div class="p-6 pb-2">
         <div class="space-y-4">
-          <div>
-            <Label for="set-select" color="default" class="mb-2">{t('testing.selectTestPlan')}</Label>
+          <FormField id="set-select" label={t('testing.selectTestPlan')}>
             <Select id="set-select" bind:value={selectedSetId} options={[{ value: '', label: t('testing.selectTestPlanPlaceholder') }, ...filteredTestSets.map(set => ({ value: set.id, label: set.name }))]} />
-          </div>
-          <div>
-            <Label for="run-name" color="default" class="mb-2">{t('testing.runName')}</Label>
+          </FormField>
+          <FormField id="run-name" label={t('testing.runName')}>
             <Input
               id="run-name"
               bind:value={runName}
               placeholder={t('testing.runNamePlaceholder')}
             />
-          </div>
-          <div>
-            <Label color="default" class="mb-2">{t('common.assignTo')}</Label>
+          </FormField>
+          <FormField label={t('common.assignTo')}>
             <UserPicker
               bind:value={selectedAssigneeId}
               {workspaceId}
               showUnassigned={true}
               placeholder={t('testing.selectAssigneeOptional')}
             />
-          </div>
-        </div>
-
-        <div class="flex gap-3 justify-end pt-2">
-          <Button
-            type="button"
-            variant="outline"
-            onclick={() => showForm = false}
-            keyboardHint="Esc"
-          >
-            {t('common.cancel')}
-          </Button>
-          <Button
-            onclick={createRun}
-            variant="primary"
-            disabled={!selectedSetId || !runName}
-            keyboardHint="↵"
-            dataTestid="create-run-submit"
-          >
-            {t('testing.createRun')}
-          </Button>
+          </FormField>
         </div>
       </div>
+      <DialogFooter
+        cancelLabel={t('common.cancel')}
+        confirmLabel={t('testing.createRun')}
+        onCancel={() => showForm = false}
+        onConfirm={createRun}
+        disabled={!selectedSetId || !runName}
+        showKeyboardHint={true}
+        confirmTestid="create-run-submit"
+      />
     </Modal>
   {/if}
 
   <!-- Content wrapper -->
-  <div class="flex-1 -mx-6 -mb-6 px-10 py-6">
+  <div class="flex-1">
     <DataTable
       columns={runColumns}
       data={allTestRuns}
       keyField="id"
       actionItems={buildRunDropdownItems}
+      actionTriggerTestid={(run) => `test-run-actions-${run.id}`}
+      rowAttrs={(run) => ({ 'data-testid': `test-run-row-${run.id}` })}
       emptyMessage={t('testing.noTestRunsYet')}
       emptyDescription={t('testing.createTestRunToExecute')}
       emptyIcon={IconPlayerPlay}
-    />
+    >
+      {#snippet statusCell(run)}
+        {@const status = run.ended_at ? 'completed' : 'in_progress'}
+        <Lozenge color={getTestStatusColor(status)} text={getStatusLabel(status)} />
+      {/snippet}
+    </DataTable>
   </div>
 </div>
-

@@ -1,10 +1,14 @@
 <script>
   import { onMount } from 'svelte';
-  import { onClickOutside } from 'runed';
   import { ChevronDown, X } from '@lucide/svelte';
-  import SearchInput from '../components/SearchInput.svelte';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
+  import BasePicker from './BasePicker.svelte';
+  import { controlSizeClasses } from '../utils/controlSizes.js';
+  import {
+    completionFieldToFilterField,
+    findQlCompletionField,
+  } from '../utils/qlCompletion.js';
 
   let {
     placeholder = '',
@@ -12,16 +16,16 @@
     disabled = false,
     fieldGroups = null,
     customFieldItems = null,
+    excludedFieldIds = [],
+    includeAggregates = false,
     onSelect = () => {},
     onClear = () => {}
   } = $props();
 
   const resolvedPlaceholder = $derived(placeholder || t('pickers.selectField'));
 
-  let isOpen = $state(false);
-  let searchQuery = $state('');
   let customFields = $state([]);
-  let dropdownElement = $state();
+  let completionCatalog = $state(null);
 
   // Helper to get field translation (handles both object and string formats)
   function getFieldTranslation(fieldKey) {
@@ -34,7 +38,7 @@
   }
 
   // Standard fields grouped by category
-  const standardFields = $derived(fieldGroups || [
+  const standardFields = $derived((fieldGroups || [
     {
       category: t('pickers.fieldCategories.basic'),
       fields: [
@@ -68,33 +72,39 @@
         { id: 'labels', name: getFieldTranslation('labels').name, type: 'enum', description: getFieldTranslation('labels').description }
       ]
     },
-  ]);
+    ...(includeAggregates
+      ? [
+          {
+            category: t('pickers.fieldCategories.automation'),
+            fields: [
+              { id: 'open_child_count', name: getFieldTranslation('openChildCount').name, type: 'number', description: getFieldTranslation('openChildCount').description },
+              { id: 'open_descendant_count', name: getFieldTranslation('openDescendantCount').name, type: 'number', description: getFieldTranslation('openDescendantCount').description }
+            ]
+          }
+        ]
+      : []),
+  ]).map((group) => ({
+    ...group,
+    fields: group.fields.map((field) => ({
+      ...field,
+      completion: findQlCompletionField(completionCatalog, field),
+    })),
+  })));
 
-  // Filtered fields derived from search query
-  const filteredFields = $derived.by(() => {
-    const query = searchQuery.toLowerCase();
-
-    const filteredStandard = standardFields.map(group => ({
-      category: group.category,
-      fields: group.fields.filter(field =>
-        (field.name || '').toLowerCase().includes(query) ||
-        (field.description || '').toLowerCase().includes(query)
-      )
-    })).filter(group => group.fields.length > 0);
-
-    const filteredCustom = customFields.filter(field =>
-      (field.name || '').toLowerCase().includes(query) ||
-      (field.description || '').toLowerCase().includes(query)
-    );
-
-    if (filteredCustom.length > 0) {
-      return [...filteredStandard, {
-        category: t('pickers.customFields'),
-        fields: filteredCustom
-      }];
+  // Flatten the grouped catalog for BasePicker, tagging each field with the
+  // category header it renders under.
+  const fieldItems = $derived.by(() => {
+    const items = [];
+    for (const group of standardFields) {
+      for (const field of group.fields) {
+        if (!excludedFieldIds.includes(field.id)) items.push({ ...field, group: group.category });
+      }
     }
-
-    return filteredStandard;
+    const customGroup = t('pickers.customFields');
+    for (const field of customFields) {
+      if (!excludedFieldIds.includes(field.id)) items.push({ ...field, group: customGroup });
+    }
+    return items;
   });
 
   onMount(async () => {
@@ -107,58 +117,24 @@
       return;
     }
     try {
-      const result = await api.customFields.getAll();
-      customFields = (result?.data || []).map(field => ({
-        id: `cf_${field.name}`,
-        customFieldId: field.id,
-        name: field.name,
-        type: field.field_type,
-        description: field.description || t('pickers.customFieldDesc', { name: field.name }),
-        isCustom: true,
-        options: field.options ? JSON.parse(field.options) : null
-      }));
+      completionCatalog = await api.queryLanguage.getCatalog();
+      customFields = (completionCatalog?.fields || [])
+        .filter((field) => /^cfid_\d+$/i.test(field.name))
+        .map(completionFieldToFilterField);
     } catch (error) {
-      console.error('Failed to load custom fields:', error);
+      console.error('Failed to load query-language fields:', error);
       customFields = [];
     }
   }
 
-  function selectField(field) {
+  function handleSelect(field) {
     selectedField = field;
-    isOpen = false;
-    searchQuery = '';
     onSelect(field);
   }
 
   function clearSelection() {
     selectedField = null;
     onClear();
-  }
-
-  function toggleDropdown() {
-    if (!disabled) {
-      isOpen = !isOpen;
-      if (isOpen) {
-        setTimeout(() => {
-          const searchInput = dropdownElement?.querySelector('input[type="text"]');
-          searchInput?.focus();
-        }, 10);
-      }
-    }
-  }
-
-  onClickOutside(
-    () => dropdownElement,
-    () => {
-      if (isOpen) {
-        isOpen = false;
-        searchQuery = '';
-      }
-    }
-  );
-
-  function handleSearchInput(event) {
-    searchQuery = event.target.value;
   }
 
   function getFieldTypeLabel(type) {
@@ -171,6 +147,7 @@
       user: t('pickers.fieldTypes.user'),
       reference: t('pickers.fieldTypes.reference'),
       select: t('pickers.fieldTypes.select'),
+      multiselect: t('pickers.fieldTypes.select'),
       textarea: t('pickers.fieldTypes.textArea'),
       identifier: t('pickers.fieldTypes.identifier')
     };
@@ -179,128 +156,98 @@
 
   function getFieldTypeColor(type) {
     const colors = {
-      text: 'bg-blue-100 text-blue-800',
-      number: 'bg-green-100 text-green-800',
-      date: 'bg-purple-100 text-purple-800',
-      enum: 'bg-orange-100 text-orange-800',
-      boolean: 'bg-neutral-100 dark:bg-neutral-700 text-neutral-800 dark:text-neutral-200',
-      user: 'bg-indigo-100 text-indigo-800',
-      reference: 'bg-pink-100 text-pink-800',
-      select: 'bg-orange-100 text-orange-800',
-      textarea: 'bg-blue-100 text-blue-800'
+      text: 'bg-ds-accent-blue-subtle text-ds-text-accent-blue',
+      number: 'bg-ds-accent-green-subtle text-ds-text-accent-green',
+      date: 'bg-ds-accent-purple-subtle text-ds-text-accent-purple',
+      enum: 'bg-ds-accent-orange-subtle text-ds-text-accent-orange',
+      boolean: 'bg-ds-background-neutral text-ds-text-subtle',
+      user: 'bg-ds-accent-teal-subtle text-ds-text-accent-teal',
+      reference: 'bg-ds-accent-red-subtle text-ds-text-accent-red',
+      select: 'bg-ds-accent-orange-subtle text-ds-text-accent-orange',
+      multiselect: 'bg-ds-accent-orange-subtle text-ds-text-accent-orange',
+      textarea: 'bg-ds-accent-blue-subtle text-ds-text-accent-blue'
     };
-    return colors[type] || 'bg-neutral-100 dark:bg-neutral-700 text-neutral-800 dark:text-neutral-200';
+    return colors[type] || 'bg-ds-background-neutral text-ds-text-subtle';
   }
 </script>
 
-<div class="relative w-full" bind:this={dropdownElement}>
-  <!-- Selected Field Display / Trigger Button -->
-  <div
-    role="button"
-    data-testid="field-selector-trigger"
-    tabindex={disabled ? -1 : 0}
-    aria-disabled={disabled}
-    onclick={() => { if (!disabled) toggleDropdown(); }}
-    onkeydown={(e) => { if (!disabled && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggleDropdown(); } }}
-    class="w-full flex items-center justify-between px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors cursor-pointer"
-    style="border-color: var(--ds-border); background-color: {disabled ? 'var(--ds-background-neutral)' : 'var(--ds-surface)'}; {disabled ? 'opacity: 0.5; cursor: not-allowed;' : ''}"
-  >
-    {#if selectedField}
-      <div class="flex items-center gap-2 flex-1 min-w-0">
-        <span class="font-medium truncate" data-testid="field-selector-value" style="color: var(--ds-text);">{selectedField.name}</span>
-        <span class="text-xs px-1.5 py-0.5 rounded {getFieldTypeColor(selectedField.type)}">
-          {getFieldTypeLabel(selectedField.type)}
-        </span>
-        {#if selectedField.isCustom}
-          <span class="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-800">{t('pickers.custom')}</span>
-        {/if}
-      </div>
-      <div class="flex items-center gap-1">
-        <button
-          type="button"
-          onclick={(e) => { e.stopPropagation(); clearSelection(); }}
-          class="p-1 rounded transition-colors hover-bg"
-          title={t('pickers.clearSelection')}
-        >
-          <X class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-        </button>
+<BasePicker
+  items={fieldItems}
+  value={selectedField?.id ?? null}
+  placeholder={resolvedPlaceholder}
+  {disabled}
+  searchFields={['name', 'description']}
+  groupBy={(field) => field.group}
+  getValue={(field) => field.id}
+  getLabel={(field) => field.name}
+  optionTestid={(opt) => `field-option-${opt.value}`}
+  searchTestid="field-selector-search"
+  searchPlaceholder={t('pickers.searchFields')}
+  menuTestid="field-selector-menu"
+  scrollTestid="field-selector-scroll"
+  onSelect={handleSelect}
+>
+  {#snippet children()}
+    <div
+      data-testid="field-selector-trigger"
+      aria-disabled={disabled}
+      class="w-full flex items-center justify-between {controlSizeClasses('medium')} border rounded transition-colors"
+      style="border-color: var(--ds-border); background-color: {disabled ? 'var(--ds-background-neutral)' : 'var(--ds-surface)'}; {disabled ? 'opacity: 0.5; cursor: not-allowed;' : ''}"
+    >
+      {#if selectedField}
+        <div class="flex items-center gap-2 flex-1 min-w-0">
+          <span class="font-medium truncate" data-testid="field-selector-value" style="color: var(--ds-text);">{selectedField.name}</span>
+          <span class="text-xs px-1.5 py-0.5 rounded {getFieldTypeColor(selectedField.type)}">
+            {getFieldTypeLabel(selectedField.type)}
+          </span>
+          {#if selectedField.isCustom}
+            <span class="text-xs px-1.5 py-0.5 rounded bg-ds-accent-purple-subtle text-ds-text-accent-purple">{t('pickers.custom')}</span>
+          {/if}
+        </div>
+        <div class="flex items-center gap-1">
+          <button
+            type="button"
+            onclick={(e) => { e.stopPropagation(); clearSelection(); }}
+            class="p-1 rounded transition-colors hover-bg"
+            title={t('pickers.clearSelection')}
+          >
+            <X class="w-4 h-4" style="color: var(--ds-text-subtle);" />
+          </button>
+          <ChevronDown class="w-4 h-4" style="color: var(--ds-text-subtle);" />
+        </div>
+      {:else}
+        <span style="color: var(--ds-text-subtle);">{resolvedPlaceholder}</span>
         <ChevronDown class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-      </div>
-    {:else}
-      <span style="color: var(--ds-text-subtle);">{resolvedPlaceholder}</span>
-      <ChevronDown class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-    {/if}
-  </div>
+      {/if}
+    </div>
+  {/snippet}
 
-  <!-- Dropdown Menu -->
-  {#if isOpen}
-    <div class="absolute z-50 mt-1 w-full max-w-md border rounded shadow-lg overflow-hidden" style="background-color: var(--ds-surface); border-color: var(--ds-border);">
-      <!-- Search Input -->
-      <div class="p-2" style="border-bottom: 1px solid var(--ds-border);">
-        <SearchInput
-          bind:value={searchQuery}
-          placeholder={t('pickers.searchFields')}
-          size="small"
-          on_input={handleSearchInput}
-        />
-      </div>
-
-      <!-- Field List -->
-      <div class="max-h-96 overflow-y-auto">
-        {#if filteredFields.length === 0}
-          <div class="p-4 text-center text-sm" style="color: var(--ds-text-subtle);">
-            {t('pickers.noFieldsFound', { query: searchQuery })}
-          </div>
-        {:else}
-          {#each filteredFields as group}
-            <div class="last:border-b-0" style="border-bottom: 1px solid var(--ds-border);">
-              <!-- Category Header -->
-              <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
-                {group.category}
-              </div>
-
-              <!-- Fields in Category -->
-              {#each group.fields as field}
-                <button
-                  type="button"
-                  data-testid={`field-option-${field.id}`}
-                  onclick={() => selectField(field)}
-                  class="w-full px-3 py-2 text-left transition-colors focus:outline-none field-item-btn"
-                >
-                  <div class="flex items-center justify-between">
-                    <div class="flex-1 min-w-0">
-                      <div class="flex items-center gap-2">
-                        <span class="font-medium" style="color: var(--ds-text);">{field.name}</span>
-                        <span class="text-xs px-1.5 py-0.5 rounded {getFieldTypeColor(field.type)}">
-                          {getFieldTypeLabel(field.type)}
-                        </span>
-                        {#if field.isCustom}
-                          <span class="text-xs px-1.5 py-0.5 rounded bg-purple-100 text-purple-800">{t('pickers.custom')}</span>
-                        {/if}
-                      </div>
-                      {#if field.description}
-                        <p class="text-xs mt-0.5" style="color: var(--ds-text-subtle);">{field.description}</p>
-                      {/if}
-                    </div>
-                  </div>
-                </button>
-              {/each}
-            </div>
-          {/each}
+  {#snippet itemSnippet({ item: field })}
+    <div class="flex-1 min-w-0">
+      <div class="flex items-center gap-2">
+        <span class="font-medium" style="color: var(--ds-text);">{field.name}</span>
+        <span class="text-xs px-1.5 py-0.5 rounded {getFieldTypeColor(field.type)}">
+          {getFieldTypeLabel(field.type)}
+        </span>
+        {#if field.isCustom}
+          <span class="text-xs px-1.5 py-0.5 rounded bg-ds-accent-purple-subtle text-ds-text-accent-purple">{t('pickers.custom')}</span>
         {/if}
       </div>
+      {#if field.description}
+        <p class="text-xs mt-0.5" style="color: var(--ds-text-subtle);">{field.description}</p>
+      {/if}
     </div>
-  {/if}
-</div>
+  {/snippet}
+
+  {#snippet noResultsSnippet({ searchQuery })}
+    <div class="p-4 text-center text-sm" style="color: var(--ds-text-subtle);">
+      {t('pickers.noFieldsFound', { query: searchQuery })}
+    </div>
+  {/snippet}
+</BasePicker>
 
 <style>
   .hover-bg:hover {
     background-color: var(--ds-background-neutral-hovered);
-  }
-  .field-item-btn:hover {
-    background-color: var(--ds-background-neutral-hovered);
-  }
-  .field-item-btn:focus {
-    background-color: var(--ds-background-neutral);
   }
 </style>

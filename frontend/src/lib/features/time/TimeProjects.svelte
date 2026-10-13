@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import TabStrip from '../../components/TabStrip.svelte';
   import { api } from '../../api.js';
   import Button from '../../components/Button.svelte';
   import TimeProjectCategories from './TimeProjectCategories.svelte';
@@ -325,24 +326,13 @@
   </PageHeader>
 
   <!-- Tabs -->
-  <div class="border-b" style="border-color: var(--ds-border);">
-    <div class="flex gap-6">
-      <button
-        class="px-1 py-3 text-sm font-medium transition-colors border-b-2 {activeTab === 'projects' ? '' : 'border-transparent'}"
-        style="{activeTab === 'projects' ? 'border-color: var(--ds-interactive); color: var(--ds-interactive);' : 'color: var(--ds-text-subtle);'}"
-        onclick={() => activeTab = 'projects'}
-      >
-        {t('time.projects.projectsTab')}
-      </button>
-      <button
-        class="px-1 py-3 text-sm font-medium transition-colors border-b-2 {activeTab === 'categories' ? '' : 'border-transparent'}"
-        style="{activeTab === 'categories' ? 'border-color: var(--ds-interactive); color: var(--ds-interactive);' : 'color: var(--ds-text-subtle);'}"
-        onclick={() => activeTab = 'categories'}
-      >
-        {t('time.projects.categoriesTab')}
-      </button>
-    </div>
-  </div>
+  <TabStrip
+    tabs={[
+      { id: 'projects', label: t('time.projects.projectsTab') },
+      { id: 'categories', label: t('time.projects.categoriesTab') }
+    ]}
+    bind:activeTab
+  />
 
   <!-- Filters Bar (only show on projects tab) -->
   {#if activeTab === 'projects'}
@@ -361,7 +351,7 @@
           {@const selectedCategory = selectedCategoryId !== null ? categories.find(c => c.id === selectedCategoryId) : null}
           <div class="flex items-center gap-2 px-4 py-2 rounded text-sm font-medium border cursor-pointer" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
             {#if selectedCategory}
-              <div class="w-2.5 h-2.5 rounded-full" style="background-color: {selectedCategory.color};"></div>
+              <ColorDot size="md" color={selectedCategory.color} />
             {/if}
             <DropdownMenu
               items={categoryDropdownItems}
@@ -393,7 +383,7 @@
   >
     <!-- Project name with color dot and description -->
     {#snippet project(project)}
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2" data-testid={`time-project-${project.id}`}>
         {#if project.color}
           <ColorDot color={project.color} size="md" />
         {/if}
@@ -411,7 +401,7 @@
       {#if project.category_name}
         <div class="flex items-center gap-2">
           {#if project.category_color}
-            <div class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background-color: {project.category_color};"></div>
+            <ColorDot size="md" color={project.category_color} class="flex-shrink-0" />
           {/if}
           <span class="text-sm" style="color: var(--ds-text);">{project.category_name}</span>
         </div>

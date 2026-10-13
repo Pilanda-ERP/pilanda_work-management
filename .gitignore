@@ -11,10 +11,34 @@ windshift
 cx
 /ws
 /logbook
+# Local build of scripts/openapi-v2-generate.
+/openapi-v2-generate
 
 # Test binary, built with `go test -c`
 *.test
-data
+/data/
+
+# Test sources live in the adjacent private core-tests repository and are
+# overlaid onto this checkout by its runners.
+*_test.go
+!/internal/database/gitlab_schema_test.go
+!/internal/scm/gitlab_test.go
+!/internal/services/planning_milestones_release_test.go
+!/internal/utils/repository_path_test.go
+*_test.sh
+*.test.js
+*.test.ts
+*.spec.js
+*.spec.ts
+
+# Public regression coverage for the locale runtime ships with the implementation.
+!frontend/src/lib/stores/i18n-utils.spec.js
+!frontend/src/lib/mobile/mobile-i18n.spec.js
+!frontend/scripts/hardcoded-i18n-ast.spec.js
+!frontend/src/lib/api/integrations.spec.js
+!frontend/src/lib/features/items/zammadPanelContext.spec.js
+!frontend/src/lib/features/items/ZammadLinkResolver.spec.js
+!internal/repository/zammad_repository_test.go
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
@@ -48,6 +72,7 @@ scripts/*/.env
 .env.development.local
 .env.test.local
 .env.production.local
+.jira-import-e2e.local.json
 
 # Frontend dependencies
 frontend/node_modules/
@@ -62,6 +87,9 @@ frontend/vite.config.js.timestamp-*
 
 # Biome cache
 .biome/
+
+# Per-worktree golangci-lint cache
+.golangci-lint-cache/
 
 # IDE and editor files
 .vscode/
@@ -82,6 +110,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+.local/
 
 # Build artifacts
 dist/
@@ -126,7 +155,9 @@ node_modules
 bin
 WINDSHIFT.md
 AGENTS.md
-docs
+
+# Private working documentation
+/docs/
 
 # Local dev docker-compose
 docker-compose.yml
@@ -144,20 +175,28 @@ releases/v0.3.2.md
 .jscpd-report
 scripts/*
 !scripts/pre-commit
+!scripts/run-golangci-lint.sh
 !scripts/check-layering.sh
 !scripts/check-handler-db-access.sh
 !scripts/report-handler-db-access.sh
+!scripts/check-schema-migration-pairing.sh
+!scripts/check-sql-boolean-literals.mjs
 !scripts/audit_coverage_inventory.py
 !scripts/.layering-baseline
 !scripts/.handler-db-access-allowlist
 !scripts/openapi-convert/
+!scripts/openapi-v2-generate/
+!scripts/openapi-v2-metadata/
 !scripts/openapi-convert/**
+!scripts/openapi-v2-check/
+!scripts/openapi-v2-check/**
 .golangci-report.json
 blog/
 .fallow/
 .windshift-local
-/docs
 /.codehamr
 /.agents/skills/donate-trace
 /skills-lock.json
 /cmd/ws/ws
+/playground
+/CONTEXT.md

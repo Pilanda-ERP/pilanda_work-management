@@ -2,13 +2,12 @@ package handlers
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"net/http"
-	"strconv"
+	"time"
 
 	"windshift/internal/logger"
 	"windshift/internal/models"
@@ -21,20 +20,27 @@ import (
 )
 
 type UserHandler struct {
-	repo              *repository.UserRepository
-	auditor           *logger.Auditor
-	permissionService *services.PermissionService
-	invitationService *services.InvitationService
-	userSvc           *services.UserReadService
-	offboardUser      func(id int) error
-	deactivateCascade func(id int) (services.AgentDeactivationResult, error)
-	agentPresence     *services.AgentPresenceService // optional; nil when the agent harness is off
+	repo               *repository.UserRepository
+	auditor            *logger.Auditor
+	permissionService  *services.PermissionService
+	invitationService  *services.InvitationService
+	userSvc            *services.UserReadService
+	offboardUser       func(id int) error
+	deactivateCascade  func(id int) (services.AgentDeactivationResult, error)
+	invalidateSessions func(id int)
+	workspaceUsers     *services.WorkspaceUserResolver
+	eraseUser          func(id int, actor services.AuditActor, input services.UserErasureInput) (services.UserErasureEvidence, error)
 }
 
-// SetAgentPresenceService wires the optional presence resolver used to
-// decorate agent users in the assignable-users response (WI-272).
-func (h *UserHandler) SetAgentPresenceService(s *services.AgentPresenceService) {
-	h.agentPresence = s
+// SetWorkspaceUserResolver wires the shared picker and validation roster.
+func (h *UserHandler) SetWorkspaceUserResolver(resolver *services.WorkspaceUserResolver) {
+	h.workspaceUsers = resolver
+}
+
+func (h *UserHandler) invalidateUserSessions(userID int) {
+	if h.invalidateSessions != nil {
+		h.invalidateSessions(userID)
+	}
 }
 
 // CreateUserRequest represents the request payload for creating a user.
@@ -71,10 +77,10 @@ type UpdateRegionalSettingsRequest struct {
 	Language string `json:"language"`
 }
 
-// NewUserHandler creates a UserHandler. offboardUser and deactivateCascade are
-// dependency-injected closures over services.OffboardUser and
-// services.DeactivateOwnedAgentsAndTokens; injecting them at construction lets
-// the handler stay free of the database import.
+// NewUserHandler creates a UserHandler. offboardUser, deactivateCascade, and
+// eraseUser are dependency-injected closures over services.OffboardUser,
+// services.DeactivateOwnedAgentsAndTokens, and services.EraseUser; injecting
+// them at construction lets the handler stay free of the database import.
 func NewUserHandler(
 	repo *repository.UserRepository,
 	auditor *logger.Auditor,
@@ -83,98 +89,20 @@ func NewUserHandler(
 	userSvc *services.UserReadService,
 	offboardUser func(id int) error,
 	deactivateCascade func(id int) (services.AgentDeactivationResult, error),
+	invalidateSessions func(id int),
+	eraseUser func(id int, actor services.AuditActor, input services.UserErasureInput) (services.UserErasureEvidence, error),
 ) *UserHandler {
 	return &UserHandler{
-		repo:              repo,
-		auditor:           auditor,
-		permissionService: permissionService,
-		invitationService: invitationService,
-		userSvc:           userSvc,
-		offboardUser:      offboardUser,
-		deactivateCascade: deactivateCascade,
+		repo:               repo,
+		auditor:            auditor,
+		permissionService:  permissionService,
+		invitationService:  invitationService,
+		userSvc:            userSvc,
+		offboardUser:       offboardUser,
+		deactivateCascade:  deactivateCascade,
+		invalidateSessions: invalidateSessions,
+		eraseUser:          eraseUser,
 	}
-}
-
-func (h *UserHandler) GetAll(w http.ResponseWriter, r *http.Request) {
-	currentUser, ok := RequireAuth(w, r)
-	if !ok {
-		return
-	}
-
-	isAdmin, _ := h.permissionService.IsSystemAdmin(currentUser.ID)
-
-	// Any authenticated user can list users (needed for issue assignment, mentions, etc.)
-	// System admins see all users with full details, regular users see only active users
-	// with limited fields.
-	if !isAdmin {
-		users, err := h.userSvc.ListAll()
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-		// Strip sensitive fields for non-admins
-		for i := range users {
-			users[i].Email = ""
-			users[i].Timezone = ""
-			users[i].Language = ""
-		}
-		respondJSONOK(w, users)
-		return
-	}
-
-	users, err := h.repo.ListAdmin()
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	respondJSONOK(w, users)
-}
-
-func (h *UserHandler) Get(w http.ResponseWriter, r *http.Request) {
-	id, ok := requireIDParam(w, r, "id")
-	if !ok {
-		return
-	}
-
-	currentUser, ok := RequireAuth(w, r)
-	if !ok {
-		return
-	}
-
-	isOwnProfile := currentUser.ID == id
-	isAdmin, _ := h.permissionService.IsSystemAdmin(currentUser.ID)
-	hasListPerm, _ := h.permissionService.HasGlobalPermission(currentUser.ID, models.PermissionUserList)
-
-	if !isOwnProfile && !isAdmin && !hasListPerm {
-		respondForbidden(w, r)
-		return
-	}
-
-	user, err := h.repo.GetByID(id)
-	if errors.Is(err, repository.ErrNotFound) {
-		respondNotFound(w, r, "user")
-		return
-	}
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Non-admin users with user.list can only see active users (not their own profile)
-	if !isOwnProfile && !isAdmin && !user.IsActive {
-		respondNotFound(w, r, "user")
-		return
-	}
-
-	// Limit returned fields when a non-admin views someone else's profile.
-	if !isOwnProfile && !isAdmin {
-		user.Email = ""
-		user.RequiresPasswordReset = false
-		user.Timezone = ""
-		user.Language = ""
-	}
-
-	respondJSONOK(w, user)
 }
 
 func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -260,7 +188,7 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 		h.auditor.LogWithDetails(r, currentUser,
 			logger.ActionUserCreate, logger.ResourceUser,
 			&user.ID, user.Username,
-			map[string]interface{}{
+			map[string]any{
 				"email":      user.Email,
 				"username":   user.Username,
 				"first_name": user.FirstName,
@@ -345,7 +273,7 @@ func (h *UserHandler) InviteUser(w http.ResponseWriter, r *http.Request) {
 		h.auditor.LogWithDetails(r, currentUser,
 			logger.ActionUserCreate, logger.ResourceUser,
 			&user.ID, user.Username,
-			map[string]interface{}{
+			map[string]any{
 				"email":      user.Email,
 				"username":   user.Username,
 				"is_invite":  true,
@@ -354,153 +282,13 @@ func (h *UserHandler) InviteUser(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	respondJSONCreated(w, map[string]interface{}{
+	respondJSONCreated(w, map[string]any{
 		"user":       user,
 		"token":      token,
 		"email_sent": emailErr == nil,
 	})
 }
 
-func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
-	id, ok := requireIDParam(w, r, "id")
-	if !ok {
-		return
-	}
-
-	req, ok := decodeJSON[UpdateUserRequest](w, r)
-	if !ok {
-		return
-	}
-	sanitize.ApplyAll(
-		sanitize.Pair{Target: &req.FirstName, Policy: sanitize.PlainTextField},
-		sanitize.Pair{Target: &req.LastName, Policy: sanitize.PlainTextField},
-		sanitize.Pair{Target: &req.Username, Policy: sanitize.ShortIdentifier},
-		sanitize.Pair{Target: &req.Timezone, Policy: sanitize.ShortIdentifier},
-		sanitize.Pair{Target: &req.Language, Policy: sanitize.ShortIdentifier},
-	)
-
-	if err := utils.Validate(req); err != nil {
-		respondValidationError(w, r, err.Error())
-		return
-	}
-
-	old, err := h.repo.GetUpdateProfileSnapshot(id)
-	if errors.Is(err, repository.ErrNotFound) {
-		respondNotFound(w, r, "user")
-		return
-	}
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	if old.SCIMManaged {
-		respondForbidden(w, r)
-		return
-	}
-
-	timezone := req.Timezone
-	if timezone == "" && old.Timezone.Valid {
-		timezone = old.Timezone.String
-	}
-	if timezone == "" {
-		timezone = "UTC"
-	}
-
-	language := req.Language
-	if language == "" && old.Language.Valid {
-		language = old.Language.String
-	}
-	if language == "" {
-		language = "en"
-	}
-
-	if exists, err := h.repo.EmailExists(req.Email, id); err != nil {
-		respondInternalError(w, r, err)
-		return
-	} else if exists {
-		respondConflict(w, r, "Email already exists")
-		return
-	}
-	if exists, err := h.repo.UsernameExists(req.Username, id); err != nil {
-		respondInternalError(w, r, err)
-		return
-	} else if exists {
-		respondConflict(w, r, "Username already exists")
-		return
-	}
-
-	if err := h.repo.UpdateProfile(id, repository.UpdateProfileParams{
-		Email:     req.Email,
-		Username:  req.Username,
-		FirstName: req.FirstName,
-		LastName:  req.LastName,
-		AvatarURL: req.AvatarURL,
-		Timezone:  timezone,
-		Language:  language,
-	}); err != nil {
-		if errors.Is(err, repository.ErrDuplicateEntry) {
-			respondConflict(w, r, "Email or username already exists")
-			return
-		}
-		respondInternalError(w, r, err)
-		return
-	}
-
-	user, err := h.repo.GetByID(id)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	user.IsActive = old.IsActive // Preserve — Update doesn't toggle activation.
-
-	currentUser := utils.GetCurrentUser(r)
-	if currentUser != nil {
-		changes := make(map[string]interface{})
-		if old.Email != req.Email {
-			changes["email"] = map[string]string{"old": old.Email, "new": req.Email}
-		}
-		if old.Username != req.Username {
-			changes["username"] = map[string]string{"old": old.Username, "new": req.Username}
-		}
-		if old.FirstName != req.FirstName {
-			changes["first_name"] = map[string]string{"old": old.FirstName, "new": req.FirstName}
-		}
-		if old.LastName != req.LastName {
-			changes["last_name"] = map[string]string{"old": old.LastName, "new": req.LastName}
-		}
-		oldAvatarURL := ""
-		if old.AvatarURL.Valid {
-			oldAvatarURL = old.AvatarURL.String
-		}
-		if oldAvatarURL != req.AvatarURL {
-			changes["avatar_url"] = map[string]string{"old": oldAvatarURL, "new": req.AvatarURL}
-		}
-		oldTz := "UTC"
-		if old.Timezone.Valid {
-			oldTz = old.Timezone.String
-		}
-		if oldTz != timezone {
-			changes["timezone"] = map[string]string{"old": oldTz, "new": timezone}
-		}
-		oldLang := "en"
-		if old.Language.Valid {
-			oldLang = old.Language.String
-		}
-		if oldLang != language {
-			changes["language"] = map[string]string{"old": oldLang, "new": language}
-		}
-
-		h.auditor.LogWithDetails(r, currentUser,
-			logger.ActionUserUpdate, logger.ResourceUser,
-			&user.ID, user.Username, changes,
-		)
-	}
-
-	respondJSONOK(w, user)
-}
-
-// UpdateAvatar updates only the avatar_url field for a user
 func (h *UserHandler) UpdateAvatar(w http.ResponseWriter, r *http.Request) {
 	id, ok := requireIDParam(w, r, "id")
 	if !ok {
@@ -522,7 +310,7 @@ func (h *UserHandler) UpdateAvatar(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AvatarURL *string `json:"avatar_url"` // pointer to distinguish null vs empty
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "Invalid request body")
 		return
 	}
@@ -535,6 +323,7 @@ func (h *UserHandler) UpdateAvatar(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.invalidateUserSessions(id)
 
 	user, err := h.repo.GetByID(id)
 	if errors.Is(err, repository.ErrNotFound) {
@@ -607,7 +396,7 @@ func (h *UserHandler) UpdateRegionalSettings(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	changes := make(map[string]interface{})
+	changes := make(map[string]any)
 	oldTz := "UTC"
 	if old.Timezone.Valid {
 		oldTz = old.Timezone.String
@@ -659,25 +448,92 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Audit before anonymization so we capture the original details.
+	if err := h.offboardUser(id); err != nil {
+		if errors.Is(err, services.ErrUserOffboardingHasProtectedIntegrationLinks) {
+			respondConflict(w, r, "Cannot offboard user while their personal workspace contains protected integration links")
+			return
+		}
+		respondInternalError(w, r, err)
+		return
+	}
+
+	// Audit after successful offboarding so a failed or blocked operation is
+	// never recorded as a successful deletion.
 	if currentUser != nil {
 		h.auditor.LogWithDetails(r, currentUser,
 			logger.ActionUserDelete, logger.ResourceUser,
 			&id, deleted.Username,
-			map[string]interface{}{
+			map[string]any{
 				"email":      deleted.Email,
 				"first_name": deleted.FirstName,
 				"last_name":  deleted.LastName,
 			},
 		)
 	}
+	h.invalidateUserSessions(id)
 
-	if err := h.offboardUser(id); err != nil {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// UserErasureRequest is the DSAR intake payload for POST /users/{id}/erase.
+type UserErasureRequest struct {
+	// RequestedBy records where the erasure request came from — the data
+	// subject's email or an intake-channel reference. Required.
+	RequestedBy string `json:"requested_by"`
+	// RequestedAt is when the controller received the request; defaults to now.
+	RequestedAt *time.Time `json:"requested_at,omitempty"`
+	// Notes optionally records the controller's decision context.
+	Notes string `json:"notes,omitempty"`
+}
+
+// Erase executes an irreversible Article 17 erasure (DSAR) on top of the
+// security offboarding primitive and persists the DSAR completion evidence.
+// Distinct from Delete: erasure is a documented data-subject right execution,
+// not an administrative deactivation. Audit logs are intentionally untouched
+// — their pseudonymized user IDs are retained per the erasure policy.
+func (h *UserHandler) Erase(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+
+	currentUser := utils.GetCurrentUser(r)
+	if currentUser != nil && currentUser.ID == id {
+		respondForbidden(w, r)
+		return
+	}
+
+	body, ok := decodeJSON[UserErasureRequest](w, r)
+	if !ok {
+		return
+	}
+
+	input := services.UserErasureInput{RequestedBy: body.RequestedBy, Notes: body.Notes}
+	if body.RequestedAt != nil {
+		input.RequestedAt = *body.RequestedAt
+	}
+
+	actor := services.NewAuditActorFromRequest(r, currentUser, nil, "")
+	evidence, err := h.eraseUser(id, actor, input)
+	if err != nil {
+		if errors.Is(err, services.ErrUserAlreadyErased) {
+			respondConflict(w, r, "User has already been erased")
+			return
+		}
+		if errors.Is(err, services.ErrUserOffboardingHasProtectedIntegrationLinks) {
+			respondConflict(w, r, "Cannot erase user while their personal workspace contains protected integration links")
+			return
+		}
+		if se, ok := err.(*services.ServiceError); ok {
+			handleServiceError(w, r, se)
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	h.invalidateUserSessions(id)
+	respondJSONCreated(w, evidence)
 }
 
 // ResetPasswordRequest represents the request to reset a user's password
@@ -709,18 +565,18 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 
 	var password string
 	requiresReset := true
-	var response map[string]interface{}
+	var response map[string]any
 
 	if req.GenerateRandom || req.Password == "" {
 		password = generateTempPassword()
-		response = map[string]interface{}{
+		response = map[string]any{
 			"temporary_password": password,
 			"message":            "Password reset successfully. User must change password on next login.",
 		}
 	} else {
 		password = req.Password
 		requiresReset = false
-		response = map[string]interface{}{
+		response = map[string]any{
 			"message": "Password set successfully.",
 		}
 	}
@@ -741,15 +597,23 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Password material on an offboarded account is meaningless state; refuse
+	// instead of writing credentials onto a retired row.
+	if target.Offboarded {
+		respondConflict(w, r, "User has been offboarded and cannot be reactivated")
+		return
+	}
+
 	if err := h.repo.SetPassword(id, string(hashedBytes), requiresReset); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.invalidateUserSessions(id)
 
 	h.auditor.LogWithDetails(r, currentUser,
 		logger.ActionUserPasswordReset, logger.ResourceUser,
 		&id, target.Username,
-		map[string]interface{}{
+		map[string]any{
 			"email":                   target.Email,
 			"requires_password_reset": requiresReset,
 			"password_type":           map[bool]string{true: "generated", false: "custom"}[req.GenerateRandom || req.Password == ""],
@@ -757,49 +621,6 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	)
 
 	respondJSONOK(w, response)
-}
-
-// GetAssignable returns only active users with limited fields for assignment
-// pickers. Agent users are decorated with a workspace-scoped presence signal
-// (online/offline/local/unbound, WI-272) so assigners can see whether
-// assigning to the agent would actually start a run.
-func (h *UserHandler) GetAssignable(w http.ResponseWriter, r *http.Request) {
-	if _, ok := RequireAuth(w, r); !ok {
-		return
-	}
-
-	users, err := h.userSvc.ListAll()
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Presence enrichment is best-effort: a resolver failure degrades to
-	// undecorated users, never a failed picker.
-	var presence map[int]string
-	if h.agentPresence != nil {
-		if workspaceID, err := strconv.Atoi(r.PathValue("workspaceId")); err == nil && workspaceID > 0 {
-			if presence, err = h.agentPresence.ForWorkspace(r.Context(), workspaceID); err != nil {
-				slog.Warn("assignable users: resolve agent presence", "workspace_id", workspaceID, "error", err)
-				presence = nil
-			}
-		}
-	}
-
-	for i := range users {
-		users[i].Email = ""
-		users[i].Timezone = ""
-		users[i].Language = ""
-		if users[i].IsAgent && presence != nil {
-			if p, ok := presence[users[i].ID]; ok {
-				users[i].AgentPresence = p
-			} else {
-				users[i].AgentPresence = services.AgentPresenceUnbound
-			}
-		}
-	}
-
-	respondJSONOK(w, users)
 }
 
 // GetAgentOwner returns the owner attribution for an agent user. Gated on
@@ -819,9 +640,7 @@ func (h *UserHandler) GetAgentOwner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isAdmin, _ := h.permissionService.IsSystemAdmin(currentUser.ID)
-	hasListPerm, _ := h.permissionService.HasGlobalPermission(currentUser.ID, models.PermissionUserList)
-	if !isAdmin && !hasListPerm {
+	if !canViewAgentOwnerAttribution(h.permissionService, currentUser.ID) {
 		respondNotFound(w, r, "agent")
 		return
 	}
@@ -837,6 +656,21 @@ func (h *UserHandler) GetAgentOwner(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSONOK(w, info)
+}
+
+// canViewAgentOwnerAttribution centralizes the visibility rule used by both
+// the individual lookup and enriched activity DTOs. Permission lookup errors
+// fail closed.
+func canViewAgentOwnerAttribution(permissionService *services.PermissionService, userID int) bool {
+	if permissionService == nil {
+		return false
+	}
+	isAdmin, _ := permissionService.IsSystemAdmin(userID)
+	if isAdmin {
+		return true
+	}
+	hasListPermission, _ := permissionService.HasGlobalPermission(userID, models.PermissionUserList)
+	return hasListPermission
 }
 
 // ActivateUser activates a user account
@@ -861,17 +695,25 @@ func (h *UserHandler) ActivateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Offboarding is irreversible; activation must never resurrect the
+	// anonymized account.
+	if target.Offboarded {
+		respondConflict(w, r, "User has been offboarded and cannot be reactivated")
+		return
+	}
+
 	if err := h.repo.SetActive(id, true); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.invalidateUserSessions(id)
 
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
 		h.auditor.LogWithDetails(r, currentUser,
 			logger.ActionUserActivate, logger.ResourceUser,
 			&id, target.Username,
-			map[string]interface{}{
+			map[string]any{
 				"email":          target.Email,
 				"previous_state": "inactive",
 				"new_state":      "active",
@@ -910,29 +752,19 @@ func (h *UserHandler) DeactivateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.repo.SetActive(id, false); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Propagate to any agents this user owns: flip them inactive and revoke every
-	// token held by the owner or their agents in a single transaction.
+	// The shared offboarding service atomically deactivates the user and their
+	// agents, revokes their API tokens, and invalidates security caches.
 	cascade, cascadeErr := h.deactivateCascade(id)
 	if cascadeErr != nil {
-		slog.Warn("deactivation cascade failed",
-			slog.String("component", "users"),
-			slog.Int("owner_id", id),
-			slog.Any("error", cascadeErr))
+		respondInternalError(w, r, cascadeErr)
+		return
 	}
-
-	// Invalidate permission caches (fans out to owned agents via PermissionService).
-	_ = h.permissionService.InvalidateUserCache(id)
 
 	if currentUser != nil {
 		h.auditor.LogWithDetails(r, currentUser,
 			logger.ActionUserDeactivate, logger.ResourceUser,
 			&id, target.Username,
-			map[string]interface{}{
+			map[string]any{
 				"email":              target.Email,
 				"previous_state":     "active",
 				"new_state":          "inactive",
@@ -948,7 +780,7 @@ func (h *UserHandler) DeactivateUser(w http.ResponseWriter, r *http.Request) {
 			h.auditor.LogWithDetails(r, currentUser,
 				logger.ActionAgentDeactivate, logger.ResourceUser,
 				&aid, "",
-				map[string]interface{}{
+				map[string]any{
 					"reason":   "owner_deactivated",
 					"owner_id": id,
 				},
@@ -959,7 +791,7 @@ func (h *UserHandler) DeactivateUser(w http.ResponseWriter, r *http.Request) {
 			h.auditor.LogWithDetails(r, currentUser,
 				logger.ActionAPITokenAutoRevoke, logger.ResourceAPIToken,
 				&tokenID, "",
-				map[string]interface{}{
+				map[string]any{
 					"reason":   "owner_deactivated",
 					"owner_id": id,
 					"table":    "api_tokens",
@@ -991,7 +823,7 @@ func generateTempPassword() string {
 // or nil when empty so the column receives SQL NULL. Kept here because
 // notification.go still uses it; will move to a shared helpers file when
 // that handler migrates.
-func nullableString(s string) interface{} {
+func nullableString(s string) any {
 	if s == "" {
 		return nil
 	}

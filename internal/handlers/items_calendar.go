@@ -110,7 +110,7 @@ func (h *ItemHandler) ScheduleItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"status":   "success",
 		"message":  "Item scheduled successfully",
 		"schedule": newEntry,
@@ -210,6 +210,14 @@ func (h *ItemHandler) UnscheduleItem(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// excludePersonalQuery reports whether the caller opted out of
+// personal-workspace items via the exclude_personal query parameter — same
+// contract as the bearer-token v1 API (restapi/v1/handlers.ExcludePersonal).
+func excludePersonalQuery(r *http.Request) bool {
+	v := r.URL.Query().Get("exclude_personal")
+	return v == "true" || v == "1"
+}
+
 // GetScheduledItems returns all items scheduled for the authenticated user
 func (h *ItemHandler) GetScheduledItems(w http.ResponseWriter, r *http.Request) {
 	// Require authentication - use authenticated user's ID only
@@ -230,7 +238,7 @@ func (h *ItemHandler) GetScheduledItems(w http.ResponseWriter, r *http.Request) 
 
 	// If user has no accessible workspaces, return empty result
 	if len(accessibleWorkspaceIDs) == 0 {
-		respondJSONOK(w, map[string][]map[string]interface{}{})
+		respondJSONOK(w, map[string][]map[string]any{})
 		return
 	}
 
@@ -248,7 +256,11 @@ func (h *ItemHandler) GetScheduledItems(w http.ResponseWriter, r *http.Request) 
 	itemCalendarData := make(map[int][]models.CalendarScheduleEntry) // item.ID -> calendar entries
 	itemIsPersonal := make(map[int]bool)
 
+	excludePersonal := excludePersonalQuery(r)
 	for _, result := range itemsWithCalendar {
+		if excludePersonal && result.IsPersonal {
+			continue
+		}
 		allItems = append(allItems, result.Item)
 		itemCalendarData[result.Item.ID] = result.CalendarEntries
 		itemIsPersonal[result.Item.ID] = result.IsPersonal
@@ -262,7 +274,7 @@ func (h *ItemHandler) GetScheduledItems(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Build scheduled items map from filtered items only
-	scheduledItems := make(map[string][]map[string]interface{})
+	scheduledItems := make(map[string][]map[string]any)
 
 	for _, item := range filteredItems {
 		calendarData := itemCalendarData[item.ID]
@@ -283,10 +295,10 @@ func (h *ItemHandler) GetScheduledItems(w http.ResponseWriter, r *http.Request) 
 
 			// Add to results grouped by date
 			if scheduledItems[entry.ScheduledDate] == nil {
-				scheduledItems[entry.ScheduledDate] = []map[string]interface{}{}
+				scheduledItems[entry.ScheduledDate] = []map[string]any{}
 			}
 
-			itemWithSchedule := map[string]interface{}{
+			itemWithSchedule := map[string]any{
 				"id":                  item.ID,
 				"workspace_id":        item.WorkspaceID,
 				"title":               item.Title,

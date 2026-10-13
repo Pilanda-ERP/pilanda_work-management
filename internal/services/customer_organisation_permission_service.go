@@ -46,18 +46,6 @@ func (s *CustomerOrganisationPermissionService) HasMembers(customerOrgID int) (b
 	return count > 0, nil
 }
 
-// HasManagers reports whether any manager rows exist for the org.
-func (s *CustomerOrganisationPermissionService) HasManagers(customerOrgID int) (bool, error) {
-	var count int
-	err := s.db.QueryRow(`
-		SELECT COUNT(*) FROM customer_organisation_managers WHERE customer_organisation_id = ?
-	`, customerOrgID).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("error checking customer organisation managers: %w", err)
-	}
-	return count > 0, nil
-}
-
 // IsManager reports whether the user manages this org (direct or via group).
 // Holders of customers.manage are always considered managers.
 func (s *CustomerOrganisationPermissionService) IsManager(userID, customerOrgID int) (bool, error) {
@@ -147,6 +135,35 @@ func (s *CustomerOrganisationPermissionService) CanView(userID, customerOrgID in
 	}
 
 	return s.isMember(userID, customerOrgID)
+}
+
+// FilterVisible returns the subset of orgIDs the user can view. A global
+// customers.manage holder sees every requested id. Callers use this to keep
+// restricted organisations out of aggregates that already passed a broader
+// (for example workspace) authorization check.
+func (s *CustomerOrganisationPermissionService) FilterVisible(userID int, orgIDs []int64) (map[int64]struct{}, error) {
+	accessible, err := s.GetAccessible(userID)
+	if err != nil {
+		return nil, err
+	}
+	if accessible == nil {
+		out := make(map[int64]struct{}, len(orgIDs))
+		for _, id := range orgIDs {
+			out[id] = struct{}{}
+		}
+		return out, nil
+	}
+	allowed := make(map[int64]struct{}, len(accessible))
+	for _, id := range accessible {
+		allowed[int64(id)] = struct{}{}
+	}
+	out := make(map[int64]struct{}, len(orgIDs))
+	for _, id := range orgIDs {
+		if _, ok := allowed[id]; ok {
+			out[id] = struct{}{}
+		}
+	}
+	return out, nil
 }
 
 // GetAccessible returns the customer-organisation IDs the user can see.

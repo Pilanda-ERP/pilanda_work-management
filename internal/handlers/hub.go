@@ -17,6 +17,7 @@ import (
 	"windshift/internal/repository"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
+	"windshift/internal/utils"
 )
 
 // sanitizeHubConfig scrubs the user-facing fields on the hub config
@@ -36,8 +37,14 @@ func sanitizeHubConfig(config *models.PortalHubConfig) {
 		sanitize.ApplyAll(
 			sanitize.Pair{Target: &config.Sections[i].ID, Policy: sanitize.ShortIdentifier},
 			sanitize.Pair{Target: &config.Sections[i].Title, Policy: sanitize.PlainTextField},
+			sanitize.Pair{Target: &config.Sections[i].Subtitle, Policy: sanitize.PlainTextField},
 			sanitize.Pair{Target: &config.Sections[i].Content, Policy: sanitize.RichText},
 		)
+		// Serialize an absent assignment list as [] rather than null so the
+		// frontend never has to distinguish the two.
+		if config.Sections[i].PortalIDs == nil {
+			config.Sections[i].PortalIDs = []int{}
+		}
 	}
 	for i := range config.FooterColumns {
 		sanitize.Apply(&config.FooterColumns[i].Title, sanitize.PlainTextField)
@@ -48,6 +55,20 @@ func sanitizeHubConfig(config *models.PortalHubConfig) {
 			)
 		}
 	}
+}
+
+func validateHubPublicURLs(config *models.PortalHubConfig) error {
+	if err := utils.ValidateBrowserAssetURL(config.LogoURL); err != nil {
+		return fmt.Errorf("hub logo URL is invalid: %w", err)
+	}
+	for _, column := range config.FooterColumns {
+		for _, link := range column.Links {
+			if err := utils.ValidateBrowserNavigationURL(link.URL); err != nil {
+				return fmt.Errorf("hub footer link URL is invalid: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // HubHandler handles HTTP requests for the Portal Hub
@@ -64,6 +85,27 @@ func NewHubHandler(db database.Database, permissionService *services.PermissionS
 		permissionService: permissionService,
 		auditor:           auditor,
 	}
+}
+
+// HasActivePortals reports whether at least one portal is enabled without
+// loading hub styling, request types, or open-request counts.
+func (h *HubHandler) HasActivePortals(ctx context.Context) (bool, error) {
+	var count int
+	err := h.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM channels WHERE type = 'portal' AND status = 'enabled'
+	`).Scan(&count)
+	return count > 0, err
+}
+
+// HasPortals reports whether any portal channel exists, enabled or disabled.
+// The customer/organisation management entry stays reachable while every portal
+// is temporarily disabled, so the operator can reactivate one from there.
+func (h *HubHandler) HasPortals(ctx context.Context) (bool, error) {
+	var count int
+	err := h.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM channels WHERE type = 'portal'
+	`).Scan(&count)
+	return count > 0, err
 }
 
 // GetHub returns the hub configuration and all enabled portals
@@ -168,6 +210,10 @@ func (h *HubHandler) UpdateHubConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sanitizeHubConfig(&config)
+	if err := validateHubPublicURLs(&config); err != nil {
+		respondValidationError(w, r, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -191,7 +237,7 @@ func (h *HubHandler) UpdateHubConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.auditor != nil {
-		h.auditor.LogWithDetails(r, user, logger.ActionHubConfigUpdate, logger.ResourceHubConfig, nil, "Portal Hub", map[string]interface{}{
+		h.auditor.LogWithDetails(r, user, logger.ActionHubConfigUpdate, logger.ResourceHubConfig, nil, "Portal Hub", map[string]any{
 			"title":          config.Title,
 			"theme":          config.Theme,
 			"section_count":  len(config.Sections),
@@ -199,7 +245,7 @@ func (h *HubHandler) UpdateHubConfig(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"message": "Hub configuration saved successfully",
 	})
@@ -319,10 +365,12 @@ func (h *HubHandler) getUserGroupIDs(ctx context.Context, userID int) []int {
 // isAdmin: if true, shows all request types regardless of visibility
 // userGroupIDs: internal user group IDs for visibility filtering
 func (h *HubHandler) getEnabledPortals(ctx context.Context, isAdmin bool, userGroupIDs []int) ([]models.HubPortalInfo, error) {
+	// The request-type count is derived from the visibility-filtered list
+	// below, not a raw table count: the two must agree so a portal card never
+	// reveals that hidden request types exist.
 	query := `
 		SELECT
-			c.id, c.name, c.description, c.status, c.config,
-			(SELECT COUNT(*) FROM request_types rt WHERE rt.channel_id = c.id AND rt.is_active = true) as request_type_count
+			c.id, c.name, COALESCE(c.description, ''), c.status, COALESCE(c.config, '{}')
 		FROM channels c
 		WHERE c.type = 'portal' AND c.status = 'enabled'
 		ORDER BY c.name ASC
@@ -343,7 +391,6 @@ func (h *HubHandler) getEnabledPortals(ctx context.Context, isAdmin bool, userGr
 
 		err = rows.Scan(
 			&portal.ID, &portal.Name, &description, &portal.Status, &configJSON,
-			&portal.RequestTypeCount,
 		)
 		if err != nil {
 			return nil, err
@@ -382,11 +429,11 @@ func (h *HubHandler) getEnabledPortals(ctx context.Context, isAdmin bool, userGr
 			return nil, err
 		}
 
-		// Map request types to their portals
+		// Map request types to their portals and derive the displayed count
+		// from the same visibility-filtered set.
 		for i := range portals {
-			if rts, ok := requestTypes[portals[i].ID]; ok {
-				portals[i].RequestTypes = rts
-			}
+			portals[i].RequestTypes = requestTypes[portals[i].ID]
+			portals[i].RequestTypeCount = len(portals[i].RequestTypes)
 		}
 	}
 
@@ -405,7 +452,7 @@ func (h *HubHandler) getRequestTypesForPortals(ctx context.Context, portalIDs []
 
 	// Build query with IN clause
 	placeholders := make([]string, len(portalIDs))
-	args := make([]interface{}, len(portalIDs))
+	args := make([]any, len(portalIDs))
 	for i, id := range portalIDs {
 		placeholders[i] = "?"
 		args[i] = id
@@ -415,7 +462,7 @@ func (h *HubHandler) getRequestTypesForPortals(ctx context.Context, portalIDs []
 		SELECT id, channel_id, name, COALESCE(description, ''), COALESCE(icon, ''), COALESCE(color, ''),
 		       visibility_group_ids, visibility_org_ids
 		FROM request_types
-		WHERE channel_id IN (%s) AND is_active = true
+		WHERE channel_id IN (%s) AND is_active = true AND kind != 'email'
 		ORDER BY display_order ASC
 	`, strings.Join(placeholders, ","))
 

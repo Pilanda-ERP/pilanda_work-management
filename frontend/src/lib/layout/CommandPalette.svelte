@@ -1,7 +1,5 @@
 <script>
   import { createCombobox, melt } from '@melt-ui/svelte';
-  import { scale } from 'svelte/transition';
-  import { backOut } from 'svelte/easing';
   import { api } from '../api.js';
   import { contextCommands } from '../utils/contextCommands.js';
   import { currentRoute } from '../router.js';
@@ -11,9 +9,9 @@
   import { t } from '../stores/i18n.svelte.js';
   import ModalBackdrop from '../components/ModalBackdrop.svelte';
 
-  import { scoreCommand, compareCommands } from '../commands/score.js';
-  import { BUCKET, BUCKET_LABELS, PER_BUCKET_CAP, TOTAL_CAP } from '../commands/buckets.js';
-  import { deriveLegacyBucket } from '../commands/types.js';
+  import { scoreCommand } from '../commands/score.js';
+  import { BUCKET, BUCKET_LABELS } from '../commands/buckets.js';
+  import { rankCommands } from '../commands/rank.js';
   import { buildContext } from '../commands/context.js';
   import { buildCommands } from '../commands/buildCommands.js';
   import { executeCommand as runCommand } from '../commands/executor.js';
@@ -137,39 +135,6 @@
     PROVIDERS,
   ));
 
-  // Score, sort by (bucket, score, insertion), cap per-bucket and overall.
-  // Providers set `bucket` explicitly; deriveLegacyBucket is the safety net
-  // for commands flowing in through makeExternalProvider that haven't been
-  // updated yet.
-  function rankCommands(query, commandsList) {
-    const annotated = commandsList.map((cmd, i) => {
-      const label = cmd.label ?? '';
-      const description = cmd.description ?? '';
-      const keywords = cmd.keywords ?? [];
-      const score = query.trim() ? scoreCommand(query, { label, description, keywords }) : 1;
-      return {
-        ...cmd,
-        bucket: cmd.bucket || deriveLegacyBucket(cmd),
-        _score: score,
-        _seq: cmd._seq ?? i,
-      };
-    });
-
-    const filtered = query.trim() ? annotated.filter((c) => c._score > 0) : annotated;
-    filtered.sort(compareCommands(query));
-
-    const counts = new Map();
-    const out = [];
-    for (const c of filtered) {
-      if (out.length >= TOTAL_CAP) break;
-      const n = counts.get(c.bucket) || 0;
-      if (n >= PER_BUCKET_CAP) continue;
-      counts.set(c.bucket, n + 1);
-      out.push(c);
-    }
-    return out;
-  }
-
   // Recently-viewed items mapped to command-shaped entries so the existing
   // render loop + keyboard handling drive navigation. No per-bucket cap is
   // applied here — the backend already bounds the list to the last 20.
@@ -289,7 +254,6 @@
   $effect(() => {
     if (isOpen) {
       loadData();
-      timerStore.initialize();
     }
   });
 
@@ -304,10 +268,6 @@
 </script>
 
 <style>
-  .command-palette-container {
-    animation: scale-in var(--duration-normal, 200ms) var(--ease-spring, cubic-bezier(0.34, 1.56, 0.64, 1)) forwards;
-  }
-
   [data-highlighted] {
     background-color: var(--ds-background-neutral-hovered) !important;
   }
@@ -349,12 +309,6 @@
   .kbd:hover {
     background-color: var(--ds-background-neutral-hovered);
   }
-
-  @media (prefers-reduced-motion: reduce) {
-    .command-palette-container {
-      animation: none;
-    }
-  }
 </style>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -362,9 +316,8 @@
 <ModalBackdrop bind:show={isOpen} opacity={0.4} blur={8} extraFilter="saturate(120%)" zIndex={60} align="top" paddingTop="pt-[20vh]" onclose={close}>
   <div
     class="relative w-full max-w-2xl mx-4"
-    transition:scale={{ duration: 200, start: 0.95, easing: backOut }}
   >
-    <div class="command-palette-container rounded-xl overflow-hidden" style="background-color: var(--ds-glass-bg, var(--ds-surface-raised)); backdrop-filter: blur(12px) saturate(180%); -webkit-backdrop-filter: blur(12px) saturate(180%); border: 1px solid var(--ds-glass-border, var(--ds-border)); box-shadow: var(--shadow-float, 0 20px 50px rgba(0, 0, 0, 0.18));">
+    <div class="command-palette-container rounded-lg overflow-hidden" style="background-color: var(--ds-glass-bg, var(--ds-surface-raised)); backdrop-filter: blur(12px) saturate(180%); -webkit-backdrop-filter: blur(12px) saturate(180%); border: 1px solid var(--ds-glass-border, var(--ds-border)); box-shadow: var(--shadow-float, 0 20px 50px rgba(0, 0, 0, 0.18));">
       <div class="p-4 border-b" style="background-color: var(--ds-surface); border-color: var(--ds-border);">
         <input
           bind:this={searchInputRef}

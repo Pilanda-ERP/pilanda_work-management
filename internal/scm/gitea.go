@@ -17,11 +17,13 @@ import (
 // Compile-time check that GiteaProvider implements the optional
 // interfaces it claims. See GitHubProvider for the same pattern.
 var (
-	_ Provider             = (*GiteaProvider)(nil)
-	_ ReleaseProvider      = (*GiteaProvider)(nil)
-	_ CommitProvider       = (*GiteaProvider)(nil)
-	_ RefProvider          = (*GiteaProvider)(nil)
-	_ IssueCommentProvider = (*GiteaProvider)(nil) // WI-426: drives the "@agent" PR-comment trigger
+	_ Provider                     = (*GiteaProvider)(nil)
+	_ ReleaseProvider              = (*GiteaProvider)(nil)
+	_ CommitProvider               = (*GiteaProvider)(nil)
+	_ RefProvider                  = (*GiteaProvider)(nil)
+	_ IssueCommentProvider         = (*GiteaProvider)(nil) // WI-426: drives the "@agent" PR-comment trigger
+	_ PullRequestReviewProvider    = (*GiteaProvider)(nil)
+	_ RepositoryPermissionProvider = (*GiteaProvider)(nil)
 )
 
 // GiteaProvider implements the Provider interface for Gitea/Forgejo
@@ -351,7 +353,7 @@ func (g *GiteaProvider) CreateBranch(ctx context.Context, owner, repo, branchNam
 func (g *GiteaProvider) CreatePullRequest(ctx context.Context, owner, repo string, opts CreatePROptions) (*PullRequest, error) {
 	createURL := g.apiURL(fmt.Sprintf("/repos/%s/%s/pulls", url.PathEscape(owner), url.PathEscape(repo)))
 
-	body := map[string]interface{}{
+	body := map[string]any{
 		"title": opts.Title,
 		"body":  opts.Body,
 		"head":  opts.HeadBranch,
@@ -385,6 +387,7 @@ type giteaComment struct {
 func (c giteaComment) toIssueComment() IssueComment {
 	return IssueComment{
 		ID:        c.ID,
+		Kind:      "issue_comment",
 		Body:      c.Body,
 		User:      c.User.toUser(),
 		CreatedAt: c.CreatedAt,
@@ -417,6 +420,67 @@ func (g *GiteaProvider) ListIssueComments(ctx context.Context, owner, repo strin
 	return comments, nil
 }
 
+// ListPullRequestReviewEvents normalizes Gitea review bodies and their inline
+// comments. Inline comments are nested under a review in the Gitea API.
+func (g *GiteaProvider) ListPullRequestReviewEvents(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
+	const perPage = 50
+	var events []IssueComment
+	for page := 1; ; page++ {
+		reqURL := g.apiURL(fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?page=%d&limit=%d", url.PathEscape(owner), url.PathEscape(repo), number, page, perPage))
+		var reviews []struct {
+			ID          int64     `json:"id"`
+			Body        string    `json:"body"`
+			User        giteaUser `json:"user"`
+			SubmittedAt time.Time `json:"submitted_at"`
+		}
+		if err := g.doJSON(ctx, "GET", reqURL, http.NoBody, http.StatusOK, &reviews); err != nil {
+			return nil, err
+		}
+		for _, review := range reviews {
+			if strings.TrimSpace(review.Body) != "" {
+				events = append(events, IssueComment{ID: review.ID, Kind: "review", Body: review.Body, User: review.User.toUser(), CreatedAt: review.SubmittedAt, UpdatedAt: review.SubmittedAt})
+			}
+			commentsURL := g.apiURL(fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews/%d/comments", url.PathEscape(owner), url.PathEscape(repo), number, review.ID))
+			var comments []struct {
+				ID          int64     `json:"id"`
+				Body        string    `json:"body"`
+				User        giteaUser `json:"user"`
+				Path        string    `json:"path"`
+				NewPosition int       `json:"new_position"`
+				CreatedAt   time.Time `json:"created_at"`
+				UpdatedAt   time.Time `json:"updated_at"`
+			}
+			if err := g.doJSON(ctx, "GET", commentsURL, http.NoBody, http.StatusOK, &comments); err != nil {
+				return nil, err
+			}
+			for _, c := range comments {
+				events = append(events, IssueComment{ID: c.ID, Kind: "review_comment", Body: c.Body, User: c.User.toUser(), Path: c.Path, Line: c.NewPosition, ThreadID: fmt.Sprintf("%d", review.ID), CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt})
+			}
+		}
+		if len(reviews) < perPage {
+			break
+		}
+	}
+	return events, nil
+}
+
+// CanUserWriteRepository checks Gitea's effective collaborator permission.
+func (g *GiteaProvider) CanUserWriteRepository(ctx context.Context, owner, repo, username string) (bool, error) {
+	reqURL := g.apiURL(fmt.Sprintf("/repos/%s/%s/collaborators/%s/permission", url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(username)))
+	var out struct {
+		Permission string `json:"permission"`
+	}
+	if err := g.doJSON(ctx, "GET", reqURL, http.NoBody, http.StatusOK, &out); err != nil {
+		return false, err
+	}
+	switch strings.ToLower(out.Permission) {
+	case "admin", "owner", "write", "push", "triage":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
 // CreateIssueComment posts a comment on an issue or pull request and returns the
 // new comment's id. Used for the agent's reply-back, which carries
 // models.AgentCommentMarker so the poller never re-triggers on it.
@@ -437,7 +501,7 @@ func (g *GiteaProvider) CreateIssueComment(ctx context.Context, owner, repo stri
 }
 
 // UpdateIssueComment edits an existing issue/PR comment by its id.
-func (g *GiteaProvider) UpdateIssueComment(ctx context.Context, owner, repo string, commentID int64, commentBody string) error {
+func (g *GiteaProvider) UpdateIssueComment(ctx context.Context, owner, repo string, _ int, commentID int64, commentBody string) error {
 	reqURL := g.apiURL(fmt.Sprintf("/repos/%s/%s/issues/comments/%d",
 		url.PathEscape(owner), url.PathEscape(repo), commentID))
 
@@ -452,7 +516,7 @@ func (g *GiteaProvider) UpdateIssueComment(ctx context.Context, owner, repo stri
 func (g *GiteaProvider) CreateRelease(ctx context.Context, owner, repo string, opts CreateReleaseOptions) (*Release, error) {
 	createURL := g.apiURL(fmt.Sprintf("/repos/%s/%s/releases", url.PathEscape(owner), url.PathEscape(repo)))
 
-	body := map[string]interface{}{
+	body := map[string]any{
 		"tag_name":   opts.TagName,
 		"name":       opts.Name,
 		"body":       opts.Body,
@@ -580,7 +644,7 @@ func (g *GiteaProvider) RegisterWebhook(ctx context.Context, owner, repo string,
 		events = []string{"push", "pull_request"}
 	}
 
-	body := map[string]interface{}{
+	body := map[string]any{
 		"type":   "gitea", // Gitea webhook type
 		"active": true,
 		"events": events,
@@ -689,8 +753,11 @@ type giteaPullRequest struct {
 }
 
 type giteaPRBranch struct {
-	Ref string `json:"ref"`
-	SHA string `json:"sha"`
+	Ref  string `json:"ref"`
+	SHA  string `json:"sha"`
+	Repo struct {
+		FullName string `json:"full_name"`
+	} `json:"repo"`
 }
 
 func (pr giteaPullRequest) toPullRequest() PullRequest {
@@ -707,6 +774,7 @@ func (pr giteaPullRequest) toPullRequest() PullRequest {
 		State:      state,
 		URL:        pr.HTMLURL,
 		HeadBranch: pr.Head.Ref,
+		HeadRepo:   pr.Head.Repo.FullName,
 		HeadSHA:    pr.Head.SHA,
 		BaseBranch: pr.Base.Ref,
 		IsMerged:   pr.Merged,
@@ -801,16 +869,24 @@ type giteaRelease struct {
 }
 
 func (r giteaRelease) toRelease() Release {
+	status := "released"
+	if r.Draft {
+		status = "draft"
+	} else if r.Prerelease {
+		status = "prerelease"
+	}
 	return Release{
 		ID:           fmt.Sprintf("%d", r.ID),
 		TagName:      r.TagName,
 		Name:         r.Name,
 		Body:         r.Body,
 		URL:          r.HTMLURL,
+		Status:       status,
 		IsDraft:      r.Draft,
 		IsPrerelease: r.Prerelease,
 		CreatedAt:    r.CreatedAt,
 		PublishedAt:  r.PublishedAt,
+		ReleasedAt:   r.PublishedAt,
 	}
 }
 

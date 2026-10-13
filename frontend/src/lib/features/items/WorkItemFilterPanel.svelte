@@ -4,6 +4,7 @@
   import BasePicker from '../../pickers/BasePicker.svelte';
   import DynamicFieldFilter from './DynamicFieldFilter.svelte';
   import Button from '../../components/Button.svelte';
+  import Input from '../../components/Input.svelte';
   import Panel from '../../components/Panel.svelte';
   import Modal from '../../dialogs/Modal.svelte';
 
@@ -17,8 +18,11 @@
     searchQuery = '',
     dynamicFilters = [],
     disabled = false,
+    interactionDisabled = disabled,
     /** 'modal' for compact contexts (sidebar), 'inline' for wide pages. */
     searchInputMode = 'modal',
+    /** Optional scope for page-specific E2E selectors. */
+    testIdPrefix = null,
     onupdateworkspaces = null,
     onupdatestatuses = null,
     onupdatepriorities = null,
@@ -29,6 +33,10 @@
 
   let showSearchModal = $state(false);
   let tempSearchQuery = $state('');
+
+  function testId(suffix, fallback) {
+    return testIdPrefix ? `${testIdPrefix}-${suffix}` : fallback;
+  }
 
   function handleWorkspacesChange(newValue) {
     onupdateworkspaces?.(newValue);
@@ -100,10 +108,10 @@
   </div>
 {/if}
 <div
-  data-testid="work-item-filter-panel"
-  class:pointer-events-none={disabled}
-  class:opacity-50={disabled}
-  aria-disabled={disabled ? 'true' : undefined}
+  data-testid={testId('filters', 'work-item-filter-panel')}
+  class:pointer-events-none={interactionDisabled}
+  class:opacity-50={interactionDisabled}
+  aria-disabled={interactionDisabled ? 'true' : undefined}
 >
   <!-- Search input -->
   <div class="mb-4">
@@ -113,7 +121,8 @@
           class="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
           style="color: var(--ds-icon-subtle);"
         />
-        <input
+        <Input
+          dataTestid={testId('query', 'work-item-search-input')}
           type="text"
           value={searchQuery}
           oninput={(e) => onupdatesearch?.(e.currentTarget.value)}
@@ -124,11 +133,12 @@
             }
           }}
           placeholder={t('collections.searchItems')}
-          class="w-full pl-9 pr-3 py-1.5 text-sm border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-          style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+          class="pl-9"
+          size="small"
         />
         {#if searchQuery}
           <button
+            data-testid={testId('clear-query')}
             onclick={() => {
               onupdatesearch?.('');
               onexecutesearch?.();
@@ -143,14 +153,13 @@
       </div>
     {:else}
       <div
+        data-testid={testId('search-open', 'work-item-search-open')}
         role="button"
         tabindex="0"
         onclick={openSearchModal}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openSearchModal(); } }}
-        class="w-full flex items-center gap-2 px-2.5 py-1.5 text-sm border rounded transition-colors cursor-pointer"
-        style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text-subtle);"
-        onmouseenter={(e) => (e.currentTarget.style.borderColor = 'var(--ds-border-bold)')}
-        onmouseleave={(e) => (e.currentTarget.style.borderColor = 'var(--ds-border)')}
+        class="filter-open w-full flex items-center gap-2 px-2.5 py-1.5 text-sm border rounded transition-colors cursor-pointer"
+        style="background-color: var(--ds-surface); color: var(--ds-text-subtle);"
       >
         <Search class="w-4 h-4 flex-shrink-0" style="color: var(--ds-icon-subtle);" />
         {#if searchQuery}
@@ -176,7 +185,7 @@
 
   <!-- Filter pickers -->
   <div class="space-y-4">
-    <div>
+    <div data-testid={testId('workspace-filter')}>
       <span class="block text-xs font-medium mb-1.5" style="color: var(--ds-text-subtle);">
         {t('collections.workspaces')}
       </span>
@@ -187,11 +196,12 @@
         placeholder={t('collections.selectWorkspaces')}
         getValue={(item) => item?.id}
         getLabel={(item) => item?.name ?? ''}
+        optionTestid={(option) => testId(`workspace-option-${option.value}`)}
         onChange={handleWorkspacesChange}
       />
     </div>
 
-    <div>
+    <div data-testid={testId('status-filter')}>
       <span class="block text-xs font-medium mb-1.5" style="color: var(--ds-text-subtle);">
         {t('collections.status')}
       </span>
@@ -202,11 +212,12 @@
         placeholder={t('collections.selectStatuses')}
         getValue={(item) => item?.id}
         getLabel={(item) => item?.name ?? ''}
+        optionTestid={(option) => testId(`status-option-${option.value}`)}
         onChange={handleStatusesChange}
       />
     </div>
 
-    <div>
+    <div data-testid={testId('priority-filter')}>
       <span class="block text-xs font-medium mb-1.5" style="color: var(--ds-text-subtle);">
         {t('collections.priority')}
       </span>
@@ -217,6 +228,7 @@
         placeholder={t('collections.selectPriorities')}
         getValue={(item) => item?.id}
         getLabel={(item) => item?.name ?? ''}
+        optionTestid={(option) => testId(`priority-option-${option.value}`)}
         onChange={handlePrioritiesChange}
       />
     </div>
@@ -225,13 +237,16 @@
       <DynamicFieldFilter
         {filter}
         compact={true}
+        testIdPrefix={testId(`dynamic-filter-${index}`)}
         onchange={(data) => handleDynamicFilterChange(index, data)}
         onremove={() => removeDynamicFilter(index)}
         onexecute={handleDynamicFilterExecute}
       />
     {/each}
 
+    <!-- shortcut-guard-exempt: contextual filter-row action; no global shortcut -->
     <Button
+      dataTestid={testId('add-dynamic-filter')}
       variant="ghost"
       size="sm"
       icon={Plus}
@@ -248,17 +263,27 @@
     <h3 class="text-lg font-semibold mb-4" style="color: var(--ds-text);">
       {t('collections.searchItemsTitle')}
     </h3>
-    <input
+    <Input
+      dataTestid={testId('search-input', 'work-item-search-modal-input')}
       type="text"
       bind:value={tempSearchQuery}
       placeholder={t('collections.enterSearchText')}
-      class="w-full px-3 py-2 text-sm border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-      style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+      size="small"
     />
     <div class="flex justify-end gap-2 mt-4">
       <Button variant="ghost" size="sm" onclick={clearSearch}>{t('collections.clear')}</Button>
       <Button variant="ghost" size="sm" onclick={closeSearchModal}>{t('common.cancel')}</Button>
-      <Button variant="primary" size="sm" onclick={applySearch}>{t('collections.apply')}</Button>
+      <Button dataTestid={testId('search-apply', 'work-item-search-apply')} variant="primary" size="sm" onclick={applySearch}>{t('collections.apply')}</Button>
     </div>
   </div>
 </Modal>
+
+<style>
+  .filter-open {
+    border-color: var(--ds-border);
+  }
+
+  .filter-open:hover {
+    border-color: var(--ds-border-bold);
+  }
+</style>

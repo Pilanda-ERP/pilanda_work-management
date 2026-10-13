@@ -18,6 +18,7 @@ type IssueSyncHandler struct {
 	issueSyncService  *scm.IssueSyncService
 	permissionService *services.PermissionService
 	auditor           *logger.Auditor
+	syncConfigChanged func()
 }
 
 // NewIssueSyncHandler creates a new IssueSyncHandler.
@@ -27,6 +28,10 @@ func NewIssueSyncHandler(issueSyncService *scm.IssueSyncService, permService *se
 		permissionService: permService,
 		auditor:           auditor,
 	}
+}
+
+func (h *IssueSyncHandler) SetSyncConfigChanged(callback func()) {
+	h.syncConfigChanged = callback
 }
 
 // validateSyncConfigRequest gates the user-supplied fields on a sync-config
@@ -140,7 +145,7 @@ func (h *IssueSyncHandler) CreateSyncConfig(w http.ResponseWriter, r *http.Reque
 	}
 
 	var req models.IssueSyncConfigRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "Invalid request body")
 		return
 	}
@@ -180,6 +185,9 @@ func (h *IssueSyncHandler) CreateSyncConfig(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if h.syncConfigChanged != nil {
+		h.syncConfigChanged()
+	}
 	h.audit(r, user, logger.ActionIssueSyncConfigCreate, config)
 	respondJSONCreated(w, config)
 }
@@ -192,7 +200,7 @@ func (h *IssueSyncHandler) UpdateSyncConfig(w http.ResponseWriter, r *http.Reque
 	}
 
 	var req models.IssueSyncConfigRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "Invalid request body")
 		return
 	}
@@ -246,6 +254,9 @@ func (h *IssueSyncHandler) UpdateSyncConfig(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if h.syncConfigChanged != nil {
+		h.syncConfigChanged()
+	}
 	h.audit(r, user, logger.ActionIssueSyncConfigUpdate, updated)
 	respondJSONOK(w, updated)
 }
@@ -262,6 +273,9 @@ func (h *IssueSyncHandler) DeleteSyncConfig(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if h.syncConfigChanged != nil {
+		h.syncConfigChanged()
+	}
 	h.audit(r, user, logger.ActionIssueSyncConfigDelete, config)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -286,7 +300,7 @@ func (h *IssueSyncHandler) audit(r *http.Request, user *models.User, action stri
 	if h.auditor == nil || user == nil || config == nil {
 		return
 	}
-	h.auditor.LogWithDetails(r, user, action, logger.ResourceIssueSyncConfig, &config.ID, config.RepositoryName, map[string]interface{}{
+	h.auditor.LogWithDetails(r, user, action, logger.ResourceIssueSyncConfig, &config.ID, config.RepositoryName, map[string]any{
 		"workspace_id":            config.WorkspaceID,
 		"workspace_repository_id": config.WorkspaceRepositoryID,
 		"sync_enabled":            config.SyncEnabled,
@@ -310,11 +324,11 @@ func (h *IssueSyncHandler) GetSyncStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if config == nil {
-		respondJSONOK(w, map[string]interface{}{"configured": false})
+		respondJSONOK(w, map[string]any{"configured": false})
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"configured":        true,
 		"sync_enabled":      config.SyncEnabled,
 		"last_sync_at":      config.LastFullSyncAt,
@@ -336,7 +350,7 @@ func (h *IssueSyncHandler) GetSyncedItems(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if config == nil {
-		respondJSONOK(w, []interface{}{})
+		respondJSONOK(w, []any{})
 		return
 	}
 

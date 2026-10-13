@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -51,7 +50,7 @@ func (h *PersonalLabelHandler) GetAll(w http.ResponseWriter, r *http.Request) {
 		SELECT id, name, color, user_id, created_at, updated_at
 		FROM personal_labels
 		WHERE `
-	var args []interface{}
+	var args []any
 
 	switch userIDParam {
 	case "":
@@ -128,7 +127,7 @@ func (h *PersonalLabelHandler) validatePersonalLabel(w http.ResponseWriter, r *h
 	var existingCount int
 	if label.UserID != nil {
 		query := "SELECT COUNT(*) FROM personal_labels WHERE name = ? AND user_id = ?"
-		args := []interface{}{label.Name, *label.UserID}
+		args := []any{label.Name, *label.UserID}
 		if excludeID > 0 {
 			query += " AND id != ?"
 			args = append(args, excludeID)
@@ -139,7 +138,7 @@ func (h *PersonalLabelHandler) validatePersonalLabel(w http.ResponseWriter, r *h
 		}
 	} else {
 		query := "SELECT COUNT(*) FROM personal_labels WHERE name = ? AND user_id IS NULL"
-		args := []interface{}{label.Name}
+		args := []any{label.Name}
 		if excludeID > 0 {
 			query += " AND id != ?"
 			args = append(args, excludeID)
@@ -211,6 +210,12 @@ func (h *PersonalLabelHandler) Create(w http.ResponseWriter, r *http.Request) {
 	`, label.Name, label.Color, label.UserID, now, now).Scan(&id)
 
 	if err != nil {
+		// The per-user unique index fires when the scoped pre-check raced with
+		// a concurrent create for the same user.
+		if database.IsUniqueConstraintError(err) {
+			respondConflict(w, r, "A label with this name already exists")
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
@@ -265,6 +270,10 @@ func (h *PersonalLabelHandler) Update(w http.ResponseWriter, r *http.Request) {
 		SET name = ?, color = ?, user_id = ?, updated_at = ?
 		WHERE id = ?
 	`, label.Name, label.Color, label.UserID, now, id); err != nil {
+		if database.IsUniqueConstraintError(err) {
+			respondConflict(w, r, "A label with this name already exists")
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
@@ -403,7 +412,7 @@ func (h *PersonalLabelHandler) SetItemPersonalLabels(w http.ResponseWriter, r *h
 	var input struct {
 		LabelIDs []int `json:"label_ids"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&input); err != nil {
 		respondBadRequest(w, r, err.Error())
 		return
 	}
@@ -476,7 +485,7 @@ func (h *PersonalLabelHandler) AddItemPersonalLabel(w http.ResponseWriter, r *ht
 	var input struct {
 		LabelID int `json:"label_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&input); err != nil {
 		respondBadRequest(w, r, err.Error())
 		return
 	}
@@ -591,64 +600,4 @@ func (h *PersonalLabelHandler) respondItemPersonalLabels(w http.ResponseWriter, 
 	}
 
 	respondJSONOK(w, labels)
-}
-
-// LoadPersonalLabelsForItems bulk-loads personal labels for a slice of items
-// in a single query, attaching them to each item's PersonalLabels field.
-// The viewing user determines visibility: a user only sees their own personal
-// labels plus any shared (user_id IS NULL) labels.
-func LoadPersonalLabelsForItems(db database.Database, items []models.Item, viewingUserID int) error {
-	if len(items) == 0 {
-		return nil
-	}
-
-	itemIDs := make([]interface{}, 0, len(items)+1)
-	placeholders := make([]string, 0, len(items))
-	for _, item := range items {
-		itemIDs = append(itemIDs, item.ID)
-		placeholders = append(placeholders, "?")
-	}
-	itemIDs = append(itemIDs, viewingUserID)
-
-	query := fmt.Sprintf(`
-		SELECT pil.item_id, pl.id, pl.name, pl.color, pl.user_id, pl.created_at, pl.updated_at
-		FROM personal_item_labels pil
-		JOIN personal_labels pl ON pil.personal_label_id = pl.id
-		WHERE pil.item_id IN (%s)
-		  AND (pl.user_id IS NULL OR pl.user_id = ?)
-		ORDER BY pl.name
-	`, strings.Join(placeholders, ","))
-
-	rows, err := db.Query(query, itemIDs...)
-	if err != nil {
-		return fmt.Errorf("failed to load personal labels for items: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	labelMap := make(map[int][]models.PersonalLabel)
-	for rows.Next() {
-		var itemID int
-		var label models.PersonalLabel
-		var userID sql.NullInt64
-		if err := rows.Scan(&itemID, &label.ID, &label.Name, &label.Color, &userID,
-			&label.CreatedAt, &label.UpdatedAt); err != nil {
-			return fmt.Errorf("failed to scan personal label: %w", err)
-		}
-		if userID.Valid {
-			v := int(userID.Int64)
-			label.UserID = &v
-		}
-		labelMap[itemID] = append(labelMap[itemID], label)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate personal labels: %w", err)
-	}
-
-	for i := range items {
-		if labels, ok := labelMap[items[i].ID]; ok {
-			items[i].PersonalLabels = labels
-		}
-	}
-
-	return nil
 }

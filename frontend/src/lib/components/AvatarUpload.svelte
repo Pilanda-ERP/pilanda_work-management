@@ -1,17 +1,7 @@
 <script>
-  /**
-   * AvatarUpload - reusable avatar upload control.
-   *
-   * Mirrors the workspace avatar pattern in WorkspaceLookAndFeel. Wraps
-   * api.attachments.upload with the agreed entity category, an
-   * attachmentStatus.enabled gate, image-MIME validation, and toast
-   * feedback. The fallback rendering shows a colored tile with the
-   * supplied icon component when no avatar is present.
-   *
-   * Backend categories must mirror this list: workspace_avatar,
-   * team_avatar, customer_avatar, etc. — adding a new one requires
-   * a corresponding case in internal/handlers/attachment.go.
-   */
+  import FileInput from './FileInput.svelte';
+  /** Reusable image-avatar upload control with availability/MIME checks and
+   * fallback tile. Categories require matching backend attachment support. */
   import { Camera, Trash2, Package } from '@lucide/svelte';
   import { api } from '../api.js';
   import { attachmentStatus } from '../stores';
@@ -123,15 +113,14 @@
 
   {#if showUpload && attachmentStatus.enabled}
     <div class="p-4 rounded border" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-      <input
-        type="file"
+      <FileInput
         accept="image/*"
         onchange={(e) => handleFiles(e.currentTarget.files)}
         disabled={uploading}
-        class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
+        class="block w-full text-sm text-ds-text-subtle file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-ds-background-neutral file:text-ds-text-link hover:file:bg-ds-background-neutral-hovered disabled:opacity-50"
       />
       {#if uploading}
-        <div class="mt-2 text-sm text-blue-600">{t('workspaceSettings.uploading')}</div>
+        <div class="mt-2 text-sm text-ds-interactive">{t('workspaceSettings.uploading')}</div>
       {/if}
       <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
         {t('workspaceSettings.uploadRecommendation')}

@@ -5,7 +5,10 @@
   import { t } from '../stores/i18n.svelte.js';
   import { sanitizeHtml } from '../utils/sanitize.ts';
   import { tick } from 'svelte';
+  import { toStore } from 'svelte/store';
   import Checkbox from '../components/Checkbox.svelte';
+  import Input from '../components/Input.svelte';
+  import ItemTypeIcon from '../components/ItemTypeIcon.svelte';
 
   let {
     triggerText = '',
@@ -17,6 +20,7 @@
     triggerGap = 'gap-2',
     items = [],
     maxWidth = 'max-w-3xl',
+    matchTriggerWidth = false,
     /** @type {'bottom' | 'bottom-start' | 'bottom-end' | 'top' | 'top-start' | 'top-end' | 'left' | 'left-start' | 'left-end' | 'right' | 'right-start' | 'right-end'} */
     placement = 'bottom',
     align = undefined,
@@ -28,22 +32,39 @@
     triggerAlignment = 'center',
     disabled = false,
     triggerTestid = '',
+    triggerLabel = '',
+    isOpen = $bindable(false),
+    onOpenChange = null,
     children = undefined
   } = $props();
 
   const isDisabled = $derived(disabled || (items.length === 0 && !children));
 
   // Create popover (replaces createDropdownMenu to avoid typeahead focus-stealing)
+  const controlledOpen = toStore(
+    () => isOpen,
+    (value) => {
+      if (isOpen === value) return;
+      isOpen = value;
+      onOpenChange?.(value);
+    }
+  );
+
   const {
     elements: { trigger, content },
     states: { open }
   } = createPopover(/** @type {any} */ ({
     forceVisible: true,
     positioning: {
+      strategy: 'fixed',
+      fitViewport: true,
+      // svelte-ignore state_referenced_locally
+      sameWidth: matchTriggerWidth,
       // svelte-ignore state_referenced_locally
       placement: /** @type {import('@floating-ui/dom').Placement} */ (placement || 'bottom')
     },
     portal: 'body',
+    open: controlledOpen,
     // svelte-ignore state_referenced_locally
     disabled: isDisabled
   }));
@@ -75,7 +96,7 @@
         } else {
           const container = document.querySelector('[data-menu-container]');
           if (container) {
-            const firstItem = container.querySelector('button[data-menu-item]');
+            const firstItem = container.querySelector('[data-menu-item]');
             if (firstItem) /** @type {HTMLElement} */ (firstItem).focus({ preventScroll: true });
           }
         }
@@ -100,7 +121,7 @@
   }
 
   function handleMenuKeydown(e) {
-    const focusableItems = [...e.currentTarget.querySelectorAll('button[data-menu-item]')];
+    const focusableItems = [...e.currentTarget.querySelectorAll('[data-menu-item]')];
     const currentIndex = focusableItems.indexOf(document.activeElement);
 
     if (e.key === 'ArrowDown') {
@@ -133,9 +154,14 @@
   }
 
   function handleItemClick(itemData, event) {
-    // Stop event from bubbling to prevent it from reaching modal overlays
-    if (event) {
+    // Action items must not reach modal overlays. Links keep bubbling so the
+    // app router can intercept plain clicks while modified clicks stay native.
+    if (event && !itemData.href) {
       event.stopPropagation();
+    }
+
+    if (itemData.disabled) {
+      return;
     }
 
     if (itemData.type === 'checkbox' && itemData.onChange) {
@@ -159,6 +185,8 @@
     use:melt={$trigger}
     disabled={isDisabled}
     data-testid={triggerTestid || undefined}
+    aria-label={triggerLabel || triggerText || undefined}
+    title={triggerText || undefined}
     onclick={(e) => e.stopPropagation()}
     onkeydown={(e) => e.stopPropagation()}
     class="{triggerAvatar ? 'p-0' : iconOnly ? '' : triggerClass ? '' : 'px-4 py-2'} rounded text-sm font-medium transition flex items-center {alignmentClass} {triggerGap} flex-shrink-0 {triggerBgColor ? getTextColorForBackground(triggerBgColor) : ''} {triggerClass} {isDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}"
@@ -170,9 +198,9 @@
         <ChevronDown class="w-3 h-3" />
       {/if}
     {:else if triggerAvatar}
-      <img src={triggerAvatar} alt={t('common.profile')} class="w-8 h-8 rounded-full object-cover flex-shrink-0" />
+      <img src={triggerAvatar} alt={t('common.profile')} class="w-8 min-w-8 h-8 rounded-full object-cover flex-none" />
       {#if triggerText}
-        <span class="text-sm whitespace-nowrap">{triggerText}</span>
+        <span class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-sm">{triggerText}</span>
       {/if}
       {#if showChevron && !isDisabled}
         <ChevronDown class="w-3 h-3" />
@@ -197,7 +225,9 @@
         {/if}
       {/if}
       {#if triggerText}
-        <span class="{triggerAlignment === 'between' ? 'flex-1 text-left' : ''}">{triggerText}</span>
+        <span
+          class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap {triggerAlignment === 'between' || triggerAlignment === 'start' ? 'flex-1 text-left' : ''}"
+        >{triggerText}</span>
       {/if}
       {#if showChevron && !isDisabled}
         <ChevronDown class="w-3 h-3 flex-shrink-0" />
@@ -211,9 +241,11 @@
   <div
     use:melt={$content}
     data-menu-container
+    data-testid={triggerTestid ? `${triggerTestid}-menu` : undefined}
     role="menu"
+    tabindex="-1"
     onkeydown={handleMenuKeydown}
-    class="{maxWidth} rounded shadow-xl border focus:outline-none z-[60]"
+    class="{maxWidth} rounded shadow-xl border overflow-y-auto overscroll-contain focus:outline-none z-[60]"
     style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.25), 0 10px 10px -5px rgba(0, 0, 0, 0.15);"
   >
     <div>
@@ -224,10 +256,10 @@
           <div class="px-4 py-3 text-sm text-center italic" style="color: var(--ds-text-subtle);">{itemData.text}</div>
         {:else if itemData.type === 'search'}
           <div class="px-3 py-2 border-b" style="border-color: var(--ds-border);">
-            <input
-              bind:this={searchInputElement}
+            <Input
+              bind:inputRef={searchInputElement}
               type="text"
-              data-testid={itemData.testid || undefined}
+              dataTestid={itemData.testid || undefined}
               placeholder={itemData.placeholder || t('common.search')}
               value={itemData.value || ''}
               oninput={(e) => itemData.onInput && itemData.onInput(/** @type {HTMLInputElement} */ (e.target).value)}
@@ -237,7 +269,7 @@
                   e.preventDefault();
                   const container = /** @type {HTMLElement} */ (e.target).closest('[data-menu-container]');
                   if (container) {
-                    const firstItem = container.querySelector('button[data-menu-item]');
+                    const firstItem = container.querySelector('[data-menu-item]');
                     if (firstItem) /** @type {HTMLElement} */ (firstItem).focus();
                   }
                   return;
@@ -256,13 +288,11 @@
           {@const accordionExpanded = isAccordionExpanded(itemData)}
           <button
             data-menu-item
+            data-testid={itemData.testid || undefined}
             role="menuitem"
             aria-expanded={accordionExpanded}
             onclick={(e) => { e.stopPropagation(); toggleAccordion(itemData.id); }}
-            class="flex items-center w-full px-4 py-3 text-sm transition-all duration-200 cursor-pointer"
-            style="color: var(--ds-text);"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+            class="menu-item flex items-center w-full px-4 py-3 text-sm transition-all duration-200 cursor-pointer"
           >
             {#if itemData.icon}
               {#if itemData.iconColor}
@@ -292,13 +322,12 @@
             {#each itemData.subItems as subItem (subItem.id)}
               <button
                 data-menu-item
+                data-testid={subItem.testid || undefined}
                 role="menuitemradio"
                 aria-checked={!!subItem.selected}
                 onclick={(e) => handleItemClick(subItem, e)}
-                class="flex items-center w-full pl-14 pr-4 py-2 text-sm transition-all duration-200 cursor-pointer"
+                class="menu-item flex items-center w-full pl-14 pr-4 py-2 text-sm transition-all duration-200 cursor-pointer"
                 style="color: var(--ds-text); {subItem.selected ? 'background-color: var(--ds-background-selected);' : ''}"
-                onmouseenter={(e) => { if (!subItem.selected) e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'; }}
-                onmouseleave={(e) => e.currentTarget.style.backgroundColor = subItem.selected ? 'var(--ds-background-selected)' : ''}
               >
                 {#if subItem.icon}
                   {@const SubIcon = subItem.icon}
@@ -313,16 +342,18 @@
           {/if}
         {:else if itemData.type === 'group'}
           {#each itemData.items as groupItem (groupItem.id)}
-            <button
+            <svelte:element
+              this={groupItem.href ? 'a' : 'button'}
+              href={groupItem.href || undefined}
+              type={groupItem.href ? undefined : 'button'}
               data-menu-item
               data-testid={groupItem.testid || undefined}
               data-id={groupItem.id ?? undefined}
               role="menuitem"
+              tabindex="0"
               onclick={(e) => handleItemClick(groupItem, e)}
-              class="flex items-center w-full px-4 py-3 text-sm transition-all duration-200 cursor-pointer {groupItem.class || 'group'}"
+              class="menu-item flex items-center w-full px-4 py-3 text-sm transition-all duration-200 cursor-pointer {groupItem.class || 'group'}"
               style="color: {groupItem.color || 'var(--ds-text)'};"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
             >
               {#if groupItem.type === 'checkbox'}
                 <div class="mr-3 pointer-events-none">
@@ -362,20 +393,23 @@
               {#if groupItem.badge}
                 <span class="text-xs px-2 py-1 rounded-full" style="color: var(--ds-text-subtlest); background-color: var(--ds-background-neutral);">{groupItem.badge}</span>
               {/if}
-            </button>
+            </svelte:element>
           {/each}
         {:else}
           <!-- Regular item -->
-          <button
+          <svelte:element
+            this={itemData.href ? 'a' : 'button'}
+            href={itemData.href || undefined}
+            type={itemData.href ? undefined : 'button'}
             data-menu-item
             data-testid={itemData.testid || undefined}
             data-id={itemData.id ?? undefined}
             role="menuitem"
+            aria-disabled={itemData.disabled ? 'true' : undefined}
+            tabindex={itemData.disabled ? -1 : 0}
             onclick={(e) => handleItemClick(itemData, e)}
-            class="flex items-center w-full px-4 py-3 text-sm transition-all duration-200 cursor-pointer {itemData.class || ''}"
+            class="menu-item flex items-center w-full px-4 py-3 text-sm transition-all duration-200 cursor-pointer {itemData.disabled ? 'opacity-50 cursor-not-allowed pointer-events-none' : ''} {itemData.class || ''}"
             style="color: {itemData.color || 'var(--ds-text)'}; {itemData.style || ''}"
-            onmouseenter={(e) => { if (!itemData.style) e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'; }}
-            onmouseleave={(e) => { if (!itemData.style) e.currentTarget.style.backgroundColor = ''; }}
           >
             {#if itemData.type === 'checkbox'}
               <div class="mr-3 pointer-events-none">
@@ -386,6 +420,8 @@
                 class="w-2 h-2 mr-3 rounded-full flex-shrink-0"
                 style="background-color: {itemData.iconColor || 'var(--ds-icon-subtle)'};"
               ></span>
+            {:else if itemData.itemType}
+              <ItemTypeIcon itemType={itemData.itemType} class="mr-3" />
             {:else if itemData.icon}
               {#if itemData.iconColor}
                 {@const ItemIcon = itemData.icon}
@@ -414,11 +450,28 @@
             </div>
 
             {#if itemData.badge}
-              <span class="ml-auto text-xs {itemData.badgeClass || ''}" style="{itemData.badgeStyle || (itemData.badgeClass ? '' : 'color: var(--ds-text-subtlest);')}">{itemData.badge}</span>
+              <span
+                class="ml-auto text-xs {itemData.badgeClass || ''} {itemData.subtitle ? 'self-start mt-0.5' : ''}"
+                style="{itemData.badgeStyle || (itemData.badgeClass ? '' : 'color: var(--ds-text-subtlest);')}"
+              >{itemData.badge}</span>
             {/if}
-          </button>
+            {#if itemData.selected}
+              <Check class="ml-3 w-4 h-4 flex-shrink-0" style="color: var(--ds-icon-brand);" />
+            {/if}
+          </svelte:element>
         {/if}
       {/each}
     </div>
   </div>
 {/if}
+
+<style>
+  .menu-item:hover {
+    background-color: var(--ds-surface-raised-hovered);
+  }
+
+  /* Radio-checked items keep their selected background instead of the hover. */
+  .menu-item[aria-checked='true']:hover {
+    background-color: var(--ds-background-selected);
+  }
+</style>

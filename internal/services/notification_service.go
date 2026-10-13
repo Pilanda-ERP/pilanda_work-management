@@ -1,7 +1,10 @@
 package services
 
 import (
+	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +16,7 @@ import (
 
 	"windshift/internal/database"
 	"windshift/internal/models"
+	"windshift/internal/repository"
 )
 
 // NotificationManager interface for adding notifications. AddNotification
@@ -20,6 +24,8 @@ import (
 // callers that only need delivery can discard the returned value.
 type NotificationManager interface {
 	AddNotification(notification models.Notification) (models.Notification, error)
+	AddNotifications(notifications []models.Notification) ([]models.Notification, error)
+	AddNotificationsContext(ctx context.Context, notifications []models.Notification) ([]models.Notification, error)
 	DeleteUserNotifications(userID int) error
 	MarkNotificationsSent(notificationIDs []int) error
 	MarkNotificationsSendFailed(notificationIDs []int) error
@@ -28,14 +34,18 @@ type NotificationManager interface {
 
 // NotificationEvent represents an event that should trigger notifications
 type NotificationEvent struct {
-	EventType    string                 // e.g., "item.created", "comment.added"
-	WorkspaceID  int                    // Workspace where event occurred
-	ActorUserID  int                    // User who triggered the event
-	ItemID       int                    // Work item ID (for action URL)
-	AssigneeID   *int                   // Current assignee (if applicable)
-	CreatorID    *int                   // Item creator (if applicable)
-	Title        string                 // Event title
-	TemplateData map[string]interface{} // Data for template substitution
+	EventType                     string         // e.g., "item.created", "comment.added"
+	WorkspaceID                   int            // Workspace where event occurred
+	ActorUserID                   int            // User who triggered the event
+	ItemID                        int            // Work item ID (for action URL)
+	AssigneeID                    *int           // Current assignee (if applicable)
+	CreatorID                     *int           // Item creator (if applicable)
+	Title                         string         // Event title
+	TemplateData                  map[string]any // Data for template substitution
+	ReferencedWorkspaceID         int            // Optional secondary workspace whose content appears in TemplateData
+	ReferencedWorkspacePermission string         // Permission required to receive secondary-entity data
+	ReferencedEntityType          string         // Entity whose rendered data requires independent authorization
+	ReferencedEntityID            int            // Referenced entity ID
 }
 
 // RuleCache stores cached notification rules for fast lookup
@@ -45,21 +55,36 @@ type RuleCache struct {
 	Templates           map[string]string                      // template_name -> content
 	DefaultConfigSetID  int                                    // configuration_sets.is_default — fallback scheme when a workspace has none
 	PersonalWorkspaces  map[int]bool                           // workspace_id -> true for is_personal workspaces (never notified)
-	LastRefreshed       time.Time
+	// SuppressAll fails closed: the personal-workspace load failed, so the
+	// exclusion set can't be trusted. Rule-based dispatch stops entirely until
+	// the next successful refresh instead of notifying personal workspaces.
+	SuppressAll   bool
+	LastRefreshed time.Time
 }
 
 // NotificationServiceConfig represents configuration for the notification service
 type NotificationServiceConfig struct {
-	RefreshInterval time.Duration // How often to refresh rules cache
-	EventBufferSize int           // Size of event channel buffer
+	RefreshInterval     time.Duration // How often to refresh rules cache
+	EventBufferSize     int           // Hard bound for queued events
+	EventWorkers        int           // Bounded concurrent event processors
+	EventProcessTimeout time.Duration // Deadline for one event
+	ShutdownTimeout     time.Duration // Deadline used by Close
 }
 
 // DefaultNotificationServiceConfig returns default configuration
 func DefaultNotificationServiceConfig() NotificationServiceConfig {
 	return NotificationServiceConfig{
-		RefreshInterval: 5 * time.Minute,
-		EventBufferSize: 1000,
+		RefreshInterval:     5 * time.Minute,
+		EventBufferSize:     1000,
+		EventWorkers:        4,
+		EventProcessTimeout: 15 * time.Second,
+		ShutdownTimeout:     20 * time.Second,
 	}
+}
+
+type queuedNotificationEvent struct {
+	event      *NotificationEvent
+	enqueuedAt time.Time
 }
 
 // UserNotificationBatch is a set of unread notifications destined for one
@@ -72,11 +97,34 @@ type UserNotificationBatch struct {
 	NotificationIDs []int
 }
 
+const (
+	notificationEmailPending = "pending"
+	notificationEmailClaimed = "claimed"
+	notificationEmailSent    = "sent"
+	notificationEmailFailed  = "failed"
+
+	// maxNotificationEmailRecipients caps how many distinct recipients one
+	// batching tick resolves. Recipients beyond the cap are served on the
+	// next tick; their notifications stay eligible until then.
+	maxNotificationEmailRecipients = 200
+)
+
+var ErrNotificationEmailClaimLost = errors.New("notification email claim lost")
+
+// NotificationEmailClaim fences one recipient batch to a scheduler instance.
+type NotificationEmailClaim struct {
+	*UserNotificationBatch
+	Owner     string
+	Token     string
+	ExpiresAt time.Time
+}
+
 // NotificationService handles asynchronous notification creation
 type NotificationService struct {
 	db                  database.Database
 	notificationManager NotificationManager
 	permService         *PermissionService
+	notificationAuth    *NotificationAuthorizer
 	config              NotificationServiceConfig
 
 	// Rule cache
@@ -84,105 +132,415 @@ type NotificationService struct {
 	cacheMu   sync.RWMutex
 
 	// Event processing
-	eventChan chan *NotificationEvent
-	stopChan  chan struct{}
-	wg        sync.WaitGroup
+	eventChan      chan queuedNotificationEvent
+	cacheStop      chan struct{}
+	emitMu         sync.RWMutex
+	closeOnce      sync.Once
+	closed         bool
+	workerCtx      context.Context
+	workerCancel   context.CancelFunc
+	processEventFn func(context.Context, *NotificationEvent) error
+	durableIngress *DurableNotificationIngress
+	wg             sync.WaitGroup
 
 	// Statistics
-	eventsProcessed int64
-	cacheHits       int64
-	cacheMisses     int64
-	errors          int64
+	eventsProcessed  int64
+	eventsDropped    int64
+	eventsQueued     int64
+	activeWorkers    int64
+	maxActiveWorkers int64
+	lastQueueWaitNS  int64
+	maxQueueWaitNS   int64
+	cacheHits        int64
+	cacheMisses      int64
+	errors           int64
 }
 
-// UnreadEmailBatches returns notifications that still need emailing, grouped by
-// user. It filters out in-app-read notifications so a user who reads their tray
-// within the batch window doesn't get a redundant email, and caps each user's
-// batch at maxBatchSize via SQL ROW_NUMBER so a user with a huge backlog (say
-// 100k unread) doesn't drag the entire row set across the wire just to keep a
-// handful of them. Window functions are supported on SQLite 3.25+ and on every
-// supported Postgres version.
+// UnreadEmailBatches resolves one current workspace scope per recipient, then
+// bulk-filters and caps that recipient's pending rows. Legacy scopes fail closed.
 func (ns *NotificationService) UnreadEmailBatches(maxBatchSize int) (map[string]*UserNotificationBatch, error) {
-	query := `
-		SELECT id, user_id, title, message, type, timestamp, read,
-		       sent_at, avatar, action_url, metadata, created_at, updated_at,
-		       email, first_name, last_name
-		FROM (
-			SELECT n.id, n.user_id, n.title, n.message, n.type, n.timestamp, n.read,
-			       n.sent_at, n.avatar, n.action_url, n.metadata, n.created_at, n.updated_at,
-			       u.email, u.first_name, u.last_name,
-			       ROW_NUMBER() OVER (PARTITION BY u.email ORDER BY n.timestamp DESC) AS rn
-			FROM notifications n
-			JOIN users u ON n.user_id = u.id
-			WHERE n.sent_at IS NULL AND n.read = false AND u.email != ''
-		) ranked
-		WHERE rn <= ?
-		ORDER BY email, timestamp DESC
-	`
+	return ns.unreadEmailBatches(maxBatchSize, time.Now())
+}
 
-	rows, err := ns.db.Query(query, maxBatchSize)
+func (ns *NotificationService) unreadEmailBatches(maxBatchSize int, now time.Time) (map[string]*UserNotificationBatch, error) {
+	// The cap keeps each tick's recipient scan bounded; recipients beyond it
+	// are served on the next tick.
+	rows, err := ns.db.Query(`
+		SELECT DISTINCT u.id, u.email, u.first_name, u.last_name
+		FROM notifications n
+		JOIN users u ON n.user_id = u.id
+		WHERE n.sent_at IS NULL AND n.read = false AND u.email != '' AND u.is_active = true
+		  AND (n.email_delivery_state IN (?, ?) OR
+		       (n.email_delivery_state = ? AND (n.email_claim_expires_at IS NULL OR n.email_claim_expires_at <= ?)))
+		  AND n.authorization_scope IN (?, ?, ?)
+		LIMIT ?
+	`, notificationEmailPending, notificationEmailFailed, notificationEmailClaimed, now,
+		models.NotificationScopeSystem, models.NotificationScopeWorkspace, models.NotificationScopeAsset,
+		maxNotificationEmailRecipients)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query unread notifications: %w", err)
+		return nil, fmt.Errorf("query notification email recipients: %w", err)
 	}
-	defer rows.Close()
-
-	userBatches := make(map[string]*UserNotificationBatch)
-
+	type recipient struct {
+		id                 int
+		email, first, last string
+	}
+	recipients := make([]recipient, 0)
 	for rows.Next() {
-		var n models.Notification
-		var avatar, actionURL, metadata *string
-		var email, firstName, lastName string
+		var candidate recipient
+		if err := rows.Scan(&candidate.id, &candidate.email, &candidate.first, &candidate.last); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan notification email recipient: %w", err)
+		}
+		recipients = append(recipients, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterate notification email recipients: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close notification email recipients: %w", err)
+	}
 
-		err := rows.Scan(
-			&n.ID, &n.UserID, &n.Title, &n.Message, &n.Type,
-			&n.Timestamp, &n.Read, &n.SentAt, &avatar, &actionURL, &metadata,
-			&n.CreatedAt, &n.UpdatedAt, &email, &firstName, &lastName,
-		)
+	batches := make(map[string]*UserNotificationBatch, len(recipients))
+	for _, candidate := range recipients {
+		snapshot, err := ns.notificationAuth.Snapshot(candidate.id)
+		if err != nil {
+			return nil, fmt.Errorf("resolve notification scope for user %d: %w", candidate.id, err)
+		}
+		notifications, err := ns.unreadEmailNotificationsForUser(candidate.id, snapshot, maxBatchSize, now)
 		if err != nil {
 			return nil, err
 		}
+		if len(notifications) == 0 {
+			continue
+		}
+		batch := &UserNotificationBatch{
+			UserID:          candidate.id,
+			UserEmail:       candidate.email,
+			UserName:        strings.TrimSpace(candidate.first + " " + candidate.last),
+			Notifications:   notifications,
+			NotificationIDs: make([]int, len(notifications)),
+		}
+		for i, notification := range notifications {
+			batch.NotificationIDs[i] = notification.ID
+		}
+		batches[candidate.email] = batch
+	}
+	return batches, nil
+}
 
-		// Set optional fields
+// notificationPageCursor is the (timestamp, id) keyset for paging one
+// recipient's eligible backlog.
+type notificationPageCursor struct {
+	timestamp time.Time
+	id        int
+}
+
+// unreadEmailNotificationsForUser collects up to limit visible notifications
+// for one recipient. Each SQL page reads at most the remaining row count;
+// authorization filtering happens in Go between pages, so a backlog full of
+// invisible rows still never loads more than one bounded page per query.
+func (ns *NotificationService) unreadEmailNotificationsForUser(userID int, snapshot *NotificationAuthorizationSnapshot, limit int, now time.Time) ([]models.Notification, error) {
+	notifications := make([]models.Notification, 0, limit)
+	seen := make(map[int]bool, limit)
+	cursor := notificationPageCursor{}
+	for len(notifications) < limit {
+		pageSize := limit - len(notifications)
+		page, err := ns.queryUnreadEmailNotificationPage(userID, pageSize, now, cursor)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		previous := cursor
+		for _, notification := range page {
+			cursor = notificationPageCursor{timestamp: notification.Timestamp, id: notification.ID}
+			if seen[notification.ID] {
+				continue
+			}
+			seen[notification.ID] = true
+			visible, err := snapshot.Visible(notification)
+			if err != nil {
+				return nil, err
+			}
+			if visible {
+				notifications = append(notifications, notification)
+			}
+		}
+		if len(page) < pageSize || cursor == previous {
+			break
+		}
+	}
+	return notifications, nil
+}
+
+func (ns *NotificationService) queryUnreadEmailNotificationPage(userID, pageSize int, now time.Time, cursor notificationPageCursor) ([]models.Notification, error) {
+	rows, err := ns.db.Query(`
+		SELECT n.id, n.user_id, n.title, n.message, n.type, n.timestamp, n.read,
+		       n.sent_at, n.avatar, n.action_url, n.metadata, n.authorization_scope,
+		       n.workspace_id, n.item_id, n.source_type, n.source_id,
+		       n.referenced_entity_type, n.referenced_entity_id, n.referenced_workspace_id, n.referenced_workspace_permission,
+		       n.created_at, n.updated_at
+		FROM notifications n
+		WHERE n.user_id = ? AND n.sent_at IS NULL AND n.read = false
+		  AND (n.email_delivery_state IN (?, ?) OR
+		       (n.email_delivery_state = ? AND (n.email_claim_expires_at IS NULL OR n.email_claim_expires_at <= ?)))
+		  AND n.authorization_scope IN (?, ?, ?)
+		  AND (n.timestamp > ? OR (n.timestamp = ? AND n.id > ?))
+		ORDER BY n.timestamp ASC, n.id ASC
+		LIMIT ?
+	`, userID, notificationEmailPending, notificationEmailFailed, notificationEmailClaimed, now,
+		models.NotificationScopeSystem, models.NotificationScopeWorkspace, models.NotificationScopeAsset,
+		cursor.timestamp, cursor.timestamp, cursor.id, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("query unread notifications for user %d: %w", userID, err)
+	}
+	defer rows.Close()
+
+	page := make([]models.Notification, 0, pageSize)
+	for rows.Next() {
+		var notification models.Notification
+		var avatar, actionURL, metadata, sourceType, referencedEntityType, referencedPermission *string
+		if err := rows.Scan(
+			&notification.ID, &notification.UserID, &notification.Title, &notification.Message, &notification.Type,
+			&notification.Timestamp, &notification.Read, &notification.SentAt, &avatar, &actionURL, &metadata,
+			&notification.AuthorizationScope, &notification.WorkspaceID, &notification.ItemID, &sourceType, &notification.SourceID,
+			&referencedEntityType, &notification.ReferencedEntityID, &notification.ReferencedWorkspaceID, &referencedPermission,
+			&notification.CreatedAt, &notification.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan unread notification for user %d: %w", userID, err)
+		}
 		if avatar != nil {
-			n.Avatar = *avatar
+			notification.Avatar = *avatar
 		}
 		if actionURL != nil {
-			n.ActionURL = *actionURL
+			notification.ActionURL = *actionURL
 		}
 		if metadata != nil {
-			n.Metadata = *metadata
+			notification.Metadata = *metadata
 		}
-
-		// Get or create user batch
-		batch, exists := userBatches[email]
-		if !exists {
-			userName := fmt.Sprintf("%s %s", firstName, lastName)
-			batch = &UserNotificationBatch{
-				UserID:          n.UserID,
-				UserEmail:       email,
-				UserName:        userName,
-				Notifications:   []models.Notification{},
-				NotificationIDs: []int{},
-			}
-			userBatches[email] = batch
+		if sourceType != nil {
+			notification.SourceType = *sourceType
 		}
-
-		batch.Notifications = append(batch.Notifications, n)
-		batch.NotificationIDs = append(batch.NotificationIDs, n.ID)
+		if referencedEntityType != nil {
+			notification.ReferencedEntityType = *referencedEntityType
+		}
+		if referencedPermission != nil {
+			notification.ReferencedWorkspacePermission = *referencedPermission
+		}
+		page = append(page, notification)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate unread notifications for user %d: %w", userID, err)
+	}
+	return page, nil
+}
 
-	return userBatches, rows.Err()
+// ClaimUnreadEmailBatches atomically fences each selected recipient batch.
+// Live claims are excluded; expired claims and failed attempts are recoverable.
+func (ns *NotificationService) ClaimUnreadEmailBatches(owner string, now time.Time, lease time.Duration, maxBatchSize int) (map[string]*NotificationEmailClaim, error) {
+	if strings.TrimSpace(owner) == "" {
+		return nil, fmt.Errorf("claim notification email batches: owner is required")
+	}
+	if lease <= 0 {
+		return nil, fmt.Errorf("claim notification email batches: lease must be positive")
+	}
+	batches, err := ns.unreadEmailBatches(maxBatchSize, now)
+	if err != nil {
+		return nil, err
+	}
+	claims := make(map[string]*NotificationEmailClaim, len(batches))
+	for email, batch := range batches {
+		token, err := newNotificationClaimToken()
+		if err != nil {
+			return nil, err
+		}
+		expiresAt := now.Add(lease)
+		claimed, err := ns.claimNotificationIDs(batch.NotificationIDs, owner, token, now, expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		if !claimed {
+			continue
+		}
+		claims[email] = &NotificationEmailClaim{
+			UserNotificationBatch: batch,
+			Owner:                 owner,
+			Token:                 token,
+			ExpiresAt:             expiresAt,
+		}
+	}
+	return claims, nil
+}
+
+func newNotificationClaimToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate notification email claim token: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+func (ns *NotificationService) claimNotificationIDs(ids []int, owner, token string, now, expiresAt time.Time) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := []any{notificationEmailClaimed, owner, token, expiresAt, now}
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, notificationEmailPending, notificationEmailFailed, notificationEmailClaimed, now)
+	result, err := ns.db.ExecWrite(`
+		UPDATE notifications
+		SET email_delivery_state = ?, email_claim_owner = ?, email_claim_token = ?,
+		    email_claim_expires_at = ?, email_delivery_attempts = email_delivery_attempts + 1,
+		    email_last_error = NULL, updated_at = ?
+		WHERE id IN (`+strings.Join(placeholders, ",")+`)
+		  AND sent_at IS NULL AND read = false
+		  AND (email_delivery_state IN (?, ?) OR
+		       (email_delivery_state = ? AND (email_claim_expires_at IS NULL OR email_claim_expires_at <= ?)))
+	`, args...)
+	if err != nil {
+		return false, fmt.Errorf("claim notification email batch: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count claimed notification rows: %w", err)
+	}
+	if affected == int64(len(ids)) {
+		return true, nil
+	}
+	if _, releaseErr := ns.db.ExecWrite(`
+		UPDATE notifications
+		SET email_delivery_state = ?, email_claim_owner = NULL, email_claim_token = NULL,
+		    email_claim_expires_at = NULL, updated_at = ?
+		WHERE email_delivery_state = ? AND email_claim_owner = ? AND email_claim_token = ?
+	`, notificationEmailPending, now, notificationEmailClaimed, owner, token); releaseErr != nil {
+		return false, fmt.Errorf("release partial notification email claim: %w", releaseErr)
+	}
+	return false, nil
+}
+
+// CompleteNotificationEmailClaim records a successful SMTP call. Only the
+// exact live owner/token pair may complete the rows it claimed.
+func (ns *NotificationService) CompleteNotificationEmailClaim(claim *NotificationEmailClaim, now time.Time) error {
+	return ns.transitionNotificationEmailClaim(claim, `
+		email_delivery_state = ?, sent_at = ?, email_claim_owner = NULL,
+		email_claim_token = NULL, email_claim_expires_at = NULL,
+		email_last_error = NULL, last_send_failed = false, updated_at = ?
+	`, notificationEmailSent, now, now)
+}
+
+// FailNotificationEmailClaim records a definite sender error and makes the
+// rows eligible for a later fenced retry.
+func (ns *NotificationService) FailNotificationEmailClaim(claim *NotificationEmailClaim, sendErr error, now time.Time) error {
+	message := "notification email send failed"
+	if sendErr != nil {
+		message = sendErr.Error()
+	}
+	if len(message) > 2000 {
+		message = message[:2000]
+	}
+	return ns.transitionNotificationEmailClaim(claim, `
+		email_delivery_state = ?, email_claim_owner = NULL, email_claim_token = NULL,
+		email_claim_expires_at = NULL, email_last_error = ?, last_send_failed = true,
+		updated_at = ?
+	`, notificationEmailFailed, message, now)
+}
+
+// ReleaseNotificationEmailClaim returns an unsent claim to pending without
+// letting a stale owner alter a newer claim.
+func (ns *NotificationService) ReleaseNotificationEmailClaim(claim *NotificationEmailClaim, now time.Time) error {
+	return ns.transitionNotificationEmailClaim(claim, `
+		email_delivery_state = ?, email_claim_owner = NULL, email_claim_token = NULL,
+		email_claim_expires_at = NULL, updated_at = ?
+	`, notificationEmailPending, now)
+}
+
+// NotificationEmailClaimDeliverable rechecks recipient and content access
+// immediately before SMTP starts. Once SMTP is in progress, deactivation
+// cannot recall a message the remote server may already have accepted.
+func (ns *NotificationService) NotificationEmailClaimDeliverable(claim *NotificationEmailClaim) (bool, error) {
+	if claim == nil || claim.UserNotificationBatch == nil {
+		return false, fmt.Errorf("%w: invalid claim", ErrNotificationEmailClaimLost)
+	}
+	snapshot, err := ns.notificationAuth.Snapshot(claim.UserID)
+	if err != nil {
+		return false, err
+	}
+	for _, notification := range claim.Notifications {
+		visible, err := snapshot.Visible(notification)
+		if err != nil {
+			return false, err
+		}
+		if !visible {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (ns *NotificationService) transitionNotificationEmailClaim(claim *NotificationEmailClaim, setClause string, setArgs ...any) error {
+	if claim == nil || claim.UserNotificationBatch == nil || len(claim.NotificationIDs) == 0 || claim.Owner == "" || claim.Token == "" {
+		return fmt.Errorf("%w: invalid claim", ErrNotificationEmailClaimLost)
+	}
+	placeholders := make([]string, len(claim.NotificationIDs))
+	args := append([]any(nil), setArgs...)
+	args = append(args, notificationEmailClaimed, claim.Owner, claim.Token)
+	for i, id := range claim.NotificationIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	result, err := ns.db.ExecWrite(`UPDATE notifications SET `+setClause+`
+		WHERE email_delivery_state = ? AND email_claim_owner = ? AND email_claim_token = ?
+		  AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("transition notification email claim: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count transitioned notification email rows: %w", err)
+	}
+	if affected != int64(len(claim.NotificationIDs)) {
+		return fmt.Errorf("%w: transitioned %d of %d rows", ErrNotificationEmailClaimLost, affected, len(claim.NotificationIDs))
+	}
+	return nil
 }
 
 // NewNotificationService creates a new notification service. The
 // permService argument is used to re-authorize recipients at delivery time
 // so a user who has lost workspace access does not receive notifications
 // for items in that workspace via a stale watch or admin assignment.
-func NewNotificationService(db database.Database, notificationManager NotificationManager, permService *PermissionService, config NotificationServiceConfig) *NotificationService {
+func NewNotificationService(db database.Database, notificationManager NotificationManager, permService *PermissionService, config NotificationServiceConfig, assetPermissions ...AssetSetPermissionChecker) *NotificationService {
+	defaults := DefaultNotificationServiceConfig()
+	if config.RefreshInterval <= 0 {
+		config.RefreshInterval = defaults.RefreshInterval
+	}
+	if config.EventBufferSize <= 0 {
+		config.EventBufferSize = defaults.EventBufferSize
+	}
+	if config.EventWorkers <= 0 {
+		config.EventWorkers = defaults.EventWorkers
+	}
+	if config.EventProcessTimeout <= 0 {
+		config.EventProcessTimeout = defaults.EventProcessTimeout
+	}
+	if config.ShutdownTimeout <= 0 {
+		config.ShutdownTimeout = defaults.ShutdownTimeout
+	}
+	workerCtx, workerCancel := context.WithCancel(context.Background()) //nolint:gosec // retained and called by CloseContext
+	var assetPermissionChecker AssetSetPermissionChecker
+	if len(assetPermissions) > 0 {
+		assetPermissionChecker = assetPermissions[0]
+	}
 	service := &NotificationService{
 		db:                  db,
 		notificationManager: notificationManager,
 		permService:         permService,
+		notificationAuth:    NewNotificationAuthorizer(db, permService, assetPermissionChecker),
 		config:              config,
 		ruleCache: &RuleCache{
 			WorkspaceConfigSets: make(map[int]int),
@@ -191,8 +549,10 @@ func NewNotificationService(db database.Database, notificationManager Notificati
 			PersonalWorkspaces:  make(map[int]bool),
 			LastRefreshed:       time.Time{},
 		},
-		eventChan: make(chan *NotificationEvent, config.EventBufferSize),
-		stopChan:  make(chan struct{}),
+		eventChan:    make(chan queuedNotificationEvent, config.EventBufferSize),
+		cacheStop:    make(chan struct{}),
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
 	}
 
 	// Load initial cache
@@ -200,12 +560,14 @@ func NewNotificationService(db database.Database, notificationManager Notificati
 		slog.Warn("failed to load initial notification rule cache", slog.String("component", "notifications"), slog.Any("error", err))
 	}
 
-	// Start background workers
-	service.wg.Add(2)
-	go service.eventProcessor()
+	// Start a fixed event worker pool plus the independent cache refresher.
+	service.wg.Add(config.EventWorkers + 1)
+	for workerID := 0; workerID < config.EventWorkers; workerID++ {
+		go service.eventProcessor(workerID)
+	}
 	go service.cacheRefresher()
 
-	slog.Debug("notification service initialized", slog.String("component", "notifications"), slog.Duration("refresh_interval", config.RefreshInterval))
+	slog.Debug("notification service initialized", slog.String("component", "notifications"), slog.Duration("refresh_interval", config.RefreshInterval), slog.Int("event_workers", config.EventWorkers), slog.Int("event_buffer_size", config.EventBufferSize))
 
 	return service
 }
@@ -222,30 +584,108 @@ func itemActionURL(workspaceID, itemID int) string {
 // config use this to avoid the event→rule→recipient pipeline which can't
 // express "notify exactly these users".
 func (ns *NotificationService) NotifyUsers(userIDs []int, workspaceID, itemID, actorUserID int, notifType, title, message string) error {
-	if ns.notificationManager == nil {
-		return fmt.Errorf("notification manager not configured")
+	_, err := ns.NotifyUsersWithRecords(userIDs, workspaceID, itemID, actorUserID, notifType, title, message)
+	return err
+}
+
+// NotifyUsersWithRecords is NotifyUsers but returns the persisted
+// notifications so callers can correlate follow-up delivery. The mention
+// email path needs the notification id to suppress the content-less digest
+// copy once the dedicated email carrying the message body has gone out.
+func (ns *NotificationService) NotifyUsersWithRecords(userIDs []int, workspaceID, itemID, actorUserID int, notifType, title, message string) ([]models.Notification, error) {
+	var authorize func(int) (bool, error)
+	if ns.permService != nil {
+		authorize = func(userID int) (bool, error) {
+			return ns.permService.HasWorkspacePermission(userID, workspaceID, models.PermissionItemView)
+		}
 	}
-	actionURL := itemActionURL(workspaceID, itemID)
+	return ns.notifyUsersAtURL(userIDs, actorUserID, notifType, title, message, itemActionURL(workspaceID, itemID),
+		models.NotificationScopeWorkspace, &workspaceID, &itemID, "item", &itemID, authorize)
+}
+
+// NotifyUsersForAsset creates direct notifications for users who currently
+// retain view access to the asset's set. Asset actions cannot use the
+// workspace notification-rule pipeline, and silently skipping this check
+// would disclose asset-derived titles/messages to arbitrary configured IDs.
+func (ns *NotificationService) NotifyUsersForAsset(userIDs []int, setID, assetID, actorUserID int, notifType, title, message string, includeLink bool, checker AssetSetPermissionChecker) ([]int, error) {
+	if checker == nil {
+		return nil, fmt.Errorf("asset notification blocked: asset permission checker not configured")
+	}
+	actionURL := ""
+	if includeLink {
+		actionURL = fmt.Sprintf("/assets/%d", assetID)
+	}
+	authorize := func(userID int) (bool, error) {
+		return checker.HasAssetSetPermission(userID, setID, AssetPermissionKeyView)
+	}
+	notifications, err := ns.notifyUsersAtURL(userIDs, actorUserID, notifType, title, message, actionURL,
+		models.NotificationScopeAsset, nil, nil, "asset", &assetID, authorize)
+	if err != nil {
+		return nil, err
+	}
+	delivered := make([]int, len(notifications))
+	for i, notification := range notifications {
+		delivered[i] = notification.UserID
+	}
+	return delivered, nil
+}
+
+func (ns *NotificationService) notifyUsersAtURL(
+	userIDs []int,
+	actorUserID int,
+	notifType, title, message, actionURL, authorizationScope string,
+	workspaceID, itemID *int,
+	sourceType string,
+	sourceID *int,
+	authorize func(int) (bool, error),
+) ([]models.Notification, error) {
+	if ns.notificationManager == nil {
+		return nil, fmt.Errorf("notification manager not configured")
+	}
+	skipAsAgent := map[int]bool{}
+	if ns.db != nil {
+		skipAsAgent = ns.agentOrUnknownUsers(userIDs)
+	}
 	seen := make(map[int]bool, len(userIDs))
+	notifications := make([]models.Notification, 0, len(userIDs))
+	now := time.Now()
 	for _, uid := range userIDs {
-		if uid == 0 || uid == actorUserID || seen[uid] {
+		if uid <= 0 || uid == actorUserID || seen[uid] || skipAsAgent[uid] {
 			continue
 		}
 		seen[uid] = true
-		notification := models.Notification{
-			UserID:    uid,
-			Title:     title,
-			Message:   message,
-			Type:      notifType,
-			Timestamp: time.Now(),
-			Read:      false,
-			ActionURL: actionURL,
+		if authorize != nil {
+			allowed, err := authorize(uid)
+			if err != nil {
+				return nil, fmt.Errorf("authorize notification recipient %d: %w", uid, err)
+			}
+			if !allowed {
+				continue
+			}
 		}
-		if _, err := ns.notificationManager.AddNotification(notification); err != nil {
-			return fmt.Errorf("add notification for user %d: %w", uid, err)
-		}
+		notifications = append(notifications, models.Notification{
+			UserID:             uid,
+			Title:              title,
+			Message:            message,
+			Type:               notifType,
+			Timestamp:          now,
+			Read:               false,
+			ActionURL:          actionURL,
+			AuthorizationScope: authorizationScope,
+			WorkspaceID:        workspaceID,
+			ItemID:             itemID,
+			SourceType:         sourceType,
+			SourceID:           sourceID,
+		})
 	}
-	return nil
+	if len(notifications) == 0 {
+		return []models.Notification{}, nil
+	}
+	stored, err := ns.notificationManager.AddNotifications(notifications)
+	if err != nil {
+		return nil, fmt.Errorf("add notifications for %d users: %w", len(notifications), err)
+	}
+	return stored, nil
 }
 
 // CreateNotification stores a single notification through the notification
@@ -292,44 +732,72 @@ func (ns *NotificationService) RollbackNotificationsSent(notificationIDs []int) 
 	return ns.notificationManager.RollbackNotificationsSent(notificationIDs)
 }
 
-// EmitEvent sends an event to be processed asynchronously (non-blocking)
+// EmitEvent durably admits an event when the domain event engine is installed.
+// The bounded in-memory path remains available to standalone embeddings.
 func (ns *NotificationService) EmitEvent(event *NotificationEvent) {
-	slog.Debug("queuing event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("workspace_id", event.WorkspaceID), slog.Int("actor_user_id", event.ActorUserID), slog.Int("item_id", event.ItemID))
+	ns.TryEmitEvent(event)
+}
 
-	select {
-	case ns.eventChan <- event:
-		// Event queued successfully
-		slog.Debug("event queued successfully", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("item_id", event.ItemID))
-	default:
-		// Channel full, log warning but don't block
-		slog.Warn("event channel full, dropping event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("workspace_id", event.WorkspaceID))
+// TryEmitEvent reports whether the event was durably admitted or queued.
+func (ns *NotificationService) TryEmitEvent(event *NotificationEvent) bool {
+	if event == nil {
+		atomic.AddInt64(&ns.eventsDropped, 1)
 		atomic.AddInt64(&ns.errors, 1)
+		return false
+	}
+	slog.Debug("queuing event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("workspace_id", event.WorkspaceID), slog.Int("actor_user_id", event.ActorUserID), slog.Int("item_id", event.ItemID))
+	if ns.durableIngress != nil {
+		if err := ns.durableIngress.Emit(context.Background(), event); err != nil {
+			slog.Error("failed to admit durable notification event", "event_type", event.EventType, "error", err)
+			atomic.AddInt64(&ns.eventsDropped, 1)
+			atomic.AddInt64(&ns.errors, 1)
+			return false
+		}
+		atomic.AddInt64(&ns.eventsQueued, 1)
+		return true
+	}
+
+	ns.emitMu.RLock()
+	defer ns.emitMu.RUnlock()
+	if ns.closed {
+		atomic.AddInt64(&ns.eventsDropped, 1)
+		return false
+	}
+	select {
+	case ns.eventChan <- queuedNotificationEvent{event: event, enqueuedAt: time.Now()}:
+		atomic.AddInt64(&ns.eventsQueued, 1)
+		slog.Debug("event queued successfully", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("item_id", event.ItemID))
+		return true
+	default:
+		slog.Warn("event channel full, dropping event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("workspace_id", event.WorkspaceID))
+		atomic.AddInt64(&ns.eventsDropped, 1)
+		atomic.AddInt64(&ns.errors, 1)
+		return false
 	}
 }
 
-// eventProcessor runs in background and processes events from the channel
-func (ns *NotificationService) eventProcessor() {
+// eventProcessor runs as one member of the fixed worker pool.
+func (ns *NotificationService) eventProcessor(workerID int) {
 	defer ns.wg.Done()
-
-	for {
-		select {
-		case event := <-ns.eventChan:
-			if err := ns.processEvent(event); err != nil {
-				slog.Error("failed to process notification event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Any("error", err))
-				atomic.AddInt64(&ns.errors, 1)
-			} else {
-				atomic.AddInt64(&ns.eventsProcessed, 1)
-			}
-		case <-ns.stopChan:
-			slog.Debug("stopping notification event processor", slog.String("component", "notifications"))
-			// Drain remaining events
-			for len(ns.eventChan) > 0 {
-				event := <-ns.eventChan
-				if err := ns.processEvent(event); err != nil {
-					slog.Error("failed to process notification event during shutdown", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Any("error", err))
-				}
-			}
-			return
+	for queued := range ns.eventChan {
+		wait := time.Since(queued.enqueuedAt)
+		atomic.StoreInt64(&ns.lastQueueWaitNS, int64(wait))
+		updateNotificationServiceMaximum(&ns.maxQueueWaitNS, int64(wait))
+		active := atomic.AddInt64(&ns.activeWorkers, 1)
+		updateNotificationServiceMaximum(&ns.maxActiveWorkers, active)
+		ctx, cancel := context.WithTimeout(ns.workerCtx, ns.config.EventProcessTimeout)
+		processEvent := ns.processEvent
+		if ns.processEventFn != nil {
+			processEvent = ns.processEventFn
+		}
+		err := processEvent(ctx, queued.event)
+		cancel()
+		atomic.AddInt64(&ns.activeWorkers, -1)
+		if err != nil {
+			slog.Error("failed to process notification event", slog.String("component", "notifications"), slog.Int("worker_id", workerID), slog.String("event_type", queued.event.EventType), slog.Any("error", err))
+			atomic.AddInt64(&ns.errors, 1)
+		} else {
+			atomic.AddInt64(&ns.eventsProcessed, 1)
 		}
 	}
 }
@@ -347,7 +815,7 @@ func (ns *NotificationService) cacheRefresher() {
 			if err := ns.refreshRuleCache(); err != nil {
 				slog.Error("failed to refresh notification rule cache", slog.String("component", "notifications"), slog.Any("error", err))
 			}
-		case <-ns.stopChan:
+		case <-ns.cacheStop:
 			slog.Debug("stopping notification cache refresher", slog.String("component", "notifications"))
 			return
 		}
@@ -355,7 +823,11 @@ func (ns *NotificationService) cacheRefresher() {
 }
 
 // processEvent processes a single notification event
-func (ns *NotificationService) processEvent(event *NotificationEvent) error {
+func (ns *NotificationService) processEvent(ctx context.Context, event *NotificationEvent) error {
+	return ns.processEventWithKey(ctx, event, "")
+}
+
+func (ns *NotificationService) processEventWithKey(ctx context.Context, event *NotificationEvent, eventKey string) error {
 	slog.Debug("processing event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("workspace_id", event.WorkspaceID), slog.Int("item_id", event.ItemID))
 
 	// Get configuration set for workspace
@@ -378,7 +850,9 @@ func (ns *NotificationService) processEvent(event *NotificationEvent) error {
 
 	slog.Debug("found rules for event type", slog.String("component", "notifications"), slog.Int("rule_count", len(rules)), slog.String("event_type", event.EventType))
 
-	// Process each rule
+	// Resolve every rule into one atomic recipient batch for this event.
+	notifications := make([]models.Notification, 0)
+	now := time.Now()
 	for _, rule := range rules {
 		if !rule.IsEnabled {
 			slog.Debug("rule is disabled, skipping", slog.String("component", "notifications"), slog.Int("rule_id", rule.ID))
@@ -399,7 +873,7 @@ func (ns *NotificationService) processEvent(event *NotificationEvent) error {
 		// Generate notification message
 		title, message := ns.generateNotificationMessage(event, &rule)
 
-		// Create notification for each recipient
+		// Build one notification for each recipient.
 		for _, userID := range recipients {
 			// Skip if recipient is the actor (don't notify yourself)
 			if userID == event.ActorUserID {
@@ -407,29 +881,38 @@ func (ns *NotificationService) processEvent(event *NotificationEvent) error {
 				continue
 			}
 
-			notification := models.Notification{
-				UserID:    userID,
-				Title:     title,
-				Message:   message,
-				Type:      ns.getNotificationType(event.EventType),
-				Timestamp: time.Now(),
-				Read:      false,
-				ActionURL: itemActionURL(event.WorkspaceID, event.ItemID),
+			deliveryKey := ""
+			if eventKey != "" {
+				deliveryKey = fmt.Sprintf("%s:%d:%d", eventKey, rule.ID, userID)
 			}
-
-			slog.Debug("creating notification for user", slog.String("component", "notifications"), slog.Int("user_id", userID), slog.String("notification_type", notification.Type), slog.String("title", notification.Title))
-
-			// Add to notification manager (BigCache)
-			if _, err := ns.notificationManager.AddNotification(notification); err != nil {
-				slog.Error("failed to add notification for user", slog.String("component", "notifications"), slog.Int("user_id", userID), slog.Any("error", err))
-				return err
-			}
-
-			slog.Debug("successfully created notification for user", slog.String("component", "notifications"), slog.Int("user_id", userID))
+			notifications = append(notifications, models.Notification{
+				UserID:                        userID,
+				Title:                         title,
+				Message:                       message,
+				Type:                          ns.getNotificationType(event.EventType),
+				Timestamp:                     now,
+				Read:                          false,
+				ActionURL:                     itemActionURL(event.WorkspaceID, event.ItemID),
+				AuthorizationScope:            models.NotificationScopeWorkspace,
+				WorkspaceID:                   &event.WorkspaceID,
+				ItemID:                        &event.ItemID,
+				SourceType:                    event.EventType,
+				SourceID:                      &event.ItemID,
+				ReferencedEntityType:          event.ReferencedEntityType,
+				ReferencedEntityID:            positiveIntPointer(event.ReferencedEntityID),
+				ReferencedWorkspaceID:         positiveIntPointer(event.ReferencedWorkspaceID),
+				ReferencedWorkspacePermission: event.ReferencedWorkspacePermission,
+				DeliveryKey:                   deliveryKey,
+			})
+		}
+	}
+	if len(notifications) > 0 {
+		if _, err := ns.notificationManager.AddNotificationsContext(ctx, notifications); err != nil {
+			return fmt.Errorf("persist %d event notifications: %w", len(notifications), err)
 		}
 	}
 
-	slog.Debug("completed processing event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("item_id", event.ItemID))
+	slog.Debug("completed processing event", slog.String("component", "notifications"), slog.String("event_type", event.EventType), slog.Int("item_id", event.ItemID), slog.Int("notification_count", len(notifications)))
 	return nil
 }
 
@@ -460,7 +943,10 @@ func (ns *NotificationService) refreshRuleCache() error {
 	// set so the async resolver can skip them without a per-event query.
 	personalRows, err := ns.db.Query(`SELECT id FROM workspaces WHERE is_personal = true`)
 	if err != nil {
-		slog.Warn("failed to load personal workspaces for notifications", slog.String("component", "notifications"), slog.Any("error", err))
+		// Fail closed: without the exclusion set, personal workspaces would fall
+		// through to configured/default rules.
+		slog.Error("failed to load personal workspaces for notifications", slog.String("component", "notifications"), slog.Any("error", err))
+		newCache.SuppressAll = true
 	} else {
 		for personalRows.Next() {
 			var wsID int
@@ -574,25 +1060,14 @@ func (ns *NotificationService) refreshRuleCache() error {
 	return nil
 }
 
-// getConfigSetForWorkspace resolves the notification configuration set for a
-// workspace, mirroring the workflow resolver's fallback chain
-// (WorkflowService.GetWorkflowIDForItem): use the workspace's assigned config
-// set, otherwise fall back to the default set's scheme.
-//
-//   - Personal workspaces never notify — return 0 (skip), matching the
-//     workflow resolver's is_personal early-return.
-//   - A workspace with an assigned config set uses it as-is. If that set's
-//     scheme has no rules (or none linked), no notification fires — that is the
-//     supported way to express "no notifications", so the fallback must NOT
-//     override it.
-//   - A workspace with no assigned config set falls back to the default set.
-//     DefaultConfigSetID is 0 only when no is_default row exists, which resolves
-//     to "no rules" (skip) — the safe degrade.
+// getConfigSetForWorkspace skips personal workspaces, then uses the assigned
+// set or default. An assigned set with no rules intentionally suppresses
+// notifications and must not fall back.
 func (ns *NotificationService) getConfigSetForWorkspace(workspaceID int) (int, error) {
 	ns.cacheMu.RLock()
 	defer ns.cacheMu.RUnlock()
 
-	if ns.ruleCache.PersonalWorkspaces[workspaceID] {
+	if ns.ruleCache.SuppressAll || ns.ruleCache.PersonalWorkspaces[workspaceID] {
 		return 0, nil
 	}
 
@@ -695,19 +1170,38 @@ func (ns *NotificationService) determineRecipients(event *NotificationEvent, rul
 		if !ns.canViewWorkspace(userID, event.WorkspaceID) {
 			continue
 		}
+		if event.ReferencedEntityType != "" || event.ReferencedWorkspacePermission != "" {
+			snapshot, err := ns.notificationAuth.Snapshot(userID)
+			if err != nil {
+				continue
+			}
+			visible, err := snapshot.Visible(models.Notification{
+				UserID:                        userID,
+				AuthorizationScope:            models.NotificationScopeSystem,
+				SourceType:                    event.EventType,
+				ReferencedEntityType:          event.ReferencedEntityType,
+				ReferencedEntityID:            positiveIntPointer(event.ReferencedEntityID),
+				ReferencedWorkspaceID:         positiveIntPointer(event.ReferencedWorkspaceID),
+				ReferencedWorkspacePermission: event.ReferencedWorkspacePermission,
+			})
+			if err != nil || !visible {
+				continue
+			}
+		}
 		recipients = append(recipients, userID)
 	}
 
 	return recipients
 }
 
-// agentOrUnknownUsers returns the subset of userIDs that must be excluded from
-// notifications because they are agent / service-user rows (is_agent = true) or
-// have no readable user row. It replaces a per-recipient is_agent query with a
-// single batched lookup. Fail-closed, matching the previous per-user behavior:
-// any id the query can't positively confirm as a non-agent human — a row
-// flagged is_agent, an id with no row, or a total query failure — is returned
-// as "skip", so an unreadable user never receives a notification.
+func positiveIntPointer(value int) *int {
+	if value <= 0 {
+		return nil
+	}
+	return &value
+}
+
+// agentOrUnknownUsers batch-loads notification exclusions and fails closed for non-human or unreadable users.
 func (ns *NotificationService) agentOrUnknownUsers(userIDs []int) map[int]bool {
 	skip := make(map[int]bool, len(userIDs))
 	if len(userIDs) == 0 {
@@ -728,7 +1222,7 @@ func (ns *NotificationService) agentOrUnknownUsers(userIDs []int) map[int]bool {
 		args[i] = id
 	}
 	rows, err := ns.db.Query(
-		fmt.Sprintf(`SELECT id, is_agent FROM users WHERE id IN (%s)`, strings.Join(placeholders, ",")),
+		fmt.Sprintf(`SELECT id, is_agent, is_active FROM users WHERE id IN (%s)`, strings.Join(placeholders, ",")),
 		args...)
 	if err != nil {
 		slog.Warn("is_agent batch check failed during recipient filtering; skipping all",
@@ -740,12 +1234,12 @@ func (ns *NotificationService) agentOrUnknownUsers(userIDs []int) map[int]bool {
 	seen := make(map[int]bool, len(userIDs))
 	for rows.Next() {
 		var id int
-		var isAgent bool
-		if err := rows.Scan(&id, &isAgent); err != nil {
+		var isAgent, isActive bool
+		if err := rows.Scan(&id, &isAgent, &isActive); err != nil {
 			continue
 		}
 		seen[id] = true
-		if isAgent {
+		if isAgent || !isActive {
 			skip[id] = true
 		}
 	}
@@ -768,10 +1262,14 @@ func (ns *NotificationService) agentOrUnknownUsers(userIDs []int) map[int]bool {
 // permission on the workspace. A nil permService (test wiring) means we
 // fall back to "allow" so legacy paths keep working.
 func (ns *NotificationService) canViewWorkspace(userID, workspaceID int) bool {
+	return ns.canUseWorkspacePermission(userID, workspaceID, models.PermissionItemView)
+}
+
+func (ns *NotificationService) canUseWorkspacePermission(userID, workspaceID int, permission string) bool {
 	if ns.permService == nil {
 		return true
 	}
-	ok, err := ns.permService.HasWorkspacePermission(userID, workspaceID, models.PermissionItemView)
+	ok, err := ns.permService.HasWorkspacePermission(userID, workspaceID, permission)
 	if err != nil {
 		slog.Warn("permission check failed during recipient filtering; denying",
 			slog.String("component", "notifications"),
@@ -808,23 +1306,31 @@ func (ns *NotificationService) queryUserIDs(errLabel, query string, args ...any)
 	return ids
 }
 
-// getWorkspaceAdmins retrieves admin user IDs for a workspace
+// getWorkspaceAdmins retrieves admin user IDs for a workspace, including admins
+// whose role is granted through a group rather than a direct assignment.
 func (ns *NotificationService) getWorkspaceAdmins(workspaceID int) []int {
 	return ns.queryUserIDs("fetch workspace admins", `
 		SELECT DISTINCT uwr.user_id
 		FROM user_workspace_roles uwr
 		JOIN workspace_roles wr ON uwr.role_id = wr.id
-		WHERE uwr.workspace_id = ? AND wr.name = 'Administrator'
-	`, workspaceID)
+		WHERE uwr.workspace_id = ? AND wr.builtin_key = ?
+		UNION
+		SELECT DISTINCT gm.user_id
+		FROM group_workspace_roles gwr
+		JOIN workspace_roles wr ON gwr.role_id = wr.id
+		JOIN group_members gm ON gwr.group_id = gm.group_id
+		WHERE gwr.workspace_id = ? AND wr.builtin_key = ?
+	`, workspaceID, models.RoleBuiltinAdministrator, workspaceID, models.RoleBuiltinAdministrator)
 }
 
 // getItemWatchers retrieves active watcher user IDs for an item
 func (ns *NotificationService) getItemWatchers(itemID int) []int {
-	return ns.queryUserIDs("fetch item watchers", `
-		SELECT DISTINCT user_id
-		FROM item_watches
-		WHERE item_id = ? AND is_active = true
-	`, itemID)
+	watchers, err := repository.NewItemRepository(ns.db).GetWatchers(itemID)
+	if err != nil {
+		slog.Error("failed to fetch item watchers", slog.String("component", "notifications"), slog.Any("error", err))
+		return nil
+	}
+	return watchers
 }
 
 // generateNotificationMessage generates title and message for a notification
@@ -906,6 +1412,10 @@ func (ns *NotificationService) getDefaultMessage(event *NotificationEvent) (subj
 		message = fmt.Sprintf("Work items linked: %s", getItemIdentifier())
 	case models.EventItemUnlinked:
 		message = fmt.Sprintf("Work item link removed: %s", getItemIdentifier())
+	case models.EventSLABreached:
+		message = fmt.Sprintf("SLA breached (%s) for: %s", data["sla.metric"], getItemIdentifier())
+	case models.EventSLAWarning:
+		message = fmt.Sprintf("SLA warning (%s) for: %s", data["sla.metric"], getItemIdentifier())
 	case models.EventMention:
 		actorName := "Someone"
 		if name, ok := data["actor.name"]; ok && name != nil && name != "" {
@@ -943,9 +1453,22 @@ func (ns *NotificationService) getNotificationType(eventType string) string {
 
 // Close gracefully shuts down the notification service
 func (ns *NotificationService) Close() error {
-	slog.Debug("closing notification service", slog.String("component", "notifications"))
-	close(ns.stopChan)
+	ctx, cancel := context.WithTimeout(context.Background(), ns.config.ShutdownTimeout)
+	defer cancel()
+	return ns.CloseContext(ctx)
+}
 
+// CloseContext stops accepting events, drains the bounded queue, and reports
+// any work that remains when the caller deadline expires.
+func (ns *NotificationService) CloseContext(ctx context.Context) error {
+	slog.Debug("closing notification service", slog.String("component", "notifications"))
+	ns.closeOnce.Do(func() {
+		ns.emitMu.Lock()
+		ns.closed = true
+		close(ns.eventChan)
+		close(ns.cacheStop)
+		ns.emitMu.Unlock()
+	})
 	done := make(chan struct{})
 	go func() {
 		ns.wg.Wait()
@@ -954,11 +1477,13 @@ func (ns *NotificationService) Close() error {
 
 	select {
 	case <-done:
+		ns.workerCancel()
 		slog.Debug("notification service closed successfully", slog.String("component", "notifications"))
-	case <-time.After(3 * time.Second):
-		slog.Warn("notification service close timed out after 3s", slog.String("component", "notifications"))
+		return nil
+	case <-ctx.Done():
+		ns.workerCancel()
+		return fmt.Errorf("notification service shutdown with %d queued and %d active: %w", len(ns.eventChan), atomic.LoadInt64(&ns.activeWorkers), ctx.Err())
 	}
-	return nil
 }
 
 // GetStats returns service statistics
@@ -968,12 +1493,27 @@ func (ns *NotificationService) GetStats() map[string]int64 {
 	ns.cacheMu.RUnlock()
 
 	return map[string]int64{
-		"events_processed":  atomic.LoadInt64(&ns.eventsProcessed),
-		"cache_hits":        atomic.LoadInt64(&ns.cacheHits),
-		"cache_misses":      atomic.LoadInt64(&ns.cacheMisses),
-		"errors":            atomic.LoadInt64(&ns.errors),
-		"cache_age_seconds": int64(time.Since(lastRefreshed).Seconds()),
-		"pending_events":    int64(len(ns.eventChan)),
+		"events_queued":      atomic.LoadInt64(&ns.eventsQueued),
+		"events_processed":   atomic.LoadInt64(&ns.eventsProcessed),
+		"events_dropped":     atomic.LoadInt64(&ns.eventsDropped),
+		"pending_events":     int64(len(ns.eventChan)),
+		"active_workers":     atomic.LoadInt64(&ns.activeWorkers),
+		"max_active_workers": atomic.LoadInt64(&ns.maxActiveWorkers),
+		"last_queue_wait_ms": time.Duration(atomic.LoadInt64(&ns.lastQueueWaitNS)).Milliseconds(),
+		"max_queue_wait_ms":  time.Duration(atomic.LoadInt64(&ns.maxQueueWaitNS)).Milliseconds(),
+		"cache_hits":         atomic.LoadInt64(&ns.cacheHits),
+		"cache_misses":       atomic.LoadInt64(&ns.cacheMisses),
+		"errors":             atomic.LoadInt64(&ns.errors),
+		"cache_age_seconds":  int64(time.Since(lastRefreshed).Seconds()),
+	}
+}
+
+func updateNotificationServiceMaximum(target *int64, value int64) {
+	for {
+		previous := atomic.LoadInt64(target)
+		if value <= previous || atomic.CompareAndSwapInt64(target, previous, value) {
+			return
+		}
 	}
 }
 

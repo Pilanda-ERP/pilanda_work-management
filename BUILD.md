@@ -28,7 +28,7 @@ make help
 ```bash
 # Build frontend
 cd frontend
-npm install
+npm ci
 npm run build
 cd ..
 
@@ -51,6 +51,7 @@ The Makefile produces binaries in the project root:
 windshift           # Main server binary (current platform)
 windshift_unix      # Linux binary (from make build-linux)
 windshift.exe       # Windows binary (from make build-windows)
+windshift-windows-arm64.exe  # Windows on ARM64 binary (from make build-windows-arm64)
 ```
 
 ### Release Builds (release.sh)
@@ -63,12 +64,14 @@ dist/
 │   ├── windshift-linux-amd64
 │   ├── windshift-linux-arm64
 │   ├── windshift-windows-amd64.exe
+│   ├── windshift-windows-arm64.exe
 │   ├── windshift-darwin-amd64
 │   └── windshift-darwin-arm64
 └── releases/
     ├── windshift-v1.0.0-linux-amd64.tar.gz
     ├── windshift-v1.0.0-linux-arm64.tar.gz
     ├── windshift-v1.0.0-windows-amd64.zip
+    ├── windshift-v1.0.0-windows-arm64.zip
     ├── windshift-v1.0.0-darwin-amd64.tar.gz
     ├── windshift-v1.0.0-darwin-arm64.tar.gz
     └── SHA256SUMS.txt
@@ -84,6 +87,9 @@ make build-linux
 
 # Cross-compile for Windows
 make build-windows
+
+# Cross-compile for Windows on ARM64
+make build-windows-arm64
 ```
 
 ### Using release.sh (Full Release)
@@ -121,12 +127,12 @@ make build-windows
 ## Build Requirements
 
 ### For Server + Frontend
-- **Go 1.25+** - Backend compilation
-- **Node.js 18+** - Frontend build
-- **npm** - Package management
+- **Go 1.27.2** - Exact version declared in `go.mod`
+- **Node.js 24.18.0** - Exact version pinned in `.nvmrc` and `frontend/package.json`
+- **npm 11.16.0** - Exact version pinned in `frontend/package.json`
 
 ### For WS Client Only
-- **Go 1.25+** - Client compilation only
+- **Go 1.27.2** - Exact version declared in `go.mod`
 
 ### For Cross-Compilation (release.sh)
 - **Docker + Buildx** - Multi-arch Docker images
@@ -159,17 +165,17 @@ cmd\ws\ws.exe workspace list
 Production builds use these Go build flags:
 
 - `-ldflags "-s -w"` - Strip debug information and reduce binary size
-- `-tags="!test"` - Exclude test code from production binaries
 - Version information embedded at build time
 
 ## Troubleshooting
 
 ### Frontend Build Issues
 ```bash
-# Clear npm cache and reinstall
+# Reinstall exactly from the lockfile
 cd frontend
-rm -rf node_modules package-lock.json
-npm install
+rm -rf node_modules
+npm cache verify
+npm ci
 npm run build
 ```
 
@@ -197,16 +203,16 @@ Run `make help` to see all available targets:
 - `make build` - Build production binary (excludes test code)
 - `make build-linux` - Cross-compile for Linux
 - `make build-windows` - Cross-compile for Windows
+- `make build-windows-arm64` - Cross-compile for Windows on ARM64
 - `make release` - Full production release build
 
 **Development builds:**
-- `make dev-build` - Development binary (includes test utils)
+- `make dev-build` - Development binary
 - `make dev` - Full development cycle
 
 **Testing:**
-- `make test` - Run all unit tests
-- `make test-coverage` - Run tests with coverage report
-- `make test-verbose` - Run tests with verbose output
+- Test sources and runners live in the adjacent private `core-tests`
+  repository. Use `../core-tests/overlay.sh .` for the Go suites.
 
 **Utilities:**
 - `make frontend` - Build frontend only

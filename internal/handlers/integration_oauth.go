@@ -10,32 +10,92 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/integrations"
 	"windshift/internal/integrations/notion"
 	"windshift/internal/integrations/todoist"
+	"windshift/internal/logger"
 	"windshift/internal/models"
+	"windshift/internal/repository"
 	"windshift/internal/sso"
+	"windshift/internal/utils"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // IntegrationOAuthHandler handles OAuth flows and user connection management
 type IntegrationOAuthHandler struct {
-	db         database.Database
-	encryption *sso.SecretEncryption
-	baseURL    string
+	db          database.Database
+	encryption  *sso.SecretEncryption
+	baseURL     string
+	systemFlows map[models.IntegrationProviderType]systemOAuthRegistration
+}
+
+type systemOAuthRegistration struct {
+	flow    integrations.SystemOAuthFlow
+	auditor *logger.Auditor
 }
 
 // NewIntegrationOAuthHandler creates a new integration OAuth handler.
 // baseURL: public URL of the application (from config.Load).
 func NewIntegrationOAuthHandler(db database.Database, encryption *sso.SecretEncryption, baseURL string) *IntegrationOAuthHandler {
 	return &IntegrationOAuthHandler{
-		db:         db,
-		encryption: encryption,
-		baseURL:    baseURL,
+		db:          db,
+		encryption:  encryption,
+		baseURL:     baseURL,
+		systemFlows: make(map[models.IntegrationProviderType]systemOAuthRegistration),
 	}
+}
+
+// RegisterSystemOAuthFlow adds a system-owned provider extension to the same
+// OAuth handler used by user-owned integrations.
+func (h *IntegrationOAuthHandler) RegisterSystemOAuthFlow(providerType models.IntegrationProviderType, flow integrations.SystemOAuthFlow, auditor *logger.Auditor) {
+	capabilities, ok := integrations.Capabilities(providerType)
+	if !ok || !capabilities.OAuth || capabilities.CredentialOwner != integrations.CredentialOwnerSystem || flow == nil {
+		return
+	}
+	h.systemFlows[providerType] = systemOAuthRegistration{flow: flow, auditor: auditor}
+}
+
+// StartSystemOAuth initiates OAuth for an administrator-managed provider row.
+func (h *IntegrationOAuthHandler) StartSystemOAuth(w http.ResponseWriter, r *http.Request) {
+	user, ok := RequireAuth(w, r)
+	if !ok {
+		return
+	}
+	providerID := r.PathValue("id")
+	var providerType models.IntegrationProviderType
+	if err := h.db.QueryRow("SELECT provider_type FROM integration_providers WHERE id = ? AND enabled = true", providerID).Scan(&providerType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			respondNotFound(w, r, "integration_provider")
+		} else {
+			respondInternalError(w, r, err)
+		}
+		return
+	}
+	registration, registered := h.systemFlows[providerType]
+	if !registered || registration.flow == nil {
+		respondBadRequest(w, r, "OAuth is not supported for this provider")
+		return
+	}
+	authURL, err := registration.flow.StartOAuth(r.Context(), providerID, user.ID, h.baseURL)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respondNotFound(w, r, "integration_provider")
+		} else {
+			respondBadRequest(w, r, "OAuth is not configured for this provider")
+		}
+		return
+	}
+	if registration.auditor != nil {
+		registration.auditor.LogWithDetails(r, user, logger.ActionIntegrationProviderUpdate, logger.ResourceIntegrationProvider, nil, providerID, map[string]any{
+			"provider_id": providerID, "provider_type": providerType, "oauth_started": true,
+		})
+	}
+	respondJSONOK(w, map[string]string{"auth_url": authURL})
 }
 
 // StartOAuth initiates the OAuth flow for an integration provider
@@ -62,6 +122,10 @@ func (h *IntegrationOAuthHandler) StartOAuth(w http.ResponseWriter, r *http.Requ
 		} else {
 			respondInternalError(w, r, err)
 		}
+		return
+	}
+	if !integrations.SupportsUserOAuth(providerType) {
+		respondNotFound(w, r, "integration_provider")
 		return
 	}
 
@@ -141,8 +205,20 @@ func (h *IntegrationOAuthHandler) OAuthCallback(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Delete used state
+	// Consume the state before any further checks so a rejected callback cannot
+	// be replayed.
 	_, _ = h.db.ExecWrite("DELETE FROM integration_oauth_state WHERE state = ?", state)
+
+	// Bind the flow to the initiating account. The state row records who started
+	// it; the browser completing the redirect must be signed in as that same
+	// user, otherwise a forwarded authorization URL would attach the victim's
+	// provider credentials to the attacker's Windshift identity.
+	currentUser := utils.GetCurrentUser(r)
+	if currentUser == nil || fmt.Sprintf("%d", currentUser.ID) != userID {
+		slog.Warn("integration OAuth state/account mismatch", slog.String("component", "integrations"))
+		h.redirectWithError(w, r, "Sign in to the account that started this connection and try again")
+		return
+	}
 
 	// Get provider details
 	var providerType models.IntegrationProviderType
@@ -156,6 +232,10 @@ func (h *IntegrationOAuthHandler) OAuthCallback(w http.ResponseWriter, r *http.R
 	if err != nil {
 		slog.Error("failed to get integration provider", slog.String("component", "integrations"), slog.Any("error", err))
 		h.redirectWithError(w, r, "Provider not found")
+		return
+	}
+	if !integrations.SupportsUserOAuth(providerType) {
+		h.redirectWithError(w, r, "Unsupported provider type")
 		return
 	}
 
@@ -188,6 +268,61 @@ func (h *IntegrationOAuthHandler) OAuthCallback(w http.ResponseWriter, r *http.R
 	default:
 		h.redirectWithError(w, r, "Unsupported provider type")
 	}
+}
+
+// SystemOAuthCallback completes an administrator-managed provider flow on a
+// path that cannot collide with user-configurable provider slugs.
+func (h *IntegrationOAuthHandler) SystemOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	providerType := models.IntegrationProviderType(r.PathValue("providerType"))
+	registration, ok := h.systemFlows[providerType]
+	if !ok || registration.flow == nil {
+		respondNotFound(w, r, "integration_provider")
+		return
+	}
+	h.handleSystemOAuthCallback(w, r, providerType, registration)
+}
+
+func (h *IntegrationOAuthHandler) handleSystemOAuthCallback(w http.ResponseWriter, r *http.Request, providerType models.IntegrationProviderType, registration systemOAuthRegistration) {
+	state, code := r.URL.Query().Get("state"), r.URL.Query().Get("code")
+	var result *integrations.SystemOAuthCallbackResult
+	var err error
+	if state == "" || code == "" || r.URL.Query().Get("error") != "" {
+		if state != "" {
+			result, _ = registration.flow.ConsumeFailedOAuthCallback(state)
+		}
+		err = errors.New("OAuth callback was rejected")
+	} else {
+		result, err = registration.flow.CompleteOAuth(r.Context(), state, code, h.baseURL)
+	}
+	h.auditSystemOAuthCallback(r, providerType, registration.auditor, result, err == nil)
+	h.redirectSystemOAuthResult(w, r, providerType, err == nil)
+}
+
+func (h *IntegrationOAuthHandler) auditSystemOAuthCallback(r *http.Request, providerType models.IntegrationProviderType, auditor *logger.Auditor, result *integrations.SystemOAuthCallbackResult, success bool) {
+	if auditor == nil || result == nil || result.Initiator == nil {
+		return
+	}
+	details := map[string]any{
+		"provider_id": result.ProviderID, "provider_type": providerType,
+		"oauth_callback": true, "credential_mutation": true, "generation": result.Generation,
+	}
+	if success {
+		auditor.LogWithDetails(r, result.Initiator, logger.ActionIntegrationProviderOAuthCredentialSet, logger.ResourceIntegrationProvider, nil, result.ProviderName, details)
+		return
+	}
+	auditor.LogFailure(r, result.Initiator, logger.ActionIntegrationProviderOAuthCredentialSet, logger.ResourceIntegrationProvider, nil, result.ProviderName, "oauth_callback_failed", details)
+}
+
+func (h *IntegrationOAuthHandler) redirectSystemOAuthResult(w http.ResponseWriter, r *http.Request, providerType models.IntegrationProviderType, success bool) {
+	result := "error"
+	if success {
+		result = "success"
+	}
+	contextPath := ""
+	if publicURL, err := url.Parse(h.baseURL); err == nil {
+		contextPath = strings.TrimRight(publicURL.EscapedPath(), "/")
+	}
+	http.Redirect(w, r, contextPath+"/admin/integration-providers?tab="+url.QueryEscape(string(providerType))+"&oauth="+url.QueryEscape(result), http.StatusFound)
 }
 
 func (h *IntegrationOAuthHandler) handleTodoistCallback(w http.ResponseWriter, r *http.Request, clientID, clientSecret, code, providerID, userID, providerSlug string) {
@@ -386,7 +521,9 @@ func (h *IntegrationOAuthHandler) GetAvailableProviders(w http.ResponseWriter, r
 		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.ProviderType); err != nil {
 			continue
 		}
-		providers = append(providers, p)
+		if integrations.SupportsUserOAuth(models.IntegrationProviderType(p.ProviderType)) {
+			providers = append(providers, p)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		respondInternalError(w, r, err)
@@ -398,13 +535,8 @@ func (h *IntegrationOAuthHandler) GetAvailableProviders(w http.ResponseWriter, r
 
 // Helper methods
 
-// getRedirectURI returns the canonical OAuth callback URL for the given
-// provider slug. It is ALWAYS built from the configured baseURL — never from
-// request headers like Host or X-Forwarded-Host, which can be spoofed by any
-// caller (or any proxy hop that doesn't strip them). If baseURL is unset,
-// OAuth flows are treated as misconfigured and an error is surfaced so the
-// caller can respond 503 rather than silently generating a redirect through
-// an attacker-controlled host.
+// getRedirectURI uses configured baseURL only, never spoofable request headers.
+// Missing baseURL is a 503-worthy OAuth misconfiguration.
 func (h *IntegrationOAuthHandler) getRedirectURI(slug string) (string, error) {
 	if h.baseURL == "" {
 		return "", fmt.Errorf("integration OAuth is not configured: baseURL is unset")

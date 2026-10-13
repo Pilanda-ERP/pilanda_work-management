@@ -20,6 +20,9 @@ import (
 	"windshift/internal/services"
 	"windshift/internal/utils"
 	"windshift/internal/webauthn"
+
+	"github.com/go-webauthn/webauthn/protocol"
+	webauthnlib "github.com/go-webauthn/webauthn/webauthn"
 )
 
 const (
@@ -40,6 +43,7 @@ type WebAuthnHandler struct {
 	sessionStore      *webauthn.SessionStore
 	credentialStore   *webauthn.CredentialStore
 	ipExtractor       *utils.IPExtractor
+	authPolicyHandler *AuthPolicyHandler
 }
 
 // NewWebAuthnHandler creates a new WebAuthn handler
@@ -55,6 +59,64 @@ func NewWebAuthnHandler(db database.Database, permissionService *services.Permis
 	}
 }
 
+// SetAuthPolicyHandler enables policy-aware password+passkey completion. It is
+// set after construction because the server initializes the policy handler
+// later in its dependency graph.
+func (h *WebAuthnHandler) SetAuthPolicyHandler(policy *AuthPolicyHandler) {
+	h.authPolicyHandler = policy
+}
+
+func (h *WebAuthnHandler) passwordPasskeyPolicyActive() bool {
+	return h.authPolicyHandler != nil && !h.authPolicyHandler.IsPreviewMode() &&
+		h.authPolicyHandler.GetCurrentPolicy() == AuthPolicyPasswordPasskey2FA
+}
+
+func (h *WebAuthnHandler) pendingPasskeySession(r *http.Request) (*auth.Session, bool) {
+	token, err := h.sessionManager.GetSessionFromRequest(r)
+	if err != nil {
+		return nil, false
+	}
+	session, err := h.sessionManager.ValidateSessionContext(r.Context(), token, h.ipExtractor.GetClientIP(r))
+	if err != nil || !session.EnrollmentRequired ||
+		session.AuthPendingType != auth.AuthPendingPasskeyVerification {
+		return nil, false
+	}
+	return session, true
+}
+
+func (h *WebAuthnHandler) pendingSession(r *http.Request, userID int) (*auth.Session, bool) {
+	session, ok := h.pendingPasskeySession(r)
+	if !ok || session.UserID != userID {
+		return nil, false
+	}
+	return session, true
+}
+
+// padLoginCredentials makes allowCredentials a fixed size so its length does
+// not disclose whether (or how many) passkeys an account has. Stable opaque
+// decoys also prevent repeated starts from identifying the one persistent real
+// ID; authenticators simply ignore unknown IDs.
+func padLoginCredentials(credentials []webauthnlib.Credential, decoyID func(int) []byte) []webauthnlib.Credential {
+	padded := append([]webauthnlib.Credential(nil), credentials...)
+	// Transport hints are optional and vary by authenticator. Omitting them
+	// avoids another account-specific shape difference in the public response.
+	for i := range padded {
+		padded[i].Transport = nil
+	}
+	for len(padded) < maxCredentialsPerUser {
+		padded = append(padded, webauthnlib.Credential{ID: decoyID(len(padded))})
+	}
+	return padded
+}
+
+func credentialDescriptors(credentials []webauthnlib.Credential) []protocol.CredentialDescriptor {
+	descriptors := make([]protocol.CredentialDescriptor, len(credentials))
+	for i, credential := range credentials {
+		descriptors[i] = credential.Descriptor()
+	}
+	return descriptors
+}
+
 // FIDORegistrationRequestNew represents the request to start FIDO registration
 type FIDORegistrationRequestNew struct {
 	CredentialName string `json:"credential_name"`
@@ -62,9 +124,9 @@ type FIDORegistrationRequestNew struct {
 
 // FIDOCompleteRegistrationRequest represents the completion request
 type FIDOCompleteRegistrationRequest struct {
-	SessionID      string      `json:"sessionId"`
-	CredentialName string      `json:"credentialName"`
-	Response       interface{} `json:"response"`
+	SessionID      string `json:"sessionId"`
+	CredentialName string `json:"credentialName"`
+	Response       any    `json:"response"`
 }
 
 // StartFIDORegistrationNew initiates FIDO2/WebAuthn registration with proper verification
@@ -151,7 +213,7 @@ func (h *WebAuthnHandler) StartFIDORegistrationNew(w http.ResponseWriter, r *htt
 
 	// Send response - options already contains the publicKey structure
 	// We need to extract just the publicKey content from the CredentialCreation
-	response := map[string]interface{}{
+	response := map[string]any{
 		"publicKey": options.Response,
 		"sessionId": sessionID,
 	}
@@ -279,10 +341,10 @@ func (h *WebAuthnHandler) CompleteFIDORegistrationNew(w http.ResponseWriter, r *
 		})
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"status":  "success",
 		"message": "FIDO credential registered successfully",
-		"credential": map[string]interface{}{
+		"credential": map[string]any{
 			"id":              credential.ID,
 			"name":            req.CredentialName,
 			"attestationType": credential.AttestationType,
@@ -337,11 +399,9 @@ func (h *WebAuthnHandler) RemoveWebAuthnCredential(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Verify the credential belongs to the user
-	var ownerID int
-	err = h.db.QueryRow(`
-		SELECT user_id FROM webauthn_credentials WHERE id = ?
-	`, credentialID).Scan(&ownerID)
+	// Verify the credential belongs to the user. The store owns the fixed
+	// credential table and owner column for this WebAuthn surface.
+	ownerID, err := h.credentialStore.LookupUserByCredentialID(credentialID)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		respondNotFound(w, r, "credential")
@@ -394,97 +454,113 @@ type FIDOLoginRequestNew struct {
 
 // FIDOCompleteLoginRequest represents the login completion request
 type FIDOCompleteLoginRequest struct {
-	SessionID string      `json:"sessionId"`
-	Response  interface{} `json:"response"`
+	SessionID string `json:"sessionId"`
+	Response  any    `json:"response"`
 }
 
-// StartFIDOLoginNew initiates FIDO authentication with proper verification
+// StartFIDOLoginNew initiates FIDO authentication with proper verification.
+// Unknown, inactive, no-credential, and policy-ineligible users receive a real
+// synthetic challenge with the same response shape. The synthetic session is
+// guaranteed to fail completion because its WebAuthn user ID is not a database
+// user and its database session has a NULL user_id.
 func (h *WebAuthnHandler) StartFIDOLoginNew(w http.ResponseWriter, r *http.Request) {
 	req, ok := decodeJSON[FIDOLoginRequestNew](w, r)
 	if !ok {
 		return
 	}
 	sanitize.Apply(&req.EmailOrUsername, sanitize.ShortIdentifier)
-
 	if strings.TrimSpace(req.EmailOrUsername) == "" {
 		respondValidationError(w, r, "Email or username is required")
 		return
 	}
 
-	// Find user by email or username
 	var user models.User
 	var avatarURL sql.NullString
 	err := h.db.QueryRow(`
 		SELECT id, email, username, first_name, last_name, is_active, avatar_url
 		FROM users
-		WHERE (email = ? OR username = ?) AND is_active = true
+		WHERE email = ? OR username = ?
 	`, req.EmailOrUsername, req.EmailOrUsername).Scan(
 		&user.ID, &user.Email, &user.Username, &user.FirstName,
 		&user.LastName, &user.IsActive, &avatarURL,
 	)
-
-	if errors.Is(err, sql.ErrNoRows) {
-		// Don't reveal that user doesn't exist
-		respondNotFound(w, r, "credential")
-		return
-	}
-	if err != nil {
+	useSynthetic := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !useSynthetic {
 		respondInternalError(w, r, err)
 		return
 	}
 
-	// Handle NULL avatar_url
-	if avatarURL.Valid {
-		user.AvatarURL = avatarURL.String
+	credentialUserID := 0
+	if !useSynthetic && user.IsActive {
+		credentialUserID = user.ID
+		if avatarURL.Valid {
+			user.AvatarURL = avatarURL.String
+		}
 	} else {
-		user.AvatarURL = ""
+		useSynthetic = true
 	}
-
-	if !user.IsActive {
-		// Return same response as non-existent user to prevent enumeration
-		respondNotFound(w, r, "credential")
-		return
-	}
-
-	// Create WebAuthn user wrapper
-	webAuthnUser := webauthn.NewUser(&user)
-
-	// Get user's credentials
-	credentials, err := h.credentialStore.GetUserCredentials(user.ID)
+	credentials, err := h.credentialStore.GetUserCredentials(credentialUserID)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
-
-	if len(credentials) == 0 {
-		respondNotFound(w, r, "credential")
-		return
+	useSynthetic = useSynthetic || len(credentials) == 0
+	var pendingAuthSession *auth.Session
+	if h.passwordPasskeyPolicyActive() {
+		var pending bool
+		pendingAuthSession, pending = h.pendingSession(r, credentialUserID)
+		useSynthetic = useSynthetic || !pending
 	}
 
-	webAuthnUser.SetCredentials(credentials)
+	var storedUserID *int
+	if useSynthetic {
+		user = models.User{ID: 0, Email: "invalid@invalid", Username: "invalid"}
+	} else {
+		storedUserID = &user.ID
+	}
+	decoySeed := strings.ToLower(strings.TrimSpace(req.EmailOrUsername))
+	padCredentials := func(input []webauthnlib.Credential) []webauthnlib.Credential {
+		return padLoginCredentials(input, func(index int) []byte {
+			return h.sessionManager.DeriveOpaqueValue(
+				"webauthn-login-decoy",
+				decoySeed+":"+strconv.Itoa(index),
+			)
+		})
+	}
 
-	// Begin authentication with go-webauthn
+	// Synthetic starts need decoys before BeginLogin because the library
+	// refuses a non-discoverable login with no credentials. Real users retain
+	// only their owned credentials in SessionData; decoys are added to the
+	// public response afterward so FinishLogin never treats them as owned.
+	beginCredentials := credentials
+	if useSynthetic {
+		beginCredentials = padCredentials(nil)
+	}
+	webAuthnUser := webauthn.NewUser(&user)
+	webAuthnUser.SetCredentials(beginCredentials)
 	options, sessionData, err := h.config.WebAuthn().BeginLogin(webAuthnUser)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
+	if !useSynthetic {
+		options.Response.AllowedCredentials = credentialDescriptors(padCredentials(credentials))
+	}
 
-	// Save session data
-	sessionID, err := h.sessionStore.SaveAuthenticationSession(&user.ID, sessionData)
+	var sessionID string
+	if pendingAuthSession != nil && !useSynthetic {
+		sessionID, err = h.sessionStore.SaveAuthenticationSessionBound(user.ID, pendingAuthSession.ID, sessionData)
+	} else {
+		sessionID, err = h.sessionStore.SaveAuthenticationSession(storedUserID, sessionData)
+	}
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
-
-	// Send response - options already contains the publicKey structure
-	// We need to extract just the publicKey content from the CredentialAssertion
-	response := map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"publicKey": options.Response,
 		"sessionId": sessionID,
-	}
-
-	respondJSONOK(w, response)
+	})
 }
 
 // CompleteFIDOLoginNew completes FIDO authentication with proper verification
@@ -495,8 +571,22 @@ func (h *WebAuthnHandler) CompleteFIDOLoginNew(w http.ResponseWriter, r *http.Re
 	}
 	sanitize.Apply(&req.SessionID, sanitize.ShortIdentifier)
 
-	// Get session data
-	sessionData, err := h.sessionStore.GetAuthenticationSession(req.SessionID)
+	// Under password+passkey policy, consume only a challenge bound to this
+	// exact password-verified browser session.
+	var pendingSession *auth.Session
+	var sessionData *webauthnlib.SessionData
+	var err error
+	if h.passwordPasskeyPolicyActive() {
+		var pending bool
+		pendingSession, pending = h.pendingPasskeySession(r)
+		if !pending {
+			respondUnauthorized(w, r)
+			return
+		}
+		sessionData, err = h.sessionStore.GetAuthenticationSessionBound(req.SessionID, pendingSession.ID)
+	} else {
+		sessionData, err = h.sessionStore.GetAuthenticationSession(req.SessionID)
+	}
 	if err != nil {
 		respondValidationError(w, r, "Invalid or expired session")
 		return
@@ -512,6 +602,10 @@ func (h *WebAuthnHandler) CompleteFIDOLoginNew(w http.ResponseWriter, r *http.Re
 	userID, err := strconv.Atoi(string(userIDBytes))
 	if err != nil {
 		respondValidationError(w, r, "Invalid user ID in session")
+		return
+	}
+	if pendingSession != nil && pendingSession.UserID != userID {
+		respondUnauthorized(w, r)
 		return
 	}
 
@@ -562,6 +656,10 @@ func (h *WebAuthnHandler) CompleteFIDOLoginNew(w http.ResponseWriter, r *http.Re
 	// Finish authentication with go-webauthn (performs all verification)
 	credential, err := h.config.WebAuthn().FinishLogin(webAuthnUser, *sessionData, r)
 	if err != nil {
+		slog.Warn("failed to verify webauthn login assertion",
+			slog.String("component", "webauthn"),
+			slog.Int("user_id", user.ID),
+			slog.Any("error", err))
 		respondUnauthorized(w, r)
 		return
 	}
@@ -606,22 +704,31 @@ func (h *WebAuthnHandler) CompleteFIDOLoginNew(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	clientIP := h.ipExtractor.GetClientIP(r)
-	session, err := h.sessionManager.CreateSession(user.ID, clientIP, r.UserAgent(), false)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	if err := h.sessionManager.SetSessionCookie(w, r, session.Token, false); err != nil {
-		if delErr := h.sessionManager.DeleteSession(session.Token); delErr != nil {
-			slog.Warn("failed to revoke session after cookie error", slog.Any("error", delErr))
+	if pendingSession != nil {
+		// Elevate only the password-bound restricted session that initiated this
+		// assertion. The existing cookie remains unchanged.
+		if err := h.sessionManager.ClearEnrollmentRequired(pendingSession.ID); err != nil {
+			respondInternalError(w, r, err)
+			return
 		}
-		respondInternalError(w, r, err)
-		return
+	} else {
+		clientIP := h.ipExtractor.GetClientIP(r)
+		session, err := h.sessionManager.CreateSession(user.ID, clientIP, r.UserAgent(), false)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+
+		if err := h.sessionManager.SetSessionCookie(w, r, session.Token, false); err != nil {
+			if delErr := h.sessionManager.DeleteSession(session.Token); delErr != nil {
+				slog.Warn("failed to revoke session after cookie error", slog.Any("error", delErr))
+			}
+			respondInternalError(w, r, err)
+			return
+		}
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"status":  "success",
 		"message": "Authentication successful",
 		"user":    user,

@@ -1,6 +1,7 @@
 package logbook
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/logbookevents"
 	"windshift/internal/models"
 
 	"github.com/lib/pq"
@@ -213,7 +215,7 @@ func (r *Repository) HasBucketPermission(userID int, groupIDs []int, bucketID, p
 	// Check group permission using provided group IDs
 	if len(groupIDs) > 0 {
 		groupPlaceholders, groupArgs := buildIntPlaceholders(groupIDs, 2)
-		args := make([]interface{}, 0, 2+len(groupArgs))
+		args := make([]any, 0, 2+len(groupArgs))
 		args = append(args, bucketID, permission)
 		args = append(args, groupArgs...)
 		query := fmt.Sprintf(`
@@ -249,7 +251,7 @@ func (r *Repository) GetAccessibleBucketIDs(userID int, groupIDs []int, permissi
 
 	// User + group query
 	groupPlaceholders, groupArgs := buildIntPlaceholders(groupIDs, 2)
-	args := make([]interface{}, 0, 2+len(groupArgs))
+	args := make([]any, 0, 2+len(groupArgs))
 	args = append(args, userID, permission)
 	args = append(args, groupArgs...)
 	query := fmt.Sprintf(`
@@ -648,43 +650,56 @@ func (r *Repository) FindByContentHash(bucketID, hash string) (*models.LogbookDo
 
 // --- Chunks ---
 
-// CreateChunks inserts chunks in bulk.
-func (r *Repository) CreateChunks(documentID string, chunks []models.LogbookChunk) error {
-	tx, err := r.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+// CompleteDocumentIngestion atomically replaces searchable chunks, publishes
+// the ready status, and appends the classified document fact.
+func (r *Repository) CompleteDocumentIngestion(
+	ctx context.Context,
+	documentID string,
+	chunks []models.LogbookChunk,
+	statusMessage string,
+	recorder DocumentEventRecorder,
+	eventInput logbookevents.ClassifiedInput,
+) error {
+	if recorder == nil {
+		return errors.New("logbook document event recorder is required")
 	}
-	defer tx.Rollback()
-
-	for i := range chunks {
-		c := &chunks[i]
-
-		tags := c.Tags
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin document completion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM logbook_chunks WHERE document_id = ?", documentID); err != nil {
+		return fmt.Errorf("replace document chunks: %w", err)
+	}
+	for index := range chunks {
+		chunk := &chunks[index]
+		tags := chunk.Tags
 		if tags == nil {
 			tags = []string{}
 		}
-
-		_, err := tx.Exec(`
-			INSERT INTO logbook_chunks (document_id, position, content, token_count,
-			    byte_start, byte_end, first_page, last_page, summary, tags)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		`, documentID, c.Position, c.Content, c.TokenCount,
-			c.ByteStart, c.ByteEnd, c.FirstPage, c.LastPage,
-			c.Summary, pq.Array(tags),
-		)
-		if err != nil {
-			return fmt.Errorf("failed to insert chunk %d: %w", i, err)
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO logbook_chunks (
+				document_id, position, content, token_count, byte_start, byte_end,
+				first_page, last_page, summary, tags
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, documentID, chunk.Position, chunk.Content, chunk.TokenCount,
+			chunk.ByteStart, chunk.ByteEnd, chunk.FirstPage, chunk.LastPage,
+			chunk.Summary, pq.Array(tags)); err != nil {
+			return fmt.Errorf("insert replacement chunk %d: %w", index, err)
 		}
 	}
-
-	return tx.Commit()
-}
-
-// DeleteChunksByDocument removes all chunks for a document.
-func (r *Repository) DeleteChunksByDocument(documentID string) error {
-	_, err := r.db.ExecWrite(`DELETE FROM logbook_chunks WHERE document_id = $1`, documentID)
-	if err != nil {
-		return fmt.Errorf("failed to delete chunks: %w", err)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE logbook_documents
+		SET status = ?, status_message = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, models.LogbookDocStatusReady, statusMessage, documentID); err != nil {
+		return fmt.Errorf("publish completed document: %w", err)
+	}
+	if err := recorder.RecordClassified(ctx, tx, eventInput); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit document completion: %w", err)
 	}
 	return nil
 }
@@ -871,10 +886,10 @@ func capIDs[T any](ids []T, label string) []T {
 }
 
 // buildStringPlaceholders creates PostgreSQL $N placeholders for string slices.
-func buildStringPlaceholders(ids []string) (placeholders string, args []interface{}) {
+func buildStringPlaceholders(ids []string) (placeholders string, args []any) {
 	ids = capIDs(ids, "string-ids")
 	ph := make([]string, len(ids))
-	args = make([]interface{}, len(ids))
+	args = make([]any, len(ids))
 	for i, id := range ids {
 		ph[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
@@ -885,10 +900,10 @@ func buildStringPlaceholders(ids []string) (placeholders string, args []interfac
 
 // buildIntPlaceholders creates PostgreSQL $N placeholders for int slices,
 // starting at the given parameter offset (1-based).
-func buildIntPlaceholders(ids []int, offset int) (placeholders string, args []interface{}) {
+func buildIntPlaceholders(ids []int, offset int) (placeholders string, args []any) {
 	ids = capIDs(ids, "int-ids")
 	ph := make([]string, len(ids))
-	args = make([]interface{}, len(ids))
+	args = make([]any, len(ids))
 	for i, id := range ids {
 		ph[i] = fmt.Sprintf("$%d", offset+i+1)
 		args[i] = id

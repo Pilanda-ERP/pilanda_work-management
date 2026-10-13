@@ -4,18 +4,12 @@
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
   import BasePicker from '../../pickers/BasePicker.svelte';
   import { api } from '../../api.js';
+  import { workspacesStore } from '../../stores/workspaces.svelte.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { isSelfOrDescendant } from './pageHierarchy.js';
 
-  /**
-   * "Move to…" dialog for reparenting a page. Computes valid destinations
-   * by excluding the page itself, every descendant, and the current
-   * parent — the backend cycle check is the source of truth, but
-   * filtering up front avoids guaranteed-error round-trips and a
-   * confusing "already there" no-op option.
-   *
-   * Descendant detection uses the materialized path returned by
-   * /pages/tree, so it survives without an extra request per row.
-   */
+  /** Page reparenting dialog. It can point the subtree at another accessible
+   * workspace; the backend remains the permission and cycle authority. */
   let {
     isOpen = $bindable(false),
     workspaceId,
@@ -24,52 +18,71 @@
   } = $props();
 
   let candidates = $state([]);
+  let sourceTree = $state([]);
+  let workspaces = $state([]);
   let loading = $state(false);
+  let loadingWorkspaces = $state(false);
   let saving = $state(false);
   let error = $state('');
 
-  /**
-   * `pickedParentId` mirrors the picker's bound value (null when the
-   * user picks "Workspace root", a page id otherwise). It alone can't
-   * distinguish "root picked" from "nothing picked yet" — both surface
-   * as null — so we track `selectionMade` separately via onSelect.
-   */
+  /** Root and no selection both bind as null, so selectionMade disambiguates. */
+  let pickedWorkspaceId = $state(null);
   let pickedParentId = $state(null);
   let selectionMade = $state(false);
 
   $effect(() => {
     if (isOpen && page) {
-      loadCandidates();
+      pickedWorkspaceId = workspaceId;
+      loadDialogData();
     }
     if (!isOpen) {
+      pickedWorkspaceId = null;
       pickedParentId = null;
       selectionMade = false;
       error = '';
     }
   });
 
-  async function loadCandidates() {
+  async function loadDialogData() {
+    loadingWorkspaces = true;
+    const workspaceRequest = workspacesStore.load();
+    await Promise.all([loadCandidates(workspaceId, true), workspaceRequest.then((items) => {
+      workspaces = (items || []).filter((item) => item.active !== false);
+    }).catch((err) => {
+      error = err?.message || t('pages.errorLoadWorkspaces');
+      workspaces = [];
+    }).finally(() => {
+      loadingWorkspaces = false;
+    })]);
+  }
+
+  async function loadCandidates(destinationWorkspaceId, rememberSource = false) {
     loading = true;
     error = '';
     try {
-      const resp = await api.pages.getTree(workspaceId);
-      const all = resp.pages || [];
-      // A page p2 is a descendant of `page` iff its materialized path
-      // starts with the path that the children of `page` would have.
-      // Schema path format: "/a/b/c/" — descendants of page id N at path
-      // "/X/N/" have paths starting with "/X/N/".
-      const selfPrefix = `${page.path}${page.id}/`;
-      candidates = all.filter((p) => {
-        if (p.id === page.id) return false;
-        if (p.path === selfPrefix || p.path.startsWith(selfPrefix)) return false;
-        if (p.id === page.parent_id) return false; // already the parent
-        return true;
-      });
+      const all = (await api.pages.getAll(destinationWorkspaceId)) || [];
+      if (rememberSource) sourceTree = all;
+      candidates = destinationWorkspaceId === workspaceId
+        ? all.filter((candidate) => {
+            if (isSelfOrDescendant(candidate, page)) return false;
+            if (candidate.id === page.parent_id) return false;
+            return true;
+          })
+        : all;
     } catch (err) {
       error = err?.message || t('pages.errorLoadTree');
+      candidates = [];
     } finally {
       loading = false;
     }
+  }
+
+  async function onWorkspacePick(item) {
+    if (!item) return;
+    pickedWorkspaceId = item.id;
+    pickedParentId = null;
+    selectionMade = false;
+    await loadCandidates(item.id);
   }
 
   function onPick(item) {
@@ -82,16 +95,24 @@
   // Show the "Workspace root" option only when moving there would
   // actually change something. If the page is already at the root it'd
   // be a confusing no-op.
-  const rootAvailable = $derived(page?.parent_id != null);
+  const crossWorkspace = $derived(
+    pickedWorkspaceId != null && pickedWorkspaceId !== workspaceId
+  );
+  const rootAvailable = $derived(crossWorkspace || page?.parent_id != null);
+  const subtreeCount = $derived(
+    sourceTree.filter((candidate) => isSelfOrDescendant(candidate, page)).length || 1
+  );
 
   async function confirmMove() {
     if (!selectionMade || saving) return;
     saving = true;
     error = '';
     try {
-      await api.pages.movePage(workspaceId, page.id, pickedParentId);
+      const moved = await api.pages.movePage(workspaceId, page.id, pickedParentId, {
+        destinationWorkspaceId: pickedWorkspaceId,
+      });
       isOpen = false;
-      onMoved?.();
+      onMoved?.(moved);
     } catch (err) {
       error = err?.message || t('pages.errorMove');
     } finally {
@@ -112,18 +133,43 @@
     {/if}
 
     <BasePicker
+      id="page-move-workspace-picker"
+      bind:value={pickedWorkspaceId}
+      items={workspaces}
+      loading={loadingWorkspaces}
+      label={t('pages.moveWorkspaceLabel')}
+      placeholder={t('pages.moveWorkspacePlaceholder')}
+      searchFields={['name', 'key', 'description']}
+      getValue={(item) => item.id}
+      getLabel={(item) => item.name}
+      optionTestid={(option) => `page-move-workspace-option-${option.value}`}
+      onSelect={onWorkspacePick}
+    />
+
+    <BasePicker
       id="page-move-picker"
       bind:value={pickedParentId}
       items={candidates}
       {loading}
+      label={t('pages.moveParentLabel')}
       placeholder={t('pages.moveSearchPlaceholder')}
       showUnassigned={rootAvailable}
       unassignedLabel={t('pages.moveRoot')}
       searchFields={['title', 'path']}
       getValue={(p) => p.id}
       getLabel={(p) => p.title}
+      optionTestid={(option) => option.isUnassigned
+        ? 'page-move-parent-root'
+        : `page-move-parent-option-${option.value}`}
       onSelect={onPick}
     />
+
+    {#if crossWorkspace}
+      <div class="move-policy" data-testid="page-move-cross-workspace-preview">
+        <strong>{t('pages.moveCrossWorkspaceSummary', { count: subtreeCount })}</strong>
+        <p>{t('pages.moveCrossWorkspacePolicy')}</p>
+      </div>
+    {/if}
   </div>
   <DialogFooter
     cancelLabel={t('pages.moveCancel')}
@@ -152,5 +198,25 @@
     color: var(--ds-text-danger, #b91c1c);
     border-radius: 0.25rem;
     font-size: 0.875rem;
+  }
+
+  .move-policy {
+    padding: 0.75rem 0.875rem;
+    background: var(--ds-background-neutral, #f4f5f7);
+    border: 1px solid var(--ds-border, #dfe1e6);
+    border-radius: 0.5rem;
+    color: var(--ds-text, #172b4d);
+    font-size: 0.8125rem;
+    line-height: 1.45;
+  }
+
+  .move-policy strong {
+    display: block;
+    font-weight: 600;
+  }
+
+  .move-policy p {
+    margin: 0.25rem 0 0;
+    color: var(--ds-text-subtle, #44546f);
   }
 </style>

@@ -1,5 +1,6 @@
 <script>
 	import { onMount } from 'svelte';
+	import Avatar from '../components/Avatar.svelte';
 	import { api } from '../api.js';
 	import { authStore } from '../stores';
 	import { Plus, Edit, Trash2, RotateCcw, Circle, CheckCircle, Key, Users, UserCheck, UserX, AlertTriangle, Send, Link } from '@lucide/svelte';
@@ -17,11 +18,14 @@
 	import Lozenge from '../components/Lozenge.svelte';
 	import Label from '../components/Label.svelte';
 	import Checkbox from '../components/Checkbox.svelte';
+	import Radio from '../components/Radio.svelte';
 	import { toHotkeyString } from '../utils/keyboardShortcuts.js';
 	import { t } from '../stores/i18n.svelte.js';
+	import { scopeCatalogStore } from '../stores/scopeCatalog.svelte.js';
 	import { formatDateSimple } from '../utils/dateFormatter.js';
 	import { confirm } from '../composables/useConfirm.js';
 	import { publicBaseURL } from '../runtime/contextPath.js';
+	import TextField from '../components/TextField.svelte';
 
 	let users = $state([]);
 	let loading = $state(false);
@@ -58,39 +62,28 @@
 	let showTokenModal = $state(false);
 	let tokenTargetUser = $state(null);
 	let newTokenName = $state('');
-	let newTokenExpiresDays = $state(90);
+	let newTokenExpiry = $state('');
 	let newTokenScopes = $state([]);
 	let creatingToken = $state(false);
 	let mintedToken = $state('');
 	let mintedTokenError = $state('');
 
-	const AGENT_TOKEN_SCOPE_OPTIONS = [
-		{ value: 'items:read', label: 'Read items' },
-		{ value: 'items:write', label: 'Create/update items' },
-		{ value: 'workspaces:read', label: 'Read workspaces' },
-		{ value: 'workspaces:write', label: 'Modify workspaces' },
-		{ value: 'collections:read', label: 'Read collections and reports' },
-		{ value: 'pages:read', label: 'Read pages' },
-		{ value: 'pages:write', label: 'Create/update pages' },
-		{ value: 'pages:delete', label: 'Archive pages' },
-		{ value: 'users:read', label: 'Read users' },
-		{ value: 'item-types:read', label: 'Read item types' },
-		{ value: 'workflows:read', label: 'Read workflows' },
-		{ value: 'statuses:read', label: 'Read statuses' },
-		{ value: 'priorities:read', label: 'Read priorities' },
-		{ value: 'custom-fields:read', label: 'Read custom fields' },
-		{ value: 'item-templates:read', label: 'Read work item templates' },
-		{ value: 'milestones:read', label: 'Read milestones' },
-		{ value: 'iterations:read', label: 'Read iterations' },
-		{ value: 'projects:read', label: 'Read projects' },
-		{ value: 'mcp:access', label: 'MCP access' },
-	];
-	const DEFAULT_AGENT_TOKEN_SCOPES = AGENT_TOKEN_SCOPE_OPTIONS.map((s) => s.value);
+	// Grantable scopes come from the server catalog (auth.ScopeCatalog) rather
+	// than a list maintained here, which had silently fallen behind and left
+	// time:*, tests:*, assets:* and actions:* impossible to grant to an agent.
+	// Non-admin only: minting an admin-scoped token for an agent is not something
+	// this modal offers, and the server rejects it for non-admin callers anyway.
+	let agentScopeOptions = $derived(scopeCatalogStore.catalog.filter((s) => !s.admin));
+	// The default selection mirrors the server's DefaultAgentScopes, so a token
+	// minted here matches one minted by `ws init` or the MCP OAuth flow.
+	let defaultAgentTokenScopes = $derived(
+		scopeCatalogStore.catalog.filter((s) => s.agent_default).map((s) => s.scope)
+	);
 
 	async function loadUsers() {
 		loading = true;
 		try {
-			users = await api.getUsers();
+			users = await api.getAdminUsers();
 			error = '';
 		} catch (err) {
 			error = err.message || t('users.failedToLoad');
@@ -275,7 +268,7 @@
 					icon: UserX,
 					title: t('common.disable'),
 					color: '#f59e0b',
-					hoverClass: 'hover:bg-orange-50',
+					hoverClass: 'hover:bg-ds-accent-orange-subtle',
 					onClick: () => deactivateUser(user.id, user.full_name)
 				});
 			} else {
@@ -285,7 +278,7 @@
 					icon: UserCheck,
 					title: t('common.enable'),
 					color: '#10b981',
-					hoverClass: 'hover:bg-green-50',
+					hoverClass: 'hover:bg-ds-success-subtle',
 					onClick: () => activateUser(user.id, user.full_name)
 				});
 			}
@@ -378,8 +371,8 @@
 	function openTokenModal(user) {
 		tokenTargetUser = user;
 		newTokenName = `${user.username}-token`;
-		newTokenExpiresDays = 90;
-		newTokenScopes = [...DEFAULT_AGENT_TOKEN_SCOPES];
+		newTokenExpiry = '';
+		newTokenScopes = [...defaultAgentTokenScopes];
 		mintedToken = '';
 		mintedTokenError = '';
 		showTokenModal = true;
@@ -408,13 +401,9 @@
 			const payload = {
 				name: newTokenName,
 				user_id: tokenTargetUser.id,
-				permissions: newTokenScopes
+				permissions: newTokenScopes,
+				expires_on: newTokenExpiry || null
 			};
-			if (newTokenExpiresDays && Number(newTokenExpiresDays) > 0) {
-				const expires = new Date();
-				expires.setDate(expires.getDate() + Number(newTokenExpiresDays));
-				payload.expires_at = expires.toISOString();
-			}
 			const result = await api.createApiToken(payload);
 			mintedToken = result?.token || result?.api_token?.token || '';
 		} catch (err) {
@@ -438,6 +427,7 @@
 
 	onMount(() => {
 		loadUsers();
+		scopeCatalogStore.load();
 	});
 </script>
 
@@ -492,40 +482,44 @@
 			<form onsubmit={(e) => { e.preventDefault(); saveUser(); }} class="space-y-4">
 				<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
 					<div>
-						<Label for="first_name" color="default">{t('users.firstName')}</Label>
-						<Input
+						<TextField
+							label={t('users.firstName')}
 							id="first_name"
-							bind:value={formData.first_name}
 							required
+							labelColor="default"
+							bind:value={formData.first_name}
 						/>
 					</div>
 
 					<div>
-						<Label for="last_name" color="default">{t('users.lastName')}</Label>
-						<Input
+						<TextField
+							label={t('users.lastName')}
 							id="last_name"
-							bind:value={formData.last_name}
 							required
+							labelColor="default"
+							bind:value={formData.last_name}
 						/>
 					</div>
 				</div>
 
 				<div>
-					<Label for="email" color="default">{t('common.email')}</Label>
-					<Input
+					<TextField
+						label={t('common.email')}
 						id="email"
+						required
+						labelColor="default"
 						type="email"
 						bind:value={formData.email}
-						required
 					/>
 				</div>
 
 				<div>
-					<Label for="username" color="default">{t('common.username')}</Label>
-					<Input
+					<TextField
+						label={t('common.username')}
 						id="username"
-						bind:value={formData.username}
 						required
+						labelColor="default"
+						bind:value={formData.username}
 					/>
 				</div>
 
@@ -590,12 +584,12 @@
 		<div class="px-6 py-4">
 			<div class="space-y-4">
 				{#if emailSent}
-					<div class="flex items-start gap-3 p-3 bg-green-50 rounded-lg text-green-800 border border-green-100">
+					<div class="flex items-start gap-3 p-3 bg-ds-success-subtle rounded-lg text-ds-text-success border border-ds-status-success-border">
 						<CheckCircle class="w-5 h-5 flex-shrink-0 mt-0.5" />
 						<p class="text-sm">An invitation email has been sent to <strong>{formData.email}</strong>.</p>
 					</div>
 				{:else}
-					<div class="flex items-start gap-3 p-3 bg-amber-50 rounded-lg text-amber-800 border border-amber-100">
+					<div class="flex items-start gap-3 p-3 bg-ds-warning-subtle rounded-lg text-ds-text-warning border border-ds-status-warning-border">
 						<AlertTriangle class="w-5 h-5 flex-shrink-0 mt-0.5" />
 						<div>
 							<p class="text-sm font-medium">Email could not be sent.</p>
@@ -634,11 +628,10 @@
 			<div class="space-y-4">
 				<div>
 					<label class="flex items-center">
-						<input
-							type="radio"
-							bind:group={generateRandomPassword}
+						<Radio
+							bind:groupValue={generateRandomPassword}
 							value={true}
-							class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+							class="h-4 w-4 text-ds-interactive focus:ring-ds-border-focused border-ds-border-bold"
 						/>
 						<span class="ml-2 text-sm" style="color: var(--ds-text)">{t('auth.resetPassword')}</span>
 					</label>
@@ -646,11 +639,10 @@
 
 				<div>
 					<label class="flex items-center">
-						<input
-							type="radio"
-							bind:group={generateRandomPassword}
+						<Radio
+							bind:groupValue={generateRandomPassword}
 							value={false}
-							class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+							class="h-4 w-4 text-ds-interactive focus:ring-ds-border-focused border-ds-border-bold"
 						/>
 						<span class="ml-2 text-sm" style="color: var(--ds-text)">{t('common.custom')}</span>
 					</label>
@@ -658,14 +650,15 @@
 
 				{#if !generateRandomPassword}
 					<div class="ml-6">
-						<Label for="new-password" color="default" class="mb-1">{t('auth.newPassword')}</Label>
-						<input
+						<TextField
+							label={t('auth.newPassword')}
 							id="new-password"
+							required
+							labelColor="default"
 							type="password"
-							bind:value={newPassword}
-							required={!generateRandomPassword}
 							placeholder={t('placeholders.enterNewPassword')}
-							class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+							size="small"
+							bind:value={newPassword}
 						/>
 					</div>
 				{/if}
@@ -737,15 +730,11 @@
 		>
 			{#snippet name(user)}
 				<div class="flex items-center">
-					{#if user.avatar_url}
-						<img class="h-10 w-10 rounded-full" src={user.avatar_url} alt="" />
-					{:else}
-						<div class="h-10 w-10 rounded-full flex items-center justify-center" style="background-color: var(--ds-background-neutral)">
-							<span class="text-sm font-medium" style="color: var(--ds-text)">
-								{user.first_name.charAt(0)}{user.last_name.charAt(0)}
-							</span>
-						</div>
-					{/if}
+					<Avatar
+						src={user.avatar_url}
+						name={[user.first_name, user.last_name].filter(Boolean).join(' ')}
+						size="lg"
+					/>
 					<div class="ml-4">
 						<div class="text-sm font-medium flex items-center gap-2" style="color: var(--ds-text)">
 							{user.full_name}
@@ -794,12 +783,22 @@
 				</div>
 			{:else}
 				<div>
-					<Label for="token-name" color="default" required>Token name</Label>
-					<Input id="token-name" bind:value={newTokenName} required />
+					<TextField
+						label={"Token name"}
+						id="token-name"
+						required
+						labelColor="default"
+						bind:value={newTokenName}
+					/>
 				</div>
 				<div>
-					<Label for="token-expiry" color="default">Expires in (days, 0 = never)</Label>
-					<Input id="token-expiry" type="number" min="0" max="3650" bind:value={newTokenExpiresDays} />
+					<TextField
+						label={"Last valid date (optional)"}
+						id="token-expiry"
+						labelColor="default"
+						type="date"
+						bind:value={newTokenExpiry}
+					/>
 				</div>
 				{#if tokenTargetUser && !tokenTargetUser.agent_owner_user_id}
 					<AlertBox message="Service users do not inherit an owner's workspace/page permissions. Grant this agent workspace roles or page ACLs separately; scopes only limit what the token may do." />
@@ -807,12 +806,13 @@
 				<div class="space-y-2">
 					<Label color="default">Scopes</Label>
 					<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto border rounded p-3" style="border-color: var(--ds-border);">
-						{#each AGENT_TOKEN_SCOPE_OPTIONS as scope}
+						{#each agentScopeOptions as scope (scope.scope)}
 							<Checkbox
-								checked={newTokenScopes.includes(scope.value)}
-								onchange={(checked) => toggleAgentTokenScope(scope.value, checked)}
-								label={scope.label}
+								checked={newTokenScopes.includes(scope.scope)}
+								onchange={(checked) => toggleAgentTokenScope(scope.scope, checked)}
+								label={`${scope.resource_label}: ${scope.action}`}
 								size="small"
+								dataTestid={`agent-token-scope-${scope.scope}`}
 							/>
 						{/each}
 					</div>

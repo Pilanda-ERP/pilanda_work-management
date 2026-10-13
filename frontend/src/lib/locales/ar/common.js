@@ -136,6 +136,8 @@ export default {
 
     // Status indicators
     loading: 'جاري التحميل...',
+    loadingSlow: 'قد يستغرق هذا بعض الوقت عند بطء الاتصال.',
+    skipToMainContent: 'الانتقال إلى المحتوى الرئيسي',
     saving: 'جاري الحفظ...',
     deleting: 'جاري الحذف...',
     processing: 'جاري المعالجة...',
@@ -155,6 +157,7 @@ export default {
     loadingMore: 'جاري تحميل المزيد...',
     remaining: 'متبقي',
     showingOfTotal: 'عرض {count} من {total}',
+    showingXofY: 'عرض {from}–{to} من أصل {total}',
 
     // Results
     noResults: 'لم يتم العثور على نتائج',
@@ -223,6 +226,7 @@ export default {
     updated: 'تم التحديث بنجاح',
     copied: 'تم النسخ إلى الحافظة',
     failed: 'فشلت العملية',
+    layoutSaveFailed: 'تعذّر حفظ تغييرات لوحة التحكم. ستُفقد تعديلاتك عند إعادة التحميل.',
   },
 
   // Backend error codes
@@ -313,5 +317,16 @@ export default {
     noRequirements: 'لا توجد متطلبات مكوّنة',
     configureFilter: 'قم بتكوين الفلتر لرؤية العناصر',
     createToStart: 'أنشئ {item} للبدء',
+  },
+  dueDate: {
+    noDueDate: 'لا يوجد تاريخ استحقاق',
+    dueToday: 'يستحق اليوم',
+    dueTomorrow: 'يستحق غدًا',
+    dueYesterday: 'استحق أمس',
+    dueInDays: 'يستحق خلال {days} أيام',
+    overdueByDays: 'متأخر بـ {days} أيام',
+    overdueTooltip: 'متأخر بـ {days} أيام — كان مستحقًا في {date}',
+    dueSoonTooltip: 'يستحق خلال {days} أيام — {date}',
+    dueLaterTooltip: 'يستحق في {date}',
   },
 };

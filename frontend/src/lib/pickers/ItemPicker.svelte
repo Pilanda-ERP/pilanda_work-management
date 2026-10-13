@@ -26,6 +26,15 @@
     keepOpenOnFooterTab = false,
     onSearchChange = null,
     searchDebounce = 300,
+    allowCreate = false,
+    onCreate = null,
+    noResultsSnippet = null,
+    searchTestid = undefined,
+    optionTestid = null,
+    // (value) => string | null. Labels the selected value when it is not in
+    // items yet (options may load lazily on open).
+    resolveMissingLabel = null,
+    onOpen = null,
     onSelect = null,
     onCancel = null
   } = $props();
@@ -38,6 +47,7 @@
       badges: [],
       metadata: [],
       searchFields: ['name', 'label'],
+      groupBy: null,
       getValue: (item) => item.id,
       getLabel: (item) => item.name || item.label || ''
     };
@@ -62,11 +72,18 @@
   {maxSelections}
   class={className}
   searchFields={finalConfig.searchFields}
+  groupBy={finalConfig.groupBy}
   getValue={finalConfig.getValue}
   getLabel={finalConfig.getLabel}
   serverSearch={!!onSearchChange}
   {searchDebounce}
+  {allowCreate}
+  {onCreate}
+  {noResultsSnippet}
+  {searchTestid}
+  {optionTestid}
   onSearchChange={(query) => onSearchChange?.(query)}
+  onOpen={() => onOpen?.()}
   onSelect={(item) => onSelect?.(item)}
   onChange={(values) => onSelect?.(values)}
   onCancel={() => onCancel?.()}
@@ -79,23 +96,25 @@
     {:else}
       <div
         aria-disabled={disabled}
-        tabindex={disabled ? -1 : 0}
         class="relative w-full flex items-center justify-between gap-2 px-3 py-2 rounded text-sm transition-colors {className}"
         style="background-color: var(--ds-background-input); border: 1px solid var(--ds-border); color: var(--ds-text);"
         style:opacity={disabled ? 0.5 : 1}
         style:cursor={disabled ? 'not-allowed' : 'pointer'}
-        role="combobox"
-        aria-haspopup="listbox"
         data-testid="item-picker-trigger"
       >
         <div class="flex items-center gap-2 flex-1 min-w-0 {multiSelect ? 'flex-wrap' : ''}">
           {#if multiSelect}
             {#if values.length > 0}
-              {#each values as val}
+              {#each values as val (val)}
                 {@const selItem = items.find(i => finalConfig.getValue(i) === val)}
+                {@const missingLabel = selItem ? '' : (resolveMissingLabel?.(val) || '')}
                 {#if selItem}
                   <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs" style="background-color: var(--ds-background-selected); color: var(--ds-text);">
                     <span class="truncate max-w-[120px]">{finalConfig.getLabel(selItem)}</span>
+                  </span>
+                {:else if missingLabel}
+                  <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs" style="background-color: var(--ds-background-selected); color: var(--ds-text);">
+                    <span class="truncate max-w-[120px]">{missingLabel}</span>
                   </span>
                 {/if}
               {/each}
@@ -104,6 +123,7 @@
             {/if}
           {:else}
             {@const selItem = items.find(i => finalConfig.getValue(i) === value)}
+            {@const missingLabel = selItem || !showSelectedInTrigger ? '' : (resolveMissingLabel?.(value) || '')}
             {#if selItem && showSelectedInTrigger}
               {#if finalConfig.icon?.type === 'color-dot'}
                 {@const color = finalConfig.icon.source(selItem)}
@@ -115,6 +135,8 @@
                 {/if}
               {/if}
               <span class="truncate">{finalConfig.getLabel(selItem)}</span>
+            {:else if missingLabel}
+              <span class="truncate">{missingLabel}</span>
             {:else}
               <span style="color: var(--ds-text-subtle);">{placeholder || t('pickers.select')}</span>
             {/if}

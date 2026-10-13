@@ -27,7 +27,17 @@ type AIHandler struct {
 	// actionService is the cache-invalidation hook for tools that mutate
 	// actions (create_action). Optional — when nil, newly created actions
 	// fire after the next periodic cache refresh.
-	actionService *services.ActionService
+	actionService          *services.ActionService
+	pageApplicationService *services.PageApplicationService
+	pageDiagramService     *services.PageDiagramService
+	conversations          *repository.AgentConversationRepository
+	agentBindings          *repository.WorkspaceAgentBindingRepository
+	commentService         *services.CommentService
+	approvalService        *services.ApprovalService
+	chatLLMs               chatLLMResolver
+	// llmUsage meters each chat turn's token/cost against its own agent_runs
+	// row, so the model's identity and the turn's spend outlive the response.
+	llmUsage *repository.LLMUsageRepository
 }
 
 // NewAIHandler creates a new AI handler.
@@ -39,16 +49,29 @@ func NewAIHandler(
 	timerService *services.TimerService,
 	promptStore *llm.PromptStore,
 	actionService *services.ActionService,
+	pageApplicationService *services.PageApplicationService,
+	pageDiagramService *services.PageDiagramService,
 ) *AIHandler {
 	return &AIHandler{
-		db:              db,
-		llmManager:      llmManager,
-		permService:     permService,
-		timePermService: timePermService,
-		timerService:    timerService,
-		promptStore:     promptStore,
-		actionService:   actionService,
+		db:                     db,
+		llmManager:             llmManager,
+		permService:            permService,
+		timePermService:        timePermService,
+		timerService:           timerService,
+		promptStore:            promptStore,
+		actionService:          actionService,
+		pageApplicationService: pageApplicationService,
+		pageDiagramService:     pageDiagramService,
+		conversations:          repository.NewAgentConversationRepository(db),
+		agentBindings:          repository.NewWorkspaceAgentBindingRepository(db),
+		chatLLMs:               llmManager,
+		llmUsage:               repository.NewLLMUsageRepository(db),
 	}
+}
+
+func (h *AIHandler) SetConversationDependencies(comments *services.CommentService, approvals *services.ApprovalService) {
+	h.commentService = comments
+	h.approvalService = approvals
 }
 
 // PlanMyDayResponse is the response for the Plan My Day endpoint.
@@ -100,7 +123,7 @@ func (h *AIHandler) PlanMyDay(w http.ResponseWriter, r *http.Request) {
 
 	// Build filter: include items assigned to user OR items in their personal workspace(s)
 	statusFilter := "NOT EXISTS (SELECT 1 FROM status_categories sc WHERE sc.id = st.category_id AND COALESCE(sc.is_completed, FALSE) = TRUE) OR i.status_id IS NULL"
-	qlArgs := []interface{}{user.ID}
+	qlArgs := []any{user.ID}
 	ownershipFilter := "i.assignee_id = ?"
 
 	if len(personalWSIDs) > 0 {
@@ -222,7 +245,7 @@ func (h *AIHandler) PlanMyDay(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), llm.DefaultRequestTimeout)
 	defer cancel()
 
-	plan, err := llm.ChatCompletionStructured[PlanMyDayResponse](ctx, llmClient, llm.ChatCompletionRequest{
+	plan, err := llm.CompleteStructured[PlanMyDayResponse](ctx, llmClient, llm.CompletionRequest{
 		Messages: []llm.Message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
@@ -261,26 +284,34 @@ func (h *AIHandler) PlanMyDay(w http.ResponseWriter, r *http.Request) {
 	respondJSONOK(w, *plan)
 }
 
-// Status checks whether AI features are available by resolving the LLM client
-// through the same path used by actual AI handlers (including LLM_ENDPOINT fallback).
-func (h *AIHandler) Status(w http.ResponseWriter, r *http.Request) {
+// AIFeatureStatus describes whether one AI feature is enabled and which mode it uses.
+type AIFeatureStatus struct {
+	Enabled bool   `json:"enabled"`
+	Mode    string `json:"mode"`
+}
+
+// AIStatusResponse describes the resolved AI availability and per-feature configuration.
+type AIStatusResponse struct {
+	Available   bool                       `json:"available"`
+	ChatEnabled bool                       `json:"chat_enabled"`
+	Features    map[string]AIFeatureStatus `json:"features"`
+}
+
+// StatusSnapshot returns AI availability for composed API responses.
+func (h *AIHandler) StatusSnapshot() AIStatusResponse {
 	client, err := h.llmManager.Resolve(0)
 	available := err == nil && client != nil && client.Available()
 
 	// Load per-feature config
 	cfg, _ := llm.LoadAIFeaturesConfig(h.db)
 	featureKeys := []string{"ai_chat", "daily_briefing", "plan_my_day", "catch_me_up", "find_similar", "decompose", "release_notes", "dependency_analysis"}
-	type featureStatus struct {
-		Enabled bool   `json:"enabled"`
-		Mode    string `json:"mode"`
-	}
-	features := make(map[string]featureStatus, len(featureKeys))
+	features := make(map[string]AIFeatureStatus, len(featureKeys))
 	for _, key := range featureKeys {
 		fc, ok := cfg[key]
 		if !ok {
-			features[key] = featureStatus{Enabled: true, Mode: string(models.AIFeatureModeDefault)}
+			features[key] = AIFeatureStatus{Enabled: true, Mode: string(models.AIFeatureModeDefault)}
 		} else {
-			features[key] = featureStatus{
+			features[key] = AIFeatureStatus{
 				Enabled: fc.Mode != models.AIFeatureModeDisabled,
 				Mode:    string(fc.Mode),
 			}
@@ -290,11 +321,11 @@ func (h *AIHandler) Status(w http.ResponseWriter, r *http.Request) {
 	// chat_enabled derived from per-feature config for backward compatibility
 	chatEnabled := features["ai_chat"].Enabled
 
-	respondJSONOK(w, map[string]interface{}{
-		"available":    available,
-		"chat_enabled": chatEnabled,
-		"features":     features,
-	})
+	return AIStatusResponse{Available: available, ChatEnabled: chatEnabled, Features: features}
+}
+
+func (h *AIHandler) Status(w http.ResponseWriter, r *http.Request) {
+	respondJSONOK(w, h.StatusSnapshot())
 }
 
 // GetDailyBriefing returns the most recent successful daily briefing for the current user.
@@ -303,11 +334,24 @@ func (h *AIHandler) GetDailyBriefing(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	accessibleWorkspaceIDs, err := h.permService.AccessibleWorkspaceIDs(user.ID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	accessible := make(map[int]struct{}, len(accessibleWorkspaceIDs))
+	for _, workspaceID := range accessibleWorkspaceIDs {
+		accessible[workspaceID] = struct{}{}
+	}
 
 	briefing, err := repository.NewAIRepository(h.db).GetLatestSuccessfulDailyBriefing(user.ID)
 	if err != nil {
 		slog.Warn("GetDailyBriefing: no briefing found", slog.Int("user_id", user.ID), slog.Any("error", err))
-		respondJSONOK(w, map[string]interface{}{"content": ""})
+		respondJSONOK(w, map[string]any{"content": ""})
+		return
+	}
+	if !briefing.ScopeRecorded || !workspaceScopeContained(briefing.SourceWorkspaceIDs, accessible) {
+		respondJSONOK(w, map[string]any{"content": ""})
 		return
 	}
 
@@ -324,7 +368,7 @@ func (h *AIHandler) GetDailyBriefing(w http.ResponseWriter, r *http.Request) {
 	itemKeyRe := regexp.MustCompile(`[A-Z]{2,10}-\d+`)
 	keys := itemKeyRe.FindAllString(briefing.Content, -1)
 
-	references := map[string]interface{}{}
+	references := map[string]any{}
 	if len(keys) > 0 {
 		seen := map[string]bool{}
 		unique := make([]string, 0, len(keys))
@@ -335,9 +379,9 @@ func (h *AIHandler) GetDailyBriefing(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if refs, qErr := repository.NewItemRepository(h.db).ResolveItemKeyReferences(unique); qErr == nil {
+		if refs, qErr := repository.NewItemRepository(h.db).ResolveItemKeyReferencesInWorkspaces(unique, accessibleWorkspaceIDs); qErr == nil {
 			for _, ref := range refs {
-				references[ref.ItemKey] = map[string]interface{}{
+				references[ref.ItemKey] = map[string]any{
 					"item_id":      ref.ItemID,
 					"workspace_id": ref.WorkspaceID,
 				}
@@ -345,11 +389,20 @@ func (h *AIHandler) GetDailyBriefing(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"id":           briefing.ID,
 		"content":      briefing.Content,
 		"date":         briefing.Date,
 		"generated_at": briefing.GeneratedAt,
 		"references":   references,
 	})
+}
+
+func workspaceScopeContained(source []int, accessible map[int]struct{}) bool {
+	for _, workspaceID := range source {
+		if _, ok := accessible[workspaceID]; !ok {
+			return false
+		}
+	}
+	return true
 }

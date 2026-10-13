@@ -48,6 +48,10 @@ var oidcErrorMessages = map[string]string{
 	"invalid_grant":              "Invalid or expired authorization code",
 }
 
+// ssoStateTokenTTL leaves enough time for slower identity-provider flows,
+// including MFA and account-selection prompts, while keeping state short-lived.
+const ssoStateTokenTTL = 15 * time.Minute
+
 // SSOHandler handles SSO authentication endpoints
 type SSOHandler struct {
 	db                       database.Database
@@ -95,7 +99,7 @@ type SSOProviderResponse struct {
 	HasClientSecret      bool   `json:"has_client_secret"`
 	Scopes               string `json:"scopes"`
 	AutoProvisionUsers   bool   `json:"auto_provision_users"`
-	RequireVerifiedEmail bool   `json:"require_verified_email"`
+	RequireVerifiedEmail bool   `json:"require_verified_email"` // Provider is authoritative for email; skips Windshift email verification.
 	AttributeMapping     string `json:"attribute_mapping"`
 	// SAML-specific fields
 	SAMLIdPMetadataURL string    `json:"saml_idp_metadata_url,omitempty"`
@@ -119,7 +123,7 @@ type SSOProviderRequest struct {
 	ClientSecret         string `json:"client_secret,omitempty"`
 	Scopes               string `json:"scopes"`
 	AutoProvisionUsers   bool   `json:"auto_provision_users"`
-	RequireVerifiedEmail *bool  `json:"require_verified_email"` // Pointer to distinguish between false and not set
+	RequireVerifiedEmail *bool  `json:"require_verified_email"` // Pointer distinguishes false from an omitted trust setting.
 	AttributeMapping     string `json:"attribute_mapping"`
 	// SAML-specific fields
 	SAMLIdPMetadataURL string `json:"saml_idp_metadata_url,omitempty"`
@@ -229,6 +233,11 @@ func NewSSOHandler(db database.Database, sessionManager *auth.SessionManager, pe
 	}
 }
 
+// SetPluginManager supplies the plugin manager after its dependencies are initialized.
+func (h *SSOHandler) SetPluginManager(pluginManager *plugins.Manager) {
+	h.pluginManager = pluginManager
+}
+
 // GetStatus returns the public SSO status (no auth required)
 func (h *SSOHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.providerStore.ListEnabled()
@@ -294,6 +303,11 @@ func (h *SSOHandler) StartLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rememberMe := ssoRememberMeFromRequest(r)
+	slog.Info("starting OIDC login",
+		slog.String("component", "sso"),
+		slog.String("provider", provider.Slug),
+		slog.Bool("remember_me", rememberMe),
+	)
 
 	// Decrypt client secret
 	clientSecret, err := h.encryption.Decrypt(provider.ClientSecretEncrypted)
@@ -319,7 +333,7 @@ func (h *SSOHandler) StartLogin(w http.ResponseWriter, r *http.Request) {
 	state := generateRandomState()
 
 	// Store state token with redirect_uri and remember_me
-	storeErr := repository.NewSSOStateRepository(h.db).Store(provider.ID, state, redirectAfterLogin, rememberMe, time.Now().Add(5*time.Minute))
+	storeErr := repository.NewSSOStateRepository(h.db).Store(provider.ID, state, "", redirectAfterLogin, rememberMe, time.Now().Add(ssoStateTokenTTL))
 	if storeErr != nil {
 		slog.Error("failed to store OIDC state token", "error", storeErr)
 		respondInternalError(w, r, storeErr)
@@ -363,6 +377,24 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject missing, expired, replayed, or provider-mismatched application
+	// state before doing OIDC discovery. The relying-party library still
+	// validates its encrypted state cookie during code exchange; this early
+	// application-level check keeps invalid callbacks fail-closed and gives the
+	// browser a useful recovery message even when the IdP is unavailable.
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		h.redirectWithError(w, r, "Login session expired. Please try signing in again.")
+		return
+	}
+	if _, stateErr := repository.NewSSOStateRepository(h.db).GetValid(state, provider.ID, time.Now()); stateErr != nil {
+		slog.Warn("OIDC callback state token missing or expired",
+			slog.String("component", "sso"),
+			slog.String("provider", provider.Slug))
+		h.redirectWithError(w, r, "Login session expired. Please try signing in again.")
+		return
+	}
+
 	// Decrypt client secret
 	clientSecret, err := h.encryption.Decrypt(provider.ClientSecretEncrypted)
 	if err != nil {
@@ -399,7 +431,7 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		// a valid state. The DB lookup is here for application-level metadata
 		// (where to redirect, remember-me flag) and as a defense-in-depth layer
 		// against state replay across deployments. If the row is missing —
-		// most likely the 5-minute expiry elapsed — fail closed instead of
+		// most likely the state expiry elapsed — fail closed instead of
 		// silently defaulting to "/", so the user gets a retry prompt and the
 		// audit log carries a discrete signal.
 		token, stateErr := repository.NewSSOStateRepository(h.db).GetValid(state, provider.ID, time.Now())
@@ -411,6 +443,11 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		_ = repository.NewSSOStateRepository(h.db).Delete(token.ID)
 		storedRedirectURI := token.RedirectURI
 		rememberMe := token.RememberMe
+		slog.Info("restored OIDC login state",
+			slog.String("component", "sso"),
+			slog.String("provider", provider.Slug),
+			slog.Bool("remember_me", rememberMe),
+		)
 		// A native (desktop/iOS) flow is identified by its custom-scheme
 		// redirect target, stored in StartLogin. Web flows keep the existing
 		// relative-path coercion; the native target is left intact so the
@@ -435,8 +472,6 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case err == sso.ErrAutoProvisionDisabled:
 				h.redirectWithError(w, r, "User account not found. Contact your administrator.")
-			case errors.Is(err, sso.ErrEmailNotVerified):
-				h.redirectWithError(w, r, "Your email address has not been verified by the identity provider")
 			case errors.Is(err, sso.ErrAccountLinkingRequiresVerification):
 				h.redirectWithError(w, r, "Cannot link to existing account: your identity provider must verify your email address first")
 			default:
@@ -447,14 +482,13 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 
 		user := result.User
 
-		// If IdP verified the email, update our DB to reflect that
-		if !result.NeedsEmailVerification && !user.EmailVerified {
-			if h.emailVerificationService != nil {
-				if err := h.emailVerificationService.SetEmailVerified(user.ID, true); err != nil {
-					slog.Warn("failed to set email verified from IdP", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.Any("error", err))
-				} else {
-					user.EmailVerified = true
-				}
+		// SSO authentication is itself evidence of account ownership: keep the
+		// verification column aligned so informational UI reflects the login.
+		if !user.EmailVerified && h.emailVerificationService != nil {
+			if err := h.emailVerificationService.SetEmailVerified(user.ID, true); err != nil {
+				slog.Warn("failed to mark SSO user email verified", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.Any("error", err))
+			} else {
+				user.EmailVerified = true
 			}
 		}
 
@@ -464,33 +498,16 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Handle email verification if needed
-		if result.NeedsEmailVerification && !user.EmailVerified {
-			// User needs email verification - send verification email
-			if h.emailVerificationService != nil {
-				var token string
-				token, err = h.emailVerificationService.GenerateVerificationToken(user.ID)
-				if err != nil {
-					slog.Warn("failed to generate verification token", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.Any("error", err))
-					// Continue with login but log the error
-				} else {
-					if err = h.emailVerificationService.SendVerificationEmail(user, token); err != nil {
-						slog.Warn("failed to send verification email", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.Any("error", err))
-						// Continue with login but log the error
-					} else {
-						slog.Info("sent verification email", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.String("email", user.Email))
-					}
-				}
-			} else {
-				slog.Warn("user needs email verification but SMTP is not configured", slog.String("component", "sso"), slog.Int("user_id", user.ID))
-			}
-		}
-
 		// Get client IP for session
 		ipAddress := h.ipExtractor.GetClientIP(r)
 
 		// Create session
-		slog.Debug("creating session", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.String("ip_address", ipAddress))
+		slog.Info("creating OIDC session",
+			slog.String("component", "sso"),
+			slog.String("provider", provider.Slug),
+			slog.Int("user_id", user.ID),
+			slog.Bool("remember_me", rememberMe),
+		)
 		session, err := h.sessionManager.CreateSession(user.ID, ipAddress, r.UserAgent(), rememberMe)
 		if err != nil {
 			slog.Error("failed to create session", slog.String("component", "sso"), slog.Any("error", err))
@@ -528,13 +545,8 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		}
 		slog.Debug("session cookie set, redirecting", slog.String("component", "sso"))
 
-		// Redirect based on email verification status
-		if result.NeedsEmailVerification && !user.EmailVerified {
-			http.Redirect(w, r, "/?verify_email=pending", http.StatusFound)
-		} else {
-			// storedRedirectURI is validated above by isValidRedirectURI (relative path only).
-			http.Redirect(w, r, storedRedirectURI, http.StatusFound) // #nosec G710
-		}
+		// storedRedirectURI is validated above by isValidRedirectURI (relative path only).
+		http.Redirect(w, r, storedRedirectURI, http.StatusFound) // #nosec G710
 	})
 
 	callbackHandler(w, r)
@@ -716,7 +728,7 @@ func (h *SSOHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 
 	// Gate: require sso.multi-provider capability to add more than one provider
 	if count >= 1 && (h.pluginManager == nil || !h.pluginManager.HasCapability("sso.multi-provider")) {
-		respondJSON(w, http.StatusForbidden, map[string]interface{}{
+		respondJSON(w, http.StatusForbidden, map[string]any{
 			"error": "Multiple SSO providers require the sso.multi-provider capability",
 			"code":  "CAPABILITY_REQUIRED",
 		})
@@ -740,10 +752,11 @@ func (h *SSOHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		req.Scopes = "openid email profile"
 	}
 
-	// Default RequireVerifiedEmail to true for security
-	requireVerifiedEmail := true
+	// Preserve the existing default: trust provider-managed email when the
+	// provider omits verification status.
+	trustProviderEmail := true
 	if req.RequireVerifiedEmail != nil {
-		requireVerifiedEmail = *req.RequireVerifiedEmail
+		trustProviderEmail = *req.RequireVerifiedEmail
 	}
 
 	provider := &sso.SSOProvider{
@@ -757,7 +770,7 @@ func (h *SSOHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		ClientSecretEncrypted: encryptedSecret,
 		Scopes:                req.Scopes,
 		AutoProvisionUsers:    req.AutoProvisionUsers,
-		RequireVerifiedEmail:  requireVerifiedEmail,
+		RequireVerifiedEmail:  trustProviderEmail,
 		AttributeMapping:      req.AttributeMapping,
 		SAMLIdPMetadataURL:    req.SAMLIdPMetadataURL,
 		SAMLIdPSSOURL:         req.SAMLIdPSSOURL,
@@ -775,8 +788,8 @@ func (h *SSOHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if provider.AutoProvisionUsers && !provider.RequireVerifiedEmail {
-		slog.Warn("SSO provider saved with auto-provisioning enabled and IdP email verification trust disabled — an IdP that lets users self-assert email addresses can pre-empt accounts and may later be linked to access from stricter providers",
+	if provider.RequireVerifiedEmail {
+		slog.Warn("SSO provider saved with provider-managed email trust enabled — a provider that lets users self-assert email addresses can link identities to existing accounts",
 			slog.String("component", "sso"),
 			slog.String("provider", provider.Slug),
 			slog.Int("provider_id", provider.ID))
@@ -877,8 +890,8 @@ func (h *SSOHandler) UpdateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if existing.AutoProvisionUsers && !existing.RequireVerifiedEmail {
-		slog.Warn("SSO provider saved with auto-provisioning enabled and IdP email verification trust disabled — an IdP that lets users self-assert email addresses can pre-empt accounts and may later be linked to access from stricter providers",
+	if existing.RequireVerifiedEmail {
+		slog.Warn("SSO provider saved with provider-managed email trust enabled — a provider that lets users self-assert email addresses can link identities to existing accounts",
 			slog.String("component", "sso"),
 			slog.String("provider", existing.Slug),
 			slog.Int("provider_id", existing.ID))
@@ -997,14 +1010,14 @@ func (h *SSOHandler) TestProvider(w http.ResponseWriter, r *http.Request) {
 			safeMessage = "OIDC discovery failed. Verify the issuer URL is correct and accessible."
 		}
 
-		respondJSON(w, http.StatusBadRequest, map[string]interface{}{
+		respondJSON(w, http.StatusBadRequest, map[string]any{
 			"success": false,
 			"error":   safeMessage,
 		})
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"message": "Successfully connected to OIDC provider",
 	})

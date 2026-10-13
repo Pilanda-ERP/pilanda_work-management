@@ -1,6 +1,8 @@
 <script>
   import { Target, CheckCircle, AlertCircle } from '@lucide/svelte';
+  import Progress from '../../components/Progress.svelte';
   import { homepageStore } from '../../stores';
+  import { t } from '../../stores/i18n.svelte.js';
 
   let milestones = $derived(homepageStore.upcomingMilestones);
   let loading = $derived(homepageStore.loading);
@@ -21,7 +23,7 @@
 {:else if milestones.length === 0}
   <div class="flex flex-col items-center text-center py-6" style="color: var(--ds-text-subtle);">
     <Target class="w-6 h-6 mb-2 opacity-60" />
-    <p class="text-sm">No upcoming milestones</p>
+    <p class="text-sm">{t('dashboard.states.noUpcomingMilestones')}</p>
   </div>
 {:else}
   <ul class="flex flex-col gap-3">
@@ -48,15 +50,15 @@
               </span>
             </div>
             <p class="text-xs mt-1" style="color: var(--ds-text-subtle);">
-              {m.done_items} of {m.total_items} done
+              {t('dashboard.states.milestoneProgress', { done: m.done_items, total: m.total_items })}
               {#if m.target_date}
                 ·
                 {#if overdue}
-                  <span style="color: var(--ds-text-danger);">{Math.abs(daysUntil)} days overdue</span>
+                  <span style="color: var(--ds-text-danger);">{t('dashboard.states.daysOverdue', { days: Math.abs(daysUntil) })}</span>
                 {:else if daysUntil === 0}
-                  Due today
+                  {t('dashboard.dueToday')}
                 {:else if daysUntil !== null}
-                  {daysUntil} days left
+                  {t('dashboard.states.daysLeft', { days: daysUntil })}
                 {/if}
               {/if}
             </p>
@@ -65,15 +67,12 @@
             {Math.round(m.percent_complete)}%
           </span>
         </div>
-        <div
-          class="mt-2 h-1.5 rounded-full overflow-hidden"
-          style="background-color: var(--ds-background-neutral);"
-        >
-          <div
-            class="h-full rounded-full transition-all"
-            style={`width: ${Math.min(100, Math.max(0, m.percent_complete))}%; background-color: ${barColor(m.percent_complete, overdue)};`}
-          ></div>
-        </div>
+        <Progress
+          value={m.percent_complete}
+          size="sm"
+          class="mt-2"
+          color={barColor(m.percent_complete, overdue)}
+        />
       </li>
     {/each}
   </ul>

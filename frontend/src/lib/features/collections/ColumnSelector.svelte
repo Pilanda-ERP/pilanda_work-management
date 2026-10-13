@@ -12,6 +12,7 @@
     columns = [],
     customFieldDefinitions = [],
     canConfigure = true,
+    testId = 'column-selector-trigger',
     onchange,
   } = $props();
 
@@ -37,6 +38,8 @@
   } = createPopover({
     forceVisible: true,
     positioning: {
+      strategy: 'fixed',
+      fitViewport: true,
       placement: 'bottom-end'
     },
     portal: 'body'
@@ -221,7 +224,7 @@
     class="flex items-center gap-2 px-3 py-2 text-sm rounded-lg transition-colors"
     style="color: var(--ctx-text-subtle, var(--ds-text-subtle));"
     title="Configure columns"
-    data-testid="column-selector-trigger"
+    data-testid={testId}
   >
     <Columns3 class="w-4 h-4" />
     <span>Columns</span>
@@ -232,11 +235,12 @@
 {#if $open}
   <div
     use:melt={$content}
-    class="w-80 rounded-lg shadow-xl border z-[60]"
+    data-testid="column-selector-menu"
+    class="w-80 rounded-lg shadow-xl border z-[60] flex flex-col overflow-hidden"
     style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
   >
     <!-- Header -->
-    <div class="px-4 py-3 border-b flex items-center justify-between" style="border-color: var(--ds-border);">
+    <div class="px-4 py-3 border-b shrink-0 flex items-center justify-between" style="border-color: var(--ds-border);">
       <span class="font-medium text-sm" style="color: var(--ds-text);">Configure Columns</span>
       <button
         onclick={cancelChanges}
@@ -248,7 +252,7 @@
     </div>
 
     <!-- Column List -->
-    <div class="p-2 max-h-80 overflow-y-auto">
+    <div data-testid="column-selector-scroll" class="p-2 min-h-0 max-h-80 overflow-y-auto overscroll-contain">
       <div class="text-xs font-medium px-2 py-1 mb-1" style="color: var(--ds-text-subtle);">
         Visible Columns
       </div>
@@ -257,7 +261,7 @@
         {@const required = isRequired(column.field_identifier)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="flex items-center gap-2 px-2 py-2 rounded transition-colors {dragOverIndex === index ? 'bg-blue-50 dark:bg-blue-900/20' : ''}"
+          class="flex items-center gap-2 px-2 py-2 rounded transition-colors {dragOverIndex === index ? 'bg-ds-accent-blue-subtle' : ''}"
           draggable={!required}
           ondragstart={(e) => handleDragStart(e, index)}
           ondragover={(e) => handleDragOver(e, index)}
@@ -286,7 +290,7 @@
             {#each widthOptions as opt}
               <button
                 onclick={() => changeWidth(column.field_identifier, opt.value)}
-                class="w-6 h-6 text-xs rounded transition-colors {column.width === opt.value ? 'bg-blue-500 text-white' : 'hover:bg-[var(--ds-background-neutral-hovered)]'}"
+                class="w-6 h-6 text-xs rounded transition-colors {column.width === opt.value ? 'bg-ds-interactive text-white' : 'hover:bg-ds-background-neutral-hovered'}"
                 style="{column.width !== opt.value ? 'color: var(--ds-text-subtle);' : ''}"
                 title="Width: {opt.label}"
               >
@@ -297,12 +301,13 @@
 
           <!-- Remove Button (if not required) -->
           {#if !required}
-            <button
-              onclick={() => toggleColumn(column.field_identifier)}
-              class="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/20 transition-colors"
-              style="color: var(--ds-text-subtle);"
-              title="Remove column"
-            >
+              <button
+                onclick={() => toggleColumn(column.field_identifier)}
+                class="p-1 rounded hover:bg-ds-danger-subtle transition-colors"
+                style="color: var(--ds-text-subtle);"
+                title="Remove column"
+                data-testid={`remove-column-${column.field_identifier}`}
+              >
               <X class="w-3 h-3" />
             </button>
           {:else}
@@ -369,7 +374,7 @@
     </div>
 
     <!-- Footer -->
-    <div class="px-4 py-3 border-t flex items-center justify-end gap-2" style="border-color: var(--ds-border);">
+    <div class="px-4 py-3 border-t shrink-0 flex items-center justify-end gap-2" style="border-color: var(--ds-border);">
       <button
         onclick={cancelChanges}
         class="px-3 py-1.5 text-sm rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)]"
@@ -379,7 +384,7 @@
       </button>
       <button
         onclick={saveChanges}
-        class="px-3 py-1.5 text-sm rounded bg-blue-500 text-white transition-colors hover:bg-blue-600"
+        class="px-3 py-1.5 text-sm rounded bg-ds-interactive text-white transition-colors hover:bg-ds-interactive-hovered"
         data-testid="column-selector-apply"
       >
         Apply

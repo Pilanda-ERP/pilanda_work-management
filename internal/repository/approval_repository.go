@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"windshift/internal/database"
@@ -43,7 +44,18 @@ type ApproverInsert struct {
 // FindFullRequestByID loads a request with its step instances, approvers,
 // and decisions. Returns ErrNotFound if no row matches.
 func (r *ApprovalRepository) FindFullRequestByID(ctx context.Context, requestID int) (*models.ApprovalRequest, error) {
-	req, err := r.findRequestRow(ctx, requestID)
+	return r.findFullRequestByID(ctx, requestID, nil)
+}
+
+// FindFullRequestByIDInChannel loads a request only when its item belongs to
+// channelID. Portal routes use this instead of loading globally and checking
+// the channel after hydration.
+func (r *ApprovalRepository) FindFullRequestByIDInChannel(ctx context.Context, requestID, channelID int) (*models.ApprovalRequest, error) {
+	return r.findFullRequestByID(ctx, requestID, &channelID)
+}
+
+func (r *ApprovalRepository) findFullRequestByID(ctx context.Context, requestID int, channelID *int) (*models.ApprovalRequest, error) {
+	req, err := r.findRequestRowInChannel(ctx, requestID, channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -154,26 +166,96 @@ func (r *ApprovalRepository) FindRequestIDsForItem(ctx context.Context, itemID i
 	return scanIntList(rows)
 }
 
+// FindRequestIDsForItemPage returns a newest-first bounded timeline page.
+func (r *ApprovalRepository) FindRequestIDsForItemPage(ctx context.Context, itemID, limit, offset int) (ids []int, total int, err error) {
+	if limit <= 0 {
+		return nil, 0, errors.New("approval page limit must be positive")
+	}
+	if err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM approval_requests WHERE item_id = ?", itemID).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count item approvals: %w", err)
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id FROM approval_requests
+		WHERE item_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ? OFFSET ?`, itemID, limit, max(offset, 0))
+	if err != nil {
+		return nil, 0, fmt.Errorf("query item approval page: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	ids, err = scanIntList(rows)
+	return ids, total, err
+}
+
 // FindRequestIDsForActor returns request ids where the actor (user or portal
 // customer) is in the active approver pool of any pending step. actorColumn
 // must be exactly "user_id" or "portal_customer_id" — the literal is
 // concatenated into the query, callers cannot pass arbitrary strings.
 func (r *ApprovalRepository) FindRequestIDsForActor(ctx context.Context, actorColumn string, actorID int, status string) ([]int, error) {
+	return r.findRequestIDsForActor(ctx, actorColumn, actorID, status, nil)
+}
+
+// FindRequestIDsForActorPage returns a stable bounded page for an approver.
+func (r *ApprovalRepository) FindRequestIDsForActorPage(ctx context.Context, actorColumn string, actorID int, status string, limit, offset int) (ids []int, total int, err error) {
+	if actorColumn != "user_id" && actorColumn != "portal_customer_id" {
+		return nil, 0, fmt.Errorf("invalid actor column %q", actorColumn)
+	}
+	if limit <= 0 {
+		return nil, 0, errors.New("approval page limit must be positive")
+	}
+	if status == "" {
+		status = models.ApprovalRequestStatusPending
+	}
+	base := fmt.Sprintf(`
+		FROM approval_requests ar
+		JOIN approval_step_instances asi ON asi.approval_request_id = ar.id AND asi.status = 'pending'
+		JOIN approval_step_approvers asa ON asa.approval_step_instance_id = asi.id AND asa.is_active = true
+		WHERE ar.status = ? AND asa.%s = ?`, actorColumn)
+	args := []any{status, actorID}
+	if err := r.db.QueryRowContext(ctx, "SELECT COUNT(DISTINCT ar.id) "+base, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count approvals for actor: %w", err)
+	}
+	pageArgs := append(slices.Clone(args), limit, max(offset, 0))
+	rows, err := r.db.QueryContext(ctx, "SELECT DISTINCT ar.id "+base+" ORDER BY ar.id DESC LIMIT ? OFFSET ?", pageArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query approval page for actor: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	ids, err = scanIntList(rows)
+	return ids, total, err
+}
+
+// FindRequestIDsForActorInChannel is the portal-scoped counterpart to
+// FindRequestIDsForActor. It filters at the item join so requests from another
+// portal can never enter the hydration path.
+func (r *ApprovalRepository) FindRequestIDsForActorInChannel(ctx context.Context, actorColumn string, actorID int, status string, channelID int) ([]int, error) {
+	return r.findRequestIDsForActor(ctx, actorColumn, actorID, status, &channelID)
+}
+
+func (r *ApprovalRepository) findRequestIDsForActor(ctx context.Context, actorColumn string, actorID int, status string, channelID *int) ([]int, error) {
 	if actorColumn != "user_id" && actorColumn != "portal_customer_id" {
 		return nil, fmt.Errorf("invalid actor column %q", actorColumn)
 	}
 	if status == "" {
 		status = models.ApprovalRequestStatusPending
 	}
+	channelJoin := ""
+	args := []any{}
+	if channelID != nil {
+		channelJoin = "JOIN items i ON i.id = ar.item_id AND i.channel_id = ?"
+		args = append(args, *channelID)
+	}
+	args = append(args, status, actorID)
 	q := fmt.Sprintf(`
 		SELECT DISTINCT ar.id
 		FROM approval_requests ar
 		JOIN approval_step_instances asi ON asi.approval_request_id = ar.id AND asi.status = 'pending'
 		JOIN approval_step_approvers asa ON asa.approval_step_instance_id = asi.id AND asa.is_active = true
+		%s
 		WHERE ar.status = ? AND asa.%s = ?
 		ORDER BY ar.id DESC
-	`, actorColumn)
-	rows, err := r.db.QueryContext(ctx, q, status, actorID)
+	`, channelJoin, actorColumn)
+	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query for actor: %w", err)
 	}
@@ -193,7 +275,7 @@ func (r *ApprovalRepository) ActorHasActivePoolMembershipOnItem(ctx context.Cont
 		return false, fmt.Errorf("invalid actor column %q", actorColumn)
 	}
 	channelJoin := ""
-	args := []interface{}{}
+	args := []any{}
 	if channelID != nil {
 		channelJoin = "JOIN items i ON i.id = ar.item_id AND i.channel_id = ?"
 		args = append(args, *channelID)
@@ -232,7 +314,8 @@ func (r *ApprovalRepository) FindGatedRequestForTransition(ctx context.Context, 
 		JOIN workflow_transitions wt
 			ON wt.id IN (ass.approve_transition_id, ass.deny_transition_id)
 		WHERE ar.item_id = ? AND ar.status = 'pending'
-		  AND wt.from_status_id = ? AND wt.to_status_id = ?
+		  AND (wt.from_status_id = ? OR wt.from_all_statuses = TRUE)
+		  AND wt.to_status_id = ?
 		LIMIT 1
 	`, itemID, fromStatusID, toStatusID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -359,16 +442,29 @@ func (r *ApprovalRepository) CountPendingApproversForRole(ctx context.Context, r
 	return count, nil
 }
 
-// findRequestRow loads a single approval_requests row by id without nested
-// data. Internal helper for FindFullRequestByID.
-func (r *ApprovalRepository) findRequestRow(ctx context.Context, requestID int) (*models.ApprovalRequest, error) {
+func (r *ApprovalRepository) findRequestRowInChannel(ctx context.Context, requestID int, channelID *int) (*models.ApprovalRequest, error) {
 	var req models.ApprovalRequest
 	var fromStatus sql.NullInt64
-	err := r.db.QueryRowContext(ctx, `
-		SELECT id, item_id, approval_set_status_id, status_id, from_status_id, triggered_by_user_id, status, created_at, completed_at
-		FROM approval_requests WHERE id = ?
-	`, requestID).Scan(
-		&req.ID, &req.ItemID, &req.ApprovalSetStatusID, &req.StatusID,
+	query := `
+		SELECT ar.id, ar.item_id, i.workspace_id, ar.approval_set_status_id, ar.status_id, ar.from_status_id,
+		       ar.triggered_by_user_id, ar.status, ar.created_at, ar.completed_at
+		FROM approval_requests ar
+		JOIN items i ON i.id = ar.item_id
+		WHERE ar.id = ?
+	`
+	args := []any{requestID}
+	if channelID != nil {
+		query = `
+			SELECT ar.id, ar.item_id, i.workspace_id, ar.approval_set_status_id, ar.status_id, ar.from_status_id,
+			       ar.triggered_by_user_id, ar.status, ar.created_at, ar.completed_at
+			FROM approval_requests ar
+			JOIN items i ON i.id = ar.item_id
+			WHERE ar.id = ? AND i.channel_id = ?
+		`
+		args = append(args, *channelID)
+	}
+	err := r.db.QueryRowContext(ctx, query, args...).Scan(
+		&req.ID, &req.ItemID, &req.WorkspaceID, &req.ApprovalSetStatusID, &req.StatusID,
 		&fromStatus, &req.TriggeredByUserID, &req.Status, &req.CreatedAt, &req.CompletedAt,
 	)
 	if err != nil {
@@ -388,13 +484,38 @@ func (r *ApprovalRepository) findRequestRow(ctx context.Context, requestID int) 
 // LoadRequestByIDInTx loads a bare request row inside a tx. Returns
 // ErrNotFound if no row matches.
 func (r *ApprovalRepository) LoadRequestByIDInTx(ctx context.Context, tx database.Tx, requestID int) (*models.ApprovalRequest, error) {
+	return r.loadRequestByIDInChannelInTx(ctx, tx, requestID, nil)
+}
+
+// LoadRequestByIDInChannelInTx is the decision-path guard for portal routes.
+// It keeps the channel check in the same transaction as the state mutation.
+func (r *ApprovalRepository) LoadRequestByIDInChannelInTx(ctx context.Context, tx database.Tx, requestID, channelID int) (*models.ApprovalRequest, error) {
+	return r.loadRequestByIDInChannelInTx(ctx, tx, requestID, &channelID)
+}
+
+func (r *ApprovalRepository) loadRequestByIDInChannelInTx(ctx context.Context, tx database.Tx, requestID int, channelID *int) (*models.ApprovalRequest, error) {
 	var req models.ApprovalRequest
 	var fromStatus sql.NullInt64
-	err := tx.QueryRowContext(ctx, `
-		SELECT id, item_id, approval_set_status_id, status_id, from_status_id, triggered_by_user_id, status, created_at, completed_at
-		FROM approval_requests WHERE id = ?
-	`, requestID).Scan(
-		&req.ID, &req.ItemID, &req.ApprovalSetStatusID, &req.StatusID,
+	query := `
+		SELECT ar.id, ar.item_id, i.workspace_id, ar.approval_set_status_id, ar.status_id, ar.from_status_id,
+		       ar.triggered_by_user_id, ar.status, ar.created_at, ar.completed_at
+		FROM approval_requests ar
+		JOIN items i ON i.id = ar.item_id
+		WHERE ar.id = ?
+	`
+	args := []any{requestID}
+	if channelID != nil {
+		query = `
+			SELECT ar.id, ar.item_id, i.workspace_id, ar.approval_set_status_id, ar.status_id, ar.from_status_id,
+			       ar.triggered_by_user_id, ar.status, ar.created_at, ar.completed_at
+			FROM approval_requests ar
+			JOIN items i ON i.id = ar.item_id
+			WHERE ar.id = ? AND i.channel_id = ?
+		`
+		args = append(args, *channelID)
+	}
+	err := tx.QueryRowContext(ctx, query, args...).Scan(
+		&req.ID, &req.ItemID, &req.WorkspaceID, &req.ApprovalSetStatusID, &req.StatusID,
 		&fromStatus, &req.TriggeredByUserID, &req.Status, &req.CreatedAt, &req.CompletedAt,
 	)
 	if err != nil {
@@ -574,14 +695,19 @@ func (r *ApprovalRepository) GetItemCurrentStatusID(ctx context.Context, tx data
 }
 
 // GetTransitionEndpoints returns (from_status_id, to_status_id) for a
-// workflow_transitions row. Used by finalizeRequest to compute the
-// destination status for the approve/deny transition.
-func (r *ApprovalRepository) GetTransitionEndpoints(ctx context.Context, tx database.Tx, transitionID int) (fromStatusID, toStatusID int, err error) {
+// workflow_transitions row. The source is nil for an all-statuses or initial
+// transition. finalizeRequest only needs the destination status.
+func (r *ApprovalRepository) GetTransitionEndpoints(ctx context.Context, tx database.Tx, transitionID int) (fromStatusID *int, toStatusID int, err error) {
+	var fromStatus sql.NullInt64
 	err = tx.QueryRowContext(ctx,
 		`SELECT from_status_id, to_status_id FROM workflow_transitions WHERE id = ?`, transitionID,
-	).Scan(&fromStatusID, &toStatusID)
+	).Scan(&fromStatus, &toStatusID)
 	if err != nil {
-		return 0, 0, notFoundOrWrap(err, "load transition endpoints")
+		return nil, 0, notFoundOrWrap(err, "load transition endpoints")
+	}
+	if fromStatus.Valid {
+		id := int(fromStatus.Int64)
+		fromStatusID = &id
 	}
 	return fromStatusID, toStatusID, nil
 }
@@ -684,7 +810,7 @@ func (r *ApprovalRepository) SkipPendingPeerSteps(ctx context.Context, tx databa
 	return nil
 }
 
-// DeactivateApprovers flips is_active=1 → is_active=0 on every active
+// DeactivateApprovers flips is_active=TRUE → is_active=FALSE on every active
 // approver row for a step. Used by reassign / refresh flows to tombstone the
 // prior pool while preserving snapshot history.
 func (r *ApprovalRepository) DeactivateApprovers(ctx context.Context, tx database.Tx, stepInstanceID int) error {
@@ -712,7 +838,7 @@ func (r *ApprovalRepository) DeactivateApproverByUser(ctx context.Context, tx da
 // InsertApprover inserts an approval_step_approvers row. Exactly one of
 // UserID / PortalCustomerID must be > 0 — the schema CHECK enforces this.
 func (r *ApprovalRepository) InsertApprover(ctx context.Context, tx database.Tx, stepInstanceID int, ai ApproverInsert) error {
-	var userID, portalCustomerID interface{}
+	var userID, portalCustomerID any
 	switch {
 	case ai.PortalCustomerID > 0:
 		portalCustomerID = ai.PortalCustomerID
@@ -765,7 +891,7 @@ func (r *ApprovalRepository) WriteDecision(ctx context.Context, tx database.Tx, 
 	// metadata is JSONB on Postgres. Writing the empty string (which is what
 	// `string(nil)` produces) fails JSONB parsing, so a nil map must hit the
 	// driver as a Go nil interface (→ SQL NULL).
-	var metadataArg interface{}
+	var metadataArg any
 	if metadata != nil {
 		metaJSON, err := json.Marshal(metadata)
 		if err != nil {

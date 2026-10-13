@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { useEventListener } from 'runed';
-  import { Editor, rootCtx, defaultValueCtx, editorViewOptionsCtx, editorViewCtx } from '@milkdown/kit/core';
+  import { Editor, rootCtx, defaultValueCtx, editorViewOptionsCtx, editorViewCtx, serializerCtx, remarkPluginsCtx } from '@milkdown/kit/core';
   import { commonmark, toggleStrongCommand, toggleEmphasisCommand, wrapInBulletListCommand, wrapInOrderedListCommand, toggleInlineCodeCommand } from '@milkdown/kit/preset/commonmark';
   import { gfm, toggleStrikethroughCommand } from '@milkdown/kit/preset/gfm';
   import { listener, listenerCtx } from '@milkdown/kit/plugin/listener';
@@ -12,12 +12,15 @@
   import { nord } from '@milkdown/theme-nord';
   import '@milkdown/theme-nord/style.css';
   import { imageBlockComponent } from '@milkdown/kit/component/image-block';
-  import { Bold, Italic, Code, List, ListOrdered, Strikethrough, Image as ImageIcon, Workflow } from '@lucide/svelte';
+  import { Bold, Italic, Code, List, ListOrdered, Strikethrough, Image as ImageIcon, Workflow, BookOpen } from '@lucide/svelte';
   import { api } from '../api.js';
+  import { confirm } from '../composables/useConfirm.js';
   import Tooltip from '../components/Tooltip.svelte';
+  import FileInput from '../components/FileInput.svelte';
   import MentionPicker from '../pickers/MentionPicker.svelte';
   import { mentionDecorationPlugin } from './milkdown-mention-mark.js';
   import { linkSanitizerPlugin } from './milkdown-link-sanitizer.js';
+  import { rewriteBreakHTML } from './milkdown-hardbreak.js';
   import { excalidrawBlock } from './milkdown-excalidraw-block.svelte.js';
   import PageDiagramModal from '../features/pages/PageDiagramModal.svelte';
   import { highlightCodeBlocks } from './code-highlight.js';
@@ -32,11 +35,24 @@
     customUploadFn = null, downloadUrlBase = '/api/attachments', deferImageUploads = false,
     onDeferredImageUpload = null,
     enableDiagrams = false,
-    workspaceId = null
+    workspaceId = null,
+    enablePageLinks = false,
+    expectedContentHash = '',
+    onBeforeDiagramOpen = async () => {},
+    onDiagramPersisted = (_payload) => {},
+    testId = null
   } = $props();
 
   // Diagram modal state — only meaningful when enableDiagrams=true.
   let diagramModal = $state({ open: false, mode: 'create', attachmentId: null, name: '', getPos: null });
+
+  // Page-link picker state — only meaningful when enablePageLinks=true.
+  let pageLinkPickerOpen = $state(false);
+  let pageLinkQuery = $state('');
+  let pageLinkResults = $state([]);
+  let pageLinkSearching = $state(false);
+  let pageLinkTimer = null;
+  let pageLinkSearchVersion = 0;
 
   const effectivePlaceholder = $derived(placeholder || t('editors.enterText'));
 
@@ -53,10 +69,41 @@
   let isFocused = $state(false);
   const toolbarVisible = $derived(showToolbar && !readonly && (!hideToolbarUntilFocus || isFocused));
 
+  // Blur collapses the focus-revealed toolbar, which reflows everything below
+  // the editor. Hide it on a short delay instead so a click that started on a
+  // control under the editor (e.g. the comment submit button) lands before the
+  // shift; refocusing cancels the pending hide (WI-1349).
+  let toolbarHideTimer = null;
+
+  function handleEditorFocusIn() {
+    clearTimeout(toolbarHideTimer);
+    toolbarHideTimer = null;
+    isFocused = true;
+  }
+
+  function handleEditorFocusOut(e) {
+    if (e.currentTarget.contains(/** @type {Node | null} */ (e.relatedTarget))) return;
+    clearTimeout(toolbarHideTimer);
+    toolbarHideTimer = setTimeout(() => {
+      toolbarHideTimer = null;
+      isFocused = false;
+    }, 250);
+  }
+
   let editorElement = $state(null);
   let fileInput = $state(null);
   let editor = $state(null);
+  let disposed = false;
   let initialContent = content;
+
+  async function destroyEditor(target) {
+    if (!target) return;
+    try {
+      await target.destroy();
+    } catch (e) {
+      console.error('Error destroying editor:', e);
+    }
+  }
 
   // Mention picker state
   let mentionPickerOpen = $state(false);
@@ -141,6 +188,7 @@
 
   function handleMentionSelect(user) {
     if (!editor || !mentionRange) return;
+    const range = mentionRange;
 
     // Format the mention text based on whether display name has spaces
     const displayName = `${user.first_name || ''} ${user.last_name || ''}`.trim();
@@ -155,11 +203,20 @@
 
       // Replace @query with @"Display Name" or @username
       const tr = state.tr.replaceWith(
-        mentionRange.from,
-        mentionRange.to,
+        range.from,
+        range.to,
         state.schema.text(mentionText + ' ')
       );
       dispatch(tr);
+      view.focus();
+
+      // The listener plugin normally mirrors document changes back into the
+      // bindable Markdown value. Under a busy event loop, however, a submit
+      // can observe the old @query before that listener callback runs. Keep
+      // programmatic mention insertion atomic from the form's perspective.
+      const markdown = ctx.get(serializerCtx)(tr.doc);
+      content = markdown;
+      onContentChange?.(markdown);
     });
 
     closeMentionPicker();
@@ -305,19 +362,25 @@
             };
           }
 
-          const formData = new FormData();
-          formData.append('file', image);
-
-          if (effectiveEntityId && effectiveEntityType) {
-            formData.append('entity_id', effectiveEntityId.toString());
-            formData.append('entity_type', effectiveEntityType);
+          let result;
+          if (!customUploadFn && effectiveEntityType === 'item' && effectiveEntityId) {
+            const attachment = await api.attachments.uploadToItem(effectiveEntityId, image);
+            result = { success: true, attachment };
+          } else {
+            const formData = new FormData();
+            formData.append('file', image);
+            if (effectiveEntityId && effectiveEntityType) {
+              formData.append('entity_id', effectiveEntityId.toString());
+              formData.append('entity_type', effectiveEntityType);
+            }
+            result = customUploadFn
+              ? await customUploadFn(formData)
+              : await api.attachments.upload(formData);
           }
-
-          const result = customUploadFn
-            ? await customUploadFn(formData)
-            : await api.attachments.upload(formData);
           if (result.success && result.attachment) {
-            const src = `${downloadUrlBase}/${result.attachment.id}/download`;
+            const src = downloadUrlBase === '/api/attachments'
+              ? api.attachments.getDownloadUrl(result.attachment.id)
+              : `${downloadUrlBase}/${result.attachment.id}/download`;
             const node = schema?.nodes?.image?.createAndFill({
               src,
               alt: image.name,
@@ -366,8 +429,9 @@
     return nodes;
   }
 
-  function openDiagramCreate() {
+  async function openDiagramCreate() {
     if (readonly || !enableDiagrams) return;
+    await onBeforeDiagramOpen();
     diagramModal = { open: true, mode: 'create', attachmentId: null, name: '', getPos: null };
   }
 
@@ -390,22 +454,43 @@
     return true;
   }
 
-  function handleDiagramSaved({ attachmentId, name }) {
+  function handleDiagramSaved({ attachmentId, name, contentHash, pageContent }) {
     if (!editor) return;
-    if (diagramModal.mode === 'edit' && typeof diagramModal.getPos === 'function') {
-      const pos = diagramModal.getPos();
-      if (typeof pos === 'number') {
-        editor.action((ctx) => {
-          const view = ctx.get(editorViewCtx);
-          const tr = view.state.tr.setNodeMarkup(pos, undefined, { attachmentId, name });
-          view.dispatch(tr);
-        });
+    editor.action(replaceAll(pageContent || ''));
+    onDiagramPersisted({ attachmentId, name, contentHash, pageContent });
+  }
+
+  async function deleteDiagramNode(attachmentId, getPos) {
+    const confirmed = await confirm({
+      title: t('common.delete'),
+      message: t('components.diagram.confirmDelete'),
+      confirmText: t('common.delete'),
+      variant: 'danger',
+    });
+    if (!confirmed || !editor || typeof getPos !== 'function') return;
+
+    editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx);
+      let position;
+      try {
+        position = getPos();
+      } catch {
         return;
       }
-    }
-    // Create mode — insert a fenced excalidraw block at the cursor.
-    const fenced = '\n```excalidraw\n' + JSON.stringify({ attachmentId, name }) + '\n```\n';
-    editor.action(insert(fenced));
+      if (!Number.isInteger(position)) return;
+      const node = view.state.doc.nodeAt(position);
+      if (
+        !node ||
+        node.type.name !== 'excalidraw' ||
+        node.attrs.attachmentId !== attachmentId
+      ) {
+        return;
+      }
+      view.dispatch(
+        view.state.tr.delete(position, position + node.nodeSize).scrollIntoView()
+      );
+      view.focus();
+    });
   }
 
   onMount(async () => {
@@ -414,27 +499,42 @@
         .config((ctx) => {
           ctx.set(rootCtx, editorElement);
           ctx.set(defaultValueCtx, initialContent || '');
+          // Parse `<br>`-style html as hard breaks (see milkdown-hardbreak.js).
+          // Registered through remarkPluginsCtx here — config runs before the
+          // schema step snapshots the remark processor; a `.use($remark)`
+          // plugin appends after that snapshot and never takes effect.
+          ctx.update(remarkPluginsCtx, (plugins) => [
+            ...plugins,
+            { plugin: rewriteBreakHTML, options: {} },
+          ]);
           ctx.get(listenerCtx).markdownUpdated((ctx, markdown) => {
-            content = markdown;
-            if (onContentChange) onContentChange(markdown);
+            if (disposed) return;
+            // Listener notifications can be delivered after a newer editor
+            // transaction (for example, selecting an @ mention). Always
+            // serialize the current document so a delayed callback cannot
+            // regress the bindable value to an older Markdown snapshot.
+            let currentMarkdown = markdown;
+            try {
+              const view = ctx.get(editorViewCtx);
+              if (view) currentMarkdown = ctx.get(serializerCtx)(view.state.doc);
+            } catch {
+              // The listener can outlive the editor view during teardown.
+            }
+            content = currentMarkdown;
+            if (onContentChange) onContentChange(currentMarkdown);
           });
-          // Detect the @-mention trigger on every document change, not just on
-          // keyup. Mobile soft keyboards (Gboard, iOS) routinely don't emit
-          // keydown/keyup for character input, so the keyup handler below never
-          // fires and the picker never opens on phones (WI-431). `updated`
-          // fires on any content change regardless of input method.
-          // checkForMentionTrigger only reads state, so overlapping with keyup
-          // on desktop is harmless.
+          // Detect mentions on all changes: mobile keyboards may omit keyup.
+          // Overlap with desktop keyup is safe because the check only reads state.
           ctx.get(listenerCtx).updated((updateCtx) => {
-            if (readonly) return;
+            if (readonly || disposed) return;
             try {
               const view = updateCtx.get(editorViewCtx);
               if (view) checkForMentionTrigger(view);
             } catch {
-              // Editor view not ready yet (e.g. initial value load) — ignore.
+              // Ignore an editor view not yet ready.
             }
           });
-          // Use set instead of update to handle case where context may not be initialized
+          // Context may not be initialized for update.
           ctx.set(editorViewOptionsCtx, {
             editable: () => !readonly,
             attributes: {
@@ -444,14 +544,8 @@
             // Handle DOM events for mention detection
             handleDOMEvents: {
               keydown: (_view, event) => {
-                // ProseMirror's own keydown handler calls preventDefault() on a
-                // bare Escape. That makes Escape-to-close bail in any enclosing
-                // modal whose handler guards on `defaultPrevented` (e.g. the
-                // item-detail modal). Returning true here skips ProseMirror's
-                // keydown handler entirely, so Escape bubbles un-prevented and
-                // the modal closes. When the mention picker is open, Escape
-                // should dismiss the picker instead, so leave that to the
-                // normal editor handling.
+                // Bypass ProseMirror's bare-Escape prevention so enclosing
+                // modals close; let the open mention picker handle Escape.
                 if (event.key === 'Escape' && !mentionPickerOpen) {
                   return true;
                 }
@@ -498,10 +592,18 @@
         builder.use(excalidrawBlock);
       }
 
-      editor = await builder.create();
-
+      const created = await builder.create();
+      if (disposed) {
+        // The component unmounted while the async builder was still running;
+        // destroy the late editor here so teardown owns it exactly once.
+        await destroyEditor(created);
+        return;
+      }
+      editor = created;
     } catch (error) {
-      console.error('Failed to initialize Milkdown editor:', error);
+      if (!disposed) {
+        console.error('Failed to initialize Milkdown editor:', error);
+      }
     }
   });
 
@@ -510,27 +612,40 @@
   // node view stays presentational.
   $effect(() => {
     if (!editorElement || !enableDiagrams) return;
-    const handler = (e) => {
+    const handler = async (e) => {
       const { attachmentId, name, getPos } = e.detail || {};
+      await onBeforeDiagramOpen();
       diagramModal = { open: true, mode: 'edit', attachmentId, name: name || '', getPos };
     };
+    const deleteHandler = (e) => {
+      const { attachmentId, getPos } = e.detail || {};
+      void deleteDiagramNode(attachmentId, getPos);
+    };
     editorElement.addEventListener('excalidraw:edit', handler);
-    return () => editorElement.removeEventListener('excalidraw:edit', handler);
+    editorElement.addEventListener('excalidraw:delete', deleteHandler);
+    return () => {
+      editorElement.removeEventListener('excalidraw:edit', handler);
+      editorElement.removeEventListener('excalidraw:delete', deleteHandler);
+    };
   });
 
   onDestroy(async () => {
+    disposed = true;
     if (hoverCardTimeout) {
       clearTimeout(hoverCardTimeout);
     }
     if (hideCardTimeout) {
       clearTimeout(hideCardTimeout);
     }
+    if (toolbarHideTimer) {
+      clearTimeout(toolbarHideTimer);
+      toolbarHideTimer = null;
+    }
+    clearTimeout(pageLinkTimer);
     if (editor) {
-      try {
-        await editor.destroy();
-      } catch (e) {
-        console.error('Error destroying editor:', e);
-      }
+      const target = editor;
+      editor = null;
+      await destroyEditor(target);
     }
   });
 
@@ -606,6 +721,74 @@
     }
   }
 
+  // Insert markdown at the cursor (canned responses, WI-1138). The listener
+  // plugin mirrors the document change back into the bindable content value.
+  export function insertMarkdown(markdown) {
+    if (!editor || readonly) {
+      console.warn('Cannot insert markdown: editor not ready or readonly');
+      return;
+    }
+    try {
+      editor.action(insert(markdown));
+    } catch (error) {
+      console.error('Failed to insert markdown:', error);
+    }
+  }
+
+  function togglePageLinkPicker() {
+    pageLinkPickerOpen = !pageLinkPickerOpen;
+    if (pageLinkPickerOpen) {
+      pageLinkQuery = '';
+      pageLinkResults = [];
+      pageLinkSearchVersion += 1;
+    }
+  }
+
+  function closePageLinkPicker() {
+    clearTimeout(pageLinkTimer);
+    pageLinkSearchVersion += 1;
+    pageLinkPickerOpen = false;
+  }
+
+  function handlePageLinkQuery(event) {
+    pageLinkQuery = event.currentTarget.value;
+    clearTimeout(pageLinkTimer);
+    const trimmed = pageLinkQuery.trim();
+    if (!trimmed || !workspaceId) {
+      pageLinkSearchVersion += 1;
+      pageLinkResults = [];
+      pageLinkSearching = false;
+      return;
+    }
+    pageLinkSearching = true;
+    const version = ++pageLinkSearchVersion;
+    pageLinkTimer = setTimeout(async () => {
+      try {
+        const result = await api.pages.searchPages(workspaceId, trimmed, { limit: 8 });
+        if (version !== pageLinkSearchVersion) return;
+        pageLinkResults = result?.results ?? (Array.isArray(result) ? result : []);
+      } catch (error) {
+        if (version !== pageLinkSearchVersion) return;
+        console.error('Page search failed:', error);
+        pageLinkResults = [];
+      } finally {
+        if (version === pageLinkSearchVersion) pageLinkSearching = false;
+      }
+    }, 250);
+  }
+
+  function insertPageLink(page) {
+    if (!editor || readonly || !page?.id) return;
+    const title = String(page.title || `Page ${page.id}`).replace(/[/\\]/g, ' ');
+    try {
+      editor.action(insert(`[${title}](page:${page.id})`));
+      closePageLinkPicker();
+      focus();
+    } catch (error) {
+      console.error('Failed to insert page link:', error);
+    }
+  }
+
   function handleClick() {
     if (!readonly) {
       focus();
@@ -641,12 +824,26 @@
       });
     }
   });
+
+  // Page permissions load after the document, so a diagram node view can be
+  // created while the editor is provisionally readonly. ProseMirror does not
+  // update custom node views when only `view.editable` changes, so replace the
+  // node-view map with an equivalent copy to make it rebuild those views using
+  // the current permission state.
+  $effect(() => {
+    readonly;
+    if (!editor) return;
+    editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx);
+      view.setProps({ nodeViews: { ...(view.props.nodeViews || {}) } });
+    });
+  });
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="milkdown-wrapper" class:has-toolbar={toolbarVisible}
-  onfocusin={() => isFocused = true}
-  onfocusout={(e) => { if (!e.currentTarget.contains(/** @type {Node | null} */ (e.relatedTarget))) isFocused = false; }}
+  onfocusin={handleEditorFocusIn}
+  onfocusout={handleEditorFocusOut}
 >
   {#if toolbarVisible}
     <div class="milkdown-toolbar" tabindex="-1">
@@ -711,18 +908,35 @@
           {/snippet}
         </Tooltip>
       {/if}
+      {#if enablePageLinks && workspaceId}
+        <Tooltip content={t('editors.insertPageLink')} placement="bottom">
+          {#snippet children()}
+            <button type="button" class="toolbar-btn" tabindex="-1" onclick={togglePageLinkPicker} aria-label={t('editors.insertPageLink')} data-testid="milkdown-insert-page-link">
+              <BookOpen size={14} />
+            </button>
+          {/snippet}
+        </Tooltip>
+      {/if}
     </div>
   {/if}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div bind:this={editorElement} class="milkdown-editor" class:readonly class:compact class:has-toolbar={toolbarVisible} onclick={handleClick}></div>
+  <div
+    bind:this={editorElement}
+    data-testid={testId}
+    data-ready={editor ? 'true' : 'false'}
+    class="milkdown-editor"
+    class:readonly
+    class:compact
+    class:has-toolbar={toolbarVisible}
+    onclick={handleClick}
+  ></div>
 </div>
-<input
-  bind:this={fileInput}
-  type="file"
+<FileInput
+  bind:inputRef={fileInput}
   accept="image/*"
   multiple
   tabindex="-1"
-  aria-hidden="true"
+  ariaHidden="true"
   class="hidden-file-input"
   onchange={handleFileInputChange}
 />
@@ -732,15 +946,59 @@
     mode={diagramModal.mode}
     initialAttachmentId={diagramModal.attachmentId}
     initialName={diagramModal.name}
+    {workspaceId}
     pageId={entityType === 'page' ? entityId : null}
+    {expectedContentHash}
     onSaved={handleDiagramSaved}
   />
+{/if}
+<!-- Page-link picker for inserting knowledge-page links -->
+{#if pageLinkPickerOpen}
+  <!-- Container only: the click handler stops propagation to the editor.
+       role="presentation" keeps it out of the accessibility tree. -->
+  <div
+    class="page-link-picker"
+    role="presentation"
+    data-testid="page-link-picker"
+    onclick={(e) => e.stopPropagation()}
+  >
+    <input
+      type="text"
+      class="page-link-input"
+      placeholder={t('editors.searchPagesToLink')}
+      value={pageLinkQuery}
+      oninput={handlePageLinkQuery}
+      data-testid="page-link-search"
+    />
+    {#if pageLinkSearching}
+      <div class="page-link-empty">{t('common.searching')}</div>
+    {:else if pageLinkResults.length === 0}
+      <div class="page-link-empty">{t('common.noResults')}</div>
+    {:else}
+      <ul class="page-link-results">
+        {#each pageLinkResults as page (page.id)}
+          <li>
+            <button
+              type="button"
+              class="page-link-option"
+              data-testid="page-link-option"
+              onclick={() => insertPageLink(page)}
+            >
+              <BookOpen size={13} />
+              <span class="page-link-title">{page.title}</span>
+            </button>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </div>
 {/if}
 <!-- Mention Picker for @ mentions -->
 <MentionPicker
   bind:open={mentionPickerOpen}
   query={mentionQuery}
   position={mentionPosition}
+  {workspaceId}
   {isPersonalWorkspace}
   onSelect={handleMentionSelect}
   onCancel={handleMentionCancel}
@@ -783,7 +1041,7 @@
 {/if}
 
 <style>
-  .hidden-file-input {
+  :global(.hidden-file-input) {
     position: absolute;
     opacity: 0;
     pointer-events: none;
@@ -892,27 +1150,37 @@
   :global(.milkdown-editor .ProseMirror h1) {
     font-size: 1.35rem;
     font-weight: 700;
-    margin: 0.75rem 0 0.5rem;
+    margin: 1.5rem 0 0.75rem;
   }
 
   :global(.milkdown-editor .ProseMirror h2) {
     font-size: 1.2rem;
     font-weight: 600;
-    margin: 0.75rem 0 0.5rem;
+    margin: 1.25rem 0 0.625rem;
   }
 
   :global(.milkdown-editor .ProseMirror h3) {
     font-size: 1.05rem;
     font-weight: 600;
-    margin: 0.5rem 0 0.25rem;
+    margin: 1rem 0 0.5rem;
   }
 
   :global(.milkdown-editor .ProseMirror p) {
+    margin: 0.5rem 0;
+  }
+
+  :global(.milkdown-editor .ProseMirror li p) {
     margin: 0.25rem 0;
   }
 
+  :global(.milkdown-editor .ProseMirror > h1:first-child),
+  :global(.milkdown-editor .ProseMirror > h2:first-child),
+  :global(.milkdown-editor .ProseMirror > h3:first-child) {
+    margin-top: 0;
+  }
+
   /* Preserve blank lines from remarkPreserveEmptyLinePlugin */
-  :global(.milkdown-editor .ProseMirror br) {
+  :global(.milkdown-editor .ProseMirror br:not(.ProseMirror-trailingBreak)) {
     display: block;
     content: "";
     margin-top: 0.5rem;
@@ -921,7 +1189,7 @@
   :global(.milkdown-editor .ProseMirror ul),
   :global(.milkdown-editor .ProseMirror ol) {
     padding-left: 1.5rem;
-    margin: 0.25rem 0;
+    margin: 0.5rem 0;
   }
 
   :global(.milkdown-editor .ProseMirror ul) {
@@ -939,7 +1207,7 @@
   :global(.milkdown-editor .ProseMirror blockquote) {
     border-left: 4px solid var(--ds-border);
     padding-left: 1rem;
-    margin: 0.25rem 0;
+    margin: 0.75rem 0;
     font-style: italic;
     color: var(--ds-text-subtle);
   }
@@ -958,7 +1226,7 @@
     padding: 1rem;
     border-radius: 0.375rem;
     overflow-x: auto;
-    margin: 0.25rem 0;
+    margin: 0.75rem 0;
     border: 1px solid var(--ds-border);
   }
 
@@ -972,7 +1240,7 @@
     padding: 1rem;
     border-radius: 0.375rem;
     overflow-x: auto;
-    margin: 0.25rem 0;
+    margin: 0.75rem 0;
     border: 1px solid var(--ds-border);
     font-size: 0.875rem;
     color: var(--shiki-light);
@@ -1033,7 +1301,7 @@
     border-collapse: collapse;
     table-layout: auto;
     width: 100%;
-    margin: 0.25rem 0;
+    margin: 0.75rem 0;
     overflow: hidden;
   }
 
@@ -1283,6 +1551,75 @@
   /* Name part of quoted mentions - needs @ prefix via CSS */
   :global(.mention-chip-name::before) {
     content: '@';
+  }
+
+  /* ===== Page-link picker styles ===== */
+  .page-link-picker {
+    background: var(--ds-surface-raised, white);
+    border: 1px solid var(--ds-border, #dfe1e6);
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    width: 280px;
+    max-width: 100%;
+    padding: 6px;
+    margin-top: 4px;
+    z-index: 1000;
+  }
+
+  .page-link-input {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 13px;
+    padding: 6px 8px;
+    border: 1px solid var(--ds-border, #dfe1e6);
+    border-radius: 6px;
+    background: var(--ds-bg, white);
+    color: var(--ds-text, #172b4d);
+    margin-bottom: 4px;
+  }
+
+  .page-link-input:focus {
+    outline: none;
+    border-color: var(--ds-interactive, #2563eb);
+  }
+
+  .page-link-empty {
+    font-size: 12px;
+    color: var(--ds-text-subtle, #6b778c);
+    padding: 6px 4px;
+  }
+
+  .page-link-results {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .page-link-option {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    padding: 6px;
+    font-size: 13px;
+    color: var(--ds-text, #172b4d);
+    cursor: pointer;
+  }
+
+  .page-link-option:hover {
+    background: var(--ds-bg-subtle, #f4f5f7);
+  }
+
+  .page-link-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* ===== User Hover Card Styles ===== */

@@ -1,11 +1,15 @@
 <script>
   import { onMount } from 'svelte';
+  import Spinner from '../components/Spinner.svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import Label from '../components/Label.svelte';
+  import NativeSelect from '../components/NativeSelect.svelte';
   import Modal from './Modal.svelte';
   import ModalHeader from './ModalHeader.svelte';
-  import { Search, ExternalLink, Loader2 } from '@lucide/svelte';
+  import { Search, ExternalLink } from '@lucide/svelte';
   import EmptyState from '../components/EmptyState.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import { successToast, errorToast } from '../stores/toasts.svelte.js';
@@ -24,6 +28,16 @@
   let linking = $state(null);
   let error = $state(null);
   let searchTimeout = null;
+
+  const providerOptions = $derived([
+    { value: null, label: t('integrations.selectProvider') },
+    ...providers.map((provider) => ({ value: provider.id, label: provider.name })),
+  ]);
+
+  function resetSearch() {
+    searchResults = [];
+    searchQuery = '';
+  }
 
   onMount(async () => {
     await loadProviders();
@@ -122,9 +136,7 @@
     <!-- Content -->
     <div class="px-6 py-4 space-y-4">
       {#if loading}
-        <div class="flex items-center justify-center py-8">
-          <Loader2 class="w-6 h-6 animate-spin" style="color: var(--ds-text-subtle);" />
-        </div>
+        <StateDisplay type="loading" />
       {:else if providers.length === 0}
         <EmptyState
           icon={ExternalLink}
@@ -136,17 +148,12 @@
         {#if providers.length > 1}
           <div>
             <Label color="default" required class="mb-1.5">{t('integrations.selectProvider')}</Label>
-            <select
+            <NativeSelect
               bind:value={selectedProviderId}
-              class="w-full h-9 px-3 text-sm border rounded-md"
-              style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-              onchange={() => { searchResults = []; searchQuery = ''; }}
-            >
-              <option value={null}>{t('integrations.selectProvider')}</option>
-              {#each providers as provider}
-                <option value={provider.id}>{provider.name}</option>
-              {/each}
-            </select>
+              options={providerOptions}
+              onchange={resetSearch}
+              size="small"
+            />
           </div>
         {/if}
 
@@ -156,17 +163,17 @@
             <div class="relative">
               <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style="color: var(--ds-text-subtle);" />
               <!-- svelte-ignore a11y_autofocus -->
-              <input
+              <Input
                 type="text"
-                value={searchQuery}
+                bind:value={searchQuery}
                 oninput={onSearchInput}
                 placeholder={t('integrations.searchPages')}
-                class="w-full pl-10 pr-3 py-2 rounded-lg border text-sm"
-                style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+                class="pl-10 pr-10"
                 autofocus
+                size="small"
               />
               {#if searching}
-                <Loader2 class="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 animate-spin" style="color: var(--ds-text-subtle);" />
+                <Spinner size="sm" class="absolute right-3 top-1/2 -translate-y-1/2" />
               {/if}
             </div>
           </div>
@@ -194,7 +201,7 @@
                     </span>
                   </div>
                   {#if linking === result.external_id}
-                    <Loader2 class="w-4 h-4 animate-spin flex-shrink-0" style="color: var(--ds-text-subtle);" />
+                    <Spinner size="sm" class="flex-shrink-0" />
                   {/if}
                 </button>
               {/each}

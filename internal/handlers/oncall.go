@@ -7,15 +7,25 @@ import (
 	"strings"
 	"time"
 
+	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
+	"windshift/internal/utils"
 )
 
-// sanitizeScheduleRequest scrubs the user-facing fields on a schedule
-// payload. Name + Description render in oncall directories + rotation
-// pickers; Timezone is the IANA zone identifier.
+type OnCallHandler struct {
+	onCallRepo        *repository.OnCallRepository
+	teamRepo          *repository.TeamRepository
+	itemRepo          *repository.ItemRepository
+	onCallService     *services.OnCallService
+	incidentService   *services.IncidentService
+	permissionService *services.PermissionService
+	auditor           *logger.Auditor
+}
+
+// sanitizeScheduleRequest sanitizes schedule fields.
 func sanitizeScheduleRequest(req *models.OnCallScheduleRequest) {
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField},
@@ -24,9 +34,13 @@ func sanitizeScheduleRequest(req *models.OnCallScheduleRequest) {
 	)
 }
 
-// sanitizeLayerRequest scrubs the rotation-layer payload. Name labels
-// the layer in the rotation editor; rotation_type and handoff_time are
-// short identifier-shaped strings.
+func (h *OnCallHandler) auditMutation(r *http.Request, action, resource string, resourceID *int, resourceName string, details map[string]any) {
+	if user := utils.GetCurrentUser(r); user != nil {
+		h.auditor.LogWithDetails(r, user, action, resource, resourceID, resourceName, details)
+	}
+}
+
+// sanitizeLayerRequest sanitizes rotation-layer fields.
 func sanitizeLayerRequest(req *models.OnCallScheduleLayerRequest) {
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField},
@@ -39,8 +53,7 @@ func sanitizeLayerRequest(req *models.OnCallScheduleLayerRequest) {
 	}
 }
 
-// sanitizeEscalationPolicy scrubs the policy payload. Name + Description
-// render in policy directories + the escalation chain editor.
+// sanitizeEscalationPolicy sanitizes escalation-policy fields.
 func sanitizeEscalationPolicy(req *models.OnCallEscalationPolicyRequest) {
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField},
@@ -48,26 +61,19 @@ func sanitizeEscalationPolicy(req *models.OnCallEscalationPolicyRequest) {
 	)
 }
 
-// OnCallHandler handles HTTP requests for on-call schedule management
-type OnCallHandler struct {
-	onCallRepo        *repository.OnCallRepository
-	teamRepo          *repository.TeamRepository
-	onCallService     *services.OnCallService
-	permissionService *services.PermissionService
-}
-
-// NewOnCallHandler creates a new on-call handler
-func NewOnCallHandler(onCallRepo *repository.OnCallRepository, teamRepo *repository.TeamRepository, onCallService *services.OnCallService, permissionService *services.PermissionService) *OnCallHandler {
+func NewOnCallHandler(onCallRepo *repository.OnCallRepository, teamRepo *repository.TeamRepository, itemRepo *repository.ItemRepository, onCallService *services.OnCallService, incidentService *services.IncidentService, permissionService *services.PermissionService, auditor *logger.Auditor) *OnCallHandler {
 	return &OnCallHandler{
 		onCallRepo:        onCallRepo,
 		teamRepo:          teamRepo,
+		itemRepo:          itemRepo,
 		onCallService:     onCallService,
+		incidentService:   incidentService,
 		permissionService: permissionService,
+		auditor:           auditor,
 	}
 }
 
-// canManageTeamOnCall checks whether the current user can manage on-call for the given team.
-// Returns true if the user has global teams.manage permission or is a team admin.
+// canManageTeamOnCall permits global team managers and team admins.
 func (h *OnCallHandler) canManageTeamOnCall(w http.ResponseWriter, r *http.Request, teamID int) bool {
 	user, ok := RequireAuth(w, r)
 	if !ok {
@@ -89,42 +95,45 @@ func (h *OnCallHandler) canManageTeamOnCall(w http.ResponseWriter, r *http.Reque
 	return false
 }
 
-// canViewTeamOnCall is the read-side counterpart of canManageTeamOnCall.
-// Permits anyone who can manage the team plus any direct or group-resolved
-// team member. Used to gate read-only on-call info that would otherwise leak
-// names/emails of team members across team boundaries.
+// canViewTeamOnCall permits managers and team members to view roster data.
 func (h *OnCallHandler) canViewTeamOnCall(w http.ResponseWriter, r *http.Request, teamID int) bool {
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return false
 	}
-	hasGlobal, err := h.permissionService.HasGlobalPermission(user.ID, models.PermissionTeamsManage)
-	if err == nil && hasGlobal {
-		return true
-	}
-	isAdmin, err := h.teamRepo.IsTeamAdmin(teamID, user.ID)
+	allowed, err := h.hasTeamOnCallViewAccess(user.ID, teamID)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return false
 	}
-	if isAdmin {
-		return true
-	}
-	isMember, err := h.teamRepo.IsTeamMember(teamID, user.ID)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return false
-	}
-	if isMember {
+	if allowed {
 		return true
 	}
 	respondForbidden(w, r)
 	return false
 }
 
-// resolveSchedule parses a schedule ID from the URL parameter named paramName,
-// fetches the schedule, checks manage permission, and writes the appropriate
-// HTTP error when anything fails. Returns the schedule and true on success.
+// hasTeamOnCallViewAccess checks roster access without writing a response.
+func (h *OnCallHandler) hasTeamOnCallViewAccess(userID, teamID int) (bool, error) {
+	hasGlobal, err := h.permissionService.HasGlobalPermission(userID, models.PermissionTeamsManage)
+	if err == nil && hasGlobal {
+		return true, nil
+	}
+	isAdmin, err := h.teamRepo.IsTeamAdmin(teamID, userID)
+	if err != nil {
+		return false, err
+	}
+	if isAdmin {
+		return true, nil
+	}
+	isMember, err := h.teamRepo.IsTeamMember(teamID, userID)
+	if err != nil {
+		return false, err
+	}
+	return isMember, nil
+}
+
+// resolveSchedule loads and authorizes management of a schedule.
 func (h *OnCallHandler) resolveSchedule(w http.ResponseWriter, r *http.Request, paramName string) (*models.OnCallSchedule, bool) {
 	id, ok := requireIDParam(w, r, paramName)
 	if !ok {
@@ -148,10 +157,33 @@ func (h *OnCallHandler) resolveSchedule(w http.ResponseWriter, r *http.Request, 
 	return schedule, true
 }
 
-// resolvePolicy parses an escalation-policy ID from the URL parameter named
-// paramName, fetches the policy, checks manage permission, and writes the
-// appropriate HTTP error when anything fails. Returns the policy and true on
-// success.
+// resolveLayerForSchedule verifies a layer belongs to an authorized schedule.
+// Foreign layers return 404 to avoid disclosing their existence.
+func (h *OnCallHandler) resolveLayerForSchedule(w http.ResponseWriter, r *http.Request, paramName string, schedule *models.OnCallSchedule) (int, bool) {
+	layerID, ok := requireIDParam(w, r, paramName)
+	if !ok {
+		return 0, false
+	}
+
+	layer, err := h.onCallRepo.GetLayerByID(layerID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respondNotFound(w, r, "Layer")
+			return 0, false
+		}
+		respondInternalError(w, r, err)
+		return 0, false
+	}
+
+	if layer.ScheduleID != schedule.ID {
+		respondNotFound(w, r, "Layer")
+		return 0, false
+	}
+
+	return layerID, true
+}
+
+// resolvePolicy loads and authorizes management of an escalation policy.
 func (h *OnCallHandler) resolvePolicy(w http.ResponseWriter, r *http.Request, paramName string) (*models.OnCallEscalationPolicy, bool) {
 	id, ok := requireIDParam(w, r, paramName)
 	if !ok {
@@ -175,9 +207,7 @@ func (h *OnCallHandler) resolvePolicy(w http.ResponseWriter, r *http.Request, pa
 	return policy, true
 }
 
-// validateScheduleRequest checks that required fields on an OnCallScheduleRequest
-// are present. It writes a validation error response and returns false when a
-// check fails.
+// validateScheduleRequest validates required schedule fields.
 func validateScheduleRequest(w http.ResponseWriter, r *http.Request, req models.OnCallScheduleRequest) bool {
 	if strings.TrimSpace(req.Name) == "" {
 		respondValidationError(w, r, "name is required")
@@ -187,16 +217,53 @@ func validateScheduleRequest(w http.ResponseWriter, r *http.Request, req models.
 		respondValidationError(w, r, "timezone is required")
 		return false
 	}
+	if _, _, err := services.ResolveTimezone(req.Timezone); err != nil {
+		respondValidationError(w, r, err.Error())
+		return false
+	}
 	return true
 }
 
-// ---------------------------------------------------------------------------
-// Schedule CRUD
-// ---------------------------------------------------------------------------
+func validateLayerRequest(w http.ResponseWriter, r *http.Request, req models.OnCallScheduleLayerRequest) bool {
+	if strings.TrimSpace(req.Name) == "" {
+		respondValidationError(w, r, "name is required")
+		return false
+	}
+	rotationType := strings.TrimSpace(req.RotationType)
+	if rotationType != "daily" && rotationType != "weekly" && rotationType != "custom" {
+		respondValidationError(w, r, "rotation_type must be daily, weekly, or custom")
+		return false
+	}
+	if rotationType == "custom" && req.RotationIntervalDays <= 0 {
+		respondValidationError(w, r, "rotation_interval_days must be positive for custom rotations")
+		return false
+	}
+	if _, err := time.Parse("15:04", req.HandoffTime); err != nil {
+		respondValidationError(w, r, "handoff_time must be in HH:MM format")
+		return false
+	}
+	startDate, err := time.Parse(time.DateOnly, req.StartDate)
+	if err != nil {
+		respondValidationError(w, r, "start_date must be in YYYY-MM-DD format")
+		return false
+	}
+	if req.EndDate != nil {
+		endDate, err := time.Parse(time.DateOnly, *req.EndDate)
+		if err != nil {
+			respondValidationError(w, r, "end_date must be in YYYY-MM-DD format")
+			return false
+		}
+		if endDate.Before(startDate) {
+			respondValidationError(w, r, "end_date must be on or after start_date")
+			return false
+		}
+	}
+	return true
+}
 
 // ListSchedules returns all on-call schedules for a team.
 func (h *OnCallHandler) ListSchedules(w http.ResponseWriter, r *http.Request) {
-	_, ok := RequireAuth(w, r)
+	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
 	}
@@ -206,7 +273,12 @@ func (h *OnCallHandler) ListSchedules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	schedules, err := h.onCallRepo.ListSchedulesForTeam(teamID)
+	includeRoster, err := h.hasTeamOnCallViewAccess(user.ID, teamID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	schedules, err := h.onCallRepo.ListSchedulesForTeam(teamID, includeRoster)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
@@ -214,6 +286,12 @@ func (h *OnCallHandler) ListSchedules(w http.ResponseWriter, r *http.Request) {
 
 	if schedules == nil {
 		schedules = []models.OnCallSchedule{}
+	}
+	if includeRoster {
+		now := time.Now()
+		for i := range schedules {
+			schedules[i].CurrentOnCall = h.onCallService.CurrentOnCallForSchedule(&schedules[i], now)
+		}
 	}
 	respondJSONOK(w, schedules)
 }
@@ -252,6 +330,7 @@ func (h *OnCallHandler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallScheduleCreate, logger.ResourceOnCallSchedule, &id, schedule.Name, map[string]any{"team_id": teamID})
 
 	respondJSONCreated(w, schedule)
 }
@@ -275,6 +354,9 @@ func (h *OnCallHandler) GetSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		respondInternalError(w, r, err)
+		return
+	}
+	if !h.canViewTeamOnCall(w, r, schedule.TeamID) {
 		return
 	}
 
@@ -313,6 +395,7 @@ func (h *OnCallHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallScheduleUpdate, logger.ResourceOnCallSchedule, &schedule.ID, updated.Name, map[string]any{"team_id": schedule.TeamID})
 
 	respondJSONOK(w, updated)
 }
@@ -328,13 +411,10 @@ func (h *OnCallHandler) DeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallScheduleDelete, logger.ResourceOnCallSchedule, &schedule.ID, schedule.Name, map[string]any{"team_id": schedule.TeamID})
 
 	w.WriteHeader(http.StatusNoContent)
 }
-
-// ---------------------------------------------------------------------------
-// Layer Management
-// ---------------------------------------------------------------------------
 
 // AddLayer adds a rotation layer to a schedule.
 func (h *OnCallHandler) AddLayer(w http.ResponseWriter, r *http.Request) {
@@ -349,37 +429,29 @@ func (h *OnCallHandler) AddLayer(w http.ResponseWriter, r *http.Request) {
 	}
 	sanitizeLayerRequest(&req)
 
-	if strings.TrimSpace(req.Name) == "" {
-		respondValidationError(w, r, "name is required")
+	if !validateLayerRequest(w, r, req) {
 		return
 	}
 	rotationType := strings.TrimSpace(req.RotationType)
-	if rotationType != "daily" && rotationType != "weekly" && rotationType != "custom" {
-		respondValidationError(w, r, "rotation_type must be daily, weekly, or custom")
-		return
-	}
-	if strings.TrimSpace(req.StartDate) == "" {
-		respondValidationError(w, r, "start_date is required")
-		return
-	}
 
 	id, err := h.onCallRepo.AddLayer(schedule.ID, req.Name, req.Priority, rotationType, req.RotationIntervalDays, req.HandoffTime, req.StartDate, req.EndDate)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallLayerCreate, logger.ResourceOnCallLayer, &id, req.Name, map[string]any{"schedule_id": schedule.ID})
 
 	respondJSONCreated(w, map[string]int{"id": id})
 }
 
 // UpdateLayer updates an existing rotation layer.
 func (h *OnCallHandler) UpdateLayer(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.resolveSchedule(w, r, "scheduleId")
+	schedule, ok := h.resolveSchedule(w, r, "scheduleId")
 	if !ok {
 		return
 	}
 
-	layerID, ok := requireIDParam(w, r, "layerId")
+	layerID, ok := h.resolveLayerForSchedule(w, r, "layerId", schedule)
 	if !ok {
 		return
 	}
@@ -389,23 +461,27 @@ func (h *OnCallHandler) UpdateLayer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sanitizeLayerRequest(&req)
+	if !validateLayerRequest(w, r, req) {
+		return
+	}
 
-	if err := h.onCallRepo.UpdateLayer(layerID, req.Name, req.Priority, req.RotationType, req.RotationIntervalDays, req.HandoffTime, req.StartDate, req.EndDate); err != nil {
+	if err := h.onCallRepo.UpdateLayer(layerID, req.Name, req.Priority, strings.TrimSpace(req.RotationType), req.RotationIntervalDays, req.HandoffTime, req.StartDate, req.EndDate); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallLayerUpdate, logger.ResourceOnCallLayer, &layerID, req.Name, map[string]any{"schedule_id": schedule.ID})
 
 	respondJSONOK(w, map[string]string{"status": "ok"})
 }
 
 // DeleteLayer removes a rotation layer.
 func (h *OnCallHandler) DeleteLayer(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.resolveSchedule(w, r, "scheduleId")
+	schedule, ok := h.resolveSchedule(w, r, "scheduleId")
 	if !ok {
 		return
 	}
 
-	layerID, ok := requireIDParam(w, r, "layerId")
+	layerID, ok := h.resolveLayerForSchedule(w, r, "layerId", schedule)
 	if !ok {
 		return
 	}
@@ -414,18 +490,19 @@ func (h *OnCallHandler) DeleteLayer(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallLayerDelete, logger.ResourceOnCallLayer, &layerID, "", map[string]any{"schedule_id": schedule.ID})
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // SetLayerMembers replaces the member list for a rotation layer.
 func (h *OnCallHandler) SetLayerMembers(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.resolveSchedule(w, r, "scheduleId")
+	schedule, ok := h.resolveSchedule(w, r, "scheduleId")
 	if !ok {
 		return
 	}
 
-	layerID, ok := requireIDParam(w, r, "layerId")
+	layerID, ok := h.resolveLayerForSchedule(w, r, "layerId", schedule)
 	if !ok {
 		return
 	}
@@ -440,18 +517,13 @@ func (h *OnCallHandler) SetLayerMembers(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	h.auditMutation(r, logger.ActionOnCallSetLayerMembers, logger.ResourceOnCallLayer, &layerID, "", map[string]any{"schedule_id": schedule.ID, "user_ids": req.UserIDs})
+
 	respondJSONOK(w, map[string]string{"status": "ok"})
 }
 
-// ---------------------------------------------------------------------------
-// Overrides
-// ---------------------------------------------------------------------------
-
 // CreateOverride creates a manual override for a schedule.
 func (h *OnCallHandler) CreateOverride(w http.ResponseWriter, r *http.Request) {
-	// resolveSchedule both fetches the schedule by URL id and gates on
-	// canManageTeamOnCall — i.e. the caller must hold global teams.manage
-	// or be a team-admin on the schedule's team.
 	schedule, ok := h.resolveSchedule(w, r, "id")
 	if !ok {
 		return
@@ -466,9 +538,7 @@ func (h *OnCallHandler) CreateOverride(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Reason renders on the schedule timeline + audit log. StartTime/
-	// EndTime are ISO 8601 (identifier-shaped); the time.Parse below
-	// rejects anything malformed.
+	// Timestamp fields are sanitized before RFC3339 validation.
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &req.Reason, Policy: sanitize.RichText},
 		sanitize.Pair{Target: &req.StartTime, Policy: sanitize.ShortIdentifier},
@@ -491,14 +561,14 @@ func (h *OnCallHandler) CreateOverride(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallOverrideCreate, logger.ResourceOnCallOverride, &id, "", map[string]any{
+		"schedule_id": schedule.ID, "user_id": req.UserID, "override_user_id": req.OverrideUserID,
+	})
 
 	respondJSONCreated(w, map[string]int{"id": id})
 }
 
-// DeleteOverride removes a schedule override. Permission gate: load the
-// override's parent schedule and require canManageTeamOnCall on its team.
-// This is the only handler that takes an override id directly (no schedule
-// id in the URL), so we look the override up to find the team.
+// DeleteOverride authorizes against the override's parent schedule.
 func (h *OnCallHandler) DeleteOverride(w http.ResponseWriter, r *http.Request) {
 	if _, ok := RequireAuth(w, r); !ok {
 		return
@@ -531,18 +601,12 @@ func (h *OnCallHandler) DeleteOverride(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallOverrideDelete, logger.ResourceOnCallOverride, &overrideID, "", map[string]any{"schedule_id": override.ScheduleID})
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---------------------------------------------------------------------------
-// Current On-Call
-// ---------------------------------------------------------------------------
-
-// GetCurrentOnCall returns who is currently on call for a schedule.
-// Read-side gate: any team member (direct or via a mapped group) plus the
-// usual manage path. Without this gate any authenticated user could
-// enumerate the on-call roster (names + emails) for any team in the org.
+// GetCurrentOnCall returns a schedule's roster to authorized team members.
 func (h *OnCallHandler) GetCurrentOnCall(w http.ResponseWriter, r *http.Request) {
 	scheduleID, ok := requireIDParam(w, r, "id")
 	if !ok {
@@ -572,15 +636,7 @@ func (h *OnCallHandler) GetCurrentOnCall(w http.ResponseWriter, r *http.Request)
 	respondJSONOK(w, result)
 }
 
-// ---------------------------------------------------------------------------
-// Swap Requests
-// ---------------------------------------------------------------------------
-
-// CreateSwapRequest creates a shift swap request between two on-call members.
-// The requester must be a member of the schedule's team (direct or via a
-// mapped group); the target user must also be a member, so a swap can't drag
-// in someone who isn't on the team. Without these gates, any authenticated
-// user could spam swap requests against any team's schedule, naming any user.
+// CreateSwapRequest creates a shift swap between members of one team.
 func (h *OnCallHandler) CreateSwapRequest(w http.ResponseWriter, r *http.Request) {
 	user, ok := RequireAuth(w, r)
 	if !ok {
@@ -602,8 +658,6 @@ func (h *OnCallHandler) CreateSwapRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Requester must be on the team (membership covers both direct and group
-	// members; canViewTeamOnCall accepts admins too).
 	if !h.canViewTeamOnCall(w, r, schedule.TeamID) {
 		return
 	}
@@ -612,23 +666,19 @@ func (h *OnCallHandler) CreateSwapRequest(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	// Both timestamps are ISO 8601 — defensive scrub keeps any HTML
-	// markers out of the validation error echoed back to the caller.
+	// Sanitize timestamps before validation errors can echo them.
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &req.SwapStart, Policy: sanitize.ShortIdentifier},
 		sanitize.Pair{Target: &req.SwapEnd, Policy: sanitize.ShortIdentifier},
 	)
 
-	// Target user must also be on the team. Otherwise a swap could redirect
-	// on-call to an arbitrary user the team has no relationship with.
 	targetIsMember, err := h.teamRepo.IsTeamMember(schedule.TeamID, req.TargetUserID)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 	if !targetIsMember {
-		// Fall back to admin check in case the swap target is a team admin
-		// without an explicit membership row in the unusual case.
+		// Team admins may not have an explicit membership row.
 		targetIsAdmin, adminErr := h.teamRepo.IsTeamAdmin(schedule.TeamID, req.TargetUserID)
 		if adminErr != nil {
 			respondInternalError(w, r, adminErr)
@@ -713,10 +763,6 @@ func (h *OnCallHandler) RespondSwapRequest(w http.ResponseWriter, r *http.Reques
 	respondJSONOK(w, map[string]string{"status": status})
 }
 
-// ---------------------------------------------------------------------------
-// Escalation Policies
-// ---------------------------------------------------------------------------
-
 // ListPolicies returns all escalation policies for a team.
 func (h *OnCallHandler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 	_, ok := RequireAuth(w, r)
@@ -770,6 +816,7 @@ func (h *OnCallHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallPolicyCreate, logger.ResourceOnCallPolicy, &id, req.Name, map[string]any{"team_id": teamID})
 
 	respondJSONCreated(w, map[string]int{"id": id})
 }
@@ -826,6 +873,7 @@ func (h *OnCallHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallPolicyUpdate, logger.ResourceOnCallPolicy, &policy.ID, req.Name, map[string]any{"team_id": policy.TeamID})
 
 	respondJSONOK(w, map[string]string{"status": "ok"})
 }
@@ -841,6 +889,7 @@ func (h *OnCallHandler) DeletePolicy(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallPolicyDelete, logger.ResourceOnCallPolicy, &policy.ID, policy.Name, map[string]any{"team_id": policy.TeamID})
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -861,17 +910,14 @@ func (h *OnCallHandler) SetRules(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	h.auditMutation(r, logger.ActionOnCallPolicySetRules, logger.ResourceOnCallPolicy, &policy.ID, policy.Name, map[string]any{"team_id": policy.TeamID, "rule_count": len(req.Rules)})
 
 	respondJSONOK(w, map[string]string{"status": "ok"})
 }
 
-// ---------------------------------------------------------------------------
-// Incidents
-// ---------------------------------------------------------------------------
-
 // ListIncidents returns active incidents, optionally filtered by policy.
 func (h *OnCallHandler) ListIncidents(w http.ResponseWriter, r *http.Request) {
-	_, ok := RequireAuth(w, r)
+	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
 	}
@@ -886,54 +932,263 @@ func (h *OnCallHandler) ListIncidents(w http.ResponseWriter, r *http.Request) {
 		policyID = &parsed
 	}
 
-	incidents, err := h.onCallRepo.GetActiveIncidents(policyID, "")
+	allTeams, err := h.permissionService.HasGlobalPermissionContext(r.Context(), user.ID, models.PermissionTeamsManage)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 
-	if incidents == nil {
-		incidents = []models.OnCallIncident{}
+	var teamIDs []int
+	if !allTeams {
+		teams, teamErr := h.teamRepo.GetTeamsForUser(user.ID)
+		if teamErr != nil {
+			respondInternalError(w, r, teamErr)
+			return
+		}
+		teamIDs = make([]int, len(teams))
+		for i := range teams {
+			teamIDs[i] = teams[i].ID
+		}
+	}
+
+	workspaceIDs, err := h.permissionService.AccessibleWorkspaceIDs(user.ID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+
+	incidents, err := h.onCallRepo.ListIncidents(repository.IncidentFilter{
+		PolicyID:     policyID,
+		TeamIDs:      teamIDs,
+		WorkspaceIDs: workspaceIDs,
+		AllTeams:     allTeams,
+	})
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
 	}
 	respondJSONOK(w, incidents)
 }
 
-// AcknowledgeIncident marks an incident as acknowledged.
+// GetItemIncident returns the incident currently attached to an item. Missing
+// incidents return 404 so item-less workspaces do not leak pager state.
+func (h *OnCallHandler) GetItemIncident(w http.ResponseWriter, r *http.Request) {
+	user, ok := RequireAuth(w, r)
+	if !ok {
+		return
+	}
+
+	incident, ok := h.itemIncident(w, r)
+	if !ok {
+		return
+	}
+
+	allowed, err := h.canViewIncidentItem(user.ID, incident)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if !allowed {
+		respondForbidden(w, r)
+		return
+	}
+	respondJSONOK(w, incident)
+}
+
+// TriggerIncident declares an incident on an item. The item must have an
+// assigned team, and the item's team must have an active escalation policy
+// unless one is named explicitly. Gated on item edit permission.
+func (h *OnCallHandler) TriggerIncident(w http.ResponseWriter, r *http.Request) {
+	user, ok := RequireAuth(w, r)
+	if !ok {
+		return
+	}
+
+	itemID, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	item, err := h.itemRepo.FindByIDWithDetails(itemID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respondNotFound(w, r, "Item")
+			return
+		}
+		respondInternalError(w, r, err)
+		return
+	}
+
+	allowed, err := h.permissionService.HasWorkspacePermission(user.ID, item.WorkspaceID, models.PermissionItemEdit)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if !allowed {
+		respondForbidden(w, r)
+		return
+	}
+
+	var req models.IncidentTriggerRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		decoded, ok := decodeJSON[models.IncidentTriggerRequest](w, r)
+		if !ok {
+			return
+		}
+		req = decoded
+	}
+
+	incident, err := h.incidentService.Trigger(itemID, req.PolicyID, req.Urgency, "manual")
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrIncidentItemTeamRequired), errors.Is(err, services.ErrIncidentPolicyUnknown):
+			respondValidationError(w, r, err.Error())
+		case errors.Is(err, services.ErrIncidentAlreadyOpen):
+			respondConflict(w, r, err.Error())
+		default:
+			respondInternalError(w, r, err)
+		}
+		return
+	}
+
+	respondJSONCreated(w, incident)
+}
+
+// AcknowledgeIncident records the ack handshake. Gated on responder-ship, not
+// item permission: the 3am responder may have no rights in the item workspace.
 func (h *OnCallHandler) AcknowledgeIncident(w http.ResponseWriter, r *http.Request) {
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
 	}
 
-	id, ok := requireIDParam(w, r, "id")
+	incident, ok := h.itemIncident(w, r)
 	if !ok {
 		return
 	}
+	if !h.requireResponderShip(w, r, user, incident) {
+		return
+	}
 
-	if err := h.onCallService.AcknowledgeIncident(id, user.ID); err != nil {
+	if err := h.incidentService.Acknowledge(incident.ID, user.ID); err != nil {
+		if errors.Is(err, services.ErrIncidentResolved) || errors.Is(err, services.ErrIncidentConflict) {
+			respondConflict(w, r, err.Error())
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
 
-	respondJSONOK(w, map[string]string{"status": "acknowledged"})
+	respondJSONOK(w, h.reloadItemIncident(incident))
 }
 
-// ResolveIncident marks an incident as resolved.
+// UnacknowledgeIncident returns an acknowledged incident to the triggered state.
+func (h *OnCallHandler) UnacknowledgeIncident(w http.ResponseWriter, r *http.Request) {
+	user, ok := RequireAuth(w, r)
+	if !ok {
+		return
+	}
+
+	incident, ok := h.itemIncident(w, r)
+	if !ok {
+		return
+	}
+	if !h.requireResponderShip(w, r, user, incident) {
+		return
+	}
+
+	if err := h.incidentService.Unacknowledge(incident.ID); err != nil {
+		if errors.Is(err, services.ErrIncidentResolved) || errors.Is(err, services.ErrIncidentConflict) || errors.Is(err, services.ErrIncidentNotAcknowledged) {
+			respondConflict(w, r, err.Error())
+			return
+		}
+		respondInternalError(w, r, err)
+		return
+	}
+
+	respondJSONOK(w, h.reloadItemIncident(incident))
+}
+
+// ResolveIncident ends the incident. It does not complete the item.
 func (h *OnCallHandler) ResolveIncident(w http.ResponseWriter, r *http.Request) {
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
 	}
 
-	id, ok := requireIDParam(w, r, "id")
+	incident, ok := h.itemIncident(w, r)
 	if !ok {
 		return
 	}
+	if !h.requireResponderShip(w, r, user, incident) {
+		return
+	}
 
-	if err := h.onCallService.ResolveIncident(id, user.ID); err != nil {
+	if err := h.incidentService.Resolve(incident.ID, user.ID); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 
-	respondJSONOK(w, map[string]string{"status": "resolved"})
+	respondJSONOK(w, h.reloadItemIncident(incident))
+}
+
+// itemIncident loads the incident attached to the {id} item path parameter.
+func (h *OnCallHandler) itemIncident(w http.ResponseWriter, r *http.Request) (*models.Incident, bool) {
+	itemID, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return nil, false
+	}
+	incident, err := h.onCallRepo.GetIncidentForItem(itemID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respondNotFound(w, r, "Incident")
+			return nil, false
+		}
+		respondInternalError(w, r, err)
+		return nil, false
+	}
+	return incident, true
+}
+
+// reloadItemIncident re-reads an incident after a mutation so the response
+// carries the updated ack/resolve actors. Write failures only drop the
+// enrichment; the status change itself already committed.
+func (h *OnCallHandler) reloadItemIncident(incident *models.Incident) *models.Incident {
+	updated, err := h.onCallRepo.GetIncidentByID(incident.ID)
+	if err != nil {
+		return incident
+	}
+	return updated
+}
+
+// canViewIncidentItem permits workspace viewers or responders to read an item's
+// incident.
+func (h *OnCallHandler) canViewIncidentItem(userID int, incident *models.Incident) (bool, error) {
+	allowed, err := h.permissionService.HasWorkspacePermission(userID, incident.WorkspaceID, models.PermissionItemView)
+	if err != nil || allowed {
+		return allowed, err
+	}
+	if incident.TeamID == nil {
+		return false, nil
+	}
+	return h.hasTeamOnCallViewAccess(userID, *incident.TeamID)
+}
+
+// requireResponderShip enforces that the caller can respond to the incident:
+// a member or admin of the incident's team, or a global team manager. It is
+// deliberately independent of item workspace permission.
+func (h *OnCallHandler) requireResponderShip(w http.ResponseWriter, r *http.Request, user *models.User, incident *models.Incident) bool {
+	if incident.TeamID == nil {
+		respondForbidden(w, r)
+		return false
+	}
+	allowed, err := h.hasTeamOnCallViewAccess(user.ID, *incident.TeamID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return false
+	}
+	if !allowed {
+		respondForbidden(w, r)
+		return false
+	}
+	return true
 }

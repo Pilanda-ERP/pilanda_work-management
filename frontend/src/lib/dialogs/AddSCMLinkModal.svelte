@@ -1,18 +1,13 @@
 <script>
-  import { onMount } from 'svelte';
   import { api } from '../api.js';
-  import BasePicker from '../pickers/BasePicker.svelte';
   import Label from '../components/Label.svelte';
-  import Modal from './Modal.svelte';
-  import ModalHeader from './ModalHeader.svelte';
-  import DialogFooter from './DialogFooter.svelte';
-  import { GitMerge, GitBranch, GitCommit, Loader2 } from '@lucide/svelte';
-  import EmptyState from '../components/EmptyState.svelte';
+  import { GitMerge, GitBranch, GitCommit } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import SCMRepositoryModal from './SCMRepositoryModal.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let { itemId, oncreated, onclose } = $props();
 
-  let loading = $state(true);
   let submitting = $state(false);
   let repositories = $state([]);
   let error = $state(null);
@@ -23,29 +18,6 @@
   let externalId = $state('');
   let title = $state('');
   let externalUrl = $state('');
-
-  onMount(async () => {
-    await loadRepositories();
-  });
-
-  async function loadRepositories() {
-    loading = true;
-    error = null;
-
-    try {
-      repositories = await api.itemSCMLinks.getRepositories(itemId) || [];
-      // Auto-select first repository if only one
-      if (repositories.length === 1) {
-        selectedRepoId = repositories[0].id;
-      }
-    } catch (err) {
-      console.error('Failed to load repositories:', err);
-      error = t('scm.failedToLoadRepos');
-      repositories = [];
-    } finally {
-      loading = false;
-    }
-  }
 
   async function submit() {
     if (!selectedRepoId || !linkType || !externalId) {
@@ -149,40 +121,22 @@
   }
 </script>
 
-<Modal isOpen={true} maxWidth="max-w-md" onclose={close}>
-  <ModalHeader
-    title={t('scm.linkDevResource')}
-    subtitle={t('scm.linkDevResourceDesc')}
-    onClose={close}
-  />
-
-    <!-- Content -->
-    <div class="px-6 py-4 space-y-4">
-      {#if loading}
-        <div class="flex items-center justify-center py-8">
-          <Loader2 class="w-6 h-6 animate-spin" style="color: var(--ds-text-subtle);" />
-        </div>
-      {:else if repositories.length === 0}
-        <EmptyState
-          icon={GitMerge}
-          title={t('scm.noReposLinked')}
-          description={t('scm.linkReposHelp')}
-        />
-      {:else}
-        <!-- Repository Selection -->
-        <div>
-          <Label color="default" required class="mb-1.5">{t('scm.repository')}</Label>
-          <BasePicker
-            bind:value={selectedRepoId}
-            items={repositories}
-            placeholder={t('scm.selectRepository')}
-            showUnassigned={true}
-            unassignedLabel={t('scm.selectRepository')}
-            getValue={(repo) => repo.id}
-            getLabel={(repo) => `${repo.repository_name} (${repo.provider_name})`}
-          />
-        </div>
-
+<SCMRepositoryModal
+  {itemId}
+  title={t('scm.linkDevResource')}
+  subtitle={t('scm.linkDevResourceDesc')}
+  emptyIcon={GitMerge}
+  bind:repositories
+  bind:selectedRepoId
+  bind:error
+  {submitting}
+  confirmLabel={t('scm.linkResource')}
+  loadingLabel={t('scm.linking')}
+  confirmDisabled={!externalId}
+  onclose={close}
+  onsubmit={submit}
+>
+  {#snippet fields()}
         <!-- Link Type -->
         <div>
           <Label color="default" required class="mb-1.5">{t('scm.type')}</Label>
@@ -231,41 +185,28 @@
 
         <!-- External ID -->
         <div>
-          <Label color="default" required class="mb-1.5">{getIdLabel(linkType)}</Label>
-          <input
+          <TextField
+            label={getIdLabel(linkType)}
+            required
+            labelColor="default"
             type="text"
-            bind:value={externalId}
             placeholder={getPlaceholder(linkType)}
-            class="w-full px-3 py-2 rounded-lg border text-sm"
-            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+            size="small"
+            bind:value={externalId}
           />
         </div>
 
         <!-- Title (optional) -->
         <div>
-          <Label color="default" class="mb-1.5">{t('scm.titleOptional')}</Label>
-          <input
+          <TextField
+            label={t('scm.titleOptional')}
+            labelColor="default"
             type="text"
-            bind:value={title}
             placeholder="e.g., Add user authentication"
-            class="w-full px-3 py-2 rounded-lg border text-sm"
-            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+            size="small"
+            bind:value={title}
           />
         </div>
 
-        <!-- Error -->
-        {#if error}
-          <p class="text-sm" style="color: var(--ds-text-danger);">{error}</p>
-        {/if}
-      {/if}
-    </div>
-
-  <DialogFooter
-    onCancel={close}
-    onConfirm={submit}
-    confirmLabel={t('scm.linkResource')}
-    loading={submitting}
-    loadingLabel={t('scm.linking')}
-    disabled={loading || repositories.length === 0 || !selectedRepoId || !externalId}
-  />
-</Modal>
+  {/snippet}
+</SCMRepositoryModal>

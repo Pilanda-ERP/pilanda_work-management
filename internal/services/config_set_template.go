@@ -2,19 +2,9 @@ package services
 
 import "time"
 
-// Configuration-set template (export/import) types.
-//
-// The on-disk JSON format for `windshift.configuration-set` exports.
-// Versioned via SchemaVersion + Kind so v2 can extend (e.g. workspace-level
-// templates) without breaking the v1 reader.
-//
-// All references between sections use names (or, for users, emails) — never
-// database IDs. Import resolves names against the target instance: global
-// shared entities (statuses, item types, priorities, custom fields, status
-// categories, screens) match by name and are auto-created if missing; bundle-
-// owned entities (workflow, condition set, approval set, configuration set)
-// are always created fresh; identity refs (users, roles, groups) must already
-// exist on the target and surface as ErrUnresolvedReferences if not.
+// Versioned `windshift.configuration-set` export/import types. References use
+// names or emails, never IDs: shared entities are reused or created, bundle
+// entities are created fresh, and missing identities return ErrUnresolvedReferences.
 
 const (
 	ConfigSetTemplateSchemaVersion = 1
@@ -36,10 +26,7 @@ type ConfigSetExportBy struct {
 	Instance string `json:"instance,omitempty"`
 }
 
-// ConfigSetTplPayload bundles every entity the configuration set transitively
-// depends on. Order in this struct matches the strict creation order used by
-// the importer — custom fields first because conditions/approvals/screens
-// reference them.
+// ConfigSetTplPayload order matches importer creation dependencies.
 type ConfigSetTplPayload struct {
 	ConfigurationSet ConfigSetTplConfigSet      `json:"configuration_set"`
 	StatusCategories []ConfigSetTplStatusCat    `json:"status_categories,omitempty"`
@@ -47,6 +34,7 @@ type ConfigSetTplPayload struct {
 	Statuses         []ConfigSetTplStatus       `json:"statuses,omitempty"`
 	ItemTypes        []ConfigSetTplItemType     `json:"item_types,omitempty"`
 	Priorities       []ConfigSetTplPriority     `json:"priorities,omitempty"`
+	LinkTypes        []ConfigSetTplLinkType     `json:"link_types,omitempty"`
 	Screens          []ConfigSetTplScreen       `json:"screens,omitempty"`
 	Workflows        []ConfigSetTplWorkflow     `json:"workflows,omitempty"`
 	ConditionSets    []ConfigSetTplConditionSet `json:"condition_sets,omitempty"`
@@ -61,15 +49,12 @@ type ConfigSetTplConfigSet struct {
 	DefaultItemTypeName     string `json:"default_item_type_name,omitempty"`
 }
 
-// ConfigSetTplStatusCat references a status_category by name. Categories are
-// system-seeded (`is_completed` carries semantics), so import fails fast if
-// the named category does not exist on the target.
+// ConfigSetTplStatusCat names a required system-seeded status category.
 type ConfigSetTplStatusCat struct {
 	Name string `json:"name"`
 }
 
-// ConfigSetTplCustomField is the full embedded definition. Imported with
-// system_default=false; matched by name on import (re-used if found).
+// ConfigSetTplCustomField is matched by name and imported non-system-default.
 type ConfigSetTplCustomField struct {
 	Name                           string `json:"name"`
 	FieldType                      string `json:"field_type"`
@@ -104,6 +89,20 @@ type ConfigSetTplPriority struct {
 	SortOrder   int    `json:"sort_order"`
 }
 
+// ConfigSetTplLinkType carries one link type's semantic definition. The
+// active flag and system marker are instance-local state, not part of the
+// portable definition: import always creates active non-system rows, and
+// verification that required types are present and active belongs to the
+// conformance check, not the template.
+type ConfigSetTplLinkType struct {
+	Name               string   `json:"name"`
+	Description        string   `json:"description,omitempty"`
+	ForwardLabel       string   `json:"forward_label"`
+	ReverseLabel       string   `json:"reverse_label"`
+	Color              string   `json:"color,omitempty"`
+	AllowedEntityTypes []string `json:"allowed_entity_types,omitempty"`
+}
+
 type ConfigSetTplScreen struct {
 	Name         string                    `json:"name"`
 	Description  string                    `json:"description,omitempty"`
@@ -131,13 +130,15 @@ type ConfigSetTplWorkflow struct {
 }
 
 // ConfigSetTplWorkflowTransition carries from/to status names. FromStatusName
-// is a pointer-string: nil means "initial transition" (from_status_id IS NULL).
+// is a pointer-string: nil means "initial transition" (from_status_id IS
+// NULL) unless FromAllStatuses marks a transition from every other status.
 type ConfigSetTplWorkflowTransition struct {
-	FromStatusName *string `json:"from_status_name"`
-	ToStatusName   string  `json:"to_status_name"`
-	DisplayOrder   int     `json:"display_order,omitempty"`
-	SourceHandle   string  `json:"source_handle,omitempty"`
-	TargetHandle   string  `json:"target_handle,omitempty"`
+	FromStatusName  *string `json:"from_status_name"`
+	ToStatusName    string  `json:"to_status_name"`
+	FromAllStatuses bool    `json:"from_all_statuses,omitempty"`
+	DisplayOrder    int     `json:"display_order,omitempty"`
+	SourceHandle    string  `json:"source_handle,omitempty"`
+	TargetHandle    string  `json:"target_handle,omitempty"`
 }
 
 type ConfigSetTplConditionSet struct {
@@ -148,25 +149,29 @@ type ConfigSetTplConditionSet struct {
 }
 
 type ConfigSetTplTransitionCondition struct {
-	FromStatusName *string                 `json:"from_status_name"`
-	ToStatusName   string                  `json:"to_status_name"`
-	LogicMode      string                  `json:"logic_mode"`
-	Conditions     []ConfigSetTplCondition `json:"conditions,omitempty"`
+	FromStatusName  *string                 `json:"from_status_name"`
+	ToStatusName    string                  `json:"to_status_name"`
+	FromAllStatuses bool                    `json:"from_all_statuses,omitempty"`
+	LogicMode       string                  `json:"logic_mode"`
+	Conditions      []ConfigSetTplCondition `json:"conditions,omitempty"`
 }
 
 // ConfigSetTplCondition keeps the rule type and config as a free-form object.
 // On export, the service rewrites known integer references inside Config:
 //   - role_id   → role_name
 //   - group_id  → group_name
-//   - field_id  → custom_field_name (when source=='custom_field')
+//   - field_id  → custom_field_name (when source=='custom_field' and the
+//     source is a regular_field/custom_field user reference)
+//   - field_identifier → custom_field_name (field_value rules whose
+//     identifier is a numeric custom-field id)
 //
 // Importer reverses these substitutions.
 type ConfigSetTplCondition struct {
-	Type         string                 `json:"type"`
-	Mode         string                 `json:"mode"`
-	ErrorMessage string                 `json:"error_message,omitempty"`
-	DisplayOrder int                    `json:"display_order,omitempty"`
-	Config       map[string]interface{} `json:"config"`
+	Type         string         `json:"type"`
+	Mode         string         `json:"mode"`
+	ErrorMessage string         `json:"error_message,omitempty"`
+	DisplayOrder int            `json:"display_order,omitempty"`
+	Config       map[string]any `json:"config"`
 }
 
 type ConfigSetTplApprovalSet struct {
@@ -185,8 +190,9 @@ type ConfigSetTplApprovalSetStatus struct {
 }
 
 type ConfigSetTplTransitionRef struct {
-	FromStatusName *string `json:"from_status_name"`
-	ToStatusName   string  `json:"to_status_name"`
+	FromStatusName  *string `json:"from_status_name"`
+	ToStatusName    string  `json:"to_status_name"`
+	FromAllStatuses bool    `json:"from_all_statuses,omitempty"`
 }
 
 // ConfigSetTplApprovalStep mirrors models.ApprovalStep but swaps every
@@ -256,6 +262,11 @@ const (
 	UnresolvedKindRole           UnresolvedRefKind = "role"
 	UnresolvedKindGroup          UnresolvedRefKind = "group"
 	UnresolvedKindUser           UnresolvedRefKind = "user"
+	// Workspace-bundle identity references (WI-1335).
+	UnresolvedKindItemType    UnresolvedRefKind = "item_type"
+	UnresolvedKindCustomField UnresolvedRefKind = "custom_field"
+	UnresolvedKindLinkType    UnresolvedRefKind = "link_type"
+	UnresolvedKindPriority    UnresolvedRefKind = "priority"
 )
 
 // UnresolvedRef is a single missing reference. Path is a coarse human-readable
@@ -311,6 +322,30 @@ type ErrDefaultEntityConflict struct {
 
 func (e *ErrDefaultEntityConflict) Error() string {
 	return "configuration set import: bundle conflicts with default-flagged entities on the target"
+}
+
+// LinkTypeConflict records one template link type whose name collides with
+// an existing row in the target's global registry whose definition differs.
+// Both definitions are echoed so the admin can decide which side to rename.
+type LinkTypeConflict struct {
+	Name     string               `json:"name"`
+	Template ConfigSetTplLinkType `json:"template"`
+	Existing ConfigSetTplLinkType `json:"existing"`
+}
+
+// ErrLinkTypeDefinitionConflict is returned by ImportConfigSet before any
+// write when a template link type collides with a same-named registry row
+// carrying a different definition. Import never overwrites existing link
+// types and never duplicates identical ones.
+type ErrLinkTypeDefinitionConflict struct {
+	Conflicts []LinkTypeConflict
+}
+
+func (e *ErrLinkTypeDefinitionConflict) Error() string {
+	if len(e.Conflicts) == 1 {
+		return "configuration set import: 1 link type definition conflict"
+	}
+	return "configuration set import: link type definition conflicts"
 }
 
 // ErrCannotExportDefault is returned by ConfigSetExportService.Export when

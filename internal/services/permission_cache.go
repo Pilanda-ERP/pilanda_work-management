@@ -21,28 +21,31 @@ import (
 
 // PermissionService handles cached permission resolution
 type PermissionService struct {
-	cache *bigcache.BigCache
-	db    database.Database
-	mu    sync.RWMutex
+	cache           *bigcache.BigCache
+	db              database.Database
+	cacheCommitMu   sync.RWMutex
+	cacheGeneration atomic.Uint64
+	workspaceAccess *workspaceAccessCache
+	closeOnce       sync.Once
+	closeErr        error
 
-	// Cache statistics
-	hits      int64
-	misses    int64
-	errors    int64
-	loadTimes []int64 // For calculating average load time
+	hits                      int64
+	misses                    int64
+	errors                    int64
+	permissionCheckCount      int64
+	permissionCheckNanos      int64
+	permissionSnapshotDecodes atomic.Uint64
 
-	// Configuration
 	ttl       time.Duration
 	batchSize int
 
-	// Static data cached at startup
 	allPermissionKeys []string
 }
 
 // PermissionCacheConfig represents configuration for the permission cache
 type PermissionCacheConfig struct {
 	TTL             time.Duration `json:"ttl"`               // Default: 15min
-	MaxCacheSize    int           `json:"max_cache_size"`    // Default: 256MB
+	MaxCacheSize    int           `json:"max_cache_size"`    // Default: 123MB
 	WarmupOnStartup bool          `json:"warmup_on_startup"` // Default: true
 	PreWarmActive   bool          `json:"pre_warm_active"`   // Default: true
 	BatchSize       int           `json:"batch_size"`        // Default: 100
@@ -53,7 +56,7 @@ type PermissionCacheConfig struct {
 func DefaultPermissionCacheConfig() PermissionCacheConfig {
 	return PermissionCacheConfig{
 		TTL:             15 * time.Minute,
-		MaxCacheSize:    256, // 256MB
+		MaxCacheSize:    123,
 		WarmupOnStartup: true,
 		PreWarmActive:   true,
 		BatchSize:       100,
@@ -62,34 +65,31 @@ func DefaultPermissionCacheConfig() PermissionCacheConfig {
 
 // NewPermissionService creates a new permission service with caching
 func NewPermissionService(db database.Database, config PermissionCacheConfig) (*PermissionService, error) {
-	// Configure BigCache
-	cacheConfig := cacheutil.NewBigCacheConfig(cacheutil.BigCacheOptions{
-		TTL:          config.TTL,
-		MaxCacheMB:   config.MaxCacheSize,
-		MaxEntrySize: 8192, // 8KB per entry (larger for permission data)
+	cache, err := cacheutil.New("permissions", cacheutil.BigCacheOptions{
+		TTL:               config.TTL,
+		MaxCacheMB:        config.MaxCacheSize,
+		MaxEntrySize:      8192, // 8KB per entry (larger for permission data)
+		Shards:            64,
+		InitialCapacityMB: 4,
 	})
-
-	cache, err := bigcache.New(context.Background(), cacheConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create BigCache for permissions: %w", err)
 	}
 
 	service := &PermissionService{
-		cache:     cache,
-		db:        db,
-		ttl:       config.TTL,
-		batchSize: config.BatchSize,
-		loadTimes: make([]int64, 0, 1000), // Track last 1000 load times
+		cache:           cache,
+		db:              db,
+		workspaceAccess: newWorkspaceAccessCache(),
+		ttl:             config.TTL,
+		batchSize:       config.BatchSize,
 	}
 
-	// Pre-load all permission keys (static data)
 	if err := service.loadAllPermissionKeys(); err != nil {
 		slog.Warn("Failed to pre-load permission keys; will lazy-load on first cache build",
 			slog.String("component", "permissions"),
 			slog.Any("error", err))
 	}
 
-	// Warm up cache if configured
 	if config.WarmupOnStartup {
 		go service.WarmCache()
 	}
@@ -110,146 +110,156 @@ func (ps *PermissionService) getCacheKey(userID int) string {
 func (ps *PermissionService) HasWorkspacePermission(userID, workspaceID int, permission string) (bool, error) {
 	startTime := time.Now()
 	defer func() {
-		loadTime := time.Since(startTime).Milliseconds()
-		ps.mu.Lock()
-		if len(ps.loadTimes) >= 1000 {
-			ps.loadTimes = ps.loadTimes[1:]
-		}
-		ps.loadTimes = append(ps.loadTimes, loadTime)
-		ps.mu.Unlock()
+		atomic.AddInt64(&ps.permissionCheckCount, 1)
+		atomic.AddInt64(&ps.permissionCheckNanos, time.Since(startTime).Nanoseconds())
 	}()
 
-	// Try cache first
+	cached, err := ps.effectivePermissionSnapshot(userID)
+	if err != nil {
+		return false, err
+	}
+	return workspacePermissionFromSnapshot(cached, workspaceID, permission), nil
+}
+
+func workspacePermissionFromSnapshot(cached *models.UserPermissionCache, workspaceID int, permission string) bool {
+	if cached == nil {
+		return false
+	}
+	if cached.IsSystemAdmin {
+		return true
+	}
+	if everyonePerms := cached.WorkspaceEveryone[workspaceID]; everyonePerms[permission] {
+		return true
+	}
+	return cached.WorkspacePermissions[workspaceID][permission]
+}
+
+func (ps *PermissionService) effectivePermissionSnapshot(userID int) (*models.UserPermissionCache, error) {
 	cached, err := ps.getUserPermissionCache(userID)
 	if err == nil {
 		atomic.AddInt64(&ps.hits, 1)
-
-		// Check if user is system admin
-		if cached.IsSystemAdmin {
-			return true, nil
-		}
-
-		// Check Everyone assignment first (fast path)
-		if everyonePerms, exists := cached.WorkspaceEveryone[workspaceID]; exists {
-			if everyonePerms[permission] {
-				return true, nil
-			}
-		}
-
-		// Check workspace-specific permissions
-		if workspacePerms, exists := cached.WorkspacePermissions[workspaceID]; exists {
-			if workspacePerms[permission] {
-				return true, nil
-			}
-		}
-
-		// No matching permission
-		_, everyoneExists := cached.WorkspaceEveryone[workspaceID]
-		_, wsPermsExists := cached.WorkspacePermissions[workspaceID]
-		slog.Debug("workspace permission denied",
-			slog.String("component", "permissions"),
-			slog.Int("user_id", userID),
-			slog.Int("workspace_id", workspaceID),
-			slog.String("permission", permission),
-			slog.Bool("everyone_exists", everyoneExists),
-			slog.Bool("workspace_perms_exists", wsPermsExists))
-		return false, nil
+		return cached, nil
 	}
 
-	// Cache miss - load from database
 	atomic.AddInt64(&ps.misses, 1)
-	return ps.loadUserPermissionAndCheck(userID, workspaceID, permission)
+	cached, err = ps.buildAndStoreUserPermissionCache(userID)
+	if err != nil {
+		atomic.AddInt64(&ps.errors, 1)
+		return nil, err
+	}
+	return cached, nil
+}
+
+// buildAndStoreUserPermissionCache prevents a snapshot that started before an
+// invalidation from being written back after the invalidation completed.
+// Permission builds intentionally happen outside the commit lock so unrelated
+// reads remain concurrent; the generation check makes the final write linear.
+func (ps *PermissionService) buildAndStoreUserPermissionCache(userID int) (*models.UserPermissionCache, error) {
+	for {
+		generation := ps.cacheGeneration.Load()
+		cached, err := ps.buildUserPermissionCache(userID)
+		if err != nil {
+			return nil, err
+		}
+		stored, err := ps.storeUserPermissionCacheIfCurrent(userID, cached, generation)
+		if err != nil {
+			slog.Warn("failed to store effective permission snapshot",
+				slog.String("component", "permissions"),
+				slog.Int("user_id", userID),
+				slog.Any("error", err))
+			return cached, nil
+		}
+		if stored {
+			return cached, nil
+		}
+	}
+}
+
+func (ps *PermissionService) storeUserPermissionCacheIfCurrent(
+	userID int,
+	cached *models.UserPermissionCache,
+	generation uint64,
+) (bool, error) {
+	ps.cacheCommitMu.RLock()
+	defer ps.cacheCommitMu.RUnlock()
+	if generation != ps.cacheGeneration.Load() {
+		return false, nil
+	}
+	return true, ps.storeUserPermissionCache(userID, cached)
 }
 
 // HasGlobalPermission checks if user has a specific global permission
 func (ps *PermissionService) HasGlobalPermission(userID int, permission string) (bool, error) {
-	// Try cache first
+	// Cache misses build a complete snapshot so later checks stay in memory.
 	cached, err := ps.getUserPermissionCache(userID)
 	if err == nil {
 		atomic.AddInt64(&ps.hits, 1)
 
-		// Check if user is system admin
 		if cached.IsSystemAdmin {
 			return true, nil
 		}
 
-		// Check global permissions
 		return cached.GlobalPermissions[permission], nil
 	}
 
-	// Cache miss - load from database
 	atomic.AddInt64(&ps.misses, 1)
 	return ps.loadUserPermissionAndCheckGlobal(userID, permission)
 }
 
+// HasGlobalPermissionContext is the request-aware form used by hot read paths.
+// Cache hits remain allocation-free; a miss uses one cancellable SQL probe
+// instead of building the full permission snapshot after the request is gone.
+func (ps *PermissionService) HasGlobalPermissionContext(ctx context.Context, userID int, permission string) (bool, error) {
+	if cached, err := ps.getUserPermissionCache(userID); err == nil {
+		atomic.AddInt64(&ps.hits, 1)
+		return cached.IsSystemAdmin || cached.GlobalPermissions[permission], nil
+	}
+	atomic.AddInt64(&ps.misses, 1)
+	var allowed bool
+	err := ps.db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM user_global_permissions ugp
+			JOIN permissions p ON p.id = ugp.permission_id
+			WHERE ugp.user_id = ? AND p.permission_key IN (?, 'system.admin')
+			UNION
+			SELECT 1 FROM group_members gm
+			JOIN groups g ON g.id = gm.group_id AND g.is_active = true
+			JOIN group_global_permissions ggp ON ggp.group_id = gm.group_id
+			JOIN permissions p ON p.id = ggp.permission_id
+			WHERE gm.user_id = ? AND p.permission_key IN (?, 'system.admin')
+		)
+	`, userID, permission, userID, permission).Scan(&allowed)
+	if err != nil {
+		atomic.AddInt64(&ps.errors, 1)
+		return false, fmt.Errorf("error checking global permission: %w", err)
+	}
+	return allowed, nil
+}
+
 // HasWorkspacePermissions checks multiple permissions in single operation
 func (ps *PermissionService) HasWorkspacePermissions(userID, workspaceID int, permissions []string) (map[string]bool, error) {
-	result := make(map[string]bool)
-
-	// Try cache first
 	cached, err := ps.getUserPermissionCache(userID)
 	if err == nil {
 		atomic.AddInt64(&ps.hits, 1)
-
-		// Check if user is system admin
-		if cached.IsSystemAdmin {
-			for _, perm := range permissions {
-				result[perm] = true
-			}
-			return result, nil
-		}
-
-		// Everyone assignment fast path
-		if everyonePerms, exists := cached.WorkspaceEveryone[workspaceID]; exists {
-			for _, perm := range permissions {
-				if everyonePerms[perm] {
-					result[perm] = true
-				}
-			}
-		}
-
-		// Check workspace-specific permissions - merge with Everyone (don't overwrite false)
-		if workspacePerms, exists := cached.WorkspacePermissions[workspaceID]; exists {
-			for _, perm := range permissions {
-				if workspacePerms[perm] {
-					result[perm] = true
-				}
-			}
-		}
-		return result, nil
+		return workspacePermissionResults(cached, workspaceID, permissions), nil
 	}
 
-	// Cache miss - load from database and check all permissions
 	atomic.AddInt64(&ps.misses, 1)
 	return ps.loadUserPermissionAndCheckMultiple(userID, workspaceID, permissions)
 }
 
 // IsSystemAdmin checks if user is system administrator
 func (ps *PermissionService) IsSystemAdmin(userID int) (bool, error) {
-	// Try cache first
 	cached, err := ps.getUserPermissionCache(userID)
 	if err == nil {
 		atomic.AddInt64(&ps.hits, 1)
 		return cached.IsSystemAdmin, nil
 	}
 
-	// Cache miss - check database directly for system.admin permission.
-	// Mirrors auth_policy.go's display SQL: direct grant OR via active group.
+	// Keep this probe aligned with auth_policy.go when the snapshot is absent.
 	atomic.AddInt64(&ps.misses, 1)
 	var hasPermission bool
-	err = ps.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM user_global_permissions ugp
-			JOIN permissions p ON ugp.permission_id = p.id
-			WHERE ugp.user_id = ? AND p.permission_key = 'system.admin'
-			UNION
-			SELECT 1 FROM group_members gm
-			JOIN groups g ON g.id = gm.group_id
-			JOIN group_global_permissions ggp ON ggp.group_id = gm.group_id
-			JOIN permissions p ON p.id = ggp.permission_id
-			WHERE gm.user_id = ? AND p.permission_key = 'system.admin' AND g.is_active = true
-		)
-	`, userID, userID).Scan(&hasPermission)
+	err = ps.db.QueryRow(repository.SystemAdminGrantQuery, userID, userID).Scan(&hasPermission)
 	if err != nil {
 		atomic.AddInt64(&ps.errors, 1)
 		return false, fmt.Errorf("error checking system admin permission: %w", err)
@@ -258,22 +268,26 @@ func (ps *PermissionService) IsSystemAdmin(userID int) (bool, error) {
 	return hasPermission, nil
 }
 
-// GetItemWorkspaceID returns the workspace ID for a given item ID using lazy-loaded cache
-// This method is thread-safe and will populate the cache on first access
-func (ps *PermissionService) GetItemWorkspaceID(userID, itemID int) (int, error) {
-	// Try to get from cache first
-	cached, err := ps.getUserPermissionCache(userID)
-	if err == nil {
-		// Check if item workspace mapping exists in cache
-		if workspaceID, exists := cached.ItemWorkspaceMap[itemID]; exists {
-			atomic.AddInt64(&ps.hits, 1)
-			return workspaceID, nil
-		}
+// IsSystemAdminContext is the request-aware form of IsSystemAdmin.
+func (ps *PermissionService) IsSystemAdminContext(ctx context.Context, userID int) (bool, error) {
+	if cached, err := ps.getUserPermissionCache(userID); err == nil {
+		atomic.AddInt64(&ps.hits, 1)
+		return cached.IsSystemAdmin, nil
 	}
-
-	// Cache miss or item not in map - query database
 	atomic.AddInt64(&ps.misses, 1)
+	var hasPermission bool
+	err := ps.db.QueryRowContext(ctx, repository.SystemAdminGrantQuery, userID, userID).Scan(&hasPermission)
+	if err != nil {
+		atomic.AddInt64(&ps.errors, 1)
+		return false, fmt.Errorf("error checking system admin permission: %w", err)
+	}
+	return hasPermission, nil
+}
 
+// GetItemWorkspaceID returns the current workspace for an item. Item location
+// is intentionally not stored in permission snapshots because doing so would
+// couple item moves to authorization-cache invalidation.
+func (ps *PermissionService) GetItemWorkspaceID(_, itemID int) (int, error) {
 	workspaceID, err := repository.NewItemRepository(ps.db).GetWorkspaceID(itemID)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -281,23 +295,6 @@ func (ps *PermissionService) GetItemWorkspaceID(userID, itemID int) (int, error)
 		}
 		atomic.AddInt64(&ps.errors, 1)
 		return 0, fmt.Errorf("error querying item workspace: %w", err)
-	}
-
-	// Store in cache if we have a valid cached entry
-	if cached != nil {
-		ps.mu.Lock()
-		cached.ItemWorkspaceMap[itemID] = workspaceID
-		ps.mu.Unlock()
-
-		// Update cache storage
-		if err := ps.storeUserPermissionCache(userID, cached); err != nil {
-			slog.Warn("Failed to update cache with item workspace mapping",
-				slog.String("component", "permissions"),
-				slog.Int("user_id", userID),
-				slog.Int("item_id", itemID),
-				slog.Any("error", err))
-			// Don't fail the request, just log the error
-		}
 	}
 
 	return workspaceID, nil
@@ -318,8 +315,8 @@ func (ps *PermissionService) getUserPermissionCache(userID int) (*models.UserPer
 		_ = ps.cache.Delete(cacheKey)
 		return nil, err
 	}
+	ps.permissionSnapshotDecodes.Add(1)
 
-	// Check if cache entry has expired
 	if time.Now().After(cached.ExpiresAt) {
 		_ = ps.cache.Delete(cacheKey)
 		return nil, fmt.Errorf("cache entry expired")
@@ -328,107 +325,49 @@ func (ps *PermissionService) getUserPermissionCache(userID int) (*models.UserPer
 	return &cached, nil
 }
 
-// loadUserPermissionAndCheck loads user permissions from DB and checks specific permission
-func (ps *PermissionService) loadUserPermissionAndCheck(userID, workspaceID int, permission string) (bool, error) {
-	cached, err := ps.buildUserPermissionCache(userID)
-	if err != nil {
-		atomic.AddInt64(&ps.errors, 1)
-		return false, err
-	}
-
-	// Store in cache
-	_ = ps.storeUserPermissionCache(userID, cached)
-
-	// Check if user is system admin
-	if cached.IsSystemAdmin {
-		return true, nil
-	}
-
-	// Everyone assignment fast path
-	if everyonePerms, exists := cached.WorkspaceEveryone[workspaceID]; exists {
-		if everyonePerms[permission] {
-			return true, nil
-		}
-	}
-
-	// Check workspace-specific permissions
-	if workspacePerms, exists := cached.WorkspacePermissions[workspaceID]; exists {
-		if workspacePerms[permission] {
-			return true, nil
-		}
-	}
-
-	// No matching permission
-	_, everyoneExists := cached.WorkspaceEveryone[workspaceID]
-	_, wsPermsExists := cached.WorkspacePermissions[workspaceID]
-	slog.Debug("workspace permission denied (cache miss path)",
-		slog.String("component", "permissions"),
-		slog.Int("user_id", userID),
-		slog.Int("workspace_id", workspaceID),
-		slog.String("permission", permission),
-		slog.Bool("everyone_exists", everyoneExists),
-		slog.Bool("workspace_perms_exists", wsPermsExists))
-	return false, nil
-}
-
 // loadUserPermissionAndCheckGlobal loads user permissions from DB and checks global permission
 func (ps *PermissionService) loadUserPermissionAndCheckGlobal(userID int, permission string) (bool, error) {
-	cached, err := ps.buildUserPermissionCache(userID)
+	cached, err := ps.buildAndStoreUserPermissionCache(userID)
 	if err != nil {
 		atomic.AddInt64(&ps.errors, 1)
 		return false, err
 	}
 
-	// Store in cache
-	_ = ps.storeUserPermissionCache(userID, cached)
-
-	// Check if user is system admin
 	if cached.IsSystemAdmin {
 		return true, nil
 	}
 
-	// Check global permissions
 	return cached.GlobalPermissions[permission], nil
 }
 
 // loadUserPermissionAndCheckMultiple loads user permissions and checks multiple permissions
 func (ps *PermissionService) loadUserPermissionAndCheckMultiple(userID, workspaceID int, permissions []string) (map[string]bool, error) {
-	result := make(map[string]bool)
-
-	cached, err := ps.buildUserPermissionCache(userID)
+	cached, err := ps.buildAndStoreUserPermissionCache(userID)
 	if err != nil {
 		atomic.AddInt64(&ps.errors, 1)
-		return result, err
+		return make(map[string]bool), err
 	}
+	return workspacePermissionResults(cached, workspaceID, permissions), nil
+}
 
-	// Store in cache
-	_ = ps.storeUserPermissionCache(userID, cached)
-
-	// Check if user is system admin
+func workspacePermissionResults(
+	cached *models.UserPermissionCache,
+	workspaceID int,
+	permissions []string,
+) map[string]bool {
+	result := make(map[string]bool)
 	if cached.IsSystemAdmin {
-		for _, perm := range permissions {
-			result[perm] = true
+		for _, permission := range permissions {
+			result[permission] = true
 		}
-		return result, nil
+		return result
 	}
-
-	// Everyone assignment fast path
-	if everyonePerms, exists := cached.WorkspaceEveryone[workspaceID]; exists {
-		for _, perm := range permissions {
-			if everyonePerms[perm] {
-				result[perm] = true
-			}
-		}
+	everyone := cached.WorkspaceEveryone[workspaceID]
+	explicit := cached.WorkspacePermissions[workspaceID]
+	for _, permission := range permissions {
+		result[permission] = everyone[permission] || explicit[permission]
 	}
-
-	// Check workspace-specific permissions
-	if workspacePerms, exists := cached.WorkspacePermissions[workspaceID]; exists {
-		for _, perm := range permissions {
-			result[perm] = workspacePerms[perm]
-		}
-	}
-
-	return result, nil
+	return result
 }
 
 // GetGroupMemberships returns the group IDs for a user, leveraging the permission cache.
@@ -440,14 +379,12 @@ func (ps *PermissionService) GetGroupMemberships(userID int) ([]int, error) {
 		return cached.GroupMemberships, nil
 	}
 
-	// Cache miss — build cache and return group memberships
 	atomic.AddInt64(&ps.misses, 1)
-	cached, err = ps.buildUserPermissionCache(userID)
+	cached, err = ps.buildAndStoreUserPermissionCache(userID)
 	if err != nil {
 		atomic.AddInt64(&ps.errors, 1)
 		return nil, err
 	}
-	_ = ps.storeUserPermissionCache(userID, cached)
 	return cached.GroupMemberships, nil
 }
 
@@ -468,76 +405,75 @@ func (ps *PermissionService) HasWorkspaceRole(userID, workspaceID, roleID int) (
 // GetUserEffectivePermissions returns the full effective permission cache for a user,
 // including explicit roles, group-based roles, and "Everyone" implicit permissions.
 func (ps *PermissionService) GetUserEffectivePermissions(userID int) (*models.UserPermissionCache, error) {
-	cached, err := ps.getUserPermissionCache(userID)
-	if err == nil {
-		return cached, nil
-	}
-
-	// Cache miss - build from database
-	cached, err = ps.buildUserPermissionCache(userID)
-	if err != nil {
-		return nil, err
-	}
-	_ = ps.storeUserPermissionCache(userID, cached)
-	return cached, nil
+	return ps.effectivePermissionSnapshot(userID)
 }
 
 // InvalidateUserCache removes a user's permission cache. If the user owns
 // any agents, their caches are invalidated as well so the delegation stays
 // consistent after a permission mutation on the owner.
 func (ps *PermissionService) InvalidateUserCache(userID int) error {
-	cacheKey := ps.getCacheKey(userID)
-	err := ps.cache.Delete(cacheKey)
-	ps.invalidateOwnedAgents(userID)
-	return err
+	return ps.InvalidateMultipleUserCaches([]int{userID})
 }
 
-// invalidateOwnedAgents clears the permission cache for every agent owned by
-// the given user. Best-effort: failures are logged but don't surface.
-func (ps *PermissionService) invalidateOwnedAgents(ownerID int) {
+func (ps *PermissionService) invalidateUserCaches(userIDs []int) error {
+	ps.cacheCommitMu.Lock()
+	defer ps.cacheCommitMu.Unlock()
+	ps.cacheGeneration.Add(1)
+	var errs []error
+	for _, userID := range userIDs {
+		if err := ps.cache.Delete(ps.getCacheKey(userID)); err != nil && !errors.Is(err, bigcache.ErrEntryNotFound) {
+			errs = append(errs, fmt.Errorf("delete permission cache for user %d: %w", userID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (ps *PermissionService) ownedAgentIDs(ownerID int) ([]int, error) {
 	rows, err := ps.db.Query(
 		"SELECT id FROM users WHERE agent_owner_user_id = ?",
 		ownerID,
 	)
 	if err != nil {
-		slog.Warn("failed to enumerate owned agents for cache invalidation",
-			slog.String("component", "permissions"),
-			slog.Int("owner_id", ownerID),
-			slog.Any("error", err))
-		return
+		return nil, fmt.Errorf("enumerate agents owned by user %d: %w", ownerID, err)
 	}
 	defer func() { _ = rows.Close() }()
+	var agentIDs []int
 	for rows.Next() {
 		var agentID int
 		if err := rows.Scan(&agentID); err != nil {
-			continue
+			return nil, fmt.Errorf("scan agent owned by user %d: %w", ownerID, err)
 		}
-		_ = ps.cache.Delete(ps.getCacheKey(agentID))
+		agentIDs = append(agentIDs, agentID)
 	}
 	if err := rows.Err(); err != nil {
-		slog.Warn("failed to iterate owned agents for cache invalidation",
-			slog.String("component", "permissions"),
-			slog.Int("owner_id", ownerID),
-			slog.Any("error", err))
+		return nil, fmt.Errorf("iterate agents owned by user %d: %w", ownerID, err)
 	}
+	return agentIDs, nil
 }
 
 // InvalidateMultipleUserCaches removes permission caches for multiple users
 func (ps *PermissionService) InvalidateMultipleUserCaches(userIDs []int) error {
+	allIDs := make(map[int]struct{}, len(userIDs))
 	for _, userID := range userIDs {
-		if err := ps.InvalidateUserCache(userID); err != nil {
-			slog.Warn("Failed to invalidate cache for user",
-				slog.String("component", "permissions"),
-				slog.Int("user_id", userID),
-				slog.Any("error", err))
+		allIDs[userID] = struct{}{}
+		agentIDs, err := ps.ownedAgentIDs(userID)
+		if err != nil {
+			return err
+		}
+		for _, agentID := range agentIDs {
+			allIDs[agentID] = struct{}{}
 		}
 	}
-	return nil
+	ids := make([]int, 0, len(allIDs))
+	for userID := range allIDs {
+		ids = append(ids, userID)
+	}
+	return ps.invalidateUserCaches(ids)
 }
 
 // InvalidateGroupMemberCaches invalidates caches for all members of a group
 func (ps *PermissionService) InvalidateGroupMemberCaches(groupID int) error {
-	// Get all group members
+	// Invalidation reaches inactive groups too; reactivation must not reuse stale snapshots.
 	userIDs, err := ps.getGroupMembers(groupID)
 	if err != nil {
 		return fmt.Errorf("error getting group members for cache invalidation: %w", err)
@@ -548,7 +484,6 @@ func (ps *PermissionService) InvalidateGroupMemberCaches(groupID int) error {
 
 // InvalidateWorkspaceMemberCaches invalidates caches for all members of a workspace
 func (ps *PermissionService) InvalidateWorkspaceMemberCaches(workspaceID int) error {
-	// Get all workspace members via role assignments (both direct and group-based)
 	rows, err := ps.db.Query(`
 		SELECT DISTINCT user_id FROM user_workspace_roles WHERE workspace_id = ?
 		UNION
@@ -587,26 +522,12 @@ func (ps *PermissionService) getGroupMembers(groupID int) ([]int, error) {
 
 // OnUserPermissionChanged should be called when user permissions are modified
 func (ps *PermissionService) OnUserPermissionChanged(userID int) error {
-	// Invalidate user cache - next request will populate fresh from DB
-	if err := ps.InvalidateUserCache(userID); err != nil {
-		slog.Warn("Failed to invalidate cache for user after permission change",
-			slog.String("component", "permissions"),
-			slog.Int("user_id", userID),
-			slog.Any("error", err))
-	}
-	return nil
+	return ps.resetAfterInvalidationError(ps.InvalidateUserCache(userID))
 }
 
 // OnGroupPermissionChanged should be called when group permissions are modified
 func (ps *PermissionService) OnGroupPermissionChanged(groupID int) error {
-	// Invalidate caches for all group members - next request will populate fresh from DB
-	if err := ps.InvalidateGroupMemberCaches(groupID); err != nil {
-		slog.Warn("Failed to invalidate group member caches",
-			slog.String("component", "permissions"),
-			slog.Int("group_id", groupID),
-			slog.Any("error", err))
-	}
-	return nil
+	return ps.resetAfterInvalidationError(ps.InvalidateGroupMemberCaches(groupID))
 }
 
 // OnUserGroupMembershipChanged should be called when user is added/removed from group
@@ -616,128 +537,105 @@ func (ps *PermissionService) OnUserGroupMembershipChanged(userID, groupID int) e
 
 // OnWorkspacePermissionChanged should be called when workspace-level permissions change
 func (ps *PermissionService) OnWorkspacePermissionChanged(workspaceID int) error {
-	// Invalidate caches for all workspace members
-	if err := ps.InvalidateWorkspaceMemberCaches(workspaceID); err != nil {
-		slog.Warn("Failed to invalidate workspace member caches",
-			slog.String("component", "permissions"),
-			slog.Int("workspace_id", workspaceID),
-			slog.Any("error", err))
-	}
-
-	return nil
+	return ps.resetAfterInvalidationError(ps.InvalidateWorkspaceMemberCaches(workspaceID))
 }
 
 // OnRoleChanged should be called when a role's permissions are modified
 func (ps *PermissionService) OnRoleChanged(roleID int) error {
-	// Get all users with this role in any workspace
+	var errs []error
 	userIDs, err := ps.getUsersWithRole(roleID)
 	if err != nil {
-		slog.Error("Failed to get users with role",
-			slog.String("component", "permissions"),
-			slog.Int("role_id", roleID),
-			slog.Any("error", err))
-		return err
+		errs = append(errs, fmt.Errorf("get direct users with role %d: %w", roleID, err))
+	} else if err = ps.InvalidateMultipleUserCaches(userIDs); err != nil {
+		errs = append(errs, fmt.Errorf("invalidate direct users with role %d: %w", roleID, err))
 	}
 
-	// Invalidate caches for all affected users
-	if err = ps.InvalidateMultipleUserCaches(userIDs); err != nil {
-		slog.Warn("Failed to invalidate user caches for role",
-			slog.String("component", "permissions"),
-			slog.Int("role_id", roleID),
-			slog.Any("error", err))
-	}
-
-	// Also invalidate caches for users in groups with this role
 	groupUserIDs, err := ps.getUsersInGroupsWithRole(roleID)
 	if err != nil {
-		slog.Warn("Failed to get users in groups with role",
-			slog.String("component", "permissions"),
-			slog.Int("role_id", roleID),
-			slog.Any("error", err))
+		errs = append(errs, fmt.Errorf("get group users with role %d: %w", roleID, err))
 	} else if len(groupUserIDs) > 0 {
 		if err := ps.InvalidateMultipleUserCaches(groupUserIDs); err != nil {
-			slog.Warn("Failed to invalidate group user caches for role",
-				slog.String("component", "permissions"),
-				slog.Int("role_id", roleID),
-				slog.Any("error", err))
+			errs = append(errs, fmt.Errorf("invalidate group users with role %d: %w", roleID, err))
 		}
 	}
-
+	if len(errs) > 0 {
+		if resetErr := ps.ResetPermissionCache(); resetErr != nil {
+			return errors.Join(append(errs, fmt.Errorf("reset permission cache: %w", resetErr))...)
+		}
+	}
 	return nil
 }
 
 // OnPermissionSetChanged should be called when a permission set's permissions are modified
 func (ps *PermissionService) OnPermissionSetChanged(permissionSetID int) error {
-	// Get all configuration sets using this permission set
 	configSetIDs, err := ps.getConfigurationSetsUsingPermissionSet(permissionSetID)
 	if err != nil {
 		slog.Error("Failed to get configuration sets using permission set",
 			slog.String("component", "permissions"),
 			slog.Int("permission_set_id", permissionSetID),
 			slog.Any("error", err))
-		return err
+		return ps.resetAfterInvalidationError(err)
 	}
 
-	// For each configuration set, invalidate all workspace members
+	var errs []error
 	for _, configSetID := range configSetIDs {
-		workspaceIDs, err := ps.getWorkspacesUsingConfigurationSet(configSetID)
-		if err != nil {
-			slog.Warn("Failed to get workspaces for configuration set",
-				slog.String("component", "permissions"),
-				slog.Int("configuration_set_id", configSetID),
-				slog.Any("error", err))
-			continue
-		}
-
-		for _, workspaceID := range workspaceIDs {
-			if err := ps.InvalidateWorkspaceMemberCaches(workspaceID); err != nil {
-				slog.Warn("Failed to invalidate workspace member caches",
-					slog.String("component", "permissions"),
-					slog.Int("workspace_id", workspaceID),
-					slog.Any("error", err))
-			}
+		if err := ps.invalidateConfigurationSetWorkspaces(configSetID); err != nil {
+			errs = append(errs, fmt.Errorf("invalidate configuration set %d: %w", configSetID, err))
 		}
 	}
-
-	return nil
+	return ps.resetAfterInvalidationError(errors.Join(errs...))
 }
 
 // OnEveryoneAccessChanged resets the entire permission cache when the implicit
 // "everyone" access level changes (i.e., a role's first assignment is added or
 // its last assignment is removed for a workspace).
 func (ps *PermissionService) OnEveryoneAccessChanged() {
-	if ps.cache != nil {
-		if err := ps.cache.Reset(); err != nil {
-			slog.Error("Failed to reset permission cache after everyone-access change",
-				slog.String("component", "permissions"),
-				slog.Any("error", err))
-		}
+	if err := ps.ResetPermissionCache(); err != nil {
+		slog.Error("Failed to reset permission cache after everyone-access change",
+			slog.String("component", "permissions"),
+			slog.Any("error", err))
 	}
+}
+
+// ResetPermissionCache invalidates every permission snapshot and prevents an
+// in-flight build from committing an older generation afterward.
+func (ps *PermissionService) ResetPermissionCache() error {
+	if ps.cache == nil {
+		return nil
+	}
+	ps.cacheCommitMu.Lock()
+	defer ps.cacheCommitMu.Unlock()
+	ps.cacheGeneration.Add(1)
+	return ps.cache.Reset()
 }
 
 // OnConfigurationSetChanged should be called when a configuration set is modified or reassigned
 func (ps *PermissionService) OnConfigurationSetChanged(configurationSetID int) error {
-	// Get all workspaces using this configuration set
+	return ps.resetAfterInvalidationError(ps.invalidateConfigurationSetWorkspaces(configurationSetID))
+}
+
+func (ps *PermissionService) resetAfterInvalidationError(invalidationErr error) error {
+	if invalidationErr == nil {
+		return nil
+	}
+	if resetErr := ps.ResetPermissionCache(); resetErr != nil {
+		return errors.Join(invalidationErr, fmt.Errorf("reset permission cache: %w", resetErr))
+	}
+	return nil
+}
+
+func (ps *PermissionService) invalidateConfigurationSetWorkspaces(configurationSetID int) error {
 	workspaceIDs, err := ps.getWorkspacesUsingConfigurationSet(configurationSetID)
 	if err != nil {
-		slog.Error("Failed to get workspaces for configuration set",
-			slog.String("component", "permissions"),
-			slog.Int("configuration_set_id", configurationSetID),
-			slog.Any("error", err))
 		return err
 	}
-
-	// Invalidate caches for all members of affected workspaces
+	var errs []error
 	for _, workspaceID := range workspaceIDs {
 		if err := ps.InvalidateWorkspaceMemberCaches(workspaceID); err != nil {
-			slog.Warn("Failed to invalidate workspace member caches",
-				slog.String("component", "permissions"),
-				slog.Int("workspace_id", workspaceID),
-				slog.Any("error", err))
+			errs = append(errs, fmt.Errorf("invalidate workspace %d: %w", workspaceID, err))
 		}
 	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 // Helper functions for cache invalidation
@@ -805,9 +703,6 @@ func (ps *PermissionService) getWorkspacesUsingConfigurationSet(configSetID int)
 
 // GetCacheStats returns current cache performance statistics
 func (ps *PermissionService) GetCacheStats() models.CacheStats {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-
 	hits := atomic.LoadInt64(&ps.hits)
 	misses := atomic.LoadInt64(&ps.misses)
 	errCount := atomic.LoadInt64(&ps.errors)
@@ -818,437 +713,79 @@ func (ps *PermissionService) GetCacheStats() models.CacheStats {
 		hitRatio = float64(hits) / float64(total)
 	}
 
-	// Calculate average load time
+	// Calculate the average workspace-permission check time without taking a
+	// process-wide lock on the permission hot path.
 	avgLoadTime := int64(0)
-	if len(ps.loadTimes) > 0 {
-		sum := int64(0)
-		for _, t := range ps.loadTimes {
-			sum += t
-		}
-		avgLoadTime = sum / int64(len(ps.loadTimes))
+	checkCount := atomic.LoadInt64(&ps.permissionCheckCount)
+	if checkCount > 0 {
+		avgLoadTime = atomic.LoadInt64(&ps.permissionCheckNanos) / checkCount / int64(time.Millisecond)
 	}
 
 	// Get cache info - BigCache Stats doesn't have Entries field
 	// We'll track total users differently or estimate it
 	totalUsers := int64(0) // For now, we don't track this precisely
+	workspaceAccessStats := ps.GetWorkspaceAccessStats()
 
 	return models.CacheStats{
-		Hits:        hits,
-		Misses:      misses,
-		Errors:      errCount,
-		HitRatio:    hitRatio,
-		AvgLoadTime: avgLoadTime,
-		TotalUsers:  totalUsers,
+		Hits:                       hits,
+		Misses:                     misses,
+		Errors:                     errCount,
+		HitRatio:                   hitRatio,
+		AvgLoadTime:                avgLoadTime,
+		TotalUsers:                 totalUsers,
+		PermissionSnapshotDecodes:  workspaceAccessStats.PermissionSnapshotDecodes,
+		ActiveWorkspaceCacheHits:   workspaceAccessStats.ActiveWorkspaceCacheHits,
+		ActiveWorkspaceCacheMisses: workspaceAccessStats.ActiveWorkspaceCacheMisses,
 	}
 }
 
 // buildUserPermissionCache loads complete permission profile from database
 func (ps *PermissionService) buildUserPermissionCache(userID int) (*models.UserPermissionCache, error) {
-	// Owned agents inherit their owner's permissions. Resolve the owner up front
-	// and build the owner's cache; return it keyed under the agent's ID so the
-	// permission-check hot path is unchanged.
-	var ownerID sql.NullInt64
-	var isAgent sql.NullBool
-	err := ps.db.QueryRow(
-		"SELECT COALESCE(is_agent, false), agent_owner_user_id FROM users WHERE id = ?",
-		userID,
-	).Scan(&isAgent, &ownerID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("error loading user for permission resolution: %w", err)
-	}
-	if isAgent.Valid && isAgent.Bool && ownerID.Valid {
-		ownerCache, err := ps.buildUserPermissionCache(int(ownerID.Int64))
-		if err != nil {
-			return nil, err
-		}
-		agentCache := *ownerCache
-		agentCache.UserID = userID
-		return &agentCache, nil
+	inherited, ok, err := ps.inheritedAgentPermissionCache(userID)
+	if err != nil || ok {
+		return inherited, err
 	}
 
-	now := time.Now()
-
-	cached := &models.UserPermissionCache{
-		UserID:               userID,
-		IsSystemAdmin:        false,
-		GlobalPermissions:    make(map[string]bool),
-		WorkspacePermissions: make(map[int]map[string]bool),
-		WorkspaceEveryone:    make(map[int]map[string]bool),
-		GroupMemberships:     make([]int, 0),
-		RoleAssignments:      make(map[int][]int),
-		DirectPermissions:    make(map[int][]string),
-		PermissionSources:    make(map[int]map[string]string),
-		ItemWorkspaceMap:     make(map[int]int),
-		CachedAt:             now,
-		ExpiresAt:            now.Add(ps.ttl),
-	}
-
-	// Check if user has system.admin permission, either directly or via an
-	// active group. Mirrors auth_policy.go's display SQL — see IsSystemAdmin.
-	var hasSystemAdmin bool
-	err = ps.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM user_global_permissions ugp
-			JOIN permissions p ON ugp.permission_id = p.id
-			WHERE ugp.user_id = ? AND p.permission_key = 'system.admin'
-			UNION
-			SELECT 1 FROM group_members gm
-			JOIN groups g ON g.id = gm.group_id
-			JOIN group_global_permissions ggp ON ggp.group_id = gm.group_id
-			JOIN permissions p ON p.id = ggp.permission_id
-			WHERE gm.user_id = ? AND p.permission_key = 'system.admin' AND g.is_active = true
-		)
-	`, userID, userID).Scan(&hasSystemAdmin)
+	builder := newPermissionCacheBuilder(ps, userID)
+	isAdmin, err := builder.loadSystemAdmin()
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return cached, nil // User not found, return empty permissions
-		}
-		return nil, fmt.Errorf("error checking system admin permission: %w", err)
+		return nil, err
 	}
-	cached.IsSystemAdmin = hasSystemAdmin
-
-	// If system admin, no need to load specific permissions
-	if cached.IsSystemAdmin {
-		return cached, nil
+	// Memberships and role assignments are still loaded for system admins so
+	// user_in_group and user_in_role conditions resolve against real data.
+	// Admins bypass permission checks, so the remaining permission grants are
+	// only loaded for non-admins.
+	if err := builder.loadGroupMemberships(); err != nil {
+		return nil, err
 	}
-
-	// Cache for role permissions (lazy-loaded per role ID)
-	rolePermissionCache := make(map[int]map[string]bool)
-
-	// Load workspace active flags once
-	activeWorkspaces, err := ps.getWorkspaceActiveMap()
-	if err != nil {
-		return nil, fmt.Errorf("error loading workspace states: %w", err)
+	if err := builder.loadUserRoleAssignments(); err != nil {
+		return nil, err
 	}
-
-	// Derive Everyone permissions from the absence of explicit role assignments.
-	// Hierarchy: Viewer → Editor → Tester (each requires the previous to be open).
-	// If a role has NO explicit assignments (user or group), everyone gets those permissions.
-	// Admin always requires explicit assignment.
-
-	// Load role IDs
-	var viewerRoleID, editorRoleID, testerRoleID int
-	_ = ps.db.QueryRow(`SELECT id FROM workspace_roles WHERE name = ? LIMIT 1`, models.RoleViewer).Scan(&viewerRoleID)
-	_ = ps.db.QueryRow(`SELECT id FROM workspace_roles WHERE name = ? LIMIT 1`, models.RoleEditor).Scan(&editorRoleID)
-	_ = ps.db.QueryRow(`SELECT id FROM workspace_roles WHERE name = ? LIMIT 1`, models.RoleTester).Scan(&testerRoleID)
-
-	// Query which roles have explicit assignments per workspace
-	explicitAssignments := make(map[int]map[int]bool) // workspace_id -> role_id -> true
-	explicitRows, err := ps.db.Query(`
-		SELECT DISTINCT workspace_id, role_id FROM user_workspace_roles
-		UNION
-		SELECT DISTINCT workspace_id, role_id FROM group_workspace_roles
-	`)
-	if err != nil {
-		slog.Error("failed to load explicit role assignments",
-			slog.String("component", "permissions"),
-			slog.Int("user_id", userID),
-			slog.Any("error", err))
-	} else {
-		defer func() { _ = explicitRows.Close() }()
-		for explicitRows.Next() {
-			var wsID, roleID int
-			if err = explicitRows.Scan(&wsID, &roleID); err != nil {
-				continue
-			}
-			if explicitAssignments[wsID] == nil {
-				explicitAssignments[wsID] = make(map[int]bool)
-			}
-			explicitAssignments[wsID][roleID] = true
-		}
-		if err := explicitRows.Err(); err != nil {
-			slog.Error("failed to iterate explicit role assignments", slog.String("component", "permissions"), slog.Int("user_id", userID), slog.Any("error", err))
-		}
+	if isAdmin {
+		return builder.cached, nil
 	}
-
-	// Load role permissions (lazy, cached per role_id)
-	loadRolePerms := func(roleID int) map[string]bool {
-		if roleID == 0 {
-			return nil
-		}
-		perms, ok := rolePermissionCache[roleID]
-		if !ok {
-			perms, err = ps.getRolePermissions(roleID)
-			if err == nil {
-				rolePermissionCache[roleID] = perms
-			}
-		}
-		return perms
+	if err := builder.loadEveryonePermissions(); err != nil {
+		return nil, err
 	}
-
-	viewerPerms := loadRolePerms(viewerRoleID)
-	editorPerms := loadRolePerms(editorRoleID)
-	testerPerms := loadRolePerms(testerRoleID)
-
-	// For each active workspace, derive everyone permissions
-	for wsID, active := range activeWorkspaces {
-		if !active {
-			continue
-		}
-		wsExplicit := explicitAssignments[wsID]
-
-		// If Viewer is restricted (has explicit assignments), no implicit everyone access
-		if wsExplicit[viewerRoleID] {
-			cached.WorkspaceEveryone[wsID] = map[string]bool{}
-			continue
-		}
-
-		// Viewer is open → everyone gets Viewer permissions
-		everyonePerms := clonePermissionSet(viewerPerms)
-
-		// Editor open if no explicit Editor assignments
-		editorOpen := !wsExplicit[editorRoleID]
-		if editorOpen {
-			mergePerms(everyonePerms, editorPerms)
-		}
-
-		// Tester requires Editor to be open (Testers need Editor to create defects)
-		testerOpen := editorOpen && !wsExplicit[testerRoleID]
-		if testerOpen {
-			mergePerms(everyonePerms, testerPerms)
-		}
-
-		// Admin: never implicit
-		cached.WorkspaceEveryone[wsID] = everyonePerms
+	if err := builder.loadGlobalPermissions(); err != nil {
+		return nil, err
 	}
-
-	// Load global permissions granted directly to the user.
-	globalRows, err := ps.db.Query(`
-		SELECT p.permission_key
-		FROM user_global_permissions ugp
-		JOIN permissions p ON ugp.permission_id = p.id
-		WHERE ugp.user_id = ?
-	`, userID)
-	if err != nil {
-		return nil, fmt.Errorf("error loading global permissions: %w", err)
+	if err := builder.loadGroupMemberships(); err != nil {
+		return nil, err
 	}
-	defer func() { _ = globalRows.Close() }()
-
-	for globalRows.Next() {
-		var permissionKey string
-		if err = globalRows.Scan(&permissionKey); err != nil {
-			continue
-		}
-		cached.GlobalPermissions[permissionKey] = true
+	if err := builder.loadUserRoleAssignments(); err != nil {
+		return nil, err
 	}
-	if err := globalRows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating global permissions: %w", err)
+	if err := builder.loadWorkspaceRolePermissions(); err != nil {
+		return nil, err
 	}
-
-	// Load global permissions inherited via active group membership. The
-	// admin handlers and auth_policy display already treat these as real;
-	// the cache must too or middleware denies what the UI promises.
-	groupGlobalRows, err := ps.db.Query(`
-		SELECT DISTINCT p.permission_key
-		FROM group_members gm
-		JOIN groups g ON g.id = gm.group_id
-		JOIN group_global_permissions ggp ON ggp.group_id = gm.group_id
-		JOIN permissions p ON p.id = ggp.permission_id
-		WHERE gm.user_id = ? AND g.is_active = true
-	`, userID)
-	if err != nil {
-		return nil, fmt.Errorf("error loading group global permissions: %w", err)
+	if err := builder.loadGroupRolePermissions(); err != nil {
+		return nil, err
 	}
-	defer func() { _ = groupGlobalRows.Close() }()
-
-	for groupGlobalRows.Next() {
-		var permissionKey string
-		if err = groupGlobalRows.Scan(&permissionKey); err != nil {
-			continue
-		}
-		cached.GlobalPermissions[permissionKey] = true
+	if err := builder.loadPersonalWorkspacePermissions(); err != nil {
+		return nil, err
 	}
-	if err := groupGlobalRows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating group global permissions: %w", err)
-	}
-
-	// Load group memberships, scoped to active groups only. Inactive groups
-	// must not contribute permissions; filtering here means every downstream
-	// pass that keys off cached.GroupMemberships is automatically scoped.
-	groupRows, err := ps.db.Query(`
-		SELECT gm.group_id
-		FROM group_members gm
-		JOIN groups g ON g.id = gm.group_id
-		WHERE gm.user_id = ? AND g.is_active = true
-	`, userID)
-	if err == nil {
-		defer func() { _ = groupRows.Close() }()
-		for groupRows.Next() {
-			var groupID int
-			if err = groupRows.Scan(&groupID); err == nil {
-				cached.GroupMemberships = append(cached.GroupMemberships, groupID)
-			}
-		}
-		if err := groupRows.Err(); err != nil {
-			return nil, fmt.Errorf("error iterating group memberships: %w", err)
-		}
-	}
-
-	// Load user's role assignments — independent of permissions_enabled. Even
-	// label-only (custom) roles are tracked here so HasWorkspaceRole and
-	// downstream checks (conditions, approval routing) see them.
-	roleAssignRows, err := ps.db.Query(`
-		SELECT workspace_id, role_id FROM user_workspace_roles WHERE user_id = ?
-	`, userID)
-	if err == nil {
-		for roleAssignRows.Next() {
-			var workspaceID, roleID int
-			if err = roleAssignRows.Scan(&workspaceID, &roleID); err != nil {
-				continue
-			}
-			if cached.RoleAssignments[workspaceID] == nil {
-				cached.RoleAssignments[workspaceID] = []int{}
-			}
-			roleExists := false
-			for _, rid := range cached.RoleAssignments[workspaceID] {
-				if rid == roleID {
-					roleExists = true
-					break
-				}
-			}
-			if !roleExists {
-				cached.RoleAssignments[workspaceID] = append(cached.RoleAssignments[workspaceID], roleID)
-			}
-		}
-		if err := roleAssignRows.Err(); err != nil {
-			_ = roleAssignRows.Close()
-			return nil, fmt.Errorf("error iterating role assignments: %w", err)
-		}
-		_ = roleAssignRows.Close()
-	}
-
-	// Derive permissions from those roles, filtered to permission-bearing only.
-	// Custom (label-only) roles never contribute to a user's permission set,
-	// even if a permission row gets attached to them via direct DB access.
-	roleRows, err := ps.db.Query(`
-		SELECT uwr.workspace_id, p.permission_key
-		FROM user_workspace_roles uwr
-		JOIN workspace_roles wr ON wr.id = uwr.role_id AND wr.permissions_enabled = true
-		JOIN role_permissions rp ON uwr.role_id = rp.role_id
-		JOIN permissions p ON rp.permission_id = p.id
-		WHERE uwr.user_id = ?
-	`, userID)
-	if err == nil {
-		defer func() { _ = roleRows.Close() }()
-		for roleRows.Next() {
-			var workspaceID int
-			var permissionKey string
-			if err = roleRows.Scan(&workspaceID, &permissionKey); err != nil {
-				continue
-			}
-
-			if cached.WorkspacePermissions[workspaceID] == nil {
-				cached.WorkspacePermissions[workspaceID] = make(map[string]bool)
-			}
-			cached.WorkspacePermissions[workspaceID][permissionKey] = true
-
-			if cached.PermissionSources[workspaceID] == nil {
-				cached.PermissionSources[workspaceID] = make(map[string]string)
-			}
-			if cached.PermissionSources[workspaceID][permissionKey] == "" {
-				cached.PermissionSources[workspaceID][permissionKey] = "role"
-			}
-		}
-		if err := roleRows.Err(); err != nil {
-			return nil, fmt.Errorf("error iterating role permissions: %w", err)
-		}
-	}
-
-	// Load group role assignments (permissions granted via group membership)
-	if len(cached.GroupMemberships) > 0 {
-		// Build group ID list for query
-		groupIDList := ""
-		for i, gid := range cached.GroupMemberships {
-			if i > 0 {
-				groupIDList += ","
-			}
-			groupIDList += fmt.Sprintf("%d", gid)
-		}
-
-		// Same filter as the user-role pass: label-only roles assigned to a
-		// group are honored for membership tracking elsewhere but never
-		// contribute permissions.
-		groupRoleQuery := fmt.Sprintf(`
-			SELECT gwr.workspace_id, p.permission_key
-			FROM group_workspace_roles gwr
-			JOIN workspace_roles wr ON wr.id = gwr.role_id AND wr.permissions_enabled = true
-			JOIN role_permissions rp ON gwr.role_id = rp.role_id
-			JOIN permissions p ON rp.permission_id = p.id
-			WHERE gwr.group_id IN (%s)
-		`, groupIDList)
-
-		var groupRoleRows *sql.Rows
-		groupRoleRows, err = ps.db.Query(groupRoleQuery)
-		if err == nil {
-			defer func() { _ = groupRoleRows.Close() }()
-			for groupRoleRows.Next() {
-				var workspaceID int
-				var permissionKey string
-				if err = groupRoleRows.Scan(&workspaceID, &permissionKey); err != nil {
-					continue
-				}
-
-				// Add permission from group
-				if cached.WorkspacePermissions[workspaceID] == nil {
-					cached.WorkspacePermissions[workspaceID] = make(map[string]bool)
-				}
-				cached.WorkspacePermissions[workspaceID][permissionKey] = true
-
-				// Track source (only if not already set by role or direct)
-				if cached.PermissionSources[workspaceID] == nil {
-					cached.PermissionSources[workspaceID] = make(map[string]string)
-				}
-				if cached.PermissionSources[workspaceID][permissionKey] == "" {
-					cached.PermissionSources[workspaceID][permissionKey] = "group"
-				}
-			}
-			if err := groupRoleRows.Err(); err != nil {
-				return nil, fmt.Errorf("error iterating group role permissions: %w", err)
-			}
-		}
-	}
-
-	// Grant all permissions for personal workspaces owned by this user
-	personalRows, err := ps.db.Query(`
-		SELECT w.id FROM workspaces w WHERE w.is_personal = true AND w.owner_id = ? AND w.active = true
-	`, userID)
-	if err == nil {
-		defer func() { _ = personalRows.Close() }()
-
-		// Lazy-load if startup pre-load failed
-		if len(ps.allPermissionKeys) == 0 {
-			if err := ps.loadAllPermissionKeys(); err != nil {
-				slog.Warn("Failed to lazy-load permission keys for personal workspace grant",
-					slog.String("component", "permissions"),
-					slog.Int("user_id", userID),
-					slog.Any("error", err))
-			}
-		}
-
-		if len(ps.allPermissionKeys) > 0 {
-			for personalRows.Next() {
-				var wsID int
-				if err := personalRows.Scan(&wsID); err != nil {
-					continue
-				}
-				if cached.WorkspacePermissions[wsID] == nil {
-					cached.WorkspacePermissions[wsID] = make(map[string]bool)
-				}
-				for _, key := range ps.allPermissionKeys {
-					cached.WorkspacePermissions[wsID][key] = true
-				}
-				if cached.PermissionSources[wsID] == nil {
-					cached.PermissionSources[wsID] = make(map[string]string)
-				}
-				cached.PermissionSources[wsID]["_source"] = "personal_owner"
-			}
-			if err := personalRows.Err(); err != nil {
-				return nil, fmt.Errorf("error iterating personal workspaces: %w", err)
-			}
-		}
-	}
-
-	return cached, nil
+	return builder.cached, nil
 }
 
 // storeUserPermissionCache stores permission cache data
@@ -1302,9 +839,10 @@ func (ps *PermissionService) getRolePermissions(roleID int) (map[string]bool, er
 	perms := make(map[string]bool)
 	for rows.Next() {
 		var key string
-		if err := rows.Scan(&key); err == nil {
-			perms[key] = true
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("scan permission for role %d: %w", roleID, err)
 		}
+		perms[key] = true
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1325,9 +863,10 @@ func (ps *PermissionService) loadAllPermissionKeys() error {
 	var keys []string
 	for rows.Next() {
 		var key string
-		if err := rows.Scan(&key); err == nil {
-			keys = append(keys, key)
+		if err := rows.Scan(&key); err != nil {
+			return fmt.Errorf("scan permission key: %w", err)
 		}
+		keys = append(keys, key)
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -1336,16 +875,15 @@ func (ps *PermissionService) loadAllPermissionKeys() error {
 	return nil
 }
 
-// scanIntColumn collects a single-int-column result set into a slice. Rows
-// that fail to scan are skipped (matching the lenient behavior the cache
-// invalidation queries have always relied on); any iteration error surfaces.
+// scanIntColumn collects a complete single-int-column result set into a slice.
 func scanIntColumn(rows *sql.Rows) ([]int, error) {
 	var ids []int
 	for rows.Next() {
 		var id int
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
 		}
+		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1407,12 +945,8 @@ func (ps *PermissionService) WarmCache() {
 
 // preWarmUserCache loads and caches permissions for a specific user
 func (ps *PermissionService) preWarmUserCache(userID int) error {
-	cached, err := ps.buildUserPermissionCache(userID)
-	if err != nil {
-		return err
-	}
-
-	return ps.storeUserPermissionCache(userID, cached)
+	_, err := ps.buildAndStoreUserPermissionCache(userID)
+	return err
 }
 
 // getRecentlyActiveUsers returns user IDs who were active in the specified duration
@@ -1420,18 +954,19 @@ func (ps *PermissionService) getRecentlyActiveUsers(duration time.Duration) ([]i
 	since := time.Now().Add(-duration)
 
 	rows, err := ps.db.Query(`
-		SELECT DISTINCT user_id
+		SELECT user_id
 		FROM user_sessions
-		WHERE created_at > ? OR last_activity > ?
-		ORDER BY last_activity DESC
+		WHERE is_active = true AND expires_at > CURRENT_TIMESTAMP AND created_at > ?
+		GROUP BY user_id
+		ORDER BY MAX(created_at) DESC
 		LIMIT ?
-	`, since, since, ps.batchSize*2) // Limit to prevent excessive warm-up
+	`, since, ps.batchSize*2) // Limit to prevent excessive warm-up
 
 	if err != nil {
 		// If session table doesn't exist or has issues, fall back to basic user list
 		rows, err = ps.db.Query(`
 			SELECT id FROM users 
-			WHERE role != 'inactive'
+			WHERE is_active = true
 			ORDER BY updated_at DESC
 			LIMIT ?
 		`, ps.batchSize)
@@ -1445,7 +980,13 @@ func (ps *PermissionService) getRecentlyActiveUsers(duration time.Duration) ([]i
 	return scanIntColumn(rows)
 }
 
-// Close gracefully shuts down the permission service
+// Close stops the cache worker without closing the shared database.
+// Repeated calls are safe, including when no cache was initialized.
 func (ps *PermissionService) Close() error {
-	return ps.cache.Close()
+	ps.closeOnce.Do(func() {
+		if ps.cache != nil {
+			ps.closeErr = ps.cache.Close()
+		}
+	})
+	return ps.closeErr
 }

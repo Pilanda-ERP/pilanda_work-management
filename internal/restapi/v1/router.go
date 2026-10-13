@@ -1,62 +1,32 @@
-// Package v1 provides REST API version 1 endpoints and routing.
+// Package v1 provides scoped bearer-token REST endpoints.
 //
-// # Auth boundary
-//
-// This package is the only surface that accepts API bearer tokens
-// (Authorization: Bearer crw_*). The cookie-auth surface (/api/*,
-// internal/middleware/auth.go) explicitly rejects bearer tokens — that
-// would be a back door around the per-route token-scope checks below.
-//
-// Auth method by surface:
-//   - /rest/api/v1/* (here): Authorization: Bearer crw_* — scope-checked.
-//   - /api/* (cookie-auth): Cookie / X-Session-Token. No bearer.
-//   - /api/internal/* (sidecar RPC): X-Internal-Service-Auth shared secret.
-//
-// # Routing convention
-//
-// New routes should follow the rules below so that token scopes,
-// in-handler permission checks, and the user/workspace permission model
-// stay aligned across the surface.
-//
-// Workspace-content resources (items, milestones, iterations, projects,
-// comments) live at /workspaces/{id}/<resource>[...]. They are gated by:
-//   - bearerAuth.RequirePermission("items:<read|write|delete>") at the route
-//   - BaseHandler.RequireWorkspace<View|Edit>Access in the handler
-//
-// The URL constraint plus the in-handler check together guarantee a token
-// can only reach resources in workspaces where the user holds the matching
-// PermissionItem<View|Edit>. Global mirror routes for the same resources
-// (e.g. /milestones, /iterations, /projects) remain available for cross-
-// workspace use cases (search, dashboards) but their handlers must look up
-// the resource's scope and apply the workspace check for workspace-scoped
-// rows; see requireMilestoneAccessByID etc. in handlers/planning.go for
-// the canonical pattern.
-//
-// Workspace-config resources (statuses, item-types, priorities, custom-
-// fields) live at /workspaces/{id}/<resource> for read, gated by
-// bearerAuth.RequirePermission("workspaces:read") + RequireWorkspaceViewAccess.
-// Mutations are admin-only and sit on global routes.
-//
-// Truly global resources (workflows, status-categories, users) keep their
-// global URLs and dedicated scopes (workflows:read, statuses:read,
-// users:read).
-//
-// System-admin bypass intentionally does not apply to token-scope checks.
-// PermissionService.HasWorkspacePermission and HasGlobalPermission auto-
-// satisfy admins, so the in-handler check is bypassed; the bearer-token
-// scope check still requires the scope to be present on the token. This
-// is defense-in-depth: a token issued for a specific bot should not
-// inherit owner privileges by accident.
+// Only /rest/api/v1 accepts crw_* bearer tokens; /api uses session auth and
+// /api/internal uses the sidecar secret. Routes must enforce token scope and
+// resource access. Browser application code must never hold these tokens or
+// call this surface. System admins never bypass token scopes.
 package v1
 
 import (
+	"net/http"
+
+	"windshift/internal/auth"
+	coremiddleware "windshift/internal/middleware"
+	"windshift/internal/objecttranslation"
 	"windshift/internal/repository"
 	"windshift/internal/restapi"
 	"windshift/internal/restapi/v1/handlers"
-	"windshift/internal/restapi/v1/middleware"
+	v1middleware "windshift/internal/restapi/v1/middleware"
 	"windshift/internal/router"
 	"windshift/internal/services"
 )
+
+func deprecationHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Deprecation", "true")
+		w.Header().Set("Link", `</rest/api/v2/openapi.json>; rel="successor-version"`)
+		next.ServeHTTP(w, r)
+	})
+}
 
 // RegisterRoutes registers all v1 API routes on the given ServeMux
 func RegisterRoutes(deps restapi.Deps) {
@@ -64,36 +34,62 @@ func RegisterRoutes(deps restapi.Deps) {
 	db := deps.DB
 	tokenManager := deps.TokenManager
 	permissionService := deps.PermissionService
+	objectTranslationService := deps.ObjectTranslationService
+	if objectTranslationService == nil {
+		objectTranslationService = objecttranslation.NewService(db)
+	}
 
-	// Create auth middleware (with permission service for admin checks)
-	bearerAuth := middleware.NewBearerAuthWithPermissions(tokenManager, permissionService)
+	bearerAuth := v1middleware.NewBearerAuthWithPermissions(tokenManager, permissionService)
 
-	// Create rate limiter (1000 requests per minute)
-	rateLimiter := middleware.NewRateLimiter(1000)
+	rateLimiter := v1middleware.NewRateLimiter(1000)
 
-	// ItemHandler / CommentHandler share the fully-wired CommentService from
-	// Deps (notifications, mentions, webhooks, etc.) so comments created via
-	// the bearer-token surface fire the same notifications as the web UI
-	// (WI-434). The constructors tolerate a nil Deps.CommentService by falling
-	// back to a bare service (persists comments, skips side effects) so
-	// embedders that haven't wired Deps yet still boot.
+	// Reuse the fully wired comment service so v1 comments retain side effects.
 
-	// Initialize handlers
-	itemHandler := handlers.NewItemHandler(db, permissionService, deps.CommentService)
-	workspaceHandler := handlers.NewWorkspaceHandler(db, permissionService)
-	statusHandler := handlers.NewStatusHandler(db, permissionService)
+	itemHandler := handlers.NewItemHandler(db, permissionService, deps.CommentService, deps.ItemCreationService)
+	itemHandler.SetItemUpdateApplicationService(deps.ItemUpdateApplicationService)
+	itemHandler.SetItemDeletionApplicationService(deps.ItemDeletionApplicationService)
+	workspaceHandler := handlers.NewWorkspaceHandler(db, permissionService, deps.AuthorizationCacheInvalidator)
+	workspaceHandler.SetPackProvisioner(deps.PackProvisioner)
+	statusHandler := handlers.NewStatusHandler(db, permissionService, objectTranslationService)
 	workflowHandler := handlers.NewWorkflowHandler(db, permissionService)
-	itemTypeHandler := handlers.NewItemTypeHandler(db, permissionService)
-	priorityHandler := handlers.NewPriorityHandler(db, permissionService)
+	itemTypeHandler := handlers.NewItemTypeHandler(db, permissionService, objectTranslationService)
+	priorityHandler := handlers.NewPriorityHandler(db, permissionService, objectTranslationService)
 	customFieldHandler := handlers.NewCustomFieldHandler(db, permissionService)
 	userHandler := handlers.NewUserHandler(db, permissionService)
+	userPreferencesHandler := handlers.NewUserPreferencesHandler(db, permissionService)
+	agentRunHandler := handlers.NewAgentRunHandler(db, permissionService)
 	commentHandler := handlers.NewCommentHandler(db, permissionService, deps.CommentService)
 	milestoneHandler := handlers.NewMilestoneHandler(db, permissionService)
 	iterationHandler := handlers.NewIterationHandler(db, permissionService)
 	collectionHandler := handlers.NewCollectionHandler(db, permissionService)
 	actionHandler := handlers.NewActionHandler(db, permissionService, deps.ActionService)
+	actionHandler.SetAssetService(deps.AssetService)
 	attachmentHandler := handlers.NewAttachmentHandler(db, permissionService, deps.AttachmentPath)
+	pagePermissionService := services.NewPagePermissionService(db, permissionService)
+	pageApplicationService := deps.PageApplicationService
+	if pageApplicationService == nil {
+		pageApplicationService = services.NewPageApplicationService(
+			services.NewPageService(db),
+			pagePermissionService,
+		)
+	}
 	pageHandler := handlers.NewPageHandler(db, permissionService)
+	pageHandler.SetPageApplicationService(pageApplicationService)
+	pageDiagramService := deps.PageDiagramService
+	if pageDiagramService == nil {
+		pageDiagramService = services.NewPageDiagramService(
+			db,
+			deps.AttachmentPath,
+			pageApplicationService,
+			pagePermissionService,
+			permissionService,
+		)
+	}
+	pageDiagramHandler := handlers.NewPageDiagramHandler(
+		handlers.NewBaseHandler(db, permissionService),
+		pageDiagramService,
+		pageApplicationService.PageService(),
+	)
 	pageLabelHandler := handlers.NewPageLabelHandler(db, permissionService)
 	agentSkillHandler := handlers.NewAgentSkillHandler(db, permissionService)
 	diagramHandler := handlers.NewDiagramHandler(db, permissionService)
@@ -102,7 +98,6 @@ func RegisterRoutes(deps restapi.Deps) {
 	testMgmtHandler := handlers.NewTestManagementHandler(db, permissionService)
 	recurrenceHandler := handlers.NewRecurrenceHandler(db, permissionService)
 
-	pagePermissionService := services.NewPagePermissionService(db, permissionService)
 	pageAttachmentUploadHandler := handlers.NewPageAttachmentUploadHandler(
 		handlers.NewBaseHandler(db, permissionService),
 		services.NewPageAttachmentUploadService(db, deps.AttachmentPath, permissionService, pagePermissionService),
@@ -112,7 +107,6 @@ func RegisterRoutes(deps restapi.Deps) {
 		services.NewItemAttachmentService(db, deps.AttachmentPath, permissionService),
 	)
 
-	// Time tracking
 	timePermService := services.NewTimePermissionService(db, permissionService)
 	timeProjectHandler := handlers.NewTimeProjectHandler(handlers.NewBaseHandler(db, permissionService), timePermService)
 	timeWorklogHandler := handlers.NewTimeWorklogHandler(handlers.NewBaseHandler(db, permissionService), timePermService)
@@ -126,24 +120,25 @@ func RegisterRoutes(deps restapi.Deps) {
 	// RequireAuth — the OpenAPI document describes the public surface and
 	// has to be fetchable by clients that don't yet have a token.
 	publicV1 := router.NewRouteGroup(mux, "/rest/api/v1",
-		middleware.RequestID,
+		deprecationHeaders,
+		v1middleware.RequestID,
+		coremiddleware.LimitJSONRequestBody(restapi.DefaultJSONRequestBodyLimit),
 		rateLimiter.Middleware,
 	)
 	publicV1.Handle("GET /openapi.json", handlers.OpenAPISpecJSON)
-	publicV1.Handle("GET /openapi.yaml", handlers.OpenAPISpecYAML)
 
 	// Create authenticated route group with middleware chain:
 	// RequestID -> RequireAuth -> RateLimiter
 	v1 := router.NewRouteGroup(mux, "/rest/api/v1",
-		middleware.RequestID,
+		deprecationHeaders,
+		v1middleware.RequestID,
+		coremiddleware.LimitJSONRequestBody(restapi.DefaultJSONRequestBodyLimit),
 		bearerAuth.RequireAuth,
 		rateLimiter.Middleware,
 	)
 
-	// ============================================
-	// Items
-	// ============================================
 	v1.HandleWithMiddleware("GET /items", itemHandler.List, bearerAuth.RequirePermission("items:read"))
+	v1.HandleWithMiddleware("GET /items/changes", itemHandler.ListChanges, bearerAuth.RequirePermission("items:read"))
 	// Bulk fetch by id set. Literal segment, no RequireNumericID — registered
 	// before /items/{id} so it isn't swallowed by the wildcard.
 	v1.HandleWithMiddleware("GET /items/batch", itemHandler.GetBatch, bearerAuth.RequirePermission("items:read"))
@@ -154,6 +149,7 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("GET /items/{id}/comments", itemHandler.GetComments, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("POST /items/{id}/comments", itemHandler.CreateComment, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /items/{id}/history", itemHandler.GetHistory, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
+	v1.HandleWithMiddleware("GET /items/{id}/agent-runs", agentRunHandler.ListForItem, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /items/{id}/transitions", itemHandler.GetTransitions, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("POST /items/{id}/transition", itemHandler.Transition, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("POST /items/{id}/change-type", itemHandler.ChangeType, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
@@ -164,11 +160,9 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("DELETE /attachments/{id}", itemAttachmentHandler.Delete, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /items/{id}/children", itemHandler.GetChildren, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
 
-	// ============================================
-	// Workspaces
-	// ============================================
 	v1.HandleWithMiddleware("GET /workspaces", workspaceHandler.List, bearerAuth.RequirePermission("workspaces:read"))
 	v1.HandleWithMiddleware("POST /workspaces", workspaceHandler.Create, bearerAuth.RequirePermission("workspaces:write"))
+	v1.HandleWithMiddleware("GET /workspace-templates", workspaceHandler.ListTemplates, bearerAuth.RequirePermission("workspaces:read"))
 	v1.HandleWithMiddleware("GET /workspaces/{id}", workspaceHandler.Get, bearerAuth.RequirePermission("workspaces:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("PUT /workspaces/{id}", workspaceHandler.Update, bearerAuth.RequirePermission("workspaces:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("DELETE /workspaces/{id}", workspaceHandler.Delete, bearerAuth.RequirePermission("workspaces:delete"), router.RequireNumericID)
@@ -176,7 +170,9 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("GET /workspaces/{id}/statuses", workspaceHandler.GetStatuses, bearerAuth.RequirePermission("workspaces:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /workspaces/{id}/statuses/completed", workspaceHandler.ListCompletedStatuses, bearerAuth.RequirePermission("workspaces:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /workspaces/{id}/item-types", workspaceHandler.GetItemTypes, bearerAuth.RequirePermission("workspaces:read"), router.RequireNumericID)
+	v1.HandleWithMiddleware("GET /workspaces/{id}/workflows", workspaceHandler.GetWorkflows, bearerAuth.RequirePermission("workspaces:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /workspaces/{id}/priorities", workspaceHandler.GetPriorities, bearerAuth.RequirePermission("workspaces:read"), router.RequireNumericID)
+	v1.HandleWithMiddleware("GET /workspaces/{id}/assignable-users", userHandler.GetAssignableForWorkspace, bearerAuth.RequirePermission("users:read"), router.RequireNumericID)
 
 	// Item lookup by stable (workspace_key, item_number) pair — for embed clients
 	// (e.g. docmost) that store stable references rather than volatile numeric ids.
@@ -208,56 +204,34 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("PUT /workspaces/{id}/iterations/{iterationId}", iterationHandler.UpdateInWorkspace, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("DELETE /workspaces/{id}/iterations/{iterationId}", iterationHandler.DeleteInWorkspace, bearerAuth.RequirePermission("items:delete"), router.RequireNumericID)
 
-	// ============================================
-	// Statuses & Status Categories
-	// ============================================
 	v1.HandleWithMiddleware("GET /statuses", statusHandler.List, bearerAuth.RequirePermission("statuses:read"))
 	v1.HandleWithMiddleware("GET /statuses/{id}", statusHandler.Get, bearerAuth.RequirePermission("statuses:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /status-categories", statusHandler.ListCategories, bearerAuth.RequirePermission("statuses:read"))
 	v1.HandleWithMiddleware("GET /status-categories/{id}", statusHandler.GetCategory, bearerAuth.RequirePermission("statuses:read"), router.RequireNumericID)
 
-	// ============================================
-	// Workflows
-	// ============================================
 	v1.HandleWithMiddleware("GET /workflows", workflowHandler.List, bearerAuth.RequirePermission("workflows:read"))
 	v1.HandleWithMiddleware("GET /workflows/{id}", workflowHandler.Get, bearerAuth.RequirePermission("workflows:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /workflows/{id}/transitions", workflowHandler.GetTransitions, bearerAuth.RequirePermission("workflows:read"), router.RequireNumericID)
 
-	// ============================================
-	// Item Types
-	// ============================================
 	v1.HandleWithMiddleware("GET /item-types", itemTypeHandler.List, bearerAuth.RequirePermission("item-types:read"))
 	v1.HandleWithMiddleware("GET /item-types/{id}", itemTypeHandler.Get, bearerAuth.RequirePermission("item-types:read"), router.RequireNumericID)
 
-	// ============================================
-	// Priorities
-	// ============================================
 	v1.HandleWithMiddleware("GET /priorities", priorityHandler.List, bearerAuth.RequirePermission("priorities:read"))
 	v1.HandleWithMiddleware("GET /priorities/{id}", priorityHandler.Get, bearerAuth.RequirePermission("priorities:read"), router.RequireNumericID)
 
-	// ============================================
-	// Custom Fields
-	// ============================================
 	v1.HandleWithMiddleware("GET /custom-fields", customFieldHandler.List, bearerAuth.RequirePermission("custom-fields:read"))
 	v1.HandleWithMiddleware("GET /custom-fields/{id}", customFieldHandler.Get, bearerAuth.RequirePermission("custom-fields:read"), router.RequireNumericID)
 
-	// ============================================
-	// Users
-	// ============================================
 	v1.HandleWithMiddleware("GET /users", userHandler.List, bearerAuth.RequirePermission("users:read"))
 	v1.HandleWithMiddleware("GET /users/me", userHandler.GetCurrent, bearerAuth.RequirePermission("users:read"))
+	v1.HandleWithMiddleware("GET /users/me/tui-preferences", userPreferencesHandler.GetTUI, bearerAuth.RequirePermission("user-preferences:read"))
+	v1.HandleWithMiddleware("PUT /users/me/tui-preferences", userPreferencesHandler.UpdateTUI, bearerAuth.RequirePermission("user-preferences:write"))
 	v1.HandleWithMiddleware("GET /users/{id}", userHandler.Get, bearerAuth.RequirePermission("users:read"), router.RequireNumericID)
 
-	// ============================================
-	// Comments (standalone)
-	// ============================================
 	v1.HandleWithMiddleware("GET /comments/{id}", commentHandler.Get, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("PUT /comments/{id}", commentHandler.Update, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("DELETE /comments/{id}", commentHandler.Delete, bearerAuth.RequirePermission("items:delete"), router.RequireNumericID)
 
-	// ============================================
-	// Milestones
-	// ============================================
 	v1.HandleWithMiddleware("GET /milestones", milestoneHandler.List, bearerAuth.RequirePermission("milestones:read"))
 	v1.HandleWithMiddleware("POST /milestones", milestoneHandler.Create, bearerAuth.RequirePermission("milestones:write"))
 	v1.HandleWithMiddleware("POST /milestones/reorder", milestoneHandler.ReorderGlobal, bearerAuth.RequirePermission("milestones:write"))
@@ -267,9 +241,6 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("GET /milestones/{id}/items", milestoneHandler.GetItems, bearerAuth.RequirePermission("milestones:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /milestones/{id}/progress", milestoneHandler.GetProgress, bearerAuth.RequirePermission("milestones:read"), router.RequireNumericID)
 
-	// ============================================
-	// Iterations
-	// ============================================
 	v1.HandleWithMiddleware("GET /iterations", iterationHandler.List, bearerAuth.RequirePermission("iterations:read"))
 	v1.HandleWithMiddleware("POST /iterations", iterationHandler.Create, bearerAuth.RequirePermission("iterations:write"))
 	v1.HandleWithMiddleware("GET /iterations/{id}", iterationHandler.Get, bearerAuth.RequirePermission("iterations:read"), router.RequireNumericID)
@@ -293,13 +264,8 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("POST /workspaces/{id}/actions/validate", actionHandler.ValidateAction, bearerAuth.RequirePermission("actions:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /workspaces/{id}/actions/{actionId}", actionHandler.GetAction, bearerAuth.RequirePermission("actions:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("PUT /workspaces/{id}/actions/{actionId}", actionHandler.UpdateAction, bearerAuth.RequirePermission("actions:write"), router.RequireNumericID)
+	v1.HandleWithMiddleware("DELETE /workspaces/{id}/actions/{actionId}", actionHandler.DeleteAction, bearerAuth.RequirePermission("actions:write"), router.RequireNumericID)
 
-	// ============================================
-	// Pages (workspace knowledge / wiki). Per-page ACL is enforced in the
-	// handler via PagePermissionService; the route layer gates on the
-	// pages:* token scopes so a token scoped to a different surface can't
-	// drive page CRUD even if its bearer-user has the workspace role.
-	// ============================================
 	v1.HandleWithMiddleware("GET /workspaces/{id}/pages", pageHandler.List, bearerAuth.RequirePermission("pages:read"), router.RequireNumericID)
 	// Literal "search" segment; the ServeMux prefers it over the {pageId}
 	// wildcard route below, so order is not load-bearing.
@@ -316,17 +282,15 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("POST /workspaces/{id}/pages/{pageId}/permissions", pageHandler.GrantPermission, bearerAuth.RequirePermission("pages:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("DELETE /workspaces/{id}/pages/{pageId}/permissions/{permissionId}", pageHandler.RevokePermission, bearerAuth.RequirePermission("pages:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("PATCH /workspaces/{id}/pages/{pageId}/inheritance", pageHandler.SetInheritance, bearerAuth.RequirePermission("pages:write"), router.RequireNumericID)
+	v1.HandleWithMiddleware("GET /workspaces/{id}/pages/{pageId}/diagrams", pageDiagramHandler.List, bearerAuth.RequirePermission("pages:read"), router.RequireNumericID)
+	v1.HandleWithMiddleware("POST /workspaces/{id}/pages/{pageId}/diagrams", pageDiagramHandler.Create, bearerAuth.RequirePermission("pages:write"), router.RequireNumericID)
+	v1.HandleWithMiddleware("GET /workspaces/{id}/pages/{pageId}/diagrams/{attachmentId}", pageDiagramHandler.Get, bearerAuth.RequirePermission("pages:read"), router.RequireNumericID)
+	v1.HandleWithMiddleware("PUT /workspaces/{id}/pages/{pageId}/diagrams/{attachmentId}", pageDiagramHandler.Update, bearerAuth.RequirePermission("pages:write"), router.RequireNumericID)
 	// Bearer-authenticated page-attachment upload (the cookie-auth
 	// /api/attachments/upload route rejects crw_ tokens). Uses the shared
 	// upload service so validation/storage/audit stay in one place.
 	v1.HandleWithMiddleware("POST /workspaces/{id}/pages/{pageId}/attachments", pageAttachmentUploadHandler.Upload, bearerAuth.RequirePermission("pages:write"), router.RequireNumericID)
 
-	// ============================================
-	// Page labels (workspace-scoped, attach to pages only). Label CRUD
-	// uses pages:write/pages:read scopes — same as page edits — because
-	// the user-facing permission gate is also page.edit / page.view.
-	// Attach/detach gates per-page via PagePermissionService.
-	// ============================================
 	v1.HandleWithMiddleware("GET /workspaces/{id}/agent-skills", agentSkillHandler.List, bearerAuth.RequirePermission("agent-skills:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /workspaces/{id}/agent-skills/{skillId}", agentSkillHandler.Get, bearerAuth.RequirePermission("agent-skills:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /workspaces/{id}/page-labels", pageLabelHandler.ListLabels, bearerAuth.RequirePermission("pages:read"), router.RequireNumericID)
@@ -357,6 +321,7 @@ func RegisterRoutes(deps restapi.Deps) {
 	linkHandler := handlers.NewLinkHandler(handlers.NewBaseHandler(db, permissionService), linkSvc)
 
 	v1.HandleWithMiddleware("GET /link-types", linkHandler.ListLinkTypes, bearerAuth.RequirePermission("items:read"))
+	v1.HandleWithMiddleware("GET /links/batch", linkHandler.GetLinksBatch, bearerAuth.RequirePermission("items:read"))
 	v1.HandleWithMiddleware("POST /links", linkHandler.CreateLink, bearerAuth.RequirePermission("items:write"))
 	v1.HandleWithMiddleware("DELETE /links/{id}", linkHandler.DeleteLink, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /items/{id}/links", linkHandler.GetLinksForEntity, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
@@ -393,11 +358,8 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("POST /recurrence-rules/preview", recurrenceHandler.PreviewRRule, bearerAuth.RequirePermission("items:read"))
 
 	// ============================================
-	// Item labels (workspace-scoped catalog + per-item attach/detach).
-	// Mirrors the page-labels surface in shape: catalog CRUD lives under
-	// /workspaces/{id}/labels, and the per-item attachments live under
-	// /items/{id}/labels. Gated by items:* because these labels are
-	// item-content; the handler enforces workspace view/edit on top.
+	// Global item-label catalog + per-item attach/detach. Catalog routes keep
+	// the workspace path as their authorization context.
 	// ============================================
 	v1.HandleWithMiddleware("GET /workspaces/{id}/labels", labelHandler.ListForWorkspace, bearerAuth.RequirePermission("items:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("POST /workspaces/{id}/labels", labelHandler.CreateInWorkspace, bearerAuth.RequirePermission("items:write"), router.RequireNumericID)
@@ -435,6 +397,7 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("PUT /workspaces/{workspaceId}/test-folders/reorder", testMgmtHandler.ReorderTestFolders, bearerAuth.RequirePermission("tests:write"))
 
 	v1.HandleWithMiddleware("GET /workspaces/{workspaceId}/test-cases", testMgmtHandler.ListTestCases, bearerAuth.RequirePermission("tests:read"))
+	v1.HandleWithMiddleware("GET /workspaces/{workspaceId}/test-cases/count", testMgmtHandler.GetTestCaseCount, bearerAuth.RequirePermission("tests:read"))
 	v1.HandleWithMiddleware("POST /workspaces/{workspaceId}/test-cases", testMgmtHandler.CreateTestCase, bearerAuth.RequirePermission("tests:write"))
 	v1.HandleWithMiddleware("GET /workspaces/{workspaceId}/test-cases/{id}", testMgmtHandler.GetTestCase, bearerAuth.RequirePermission("tests:read"))
 	v1.HandleWithMiddleware("PUT /workspaces/{workspaceId}/test-cases/{id}", testMgmtHandler.UpdateTestCase, bearerAuth.RequirePermission("tests:write"))
@@ -488,6 +451,7 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("GET /workspaces/{workspaceId}/test-runs", testMgmtHandler.ListTestRuns, bearerAuth.RequirePermission("tests:read"))
 	v1.HandleWithMiddleware("POST /workspaces/{workspaceId}/test-runs", testMgmtHandler.CreateTestRun, bearerAuth.RequirePermission("tests:write"))
 	v1.HandleWithMiddleware("GET /workspaces/{workspaceId}/test-runs/{id}", testMgmtHandler.GetTestRun, bearerAuth.RequirePermission("tests:read"))
+	v1.HandleWithMiddleware("GET /workspaces/{workspaceId}/test-runs/{id}/detail", testMgmtHandler.GetTestRunDetail, bearerAuth.RequirePermission("tests:read"))
 	v1.HandleWithMiddleware("PUT /workspaces/{workspaceId}/test-runs/{id}", testMgmtHandler.UpdateTestRun, bearerAuth.RequirePermission("tests:write"))
 	v1.HandleWithMiddleware("DELETE /workspaces/{workspaceId}/test-runs/{id}", testMgmtHandler.DeleteTestRun, bearerAuth.RequirePermission("tests:write"))
 	v1.HandleWithMiddleware("POST /workspaces/{workspaceId}/test-runs/{id}/end", testMgmtHandler.EndTestRun, bearerAuth.RequirePermission("tests:write"))
@@ -527,7 +491,6 @@ func RegisterRoutes(deps restapi.Deps) {
 	}
 	assetHandler := handlers.NewAssetHandler(db, permissionService, assetPermSvc, assetSvc)
 
-	// Asset entities
 	v1.HandleWithMiddleware("GET /asset-sets/{setId}/assets", assetHandler.List, bearerAuth.RequirePermission("assets:read"))
 	v1.HandleWithMiddleware("POST /asset-sets/{setId}/assets", assetHandler.Create, bearerAuth.RequirePermission("assets:write"))
 	v1.HandleWithMiddleware("POST /asset-sets/{setId}/assets/import", assetHandler.ImportCSV, bearerAuth.RequirePermission("assets:write"))
@@ -535,30 +498,20 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("PUT /assets/{id}", assetHandler.Update, bearerAuth.RequirePermission("assets:write"), router.RequireNumericID)
 	v1.HandleWithMiddleware("DELETE /assets/{id}", assetHandler.Delete, bearerAuth.RequirePermission("assets:delete"), router.RequireNumericID)
 
-	// Asset sets (read-only on v1)
 	v1.HandleWithMiddleware("GET /asset-sets", assetHandler.ListSets, bearerAuth.RequirePermission("assets:read"))
 	v1.HandleWithMiddleware("GET /asset-sets/{setId}", assetHandler.GetSet, bearerAuth.RequirePermission("assets:read"))
 
-	// Asset types (read-only on v1)
 	v1.HandleWithMiddleware("GET /asset-sets/{setId}/types", assetHandler.ListTypes, bearerAuth.RequirePermission("assets:read"))
 	v1.HandleWithMiddleware("GET /asset-types/{id}", assetHandler.GetType, bearerAuth.RequirePermission("assets:read"), router.RequireNumericID)
 
-	// Asset categories (read-only on v1)
 	v1.HandleWithMiddleware("GET /asset-sets/{setId}/categories", assetHandler.ListCategories, bearerAuth.RequirePermission("assets:read"))
 	v1.HandleWithMiddleware("GET /asset-categories/{id}", assetHandler.GetCategory, bearerAuth.RequirePermission("assets:read"), router.RequireNumericID)
 
-	// Asset statuses (read-only on v1)
 	v1.HandleWithMiddleware("GET /asset-sets/{setId}/statuses", assetHandler.ListStatuses, bearerAuth.RequirePermission("assets:read"))
 	v1.HandleWithMiddleware("GET /asset-statuses/{id}", assetHandler.GetStatus, bearerAuth.RequirePermission("assets:read"), router.RequireNumericID)
 
-	// ============================================
-	// Search
-	// ============================================
 	v1.HandleWithMiddleware("GET /search/items", itemHandler.Search, bearerAuth.RequirePermission("items:read"))
 
-	// ============================================
-	// Time tracking
-	// ============================================
 	v1.HandleWithMiddleware("GET /time/projects", timeProjectHandler.List, bearerAuth.RequirePermission("time:read"))
 	v1.HandleWithMiddleware("GET /time/projects/{id}", timeProjectHandler.Get, bearerAuth.RequirePermission("time:read"), router.RequireNumericID)
 	v1.HandleWithMiddleware("GET /time/worklogs", timeWorklogHandler.ListMine, bearerAuth.RequirePermission("time:read"))
@@ -569,32 +522,57 @@ func RegisterRoutes(deps restapi.Deps) {
 	v1.HandleWithMiddleware("GET /timer/active", activeTimerHandler.GetActiveTimer, bearerAuth.RequirePermission("time:read"))
 	v1.HandleWithMiddleware("DELETE /timer/stop", activeTimerHandler.StopTimer, bearerAuth.RequirePermission("time:write"))
 
-	// ============================================
-	// Admin endpoints (require system admin + scope)
-	// ============================================
 	adminUserHandler := handlers.NewAdminUserHandler(db, permissionService)
-	adminGroupHandler := handlers.NewAdminGroupHandler(db, permissionService)
+	adminGroupHandler := handlers.NewAdminGroupHandler(db, permissionService, deps.AuthorizationCacheInvalidator)
 	adminAuditLogHandler := handlers.NewAdminAuditLogHandler(db, permissionService)
 	adminAPITokenHandler := handlers.NewAdminAPITokenHandler(db, tokenManager, permissionService)
+	objectTranslationHandler := handlers.NewObjectTranslationHandler(
+		handlers.NewBaseHandler(db, permissionService), objectTranslationService,
+	)
 
-	// Admin sub-group: inherits auth + rate limit, adds RequireSystemAdmin
 	adminV1 := v1.Group("", bearerAuth.RequireSystemAdmin)
 
-	// Admin: Users
 	adminV1.HandleWithMiddleware("GET /admin/users", adminUserHandler.List, bearerAuth.RequirePermission("admin:users:read"))
 	adminV1.HandleWithMiddleware("PUT /admin/users/{id}", adminUserHandler.Update, bearerAuth.RequirePermission("admin:users:write"), router.RequireNumericID)
 
-	// Admin: Groups
 	adminV1.HandleWithMiddleware("GET /admin/groups", adminGroupHandler.List, bearerAuth.RequirePermission("admin:groups:read"))
 	adminV1.HandleWithMiddleware("POST /admin/groups", adminGroupHandler.Create, bearerAuth.RequirePermission("admin:groups:write"))
 	adminV1.HandleWithMiddleware("PUT /admin/groups/{id}", adminGroupHandler.Update, bearerAuth.RequirePermission("admin:groups:write"), router.RequireNumericID)
 	adminV1.HandleWithMiddleware("DELETE /admin/groups/{id}", adminGroupHandler.Delete, bearerAuth.RequirePermission("admin:groups:write"), router.RequireNumericID)
 
-	// Admin: Audit Logs
 	adminV1.HandleWithMiddleware("GET /admin/audit-logs", adminAuditLogHandler.List, bearerAuth.RequirePermission("admin:audit-logs:read"))
 	adminV1.HandleWithMiddleware("GET /admin/audit-logs/since", adminAuditLogHandler.ListSince, bearerAuth.RequirePermission("admin:audit-logs:read"))
 
-	// Admin: API Tokens
 	adminV1.HandleWithMiddleware("GET /admin/api-tokens", adminAPITokenHandler.ListAll, bearerAuth.RequirePermission("admin:api-tokens:read"))
 	adminV1.HandleWithMiddleware("DELETE /admin/api-tokens/{id}", adminAPITokenHandler.Revoke, bearerAuth.RequirePermission("admin:api-tokens:write"), router.RequireNumericID)
+
+	adminV1.HandleWithMiddleware("GET /admin/object-translations/definitions", objectTranslationHandler.ListDefinitions, bearerAuth.RequirePermission("admin:object-translations:read"))
+	adminV1.HandleWithMiddleware("POST /admin/object-translations/resolve", objectTranslationHandler.Resolve, bearerAuth.RequirePermission("admin:object-translations:read"))
+	adminV1.HandleWithMiddleware("GET /admin/object-translations/orphans", objectTranslationHandler.FindOrphans, bearerAuth.RequirePermission("admin:object-translations:read"))
+	adminV1.HandleWithMiddleware("GET /admin/object-translations/canonical-differences", objectTranslationHandler.FindCanonicalDifferences, bearerAuth.RequirePermission("admin:object-translations:read"))
+	adminV1.HandleWithMiddleware("GET /admin/object-translations/{objectType}/{objectId}", objectTranslationHandler.List, bearerAuth.RequirePermission("admin:object-translations:read"))
+	adminV1.HandleWithMiddleware("PUT /admin/object-translations/{objectType}/{objectId}/{field}/{locale}", objectTranslationHandler.Upsert, bearerAuth.RequirePermission("admin:object-translations:write"))
+	adminV1.HandleWithMiddleware("DELETE /admin/object-translations/{objectType}/{objectId}/{field}/{locale}", objectTranslationHandler.Delete, bearerAuth.RequirePermission("admin:object-translations:write"))
+
+	// ============================================
+	// AI tier (agentic chat + daily briefing).
+	//
+	// Same handlers as the cookie-auth /api/ai routes, exposed over bearer
+	// tokens for external clients (MCP-adjacent tooling, personal dashboards,
+	// the town homepage). Scope instead of session: ai:chat invokes the LLM
+	// (deliberately not an agent default — every call costs tokens), ai:read
+	// covers generated artifacts. Data access inside a chat still flows
+	// through the token owner's workspace permissions, so scope alone never
+	// widens what the assistant can see. Unregistered when the embedder did
+	// not wire deps.AI.
+	// ============================================
+	if deps.AI != nil {
+		aiSurface := handlers.NewAIHandler(deps.AI.Chat, deps.AI.GetDailyBriefing)
+		aiLimiter := func(next http.Handler) http.Handler { return next }
+		if deps.AIRateLimiter != nil {
+			aiLimiter = deps.AIRateLimiter.Limit
+		}
+		v1.HandleWithMiddleware("POST /ai/chat", aiSurface.Chat, bearerAuth.RequirePermission(auth.ScopeAIChat), aiLimiter)
+		v1.HandleWithMiddleware("GET /ai/daily-briefing", aiSurface.DailyBriefing, bearerAuth.RequirePermission(auth.ScopeAIRead))
+	}
 }

@@ -1,10 +1,11 @@
 <script>
-	import { onMount } from 'svelte';
 	import { currentRoute, navigate } from '../router.js';
 	import { authStore, securityStore } from '../stores';
 	import { t } from '../stores/i18n.svelte.js';
 	import { User, Shield, Key, Smartphone, Plus, Trash2, Code, Copy, Terminal, AlertTriangle, X } from '@lucide/svelte';
 	import Button from '../components/Button.svelte';
+	import Input from '../components/Input.svelte';
+	import TextField from '../components/TextField.svelte';
 	import EmptyState from '../components/EmptyState.svelte';
 	import SectionHeader from '../layout/SectionHeader.svelte';
 	import PageHeader from '../layout/PageHeader.svelte';
@@ -16,9 +17,11 @@
 	import AlertBox from '../components/AlertBox.svelte';
 	import Label from '../components/Label.svelte';
 	import { copyToClipboard } from '../utils/clipboard.js';
-	import { formatDate, formatDateShort } from '../utils/dateFormatter.js';
+	import { formatDate } from '../utils/dateFormatter.js';
+	import { formatAuthenticatedInstant } from '../utils/authenticatedDateFormatter.js';
 	import { errorToast, successToast } from '../stores/toasts.svelte.js';
 	import Checkbox from '../components/Checkbox.svelte';
+	import Radio from '../components/Radio.svelte';
 	import DescriptionText from '../components/DescriptionText.svelte';
 	import {
 		isWebAuthnSupported,
@@ -47,6 +50,7 @@
 	let sshAvailable = $derived(securityStore.sshAvailable);
 	let showEnrollmentBanner = $derived(securityStore.showEnrollmentBanner);
 	let enrollmentType = $derived(securityStore.enrollmentType);
+	let enrollmentOnly = $derived(securityStore.enrollmentOnly);
 	let showChangePassword = $derived(securityStore.showChangePassword);
 	let changePasswordData = $derived(securityStore.changePasswordData);
 	let changePasswordLoading = $derived(securityStore.changePasswordLoading);
@@ -57,45 +61,43 @@
 	let currentUserId = $derived(authStore.currentUser?.id);
 	let isSystemAdmin = $derived(authStore.currentUser?.is_system_admin === true);
 
-	// Scope rows for the token permission grid. `resource` drives the
-	// `<resource>:<action>` scope string; entries marked read-only have no
-	// write/delete scopes on the backend.
-	const SCOPE_ROWS = [
-		{ resource: 'items', label: 'Items', actions: ['read', 'write', 'delete'] },
-		{ resource: 'workspaces', label: 'Workspaces', actions: ['read', 'write', 'delete'] },
-		{ resource: 'milestones', label: 'Milestones', actions: ['read', 'write', 'delete'] },
-		{ resource: 'iterations', label: 'Iterations', actions: ['read', 'write', 'delete'] },
-		{ resource: 'projects', label: 'Projects', actions: ['read', 'write', 'delete'] },
-		{ resource: 'collections', label: 'Collections', actions: ['read'] },
-		{ resource: 'pages', label: 'Pages', actions: ['read', 'write', 'delete'] },
-		{ resource: 'users', label: 'Users', actions: ['read'] },
-		{ resource: 'statuses', label: 'Statuses', actions: ['read'] },
-		{ resource: 'workflows', label: 'Workflows', actions: ['read'] },
-		{ resource: 'item-types', label: 'Item types', actions: ['read'] },
-		{ resource: 'priorities', label: 'Priorities', actions: ['read'] },
-		{ resource: 'custom-fields', label: 'Custom fields', actions: ['read'] },
-		{ resource: 'item-templates', label: 'Work item templates', actions: ['read', 'write'] },
-		{ resource: 'mcp', label: 'MCP server', actions: ['access'] },
-	];
+	// The grantable scopes come from the server (GET /api-tokens/scope-catalog,
+	// backed by auth.ScopeCatalog) rather than a list maintained here. A
+	// hand-written copy silently dropped whole resources as scopes were added —
+	// time:*, tests:*, actions:* and even mcp:access were unreachable from this
+	// picker — so the catalog is now the only source of truth.
+	let scopeCatalog = $derived(securityStore.scopeCatalog);
 
-	const ADMIN_SCOPE_ROWS = [
-		{ resource: 'admin:users', label: 'Users', actions: ['read', 'write'] },
-		{ resource: 'admin:groups', label: 'Groups', actions: ['read', 'write'] },
-		{ resource: 'admin:audit-logs', label: 'Audit logs', actions: ['read'] },
-		{ resource: 'admin:api-tokens', label: 'API tokens', actions: ['read', 'write'] },
-	];
+	// Group the flat catalog into one block per resource, preserving the
+	// server's ordering, so any action name (read/write/delete/access) renders
+	// without this page needing to know the column layout in advance.
+	function groupScopes(entries) {
+		const groups = [];
+		const byResource = new Map();
+		for (const info of entries) {
+			let group = byResource.get(info.resource);
+			if (!group) {
+				group = { resource: info.resource, label: info.resource_label, scopes: [] };
+				byResource.set(info.resource, group);
+				groups.push(group);
+			}
+			group.scopes.push(info);
+		}
+		return groups;
+	}
 
-	const READ_ONLY_PRESET = [
-		'items:read', 'workspaces:read', 'milestones:read', 'iterations:read',
-		'projects:read', 'collections:read', 'pages:read', 'users:read', 'statuses:read', 'workflows:read',
-		'item-types:read', 'priorities:read', 'custom-fields:read', 'item-templates:read',
-	];
+	let scopeGroups = $derived(groupScopes(scopeCatalog.filter((s) => !s.admin)));
+	let adminScopeGroups = $derived(groupScopes(scopeCatalog.filter((s) => s.admin)));
 
-	const READ_WRITE_PRESET = [
-		...READ_ONLY_PRESET,
-		'items:write', 'workspaces:write', 'milestones:write',
-		'iterations:write', 'projects:write', 'pages:write', 'item-templates:write',
-	];
+	// Presets derived from the catalog. "Agent default" is the set an MCP or
+	// `ws` CLI token receives when minted without an explicit scope list, so a
+	// hand-made token can match one without ticking 27 boxes.
+	let agentDefaultPreset = $derived(
+		scopeCatalog.filter((s) => s.agent_default).map((s) => s.scope)
+	);
+	let readOnlyPreset = $derived(
+		scopeCatalog.filter((s) => !s.admin && s.action === 'read').map((s) => s.scope)
+	);
 
 	function isScopeSelected(scope) {
 		return newTokenScopes.includes(scope);
@@ -115,20 +117,16 @@
 		securityStore.newTokenScopes = [];
 	}
 
-	// Check for enrollment query parameter
-	onMount(() => {
-		const unsubscribe = currentRoute.subscribe(route => {
-			if (route.query?.enroll === 'passkey') {
-				securityStore.checkEnrollmentRequired('passkey');
-			}
-		});
-		return unsubscribe;
-	});
-
-	// Initialize when user ID becomes available
+	// Initialize in a dedicated enrollment-only mode when login issued a
+	// restricted first-passkey session. This must happen before loading normal
+	// Security-page resources, which the server intentionally denies.
 	$effect(() => {
+		const enrollmentRequested = $currentRoute.query?.enroll === 'passkey';
+		if (enrollmentRequested) {
+			securityStore.checkEnrollmentRequired('passkey');
+		}
 		if (currentUserId) {
-			securityStore.setCurrentUserId(currentUserId);
+			securityStore.setCurrentUserId(currentUserId, { enrollmentOnly: enrollmentRequested });
 		}
 	});
 
@@ -152,6 +150,7 @@
 
 			if (result.wasEnrollmentRequired) {
 				successToast('Passkey registered successfully! Your account is now secured.');
+				navigate('/security');
 			}
 		} catch (err) {
 			errorToast(err.message || 'Failed to register security key');
@@ -228,6 +227,10 @@
 		}
 	}
 
+	function getCredentialName(credential) {
+		return credential.name || credential.credential_name || '';
+	}
+
 	function getCredentialTypeName(type) {
 		switch (type) {
 			case 'fido':
@@ -267,7 +270,7 @@
 	}
 </script>
 
-<div class="max-w-4xl mx-auto space-y-6">
+<div class="max-w-4xl mx-auto space-y-6" data-testid="security-page">
 	<PageHeader icon={Shield} title={t('security.title')} subtitle={t('security.subtitle')} />
 
 	<!-- Enrollment Banner -->
@@ -299,14 +302,16 @@
 						</div>
 					</div>
 				</div>
-				<button
-					type="button"
-					onclick={dismissEnrollmentBanner}
-					class="p-1 rounded hover:bg-black/10"
-					style="color: var(--ds-text-warning-inverse);"
-				>
-					<X class="w-5 h-5" />
-				</button>
+				{#if !enrollmentOnly}
+					<button
+						type="button"
+						onclick={dismissEnrollmentBanner}
+						class="p-1 rounded hover:bg-black/10"
+						style="color: var(--ds-text-warning-inverse);"
+					>
+						<X class="w-5 h-5" />
+					</button>
+				{/if}
 			</div>
 		</div>
 	{/if}
@@ -315,16 +320,19 @@
 	<div class="shadow rounded-lg border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
 		<SectionHeader title={t('security.credentials')} subtitle={t('security.credentialsSubtitle')} class="mb-6">
 			{#snippet actions()}
-				<Button
-					variant="primary"
-					onclick={() => securityStore.showAddCredential = true}
-					icon={Plus}
-					size="medium"
-					keyboardHint="A"
-					hotkeyConfig={{ key: toHotkeyString('security', 'addCredential'), guard: () => !showAddCredential && !showAddToken && !showChangePassword }}
-				>
-					{t('common.add')}
-				</Button>
+				{#if !enrollmentOnly}
+					<Button
+						variant="primary"
+						onclick={() => securityStore.showAddCredential = true}
+						icon={Plus}
+						size="medium"
+						keyboardHint="A"
+						dataTestid="security-add-credential"
+						hotkeyConfig={{ key: toHotkeyString('security', 'addCredential'), guard: () => !showAddCredential && !showAddToken && !showChangePassword }}
+					>
+						{t('common.add')}
+					</Button>
+				{/if}
 			{/snippet}
 		</SectionHeader>
 
@@ -332,13 +340,13 @@
 		<div class="space-y-3">
 			{#each credentials as credential}
 				{@const CredIcon = getCredentialIcon(credential.credential_type)}
-				<div class="flex items-center justify-between p-4 border rounded hover-bg" style="border-color: var(--ds-border);">
+				<div class="flex items-center justify-between p-4 border rounded hover-bg" style="border-color: var(--ds-border);" data-testid="security-credential-row">
 					<div class="flex items-center space-x-3">
 						<CredIcon class="h-6 w-6" style="color: var(--ds-icon-subtle);" />
 						<div>
-							<div class="font-medium" style="color: var(--ds-text);">{credential.name}</div>
+							<div class="font-medium" style="color: var(--ds-text);" data-testid="security-credential-name">{getCredentialName(credential)}</div>
 							<div class="text-sm" style="color: var(--ds-text-subtle);">
-								{getCredentialTypeName(credential.credential_type)} • Added {formatDateShort(credential.created_at) || '-'}
+								{getCredentialTypeName(credential.credential_type)} • Added {formatAuthenticatedInstant(credential.created_at, { year: 'numeric', month: 'short', day: 'numeric' }) || '-'}
 							</div>
 						</div>
 					</div>
@@ -346,7 +354,8 @@
 						variant="default"
 						size="small"
 						icon={Trash2}
-						onclick={() => confirmRemoveCredential(credential.id, credential.name)}
+						onclick={() => confirmRemoveCredential(credential.id, getCredentialName(credential))}
+						dataTestid="security-credential-remove"
 					>
 						{t('common.remove')}
 					</Button>
@@ -361,6 +370,7 @@
 		</div>
 	</div>
 
+	{#if !enrollmentOnly}
 	<!-- Account Security -->
 	<div class="shadow rounded-lg border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
 		<h2 class="text-lg font-medium mb-4" style="color: var(--ds-text);">Account Security</h2>
@@ -402,12 +412,11 @@
 					{t('security.tokenWarning')}
 				</p>
 				<div class="flex items-center space-x-2">
-					<input
+					<Input
 						type="text"
 						value={newTokenValue}
 						readonly
-						class="flex-1 px-3 py-2 rounded font-mono text-sm"
-						style="background-color: var(--ds-background-input); border: 1px solid var(--ds-border-success); color: var(--ds-text);"
+						class="flex-1 font-mono border-[var(--ds-border-success)]"
 					/>
 					<Button
 						variant="default"
@@ -439,7 +448,7 @@
 						<div>
 							<div class="font-medium" style="color: var(--ds-text);">{token.name}</div>
 							<div class="text-sm" style="color: var(--ds-text-subtle);">
-								Created {formatDateShort(token.created_at) || '-'} • Expires {formatDate(token.expires_at) || 'Never expires'}
+								Created {formatAuthenticatedInstant(token.created_at, { year: 'numeric', month: 'short', day: 'numeric' }) || '-'} • Expires {formatAuthenticatedInstant(token.expires_at, { year: 'numeric', month: 'short', day: 'numeric' }) || 'Never expires'}
 							</div>
 						</div>
 					</div>
@@ -461,6 +470,7 @@
 			{/each}
 		</div>
 	</div>
+	{/if}
 </div>
 
 <!-- Change Password Modal -->
@@ -479,40 +489,40 @@
 		{:else}
 			<div class="space-y-4">
 				<div>
-					<Label for="current-password" color="default" class="mb-1">{t('auth.currentPassword')}</Label>
-					<input
+					<TextField
+						label={t('auth.currentPassword')}
+						labelColor="default"
+						labelClass="mb-1"
 						id="current-password"
 						type="password"
 						value={changePasswordData.current_password}
 						oninput={(e) => setChangePasswordData('current_password', /** @type {HTMLInputElement} */ (e.target).value)}
-						class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-						style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
 						placeholder={t('placeholders.enterPassword')}
 					/>
 				</div>
 
 				<div>
-					<Label for="new-password" color="default" class="mb-1">{t('auth.newPassword')}</Label>
-					<input
+					<TextField
+						label={t('auth.newPassword')}
+						labelColor="default"
+						labelClass="mb-1"
 						id="new-password"
 						type="password"
 						value={changePasswordData.new_password}
 						oninput={(e) => setChangePasswordData('new_password', /** @type {HTMLInputElement} */ (e.target).value)}
-						class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-						style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
 						placeholder={t('placeholders.enterNewPassword')}
 					/>
 				</div>
 
 				<div>
-					<Label for="confirm-password" color="default" class="mb-1">{t('auth.confirmPassword')}</Label>
-					<input
+					<TextField
+						label={t('auth.confirmPassword')}
+						labelColor="default"
+						labelClass="mb-1"
 						id="confirm-password"
 						type="password"
 						value={changePasswordData.confirm_password}
 						oninput={(e) => setChangePasswordData('confirm_password', /** @type {HTMLInputElement} */ (e.target).value)}
-						class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-						style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
 						placeholder={t('placeholders.confirmNewPassword')}
 					/>
 				</div>
@@ -540,7 +550,7 @@
 </Modal>
 
 <!-- Add Credential Modal -->
-<Modal isOpen={showAddCredential} onclose={() => securityStore.resetCredentialForm()} maxWidth="max-w-lg">
+<Modal isOpen={showAddCredential} onclose={() => securityStore.resetCredentialForm()} maxWidth="max-w-lg" dataTestid="security-credential-modal">
 	<div class="p-6">
 		<h3 class="text-xl font-semibold mb-6" style="color: var(--ds-text);">
 			Add Security Credential
@@ -552,8 +562,7 @@
 				<Label color="default" class="mb-2">Credential Type</Label>
 				<div class="flex space-x-4">
 					<label class="flex items-center cursor-pointer">
-						<input
-							type="radio"
+						<Radio
 							checked={credentialType === 'fido'}
 							onchange={() => setCredentialType('fido')}
 							class="mr-2"
@@ -561,10 +570,9 @@
 						<Key class="h-4 w-4 mr-2" />
 						<span style="color: var(--ds-text);">Security Key (FIDO2)</span>
 					</label>
-					{#if sshAvailable}
+					{#if sshAvailable && !enrollmentOnly}
 					<label class="flex items-center cursor-pointer">
-						<input
-							type="radio"
+						<Radio
 							checked={credentialType === 'ssh'}
 							onchange={() => setCredentialType('ssh')}
 							class="mr-2"
@@ -589,15 +597,14 @@
 
 		<div class="space-y-4">
 			<div>
-				<Label for="credential-name" color="default" class="mb-1">{credentialType === 'fido' ? 'Security Key Name' : 'SSH Key Name'}</Label>
-				<input
+				<TextField
+					label={credentialType === 'fido' ? 'Security Key Name' : 'SSH Key Name'}
+					labelColor="default"
+					labelClass="mb-1"
 					id="credential-name"
-					type="text"
 					value={newCredentialName}
 					oninput={(e) => setNewCredentialName(/** @type {HTMLInputElement} */ (e.target).value)}
 					placeholder={credentialType === 'fido' ? 'e.g., YubiKey, iPhone Touch ID' : 'e.g., MacBook Pro, CI Server'}
-					class="w-full px-3 py-2 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-					style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
 				/>
 			</div>
 
@@ -622,6 +629,7 @@
 				variant="primary"
 				onclick={credentialType === 'fido' ? startFIDORegistration : createSSHKey}
 				disabled={!newCredentialName.trim() || (credentialType === 'ssh' && !newSSHPublicKey.trim()) || enrollingFIDO || loading}
+				dataTestid="security-register-credential"
 				keyboardHint="⏎"
 			>
 				{#if credentialType === 'fido'}
@@ -630,13 +638,15 @@
 					{loading ? t('common.processing') : 'Add SSH Key'}
 				{/if}
 			</Button>
-			<Button
-				variant="default"
-				onclick={() => securityStore.resetCredentialForm()}
-				keyboardHint="Esc"
-			>
-				{t('common.cancel')}
-			</Button>
+			{#if !enrollmentOnly}
+				<Button
+					variant="default"
+					onclick={() => securityStore.resetCredentialForm()}
+					keyboardHint="Esc"
+				>
+					{t('common.cancel')}
+				</Button>
+			{/if}
 		</div>
 	</div>
 </Modal>
@@ -650,15 +660,14 @@
 
 		<div class="space-y-5">
 			<div>
-				<Label for="token-name" color="default" class="mb-1">{t('security.tokenName')}</Label>
-				<input
+				<TextField
+					label={t('security.tokenName')}
+					labelColor="default"
+					labelClass="mb-1"
 					id="token-name"
-					type="text"
 					value={newTokenName}
 					oninput={(e) => setNewTokenName(/** @type {HTMLInputElement} */ (e.target).value)}
 					placeholder="e.g., Mobile App, CI/CD Pipeline"
-					class="w-full px-3 py-2 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-					style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
 				/>
 			</div>
 
@@ -666,101 +675,70 @@
 				<div class="flex items-center justify-between mb-2">
 					<Label color="default" class="mb-0">Permissions</Label>
 					<div class="flex gap-2">
-						<Button variant="link" size="small" onclick={() => applyScopePreset(READ_ONLY_PRESET)}>Read-only</Button>
-						<Button variant="link" size="small" onclick={() => applyScopePreset(READ_WRITE_PRESET)}>Read + Write</Button>
-						<Button variant="link" size="small" onclick={clearScopes}>Clear</Button>
+						<Button variant="link" size="small" dataTestid="token-scope-preset-agent-default" onclick={() => applyScopePreset(agentDefaultPreset)}>Agent default</Button>
+						<Button variant="link" size="small" dataTestid="token-scope-preset-read-only" onclick={() => applyScopePreset(readOnlyPreset)}>Read-only</Button>
+						<Button variant="link" size="small" dataTestid="token-scope-preset-clear" onclick={clearScopes}>Clear</Button>
 					</div>
 				</div>
 				<DescriptionText>
 					Scopes limit what this token can do. The token also inherits your account's workspace permissions.
 				</DescriptionText>
 
-				<div class="mt-3 rounded border overflow-hidden" style="border-color: var(--ds-border);">
-					<table class="w-full text-sm">
-						<thead>
-							<tr style="background-color: var(--ds-background-neutral);">
-								<th class="text-left px-3 py-2 font-medium" style="color: var(--ds-text-subtle);">Resource</th>
-								<th class="px-3 py-2 font-medium w-20" style="color: var(--ds-text-subtle);">Read</th>
-								<th class="px-3 py-2 font-medium w-20" style="color: var(--ds-text-subtle);">Write</th>
-								<th class="px-3 py-2 font-medium w-20" style="color: var(--ds-text-subtle);">Delete</th>
-							</tr>
-						</thead>
-						<tbody>
-							{#each SCOPE_ROWS as row}
-								<tr class="border-t" style="border-color: var(--ds-border);">
-									<td class="px-3 py-2" style="color: var(--ds-text);">{row.label}</td>
-									{#each ['read', 'write', 'delete'] as action}
-										<td class="px-3 py-2 text-center">
-											{#if row.actions.includes(action)}
-												{@const scope = `${row.resource}:${action}`}
-												<Checkbox
-													checked={isScopeSelected(scope)}
-													onchange={(checked) => toggleScope(scope, checked)}
-													size="small"
-												/>
-											{:else}
-												<span style="color: var(--ds-text-subtlest);">—</span>
-											{/if}
-										</td>
-									{/each}
-								</tr>
-							{/each}
-						</tbody>
-					</table>
+				<div class="mt-3 rounded border overflow-hidden" style="border-color: var(--ds-border);" data-testid="token-scope-picker">
+					{#each scopeGroups as group (group.resource)}
+						<div class="border-t first:border-t-0 px-3 py-2" style="border-color: var(--ds-border);">
+							<div class="text-sm font-medium" style="color: var(--ds-text);">{group.label}</div>
+							<div class="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+								{#each group.scopes as info (info.scope)}
+									<Checkbox
+										checked={isScopeSelected(info.scope)}
+										onchange={(checked) => toggleScope(info.scope, checked)}
+										label={info.action}
+										size="small"
+										dataTestid={`token-scope-${info.scope}`}
+									/>
+								{/each}
+							</div>
+						</div>
+					{/each}
 				</div>
 
 				{#if isSystemAdmin}
 					<div class="mt-4">
 						<Label color="default" class="mb-2">Admin permissions</Label>
 						<DescriptionText>Require the system admin role. Use with care.</DescriptionText>
-						<div class="mt-2 rounded border overflow-hidden" style="border-color: var(--ds-border);">
-							<table class="w-full text-sm">
-								<thead>
-									<tr style="background-color: var(--ds-background-neutral);">
-										<th class="text-left px-3 py-2 font-medium" style="color: var(--ds-text-subtle);">Resource</th>
-										<th class="px-3 py-2 font-medium w-20" style="color: var(--ds-text-subtle);">Read</th>
-										<th class="px-3 py-2 font-medium w-20" style="color: var(--ds-text-subtle);">Write</th>
-									</tr>
-								</thead>
-								<tbody>
-									{#each ADMIN_SCOPE_ROWS as row}
-										<tr class="border-t" style="border-color: var(--ds-border);">
-											<td class="px-3 py-2" style="color: var(--ds-text);">{row.label}</td>
-											{#each ['read', 'write'] as action}
-												<td class="px-3 py-2 text-center">
-													{#if row.actions.includes(action)}
-														{@const scope = `${row.resource}:${action}`}
-														<Checkbox
-															checked={isScopeSelected(scope)}
-															onchange={(checked) => toggleScope(scope, checked)}
-															size="small"
-														/>
-													{:else}
-														<span style="color: var(--ds-text-subtlest);">—</span>
-													{/if}
-												</td>
-											{/each}
-										</tr>
-									{/each}
-								</tbody>
-							</table>
+						<div class="mt-2 rounded border overflow-hidden" style="border-color: var(--ds-border);" data-testid="token-admin-scope-picker">
+							{#each adminScopeGroups as group (group.resource)}
+								<div class="border-t first:border-t-0 px-3 py-2" style="border-color: var(--ds-border);">
+									<div class="text-sm font-medium" style="color: var(--ds-text);">{group.label}</div>
+									<div class="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+										{#each group.scopes as info (info.scope)}
+											<Checkbox
+												checked={isScopeSelected(info.scope)}
+												onchange={(checked) => toggleScope(info.scope, checked)}
+												label={info.action}
+												size="small"
+												dataTestid={`token-scope-${info.scope}`}
+											/>
+										{/each}
+									</div>
+								</div>
+							{/each}
 						</div>
 					</div>
 				{/if}
 			</div>
 
 			<div>
-				<Label for="token-expiry" color="default" class="mb-1">Expiration (Optional)</Label>
-				<input
+				<Label for="token-expiry" color="default" class="mb-1">Last valid date (optional)</Label>
+				<Input
 					id="token-expiry"
 					type="date"
 					value={newTokenExpiry}
 					oninput={(e) => setNewTokenExpiry(/** @type {HTMLInputElement} */ (e.target).value)}
 					min={formatDate(new Date())}
-					class="w-full px-3 py-2 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-					style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
 				/>
-				<DescriptionText>Leave empty for tokens that never expire</DescriptionText>
+				<DescriptionText>The token remains valid through this date in your configured timezone. Leave empty for no expiration.</DescriptionText>
 			</div>
 		</div>
 
@@ -769,6 +747,7 @@
 				variant="primary"
 				onclick={createApiToken}
 				disabled={!newTokenName.trim() || newTokenScopes.length === 0 || creatingToken}
+				dataTestid="create-token-submit"
 				keyboardHint="⏎"
 			>
 				{creatingToken ? t('common.processing') : t('security.createToken')}

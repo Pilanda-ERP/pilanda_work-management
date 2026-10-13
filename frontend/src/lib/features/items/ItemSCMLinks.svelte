@@ -1,8 +1,10 @@
 <script>
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
+  import Spinner from '../../components/Spinner.svelte';
+  import { setOAuthReturnURL } from '../../utils/oauthReturn.js';
   import { useEventListener } from 'runed';
   import { api } from '../../api.js';
-  import { GitMerge, GitBranch, GitCommit, ExternalLink, Plus, RefreshCw, Trash2, ChevronDown, ChevronRight, Loader2, GitBranchPlus, Link2 } from '@lucide/svelte';
+  import { GitMerge, GitBranch, GitCommit, ExternalLink, Plus, RefreshCw, Trash2, ChevronDown, ChevronRight, GitBranchPlus, Link2 } from '@lucide/svelte';
   import Button from '../../components/Button.svelte';
   import Text from '../../components/Text.svelte';
   import { t } from '../../stores/i18n.svelte.js';
@@ -20,12 +22,15 @@
   // SCM connection status
   let connectionStatus = $state(null);
   let checkingConnection = $state(true);
+  const loadController = new AbortController();
+  let delayedRefresh = null;
 
   // Segmented buckets for the dev panel
   const pullRequests = $derived(links.filter(l => l.link_type === 'pull_request'));
+  const hasGitLabPullRequests = $derived(pullRequests.some(link => link.provider_type === 'gitlab'));
   const branchLinks = $derived(links.filter(l => l.link_type === 'branch'));
   const commitLinks = $derived(links.filter(l => l.link_type === 'commit'));
-  // PR rollup follows Jira semantics: OPEN > MERGED > DECLINED
+  // Roll up PR state by precedence: open > merged > closed.
   const prRollupState = $derived(
     pullRequests.some(l => l.state === 'open') ? 'open'
     : pullRequests.some(l => l.state === 'merged') ? 'merged'
@@ -34,12 +39,17 @@
   );
 
   onMount(async () => {
-    await checkConnectionStatus();
-    if (connectionStatus?.connected) {
-      await loadLinks();
+    await checkConnectionStatus(loadController.signal);
+    if (!loadController.signal.aborted && connectionStatus?.connected) {
+      await loadLinks(loadController.signal);
     } else {
       loading = false;
     }
+  });
+
+  onDestroy(() => {
+    loadController.abort();
+    if (delayedRefresh) clearTimeout(delayedRefresh);
   });
 
   // Live updates (WI-484): the item-detail view that owns the SSE stream
@@ -49,18 +59,19 @@
   useEventListener(() => window, 'item-scm-links-changed', (/** @type {CustomEvent<{itemId?: number|string}>} */ event) => {
     const id = event?.detail?.itemId;
     if (id == null || String(id) !== String(itemId)) return;
-    if (connectionStatus?.connected) loadLinks();
+    if (connectionStatus?.connected) loadLinks(loadController.signal);
   });
 
-  async function checkConnectionStatus() {
+  async function checkConnectionStatus(signal) {
     if (!itemId) {
       checkingConnection = false;
       return;
     }
 
     try {
-      connectionStatus = await api.itemSCMLinks.getConnectionStatus(itemId);
+      connectionStatus = await api.itemSCMLinks.getConnectionStatus(itemId, { signal });
     } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError' || err?.status === 404) return;
       console.error('Failed to check SCM connection status:', err);
       // If we can't check connection status, assume no repos configured
       connectionStatus = { has_repositories: false };
@@ -73,8 +84,7 @@
     if (!connectionStatus?.provider_slug) return;
 
     // Store return URL so we come back to this item
-    const returnUrl = window.location.href;
-    sessionStorage.setItem('scm_oauth_return', returnUrl);
+    setOAuthReturnURL();
 
     // Start OAuth flow
     api.scmProviders.startOAuth(connectionStatus.provider_slug).then(result => {
@@ -87,18 +97,18 @@
     });
   }
 
-  export async function loadLinks() {
+  export async function loadLinks(signal) {
     if (!itemId) return;
     loading = true;
     error = null;
 
     try {
-      links = await api.itemSCMLinks.get(itemId) || [];
+      links = await api.itemSCMLinks.get(itemId, signal ? { signal } : undefined) || [];
       // Re-fetch after short delay to pick up background OAuth refresh
       if (links.some(l => l.link_type === 'pull_request' && l.state !== 'merged')) {
-        setTimeout(async () => {
+        delayedRefresh = setTimeout(async () => {
           try {
-            const updated = await api.itemSCMLinks.get(itemId) || [];
+            const updated = await api.itemSCMLinks.get(itemId, { signal: loadController.signal }) || [];
             if (JSON.stringify(updated) !== JSON.stringify(links)) {
               links = updated;
             }
@@ -106,6 +116,7 @@
         }, 3000);
       }
     } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError' || err?.status === 404) return;
       console.error('Failed to load SCM links:', err);
       error = t('scm.failedToLoadLinks');
       links = [];
@@ -229,7 +240,7 @@
     <div class="flex items-center gap-1">
       {#if connectionStatus?.connected}
         <button
-          class="p-1 rounded transition-colors opacity-0 group-hover:opacity-100"
+          class="p-1 rounded transition-colors opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
           class:invisible={!expanded}
           onclick={e => { e.stopPropagation(); openCreateBranchModal(); }}
           title={t('scm.createBranch')}
@@ -237,7 +248,7 @@
           <GitBranchPlus class="w-4 h-4" style="color: var(--ds-text-subtle);" />
         </button>
         <button
-          class="p-1 rounded transition-colors opacity-0 group-hover:opacity-100"
+          class="p-1 rounded transition-colors opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
           class:invisible={!expanded}
           onclick={e => { e.stopPropagation(); openAddLinkModal(); }}
           title={t('scm.linkExisting')}
@@ -257,7 +268,7 @@
     <div class="space-y-2 mt-1">
       {#if checkingConnection || loading}
         <div class="flex items-center justify-center py-3">
-          <Loader2 class="w-4 h-4 animate-spin" style="color: var(--ds-text-subtle);" />
+          <Spinner size="sm" />
         </div>
       {:else if !connectionStatus?.has_repositories}
         <!-- No SCM repositories configured for this workspace -->
@@ -284,7 +295,7 @@
         {#if pullRequests.length > 0}
           <section class="space-y-1.5">
             <div class="flex items-center gap-2 px-1">
-              <Text variant="subtle" size="xs" weight="medium">{t('scm.pullRequests')}</Text>
+              <Text variant="subtle" size="xs" weight="medium">{t(hasGitLabPullRequests ? 'scm.mergeRequests' : 'scm.pullRequests')}</Text>
               <span class="text-xs px-1.5 py-0.5 rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
                 {pullRequests.length}
               </span>
@@ -398,13 +409,13 @@
     </div>
 
     <!-- Actions -->
-    <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+    <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity">
       {#if link.link_type === 'branch'}
         <button
           class="p-1 rounded hover:bg-opacity-50"
           style="color: var(--ds-text-subtle);"
           onclick={() => openCreatePRModal(link)}
-          title={t('scm.createPullRequest')}
+          title={t(link.provider_type === 'gitlab' ? 'scm.createMergeRequest' : 'scm.createPullRequest')}
         >
           <GitMerge class="w-3 h-3" />
         </button>

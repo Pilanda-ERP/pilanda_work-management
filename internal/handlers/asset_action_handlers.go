@@ -1,8 +1,9 @@
 package handlers
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"windshift/internal/logger"
@@ -13,13 +14,29 @@ import (
 	"windshift/internal/services"
 )
 
-// sanitizeAssetActionFlow gates the user-supplied flow-graph strings.
-// NodeConfig is a free-form JSON blob persisted verbatim and echoed on
-// every action GET — HTML stripping would corrupt it, so it is
-// validated (size + well-formed JSON) and rejected instead of
-// scrubbed. Edge type + handles are identifier-shaped strings stored
-// and echoed verbatim. Writes a validation error and returns false
-// when a node config is rejected.
+func validateAssetActionKinds(triggerType models.AssetActionTriggerType, nodes []models.AssetActionNode) string {
+	switch triggerType {
+	case models.AssetTriggerAssetCreated, models.AssetTriggerAssetUpdated,
+		models.AssetTriggerAssetStatusChanged, models.AssetTriggerAssetDeleted,
+		models.AssetTriggerManual:
+		// valid
+	default:
+		return fmt.Sprintf("Invalid asset action trigger type: %s", triggerType)
+	}
+	for i, node := range nodes {
+		switch node.NodeType {
+		case models.AssetNodeTrigger, models.AssetNodeCreateItem, models.AssetNodeSetField,
+			models.AssetNodeSetStatus, models.AssetNodeCondition, models.AssetNodeNotifyUser:
+			// valid
+		default:
+			return fmt.Sprintf("Invalid asset action node type at nodes[%d]: %s", i, node.NodeType)
+		}
+	}
+	return ""
+}
+
+// sanitizeAssetActionFlow validates persisted JSON node configs rather than
+// scrubbing them, and sanitizes identifier-shaped edge fields.
 func sanitizeAssetActionFlow(w http.ResponseWriter, r *http.Request, nodes []models.AssetActionNode, edges []models.AssetActionEdge) bool {
 	for i := range nodes {
 		if err := sanitize.ValidateJSONPayload("node_config", nodes[i].NodeConfig); err != nil {
@@ -143,6 +160,16 @@ func (h *AssetActionHandler) CreateAction(w http.ResponseWriter, r *http.Request
 		respondValidationError(w, r, msg)
 		return
 	}
+	if msg := validateAssetActionKinds(req.TriggerType, req.Nodes); msg != "" {
+		respondValidationError(w, r, msg)
+		return
+	}
+	if h.actionService != nil {
+		if err := h.actionService.ValidateTaxonomyReferences(setID, req.TriggerConfig, req.Nodes); err != nil {
+			respondValidationError(w, r, err.Error())
+			return
+		}
+	}
 
 	if err := actionutil.ValidateFlowAcyclic[
 		models.AssetActionNode, *models.AssetActionNode,
@@ -254,10 +281,32 @@ func (h *AssetActionHandler) UpdateAction(w http.ResponseWriter, r *http.Request
 	if !sanitizeAssetActionFlow(w, r, req.Nodes, req.Edges) {
 		return
 	}
+	if req.Nodes == nil && req.Edges != nil {
+		respondValidationError(w, r, "nodes must be provided when replacing action edges")
+		return
+	}
 
 	var err error
 
 	applyAssetActionUpdateFields(action, &req)
+	if msg := actionutil.ValidateActionFields(action.Name, string(action.TriggerType)); msg != "" {
+		respondValidationError(w, r, msg)
+		return
+	}
+	effectiveNodes := action.Nodes
+	if req.Nodes != nil {
+		effectiveNodes = req.Nodes
+	}
+	if msg := validateAssetActionKinds(action.TriggerType, effectiveNodes); msg != "" {
+		respondValidationError(w, r, msg)
+		return
+	}
+	if h.actionService != nil {
+		if err := h.actionService.ValidateTaxonomyReferences(setID, action.TriggerConfig, effectiveNodes); err != nil {
+			respondValidationError(w, r, err.Error())
+			return
+		}
+	}
 
 	if req.Nodes != nil {
 		if cycleErr := actionutil.ValidateFlowAcyclic[
@@ -331,7 +380,7 @@ func (h *AssetActionHandler) DeleteAction(w http.ResponseWriter, r *http.Request
 
 // ToggleAction enables or disables an asset action
 func (h *AssetActionHandler) ToggleAction(w http.ResponseWriter, r *http.Request) {
-	_, setID, ok := h.requireSetAdminAccess(w, r)
+	currentUser, setID, ok := h.requireSetAdminAccess(w, r)
 	if !ok {
 		return
 	}
@@ -349,7 +398,11 @@ func (h *AssetActionHandler) ToggleAction(w http.ResponseWriter, r *http.Request
 	var req struct {
 		IsEnabled bool `json:"is_enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
+		if !errors.Is(err, io.EOF) {
+			respondBadRequest(w, r, "Invalid JSON request body")
+			return
+		}
 		req.IsEnabled = !action.IsEnabled
 	}
 
@@ -366,6 +419,21 @@ func (h *AssetActionHandler) ToggleAction(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
+	}
+
+	if currentUser != nil {
+		h.auditor.LogWithDetails(
+			r,
+			currentUser,
+			logger.ActionAutomationToggle,
+			logger.ResourceAutomation,
+			&actionID,
+			updatedAction.Name,
+			map[string]any{
+				"old_is_enabled": action.IsEnabled,
+				"is_enabled":     updatedAction.IsEnabled,
+			},
+		)
 	}
 
 	respondJSONOK(w, updatedAction)
@@ -404,6 +472,10 @@ func (h *AssetActionHandler) ExecuteAction(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	if !action.IsEnabled {
+		respondValidationError(w, r, "action is disabled")
+		return
+	}
 
 	// The target asset id is caller-controlled; confirm it belongs to the
 	// admin-checked set before executing, otherwise an admin of one set could
@@ -424,13 +496,13 @@ func (h *AssetActionHandler) ExecuteAction(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	err = h.actionService.ExecuteActionManually(action, req.AssetID, currentUser.ID)
+	result, err := h.actionService.ExecuteActionManuallyWithResult(action, req.AssetID, currentUser.ID)
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to execute action: %w", err))
 		return
 	}
 
-	respondJSONOK(w, map[string]string{"status": "completed"})
+	respondJSONOK(w, result)
 }
 
 // GetActionLogs gets execution logs for an asset action

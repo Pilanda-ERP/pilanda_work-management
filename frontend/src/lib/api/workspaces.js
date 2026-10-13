@@ -1,10 +1,22 @@
-import { fetchAPI } from './core.js';
+import { fetchAllV2Pages, fetchAPI, fetchAPIV2, fetchV2Data } from './core.js';
 import { createCrudClient } from './createCrudClient.js';
 import { buildQueryString } from './utils.js';
+import { normalizeStatuses } from './workflows.js';
+
+const workspaceCRUD = createCrudClient('/workspaces', { v2: true, allV2: true });
 
 export const workspaces = {
-  ...createCrudClient('/workspaces'),
-  getProjects: (id) => fetchAPI(`/workspaces/${id}/projects`),
+  ...workspaceCRUD,
+  getAll: (filters = {}, requestOptions = {}) =>
+    fetchAllV2Pages(`/workspaces${buildQueryString(filters)}`, requestOptions),
+  // Single paged directory read: { page, page_size, search, sort, order } in,
+  // { data, pagination } out. Server-side search keeps tenants larger than
+  // the cached first page reachable without fetch-all loops (WI-1442).
+  getPage: (filters = {}, requestOptions = {}) =>
+    fetchAPIV2(`/workspaces${buildQueryString(filters)}`, requestOptions),
+  get: (id, requestOptions = {}) => fetchV2Data(`/workspaces/${id}`, requestOptions),
+  getBootstrap: (id) => fetchAPI(`/workspaces/${id}/bootstrap`),
+  getProjects: (id) => fetchV2Data(`/workspaces/${id}/time-projects`),
   getOrCreatePersonal: () => fetchAPI('/workspaces/personal'),
   getStats: (id, params = {}) => {
     return fetchAPI(`/workspaces/${id}/stats${buildQueryString(params)}`);
@@ -15,11 +27,36 @@ export const workspaces = {
       method: 'PUT',
       body: JSON.stringify(layout),
     }),
-  getStatuses: (id) => fetchAPI(`/workspaces/${id}/statuses`),
+  getStatuses: async (id, itemTypeId = null) =>
+    normalizeStatuses(
+      await fetchV2Data(
+        `/workspaces/${id}/statuses${itemTypeId ? `?item_type_id=${itemTypeId}` : ''}`
+      )
+    ),
+  getItemTypes: (id) => fetchV2Data(`/workspaces/${id}/item-types`),
+  getWorkflows: (id) => fetchV2Data(`/workspaces/${id}/workflows`),
+  getPriorities: (id) => fetchV2Data(`/workspaces/${id}/priorities`),
+  // Resolved effective configuration: assigned config set (else the global
+  // default), its condition/approval sets, effective screens per mode with
+  // hydrated fields, and config-set priorities.
+  getEffectiveConfig: (id, itemTypeId = null, requestOptions = {}) =>
+    fetchV2Data(
+      `/workspaces/${id}/effective-config${itemTypeId != null ? `?item_type_id=${itemTypeId}` : ''}`,
+      requestOptions
+    ),
+  getTemplates: () => fetchV2Data('/workspace-templates'),
   // Allowed status transitions for every (item_type_id, status_id) pair in the
   // workspace, keyed "<itemTypeId>:<statusId>". One request replaces the
   // board's per-pair /items/{id}/available-status-transitions preload.
-  getTransitionMatrix: (id) => fetchAPI(`/workspaces/${id}/transition-matrix`),
+  getTransitionMatrix: async (id) => {
+    const entries = await fetchV2Data(`/workspaces/${id}/transition-matrix`);
+    return Object.fromEntries(
+      (entries || []).map(({ item_type_id: itemTypeId, status_id: statusId, transitions }) => [
+        `${itemTypeId}:${statusId}`,
+        transitions,
+      ])
+    );
+  },
 };
 
 // `create` and `delete` here go to the new admin endpoints

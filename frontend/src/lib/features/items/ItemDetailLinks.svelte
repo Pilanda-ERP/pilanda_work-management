@@ -1,6 +1,6 @@
 <script>
-  import { FileText, Link2, Trash2, Plus, GripVertical } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../../utils/icons.js';
+  import { Link2, Trash2, Plus, GripVertical, FileText } from '@lucide/svelte';
+  import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
   import Button from '../../components/Button.svelte';
   import LinkComponent from '../../components/Link.svelte';
   import { onDestroy } from 'svelte';
@@ -9,8 +9,11 @@
   import DropIndicator from '../../layout/DropIndicator.svelte';
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
-  import ItemKey from './ItemKey.svelte';
+  import ItemKey from '../../components/ItemKey.svelte';
   import StatusBadge from '../../components/StatusBadge.svelte';
+  import ItemStatusPicker from '../../pickers/ItemStatusPicker.svelte';
+  import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
+  import { errorToast } from '../../stores/toasts.svelte.js';
 
   let {
     item,
@@ -32,13 +35,12 @@
     onremovelink = undefined,
     onshowlinkmodal = undefined,
     onreorderchildren = undefined,
+    onstatuschanged = undefined,
   } = $props();
 
   const TEST_LINK_TYPE_ID = 1;
 
-  // Use centralized icon map for item types
   let currentItemId = $derived(parseInt(itemId));
-  const iconMap = itemTypeIconMap;
 
   // Partition links into the work-item group (items / test_cases / assets)
   // and the page group. Pages render differently — no status badge, no
@@ -67,7 +69,7 @@
   function handleLinkClick(event, linkedItemType, linkedItemId, linkedItemWorkspaceId, linkedItemHref) {
     if (linkedItemType === 'test_case') {
       event.preventDefault();
-      onviewtestcase?.({ testCaseId: linkedItemId });
+      onviewtestcase?.({ testCaseId: linkedItemId, workspaceId: linkedItemWorkspaceId });
       return;
     }
 
@@ -89,6 +91,25 @@
 
   function handleShowLinkModal(preselectLinkTypeId = null) {
     onshowlinkmodal?.({ preselectLinkTypeId });
+  }
+
+  // Rows with a status transition in flight; their picker stays locked until
+  // the refreshed list arrives.
+  let pendingStatusItemIds = $state(new Set());
+
+  async function changeStatus(rowItemId, statusId, kind) {
+    if (pendingStatusItemIds.has(rowItemId)) return;
+    pendingStatusItemIds = new Set(pendingStatusItemIds).add(rowItemId);
+    try {
+      await api.items.transition(rowItemId, statusId);
+      await onstatuschanged?.({ itemId: rowItemId, kind });
+    } catch (error) {
+      errorToast(t('dialogs.alerts.failedToUpdate', { error: `status: ${error.message || error}` }));
+    } finally {
+      const next = new Set(pendingStatusItemIds);
+      next.delete(rowItemId);
+      pendingStatusItemIds = next;
+    }
   }
 
   // Drag and drop state for child items
@@ -230,7 +251,7 @@
       }
 
       await api.items.updateFracIndex(draggedItem.id, {
-        prev_item_id: prevItemId,
+        previous_item_id: prevItemId,
         next_item_id: nextItemId
       });
 
@@ -252,6 +273,24 @@
   });
 </script>
 
+<!-- Linked and child items can live in another workspace, so the edit
+     permission and status options follow the row's own workspace. -->
+{#snippet statusControl(rowItemId, rowWorkspaceId, statusId, statusName, statusBuiltinKey, statusColor, kind)}
+  {#if statusId && rowWorkspaceId}
+    <span data-testid="{kind}-status">
+      <ItemStatusPicker
+        workspaceId={rowWorkspaceId}
+        {statusId}
+        {statusName}
+        {statusBuiltinKey}
+        {statusColor}
+        canEdit={workspacePermissions.canEdit(rowWorkspaceId) && !pendingStatusItemIds.has(rowItemId)}
+        onselect={(nextStatusId) => changeStatus(rowItemId, nextStatusId, kind)}
+      />
+    </span>
+  {/if}
+{/snippet}
+
 <!-- Links Section (work items, test cases, assets) -->
 {#if workItemLinks.length > 0}
   <div class="mt-6">
@@ -265,10 +304,7 @@
         <button
           type="button"
           data-testid="add-link-button"
-          class="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer"
-          style="color: var(--ds-text-subtle);"
-          onmouseenter={(e) => { e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'; e.currentTarget.style.color = 'var(--ds-text)'; }}
-          onmouseleave={(e) => { e.currentTarget.style.backgroundColor = ''; e.currentTarget.style.color = 'var(--ds-text-subtle)'; }}
+          class="add-link-btn inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer"
           onclick={() => handleShowLinkModal()}
         >
           <Plus class="w-3 h-3" />
@@ -278,7 +314,7 @@
 
       {#if loadingLinks}
         <div class="text-center py-4">
-          <div class="text-sm text-gray-500">{t('items.loadingLinks')}</div>
+          <div class="text-sm text-ds-text-subtle">{t('items.loadingLinks')}</div>
         </div>
       {:else}
       <div class="space-y-2">
@@ -303,6 +339,7 @@
           {@const linkedItemTypeColor = isCurrentSource ? link.target_item_type_color : link.source_item_type_color}
           {@const linkedItemStatusName = isCurrentSource ? link.target_status_name : link.source_status_name}
           {@const linkedItemStatusColor = isCurrentSource ? link.target_status_color : link.source_status_color}
+          {@const linkedItemStatusId = isCurrentSource ? link.target_status_id : link.source_status_id}
           {@const linkTypeName = link.link_type_name}
           {@const linkTypeLabel = getLinkLabel(link)}
           {@const linkTypeColor = link.link_type_color || 'var(--ds-text-subtle)'}
@@ -315,22 +352,10 @@
           >
             <div class="flex items-center gap-3 flex-1 min-w-0">
               <!-- Item type icon -->
-              {#if linkedItemTypeIcon && iconMap[linkedItemTypeIcon]}
-                {@const LinkedIcon = iconMap[linkedItemTypeIcon]}
-                <div
-                  class="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0"
-                  style="background-color: {linkedItemTypeColor || '#6b7280'}20; color: {linkedItemTypeColor || '#6b7280'};"
-                >
-                  <LinkedIcon class="w-3.5 h-3.5" />
-                </div>
-              {:else}
-                <div
-                  class="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0"
-                  style="background-color: #6b728020; color: #6b7280;"
-                >
-                  <FileText class="w-3.5 h-3.5" />
-                </div>
-              {/if}
+              <ItemTypeIcon
+                icon={linkedItemTypeIcon}
+                color={linkedItemTypeColor || '#6b7280'}
+              />
               <!-- Item key -->
               <LinkComponent
                 href={linkedItemHref}
@@ -343,7 +368,8 @@
               <!-- Item title -->
               <LinkComponent
                 href={linkedItemHref}
-                class="text-sm hover:text-blue-600 cursor-pointer truncate"
+                data-testid="linked-item-title"
+                class="text-sm hover:text-ds-text-link cursor-pointer truncate"
                 onClick={(event) => handleLinkClick(event, linkedItemType, linkedItemId, linkedItemWorkspaceId, linkedItemHref)}
                 style="color: var(--ds-text);"
               >
@@ -367,7 +393,9 @@
                   {linkTypeLabel}
                 </span>
               {/if}
-              {#if linkedItemStatusName}
+              {#if linkedItemType === 'item'}
+                {@render statusControl(linkedItemId, linkedItemWorkspaceId, linkedItemStatusId, linkedItemStatusName, '', linkedItemStatusColor, 'linked-item')}
+              {:else if linkedItemStatusName}
                 <StatusBadge
                   status={{ label: linkedItemStatusName, categoryColor: linkedItemStatusColor }}
                   uppercase={false}
@@ -376,10 +404,7 @@
               {/if}
               <button
                 data-testid="linked-item-delete"
-                class="p-1 rounded hidden group-hover:flex cursor-pointer delete-button"
-                style="color: var(--ds-text-subtle);"
-                onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text-danger)'}
-                onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
+                class="delete-button p-1 rounded hidden group-hover:flex cursor-pointer"
                 onclick={() => removeLink(link.id)}
                 title={t('items.removeLink')}
               >
@@ -407,10 +432,7 @@
           <button
             type="button"
             data-testid="add-page-link-button"
-            class="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer"
-            style="color: var(--ds-text-subtle);"
-            onmouseenter={(e) => { e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'; e.currentTarget.style.color = 'var(--ds-text)'; }}
-            onmouseleave={(e) => { e.currentTarget.style.backgroundColor = ''; e.currentTarget.style.color = 'var(--ds-text-subtle)'; }}
+            class="add-link-btn inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer"
             onclick={() => handleShowLinkModal(pageLinkTypeId)}
           >
             <Plus class="w-3 h-3" />
@@ -442,7 +464,7 @@
               </div>
               <LinkComponent
                 href={linkedPageHref}
-                class="text-sm hover:text-blue-600 cursor-pointer truncate"
+                class="text-sm hover:text-ds-text-link cursor-pointer truncate"
                 onClick={(event) => handleLinkClick(event, 'page', linkedPageId, linkedPageWorkspaceId, linkedPageHref)}
                 style="color: var(--ds-text);"
               >
@@ -452,10 +474,7 @@
             <div class="flex items-center gap-2 flex-shrink-0">
               <button
                 data-testid="linked-page-delete"
-                class="p-1 rounded hidden group-hover:flex cursor-pointer delete-button"
-                style="color: var(--ds-text-subtle);"
-                onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text-danger)'}
-                onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
+                class="delete-button p-1 rounded hidden group-hover:flex cursor-pointer"
                 onclick={() => removeLink(link.id)}
                 title={t('items.removeLink')}
               >
@@ -487,6 +506,7 @@
           {#each childItems as childItem}
             {@const childItemType = itemTypes.find(type => type.id === childItem.item_type_id)}
             <div
+              data-testid={`item-child-card-${childItem.id}`}
               class="group flex items-center justify-between px-4 py-3 rounded-lg border transition-colors relative"
               style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
               data-child-item-card
@@ -503,20 +523,9 @@
                 {/if}
                 <!-- Item type icon -->
                 {#if childItemType}
-                  {@const ChildTypeIcon = iconMap[childItemType.icon] || FileText}
-                  <div
-                    class="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0"
-                    style="background-color: {childItemType.color || '#6b7280'}20; color: {childItemType.color || '#6b7280'};"
-                  >
-                    <ChildTypeIcon class="w-3.5 h-3.5" />
-                  </div>
+                  <ItemTypeIcon itemType={childItemType} />
                 {:else}
-                  <div
-                    class="w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0"
-                    style="background-color: #6b728020; color: #6b7280;"
-                  >
-                    <FileText class="w-3.5 h-3.5" />
-                  </div>
+                  <ItemTypeIcon />
                 {/if}
                 <!-- Item key -->
                 <ItemKey item={childItem} {workspace}
@@ -524,21 +533,15 @@
                 <!-- Item title -->
                 <LinkComponent
                   href={`/workspaces/${childItem.workspace_id || workspaceId}/items/${childItem.id}`}
-                  class="text-sm hover:text-blue-600 cursor-pointer truncate"
+                  class="text-sm hover:text-ds-text-link cursor-pointer truncate"
                   style="color: var(--ds-text);"
                 >
                   {childItem.title}
                 </LinkComponent>
               </div>
-              <!-- Right side: status badge -->
+              <!-- Right side: status picker -->
               <div class="flex items-center gap-2 flex-shrink-0">
-                {#if childItem.status_name}
-                  <StatusBadge
-                    status={{ label: childItem.status_name, categoryColor: childItem.status_color }}
-                    uppercase={false}
-                    showDot={false}
-                  />
-                {/if}
+                {@render statusControl(childItem.id, childItem.workspace_id || workspaceId, childItem.status_id, childItem.status_name, childItem.status_builtin_key, childItem.status_color, 'child-item')}
               </div>
             </div>
           {/each}
@@ -551,6 +554,20 @@
 <style>
   .delete-button {
     animation: fadeIn 150ms ease-out;
+    color: var(--ds-text-subtle);
+  }
+
+  .delete-button:hover {
+    color: var(--ds-text-danger);
+  }
+
+  .add-link-btn {
+    color: var(--ds-text-subtle);
+  }
+
+  .add-link-btn:hover {
+    background-color: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
   }
 
   @keyframes fadeIn {

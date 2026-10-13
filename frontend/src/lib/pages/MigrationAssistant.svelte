@@ -1,11 +1,13 @@
 <script>
   import { api } from '../api.js';
-  import Spinner from '../components/Spinner.svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import Button from '../components/Button.svelte';
   import BasePicker from '../pickers/BasePicker.svelte';
   import Modal from '../dialogs/Modal.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import Badge from '../components/Badge.svelte';
+  import TabStrip from '../components/TabStrip.svelte';
+  import Input from '../components/Input.svelte';
   import { X, ArrowRight, Type, FileText, Flag, Activity } from '@lucide/svelte';
   import DialogFooter from '../dialogs/DialogFooter.svelte';
   import { t } from '../stores/i18n.svelte.js';
@@ -24,6 +26,9 @@
     // apply_workflow_to_config_set, instructing the server to update the
     // target configuration set's workflow_id atomically with the migration.
     applyWorkflowId = null,
+    // Optional proposed item-type configs for an intra-set removal. The server
+    // applies them atomically with the item remaps.
+    applyItemTypeConfigs = null,
     onclose = null
   } = $props();
 
@@ -74,7 +79,9 @@
       to_item_type_name: migration.suggested_item_type_name || '',
       item_count: migration.item_count,
       requires_migration: migration.requires_migration,
-      available_targets: migration.available_targets || analysis.available_item_types || []
+      available_targets: Array.isArray(migration.available_targets)
+        ? migration.available_targets
+        : analysis.available_item_types || []
     }));
     customFieldMappings = (analysis.custom_field_migrations || []).map(migration => ({
       field_id: migration.field_id,
@@ -94,6 +101,10 @@
       requires_migration: migration.requires_migration,
       available_targets: analysis.available_priorities || []
     }));
+
+    if (itemTypeMappings.some(mapping => mapping.requires_migration)) activeTab = 'itemType';
+    else if (customFieldMappings.some(mapping => mapping.requires_default)) activeTab = 'fields';
+    else if (priorityMappings.some(mapping => mapping.requires_migration)) activeTab = 'priority';
   }
 
   // Compute tab counts
@@ -144,7 +155,9 @@
           to_item_type_name: migration.suggested_item_type_name || '',
           item_count: migration.item_count,
           requires_migration: migration.requires_migration,
-          available_targets: migration.available_targets || migrationAnalysis.available_item_types || []
+          available_targets: Array.isArray(migration.available_targets)
+            ? migration.available_targets
+            : migrationAnalysis.available_item_types || []
         }));
 
         customFieldMappings = (migrationAnalysis.custom_field_migrations || []).map(migration => ({
@@ -241,10 +254,13 @@
           // where items created concurrently could end up orphaned. For the
           // intra-set workflow-change flow there is no swap to make (source
           // and target are the same config set), so suppress this flag.
-          attach_after_migration: !applyWorkflowId,
+          attach_after_migration: !applyWorkflowId && applyItemTypeConfigs == null,
           // For intra-set workflow change: atomically write the new workflow_id
           // to the target configuration set inside the migration transaction.
           ...(applyWorkflowId ? { apply_workflow_to_config_set: applyWorkflowId } : {}),
+          ...(applyItemTypeConfigs != null
+            ? { apply_item_type_configs_to_config_set: applyItemTypeConfigs }
+            : {}),
           status_mappings: statusMappings
             .filter(mapping => mapping.to_status_id)
             .map(mapping => ({
@@ -405,6 +421,9 @@
 
   // Check if any tab has pending migrations
   let hasPendingMigrations = $derived(statusCount > 0 || itemTypeCount > 0 || fieldCount > 0 || priorityCount > 0);
+  let hasUnmappableItemTypes = $derived(itemTypeMappings.some(mapping =>
+    mapping.requires_migration && mapping.available_targets.length === 0
+  ));
 </script>
 
 <Modal
@@ -412,7 +431,7 @@
   maxWidth="max-w-4xl"
   onclose={() => closeAssistant(true)}
 >
-  <div class="max-h-[90vh] overflow-hidden flex flex-col">
+  <div data-testid="migration-assistant" class="max-h-[90vh] overflow-hidden flex flex-col">
     <div class="px-6 py-4 border-b" style="border-color: var(--ds-border);">
       <div class="flex items-center justify-between">
         <h2 class="text-xl font-semibold" style="color: var(--ds-text);">
@@ -445,10 +464,7 @@
       {/if}
 
       {#if isAnalyzing}
-        <div class="flex items-center justify-center py-8">
-          <Spinner />
-          <span class="ml-3" style="color: var(--ds-text-subtle);">{t('migrationAssistant.analyzingMigration')}</span>
-        </div>
+        <StateDisplay type="loading" message={t('migrationAssistant.analyzingMigration')} />
       {:else if analysisError}
         <AlertBox variant="error" message="{t('migrationAssistant.analysisFailed')}: {analysisError}" />
       {:else if migrationAnalysis}
@@ -460,64 +476,15 @@
 
             {#if comprehensive}
               <!-- Tabs for each dimension -->
-              <div class="flex border-b" style="border-color: var(--ds-border);">
-                <button
-                  class="px-4 py-2 text-sm font-medium flex items-center gap-2 border-b-2 -mb-px transition-colors"
-                  class:border-blue-500={activeTab === 'itemType'}
-                  class:text-blue-600={activeTab === 'itemType'}
-                  class:border-transparent={activeTab !== 'itemType'}
-                  style={activeTab !== 'itemType' ? 'color: var(--ds-text-subtle);' : ''}
-                  onclick={() => activeTab = 'itemType'}
-                >
-                  <Type size={16} />
-                  {t('migrationAssistant.itemTypes')}
-                  {#if itemTypeCount > 0}
-                    <span class="px-1.5 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-800">{itemTypeCount}</span>
-                  {/if}
-                </button>
-                <button
-                  class="px-4 py-2 text-sm font-medium flex items-center gap-2 border-b-2 -mb-px transition-colors"
-                  class:border-blue-500={activeTab === 'fields'}
-                  class:text-blue-600={activeTab === 'fields'}
-                  class:border-transparent={activeTab !== 'fields'}
-                  style={activeTab !== 'fields' ? 'color: var(--ds-text-subtle);' : ''}
-                  onclick={() => activeTab = 'fields'}
-                >
-                  <FileText size={16} />
-                  {t('migrationAssistant.fields')}
-                  {#if fieldCount > 0}
-                    <span class="px-1.5 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-800">{fieldCount}</span>
-                  {/if}
-                </button>
-                <button
-                  class="px-4 py-2 text-sm font-medium flex items-center gap-2 border-b-2 -mb-px transition-colors"
-                  class:border-blue-500={activeTab === 'status'}
-                  class:text-blue-600={activeTab === 'status'}
-                  class:border-transparent={activeTab !== 'status'}
-                  style={activeTab !== 'status' ? 'color: var(--ds-text-subtle);' : ''}
-                  onclick={() => activeTab = 'status'}
-                >
-                  <Activity size={16} />
-                  {t('migrationAssistant.status')}
-                  {#if statusCount > 0}
-                    <span class="px-1.5 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-800">{statusCount}</span>
-                  {/if}
-                </button>
-                <button
-                  class="px-4 py-2 text-sm font-medium flex items-center gap-2 border-b-2 -mb-px transition-colors"
-                  class:border-blue-500={activeTab === 'priority'}
-                  class:text-blue-600={activeTab === 'priority'}
-                  class:border-transparent={activeTab !== 'priority'}
-                  style={activeTab !== 'priority' ? 'color: var(--ds-text-subtle);' : ''}
-                  onclick={() => activeTab = 'priority'}
-                >
-                  <Flag size={16} />
-                  {t('migrationAssistant.priority')}
-                  {#if priorityCount > 0}
-                    <span class="px-1.5 py-0.5 text-xs rounded-full bg-yellow-100 text-yellow-800">{priorityCount}</span>
-                  {/if}
-                </button>
-              </div>
+              <TabStrip
+                tabs={[
+                  { id: 'itemType', label: t('migrationAssistant.itemTypes'), count: itemTypeCount, countVariant: 'warning', icon: Type, testid: 'migration-tab-item-types' },
+                  { id: 'fields', label: t('migrationAssistant.fields'), count: fieldCount, countVariant: 'warning', icon: FileText, testid: 'migration-tab-fields' },
+                  { id: 'status', label: t('migrationAssistant.status'), count: statusCount, countVariant: 'warning', icon: Activity, testid: 'migration-tab-status' },
+                  { id: 'priority', label: t('migrationAssistant.priority'), count: priorityCount, countVariant: 'warning', icon: Flag, testid: 'migration-tab-priority' }
+                ]}
+                bind:activeTab
+              />
             {/if}
 
             <!-- Item Type Migrations -->
@@ -529,7 +496,11 @@
                 {:else}
                   <div class="space-y-4">
                     {#each itemTypeMappings as mapping}
-                      <div class="rounded p-4" style="background-color: var(--ds-surface-raised);">
+                      <div
+                        data-testid={`migration-item-type-${mapping.from_item_type_id ?? 'none'}`}
+                        class="rounded p-4"
+                        style="background-color: var(--ds-surface-raised);"
+                      >
                         <div class="flex items-center justify-between">
                           <div class="flex-1">
                             <div class="flex items-center space-x-3">
@@ -538,22 +509,34 @@
                               </Badge>
                               <ArrowRight size={16} style="color: var(--ds-text-subtle);" />
                               {#if mapping.requires_migration}
-                                <div class="w-48">
-                                  <BasePicker
-                                    bind:value={mapping.to_item_type_id}
-                                    items={mapping.available_targets}
-                                    placeholder={t('migrationAssistant.selectTargetType')}
-                                    showUnassigned={true}
-                                    unassignedLabel={t('migrationAssistant.selectTargetType')}
-                                    getValue={(type) => type.id}
-                                    getLabel={(type) => type.name}
-                                    onSelect={(type) => {
-                                      if (type) {
-                                        updateItemTypeMapping(mapping.from_item_type_id, type.id, type.name);
-                                      }
-                                    }}
-                                  />
-                                </div>
+                                {#if mapping.available_targets.length === 0}
+                                  <div
+                                    data-testid={`migration-item-type-no-target-${mapping.from_item_type_id ?? 'none'}`}
+                                    class="text-sm font-medium"
+                                    style="color: var(--ds-text-danger);"
+                                  >
+                                    No item type is available at the same hierarchy level.
+                                  </div>
+                                {:else}
+                                  <div class="w-48">
+                                    <BasePicker
+                                      id={`migration-item-type-target-${mapping.from_item_type_id ?? 'none'}`}
+                                      bind:value={mapping.to_item_type_id}
+                                      items={mapping.available_targets}
+                                      placeholder={t('migrationAssistant.selectTargetType')}
+                                      showUnassigned={true}
+                                      unassignedLabel={t('migrationAssistant.selectTargetType')}
+                                      getValue={(type) => type.id}
+                                      getLabel={(type) => type.name}
+                                      optionTestid={(option) => `migration-item-type-option-${mapping.from_item_type_id ?? 'none'}-${option.value ?? 'none'}`}
+                                      onSelect={(type) => {
+                                        if (type) {
+                                          updateItemTypeMapping(mapping.from_item_type_id, type.id, type.name);
+                                        }
+                                      }}
+                                    />
+                                  </div>
+                                {/if}
                               {:else}
                                 <Badge variant="success" size="sm">
                                   {mapping.to_item_type_name || t('migrationAssistant.compatible')}
@@ -563,7 +546,7 @@
                             <p class="text-sm mt-2" style="color: var(--ds-text-subtle);">
                               {mapping.item_count} item{mapping.item_count !== 1 ? 's' : ''}
                               {#if mapping.requires_migration}
-                                <span class="text-yellow-600 font-medium"> - {t('migrationAssistant.requiresMigration')}</span>
+                                <span class="text-ds-text-warning font-medium"> - {t('migrationAssistant.requiresMigration')}</span>
                               {/if}
                             </p>
                           </div>
@@ -607,13 +590,13 @@
                                   <Badge variant="warning" size="sm">
                                     New required field
                                   </Badge>
-                                  <input
+                                  <Input
                                     type="text"
-                                    class="px-3 py-1.5 text-sm border rounded-md w-48"
-                                    style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+                                    class="w-48"
                                     placeholder="Enter default value..."
                                     bind:value={mapping.default_value}
                                     oninput={(e) => updateFieldDefaultValue(mapping.field_id, /** @type {HTMLInputElement} */ (e.target).value)}
+                                    size="small"
                                   />
                                 </div>
                               {/if}
@@ -675,7 +658,7 @@
                             <p class="text-sm mt-2" style="color: var(--ds-text-subtle);">
                               {mapping.item_count} item{mapping.item_count !== 1 ? 's' : ''}
                               {#if mapping.requires_migration}
-                                <span class="text-yellow-600 font-medium"> - {t('migrationAssistant.requiresMigration')}</span>
+                                <span class="text-ds-text-warning font-medium"> - {t('migrationAssistant.requiresMigration')}</span>
                               {/if}
                             </p>
                           </div>
@@ -730,7 +713,7 @@
                             <p class="text-sm mt-2" style="color: var(--ds-text-subtle);">
                               {mapping.item_count} item{mapping.item_count !== 1 ? 's' : ''}
                               {#if mapping.requires_migration}
-                                <span class="text-yellow-600 font-medium"> - {t('migrationAssistant.requiresMigration')}</span>
+                                <span class="text-ds-text-warning font-medium"> - {t('migrationAssistant.requiresMigration')}</span>
                               {/if}
                             </p>
                           </div>
@@ -756,6 +739,7 @@
         onCancel={() => closeAssistant(true)}
         onConfirm={executeMigration}
         confirmLabel={t('migrationAssistant.executeMigration')}
+        confirmDisabled={hasUnmappableItemTypes}
         loading={isMigrating}
         loadingLabel={t('migrationAssistant.migrating')}
       />

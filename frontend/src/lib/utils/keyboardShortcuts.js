@@ -121,6 +121,9 @@ const shortcuts = {
   templates: {
     add: { key: 'a' },
   },
+  cannedResponses: {
+    add: { key: 'a' },
+  },
   themes: {
     add: { key: 'a' },
   },
@@ -137,6 +140,9 @@ const shortcuts = {
     add: { key: 'a' },
   },
   configurationSets: {
+    add: { key: 'a' },
+  },
+  serviceLevels: {
     add: { key: 'a' },
   },
   conditionSets: {
@@ -176,6 +182,10 @@ const shortcuts = {
   collections: {
     add: { key: 'a' },
   },
+  quickAdd: {
+    create: { key: 'Enter' },
+    cancel: { key: 'Escape' },
+  },
   groups: {
     add: { key: 'a' },
   },
@@ -210,7 +220,14 @@ const shortcuts = {
     save: { key: 'Enter', modifierKey: true },
     cancel: { key: 'Escape' },
   },
+  agents: {
+    add: { key: 'a' },
+    create: { key: 'Enter', modifierKey: true },
+  },
   actionCredentials: {
+    add: { key: 'a' },
+  },
+  llmConnections: {
     add: { key: 'a' },
   },
   // Coding agents (workspace settings tab — bindings + skills are siblings,
@@ -221,6 +238,9 @@ const shortcuts = {
   agentSkills: {
     add: { key: 'n' },
     save: { key: 'Enter', modifierKey: true },
+  },
+  agentTemplates: {
+    add: { key: 'a' },
   },
   security: {
     addCredential: { key: 'a' },

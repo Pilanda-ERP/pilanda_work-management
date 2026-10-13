@@ -1,14 +1,13 @@
 package portalwebauthn
 
 import (
-	"encoding/base64"
-	"fmt"
 	"strconv"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"windshift/internal/auth"
+	"windshift/internal/webauthn/persistence"
 )
 
 // Subject adapts auth.PortalCustomer to the webauthn.User interface.
@@ -66,73 +65,22 @@ func (s *Subject) CredentialExcludeList() []protocol.CredentialDescriptor {
 // credential. Mirrors webauthn.WebAuthnCredential but keyed on
 // portal_customer_id.
 type Credential struct {
-	ID                  string   `json:"id"`
-	PortalCustomerID    int      `json:"portal_customer_id"`
-	CredentialName      string   `json:"credential_name"`
-	PublicKey           []byte   `json:"-"`
-	AttestationType     string   `json:"attestation_type"`
-	AAGUID              []byte   `json:"-"`
-	SignCount           uint32   `json:"sign_count"`
-	CloneWarning        bool     `json:"clone_warning"`
-	Transport           []string `json:"transport"`
-	FlagsUserPresent    bool     `json:"flags_user_present"`
-	FlagsUserVerified   bool     `json:"flags_user_verified"`
-	FlagsBackupEligible bool     `json:"flags_backup_eligible"`
-	FlagsBackupState    bool     `json:"flags_backup_state"`
-	CreatedAt           string   `json:"created_at"`
-	UpdatedAt           string   `json:"updated_at"`
-	LastUsedAt          *string  `json:"last_used_at,omitempty"`
+	PortalCustomerID int `json:"portal_customer_id"`
+	persistence.CredentialWireFields
 }
 
 // ToWebAuthnCredential converts the database row to a go-webauthn credential.
 func (wc *Credential) ToWebAuthnCredential() (webauthn.Credential, error) {
-	credID, err := base64.RawURLEncoding.DecodeString(wc.ID)
-	if err != nil {
-		return webauthn.Credential{}, fmt.Errorf("failed to decode credential ID: %w", err)
-	}
-	transports := make([]protocol.AuthenticatorTransport, 0, len(wc.Transport))
-	for _, t := range wc.Transport {
-		transports = append(transports, protocol.AuthenticatorTransport(t))
-	}
-	return webauthn.Credential{
-		ID:              credID,
-		PublicKey:       wc.PublicKey,
-		AttestationType: wc.AttestationType,
-		Transport:       transports,
-		Flags: webauthn.CredentialFlags{
-			UserPresent:    wc.FlagsUserPresent,
-			UserVerified:   wc.FlagsUserVerified,
-			BackupEligible: wc.FlagsBackupEligible,
-			BackupState:    wc.FlagsBackupState,
-		},
-		Authenticator: webauthn.Authenticator{
-			AAGUID:       wc.AAGUID,
-			SignCount:    wc.SignCount,
-			CloneWarning: wc.CloneWarning,
-		},
-	}, nil
+	return credentialRecordFromPortalCredential(wc).ToWebAuthnCredential()
 }
 
-// FromWebAuthnCredential builds a database row from a go-webauthn credential.
-func FromWebAuthnCredential(portalCustomerID int, name string, cred *webauthn.Credential) *Credential {
-	credID := base64.RawURLEncoding.EncodeToString(cred.ID)
-	transports := make([]string, 0, len(cred.Transport))
-	for _, t := range cred.Transport {
-		transports = append(transports, string(t))
+func portalCredentialFromRecord(record persistence.CredentialRecord) Credential {
+	return Credential{
+		PortalCustomerID:     record.OwnerID,
+		CredentialWireFields: record.WireFields(),
 	}
-	return &Credential{
-		ID:                  credID,
-		PortalCustomerID:    portalCustomerID,
-		CredentialName:      name,
-		PublicKey:           cred.PublicKey,
-		AttestationType:     cred.AttestationType,
-		AAGUID:              cred.Authenticator.AAGUID,
-		SignCount:           cred.Authenticator.SignCount,
-		CloneWarning:        cred.Authenticator.CloneWarning,
-		Transport:           transports,
-		FlagsUserPresent:    cred.Flags.UserPresent,
-		FlagsUserVerified:   cred.Flags.UserVerified,
-		FlagsBackupEligible: cred.Flags.BackupEligible,
-		FlagsBackupState:    cred.Flags.BackupState,
-	}
+}
+
+func credentialRecordFromPortalCredential(credential *Credential) persistence.CredentialRecord {
+	return persistence.RecordFromWireFields(credential.CredentialWireFields, credential.PortalCustomerID)
 }

@@ -3,6 +3,7 @@
   import { Search, ChevronDown, Package } from '@lucide/svelte';
   import { workspaceIconMap, workspaceIconOptions } from '../utils/icons.js';
   import Label from '../components/Label.svelte';
+  import Input from '../components/Input.svelte';
   import { t } from '../stores/i18n.svelte.js';
 
   // Color options with good contrast and variety
@@ -25,6 +26,7 @@
     triggerVariant = 'default',
     triggerText = '',
     triggerTitle = '',
+    dataTestid = undefined,
     onchange = null,
     iconMap = null,
     iconOptions = null
@@ -48,6 +50,8 @@
     states: { open }
   } = createPopover({
     positioning: {
+      strategy: 'fixed',
+      fitViewport: true,
       placement: 'bottom-start',
       gutter: 8
     },
@@ -87,7 +91,11 @@
 {#if compact}
   <!-- Compact Mode -->
   {@const SelectedIcon = resolvedIconMap[selectedIcon] || Package}
-  <div class="icon-selector icon-selector-compact">
+  <div
+    class="icon-selector icon-selector-compact"
+    class:icon-selector-color-only={colorOnly}
+    data-testid={dataTestid}
+  >
     {#if resolvedLabel}
       <Label class="mb-2">{resolvedLabel}</Label>
     {/if}
@@ -96,6 +104,7 @@
     {#if colorOnly}
       <button
         use:melt={$trigger}
+        data-testid={dataTestid ? `${dataTestid}-trigger` : undefined}
         type="button"
         class="color-swatch-trigger"
         style="background-color: {selectedColor}; border: 1px solid var(--ds-border);"
@@ -105,6 +114,7 @@
     {:else if triggerVariant === 'badge'}
       <button
         use:melt={$trigger}
+        data-testid={dataTestid ? `${dataTestid}-trigger` : undefined}
         type="button"
         class="icon-badge-trigger"
         style="--icon-selector-color: {selectedColor};"
@@ -142,6 +152,7 @@
     {#if $open}
       <div
         use:melt={$content}
+        data-testid={dataTestid ? `${dataTestid}-menu` : undefined}
         class="popover-content"
         class:popover-content-color-only={colorOnly}
         style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);"
@@ -150,7 +161,7 @@
           <!-- Search Field -->
           <div class="popover-search" style="border-color: var(--ds-border);">
             <Search class="popover-search-icon" size={14} />
-            <input
+            <Input
               type="text"
               placeholder={t('pickers.searchIcons')}
               bind:value={searchQuery}
@@ -191,6 +202,7 @@
               <button
                 type="button"
                 class="popover-color-option"
+                data-testid={dataTestid ? `${dataTestid}-color` : undefined}
                 class:selected={selectedColor === color}
                 style="background-color: {color}"
                 onclick={() => selectColor(color)}
@@ -201,7 +213,7 @@
 
           <!-- Custom Color Picker -->
           <div class="custom-color-row">
-            <input
+            <Input
               type="color"
               bind:value={selectedColor}
               oninput={handleColorInputChange}
@@ -239,8 +251,8 @@
         <div class="section-header">
           <h4 class="text-sm font-medium" style="color: var(--ds-text);">{t('pickers.icon')}</h4>
           <div class="search-box">
-            <Search class="w-4 h-4 text-gray-400" />
-            <input
+            <Search class="w-4 h-4 text-ds-icon-subtle" />
+            <Input
               type="text"
               placeholder={t('pickers.searchIcons')}
               bind:value={searchQuery}
@@ -348,7 +360,7 @@
     z-index: 1;
   }
 
-  .search-input {
+  :global(.search-input) {
     width: 100%;
     padding: 6px 12px 6px 32px;
     font-size: 12px;
@@ -358,7 +370,7 @@
     transition: border-color 0.2s;
   }
 
-  .search-input:focus {
+  :global(.search-input):focus {
     border-color: #3b82f6;
     box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
   }
@@ -456,6 +468,11 @@
     width: 100%;
   }
 
+  .icon-selector-compact.icon-selector-color-only {
+    width: fit-content;
+    flex-shrink: 0;
+  }
+
   .compact-trigger {
     display: flex;
     align-items: center;
@@ -524,7 +541,8 @@
     z-index: 50;
     border-radius: 8px;
     box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-    overflow: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     width: 320px;
   }
 
@@ -538,7 +556,7 @@
     position: relative;
   }
 
-  .popover-search-input {
+  :global(.popover-search-input) {
     width: 100%;
     padding: 8px 12px 8px 32px;
     font-size: 13px;
@@ -548,7 +566,7 @@
     transition: border-color 0.2s;
   }
 
-  .popover-search-input:focus {
+  :global(.popover-search-input):focus {
     border-color: #3b82f6;
     box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
   }
@@ -563,8 +581,6 @@
 
   .popover-icons {
     padding: 8px;
-    max-height: 180px;
-    overflow-y: auto;
   }
 
   .popover-section-header {

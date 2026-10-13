@@ -1,5 +1,5 @@
 <script>
-  import { Search, Sparkles } from '@lucide/svelte';
+  import { Search, Sparkles, Command as CommandIcon } from '@lucide/svelte';
   import { authStore, aiStore } from '../stores';
   import { api } from '../api.js';
   import { navigate } from '../router.js';
@@ -8,12 +8,15 @@
   import { assignedToMeQuery } from '../widgets/dashboard/taskWidgetState.js';
   import MobileHeader from './MobileHeader.svelte';
   import MobileItemRow from './MobileItemRow.svelte';
+  import MobileListState from './MobileListState.svelte';
   import UserAvatar from '../components/UserAvatar.svelte';
+  import { mobilePalette } from './mobilePalette.svelte.js';
+  import { t } from '../stores/i18n.svelte.js';
 
   const SEGMENTS = [
-    { id: 'assigned', label: 'Assigned' },
-    { id: 'watched', label: 'Watched' },
-    { id: 'recent', label: 'Recent' },
+    { id: 'assigned', labelKey: 'common.assigned' },
+    { id: 'watched', labelKey: 'mobile.myWork.watched' },
+    { id: 'recent', labelKey: 'mobile.myWork.recent' },
   ];
 
   let segment = $state('assigned');
@@ -27,7 +30,7 @@
   const rows = $derived(data[segment] ?? []);
 
   function loadAssigned(raw) {
-    const list = Array.isArray(raw) ? raw : (raw?.items ?? []);
+    const list = raw?.data ?? [];
     return list
       .filter((i) => i?.id)
       .map((i) => ({
@@ -38,7 +41,7 @@
         statusColor: i.status_color,
         priorityName: i.priority_name,
         priorityColor: i.priority_color,
-        dueDate: i.due_date ? new Date(i.due_date) : null,
+        dueDate: i.due_date || null,
       }));
   }
 
@@ -53,7 +56,7 @@
         statusColor: w.status_color,
         priorityName: w.priority_name,
         priorityColor: w.priority_color,
-        timestamp: w.last_activity ? formatRelativeCompact(new Date(w.last_activity)) : null,
+        timestamp: w.last_active_at ? formatRelativeCompact(new Date(w.last_active_at)) : null,
       }));
   }
 
@@ -125,14 +128,17 @@
   });
 </script>
 
-<MobileHeader title="My Work">
+<MobileHeader title={t('mobile.myWork.title')}>
   {#snippet right()}
+    <button class="hdr-search" onclick={() => mobilePalette.open()} data-testid="mobile-palette-open" aria-label={t('mobile.palette.title')} type="button">
+      <CommandIcon size={20} />
+    </button>
     {#if aiStore.chatAvailable}
-      <button class="hdr-search" onclick={() => navigate('/m/chat')} data-testid="mobile-chat-open" aria-label="Assistant" type="button">
+      <button class="hdr-search" onclick={() => navigate('/m/chat')} data-testid="mobile-chat-open" aria-label={t('mobile.chat.title')} type="button">
         <Sparkles size={20} />
       </button>
     {/if}
-    <button class="hdr-search" onclick={() => navigate('/m/search')} data-testid="mobile-search-open" aria-label="Search" type="button">
+    <button class="hdr-search" onclick={() => navigate('/m/search')} data-testid="mobile-search-open" aria-label={t('common.search')} type="button">
       <Search size={20} />
     </button>
     <UserAvatar minimal />
@@ -148,30 +154,27 @@
           data-testid={`my-work-segment-${s.id}`}
           onclick={() => selectSegment(s.id)}
           type="button"
-        >{s.label}</button>
+        >{t(s.labelKey)}</button>
       {/each}
     </div>
   {/snippet}
 </MobileHeader>
 
 <div class="list" data-testid="my-work-list">
-  {#if loading && rows.length === 0}
-    <div class="skeleton">
-      {#each Array(5) as _}
-        <div class="sk-row"></div>
-      {/each}
-    </div>
-  {:else if errored}
-    <p class="msg" data-testid="my-work-error">Couldn't load your work. Pull down or switch tabs to retry.</p>
-  {:else if rows.length === 0}
-    <p class="msg" data-testid="my-work-empty">
-      {segment === 'assigned' ? 'Nothing assigned to you right now.' : segment === 'watched' ? "You aren't watching any items." : 'No recent activity.'}
-    </p>
-  {:else}
+  <MobileListState
+    {loading}
+    {errored}
+    rowCount={rows.length}
+    errorTestId="my-work-error"
+    emptyTestId="my-work-empty"
+    errorMessage={t('mobile.myWork.loadFailed')}
+    emptyMessage={segment === 'assigned' ? t('mobile.myWork.noAssigned') : segment === 'watched' ? t('mobile.myWork.noWatched') : t('mobile.myWork.noRecent')}
+    onretry={() => load(segment)}
+  >
     {#each rows as row (row.itemId)}
       <MobileItemRow {...row} />
     {/each}
-  {/if}
+  </MobileListState>
 </div>
 
 <style>
@@ -190,6 +193,7 @@
   .seg {
     flex: 1;
     min-height: 36px;
+    white-space: nowrap;
     border: 1px solid var(--ds-border);
     border-radius: var(--radius-md, 6px);
     background-color: var(--ds-surface);
@@ -203,30 +207,5 @@
     background-color: var(--ds-surface-selected, var(--ds-background-neutral));
     color: var(--ds-text);
     border-color: var(--ds-border-bold, var(--ds-border));
-  }
-
-  .msg {
-    padding: 2rem 1.25rem;
-    text-align: center;
-    color: var(--ds-text-subtle);
-    font-size: 0.875rem;
-  }
-
-  .skeleton {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .sk-row {
-    height: 56px;
-    border-bottom: 1px solid var(--ds-border);
-    background: linear-gradient(90deg, var(--ds-surface) 0%, var(--ds-background-neutral) 50%, var(--ds-surface) 100%);
-    background-size: 200% 100%;
-    animation: shimmer 1.2s ease-in-out infinite;
-  }
-
-  @keyframes shimmer {
-    0% { background-position: 200% 0; }
-    100% { background-position: -200% 0; }
   }
 </style>

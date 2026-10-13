@@ -1,4 +1,4 @@
-import { API_BASE, fetchAPI } from './core.js';
+import { API_BASE, fetchAPI, fetchAPIV2, fetchV2Data } from './core.js';
 import { createCrudClient } from './createCrudClient.js';
 
 export const configurationSets = {
@@ -24,6 +24,13 @@ export const configurationSets = {
     fetchAPI('/configuration-sets/execute-comprehensive-migration', {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+  // Workspace-scoped assignment (WI-1359): workspace admins pick the set their
+  // workspace uses; pass null to unassign. Server touches only the join rows.
+  assignToWorkspace: (workspaceId, configurationSetId) =>
+    fetchAPI(`/workspaces/${workspaceId}/configuration-set`, {
+      method: 'PUT',
+      body: JSON.stringify({ configuration_set_id: configurationSetId }),
     }),
   // Direct download URL for the export endpoint. Browsers carry the session
   // cookie automatically; bind this to an <a download> rather than calling
@@ -63,6 +70,7 @@ export const configurationSets = {
 
 export const screens = {
   ...createCrudClient('/screens'),
+  getAllWithFields: () => fetchAPI('/screens?include_fields=true'),
   getFields: (id) => fetchAPI(`/screens/${id}/fields`),
   updateFields: (id, data) =>
     fetchAPI(`/screens/${id}/fields`, {
@@ -72,7 +80,14 @@ export const screens = {
 };
 
 export const customFields = {
-  ...createCrudClient('/custom-fields', { adminBasePath: '/admin/custom-fields' }),
+  ...createCrudClient('/custom-fields', { adminBasePath: '/admin/custom-fields', readV2: true }),
+  getOverview: async (requestOptions = {}) => {
+    const document = await fetchAPIV2('/custom-fields', requestOptions);
+    return {
+      customFields: document?.data ?? [],
+      indexCounts: document?.meta?.index_counts ?? {},
+    };
+  },
   updateSettings: (data) =>
     fetchAPI('/admin/custom-fields/settings', {
       method: 'PUT',
@@ -80,56 +95,80 @@ export const customFields = {
     }),
 };
 
-export const projectFieldRequirements = {
-  getByProject: (id) => fetchAPI(`/projects/${id}/field-requirements`),
-  setRequirement: (projectId, data) =>
-    fetchAPI(`/projects/${projectId}/field-requirements`, {
+export const itemTypes = createCrudClient('/item-types', { v2: true });
+
+export const itemTemplates = createCrudClient('/item-templates', {
+  parentPath: '/workspaces',
+  v2: true,
+});
+
+export const cannedResponses = {
+  getAll: (workspaceId, includeArchived = false) =>
+    fetchV2Data(
+      `/workspaces/${workspaceId}/canned-responses${includeArchived ? '?include_archived=true' : ''}`
+    ),
+  get: (workspaceId, responseId) =>
+    fetchV2Data(`/workspaces/${workspaceId}/canned-responses/${responseId}`),
+  create: (workspaceId, data) =>
+    fetchV2Data(`/workspaces/${workspaceId}/canned-responses`, {
       method: 'POST',
+      body: JSON.stringify({
+        name: data.name,
+        body: data.body,
+        is_private: Boolean(data.is_private),
+      }),
+    }),
+  update: (workspaceId, responseId, data) =>
+    fetchV2Data(`/workspaces/${workspaceId}/canned-responses/${responseId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/merge-patch+json' },
       body: JSON.stringify(data),
     }),
-  removeRequirement: (projectId, fieldId) =>
-    fetchAPI(`/projects/${projectId}/field-requirements/${fieldId}`, {
-      method: 'DELETE',
+  delete: (workspaceId, responseId) =>
+    fetchV2Data(`/workspaces/${workspaceId}/canned-responses/${responseId}`, { method: 'DELETE' }),
+  preview: (workspaceId, responseId, itemId = 0) =>
+    fetchV2Data(`/workspaces/${workspaceId}/canned-responses/${responseId}/preview`, {
+      method: 'POST',
+      body: JSON.stringify({ item_id: itemId }),
     }),
-  getAvailableFields: (id) => fetchAPI(`/projects/${id}/available-fields`),
 };
 
-export const itemTypes = createCrudClient('/item-types');
-
-// Work item templates (WI-438). Reads need item-view, catalog writes are
-// admin-gated server-side; both surfaces share the /item-templates path.
-// getAll({ workspace_id, item_type_id? }) → query string via createCrudClient.
-export const itemTemplates = createCrudClient('/item-templates');
-
-export const priorities = createCrudClient('/priorities');
+export const priorities = createCrudClient('/priorities', { v2: true });
 
 export const hierarchyLevels = createCrudClient('/hierarchy-levels');
 
 export const linkTypes = {
-  ...createCrudClient('/link-types', { adminBasePath: '/admin/link-types' }),
+  ...createCrudClient('/link-types', { v2: true }),
   // One caller passes a boolean (LinkTypeManager); keep that signature.
-  getAll: (includeInactive = false) =>
-    fetchAPI(`/link-types${includeInactive ? '?include_inactive=true' : ''}`),
+  getAll: (includeInactive = false, requestOptions = {}) =>
+    fetchV2Data(`/link-types${includeInactive ? '?include_inactive=true' : ''}`, requestOptions),
 };
 
 export const links = {
-  getForItem: (type, id) => fetchAPI(`/${type}/${id}/links`),
+  getForItem: (type, id, requestOptions = {}) =>
+    fetchV2Data(`/${type}/${id}/links`, requestOptions),
   // Batch variant of getForItem('items', ...): returns links keyed by item id
   // ({ "<id>": { outgoing, incoming } }) for many items in one request. Used by
   // board/roadmap dependency badges so a board render is one request instead of
-  // one per card. Callers must chunk to <= 500 ids per call (server cap).
-  getForItems: (ids) => fetchAPI(`/links/batch?ids=${ids.join(',')}`),
+  // one per card. Callers chunk to the 200-item cap; the server accepts up to 500.
+  getForItems: async (ids, { includeCustomFields = false } = {}) => {
+    const customFields = includeCustomFields ? '&include_custom_fields=true' : '';
+    const document = await fetchAPIV2(
+      `/links/batch?ids=${ids.join(',')}&page_size=100${customFields}`
+    );
+    return Object.fromEntries((document?.data ?? []).map((group) => [group.item_id, group]));
+  },
   // Symmetric to getForItem for the page-detail "Work items" popover.
   // Routes through the same handler (GET /pages/{id}/links).
-  getForPage: (pageId) => fetchAPI(`/pages/${pageId}/links`),
-  getFieldLinks: (itemId, fieldId) => fetchAPI(`/items/${itemId}/field-links/${fieldId}`),
+  getForPage: (pageId) => fetchV2Data(`/pages/${pageId}/links`),
+  getFieldLinks: (itemId, fieldId) => fetchV2Data(`/items/${itemId}/fields/${fieldId}/links`),
   create: (data) =>
-    fetchAPI('/links', {
+    fetchV2Data('/links', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   delete: (id) =>
-    fetchAPI(`/links/${id}`, {
+    fetchV2Data(`/links/${id}`, {
       method: 'DELETE',
     }),
   search: (query, type = '', limit = 20, itemTypeIds = []) => {
@@ -138,6 +177,6 @@ export const links = {
     if (type) params.append('type', type);
     if (limit !== 20) params.append('limit', limit.toString());
     if (itemTypeIds.length > 0) params.append('item_type_ids', itemTypeIds.join(','));
-    return fetchAPI(`/links/search?${params.toString()}`);
+    return fetchV2Data(`/links/search?${params.toString()}`);
   },
 };

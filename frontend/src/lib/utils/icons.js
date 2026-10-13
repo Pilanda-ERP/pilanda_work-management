@@ -94,6 +94,7 @@ import {
   Tag,
   Target,
   Terminal,
+  TicketCheck,
   Trash,
   Truck,
   Upload,
@@ -255,12 +256,14 @@ export const workspaceIconMap = {
   Printer,
   RefreshCw,
   Save,
+  Search,
   Wrench,
   Truck,
   Volume2,
   Watch,
   Cloud,
   BarChart,
+  TicketCheck,
 };
 
 /**

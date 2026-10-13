@@ -11,8 +11,16 @@ export const notifications = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  clearAll: () =>
+    fetchAPI('/notifications', {
+      method: 'DELETE',
+    }),
   markAsRead: (id) =>
     fetchAPI(`/notifications/${id}/read`, {
+      method: 'PATCH',
+    }),
+  markAllAsRead: () =>
+    fetchAPI('/notifications/read-all', {
       method: 'PATCH',
     }),
   // Mark every unseen notification as seen. Distinct from markAsRead: the

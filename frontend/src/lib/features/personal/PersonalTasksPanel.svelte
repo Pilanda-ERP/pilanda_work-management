@@ -3,10 +3,10 @@
   import { api } from '../../api.js';
   import { navigate } from '../../router.js';
   import { ChevronDown, ChevronRight, Plus, Check, X, ExternalLink, CheckCircle2 } from '@lucide/svelte';
-  import { slide } from 'svelte/transition';
   import { workspacesStore } from '../../stores';
   import Tooltip from '../../components/Tooltip.svelte';
   import Text from '../../components/Text.svelte';
+  import Input from '../../components/Input.svelte';
   import { t } from '../../stores/i18n.svelte.js';
 
   let {
@@ -113,13 +113,12 @@
   let displayedTasks = $derived(showCompleted ? personalTasks : openTasks);
 
   // Load personal tasks for this work item
-  async function loadPersonalTasks() {
-    if (!itemId) return;
-
+  async function loadPersonalTasks(currentItemId, signal) {
     try {
       loading = true;
       error = null;
-      const tasks = await api.items.getPersonalTasks(itemId);
+      const tasks = await api.items.getPersonalTasks(currentItemId, { signal });
+      if (signal.aborted) return;
       personalTasks = tasks || [];
 
       // On first load, auto-expand if there are tasks, otherwise use saved preference
@@ -132,17 +131,24 @@
         }
       }
     } catch (err) {
+      if (signal.aborted || err?.name === 'AbortError' || err?.status === 404) return;
       console.error('Failed to load personal tasks:', err);
       error = err.message;
       personalTasks = [];
     } finally {
-      loading = false;
+      if (!signal.aborted) loading = false;
     }
   }
 
   // Create a new personal task linked to this work item
   async function handleAddTask() {
-    if (!newTaskTitle.trim() || !personalWorkspace) return;
+    if (!newTaskTitle.trim()) return;
+    if (!personalWorkspace) {
+      // Reachable only if the store failed to provision a personal workspace;
+      // surface it instead of silently dropping the action (WI-1390).
+      error = t('personal.noPersonalWorkspace');
+      return;
+    }
 
     try {
       adding = true;
@@ -151,8 +157,7 @@
       const newTask = await api.items.create({
         workspace_id: personalWorkspace.id,
         title: newTaskTitle.trim(),
-        related_work_item_id: itemId,
-        status_id: STATUS_ID_OPEN
+        related_work_item_id: itemId
       });
 
       // Add to list
@@ -202,25 +207,29 @@
 
   // Navigate to task detail
   function handleNavigateToTask(task) {
-    if (personalWorkspace) {
-      navigate(`/personal/items/${task.id}`);
+    if (!personalWorkspace) {
+      error = t('personal.noPersonalWorkspace');
+      return;
     }
+    navigate(`/personal/items/${task.id}`);
   }
 
   onMount(() => {
     workspacesStore.loadPersonalWorkspace();
-    loadPersonalTasks();
     // Load showCompleted preference
     showCompleted = loadShowCompletedState();
   });
 
-  // Reload when itemId changes
+  // Load once per item and cancel work that belongs to the previous route.
   $effect(() => {
-    if (itemId) {
-      // Reset the hasInitiallyLoaded flag when itemId changes
-      hasInitiallyLoaded = false;
-      loadPersonalTasks();
-    }
+    const currentItemId = itemId;
+    if (!currentItemId) return;
+
+    hasInitiallyLoaded = false;
+    const controller = new AbortController();
+    void loadPersonalTasks(currentItemId, controller.signal);
+
+    return () => controller.abort();
   });
 </script>
 
@@ -257,8 +266,8 @@
     </div>
     <div class="flex items-center gap-1">
       <button
-        class="p-1 rounded transition-colors opacity-40 group-hover:opacity-100"
-        class:invisible={showAddForm || !expanded || !personalWorkspace}
+        class="p-1 rounded transition-colors opacity-40 group-hover:opacity-100 disabled:opacity-20 disabled:cursor-not-allowed"
+        disabled={!personalWorkspace || showAddForm || !expanded}
         onclick={(e) => { e.stopPropagation(); showAddForm = true; }}
         title={t('personal.addPersonalTask')}
       >
@@ -274,13 +283,13 @@
 
   <!-- Expandable Content -->
   {#if expanded}
-    <div transition:slide={{ duration: 200 }} class="mt-1">
+    <div class="mt-1">
       {#if loading}
         <div class="py-2 text-xs" style="color: var(--ds-text-subtle);">
           {t('nav.loading')}
         </div>
       {:else if error}
-        <div class="py-2 text-xs text-red-600">
+        <div class="py-2 text-xs text-ds-text-danger">
           {error}
         </div>
       {:else if !personalWorkspace}
@@ -292,14 +301,13 @@
         {#if showAddForm}
           <div class="py-2 rounded-md mb-2" style="background-color: var(--ds-surface);">
             <form onsubmit={(e) => { e.preventDefault(); handleAddTask(); }} class="flex flex-col gap-2">
-              <input
+              <Input
                 type="text"
-                bind:this={addTaskInput}
+                bind:inputRef={addTaskInput}
                 bind:value={newTaskTitle}
                 placeholder={t('personal.taskTitlePlaceholder')}
-                class="px-2 py-1.5 text-sm border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
                 disabled={adding}
+                size="small"
               />
               <div class="flex gap-2 justify-end">
                 <button
@@ -344,7 +352,7 @@
                   title={isTaskCompleted(task) ? t('personal.markIncomplete') : t('personal.markComplete')}
                 >
                   {#if isTaskCompleted(task)}
-                    <div class="w-4 h-4 bg-green-500 rounded flex items-center justify-center">
+                    <div class="w-4 h-4 bg-ds-accent-green rounded flex items-center justify-center">
                       <Check size={12} class="text-white" strokeWidth={2.5} />
                     </div>
                   {:else}
@@ -363,7 +371,7 @@
                 </button>
 
                 <!-- Actions -->
-                <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity">
                   <button
                     class="p-0.5 rounded action-btn"
                     onclick={() => handleNavigateToTask(task)}
@@ -376,7 +384,7 @@
                     onclick={() => handleUnlink(task)}
                     title={t('personal.unlinkTask')}
                   >
-                    <X size={12} class="text-red-600" />
+                    <X size={12} class="text-ds-text-danger" />
                   </button>
                 </div>
               </div>

@@ -28,10 +28,14 @@ CREATE TABLE IF NOT EXISTS llm_provider_model_cache (
 CREATE TABLE IF NOT EXISTS llm_usage (
     id                SERIAL PRIMARY KEY,
     run_id            INTEGER NOT NULL,
+    calls             INTEGER NOT NULL DEFAULT 1,
     model             TEXT NOT NULL,
     prompt_tokens     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
     cost_usd          DOUBLE PRECISION,
     cost_source       TEXT NOT NULL DEFAULT '',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()

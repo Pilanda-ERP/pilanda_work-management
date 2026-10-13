@@ -27,10 +27,11 @@ CREATE TABLE IF NOT EXISTS system_settings (
 CREATE INDEX IF NOT EXISTS idx_system_settings_key ON system_settings(key);
 CREATE INDEX IF NOT EXISTS idx_system_settings_category ON system_settings(category);
 
--- Personal labels table
+-- Personal labels table. Name uniqueness is scoped per user (shared labels
+-- have user_id NULL and share one namespace).
 CREATE TABLE IF NOT EXISTS personal_labels (
 	id SERIAL PRIMARY KEY,
-	name TEXT NOT NULL UNIQUE,
+	name TEXT NOT NULL,
 	color TEXT DEFAULT '#3B82F6',
 	user_id INTEGER,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS personal_labels (
 );
 
 CREATE INDEX IF NOT EXISTS idx_personal_labels_user_id ON personal_labels(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_personal_labels_user_name ON personal_labels(COALESCE(user_id, 0), name);
 
 -- Reviews table
 CREATE TABLE IF NOT EXISTS reviews (
@@ -46,7 +48,7 @@ CREATE TABLE IF NOT EXISTS reviews (
 	user_id INTEGER NOT NULL,
 	review_date DATE NOT NULL,
 	review_type TEXT NOT NULL CHECK (review_type IN ('daily', 'weekly')),
-	review_data TEXT NOT NULL, -- JSON data for unstructured storage
+	review_data JSONB NOT NULL, -- JSON data for unstructured storage
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -84,6 +86,8 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	expires_at TIMESTAMPTZ NULL,
 	last_used_at TIMESTAMPTZ NULL,
 	is_temporary BOOLEAN DEFAULT false,
+	oauth_client_id TEXT,
+	oauth_resource TEXT,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -108,6 +112,7 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 	client_secret_hash TEXT,             -- bcrypt; null for public clients
 	redirect_uris TEXT NOT NULL DEFAULT '[]',
 	allowed_scopes TEXT NOT NULL DEFAULT '[]',
+	resource_uri TEXT,
 	enabled BOOLEAN NOT NULL DEFAULT true,
 	created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -146,6 +151,7 @@ CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
 	code_challenge TEXT,
 	code_challenge_method TEXT,          -- 'S256' | 'plain'
 	state TEXT,
+	resource_uri TEXT,
 	expires_at TIMESTAMPTZ NOT NULL,
 	consumed_at TIMESTAMPTZ,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
@@ -167,6 +173,7 @@ CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
 	user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
 	agent_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
 	scopes TEXT NOT NULL DEFAULT '[]',
+	resource_uri TEXT,
 	expires_at TIMESTAMPTZ NOT NULL,
 	revoked_at TIMESTAMPTZ,
 	rotated_to_id INTEGER REFERENCES oauth_refresh_tokens(id) ON DELETE SET NULL,
@@ -197,6 +204,7 @@ CREATE TABLE IF NOT EXISTS collections (
 	ql_query TEXT,
 	filter_state TEXT,
 	is_public BOOLEAN DEFAULT false,
+	is_private BOOLEAN NOT NULL DEFAULT false,
 	workspace_id INTEGER,
 	category_id INTEGER,
 	created_by INTEGER,
@@ -243,11 +251,15 @@ CREATE TABLE IF NOT EXISTS active_timers (
 CREATE INDEX IF NOT EXISTS idx_active_timers_workspace_id ON active_timers(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_active_timers_item_id ON active_timers(item_id);
 CREATE INDEX IF NOT EXISTS idx_active_timers_project_id ON active_timers(project_id);
-CREATE INDEX IF NOT EXISTS idx_active_timers_user_id ON active_timers(user_id);
+-- A user can have at most one active timer at a time; the UNIQUE index is the
+-- DB-level backstop for concurrent timer starts.
+-- migration: 20260610_active_timers_unique_user
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_timers_user_id ON active_timers(user_id);
 
 -- Themes table
 CREATE TABLE IF NOT EXISTS themes (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL,
 	description TEXT,
 	is_default BOOLEAN DEFAULT false,
@@ -256,20 +268,26 @@ CREATE TABLE IF NOT EXISTS themes (
 	nav_text_color_light TEXT NOT NULL DEFAULT '#374151',
 	nav_background_color_dark TEXT NOT NULL DEFAULT '#1f2937',
 	nav_text_color_dark TEXT NOT NULL DEFAULT '#f3f4f6',
+	logo_url TEXT,
+	logo_url_dark TEXT,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_themes_builtin_key ON themes(builtin_key) WHERE builtin_key IS NOT NULL;
 
 -- Board configuration tables
 CREATE TABLE IF NOT EXISTS board_configurations (
 	id SERIAL PRIMARY KEY,
 	workspace_id INTEGER,
 	collection_id INTEGER,
-	backlog_status_ids TEXT, -- JSON array of status IDs for backlog
-	list_columns TEXT, -- JSON array of list column configurations
-	roadmap_config TEXT, -- JSON object with roadmap view settings
-	card_fields TEXT, -- JSON array of card field configurations
+	backlog_status_ids JSONB, -- JSON array of status IDs for backlog
+	list_columns JSONB, -- JSON array of list column configurations
+	roadmap_config JSONB, -- JSON object with roadmap view settings
+	card_fields JSONB, -- JSON array of card field configurations
+	view_settings JSONB, -- JSON object of view-scoped settings (enabled_views)
 	show_rightmost_column_last_50 BOOLEAN DEFAULT false,
+	completed_item_retention_days INTEGER,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -310,7 +328,7 @@ CREATE TABLE IF NOT EXISTS test_coverage_configurations (
 	id SERIAL PRIMARY KEY,
 	workspace_id INTEGER,
 	collection_id INTEGER,
-	requirement_item_type_ids TEXT, -- JSON array of item type IDs
+	requirement_item_type_ids JSONB, -- JSON array of item type IDs
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -394,6 +412,8 @@ CREATE INDEX IF NOT EXISTS idx_user_item_activities_item_id ON user_item_activit
 CREATE INDEX IF NOT EXISTS idx_user_item_activities_last_viewed ON user_item_activities(last_activity_at);
 CREATE INDEX IF NOT EXISTS idx_item_watches_item_id ON item_watches(item_id);
 CREATE INDEX IF NOT EXISTS idx_item_watches_user_id ON item_watches(user_id);
+-- migration: idx_item_watches_user_active
+CREATE INDEX IF NOT EXISTS idx_item_watches_user_active ON item_watches(user_id, is_active);
 
 -- Request types and fields for portal/channel routing
 -- Note: request_types table is defined in request_types_postgres.sql
@@ -492,6 +512,24 @@ CREATE TABLE IF NOT EXISTS cli_auth_codes (
 CREATE INDEX IF NOT EXISTS idx_cli_auth_codes_code ON cli_auth_codes(code);
 CREATE INDEX IF NOT EXISTS idx_cli_auth_codes_expires_at ON cli_auth_codes(expires_at);
 
+-- Native auth codes (short-lived, single-use). Bridge a system-browser SSO
+-- login back into a native client (desktop/iOS, WI-446): each code is bound
+-- to a session and redeemed once at /api/auth/native/exchange for the encoded
+-- session cookie.
+CREATE TABLE IF NOT EXISTS native_auth_codes (
+	id SERIAL PRIMARY KEY,
+	code TEXT NOT NULL UNIQUE,
+	session_token TEXT NOT NULL,
+	session_expires_at TIMESTAMPTZ NOT NULL,
+	status TEXT NOT NULL DEFAULT 'valid',
+	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+	expires_at TIMESTAMPTZ NOT NULL,
+	consumed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_native_auth_codes_code ON native_auth_codes(code);
+CREATE INDEX IF NOT EXISTS idx_native_auth_codes_expires_at ON native_auth_codes(expires_at);
+
 -- Background scheduler runs: one row per tick of each in-process scheduler
 -- (briefing, email, recurrence, notification). Surfaced on the admin
 -- Diagnostics page so admins can see whether jobs ran on time, how long they
@@ -533,6 +571,8 @@ CREATE TABLE IF NOT EXISTS pending_custom_field_cleanups (
 	started_at TIMESTAMPTZ,
 	completed_at TIMESTAMPTZ,
 	items_processed INTEGER NOT NULL DEFAULT 0,
+	attempt_count INTEGER NOT NULL DEFAULT 0,
+	next_attempt_at TIMESTAMPTZ,
 	error_message TEXT
 );
 

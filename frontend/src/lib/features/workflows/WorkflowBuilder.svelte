@@ -11,7 +11,7 @@
   import Card from '../../components/Card.svelte';
   import PageHeader from '../../layout/PageHeader.svelte';
   import DataTable from '../../components/DataTable.svelte';
-  import Textarea from '../../components/Textarea.svelte';
+  import Input from '../../components/Input.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
   import Modal from '../../dialogs/Modal.svelte';
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
@@ -19,6 +19,9 @@
   import Checkbox from '../../components/Checkbox.svelte';
   import SearchInput from '../../components/SearchInput.svelte';
   import { toHotkeyString } from '../../utils/keyboardShortcuts.js';
+  import { objectDisplayValue } from '../../utils/systemLabels.js';
+  import LocalizedObjectFields from '../../settings/LocalizedObjectFields.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
 
   let workflows = $state([]);
   let searchQuery = $state('');
@@ -27,7 +30,10 @@
   let loadingStatuses = $state(true);
   let creating = $state(false);
   let editingId = $state(null);
-  let nameInput;
+  let nameInput = $state(null);
+  let editingObject = $state(null);
+  let translationEditor = $state(null);
+  let saving = $state(false);
 
   // Form state
   let newWorkflow = $state({
@@ -42,6 +48,10 @@
     is_default: false
   });
 
+  function getWorkflowDisplayValue(workflow, field) {
+    return objectDisplayValue(workflow, field, 'workflow');
+  }
+
   onMount(async () => {
     await loadStatuses();
     await loadWorkflows();
@@ -49,7 +59,7 @@
 
   async function loadStatuses() {
     try {
-      statuses = await api.get('/statuses');
+      statuses = await api.statuses.getAll();
       loadingStatuses = false;
     } catch (error) {
       console.error('Failed to load statuses:', error);
@@ -59,7 +69,7 @@
 
   async function loadWorkflows() {
     try {
-      const result = await api.get('/workflows');
+      const result = await api.workflows.getAll();
       workflows = result;
       loading = false;
     } catch (error) {
@@ -88,13 +98,15 @@
   }
 
   async function createWorkflow() {
+    if (saving) return;
     if (!newWorkflow.name.trim()) {
       errorToast(t('workflows.enterWorkflowName'));
       return;
     }
 
+    saving = true;
     try {
-      const created = await api.post('/workflows', newWorkflow);
+      const created = await api.workflows.create(newWorkflow);
       workflows = [...workflows, created];
       creating = false;
       newWorkflow = { name: '', description: '', is_default: false };
@@ -102,10 +114,13 @@
     } catch (error) {
       console.error('Failed to create workflow:', error);
       errorToast(t('dialogs.alerts.failedToCreate', { error: error.message || error }));
+    } finally {
+      saving = false;
     }
   }
 
   function startEdit(workflow) {
+    editingObject = workflow;
     editingId = workflow.id;
     editWorkflow = {
       name: workflow.name,
@@ -116,29 +131,36 @@
 
   function cancelEdit() {
     editingId = null;
+    editingObject = null;
   }
 
   async function updateWorkflow() {
+    if (saving) return;
     if (!editWorkflow.name.trim()) {
       errorToast(t('workflows.enterWorkflowName'));
       return;
     }
 
+    saving = true;
     try {
-      const updated = await api.put(`/workflows/${editingId}`, editWorkflow);
-      workflows = workflows.map(w => w.id === editingId ? updated : w);
+      translationEditor?.validate();
+      await api.workflows.update(editingId, editWorkflow);
+      await translationEditor?.save();
+      await loadWorkflows();
       editingId = null;
       window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
     } catch (error) {
       console.error('Failed to update workflow:', error);
       errorToast(t('dialogs.alerts.failedToUpdate', { error: error.message || error }));
+    } finally {
+      saving = false;
     }
   }
 
   async function deleteWorkflow(workflow) {
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: t('workflows.confirmDeleteWorkflow', { name: workflow.name }),
+      message: t('workflows.confirmDeleteWorkflow', { name: getWorkflowDisplayValue(workflow, 'name') }),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger'
@@ -146,7 +168,7 @@
     if (!confirmed) return;
 
     try {
-      await api.delete(`/workflows/${workflow.id}`);
+      await api.workflows.delete(workflow.id);
       workflows = workflows.filter(wf => wf.id !== workflow.id);
       await loadWorkflows();
       window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
@@ -163,7 +185,7 @@
         type: 'regular',
         icon: ArrowRight,
         title: t('workflows.design'),
-        hoverClass: 'hover:bg-blue-50',
+        hoverClass: 'hover:bg-ds-accent-blue-subtle',
         onClick: () => navigate(`/workflows/${workflow.id}/design`)
       },
       {
@@ -192,7 +214,9 @@
     const query = searchQuery.toLowerCase();
     return (
       wf.name?.toLowerCase().includes(query) ||
-      wf.description?.toLowerCase().includes(query)
+      wf.description?.toLowerCase().includes(query) ||
+      getWorkflowDisplayValue(wf, 'name').toLowerCase().includes(query) ||
+      getWorkflowDisplayValue(wf, 'description').toLowerCase().includes(query)
     );
   }));
 
@@ -202,12 +226,12 @@
       key: 'workflow',
       label: t('workflows.workflow'),
       slot: 'workflow',
-      render: (workflow) => workflow.name // Fallback if slot doesn't work
+      render: (workflow) => getWorkflowDisplayValue(workflow, 'name') // Fallback if slot doesn't work
     },
     {
       key: 'description',
       label: t('common.description'),
-      render: (workflow) => workflow.description || '—',
+      render: (workflow) => getWorkflowDisplayValue(workflow, 'description') || '—',
       textColor: 'var(--ds-text-subtle)'
     },
     {
@@ -273,7 +297,7 @@
     >
       {#snippet workflow(item)}
         <div class="flex items-center gap-3">
-          <h3 class="font-medium" style="color: var(--ds-text);">{item.name}</h3>
+          <h3 class="font-medium" style="color: var(--ds-text);">{getWorkflowDisplayValue(item, 'name')}</h3>
           {#if item.is_default}
             <Lozenge color="green" text={t('common.default')} />
           {/if}
@@ -283,7 +307,8 @@
 </div>
 
 <!-- Create Workflow Modal -->
-<Modal isOpen={creating} onclose={cancelCreate} maxWidth="max-w-lg">
+<Modal isOpen={creating} onclose={cancelCreate} onSubmit={createWorkflow} submitDisabled={saving} maxWidth="max-w-lg">
+  {#snippet children(submitHint)}
   <ModalHeader title={t('workflows.createWorkflow')} showCloseButton={false} />
 
   <div class="px-6 py-4">
@@ -291,23 +316,23 @@
       <div class="space-y-4">
         <div>
           <Label color="default" required class="mb-2">{t('common.name')}</Label>
-          <input
+          <Input
             type="text"
             bind:value={newWorkflow.name}
-            bind:this={nameInput}
+            bind:inputRef={nameInput}
             placeholder={t('workflows.workflowNamePlaceholder')}
-            class="w-full px-3 py-2 rounded focus:outline-none focus:ring-2"
-            style="border: 1px solid var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+            size="small"
             required
           />
         </div>
 
         <div>
-          <Label color="default" class="mb-2">{t('common.description')}</Label>
-          <Textarea
-            bind:value={newWorkflow.description}
+          <TextareaField
+            label={t('common.description')}
+            labelColor="default"
             placeholder={t('workflows.descriptionPlaceholder')}
             rows={2}
+            bind:value={newWorkflow.description}
           />
         </div>
 
@@ -322,39 +347,34 @@
         <Button type="button" onclick={cancelCreate}>
           {t('common.cancel')}
         </Button>
-        <Button variant="primary" type="submit">
+        <Button variant="primary" type="submit" keyboardHint={submitHint} loading={saving}>
           {t('workflows.createWorkflow')}
         </Button>
       </div>
     </form>
   </div>
+  {/snippet}
 </Modal>
 
 <!-- Edit Workflow Modal -->
-<Modal isOpen={editingId !== null} onclose={cancelEdit} maxWidth="max-w-lg">
+<Modal isOpen={editingId !== null} onclose={cancelEdit} onSubmit={updateWorkflow} submitDisabled={saving} maxWidth="max-w-lg">
+  {#snippet children(submitHint)}
   <ModalHeader title={t('workflows.editWorkflow')} showCloseButton={false} />
 
   <div class="px-6 py-4">
     <form onsubmit={(e) => { e.preventDefault(); updateWorkflow(); }}>
       <div class="space-y-4">
-        <div>
-          <Label color="default" required class="mb-2">{t('common.name')}</Label>
-          <input
-            type="text"
-            bind:value={editWorkflow.name}
-            class="w-full px-3 py-2 rounded focus:outline-none focus:ring-2"
-            style="border: 1px solid var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-            required
+        {#key editingId}
+          <LocalizedObjectFields
+            bind:this={translationEditor}
+            objectType="workflow"
+            objectId={editingId}
+            bind:canonicalName={editWorkflow.name}
+            bind:canonicalDescription={editWorkflow.description}
+            displayName={editingObject?.display_name || editingObject?.name}
+            displayDescription={editingObject?.display_description || editingObject?.description}
           />
-        </div>
-
-        <div>
-          <Label color="default" class="mb-2">{t('common.description')}</Label>
-          <Textarea
-            bind:value={editWorkflow.description}
-            rows={2}
-          />
-        </div>
+        {/key}
 
         <Checkbox
           bind:checked={editWorkflow.is_default}
@@ -367,11 +387,11 @@
         <Button type="button" onclick={cancelEdit}>
           {t('common.cancel')}
         </Button>
-        <Button variant="primary" type="submit">
+        <Button variant="primary" type="submit" keyboardHint={submitHint} loading={saving}>
           {t('common.saveChanges')}
         </Button>
       </div>
     </form>
   </div>
+  {/snippet}
 </Modal>
-

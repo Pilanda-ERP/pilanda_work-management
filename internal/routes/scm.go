@@ -11,6 +11,7 @@ func RegisterSCMRoutes(deps *Deps) {
 	api := deps.API
 	auth := deps.AuthMiddleware.RequireAuth
 	admin := deps.PermissionMiddleware.RequireSystemAdmin()
+	channelMgmt := deps.PermissionMiddleware.RequireChannelManagement()
 
 	// SCM Provider endpoints
 	api.HandleH("GET /admin/scm-providers", admin(http.HandlerFunc(deps.SCM.Provider.GetProviders)))
@@ -32,7 +33,10 @@ func RegisterSCMRoutes(deps *Deps) {
 
 	// SCM OAuth endpoints
 	api.HandleH("GET /scm/oauth/{slug}/start", auth(http.HandlerFunc(deps.SCM.Provider.StartOAuth)))
-	api.Handle("GET /scm/oauth/{slug}/callback", deps.SCM.Provider.OAuthCallback)
+	// OptionalAuth so the callback can bind the completing browser to the
+	// account that started the flow; the handler rejects unauthenticated or
+	// mismatched callers.
+	api.HandleH("GET /scm/oauth/{slug}/callback", deps.AuthMiddleware.OptionalAuth(http.HandlerFunc(deps.SCM.Provider.OAuthCallback)))
 
 	// Email Provider endpoints
 	api.HandleH("GET /admin/email-providers", admin(http.HandlerFunc(deps.SCM.EmailProvider.GetEmailProviders)))
@@ -40,13 +44,17 @@ func RegisterSCMRoutes(deps *Deps) {
 	api.HandleH("GET /admin/email-providers/{id}", admin(http.HandlerFunc(deps.SCM.EmailProvider.GetEmailProvider)))
 	api.HandleH("PUT /admin/email-providers/{id}", admin(http.HandlerFunc(deps.SCM.EmailProvider.UpdateEmailProvider)))
 	api.HandleH("DELETE /admin/email-providers/{id}", admin(http.HandlerFunc(deps.SCM.EmailProvider.DeleteEmailProvider)))
-	api.HandleH("POST /channels/{channel_id}/email-providers/{slug}/oauth/start", auth(http.HandlerFunc(deps.SCM.EmailProvider.StartEmailOAuth)))
-	api.Handle("GET /email/oauth/{slug}/callback", http.HandlerFunc(deps.SCM.EmailProvider.EmailOAuthCallback))
-	api.HandleH("POST /channels/{id}/test-email", auth(http.HandlerFunc(deps.SCM.EmailProvider.TestEmailChannel)))
+	api.HandleH("POST /channels/{channel_id}/email-providers/{slug}/oauth/start", channelMgmt(http.HandlerFunc(deps.SCM.EmailProvider.StartEmailOAuth)))
+	// OptionalAuth so the callback can bind the completing browser to the
+	// account that started the flow; the handler rejects unauthenticated or
+	// mismatched callers.
+	api.HandleH("GET /email/oauth/{slug}/callback", deps.AuthMiddleware.OptionalAuth(http.HandlerFunc(deps.SCM.EmailProvider.EmailOAuthCallback)))
+	api.HandleH("POST /channels/{id}/test-email", channelMgmt(http.HandlerFunc(deps.SCM.EmailProvider.TestEmailChannel)))
 
 	// Workspace SCM connection endpoints
 	wsView := deps.PermissionMiddleware.RequireWorkspacePermission(models.PermissionItemView)
 	wsAdmin := deps.PermissionMiddleware.RequireWorkspacePermission(models.PermissionWorkspaceAdmin)
+	api.HandleH("GET /scm-connections", auth(http.HandlerFunc(deps.SCM.Workspace.GetAccessibleSCMConnections)))
 	api.HandleH("GET /workspaces/{id}/scm-providers", auth(wsView(http.HandlerFunc(deps.SCM.Workspace.GetAvailableSCMProviders))))
 	api.HandleH("GET /workspaces/{id}/scm-connections", auth(wsView(http.HandlerFunc(deps.SCM.Workspace.GetWorkspaceSCMConnections))))
 	api.HandleH("POST /workspaces/{id}/scm-connections", auth(wsAdmin(http.HandlerFunc(deps.SCM.Workspace.CreateWorkspaceSCMConnection))))
@@ -65,6 +73,11 @@ func RegisterSCMRoutes(deps *Deps) {
 	api.HandleH("DELETE /workspaces/{id}/scm-connections/{connId}/auth", auth(wsAdmin(http.HandlerFunc(deps.SCM.Workspace.ClearWorkspaceCredentials))))
 	api.HandleH("GET /workspaces/{id}/scm-connections/{connId}/auth/status", auth(wsView(http.HandlerFunc(deps.SCM.Workspace.GetWorkspaceConnectionAuthStatus))))
 	api.HandleH("POST /workspace-repositories/{repoId}/sync", auth(http.HandlerFunc(deps.SCM.ItemLinks.SyncWorkspaceRepository)))
+	api.HandleH("GET /workspace-repositories/{repoId}/release-candidates", auth(http.HandlerFunc(deps.SCM.ItemLinks.ListReleaseCandidates)))
+	api.HandleH("GET /workspace-repositories/{repoId}/webhook", auth(http.HandlerFunc(deps.SCM.ItemLinks.GetGitLabWebhookConfig)))
+	api.HandleH("POST /workspace-repositories/{repoId}/webhook/rotate-secret", auth(http.HandlerFunc(deps.SCM.ItemLinks.RotateGitLabWebhookSecret)))
+	api.HandleH("DELETE /workspace-repositories/{repoId}/webhook", auth(http.HandlerFunc(deps.SCM.ItemLinks.DeleteGitLabWebhookConfig)))
+	api.HandleH("POST /scm/webhooks/gitlab/{webhookKey}", deps.WebhookLimiter.Limit(http.HandlerFunc(deps.SCM.ItemLinks.ReceiveGitLabWebhook)))
 
 	// Item SCM Links endpoints
 	api.HandleH("GET /items/{id}/scm-links", auth(http.HandlerFunc(deps.SCM.ItemLinks.GetItemSCMLinks)))

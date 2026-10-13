@@ -1,8 +1,11 @@
 <script>
   import { Search, Plus, X, AlertCircle } from '@lucide/svelte';
-  import { itemTypeIconMap, priorityIconMap } from '../utils/icons.js';
+  import { priorityIconMap } from '../utils/icons.js';
+  import ItemTypeIcon from '../components/ItemTypeIcon.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
+  import { isGenericSubtaskType } from '../utils/hierarchy.js';
+  import Input from '../components/Input.svelte';
 
   // Entity type determines rendering behavior
   let {
@@ -34,10 +37,9 @@
   async function addEntity(entityId) {
     // Check for conflicts (workspaces assigned elsewhere)
     if (entityAssignments[entityId]) {
-      const assignment = entityAssignments[entityId];
       const confirmed = await confirm({
         title: t('common.confirm'),
-        message: t('pickers.entityAlreadyAssigned', { entity: getEntityLabel(), configSetName: assignment.configSetName }),
+        message: t('pickers.entityAlreadyAssigned', { label: getEntityLabel() }),
         confirmText: t('common.confirm'),
         cancelText: t('common.cancel'),
         variant: 'warning'
@@ -74,12 +76,13 @@
   <!-- Search input -->
   <div class="relative">
     <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style="color: var(--ds-icon-subtle);" />
-    <input
+    <Input
+      dataTestid={`${entityType}-search`}
       type="text"
       placeholder={t('pickers.searchEntities', { entities: getEntityLabelPlural() })}
       bind:value={searchQuery}
-      class="w-full pl-9 pr-4 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-      style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+      class="pl-9"
+      size="small"
     />
   </div>
 
@@ -95,25 +98,30 @@
     {:else}
       <div class="border rounded-lg" style="border-color: var(--ds-border);">
         {#each assignedEntities as entity, i}
-          <div class="flex items-center justify-between p-3" style="background-color: var(--ds-surface);{i > 0 ? ' border-top: 1px solid var(--ds-border);' : ''}">
+          <div
+            data-testid={`${entityType}-assigned-${entity.id}`}
+            class="flex items-center justify-between p-3"
+            style="background-color: var(--ds-surface);{i > 0 ? ' border-top: 1px solid var(--ds-border);' : ''}"
+          >
             <div class="flex items-center gap-3 min-w-0">
               {#if entityType === 'priorities' || entityType === 'item-types'}
-                <div
-                  class="w-6 h-6 rounded flex items-center justify-center flex-shrink-0"
-                  style="background-color: {entityType === 'item-types' ? entity.color || '#3b82f6' : (entity.color || '#3b82f6') + '20'};"
-                >
-                  {#if entityType === 'item-types' && entity.icon && itemTypeIconMap[entity.icon]}
-                    {@const EntityIcon = itemTypeIconMap[entity.icon]}
-                    <EntityIcon class="w-4 h-4 text-white" />
-                  {:else if entityType === 'priorities' && entity.icon && priorityIconMap[entity.icon]}
-                    {@const EntityIcon = priorityIconMap[entity.icon]}
-                    <EntityIcon class="w-4 h-4" style="color: {entity.color || '#3b82f6'};" />
-                  {:else}
-                    <span style="color: {entityType === 'item-types' ? 'white' : entity.color || '#3b82f6'}; font-size: 12px;" class="font-medium">
-                      {entity.name?.charAt(0) || '?'}
-                    </span>
-                  {/if}
-                </div>
+                {#if entityType === 'item-types'}
+                  <ItemTypeIcon itemType={entity} />
+                {:else}
+                  <div
+                    class="w-6 h-6 rounded flex items-center justify-center flex-shrink-0"
+                    style="background-color: {(entity.color || '#3b82f6') + '20'};"
+                  >
+                    {#if entity.icon && priorityIconMap[entity.icon]}
+                      {@const EntityIcon = priorityIconMap[entity.icon]}
+                      <EntityIcon class="w-4 h-4" style="color: {entity.color || '#3b82f6'};" />
+                    {:else}
+                      <span style="color: {entity.color || '#3b82f6'}; font-size: 12px;" class="font-medium">
+                        {entity.name?.charAt(0) || '?'}
+                      </span>
+                    {/if}
+                  </div>
+                {/if}
               {/if}
               <div class="min-w-0">
                 <div class="font-medium text-sm truncate" style="color: var(--ds-text);">
@@ -125,12 +133,15 @@
                   </div>
                 {:else if entityType === 'item-types' && entity.hierarchy_level !== undefined}
                   <div class="text-xs" style="color: var(--ds-text-subtle);">
-                    {t('pickers.level')} {entity.hierarchy_level}
+                    {isGenericSubtaskType(entity)
+                      ? t('items.genericSubtaskLevelLabel')
+                      : `${t('pickers.level')} ${entity.hierarchy_level}`}
                   </div>
                 {/if}
               </div>
             </div>
             <button
+              data-testid={`${entityType}-remove-${entity.id}`}
               type="button"
               onclick={() => removeEntity(entity.id)}
               class="p-1 rounded hover-danger transition-colors flex-shrink-0"
@@ -162,25 +173,30 @@
       <div class="border rounded-lg max-h-60 overflow-y-auto" style="border-color: var(--ds-border);">
         {#each availableEntities as entity, i}
           {@const otherAssignment = entityAssignments[entity.id]}
-          <div class="flex items-center justify-between p-3" style="background-color: var(--ds-surface);{i > 0 ? ' border-top: 1px solid var(--ds-border);' : ''}">
+          <div
+            data-testid={`${entityType}-available-${entity.id}`}
+            class="flex items-center justify-between p-3"
+            style="background-color: var(--ds-surface);{i > 0 ? ' border-top: 1px solid var(--ds-border);' : ''}"
+          >
             <div class="flex items-center gap-3 min-w-0 flex-1">
               {#if entityType === 'priorities' || entityType === 'item-types'}
-                <div
-                  class="w-6 h-6 rounded flex items-center justify-center flex-shrink-0"
-                  style="background-color: {entityType === 'item-types' ? entity.color || '#3b82f6' : (entity.color || '#3b82f6') + '20'};"
-                >
-                  {#if entityType === 'item-types' && entity.icon && itemTypeIconMap[entity.icon]}
-                    {@const EntityIcon = itemTypeIconMap[entity.icon]}
-                    <EntityIcon class="w-4 h-4 text-white" />
-                  {:else if entityType === 'priorities' && entity.icon && priorityIconMap[entity.icon]}
-                    {@const EntityIcon = priorityIconMap[entity.icon]}
-                    <EntityIcon class="w-4 h-4" style="color: {entity.color || '#3b82f6'};" />
-                  {:else}
-                    <span style="color: {entityType === 'item-types' ? 'white' : entity.color || '#3b82f6'}; font-size: 12px;" class="font-medium">
-                      {entity.name?.charAt(0) || '?'}
-                    </span>
-                  {/if}
-                </div>
+                {#if entityType === 'item-types'}
+                  <ItemTypeIcon itemType={entity} />
+                {:else}
+                  <div
+                    class="w-6 h-6 rounded flex items-center justify-center flex-shrink-0"
+                    style="background-color: {(entity.color || '#3b82f6') + '20'};"
+                  >
+                    {#if entity.icon && priorityIconMap[entity.icon]}
+                      {@const EntityIcon = priorityIconMap[entity.icon]}
+                      <EntityIcon class="w-4 h-4" style="color: {entity.color || '#3b82f6'};" />
+                    {:else}
+                      <span style="color: {entity.color || '#3b82f6'}; font-size: 12px;" class="font-medium">
+                        {entity.name?.charAt(0) || '?'}
+                      </span>
+                    {/if}
+                  </div>
+                {/if}
               {/if}
               <div class="min-w-0 flex-1">
                 <div class="font-medium text-sm truncate" style="color: var(--ds-text);">
@@ -192,7 +208,9 @@
                   </div>
                 {:else if entityType === 'item-types' && entity.hierarchy_level !== undefined}
                   <div class="text-xs" style="color: var(--ds-text-subtle);">
-                    {t('pickers.level')} {entity.hierarchy_level}
+                    {isGenericSubtaskType(entity)
+                      ? t('items.genericSubtaskLevelLabel')
+                      : `${t('pickers.level')} ${entity.hierarchy_level}`}
                   </div>
                 {/if}
               </div>
@@ -204,9 +222,10 @@
               {/if}
             </div>
             <button
+              data-testid={`${entityType}-add-${entity.id}`}
               type="button"
               onclick={() => addEntity(entity.id)}
-              class="p-1 rounded hover:bg-blue-50 transition-colors flex-shrink-0 ml-2"
+              class="p-1 rounded hover:bg-ds-accent-blue-subtle transition-colors flex-shrink-0 ml-2"
               style="color: var(--ds-interactive);"
               title={t('common.add')}
             >

@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -41,7 +42,38 @@ func (r *ItemRepository) GetItemTypeAndHierarchyLevel(itemID int) (typeID *int, 
 
 // GetChildren returns direct children of an item
 func (r *ItemRepository) GetChildren(parentID int) ([]*models.Item, error) {
-	rows, err := r.db.Query(`
+	return r.GetChildrenContext(context.Background(), parentID)
+}
+
+// GetChildrenContext is the request-aware form of GetChildren.
+func (r *ItemRepository) GetChildrenContext(ctx context.Context, parentID int) ([]*models.Item, error) {
+	return r.getChildrenContext(ctx, parentID, nil)
+}
+
+// GetChildrenInWorkspacesContext returns direct children whose workspace is in
+// workspaceIDs. Callers pass the caller's accessible workspaces so children that
+// live in another workspace are not disclosed by a parent the caller can see.
+// An empty or nil workspaceIDs returns no children; internal callers that need
+// every child use GetChildrenContext.
+func (r *ItemRepository) GetChildrenInWorkspacesContext(ctx context.Context, parentID int, workspaceIDs []int) ([]*models.Item, error) {
+	if len(workspaceIDs) == 0 {
+		return []*models.Item{}, nil
+	}
+	return r.getChildrenContext(ctx, parentID, workspaceIDs)
+}
+
+func (r *ItemRepository) getChildrenContext(ctx context.Context, parentID int, workspaceIDs []int) ([]*models.Item, error) {
+	where := "WHERE i.parent_id = ?"
+	args := []any{parentID}
+	if workspaceIDs != nil {
+		placeholders := make([]string, len(workspaceIDs))
+		for i, id := range workspaceIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		where += " AND i.workspace_id IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	rows, err := r.db.QueryContext(ctx, `
 		SELECT i.id, i.workspace_id, i.workspace_item_number, i.item_type_id, i.title, i.description,
 		       i.status_id, i.priority_id, i.due_date, i.is_task, i.iteration_id,
 		       i.project_id, i.inherit_project, i.assignee_id, i.creator_id, i.custom_field_values,
@@ -49,6 +81,7 @@ func (r *ItemRepository) GetChildren(parentID int) ([]*models.Item, error) {
 		       w.name as workspace_name, w.key as workspace_key,
 		       pri.name as priority_name, pri.icon as priority_icon, pri.color as priority_color,
 		       s.name as status_name, sc.color as status_color,
+		       s.builtin_key as status_builtin_key,
 		       it.name as item_type_name
 		FROM items i
 		JOIN workspaces w ON i.workspace_id = w.id
@@ -56,9 +89,9 @@ func (r *ItemRepository) GetChildren(parentID int) ([]*models.Item, error) {
 		LEFT JOIN statuses s ON i.status_id = s.id
 		LEFT JOIN status_categories sc ON s.category_id = sc.id
 		LEFT JOIN item_types it ON i.item_type_id = it.id
-		WHERE i.parent_id = ?
+		`+where+`
 		ORDER BY i.frac_index
-	`, parentID)
+	`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get children: %w", err)
 	}
@@ -72,12 +105,38 @@ func (r *ItemRepository) GetDescendants(parentID int) ([]*models.Item, error) {
 	return r.GetDescendantsWithMaxDepth(parentID, maxItemHierarchyDepth)
 }
 
+// IsDescendantContext reports whether itemID is reachable from ancestorID
+// through the live parent_id chain, capped at the maximum hierarchy depth.
+// The materialized items.path column is not maintained by regular writes and
+// must not anchor ancestry checks.
+func (r *ItemRepository) IsDescendantContext(ctx context.Context, ancestorID, itemID int) (bool, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx, `
+		WITH RECURSIVE descendants(id, level) AS (
+			SELECT id, 1 FROM items WHERE parent_id = ?
+			UNION ALL
+			SELECT i.id, d.level + 1 FROM items i INNER JOIN descendants d ON i.parent_id = d.id WHERE d.level < ?
+		)
+		SELECT COUNT(*) FROM descendants WHERE id = ?
+	`, ancestorID, maxItemHierarchyDepth, itemID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check whether item %d descends from item %d: %w", itemID, ancestorID, err)
+	}
+	return count > 0, nil
+}
+
 // GetDescendantsWithMaxDepth returns descendants up to maxDepth levels deep.
 func (r *ItemRepository) GetDescendantsWithMaxDepth(parentID, maxDepth int) ([]*models.Item, error) {
+	return r.GetDescendantsWithMaxDepthContext(context.Background(), parentID, maxDepth)
+}
+
+// GetDescendantsWithMaxDepthContext is the request-aware form of
+// GetDescendantsWithMaxDepth.
+func (r *ItemRepository) GetDescendantsWithMaxDepthContext(ctx context.Context, parentID, maxDepth int) ([]*models.Item, error) {
 	if maxDepth <= 0 || maxDepth > maxItemHierarchyDepth {
 		maxDepth = maxItemHierarchyDepth
 	}
-	rows, err := r.db.Query(`
+	rows, err := r.db.QueryContext(ctx, `
 		WITH RECURSIVE descendants AS (
 			SELECT id, parent_id, 1 as level
 			FROM items
@@ -95,6 +154,7 @@ func (r *ItemRepository) GetDescendantsWithMaxDepth(parentID, maxDepth int) ([]*
 		       w.name as workspace_name, w.key as workspace_key,
 		       pri.name as priority_name, pri.icon as priority_icon, pri.color as priority_color,
 		       s.name as status_name, sc.color as status_color,
+		       s.builtin_key as status_builtin_key,
 		       it.name as item_type_name,
 		       d.level
 		FROM items i
@@ -118,14 +178,17 @@ func (r *ItemRepository) GetDescendantsWithMaxDepth(parentID, maxDepth int) ([]*
 func (r *ItemRepository) GetAncestors(itemID int) ([]*models.Item, error) {
 	rows, err := r.db.Query(`
 		WITH RECURSIVE ancestors AS (
-			SELECT id, parent_id, 0 as level
-			FROM items
-			WHERE id = ?
-			UNION ALL
-			SELECT i.id, i.parent_id, a.level + 1
+			SELECT i.id, i.parent_id, 0 as level, it.hierarchy_level
 			FROM items i
+			LEFT JOIN item_types it ON i.item_type_id = it.id
+			WHERE i.id = ?
+			UNION ALL
+			SELECT i.id, i.parent_id, a.level + 1, it.hierarchy_level
+			FROM items i
+			LEFT JOIN item_types it ON i.item_type_id = it.id
 			INNER JOIN ancestors a ON i.id = a.parent_id
 			WHERE a.level < ?
+			  AND COALESCE(a.hierarchy_level, -999) != 0
 		)
 		SELECT i.id, i.workspace_id, i.workspace_item_number, i.item_type_id, i.title, i.description,
 		       i.status_id, i.priority_id, i.due_date, i.is_task, i.iteration_id,
@@ -134,6 +197,7 @@ func (r *ItemRepository) GetAncestors(itemID int) ([]*models.Item, error) {
 		       w.name as workspace_name, w.key as workspace_key,
 		       pri.name as priority_name, pri.icon as priority_icon, pri.color as priority_color,
 		       s.name as status_name, sc.color as status_color,
+		       s.builtin_key as status_builtin_key,
 		       it.name as item_type_name
 		FROM items i
 		INNER JOIN ancestors a ON i.id = a.id
@@ -158,16 +222,22 @@ func (r *ItemRepository) GetAncestors(itemID int) ([]*models.Item, error) {
 // so cycle-safety tests and callers with minimal hierarchy fixtures do not need
 // the full item-detail schema.
 func (r *ItemRepository) GetAncestorsForHierarchy(itemID, maxDepth int) ([]models.Item, error) {
+	return r.GetAncestorsForHierarchyContext(context.Background(), itemID, maxDepth)
+}
+
+// GetAncestorsForHierarchyContext is the request-aware form of
+// GetAncestorsForHierarchy.
+func (r *ItemRepository) GetAncestorsForHierarchyContext(ctx context.Context, itemID, maxDepth int) ([]models.Item, error) {
 	if maxDepth <= 0 || maxDepth > maxItemHierarchyDepth {
 		maxDepth = maxItemHierarchyDepth
 	}
-	rows, err := r.db.Query(`
+	rows, err := r.db.QueryContext(ctx, `
 		WITH RECURSIVE ancestors AS (
 			SELECT i.id, i.workspace_id, i.workspace_item_number, i.item_type_id, i.title, i.description, i.is_task,
 			       i.assignee_id, i.creator_id, i.custom_field_values, i.parent_id,
 			       i.created_at, i.updated_at,
 			       w.name as workspace_name, w.key as workspace_key, it.name as item_type_name, it.color as item_type_color, it.icon as item_type_icon,
-			       0 as level
+			       0 as level, it.hierarchy_level
 			FROM items i
 			JOIN workspaces w ON i.workspace_id = w.id
 			LEFT JOIN item_types it ON i.item_type_id = it.id
@@ -179,12 +249,13 @@ func (r *ItemRepository) GetAncestorsForHierarchy(itemID, maxDepth int) ([]model
 			       p.assignee_id, p.creator_id, p.custom_field_values, p.parent_id,
 			       p.created_at, p.updated_at,
 			       w.name as workspace_name, w.key as workspace_key, it.name as item_type_name, it.color as item_type_color, it.icon as item_type_icon,
-			       a.level + 1 as level
+			       a.level + 1 as level, it.hierarchy_level
 			FROM items p
 			JOIN workspaces w ON p.workspace_id = w.id
 			LEFT JOIN item_types it ON p.item_type_id = it.id
 			JOIN ancestors a ON p.id = a.parent_id
 			WHERE a.level < ?
+			  AND COALESCE(a.hierarchy_level, -999) != 0
 		)
 		SELECT id, workspace_id, workspace_item_number, item_type_id, title, description, is_task,
 		       assignee_id, creator_id, custom_field_values, parent_id,
@@ -202,32 +273,154 @@ func (r *ItemRepository) GetAncestorsForHierarchy(itemID, maxDepth int) ([]model
 	var ancestors []models.Item
 	for rows.Next() {
 		var item models.Item
-		var itemTypeID, assigneeID, creatorID, parentID sql.NullInt64
-		var customFieldValuesJSON sql.NullString
-		var workspaceName, workspaceKey, itemTypeName, itemTypeColor, itemTypeIcon sql.NullString
-		var level int
-		if err := rows.Scan(
-			&item.ID, &item.WorkspaceID, &item.WorkspaceItemNumber, &itemTypeID, &item.Title, &item.Description, &item.IsTask,
-			&assigneeID, &creatorID, &customFieldValuesJSON, &parentID,
-			&item.CreatedAt, &item.UpdatedAt,
-			&workspaceName, &workspaceKey, &itemTypeName, &itemTypeColor, &itemTypeIcon, &level,
-		); err != nil {
+		if err := scanAncestorItem(rows, &item); err != nil {
 			return nil, fmt.Errorf("failed to scan ancestor: %w", err)
 		}
-		_ = level
-		_ = itemTypeColor
-		_ = itemTypeIcon
-		assignNullableInt(&item.ItemTypeID, itemTypeID)
-		assignNullableInt(&item.AssigneeID, assigneeID)
-		assignNullableInt(&item.CreatorID, creatorID)
-		assignNullableInt(&item.ParentID, parentID)
-		assignNullableString(&item.WorkspaceName, workspaceName)
-		assignNullableString(&item.WorkspaceKey, workspaceKey)
-		assignNullableString(&item.ItemTypeName, itemTypeName)
-		item.CustomFieldValues = parseCustomFieldsJSON(customFieldValuesJSON)
 		ancestors = append(ancestors, item)
 	}
 	return ancestors, rows.Err()
+}
+
+// scanAncestorItem reads one row of the shared ancestor SELECT column list:
+// id, workspace_id, workspace_item_number, item_type_id, title, description,
+// is_task, assignee_id, creator_id, custom_field_values, parent_id,
+// created_at, updated_at, workspace_name, workspace_key, item_type_name,
+// item_type_color, item_type_icon, level. Leading targets, when given, precede
+// the shared columns. This is the lightweight projection consumed by
+// HierarchyService — status/priority are intentionally absent so minimal
+// hierarchy fixtures do not need the full item-detail schema.
+func scanAncestorItem(rows *sql.Rows, item *models.Item, leading ...any) error {
+	var itemTypeID, assigneeID, creatorID, parentID sql.NullInt64
+	var customFieldValuesJSON sql.NullString
+	var workspaceName, workspaceKey, itemTypeName, itemTypeColor, itemTypeIcon sql.NullString
+	var level int
+	dest := make([]any, 0, len(leading)+19)
+	dest = append(dest, leading...)
+	dest = append(dest,
+		&item.ID, &item.WorkspaceID, &item.WorkspaceItemNumber, &itemTypeID, &item.Title, &item.Description, &item.IsTask,
+		&assigneeID, &creatorID, &customFieldValuesJSON, &parentID,
+		&item.CreatedAt, &item.UpdatedAt,
+		&workspaceName, &workspaceKey, &itemTypeName, &itemTypeColor, &itemTypeIcon, &level,
+	)
+	if err := rows.Scan(dest...); err != nil {
+		return err
+	}
+	_ = level
+	assignNullableInt(&item.ItemTypeID, itemTypeID)
+	assignNullableInt(&item.AssigneeID, assigneeID)
+	assignNullableInt(&item.CreatorID, creatorID)
+	assignNullableInt(&item.ParentID, parentID)
+	assignNullableString(&item.WorkspaceName, workspaceName)
+	assignNullableString(&item.WorkspaceKey, workspaceKey)
+	assignNullableString(&item.ItemTypeName, itemTypeName)
+	assignNullableString(&item.ItemTypeColor, itemTypeColor)
+	assignNullableString(&item.ItemTypeIcon, itemTypeIcon)
+	item.CustomFieldValues = parseCustomFieldsJSON(customFieldValuesJSON)
+	return nil
+}
+
+// GetAncestorsForItemsContext resolves ancestor chains for many items in one
+// recursive walk (maxDepth caps each chain). Chains exclude the items
+// themselves and are ordered root -> parent; every requested id gets an entry,
+// empty when the item has no ancestors.
+func (r *ItemRepository) GetAncestorsForItemsContext(ctx context.Context, itemIDs []int, maxDepth int) (map[int][]models.Item, error) {
+	result := make(map[int][]models.Item, len(itemIDs))
+	if len(itemIDs) == 0 {
+		return result, nil
+	}
+	if maxDepth <= 0 || maxDepth > maxItemHierarchyDepth {
+		maxDepth = maxItemHierarchyDepth
+	}
+	placeholders := strings.Repeat("?,", len(itemIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, len(itemIDs)+1)
+	for _, id := range itemIDs {
+		args = append(args, id)
+	}
+	args = append(args, maxDepth)
+	rows, err := r.db.QueryContext(ctx, `
+		WITH RECURSIVE ancestors AS (
+			SELECT i.id AS start_id, i.id, i.workspace_id, i.workspace_item_number, i.item_type_id, i.title, i.description, i.is_task,
+			       i.assignee_id, i.creator_id, i.status_id, i.priority_id, i.custom_field_values, i.parent_id,
+			       i.created_at, i.updated_at,
+			       w.name as workspace_name, w.key as workspace_key, it.name as item_type_name, it.color as item_type_color, it.icon as item_type_icon,
+			       0 as level, it.hierarchy_level
+			FROM items i
+			JOIN workspaces w ON i.workspace_id = w.id
+			LEFT JOIN item_types it ON i.item_type_id = it.id
+			WHERE i.id IN (`+placeholders+`)
+
+			UNION ALL
+
+			SELECT a.start_id, p.id, p.workspace_id, p.workspace_item_number, p.item_type_id, p.title, p.description, p.is_task,
+			       p.assignee_id, p.creator_id, p.status_id, p.priority_id, p.custom_field_values, p.parent_id,
+			       p.created_at, p.updated_at,
+			       w.name as workspace_name, w.key as workspace_key, it.name as item_type_name, it.color as item_type_color, it.icon as item_type_icon,
+			       a.level + 1 as level, it.hierarchy_level
+			FROM items p
+			JOIN workspaces w ON p.workspace_id = w.id
+			LEFT JOIN item_types it ON p.item_type_id = it.id
+			JOIN ancestors a ON p.id = a.parent_id
+			WHERE a.level < ?
+			  AND COALESCE(a.hierarchy_level, -999) != 0
+		)
+		SELECT start_id, id, workspace_id, workspace_item_number, item_type_id, title, description, is_task,
+		       assignee_id, creator_id, status_id, priority_id, custom_field_values, parent_id,
+		       created_at, updated_at,
+		       workspace_name, workspace_key, item_type_name, item_type_color, item_type_icon, level
+		FROM ancestors
+		WHERE level > 0
+		ORDER BY start_id, level DESC
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query ancestors for items: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var startID int
+		var item models.Item
+		if err := scanBatchAncestorItem(rows, &item, &startID); err != nil {
+			return nil, fmt.Errorf("failed to scan ancestor: %w", err)
+		}
+		result[startID] = append(result[startID], item)
+	}
+	return result, rows.Err()
+}
+
+// scanBatchAncestorItem reads one row of the batch ancestor SELECT column
+// list, which extends the lightweight shared projection with status_id and
+// priority_id so tree/roadmap context rows render their real status.
+func scanBatchAncestorItem(rows *sql.Rows, item *models.Item, leading ...any) error {
+	var itemTypeID, assigneeID, creatorID, statusID, priorityID, parentID sql.NullInt64
+	var customFieldValuesJSON sql.NullString
+	var workspaceName, workspaceKey, itemTypeName, itemTypeColor, itemTypeIcon sql.NullString
+	var level int
+	dest := make([]any, 0, len(leading)+21)
+	dest = append(dest, leading...)
+	dest = append(dest,
+		&item.ID, &item.WorkspaceID, &item.WorkspaceItemNumber, &itemTypeID, &item.Title, &item.Description, &item.IsTask,
+		&assigneeID, &creatorID, &statusID, &priorityID, &customFieldValuesJSON, &parentID,
+		&item.CreatedAt, &item.UpdatedAt,
+		&workspaceName, &workspaceKey, &itemTypeName, &itemTypeColor, &itemTypeIcon, &level,
+	)
+	if err := rows.Scan(dest...); err != nil {
+		return err
+	}
+	_ = level
+	assignNullableInt(&item.ItemTypeID, itemTypeID)
+	assignNullableInt(&item.AssigneeID, assigneeID)
+	assignNullableInt(&item.CreatorID, creatorID)
+	assignNullableInt(&item.StatusID, statusID)
+	assignNullableInt(&item.PriorityID, priorityID)
+	assignNullableInt(&item.ParentID, parentID)
+	assignNullableString(&item.WorkspaceName, workspaceName)
+	assignNullableString(&item.WorkspaceKey, workspaceKey)
+	assignNullableString(&item.ItemTypeName, itemTypeName)
+	assignNullableString(&item.ItemTypeColor, itemTypeColor)
+	assignNullableString(&item.ItemTypeIcon, itemTypeIcon)
+	item.CustomFieldValues = parseCustomFieldsJSON(customFieldValuesJSON)
+	return nil
 }
 
 // GetRootItems returns all root items (no parent) for a workspace
@@ -240,6 +433,7 @@ func (r *ItemRepository) GetRootItems(workspaceID int) ([]*models.Item, error) {
 		       w.name as workspace_name, w.key as workspace_key,
 		       pri.name as priority_name, pri.icon as priority_icon, pri.color as priority_color,
 		       s.name as status_name, sc.color as status_color,
+		       s.builtin_key as status_builtin_key,
 		       it.name as item_type_name
 		FROM items i
 		JOIN workspaces w ON i.workspace_id = w.id
@@ -430,8 +624,58 @@ func (r *ItemRepository) CountChildrenWithHierarchyLevelNot(parentID, level int)
 // recursive walk is capped at maxItemHierarchyDepth so a stored cycle can't
 // loop the DB.
 func (r *ItemRepository) CountDescendants(itemID int) (int, error) {
+	return r.CountDescendantsContext(context.Background(), itemID)
+}
+
+// CountOpenChildren returns how many direct children are not in a completed
+// status category. Items without a status count as open.
+func (r *ItemRepository) CountOpenChildren(itemID int) (int, error) {
+	return r.CountOpenDescendantsContext(context.Background(), itemID, 1)
+}
+
+// CountOpenDescendants counts incomplete descendants down to the given depth
+// (1 = direct children only). Depth is capped at maxItemHierarchyDepth so a
+// stored cycle can't loop the DB.
+func (r *ItemRepository) CountOpenDescendants(itemID, maxDepth int) (int, error) {
+	return r.CountOpenDescendantsContext(context.Background(), itemID, maxDepth)
+}
+
+// CountOpenDescendantsContext is the request-aware form of CountOpenDescendants.
+func (r *ItemRepository) CountOpenDescendantsContext(ctx context.Context, itemID, maxDepth int) (int, error) {
+	if maxDepth <= 0 || maxDepth > maxItemHierarchyDepth {
+		maxDepth = maxItemHierarchyDepth
+	}
 	var count int
-	err := r.db.QueryRow(`
+	err := r.db.QueryRowContext(ctx, `
+		WITH RECURSIVE descendants AS (
+			SELECT id, parent_id, 1 as depth
+			FROM items
+			WHERE parent_id = ?
+
+			UNION ALL
+
+			SELECT i.id, i.parent_id, d.depth + 1
+			FROM items i
+			JOIN descendants d ON i.parent_id = d.id
+			WHERE d.depth < ?
+		)
+		SELECT COUNT(*)
+		FROM descendants d
+		JOIN items i ON i.id = d.id
+		LEFT JOIN statuses s ON i.status_id = s.id
+		LEFT JOIN status_categories sc ON s.category_id = sc.id
+		WHERE COALESCE(sc.is_completed, FALSE) = FALSE
+	`, itemID, maxDepth).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count open descendants: %w", err)
+	}
+	return count, nil
+}
+
+// CountDescendantsContext is the request-aware form of CountDescendants.
+func (r *ItemRepository) CountDescendantsContext(ctx context.Context, itemID int) (int, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx, `
 		WITH RECURSIVE descendants AS (
 			SELECT id, parent_id, 1 as depth
 			FROM items
@@ -467,17 +711,19 @@ func (r *ItemRepository) ResolveEffectiveProject(itemID int) (*EffectiveProjectR
 		WITH RECURSIVE effective_projects AS (
 			-- Base case: the item itself
 			SELECT
-				id,
-				project_id,
-				inherit_project,
-				parent_id,
+				i.id,
+				i.project_id,
+				i.inherit_project,
+				i.parent_id,
+				it.hierarchy_level,
 				CASE
-					WHEN inherit_project = true THEN NULL
-					ELSE project_id
+					WHEN i.inherit_project = true THEN NULL
+					ELSE i.project_id
 				END as effective_project_id,
 				0 as depth
-			FROM items
-			WHERE id = ?
+			FROM items i
+			LEFT JOIN item_types it ON i.item_type_id = it.id
+			WHERE i.id = ?
 
 			UNION ALL
 
@@ -487,6 +733,7 @@ func (r *ItemRepository) ResolveEffectiveProject(itemID int) (*EffectiveProjectR
 				ep.project_id,
 				ep.inherit_project,
 				i.parent_id,
+				it.hierarchy_level,
 				CASE
 					WHEN i.project_id IS NOT NULL AND i.inherit_project = false THEN i.project_id
 					ELSE ep.effective_project_id
@@ -494,8 +741,10 @@ func (r *ItemRepository) ResolveEffectiveProject(itemID int) (*EffectiveProjectR
 				ep.depth + 1
 			FROM effective_projects ep
 			JOIN items i ON ep.parent_id = i.id
+			LEFT JOIN item_types it ON i.item_type_id = it.id
 			WHERE ep.effective_project_id IS NULL
 			  AND ep.inherit_project = true
+			  AND COALESCE(ep.hierarchy_level, -999) != 0
 			  AND ep.depth < 10
 		)
 		SELECT
@@ -594,7 +843,7 @@ func scanItemRowBase(rows *sql.Rows, level *int) (*models.Item, error) {
 	var assigneeID, creatorID sql.NullInt64
 	var dueDate sql.NullTime
 	var priorityName, priorityIcon, priorityColor sql.NullString
-	var statusName, statusColor sql.NullString
+	var statusName, statusBuiltinKey, statusColor sql.NullString
 	var itemTypeName sql.NullString
 
 	dests := []any{
@@ -604,7 +853,7 @@ func scanItemRowBase(rows *sql.Rows, level *int) (*models.Item, error) {
 		&parentID, &item.FracIndex, &item.CreatedAt, &item.UpdatedAt,
 		&item.WorkspaceName, &item.WorkspaceKey,
 		&priorityName, &priorityIcon, &priorityColor,
-		&statusName, &statusColor,
+		&statusName, &statusColor, &statusBuiltinKey,
 		&itemTypeName,
 	}
 	if level != nil {
@@ -632,16 +881,77 @@ func scanItemRowBase(rows *sql.Rows, level *int) (*models.Item, error) {
 	assignNullableString(&item.PriorityIcon, priorityIcon)
 	assignNullableString(&item.PriorityColor, priorityColor)
 	assignNullableString(&item.StatusName, statusName)
+	assignNullableString(&item.StatusBuiltinKey, statusBuiltinKey)
 	assignNullableString(&item.StatusColor, statusColor)
 	assignNullableString(&item.ItemTypeName, itemTypeName)
 
 	if customFieldValuesJSON.Valid && customFieldValuesJSON.String != "" {
 		if err := json.Unmarshal([]byte(customFieldValuesJSON.String), &item.CustomFieldValues); err != nil {
-			item.CustomFieldValues = make(map[string]interface{})
+			item.CustomFieldValues = make(map[string]any)
 		}
 	} else {
-		item.CustomFieldValues = make(map[string]interface{})
+		item.CustomFieldValues = make(map[string]any)
 	}
 
 	return &item, nil
+}
+
+// FindChildrenForUpdateContext locks children of already-locked parents.
+// PostgreSQL's parent foreign key makes concurrent attachments wait for those
+// parent locks; SQLite serializes writers for the enclosing transaction.
+func (r *ItemRepository) FindChildrenForUpdateContext(ctx context.Context, tx database.Tx, parentIDs []int) ([]*models.Item, error) {
+	if len(parentIDs) == 0 {
+		return []*models.Item{}, nil
+	}
+	placeholders, args := inPlaceholders(parentIDs)
+	query := `SELECT ` + itemBaseColumns + ` FROM items WHERE parent_id IN (` + placeholders + `) ORDER BY id`
+	if r.db.GetDriverName() == "postgres" {
+		query += " FOR UPDATE"
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("lock child items: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var items []*models.Item
+	for rows.Next() {
+		item, err := scanItemBase(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan locked child: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate locked children: %w", err)
+	}
+	return items, nil
+}
+
+// FindSubtreeForUpdateContext locks each generation before discovering its
+// children, so hierarchy changes cannot add unexamined rows to the deletion.
+func (r *ItemRepository) FindSubtreeForUpdateContext(ctx context.Context, tx database.Tx, rootID int) ([]*models.Item, error) {
+	root, err := r.FindByIDForUpdate(tx, rootID)
+	if err != nil {
+		return nil, err
+	}
+	items := []*models.Item{root}
+	seen := map[int]bool{root.ID: true}
+	pending := []int{root.ID}
+	for len(pending) > 0 {
+		batchSize := min(len(pending), 500)
+		children, err := r.FindChildrenForUpdateContext(ctx, tx, pending[:batchSize])
+		if err != nil {
+			return nil, err
+		}
+		pending = pending[batchSize:]
+		for _, child := range children {
+			if seen[child.ID] {
+				continue
+			}
+			seen[child.ID] = true
+			items = append(items, child)
+			pending = append(pending, child.ID)
+		}
+	}
+	return items, nil
 }

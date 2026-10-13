@@ -1,16 +1,16 @@
 <script>
   import { LifeBuoy, Settings, Webhook, ExternalLink, Users, Globe, Mail, Send, ClipboardList } from '@lucide/svelte';
+  import TabStrip from '../components/TabStrip.svelte';
   import { api } from '../api.js';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
   import { channelCategoriesStore } from '../stores/channelCategories.js';
   import { t } from '../stores/i18n.svelte.js';
+  import { errorToast, successToast } from '../stores/toasts.svelte.js';
+  import { isSystemAdmin } from '../stores/permissions.svelte.js';
   import Modal from './Modal.svelte';
   import Button from '../components/Button.svelte';
-  import Input from '../components/Input.svelte';
-  import Select from '../components/Select.svelte';
-  import Textarea from '../components/Textarea.svelte';
   import Lozenge from '../components/Lozenge.svelte';
   import ChannelManagersTab from '../settings/ChannelManagersTab.svelte';
-  import Label from '../components/Label.svelte';
   import DialogFooter from './DialogFooter.svelte';
 
   // Import channel config components
@@ -20,6 +20,11 @@
   import ChannelSMTPConfig from '../features/channels/ChannelSMTPConfig.svelte';
   import ChannelFormConfig from '../features/channels/ChannelFormConfig.svelte';
   import FormBuilder from '../features/channels/FormBuilder.svelte';
+  import { loadPortalConnectedMailboxes } from '../features/channels/channelAdmin.js';
+  import { formatAuthenticatedDateTime } from '../utils/authenticatedDateFormatter.js';
+	import TextareaField from '../components/TextareaField.svelte';
+	import SelectField from '../components/SelectField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let {
     isOpen = false,
@@ -31,10 +36,7 @@
   let activeTab = $state('configuration');
   let loading = $state(false);
   let configParseFailed = $state(false);
-
-  // Toast state
-  let showToast = $state(false);
-  let toastMessage = $state('');
+  let persistedStatus = $state('disabled');
 
   // Config component references
   let portalConfigRef = $state(null);
@@ -43,13 +45,20 @@
   let smtpConfigRef = $state(null);
   let formConfigRef = $state(null);
 
+  // Inbound portal channels for the email channel's connected-portal select,
+  // and email channels linked to a portal channel (read-only list).
+  let portalOptions = $state([]);
+  let connectedMailboxes = $state([]);
+
   // Portal configuration form data
   let portalFormData = $state({
     slug: '',
     workspace_ids: [],
     enabled: false,
     title: '',
-    description: ''
+    description: '',
+    registration_mode: 'open',
+    allowed_domains: ''
   });
 
   // Webhook configuration form data
@@ -61,7 +70,8 @@
     workspace_ids: [],
     collection_ids: [],
     auto_trigger: false,
-    subscribed_events: []
+    subscribed_events: [],
+    enabled: false
   });
 
   // Email configuration form data
@@ -73,6 +83,9 @@
     oauth_tenant_id: 'common',
     oauth_connected: false,
     oauth_email: '',
+    connected_oauth_provider_type: '',
+    connected_oauth_client_id: '',
+    connected_oauth_tenant_id: '',
     imap_host: '',
     imap_port: 993,
     imap_encryption: 'ssl',
@@ -81,8 +94,8 @@
     workspace_id: null,
     item_type_id: null,
     mailbox: 'INBOX',
-    mark_as_read: true,
-    delete_after_process: false,
+    processing_disposition: 'mark_read',
+    rate_limit_per_hour: null,
     enabled: false
   });
 
@@ -94,7 +107,9 @@
     password: '',
     from_email: '',
     from_name: '',
-    encryption: 'tls'
+    encryption: 'tls',
+    skip_tls_verify: false,
+    enabled: false
   });
 
   // Form channel configuration form data
@@ -111,7 +126,14 @@
 
   // Workspaces and item types for email configuration
   let workspaces = $state([]);
-  let itemTypes = $state([]);
+
+  const supportedWebhookEventIDs = new Set([
+    'item.created',
+    'item.updated',
+    'item.deleted',
+    'item.assigned',
+    'status.changed'
+  ]);
 
   // Channel basic info form
   let channelFormData = $state({
@@ -124,22 +146,38 @@
   // can refuse to render an editable form (and avoid silently overwriting
   // corrupted config with whatever the empty form produces on Save).
   function parseChannelConfig(config) {
-    if (!config) return {};
+    if (config == null) return {};
     if (typeof config === 'string') {
       if (config.trim() === '') return {};
       try {
-        return JSON.parse(config);
+        const parsed = JSON.parse(config);
+        if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+          throw new Error('Channel configuration must be a JSON object');
+        }
+        return parsed;
       } catch (e) {
         console.error('Failed to parse channel config:', e);
         return null;
       }
     }
-    return config || {};
+    if (Array.isArray(config) || typeof config !== 'object') return null;
+    return config;
   }
+
+  // Workspaces this channel routes submissions to — used to scope the form
+  // builder's routing-metadata pickers. Falls back to [] (all workspaces) when
+  // unparseable; the backend still validates the chosen workspace.
+  let formBuilderWorkspaceIds = $derived.by(() => {
+    const c = parseChannelConfig(channel?.config) || {};
+    return c.form_workspace_ids || c.portal_workspace_ids || [];
+  });
 
   // Initialize form data when channel changes
   $effect(() => {
     if (channel && isOpen) {
+      persistedStatus = channel.status || 'disabled';
+      portalOptions = [];
+      connectedMailboxes = [];
       channelFormData = {
         name: channel.name || '',
         description: channel.description || '',
@@ -149,8 +187,7 @@
       const config = parseChannelConfig(channel.config);
       if (config === null) {
         configParseFailed = true;
-        toastMessage = t('channel.channelConfigCorrupted');
-        showToast = true;
+        errorToast(t('channel.channelConfigCorrupted'));
         activeTab = 'configuration';
         return;
       }
@@ -162,8 +199,13 @@
           workspace_ids: config.portal_workspace_ids || [],
           enabled: channel.status === 'enabled',
           title: config.portal_title || '',
-          description: config.portal_description || ''
+          description: config.portal_description || '',
+          registration_mode: config.portal_registration_mode === 'manual' ? 'manual' : 'open',
+          allowed_domains: Array.isArray(config.portal_allowed_domains)
+            ? config.portal_allowed_domains.join(', ')
+            : ''
         };
+        loadConnectedMailboxes();
       } else if (channel.type === 'webhook') {
         const headersArray = config.webhook_headers
           ? Object.entries(config.webhook_headers).map(([key, value]) => ({ key, value }))
@@ -173,11 +215,14 @@
           url: config.webhook_url || '',
           secret: '',
           headers: headersArray.length > 0 ? headersArray : [],
-          scope_type: config.webhook_scope_type || 'all',
+          scope_type: config.webhook_scope_type === 'workspaces' ? 'workspaces' : 'all',
           workspace_ids: config.webhook_workspace_ids || [],
           collection_ids: config.webhook_collection_ids || [],
           auto_trigger: config.webhook_auto_trigger || false,
-          subscribed_events: config.webhook_subscribed_events || []
+          subscribed_events: Array.isArray(config.webhook_subscribed_events)
+            ? config.webhook_subscribed_events.filter(event => supportedWebhookEventIDs.has(event))
+            : [],
+          enabled: channel.status === 'enabled'
         };
       } else if (channel.type === 'email') {
         emailFormData = {
@@ -188,6 +233,9 @@
           oauth_tenant_id: config.email_oauth_tenant_id || 'common',
           oauth_connected: !!config.email_oauth_email,
           oauth_email: config.email_oauth_email || '',
+          connected_oauth_provider_type: config.email_oauth_provider_type || '',
+          connected_oauth_client_id: config.email_oauth_client_id || '',
+          connected_oauth_tenant_id: config.email_oauth_tenant_id || 'common',
           imap_host: config.imap_host || '',
           imap_port: config.imap_port || 993,
           imap_encryption: config.imap_encryption || 'ssl',
@@ -196,11 +244,18 @@
           workspace_id: config.email_workspace_id || null,
           item_type_id: config.email_item_type_id || null,
           mailbox: config.email_mailbox || 'INBOX',
-          mark_as_read: config.email_mark_as_read !== false,
-          delete_after_process: config.email_delete_after_process || false,
+          processing_disposition:
+            config.email_processing_disposition ||
+            (config.email_delete_after_process
+              ? 'delete'
+              : config.email_mark_as_read === false
+                ? 'leave'
+                : 'mark_read'),
+          rate_limit_per_hour: config.email_rate_limit_per_hour ?? null,
           enabled: channel.status === 'enabled'
         };
-        loadWorkspacesAndItemTypes();
+        loadWorkspaces();
+        loadConnectedPortalOptions();
       } else if (channel.type === 'smtp') {
         smtpFormData = {
           host: config.smtp_host || '',
@@ -209,7 +264,9 @@
           password: '',
           from_email: config.smtp_from_email || '',
           from_name: config.smtp_from_name || '',
-          encryption: config.smtp_encryption || 'tls'
+          encryption: config.smtp_encryption || 'tls',
+          skip_tls_verify: config.smtp_skip_tls_verify || false,
+          enabled: channel.status === 'enabled'
         };
       } else if (channel.type === 'form') {
         formChannelFormData = {
@@ -228,28 +285,79 @@
     }
   });
 
-  async function loadWorkspacesAndItemTypes() {
+  async function loadWorkspaces() {
     try {
-      workspaces = (await api.workspaces.getAll()).filter(w => !w.is_personal);
-      if (emailFormData.workspace_id) {
-        await loadItemTypesForWorkspace(emailFormData.workspace_id);
-      }
+      workspaces = ((await workspacesStore.load()) || []).filter(w => !w.is_personal);
     } catch (error) {
       console.error('Failed to load workspaces:', error);
     }
   }
 
-  async function loadItemTypesForWorkspace(workspaceId) {
-    if (!workspaceId) {
-      itemTypes = [];
-      return;
+  // Inbound portal channels offered as the email channel's connected portal.
+  // Disabled portals stay listed so an existing link always renders and can
+  // be cleared; the backend validates manage permission at save time.
+  async function loadConnectedPortalOptions() {
+    try {
+      const portals = await api.channels.getAll({ type: 'portal', direction: 'inbound', include_disabled: true });
+      // A list response may arrive as null (empty result); the picker iterates
+      // this prop, so coerce to an array before handing it to the child.
+      portalOptions = Array.isArray(portals) ? portals : [];
+    } catch (error) {
+      console.error('Failed to load portal channels:', error);
+      portalOptions = [];
+    }
+  }
+
+  // Email channels whose senders' tickets surface in this portal.
+  async function loadConnectedMailboxes() {
+    try {
+      connectedMailboxes = await loadPortalConnectedMailboxes(channel.id);
+    } catch (error) {
+      console.error('Failed to load connected mailboxes:', error);
+      connectedMailboxes = [];
+    }
+  }
+
+  function desiredEnabledState() {
+    if (channel.type === 'portal') return portalFormData.enabled;
+    if (channel.type === 'form') return formChannelFormData.enabled;
+    if (channel.type === 'email') return emailFormData.enabled;
+    if (channel.type === 'webhook') return webhookFormData.enabled;
+    if (channel.type === 'smtp') return smtpFormData.enabled;
+    return null;
+  }
+
+  async function saveEmailBeforeOAuth() {
+    const validation = emailConfigRef?.validate();
+    if (validation && !validation.valid) {
+      throw new Error(validation.message);
+    }
+    const wasEnabled = persistedStatus === 'enabled';
+    if (wasEnabled) {
+      const updated = await api.channels.toggle(channel.id);
+      persistedStatus = updated?.status || 'disabled';
     }
     try {
-      itemTypes = await api.itemTypes.getAll();
+      await api.channels.updateConfig(channel.id, emailConfigRef.getConfig());
+      emailConfigRef.clearSecrets?.();
+      return wasEnabled;
     } catch (error) {
-      console.error('Failed to load item types:', error);
-      itemTypes = [];
+      if (wasEnabled) {
+        try {
+          const restored = await api.channels.toggle(channel.id);
+          persistedStatus = restored?.status || 'enabled';
+        } catch (rollbackError) {
+          console.error('Failed to restore email channel status:', rollbackError);
+        }
+      }
+      throw error;
     }
+  }
+
+  async function restoreEmailAfterOAuthStartFailure(restoreEnabled) {
+    if (!restoreEnabled || persistedStatus === 'enabled') return;
+    const restored = await api.channels.toggle(channel.id);
+    persistedStatus = restored?.status || 'enabled';
   }
 
   function isPluginOwned(ch) {
@@ -257,6 +365,7 @@
   }
 
   function getChannelStatus(ch) {
+    if (ch?.id === channel?.id) return persistedStatus;
     return ch?.status || 'disabled';
   }
 
@@ -317,58 +426,70 @@
 
     const validation = validateForm();
     if (!validation.valid) {
-      toastMessage = validation.message;
-      showToast = true;
+      errorToast(validation.message);
       return;
     }
 
     try {
       loading = true;
-
-      // Save basic info (status is managed via toggle endpoint, not here)
-      await api.channels.update(channel.id, {
-        id: channel.id,
-        type: channel.type,
-        direction: channel.direction,
-        is_default: channel.is_default,
-        name: channelFormData.name,
-        description: channelFormData.description,
-        category_id: channelFormData.category_id
-      });
-
-      // Save type-specific config
-      if (channel.type === 'portal' && portalConfigRef) {
-        const existingConfig = parseChannelConfig(channel.config);
-        const configData = {
-          ...existingConfig,
-          ...portalConfigRef.getConfig()
-        };
-        await api.channels.updateConfig(channel.id, configData);
-      } else if (channel.type === 'webhook' && !isPluginOwned(channel) && webhookConfigRef) {
-        await api.channels.updateConfig(channel.id, webhookConfigRef.getConfig());
-        webhookConfigRef.clearSecret?.();
-      } else if (channel.type === 'email' && emailConfigRef) {
-        await api.channels.updateConfig(channel.id, emailConfigRef.getConfig());
-        emailConfigRef.clearSecrets?.();
-      } else if (channel.type === 'smtp' && smtpConfigRef) {
-        await api.channels.updateConfig(channel.id, smtpConfigRef.getConfig());
-        smtpConfigRef.clearSecret?.();
-      } else if (channel.type === 'form' && formConfigRef) {
-        const existingConfig = parseChannelConfig(channel.config);
-        const configData = {
-          ...existingConfig,
-          ...formConfigRef.getConfig()
-        };
-        await api.channels.updateConfig(channel.id, configData);
+      const desiredEnabled = desiredEnabledState();
+      const wasEnabled = persistedStatus === 'enabled';
+      let disabledBeforeSave = false;
+      if (desiredEnabled === false && wasEnabled) {
+        const updated = await api.channels.toggle(channel.id);
+        persistedStatus = updated?.status || 'disabled';
+        disabledBeforeSave = true;
       }
 
-      toastMessage = t('channel.channelSavedSuccess');
-      showToast = true;
+      // Save basic info (status is managed via toggle endpoint, not here)
+      try {
+        await api.channels.update(channel.id, {
+          id: channel.id,
+          type: channel.type,
+          direction: channel.direction,
+          is_default: channel.is_default,
+          name: channelFormData.name,
+          description: channelFormData.description,
+          category_id: channelFormData.category_id
+        });
+
+        // Save type-specific config
+        if (channel.type === 'portal' && portalConfigRef) {
+          await api.channels.updateConfig(channel.id, portalConfigRef.getConfig());
+        } else if (channel.type === 'webhook' && !isPluginOwned(channel) && webhookConfigRef) {
+          await api.channels.updateConfig(channel.id, webhookConfigRef.getConfig());
+          webhookConfigRef.clearSecret?.();
+        } else if (channel.type === 'email' && emailConfigRef) {
+          await api.channels.updateConfig(channel.id, emailConfigRef.getConfig());
+          emailConfigRef.clearSecrets?.();
+        } else if (channel.type === 'smtp' && smtpConfigRef) {
+          await api.channels.updateConfig(channel.id, smtpConfigRef.getConfig());
+          smtpConfigRef.clearSecret?.();
+        } else if (channel.type === 'form' && formConfigRef) {
+          await api.channels.updateConfig(channel.id, formConfigRef.getConfig());
+        }
+      } catch (error) {
+        if (disabledBeforeSave) {
+          try {
+            const restored = await api.channels.toggle(channel.id);
+            persistedStatus = restored?.status || 'enabled';
+          } catch (rollbackError) {
+            console.error('Failed to restore channel status:', rollbackError);
+          }
+        }
+        throw error;
+      }
+
+      if (desiredEnabled === true && !wasEnabled) {
+        const updated = await api.channels.toggle(channel.id);
+        persistedStatus = updated?.status || 'enabled';
+      }
+
+      successToast(t('channel.channelSavedSuccess'));
       onSave();
     } catch (error) {
       console.error('Failed to save channel:', error);
-      toastMessage = t('channel.failedToSave') + ': ' + (error.message || error);
-      showToast = true;
+      errorToast(t('channel.failedToSave') + ': ' + (error.message || error));
     } finally {
       loading = false;
     }
@@ -376,13 +497,7 @@
 
   function handleClose() {
     activeTab = 'configuration';
-    showToast = false;
     onClose();
-  }
-
-  function handleToast(message) {
-    toastMessage = message;
-    showToast = true;
   }
 </script>
 
@@ -439,63 +554,15 @@
       </div>
 
       <!-- Tab Navigation -->
-      <div class="px-6 border-b" style="border-color: var(--ds-border);">
-        <nav class="flex gap-6">
-          <button
-            onclick={() => activeTab = 'configuration'}
-            class="relative py-3 text-sm font-medium transition-colors {
-              activeTab === 'configuration'
-                ? 'text-[var(--ds-interactive)]'
-                : 'text-[var(--ds-text-subtle)] hover:text-[var(--ds-text)]'
-            }"
-          >
-            <div class="flex items-center gap-2">
-              <Settings class="w-4 h-4" />
-              <span>{t('channel.configuration')}</span>
-            </div>
-            {#if activeTab === 'configuration'}
-              <div class="absolute bottom-0 left-0 right-0 h-0.5 bg-[var(--ds-interactive)]"></div>
-            {/if}
-          </button>
-
-          {#if channel.type === 'form'}
-            <button
-              onclick={() => activeTab = 'forms'}
-              class="relative py-3 text-sm font-medium transition-colors {
-                activeTab === 'forms'
-                  ? 'text-[var(--ds-interactive)]'
-                  : 'text-[var(--ds-text-subtle)] hover:text-[var(--ds-text)]'
-              }"
-            >
-              <div class="flex items-center gap-2">
-                <ClipboardList class="w-4 h-4" />
-                <span>{t('forms.title')}</span>
-              </div>
-              {#if activeTab === 'forms'}
-                <div class="absolute bottom-0 left-0 right-0 h-0.5 bg-[var(--ds-interactive)]"></div>
-              {/if}
-            </button>
-          {/if}
-
-          {#if !isPluginOwned(channel)}
-            <button
-              onclick={() => activeTab = 'managers'}
-              class="relative py-3 text-sm font-medium transition-colors {
-                activeTab === 'managers'
-                  ? 'text-[var(--ds-interactive)]'
-                  : 'text-[var(--ds-text-subtle)] hover:text-[var(--ds-text)]'
-              }"
-            >
-              <div class="flex items-center gap-2">
-                <Users class="w-4 h-4" />
-                <span>{t('channel.managers')}</span>
-              </div>
-              {#if activeTab === 'managers'}
-                <div class="absolute bottom-0 left-0 right-0 h-0.5 bg-[var(--ds-interactive)]"></div>
-              {/if}
-            </button>
-          {/if}
-        </nav>
+      <div class="px-6">
+        <TabStrip
+          tabs={[
+            { id: 'configuration', label: t('channel.configuration'), icon: Settings },
+            ...(channel.type === 'form' ? [{ id: 'forms', label: t('forms.title'), icon: ClipboardList }] : []),
+            ...($isSystemAdmin && !isPluginOwned(channel) ? [{ id: 'managers', label: t('channel.managers'), icon: Users }] : [])
+          ]}
+          bind:activeTab
+        />
       </div>
 
       <!-- Tab Content -->
@@ -507,17 +574,33 @@
             <div class="space-y-4">
               <div class="grid grid-cols-2 gap-4">
                 <div>
-                  <Label color="default" class="mb-2">{t('channel.name')}</Label>
-                  <Input bind:value={channelFormData.name} placeholder={t('channel.channelName')} />
+                  <TextField
+                    label={t('channel.name')}
+                    labelColor="default"
+                    placeholder={t('channel.channelName')}
+                    disabled={isPluginOwned(channel)}
+                    bind:value={channelFormData.name}
+                  />
                 </div>
                 <div>
-                  <Label color="default" class="mb-2">{t('channel.category')}</Label>
-                  <Select bind:value={channelFormData.category_id} options={[{ value: null, label: t('channel.noCategory') }, ...$channelCategoriesStore.map(category => ({ value: category.id, label: category.name }))]} />
+                  <SelectField
+                    label={t('channel.category')}
+                    labelColor="default"
+                    disabled={isPluginOwned(channel)}
+                    options={[{ value: null, label: t('channel.noCategory') }, ...$channelCategoriesStore.map(category => ({ value: category.id, label: category.name }))]}
+                    bind:value={channelFormData.category_id}
+                  />
                 </div>
               </div>
               <div>
-                <Label color="default" class="mb-2">{t('channel.description')}</Label>
-                <Textarea bind:value={channelFormData.description} rows={2} placeholder={t('channel.briefDescription')} />
+                <TextareaField
+                  label={t('channel.description')}
+                  labelColor="default"
+                  rows={2}
+                  placeholder={t('channel.briefDescription')}
+                  disabled={isPluginOwned(channel)}
+                  bind:value={channelFormData.description}
+                />
               </div>
             </div>
           </div>
@@ -527,6 +610,7 @@
             <ChannelPortalConfig
               bind:this={portalConfigRef}
               bind:formData={portalFormData}
+              {connectedMailboxes}
             />
           {:else if channel.type === 'webhook'}
             <ChannelWebhookConfig
@@ -542,10 +626,10 @@
               channelId={channel.id}
               bind:formData={emailFormData}
               {workspaces}
-              {itemTypes}
+              portals={portalOptions}
               bind:loading
-              onLoadItemTypes={loadItemTypesForWorkspace}
-              onToast={handleToast}
+              onSaveBeforeOAuth={saveEmailBeforeOAuth}
+              onOAuthStartFailed={restoreEmailAfterOAuthStartFailure}
             />
           {:else if channel.type === 'smtp'}
             <ChannelSMTPConfig
@@ -574,13 +658,13 @@
           {#if channel.last_activity}
             <div class="pt-6 mt-6 border-t" style="border-color: var(--ds-border);">
               <div class="text-sm" style="color: var(--ds-text-subtle);">
-                {t('channel.lastActivity')}: {new Date(channel.last_activity).toLocaleString()}
+                {t('channel.lastActivity')}: {formatAuthenticatedDateTime(channel.last_activity)}
               </div>
             </div>
           {/if}
         {:else if activeTab === 'forms'}
-          <FormBuilder channelId={channel.id} onBack={() => activeTab = 'configuration'} />
-        {:else if activeTab === 'managers'}
+          <FormBuilder channelId={channel.id} channelWorkspaceIds={formBuilderWorkspaceIds} onBack={() => activeTab = 'configuration'} />
+        {:else if activeTab === 'managers' && $isSystemAdmin}
           <ChannelManagersTab
             channelId={channel.id}
             channelName={channel.name}
@@ -590,7 +674,13 @@
       </div>
 
       <!-- Footer -->
-      {#if activeTab === 'configuration'}
+      {#if activeTab === 'configuration' && isPluginOwned(channel)}
+        <DialogFooter
+          onCancel={handleClose}
+          cancelLabel={t('common.close')}
+          showCancel={true}
+        />
+      {:else if activeTab === 'configuration'}
         <DialogFooter
           onCancel={handleClose}
           onConfirm={handleSaveAll}
@@ -610,13 +700,3 @@
     </div>
   {/if}
 </Modal>
-
-<!-- Toast (simple inline for now) -->
-{#if showToast}
-  <div
-    class="fixed bottom-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg"
-    style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);"
-  >
-    <p class="text-sm" style="color: var(--ds-text);">{toastMessage}</p>
-  </div>
-{/if}

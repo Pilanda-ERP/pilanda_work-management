@@ -3,7 +3,7 @@
   import { createAsyncLoader } from '../composables';
   import { api } from '../api.js';
   import { FileText } from '@lucide/svelte';
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { t } from '../stores/i18n.svelte.js';
 
   let {
@@ -14,6 +14,8 @@
     disabled = false,
     allowClear = true,
     class: className = '',
+    inputTestid = undefined,
+    optionTestid = null,
     onSelect = () => {},
     onCancel = () => {},
   } = $props();
@@ -33,6 +35,7 @@
     const items = result?.results ?? (Array.isArray(result) ? result : []);
     return items;
   });
+  onDestroy(() => pages.dispose());
 
   $effect(() => {
     if (workspaceId) {
@@ -57,6 +60,8 @@
   {allowClear}
   class={className}
   serverSearch
+  {inputTestid}
+  {optionTestid}
   onSearchChange={handleSearchChange}
   getValue={(page) => page?.id}
   getLabel={(page) => page?.title ?? ''}

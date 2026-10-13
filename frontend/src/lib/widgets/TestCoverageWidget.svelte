@@ -2,7 +2,10 @@
   import { onMount } from 'svelte';
   import { ShieldX } from '@lucide/svelte';
   import EmptyState from '../components/EmptyState.svelte';
+  import PieChartSegments from '../components/PieChartSegments.svelte';
   import { api } from '../api.js';
+  import { buildCoveragePieSegments } from '../utils/pieChart.js';
+  import { t } from '../stores/i18n.svelte.js';
 
   let { workspaceId, collectionId = null } = $props();
 
@@ -12,9 +15,8 @@
 
   // Pie chart configuration
   const radius = 48;
-  const circumference = 2 * Math.PI * radius;
   const coveredColor = 'var(--ds-status-success-solid, #10b981)';
-  const notCoveredColor = 'var(--ds-status-danger-solid, #ef4444)';
+  const notCoveredColor = 'var(--ds-status-danger-solid, #ef4444)';;
 
   onMount(() => {
     loadCoverageData();
@@ -28,46 +30,14 @@
       coverageData = await api.tests.coverage.getSummary(id, workspaceId);
     } catch (err) {
       console.error('Failed to load test coverage:', err);
-      error = err.message || 'Failed to load coverage data';
+      error = t('widgets.testCoverage.loadError');
     } finally {
       loading = false;
     }
   }
 
   function buildPieSegments(covered, notCovered, total) {
-    if (!total || total <= 0) return [];
-
-    const segments = [];
-    let offset = 0;
-
-    if (covered > 0) {
-      const fraction = covered / total;
-      const arcLength = fraction * circumference;
-      segments.push({
-        key: 'covered',
-        color: coveredColor,
-        dasharray: `${arcLength} ${circumference}`,
-        offset: offset,
-        label: 'Covered',
-        count: covered
-      });
-      offset -= arcLength;
-    }
-
-    if (notCovered > 0) {
-      const fraction = notCovered / total;
-      const arcLength = fraction * circumference;
-      segments.push({
-        key: 'not-covered',
-        color: notCoveredColor,
-        dasharray: `${arcLength} ${circumference}`,
-        offset: offset,
-        label: 'Not Covered',
-        count: notCovered
-      });
-    }
-
-    return segments;
+    return buildCoveragePieSegments(covered, notCovered, total, coveredColor, notCoveredColor, radius);
   }
 
   const segments = $derived(coverageData ? buildPieSegments(coverageData.covered, coverageData.not_covered, coverageData.total) : []);
@@ -78,56 +48,35 @@
   {#if loading}
     <div class="loading-state">
       <div class="loading-spinner"></div>
-      <p>Loading coverage data...</p>
+      <p>{t('widgets.testCoverage.loading')}</p>
     </div>
   {:else if error}
     <div class="error-state">
       <p>{error}</p>
-      <button class="retry-btn" onclick={loadCoverageData}>Retry</button>
+      <button class="retry-btn" onclick={loadCoverageData}>{t('common.retry')}</button>
     </div>
   {:else if !coverageData || coverageData.total === 0}
     <EmptyState
       icon={ShieldX}
-      title="No requirements configured"
-      description="Configure requirement types in the Test Reports page to see coverage data."
+      title={t('widgets.testCoverage.emptyTitle')}
+      description={t('widgets.testCoverage.emptyDescription')}
     />
   {:else}
     <div class="coverage-content">
       <div class="pie-wrapper">
-        <svg viewBox="0 0 140 140" role="img" aria-label="Test coverage breakdown">
-          <circle
-            cx="70"
-            cy="70"
-            r={radius}
-            fill="transparent"
-            stroke="var(--ds-border)"
-            stroke-width="16"
-          />
-          {#each segments as segment (segment.key)}
-            <circle
-              cx="70"
-              cy="70"
-              r={radius}
-              fill="transparent"
-              stroke={segment.color}
-              stroke-width="16"
-              stroke-linecap="butt"
-              stroke-dasharray={segment.dasharray}
-              stroke-dashoffset={segment.offset}
-              transform="rotate(-90 70 70)"
-            />
-          {/each}
+        <svg viewBox="0 0 140 140" role="img" aria-label={t('widgets.testCoverage.chartAria')}>
+          <PieChartSegments {segments} {radius} />
           <text class="pie-percent" x="70" y="68">{Math.round(coverageRate)}%</text>
-          <text class="pie-label" x="70" y="84">covered</text>
+          <text class="pie-label" x="70" y="84">{t('widgets.testCoverage.covered')}</text>
         </svg>
       </div>
 
       <div class="summary">
         <p class="summary-value">
-          {coverageData.covered}/{coverageData.total} requirements
+          {t('widgets.testCoverage.requirementCount', { covered: coverageData.covered, total: coverageData.total })}
         </p>
         <p class="summary-subtle">
-          have linked test cases
+          {t('widgets.testCoverage.linkedCases')}
         </p>
       </div>
 
@@ -135,15 +84,15 @@
         <li>
           <span class="legend-dot covered"></span>
           <div>
-            <p class="legend-label">Covered</p>
-            <p class="legend-value">{coverageData.covered} requirements</p>
+            <p class="legend-label">{t('widgets.testCoverage.covered')}</p>
+            <p class="legend-value">{t('widgets.testCoverage.requirements', { count: coverageData.covered })}</p>
           </div>
         </li>
         <li>
           <span class="legend-dot not-covered"></span>
           <div>
-            <p class="legend-label">Not Covered</p>
-            <p class="legend-value">{coverageData.not_covered} requirements</p>
+            <p class="legend-label">{t('widgets.testCoverage.notCovered')}</p>
+            <p class="legend-value">{t('widgets.testCoverage.requirements', { count: coverageData.not_covered })}</p>
           </div>
         </li>
       </ul>

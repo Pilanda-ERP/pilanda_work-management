@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"windshift/internal/database"
+	"windshift/internal/logger"
 	"windshift/internal/restapi"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
@@ -75,7 +76,7 @@ func (h *AdminUserHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	pagination := h.ParsePagination(r)
 
-	users, total, err := h.userSvc.List(services.PaginationParams{
+	users, total, err := h.userSvc.ListAdmin(services.PaginationParams{
 		Limit:  pagination.Limit,
 		Offset: pagination.Offset,
 	})
@@ -124,7 +125,7 @@ func (h *AdminUserHandler) List(w http.ResponseWriter, r *http.Request) {
 // @Failure      500   {object}  handlers.ErrorResponse
 // @Router       /admin/users/{id} [put]
 func (h *AdminUserHandler) Update(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.RequireAuth(w, r)
+	actor, ok := h.RequireAuth(w, r)
 	if !ok {
 		return
 	}
@@ -157,24 +158,41 @@ func (h *AdminUserHandler) Update(w http.ResponseWriter, r *http.Request) {
 		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "No fields to update"))
 		return
 	}
-
-	if err := h.userSvc.UpdateAdmin(id, update); err != nil {
-		if errors.Is(err, services.ErrUserNotFound) {
-			h.RespondError(w, r, restapi.ErrUserNotFound)
-			return
-		}
-		h.RespondInternalError(w, r)
-		return
-	}
-
-	u, err := h.userSvc.GetByID(id)
+	result, err := h.userSvc.UpdateAdmin(id, update)
 	if err != nil {
-		h.RespondInternalError(w, r)
+		switch {
+		case errors.Is(err, services.ErrUserNotFound):
+			h.RespondError(w, r, restapi.ErrUserNotFound)
+		case errors.Is(err, services.ErrUserManagedExternally):
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusForbidden, restapi.ErrCodeForbidden, "User is managed externally"))
+		case errors.Is(err, services.ErrUserEmailInvalid):
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid email"))
+		case errors.Is(err, services.ErrUserEmailExists), errors.Is(err, services.ErrUserUsernameExists):
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeConflict, err.Error()))
+		default:
+			h.RespondInternalError(w, r)
+		}
 		return
 	}
+	before := result.Before
+	u := result.User
 
 	resp := mapUserToResponse(u)
 	resp.Warnings = warnings
+	changes := map[string]any{}
+	if before.FirstName != u.FirstName {
+		changes["first_name"] = map[string]string{"old": before.FirstName, "new": u.FirstName}
+	}
+	if before.LastName != u.LastName {
+		changes["last_name"] = map[string]string{"old": before.LastName, "new": u.LastName}
+	}
+	if before.Email != u.Email {
+		changes["email"] = map[string]string{"old": before.Email, "new": u.Email}
+	}
+	if before.IsActive != u.IsActive {
+		changes["is_active"] = map[string]bool{"old": before.IsActive, "new": u.IsActive}
+	}
+	h.Auditor.LogWithDetails(r, actor, logger.ActionUserUpdate, logger.ResourceUser, &u.ID, u.Username, changes)
 	h.RespondOK(w, resp)
 }
 

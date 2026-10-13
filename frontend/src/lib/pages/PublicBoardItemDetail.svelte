@@ -1,34 +1,21 @@
 <script>
   import { onMount } from 'svelte';
   import { publicBoard } from '../api/publicBoard.js';
-  import { formatRelativeTime, formatDateShort } from '../utils/dateFormatter.js';
-  import { itemTypeIconMap } from '../utils/icons.js';
-  import { CheckSquare } from '@lucide/svelte';
+  import { formatRelativeTime, formatDateOnly } from '../utils/dateFormatter.js';
+  import ItemTypeIcon from '../components/ItemTypeIcon.svelte';
   import Modal from '../dialogs/Modal.svelte';
   import ModalHeader from '../dialogs/ModalHeader.svelte';
   import StatusBadge from '../components/StatusBadge.svelte';
   import Text from '../components/Text.svelte';
+  import LazyMilkdownEditor from '../editors/LazyMilkdownEditor.svelte';
 
   let { slug, itemKey, onclose } = $props();
 
   let item = $state(null);
   let loading = $state(true);
   let error = $state(null);
-  let LazyMilkdownEditor = $state(null);
-
-  let ItemTypeIcon = $derived(
-    item?.item_type_icon ? (itemTypeIconMap[item.item_type_icon] || CheckSquare) : CheckSquare
-  );
 
   onMount(async () => {
-    // Load editor component lazily
-    try {
-      const mod = await import('../editors/LazyMilkdownEditor.svelte');
-      LazyMilkdownEditor = mod.default;
-    } catch {
-      // Editor failed to load, we'll show plain text fallback
-    }
-
     try {
       item = await publicBoard.getItem(slug, itemKey);
     } catch (err) {
@@ -61,24 +48,19 @@
       <p class="text-xs" style="color: var(--ds-text-subtle);">Something went wrong. Please try again.</p>
     </div>
   {:else if item}
-    <ModalHeader title={item.title} subtitle={item.key} onClose={onclose} />
+    <div data-testid="public-board-item-detail" data-item-key={item.key}>
+      <ModalHeader title={item.title} subtitle={item.key} onClose={onclose} />
 
-    <div class="flex overflow-hidden" style="min-height: 60vh; max-height: 70vh;">
+      <div class="flex overflow-hidden" style="min-height: 60vh; max-height: 70vh;">
       <!-- Left column: Description + Comments -->
       <div class="flex-1 min-w-0 overflow-y-auto pt-5 pb-5 px-6">
         <!-- Description -->
         <div class="mb-6">
           <h4 class="text-xs font-semibold uppercase tracking-wider mb-2" style="color: var(--ds-text-subtle);">Description</h4>
           {#if item.description}
-            {#if LazyMilkdownEditor}
-              <div class="rounded-md p-3" style="border: 1px solid var(--ds-border);">
-                <LazyMilkdownEditor content={item.description} readonly={true} showToolbar={false} />
-              </div>
-            {:else}
-              <div class="rounded-md p-3 text-sm leading-relaxed whitespace-pre-wrap" style="border: 1px solid var(--ds-border); color: var(--ds-text);">
-                {item.description}
-              </div>
-            {/if}
+            <div class="rounded-md p-3" style="border: 1px solid var(--ds-border);">
+              <LazyMilkdownEditor content={item.description} readonly={true} showToolbar={false} />
+            </div>
           {:else}
             <p class="text-xs italic" style="color: var(--ds-text-disabled);">No description</p>
           {/if}
@@ -95,7 +77,7 @@
           {:else}
             <div class="flex flex-col gap-4">
               {#each item.comments as comment}
-                <div class="flex gap-2.5">
+                <div class="flex gap-2.5" data-testid="public-board-comment">
                   <!-- Avatar -->
                   {#if comment.author_avatar}
                     <img src={comment.author_avatar} alt={comment.author_name} class="w-7 h-7 rounded-full object-cover flex-shrink-0" />
@@ -112,15 +94,9 @@
                       <span class="text-[11px]" style="color: var(--ds-text-disabled);">{formatRelativeTime(comment.created_at)}</span>
                     </div>
                     <!-- Content -->
-                    {#if LazyMilkdownEditor}
-                      <div class="comment-content">
-                        <LazyMilkdownEditor content={comment.content} readonly={true} showToolbar={false} compact={true} />
-                      </div>
-                    {:else}
-                      <div class="text-[13px] leading-normal whitespace-pre-wrap" style="color: var(--ds-text);">
-                        {comment.content}
-                      </div>
-                    {/if}
+                    <div class="comment-content">
+                      <LazyMilkdownEditor content={comment.content} readonly={true} showToolbar={false} compact={true} />
+                    </div>
                   </div>
                 </div>
               {/each}
@@ -160,12 +136,10 @@
             <div class="w-full flex items-center justify-between px-2 py-1.5 text-sm rounded">
               <Text variant="subtle" size="sm">Type</Text>
               <div class="flex items-center gap-2">
-                <div
-                  class="w-5 h-5 rounded flex items-center justify-center flex-shrink-0"
-                  style="background-color: {item.item_type_color || 'var(--ds-accent-blue)'};"
-                >
-                  <ItemTypeIcon class="w-3 h-3" style="color: white;" />
-                </div>
+                <ItemTypeIcon
+                  icon={item.item_type_icon}
+                  color={item.item_type_color || 'var(--ds-accent-blue)'}
+                />
                 <span class="text-[13px]">{item.item_type_name}</span>
               </div>
             </div>
@@ -196,8 +170,8 @@
             <div class="w-full flex items-center justify-between px-2 py-1.5 text-sm rounded">
               <Text variant="subtle" size="sm">Due Date</Text>
               <div class="flex items-center gap-2">
-                <span class="text-[13px]" class:text-red-500={isOverdue} class:font-medium={isOverdue}>
-                  {formatDateShort(item.due_date)}
+                <span class="text-[13px]" class:text-ds-text-danger={isOverdue} class:font-medium={isOverdue}>
+                  {formatDateOnly(item.due_date)}
                 </span>
               </div>
             </div>
@@ -229,6 +203,7 @@
             </div>
           </div>
         {/if}
+      </div>
       </div>
     </div>
   {/if}

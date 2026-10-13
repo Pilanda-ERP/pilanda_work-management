@@ -8,8 +8,10 @@
   import { APP_NAME } from '../constants.js';
   import Button from '../components/Button.svelte';
   import Checkbox from '../components/Checkbox.svelte';
+  import Input from '../components/Input.svelte';
   import Label from '../components/Label.svelte';
   import AlertBox from '../components/AlertBox.svelte';
+  import Spinner from '../components/Spinner.svelte';
   import {
     isWebAuthnSupported
   } from '../utils/webauthn-utils.js';
@@ -36,6 +38,7 @@
   let showFidoOption = $state(false);
   let ssoError = $state(null);
   let ssoRequiredMessage = $state(null);
+  let loginOptionsReady = $state(false);
 
   // Auth policy status (fetched on mount)
   let policyStatus = $state({
@@ -49,12 +52,16 @@
 
   // Initialize SSO status and auth policy on mount
   onMount(async () => {
-    await Promise.all([
-      ssoStore.initStatus(),
-      loadPolicyStatus()
-    ]);
-    // Check for SSO error in URL (after callback redirect)
-    ssoError = ssoStore.checkForError();
+    try {
+      await Promise.all([
+        ssoStore.initStatus(),
+        loadPolicyStatus()
+      ]);
+      // Check for SSO error in URL (after callback redirect)
+      ssoError = ssoStore.checkForError();
+    } finally {
+      loginOptionsReady = true;
+    }
   });
 
   // Load public policy status
@@ -140,8 +147,9 @@
       const loginResult = await performFidoLogin(api, emailOrUsername);
 
       if (loginResult.success || loginResult.status === 'success') {
-        // Update auth store with user info
-        authStore.setAuthData(loginResult.user, loginResult.sessionToken || loginResult.session);
+        // Verify the browser session was issued/elevated and load canonical
+        // session metadata before rendering the authenticated application.
+        await authStore.completePasskeyLogin(loginResult.user);
         isOpen = false;
         onsuccess?.();
       } else {
@@ -192,6 +200,10 @@
 
       isOpen = false;
       onsuccess?.();
+    } else if (result.passkey_required) {
+      // The password established only a server-restricted pending session.
+      // Complete the fresh passkey assertion before treating it as authenticated.
+      await handleFidoLogin();
     } else if (result.sso_required) {
       // Show SSO required message instead of regular error
       ssoRequiredMessage = result.policy_message;
@@ -207,7 +219,10 @@
 
 {#if isOpen}
 <!-- Full-screen login overlay that cannot be dismissed -->
-<div class="fixed inset-0 bg-[var(--ds-surface)] flex items-center justify-center z-50">
+<div
+  class="fixed inset-0 bg-[var(--ds-surface)] flex items-center justify-center z-50"
+  data-testid="login-dialog"
+>
   <div class="bg-[var(--ds-surface-raised)] rounded shadow-xl max-w-md w-full mx-4">
   <div class="p-6">
     <!-- Header -->
@@ -221,7 +236,9 @@
 
     <!-- Error Messages -->
     {#if ssoError}
-      <AlertBox variant="error" message={ssoError} class="mb-4" />
+      <div data-testid="login-sso-error">
+        <AlertBox variant="error" message={ssoError} class="mb-4" />
+      </div>
     {/if}
 
     {#if ssoRequiredMessage}
@@ -241,14 +258,35 @@
       <AlertBox variant="error" message={$authStore.error} class="mb-4" />
     {/if}
 
-    <!-- SSO Login Button(s) -->
+    {#if !loginOptionsReady}
+      <div
+        class="flex min-h-40 items-center justify-center gap-3 text-sm text-[var(--ds-text-subtle)]"
+        data-testid="login-options-loading"
+      >
+        <Spinner size="sm" />
+        <span>{t('common.loading')}</span>
+      </div>
+    {:else}
+    <!-- Keep the session choice in front of SSO so it also remains available
+         when the authentication policy hides the password form. -->
     {#if $ssoStore.enabled && !$ssoStore.statusLoading}
+      <Checkbox
+        bind:checked={rememberMe}
+        disabled={$authStore.loading}
+        label={t('auth.staySignedIn')}
+        size="small"
+        class="mb-4"
+        dataTestid="login-remember-me"
+      />
+
+      <!-- SSO Login Button(s) -->
       {#if $ssoStore.providers.length <= 1}
         <Button
           variant="default"
           fullWidth={true}
           onclick={handleSSOLogin}
           disabled={$authStore.loading}
+          dataTestid="login-sso"
         >
           <LogIn class="w-4 h-4 mr-2" />
           {t('auth.continueWith', { provider: $ssoStore.providerName || 'SSO' })}
@@ -261,6 +299,7 @@
               fullWidth={true}
               onclick={() => handleSSOLoginForProvider(provider)}
               disabled={$authStore.loading}
+              dataTestid={`login-sso-${provider.slug}`}
             >
               <LogIn class="w-4 h-4 mr-2" />
               {t('auth.continueWith', { provider: provider.name || 'SSO' })}
@@ -312,13 +351,13 @@
             <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
               <User class="h-4 w-4 text-[var(--ds-icon)]" />
             </div>
-            <input
+            <Input
               id="emailOrUsernamePasskey"
               type="text"
               bind:value={emailOrUsername}
               onblur={checkFidoAvailability}
               disabled={$authStore.loading || tryingFido}
-              class="block w-full pl-10 pr-3 py-2 border border-[var(--ds-border)] rounded-md leading-5 bg-[var(--ds-background-input)] placeholder-[var(--ds-text-subtlest)] text-[var(--ds-text)] focus:outline-none focus:placeholder-[var(--ds-text-disabled)] focus:ring-1 focus:ring-[var(--ds-border-focused)] focus:border-[var(--ds-border-focused)] disabled:bg-[var(--ds-background-disabled)] disabled:text-[var(--ds-text-disabled)]"
+              class="pl-10 pr-3 py-2 leading-5"
               placeholder={t('placeholders.enterEmailOrUsername')}
               autocomplete="username"
             />
@@ -332,6 +371,7 @@
           disabled={$authStore.loading || tryingFido || !emailOrUsername.trim()}
           onclick={handleFidoLogin}
           class="mt-4"
+          dataTestid="login-passkey"
         >
           {#if !tryingFido}
             <Key class="w-4 h-4 mr-2" />
@@ -342,7 +382,11 @@
     {:else}
 
     <!-- Login Form -->
-    <form onsubmit={(e) => { e.preventDefault(); handleSubmit(); }} class="space-y-4">
+    <form
+      onsubmit={(e) => { e.preventDefault(); handleSubmit(); }}
+      class="space-y-4"
+      data-testid="login-password-form"
+    >
       <!-- Email/Username Field -->
       <div>
         <Label for="emailOrUsername" color="default" class="mb-1">
@@ -352,15 +396,15 @@
           <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
             <User class="h-4 w-4 text-[var(--ds-icon)]" />
           </div>
-          <input
-            bind:this={emailInput}
+          <Input
+            bind:inputRef={emailInput}
             id="emailOrUsername"
             type="text"
             bind:value={emailOrUsername}
             onkeydown={handleKeydown}
             onblur={checkFidoAvailability}
             disabled={$authStore.loading}
-            class="block w-full pl-10 pr-3 py-2 border border-[var(--ds-border)] rounded-md leading-5 bg-[var(--ds-background-input)] placeholder-[var(--ds-text-subtlest)] text-[var(--ds-text)] focus:outline-none focus:placeholder-[var(--ds-text-disabled)] focus:ring-1 focus:ring-[var(--ds-border-focused)] focus:border-[var(--ds-border-focused)] disabled:bg-[var(--ds-background-disabled)] disabled:text-[var(--ds-text-disabled)]"
+            class="pl-10 pr-3 py-2 leading-5"
             placeholder={t('placeholders.enterEmailOrUsername')}
             autocomplete="username"
             required
@@ -377,13 +421,13 @@
           <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
             <Lock class="h-4 w-4 text-[var(--ds-icon)]" />
           </div>
-          <input
+          <Input
             id="password"
             type={showPassword ? 'text' : 'password'}
             bind:value={password}
             onkeydown={handleKeydown}
             disabled={$authStore.loading}
-            class="block w-full pl-10 pr-10 py-2 border border-[var(--ds-border)] rounded-md leading-5 bg-[var(--ds-background-input)] placeholder-[var(--ds-text-subtlest)] text-[var(--ds-text)] focus:outline-none focus:placeholder-[var(--ds-text-disabled)] focus:ring-1 focus:ring-[var(--ds-border-focused)] focus:border-[var(--ds-border-focused)] disabled:bg-[var(--ds-background-disabled)] disabled:text-[var(--ds-text-disabled)]"
+            class="pl-10 pr-10 py-2 leading-5"
             placeholder={t('placeholders.enterPassword')}
             autocomplete="current-password"
             required
@@ -403,13 +447,15 @@
         </div>
       </div>
 
-      <!-- Remember Me -->
-      <Checkbox
-        bind:checked={rememberMe}
-        disabled={$authStore.loading}
-        label={t('auth.staySignedIn')}
-        size="small"
-      />
+      {#if !$ssoStore.enabled || $ssoStore.statusLoading}
+        <Checkbox
+          bind:checked={rememberMe}
+          disabled={$authStore.loading}
+          label={t('auth.staySignedIn')}
+          size="small"
+          dataTestid="login-remember-me"
+        />
+      {/if}
 
       <!-- FIDO Authentication Option -->
       {#if showFidoOption && fidoAvailable}
@@ -428,6 +474,7 @@
           loading={tryingFido}
           disabled={$authStore.loading || tryingFido || !emailOrUsername.trim()}
           onclick={handleFidoLogin}
+          dataTestid="login-passkey"
         >
           {#if !tryingFido}
             <svg class="w-4 h-4 mr-2" fill="currentColor" viewBox="0 0 20 20">
@@ -442,6 +489,7 @@
       <Button
         variant="primary"
         type="submit"
+        dataTestid="login-submit"
         fullWidth={true}
         loading={$authStore.loading}
         disabled={$authStore.loading || !emailOrUsername.trim() || !password}
@@ -449,6 +497,7 @@
         {$authStore.loading ? t('auth.loggingIn') : t('auth.signIn')}
       </Button>
     </form>
+    {/if}
     {/if}
   </div>
   </div>

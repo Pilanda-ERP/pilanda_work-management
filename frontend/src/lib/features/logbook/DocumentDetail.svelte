@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import TabStrip from '../../components/TabStrip.svelte';
   import { navigate, currentRoute } from '../../router.js';
   import { logbookStore } from '../../stores/logbook.svelte.js';
   import { t } from '../../stores/i18n.svelte.js';
@@ -7,6 +8,7 @@
   import { successToast, errorToast } from '../../stores/toasts.svelte.js';
   import { confirm } from '../../composables/useConfirm.js';
   import Button from '../../components/Button.svelte';
+  import Input from '../../components/Input.svelte';
   import Spinner from '../../components/Spinner.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
   import Progress from '../../components/Progress.svelte';
@@ -171,10 +173,7 @@
     <div class="mb-6">
       <a
         href={doc?.bucket_id ? `/logbook/bucket/${doc.bucket_id}` : '/logbook'}
-        class="flex items-center gap-2 text-sm mb-4 cursor-pointer transition-colors no-underline"
-        style="color: var(--ds-text-subtle);"
-        onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text)'}
-        onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
+        class="back-link flex items-center gap-2 text-sm mb-4 cursor-pointer transition-colors no-underline"
       >
         <ArrowLeft class="w-4 h-4" />
         {t('logbook.back')}
@@ -197,8 +196,9 @@
       <div class="flex items-start justify-between gap-4">
         <div class="flex-1 min-w-0">
           {#if isNote}
-            <input
+            <Input
               type="text"
+              dataTestid="logbook-document-title"
               bind:value={titleValue}
               oninput={handleTitleInput}
               class="text-xl font-semibold w-full bg-transparent border-none outline-none focus:ring-0 p-0"
@@ -259,6 +259,7 @@
             {t('logbook.delete')}
           </Button>
           <Button
+            dataTestid="logbook-document-save"
             variant="primary"
             icon={Save}
             onclick={saveDocument}
@@ -284,43 +285,22 @@
     {/if}
 
     <!-- Tab Navigation -->
-    <div class="flex border-b mb-6 gap-1" style="border-color: var(--ds-border);">
-      <button
-        onclick={() => activeTab = 'article'}
-        class="px-4 py-2 text-sm font-medium transition-colors cursor-pointer -mb-px"
-        style={activeTab === 'article'
-          ? 'color: var(--ds-text); border-bottom: 2px solid var(--ds-interactive);'
-          : 'color: var(--ds-text-subtle); border-bottom: 2px solid transparent;'}
-      >
-        {t('logbook.article')}
-      </button>
-      {#if !isNote}
-        <button
-          onclick={() => activeTab = 'raw'}
-          class="px-4 py-2 text-sm font-medium transition-colors cursor-pointer -mb-px"
-          style={activeTab === 'raw'
-            ? 'color: var(--ds-text); border-bottom: 2px solid var(--ds-interactive);'
-            : 'color: var(--ds-text-subtle); border-bottom: 2px solid transparent;'}
-        >
-          {t('logbook.rawContent')}
-        </button>
-      {/if}
-      <button
-        onclick={() => activeTab = 'info'}
-        class="px-4 py-2 text-sm font-medium transition-colors cursor-pointer -mb-px"
-        style={activeTab === 'info'
-          ? 'color: var(--ds-text); border-bottom: 2px solid var(--ds-interactive);'
-          : 'color: var(--ds-text-subtle); border-bottom: 2px solid transparent;'}
-      >
-        {t('logbook.info')}
-      </button>
-    </div>
+    <TabStrip
+      class="mb-6"
+      tabs={[
+        { id: 'article', label: t('logbook.article') },
+        ...(!isNote ? [{ id: 'raw', label: t('logbook.rawContent') }] : []),
+        { id: 'info', label: t('logbook.info') }
+      ]}
+      bind:activeTab
+    />
 
     <!-- Tab Content -->
     {#if activeTab === 'article'}
       <div class="rounded-xl border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
         <LazyMilkdownEditor
           bind:content={articleContent}
+          testId="logbook-document-editor"
           placeholder={isNote ? t('logbook.noteContentPlaceholder') : 'Article content...'}
           showToolbar={true}
           customUploadFn={(formData) => api.logbook.uploadAttachment(resolvedDocumentId, formData)}
@@ -363,3 +343,13 @@
     </div>
   {/if}
 </div>
+
+<style>
+  .back-link {
+    color: var(--ds-text-subtle);
+  }
+
+  .back-link:hover {
+    color: var(--ds-text);
+  }
+</style>

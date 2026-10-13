@@ -9,93 +9,152 @@
   <a href="https://windshift.sh/download"><img src="https://img.shields.io/badge/download-latest-2e7dbd?style=flat-square" alt="Download"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-2e7dbd?style=flat-square" alt="AGPL-3.0 License"></a>
   <a href="https://windshift.sh/docs"><img src="https://img.shields.io/badge/docs-windshift.sh-2e7dbd?style=flat-square" alt="Documentation"></a>
+  <a href="https://matrix.to/#/%23windshift:matrix.org"><img src="https://img.shields.io/badge/matrix-%23windshift-2e7dbd?style=flat-square" alt="Matrix chat"></a>
 </p>
 
----
+<p align="center"> <strong>Work management that fits the way your team works.</strong><br> Jira-class planning, workflows, and automation, self-hosted and open source. </p>
 
-## Overview
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-board-framed.webp">
+    <img src=".github/assets/screenshots/hero-board-framed-dark.webp" alt="A Windshift board showing work moving from open to in progress and done" width="100%">
+  </picture>
+</p>
 
-Windshift is a comprehensive highly optimized work management platform that combines task tracking, workflow automation, and team collaboration in a single self-hosted application. Built with Go and Svelte, it offers enterprise-grade features while remaining easy to deploy and maintain.
+## What Windshift is
 
-## Screenshots
+Windshift is a work management platform for teams who want Jira's depth without Jira's weight.
 
-<table>
-  <tr>
-    <td width="50%"><img src=".github/assets/screenshots/hero-board.webp" alt="Kanban board"></td>
-    <td width="50%"><img src=".github/assets/screenshots/hero-dashboard.webp" alt="Dashboard"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Boards</b> — drag, rank, filter</sub></td>
-    <td align="center"><sub><b>Dashboards</b> — widgets for every surface</sub></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src=".github/assets/screenshots/milestone-detail.webp" alt="Milestone detail"></td>
-    <td width="50%"><img src=".github/assets/screenshots/hero-tree.webp" alt="Hierarchy tree"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Milestones</b> — plan and track delivery</sub></td>
-    <td align="center"><sub><b>Hierarchy</b> — nest work to any depth</sub></td>
-  </tr>
-</table>
+It covers the core of what Jira does: projects, epics, stories, sub-tasks, sprints and backlogs, boards, roadmaps, custom workflows, custom fields, screens, permissions, automation, and dashboards. Filtering and saved searches use Windshift Query Language, a JQL-style query language.
 
-## Features
+It also replaces the add-ons and adjacent tools you would otherwise stitch together: service management with SLAs and a customer portal, a knowledge base, test management, time tracking, and an asset/CMDB register.
 
-**Work Management**
-- Workspaces and Task Management with custom fields and workflows
-- Configurable statuses, priorities, screens and item types
-- Rich text descriptions with mentions and attachments
-- Recurring tasks with flexible scheduling
+A built-in importer handles the move off Jira.
 
-**Collaboration**
-- Comments with activity tracking
-- Email and webhook notifications
-- Customer portal for external submissions
-- Public boards for external stakeholders
-- Team workspaces with role-based access
+It ships as a single Go binary with the Svelte frontend built in, SQLite by default or PostgreSQL for data storage. No Java, no Elasticsearch cluster, no per-user pricing, and your data stays on your infrastructure.
 
-**Integrations**
-- SSO/OIDC authentication (PocketID, Authentik, etc.)
-- WebAuthn/FIDO2 passwordless login
-- SCM integration (GitHub, Gitea)
-- Jira project import
+## Highlights
 
-**Additional Modules**
-- Test management (cases, runs, results)
-- Time tracking with project billing and customer management
-- Asset management / CMDB
-- Collections and saved searches
+- Plan Jira-style without the Jira footprint: boards, backlogs, sprints, epics and sub-tasks, hierarchy trees, roadmaps, and dashboards.
+- Configure each workspace on its own: item types, custom fields, screens, statuses, workflows, priorities, and permissions.
+- Filter with a JQL-style query language and save the results as shared views.
+- Automate the busywork with event-driven rules that update fields, notify people, and create work.
+- Serve customers with SLAs, queues, approvals, and a public request portal.
+- Connect GitHub, Gitlab, Gitea, and Forgejo, import Jira projects, and send email or webhook notifications.
+- Extend it with test management, time tracking, a knowledge base, or an asset register.
 
-## Getting started
+## Coming from Jira
 
-Download the Windshift binaries from https://windshift.sh/download — you can find the quick start guide [here](https://windshift.sh/docs/01-getting-started/02-quick-start).
+| Jira | Windshift |
+|------|-----------|
+| Projects | Workspaces and collections |
+| Issues, epics, sub-tasks | Work items with configurable hierarchy levels |
+| Boards, backlogs, sprints | Board and backlog views with iterations |
+| Custom fields and screens | Custom fields and screens |
+| Workflows and statuses | Workflow builder with conditions and approvals |
+| JQL and saved filters | Windshift Query Language and saved collections |
+| Jira Automation | Built-in event-driven actions |
+| Jira Service Management | SLAs, queues, approvals, and a customer portal |
+| Jira Assets / Insight | Asset and CMDB register |
+| Confluence | Workspace knowledge base pages |
+| Xray / Zephyr | Test cases, test sets, test runs, and reports |
+| Marketplace apps | Built-in modules, packs, and plugins (extensible via WASM runtime) |
 
-## Help wanted
+## Take a look
 
-**Important**: If you are viewing this on Github, this repository is a push mirror for https://codeberg.org/realigned/windshift-core. Code contributions can only be made on Codeberg.
+<p align="center"><strong>Plan sprints on the backlog</strong></p>
 
-If you would like to contribute to this project, we are looking for help in the following areas:
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-backlog-framed.webp">
+    <img src=".github/assets/screenshots/hero-backlog-framed-dark.webp" alt="Backlog grouped into sprints, with items ready to schedule" width="100%">
+  </picture>
+</p>
 
-#### Early bug reports
-Let us know if you encounter any bug or uncertainties about a feature via Github Issues.
+<p align="center"><strong>See every level of the work</strong></p>
 
-#### OIDC Providers
-If you can connect Windshift to an OIDC Provider, let us know how it goes via Discussion. Both positive and negative feedback helps us here. We have tested OIDC with PocketID from our side.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-tree-framed.webp">
+    <img src=".github/assets/screenshots/hero-tree-framed-dark.webp" alt="Hierarchy tree view showing epics, stories, and sub-tasks" width="100%">
+  </picture>
+</p>
 
-## Tech Stack
+<p align="center"><strong>Track the timeline</strong></p>
 
-- **Backend**: Go 1.25+
-- **Frontend**: Svelte 5, Vite, Tailwind CSS
-- **Database**: SQLite (default) or PostgreSQL
-- **Authentication**: Sessions, JWT, WebAuthn, OIDC
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-roadmap-framed.webp">
+    <img src=".github/assets/screenshots/hero-roadmap-framed-dark.webp" alt="Roadmap timeline with bars spanning start and due dates" width="100%">
+  </picture>
+</p>
 
-Windshift is built on a minimalist philosophy: a lean frontend and backend while maintaining a large set of features. We try to keep the memory and resource consumption as low as possible. You can run Windshift on a Raspberry Pi easily.
+<p align="center"><strong>Measure milestone progress</strong></p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-milestone-framed.webp">
+    <img src=".github/assets/screenshots/hero-milestone-framed-dark.webp" alt="Milestone detail with completion progress and work items" width="100%">
+  </picture>
+</p>
+
+<p align="center"><strong>Keep context on the work</strong></p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-item-detail-framed.webp">
+    <img src=".github/assets/screenshots/hero-item-detail-framed-dark.webp" alt="Work item with rich description, fields, and discussion" width="100%">
+  </picture>
+</p>
+
+<p align="center"><strong>Verify releases with test runs</strong></p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-test-run-framed.webp">
+    <img src=".github/assets/screenshots/hero-test-run-framed-dark.webp" alt="Test run with per-case results and success rate" width="100%">
+  </picture>
+</p>
+
+## Language support
+
+<p align="center"><strong>Available in many languages · متوفر بالعديد من اللغات · 支持多种语言<br>Доступно на многих языках · 다양한 언어로 사용 가능</strong></p>
+
+Windshift ships with nine built-in languages — English, Deutsch, Español, Français, Português (Brasil), العربية, Русский, 简体中文, and 한국어 — including right-to-left support for Arabic.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/screenshots/hero-rtl-ar-framed.webp">
+    <img src=".github/assets/screenshots/hero-rtl-ar-framed-dark.webp" alt="A Windshift work item rendered in Arabic, showing the fully mirrored right-to-left interface">
+  </picture>
+</p>
+
+## Get started
+
+[Download the latest release](https://windshift.sh/download), then follow the [quick start guide](https://windshift.sh/self-hosting/01-getting-started/02-quick-start). Windshift is designed to run comfortably on anything from a Raspberry Pi to a dedicated server.
+
+Want to build from source? See [BUILD.md](BUILD.md). For local development and contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Contributing
+
+Code contributions, bug reports, and feedback are all welcome here on GitHub. Open pull requests against `main`; use GitHub Issues and Discussions for bug reports and feedback.
+
+We are especially interested in early bug reports and real-world feedback about OIDC providers.
+
+## Tech stack
+
+- Backend: Go
+- Frontend: Svelte, Vite, and Tailwind CSS
+- Database: SQLite by default, with PostgreSQL support
 
 ## Documentation
 
-- [BUILD.md](BUILD.md) — Build instructions
-- [CONTRIBUTING.md](CONTRIBUTING.md) — Contributing guide
-- [LOGGING.md](LOGGING.md) — Logging configuration
+- [Build instructions](BUILD.md)
+- [Contributing guide](CONTRIBUTING.md)
+- [Logging configuration](LOGGING.md)
+- [Docker backup and restore](deploy/backup-restore.md)
+- [Product documentation](https://windshift.sh/docs)
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Windshift is available under the [GNU Affero General Public License v3.0](LICENSE).

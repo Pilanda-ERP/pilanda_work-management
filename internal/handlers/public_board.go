@@ -12,21 +12,68 @@ import (
 
 	"windshift/internal/database"
 	"windshift/internal/fileserve"
+	"windshift/internal/markdown"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/services"
 )
 
+const publicBoardItemLimit = 500
+
+var publicBoardCardFieldAllowlist = map[string]struct{}{
+	"key":          {},
+	"title":        {},
+	"status":       {},
+	"priority":     {},
+	"assignee":     {},
+	"item_type":    {},
+	"story_points": {},
+	"due_date":     {},
+	"labels":       {},
+}
+
+func filterPublicBoardCardFields(fields []models.ListColumn) []models.ListColumn {
+	filtered := make([]models.ListColumn, 0, len(fields))
+	for _, field := range fields {
+		if field.FieldType != "system" {
+			continue
+		}
+		if _, allowed := publicBoardCardFieldAllowlist[field.FieldIdentifier]; allowed {
+			filtered = append(filtered, field)
+		}
+	}
+	return filtered
+}
+
+func rewritePublicAttachmentURLs(content, slug string) string {
+	return strings.ReplaceAll(
+		content,
+		"/api/attachments/",
+		fmt.Sprintf("/api/public/board/%s/attachments/", slug),
+	)
+}
+
 // PublicBoardHandler serves read-only public board views
 type PublicBoardHandler struct {
 	db                database.Database
 	permissionService *services.PermissionService
+	publicBoardScope  *services.PublicBoardScopeService
 	attachmentPath    string
 }
 
 // NewPublicBoardHandler creates a new PublicBoardHandler
 func NewPublicBoardHandler(db database.Database, permissionService *services.PermissionService, attachmentPath string) *PublicBoardHandler {
-	return &PublicBoardHandler{db: db, permissionService: permissionService, attachmentPath: attachmentPath}
+	return &PublicBoardHandler{
+		db:                db,
+		permissionService: permissionService,
+		publicBoardScope:  services.NewPublicBoardScopeService(db, permissionService),
+		attachmentPath:    attachmentPath,
+	}
+}
+
+func isPublicBoardScopeError(err error) bool {
+	return errors.Is(err, services.ErrPublicBoardWorkspaceScopeRequired) ||
+		errors.Is(err, services.ErrPublicBoardWorkspaceNotFound)
 }
 
 // publicBoardCard is a stripped-down item for public display
@@ -62,37 +109,43 @@ type publicBoardResponse struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
 	} `json:"collection"`
-	Columns    []publicColumn      `json:"columns"`
-	CardFields []models.ListColumn `json:"card_fields,omitempty"`
-	UpdatedAt  string              `json:"updated_at"`
+	Columns     []publicColumn      `json:"columns"`
+	CardFields  []models.ListColumn `json:"card_fields,omitempty"`
+	TotalItems  int                 `json:"total_items"`
+	LoadedItems int                 `json:"loaded_items"`
+	Truncated   bool                `json:"truncated"`
+	ItemLimit   int                 `json:"item_limit"`
+	UpdatedAt   string              `json:"updated_at"`
 }
 
 type publicComment struct {
 	AuthorName   string `json:"author_name"`
 	AuthorAvatar string `json:"author_avatar,omitempty"`
 	Content      string `json:"content"`
+	ContentHTML  string `json:"content_html,omitempty"`
 	CreatedAt    string `json:"created_at"`
 }
 
 type publicItemDetail struct {
-	Key            string          `json:"key"`
-	Title          string          `json:"title"`
-	Description    string          `json:"description"`
-	StatusName     string          `json:"status_name,omitempty"`
-	StatusColor    string          `json:"status_color,omitempty"`
-	PriorityName   string          `json:"priority_name,omitempty"`
-	PriorityIcon   string          `json:"priority_icon,omitempty"`
-	PriorityColor  string          `json:"priority_color,omitempty"`
-	ItemTypeName   string          `json:"item_type_name,omitempty"`
-	ItemTypeIcon   string          `json:"item_type_icon,omitempty"`
-	ItemTypeColor  string          `json:"item_type_color,omitempty"`
-	AssigneeName   string          `json:"assignee_name,omitempty"`
-	AssigneeAvatar string          `json:"assignee_avatar,omitempty"`
-	DueDate        string          `json:"due_date,omitempty"`
-	Labels         []publicLabel   `json:"labels,omitempty"`
-	StoryPoints    *float64        `json:"story_points,omitempty"`
-	Comments       []publicComment `json:"comments"`
-	CreatedAt      string          `json:"created_at"`
+	Key             string          `json:"key"`
+	Title           string          `json:"title"`
+	Description     string          `json:"description"`
+	DescriptionHTML string          `json:"description_html,omitempty"`
+	StatusName      string          `json:"status_name,omitempty"`
+	StatusColor     string          `json:"status_color,omitempty"`
+	PriorityName    string          `json:"priority_name,omitempty"`
+	PriorityIcon    string          `json:"priority_icon,omitempty"`
+	PriorityColor   string          `json:"priority_color,omitempty"`
+	ItemTypeName    string          `json:"item_type_name,omitempty"`
+	ItemTypeIcon    string          `json:"item_type_icon,omitempty"`
+	ItemTypeColor   string          `json:"item_type_color,omitempty"`
+	AssigneeName    string          `json:"assignee_name,omitempty"`
+	AssigneeAvatar  string          `json:"assignee_avatar,omitempty"`
+	DueDate         string          `json:"due_date,omitempty"`
+	Labels          []publicLabel   `json:"labels,omitempty"`
+	StoryPoints     *float64        `json:"story_points,omitempty"`
+	Comments        []publicComment `json:"comments"`
+	CreatedAt       string          `json:"created_at"`
 }
 
 // GetPublicBoardItem serves a single item detail for a public collection
@@ -161,36 +214,47 @@ func (h *PublicBoardHandler) GetPublicBoardItem(w http.ResponseWriter, r *http.R
 	labels := h.loadSingleItemLabels(itemID)
 
 	// Load public comments (non-private only)
-	comments, err := h.loadPublicComments(itemID)
+	comments, err := h.loadPublicComments(itemID, slug)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 
 	// Rewrite attachment URLs for public access
-	description = strings.ReplaceAll(description,
-		"/api/attachments/",
-		fmt.Sprintf("/api/public/board/%s/attachments/", slug))
+	description = rewritePublicAttachmentURLs(description, slug)
+	descriptionHTML, err := markdown.Render(description)
+	if err != nil {
+		respondInternalError(w, r, fmt.Errorf("render public item description: %w", err))
+		return
+	}
+	for i := range comments {
+		comments[i].ContentHTML, err = markdown.Render(comments[i].Content)
+		if err != nil {
+			respondInternalError(w, r, fmt.Errorf("render public comment: %w", err))
+			return
+		}
+	}
 
 	detail := publicItemDetail{
-		Key:            key,
-		Title:          title,
-		Description:    description,
-		StatusName:     publicItem.StatusName,
-		StatusColor:    publicItem.StatusColor,
-		PriorityName:   publicItem.PriorityName,
-		PriorityIcon:   publicItem.PriorityIcon,
-		PriorityColor:  publicItem.PriorityColor,
-		ItemTypeName:   publicItem.ItemTypeName,
-		ItemTypeIcon:   publicItem.ItemTypeIcon,
-		ItemTypeColor:  publicItem.ItemTypeColor,
-		AssigneeName:   publicItem.AssigneeName,
-		AssigneeAvatar: publicItem.AssigneeAvatar,
-		Labels:         labels,
-		Comments:       comments,
-		CreatedAt:      createdAt,
-		DueDate:        publicItem.DueDate,
-		StoryPoints:    publicItem.StoryPoints,
+		Key:             key,
+		Title:           title,
+		Description:     description,
+		DescriptionHTML: descriptionHTML,
+		StatusName:      publicItem.StatusName,
+		StatusColor:     publicItem.StatusColor,
+		PriorityName:    publicItem.PriorityName,
+		PriorityIcon:    publicItem.PriorityIcon,
+		PriorityColor:   publicItem.PriorityColor,
+		ItemTypeName:    publicItem.ItemTypeName,
+		ItemTypeIcon:    publicItem.ItemTypeIcon,
+		ItemTypeColor:   publicItem.ItemTypeColor,
+		AssigneeName:    publicItem.AssigneeName,
+		AssigneeAvatar:  publicItem.AssigneeAvatar,
+		Labels:          labels,
+		Comments:        comments,
+		CreatedAt:       createdAt,
+		DueDate:         publicItem.DueDate,
+		StoryPoints:     publicItem.StoryPoints,
 	}
 
 	respondJSONOK(w, detail)
@@ -251,6 +315,7 @@ func (h *PublicBoardHandler) GetPublicBoard(w http.ResponseWriter, r *http.Reque
 		// Parse card_fields
 		if cardFieldsJSON.Valid && cardFieldsJSON.String != "" {
 			_ = json.Unmarshal([]byte(cardFieldsJSON.String), &cardFields)
+			cardFields = filterPublicBoardCardFields(cardFields)
 		}
 
 		// Parse backlog status IDs (items in these statuses won't appear on the board)
@@ -279,11 +344,14 @@ func (h *PublicBoardHandler) GetPublicBoard(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Scope QL evaluation to the collection's home workspace when set; fall
-	// back to every active workspace only for workspace-less public
-	// collections.
+	// Resolve the mandatory query scope and narrow it further to the
+	// collection's home workspace when one is set.
 	scopedWorkspaceIDs, err := h.resolveCollectionWorkspaceIDs(collectionID)
 	if err != nil {
+		if isPublicBoardScopeError(err) {
+			respondNotFound(w, r, "board")
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
@@ -296,10 +364,10 @@ func (h *PublicBoardHandler) GetPublicBoard(w http.ResponseWriter, r *http.Reque
 
 	// Execute the collection's QL query to get items
 	crudService := services.NewItemCRUDService(h.db)
-	items, _, err := crudService.ListWithQL(services.ListWithQLParams{
+	items, totalItems, err := crudService.ListWithQL(services.ListWithQLParams{
 		CollectionID: collectionID,
 		WorkspaceIDs: scopedWorkspaceIDs,
-		Pagination:   services.PaginationParams{Limit: 500},
+		Pagination:   services.PaginationParams{Limit: publicBoardItemLimit},
 		SortBy:       "created_at",
 		SortAsc:      false,
 	})
@@ -362,9 +430,13 @@ func (h *PublicBoardHandler) GetPublicBoard(w http.ResponseWriter, r *http.Reque
 	}
 
 	resp := publicBoardResponse{
-		Columns:    responseColumns,
-		CardFields: cardFields,
-		UpdatedAt:  updatedAt,
+		Columns:     responseColumns,
+		CardFields:  cardFields,
+		TotalItems:  totalItems,
+		LoadedItems: len(items),
+		Truncated:   totalItems > len(items),
+		ItemLimit:   publicBoardItemLimit,
+		UpdatedAt:   updatedAt,
 	}
 	resp.Collection.Name = collectionName
 	resp.Collection.Description = collectionDescription
@@ -504,46 +576,28 @@ func (h *PublicBoardHandler) buildDefaultColumns() ([]boardColumnInfo, error) {
 	return columns, nil
 }
 
-func (h *PublicBoardHandler) getAllActiveWorkspaceIDs() ([]int, error) {
-	rows, err := h.db.Query("SELECT id FROM workspaces WHERE active = true")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	var ids []int
-	for rows.Next() {
-		var id int
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return ids, nil
-}
-
-// resolveCollectionWorkspaceIDs returns the workspace IDs to scope a public
-// collection's QL evaluation against. If the collection has a non-null
-// workspace_id, the scope is just that workspace — otherwise the public
-// board falls back to every active workspace (the original "global public
-// collection" behavior).
-//
-// Without this scoping, a workspace-scoped collection whose QL happens to
-// match items in other workspaces would expose those items publicly. See
-// bughunt2.md Run 6 finding #5.
+// resolveCollectionWorkspaceIDs derives the anonymous read boundary from the
+// collection query and intersects it with the optional home workspace.
 func (h *PublicBoardHandler) resolveCollectionWorkspaceIDs(collectionID int) ([]int, error) {
 	var wsID sql.NullInt64
-	err := h.db.QueryRow(`SELECT workspace_id FROM collections WHERE id = ?`, collectionID).Scan(&wsID)
+	var qlQuery string
+	err := h.db.QueryRow(`SELECT workspace_id, COALESCE(ql_query, '') FROM collections WHERE id = ?`, collectionID).Scan(&wsID, &qlQuery)
 	if err != nil {
 		return nil, err
 	}
-	if wsID.Valid {
-		return []int{int(wsID.Int64)}, nil
+	workspaceIDs, err := h.publicBoardScope.ResolveWorkspaceIDs(qlQuery)
+	if err != nil {
+		return nil, err
 	}
-	return h.getAllActiveWorkspaceIDs()
+	if !wsID.Valid {
+		return workspaceIDs, nil
+	}
+	for _, workspaceID := range workspaceIDs {
+		if workspaceID == int(wsID.Int64) {
+			return []int{workspaceID}, nil
+		}
+	}
+	return []int{}, nil
 }
 
 func (h *PublicBoardHandler) loadItemLabels(items []models.Item) map[int][]publicLabel {
@@ -567,6 +621,7 @@ func (h *PublicBoardHandler) loadItemLabels(items []models.Item) map[int][]publi
 func (h *PublicBoardHandler) buildEmptyResponse(name, desc string, columns []boardColumnInfo, cardFields []models.ListColumn, updatedAt string) publicBoardResponse {
 	resp := publicBoardResponse{
 		CardFields: cardFields,
+		ItemLimit:  publicBoardItemLimit,
 		UpdatedAt:  updatedAt,
 	}
 	resp.Collection.Name = name
@@ -608,7 +663,7 @@ func (h *PublicBoardHandler) loadSingleItemLabels(itemID int) []publicLabel {
 	return labels
 }
 
-func (h *PublicBoardHandler) loadPublicComments(itemID int) ([]publicComment, error) {
+func (h *PublicBoardHandler) loadPublicComments(itemID int, slug string) ([]publicComment, error) {
 	rows, err := h.db.Query(`
 		SELECT COALESCE(u.first_name || ' ' || u.last_name, pc.name, 'Unknown'),
 		       COALESCE(u.avatar_url, ''),
@@ -630,6 +685,7 @@ func (h *PublicBoardHandler) loadPublicComments(itemID int) ([]publicComment, er
 		if err := rows.Scan(&c.AuthorName, &c.AuthorAvatar, &c.Content, &c.CreatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan comment: %w", err)
 		}
+		c.Content = rewritePublicAttachmentURLs(c.Content, slug)
 		comments = append(comments, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -643,6 +699,9 @@ func (h *PublicBoardHandler) loadPublicComments(itemID int) ([]publicComment, er
 
 // DownloadAttachment serves an image attachment for a public board item
 func (h *PublicBoardHandler) DownloadAttachment(w http.ResponseWriter, r *http.Request) {
+	// Publication and membership are mutable authorization inputs; never cache.
+	w.Header().Set("Cache-Control", "no-store")
+
 	slug := r.PathValue("slug")
 	attachmentIDStr := r.PathValue("id")
 	if slug == "" || attachmentIDStr == "" {
@@ -667,9 +726,7 @@ func (h *PublicBoardHandler) DownloadAttachment(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Fetch attachment. Public boards may only expose item attachments; other
-	// attachment rows also store their scoped entity in item_id for legacy
-	// reasons, so entity_type must be checked before treating item_id as an item.
+	// Require an item attachment; legacy rows reuse item_id for other entities.
 	var itemID sql.NullInt64
 	var entityType sql.NullString
 	var filePath, mimeType, originalFilename string
@@ -683,19 +740,17 @@ func (h *PublicBoardHandler) DownloadAttachment(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Attachment must be a work-item attachment.
 	if !itemID.Valid || (entityType.String != "" && entityType.String != "item") {
 		respondNotFound(w, r, "attachment")
 		return
 	}
 
-	// Only allow image MIME types, reject SVG (can contain scripts)
+	// SVG is excluded because it can execute scripts.
 	if !strings.HasPrefix(mimeType, "image/") || mimeType == "image/svg+xml" {
 		respondNotFound(w, r, "attachment")
 		return
 	}
 
-	// Verify item belongs to this public collection
 	belongs, err := h.itemBelongsToCollection(int(itemID.Int64), collectionID)
 	if err != nil {
 		respondInternalError(w, r, err)
@@ -706,15 +761,7 @@ func (h *PublicBoardHandler) DownloadAttachment(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Open the file confined to the storage root. fileserve.OpenUnderRoot uses
-	// os.Root (Go 1.24+), which rejects parent-dir traversal and refuses to
-	// follow symlinks that escape the root, so even if a malicious row in the
-	// attachments table or a symlink planted in the storage volume tries to
-	// point at /etc/passwd, the read stays confined to h.attachmentPath. This
-	// matters because the volume can be operator-managed (Docker bind-mount)
-	// and we don't want to rely on the DB or filesystem being uncompromised.
-	// Any failure (outside-root, not-exist, symlink escape, permission) is
-	// hidden behind a 404.
+	// Confine reads to storage root and hide traversal or symlink failures as 404.
 	file, err := fileserve.OpenUnderRoot(h.attachmentPath, filePath)
 	if err != nil {
 		respondNotFound(w, r, "attachment")
@@ -722,23 +769,22 @@ func (h *PublicBoardHandler) DownloadAttachment(w http.ResponseWriter, r *http.R
 	}
 	defer func() { _ = file.Close() }()
 
-	// Security headers
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Content-Disposition", fileserve.ContentDisposition("inline", originalFilename))
-	w.Header().Set("Cache-Control", "public, max-age=86400")
 
 	_, _ = io.Copy(w, file)
 }
 
-// itemBelongsToCollection checks whether the given item ID appears in the
-// results of the collection's QL query, scoped to the collection's home
-// workspace (or all active workspaces if the collection is workspace-less).
+// itemBelongsToCollection checks the collection's workspace-scoped QL result.
 func (h *PublicBoardHandler) itemBelongsToCollection(itemID, collectionID int) (bool, error) {
 	scopedWorkspaceIDs, err := h.resolveCollectionWorkspaceIDs(collectionID)
 	if err != nil {
+		if isPublicBoardScopeError(err) {
+			return false, nil
+		}
 		return false, err
 	}
 

@@ -1,3 +1,4 @@
+import { onDestroy } from 'svelte';
 import { api } from '../api.js';
 import { attachmentStatus } from '../stores';
 
@@ -10,6 +11,16 @@ import { attachmentStatus } from '../stores';
  * @returns {Object} Attachment state and methods
  */
 export function useItemAttachments(getItemId, showError = console.error) {
+  let destroyed = false;
+  const markDestroyed = () => {
+    destroyed = true;
+  };
+  globalThis.window?.addEventListener('pagehide', markDestroyed);
+  onDestroy(() => {
+    markDestroyed();
+    globalThis.window?.removeEventListener('pagehide', markDestroyed);
+  });
+
   // State
   let attachments = $state([]);
   let pagination = $state(null);
@@ -56,18 +67,12 @@ export function useItemAttachments(getItemId, showError = console.error) {
       loading = true;
       const response = await api.attachments.getByItem(itemId, { page, limit });
 
-      if (response?.attachments) {
-        // Handle paginated response
-        attachments = response.attachments;
-        pagination = response.pagination;
-        currentPage = page;
-        pageSize = limit;
-      } else {
-        // Handle legacy response (backward compatibility)
-        attachments = response || [];
-        pagination = null;
-      }
+      attachments = response?.data || [];
+      pagination = response?.pagination || null;
+      currentPage = page;
+      pageSize = limit;
     } catch (err) {
+      if (destroyed || err?.name === 'AbortError') return;
       console.error('Failed to load attachments:', err);
       attachments = [];
       pagination = null;
@@ -137,14 +142,7 @@ export function useItemAttachments(getItemId, showError = console.error) {
 
     for (const file of files) {
       try {
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('item_id', itemId.toString());
-
-        const result = await api.attachments.upload(formData);
-        if (!result.success) {
-          throw new Error(result.message || 'Upload failed');
-        }
+        await api.attachments.uploadToItem(itemId, file);
       } catch (err) {
         console.error('Upload error:', err);
         showError('Failed to upload attachment', err.message || String(err));

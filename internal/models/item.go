@@ -7,9 +7,11 @@ type Item struct {
 	ID                  int        `json:"id"`
 	WorkspaceID         int        `json:"workspace_id"`
 	WorkspaceItemNumber int        `json:"workspace_item_number"`  // Workspace-specific sequential number for display keys
+	Key                 string     `json:"key,omitempty" db:"-"`   // Ready-to-display workspace key and item number
 	ItemTypeID          *int       `json:"item_type_id,omitempty"` // Optional, defaults to workspace's default item type
 	Title               string     `json:"title"`
 	Description         string     `json:"description"`
+	DescriptionHTML     string     `json:"description_html,omitempty" db:"-"`
 	StatusID            *int       `json:"status_id,omitempty"`    // Foreign key to statuses table
 	PriorityID          *int       `json:"priority_id,omitempty"`  // Foreign key to priorities table
 	DueDate             *time.Time `json:"due_date,omitempty"`     // Due date for item completion
@@ -31,6 +33,9 @@ type Item struct {
 	ProjectID      *int `json:"project_id,omitempty"`
 	InheritProject bool `json:"inherit_project"` // If true, ProjectID is ignored and the parent item's effective project is used
 	TimeProjectID  *int `json:"time_project_id,omitempty"`
+	// Team assignment. Mirrors AssigneeID at the team level and is the team
+	// whose on-call policy governs an incident on this item.
+	TeamID *int `json:"team_id,omitempty"`
 	// User assignment fields
 	AssigneeID              *int `json:"assignee_id,omitempty"`                // User assigned to this item
 	CreatorID               *int `json:"creator_id,omitempty"`                 // Internal user who created this item
@@ -39,13 +44,20 @@ type Item struct {
 	// Portal submission tracking fields (immutable once set)
 	ChannelID         *int                    `json:"channel_id,omitempty"`      // Portal/channel this request was submitted through
 	RequestTypeID     *int                    `json:"request_type_id,omitempty"` // Request type used for submission
-	CustomFieldValues map[string]interface{}  `json:"custom_field_values,omitempty"`
-	VirtualFieldData  map[string]interface{}  `json:"virtual_field_data,omitempty"`
+	IntakeID          *int                    `json:"intake_id,omitempty"`       // Email intake that created this item
+	PortalOrgShared   bool                    `json:"portal_org_shared"`         // Creator opted to share the request with their organisation
+	CustomFieldValues map[string]any          `json:"custom_field_values,omitempty"`
+	VirtualFieldData  map[string]any          `json:"virtual_field_data,omitempty"`
 	CalendarData      []CalendarScheduleEntry `json:"calendar_data,omitempty"`
 	// Hierarchy fields
-	ParentID *int `json:"parent_id"` // Foreign key to parent item
+	ParentID  *int   `json:"parent_id"` // Foreign key to parent item
+	ParentKey string `json:"parent_key,omitempty" db:"-"`
 	// Personal task relationship (for linking personal workspace tasks to work items)
 	RelatedWorkItemID *int `json:"related_work_item_id,omitempty"` // Link to work item (for personal tasks)
+	// Current/latest incident. Non-nil means this item is an incident; the
+	// incident's own history lives in the incidents table.
+	IncidentID *int      `json:"incident_id,omitempty"`
+	Incident   *Incident `json:"incident,omitempty" db:"-"`
 	// Estimation
 	StoryPoints     *float64 `json:"story_points,omitempty"`     // Story points for velocity tracking
 	EstimateMinutes *int     `json:"estimate_minutes,omitempty"` // Time estimate in minutes (compared against logged worklog time)
@@ -61,12 +73,17 @@ type Item struct {
 	WorkspaceName             string `json:"workspace_name,omitempty"`
 	WorkspaceKey              string `json:"workspace_key,omitempty"`
 	ItemTypeName              string `json:"item_type_name,omitempty"`
+	ItemTypeBuiltinKey        string `json:"item_type_builtin_key,omitempty"`
+	ItemTypeIcon              string `json:"item_type_icon,omitempty"`
+	ItemTypeColor             string `json:"item_type_color,omitempty"`
 	PriorityName              string `json:"priority_name,omitempty"`
+	PriorityBuiltinKey        string `json:"priority_builtin_key,omitempty"`
 	PriorityIcon              string `json:"priority_icon,omitempty"`
 	PriorityColor             string `json:"priority_color,omitempty"`
 	ParentTitle               string `json:"parent_title,omitempty"`
 	ParentWorkspaceItemNumber *int   `json:"parent_workspace_item_number,omitempty"` // Parent's workspace-scoped number, for rendering the parent key
 	StatusName                string `json:"status_name,omitempty"`                  // Name from statuses table (joined field)
+	StatusBuiltinKey          string `json:"status_builtin_key,omitempty"`           // Stable key for translating built-in statuses
 	StatusColor               string `json:"status_color,omitempty"`                 // Color from the status category (joined field)
 	// StatusSince is when the item last entered its current status, derived from
 	// item_history (falls back to created_at when there is no recorded change).
@@ -81,6 +98,10 @@ type Item struct {
 	EffectiveProjectID     *int   `json:"effective_project_id,omitempty"`
 	EffectiveProjectName   string `json:"effective_project_name,omitempty"`
 	ProjectInheritanceMode string `json:"project_inheritance_mode,omitempty"` // "none" | "inherit" | "direct"
+	// Team information for API responses
+	TeamName      string `json:"team_name,omitempty"`
+	TeamColor     string `json:"team_color,omitempty"`
+	TeamAvatarURL string `json:"team_avatar_url,omitempty"`
 	// User information for API responses
 	AssigneeName               string `json:"assignee_name,omitempty"`                 // Full name of assigned user
 	AssigneeEmail              string `json:"assignee_email,omitempty"`                // Email of assigned user
@@ -92,6 +113,10 @@ type Item struct {
 	ReporterAvatar             string `json:"reporter_avatar,omitempty"`               // Avatar URL of reporter
 	CreatorPortalCustomerName  string `json:"creator_portal_customer_name,omitempty"`  // Name of portal customer creator
 	CreatorPortalCustomerEmail string `json:"creator_portal_customer_email,omitempty"` // Email of portal customer creator
+	// Customer organisation of the portal-customer creator, for the ticket
+	// customer-context panel. Empty for internal creators.
+	CreatorCustomerOrganisationID   *int   `json:"creator_customer_organisation_id,omitempty"`
+	CreatorCustomerOrganisationName string `json:"creator_customer_organisation_name,omitempty"`
 	// Portal submission tracking joined fields
 	ChannelName     string `json:"channel_name,omitempty"`      // Name of the portal/channel
 	RequestTypeName string `json:"request_type_name,omitempty"` // Name of the request type
@@ -101,7 +126,7 @@ type Item struct {
 	RelatedWorkItemWorkspaceID  int             `json:"related_work_item_workspace_id,omitempty"`
 	RelatedWorkItemNumber       int             `json:"related_work_item_number,omitempty"`
 	Children                    []Item          `json:"children,omitempty"` // For tree representations
-	Labels                      []Label         `json:"labels,omitempty"`   // Workspace-scoped labels
+	Labels                      []Label         `json:"labels,omitempty"`   // Global item labels
 	PersonalLabels              []PersonalLabel `json:"personal_labels,omitempty"`
 	Milestones                  []Milestone     `json:"milestones,omitempty"`
 }
@@ -114,6 +139,16 @@ type TimeRollup struct {
 	TotalEstimateMinutes int64 `json:"total_estimate_minutes"` // Sum of items.estimate_minutes across the included items.
 	TotalLoggedMinutes   int64 `json:"total_logged_minutes"`   // Sum of time_worklogs.duration_minutes for those items.
 	Truncated            bool  `json:"truncated"`              // True when the descendant set hit the max-items cap.
+}
+
+// RoadmapHierarchyDate is the minimal hierarchy projection used by roadmap
+// rollup and rolldown calculations.
+type RoadmapHierarchyDate struct {
+	ID          int    `json:"id"`
+	WorkspaceID int    `json:"workspace_id"`
+	ParentID    *int   `json:"parent_id"`
+	StartDate   string `json:"start_date,omitempty"`
+	EndDate     string `json:"end_date,omitempty"`
 }
 
 // ItemHistory represents a single change to an item field
@@ -129,9 +164,46 @@ type ItemHistory struct {
 	UserName  string `json:"user_name,omitempty"`  // Full name of user who made the change
 	UserEmail string `json:"user_email,omitempty"` // Email of user who made the change
 	IsAgent   bool   `json:"is_agent"`             // Whether the user is an AI agent
+	// ActorKind is "user" (default/legacy), "portal_customer", or "system".
+	// UserID is 0 for non-user actors and PortalCustomerID carries the
+	// acting portal customer instead.
+	ActorKind          string `json:"actor_kind,omitempty"`
+	PortalCustomerID   *int   `json:"portal_customer_id,omitempty"`
+	PortalCustomerName string `json:"portal_customer_name,omitempty"`
+	// PortalCustomerEmail is the resolved portal-customer email for
+	// non-user actors; not set for user rows.
+	PortalCustomerEmail string `json:"portal_customer_email,omitempty"`
+	// AgentOwnerName is permission-filtered by the item-history handler.
+	AgentOwnerName string `json:"agent_owner_name,omitempty"`
+	// Source names the acting surface when an agent made the change on the
+	// user's behalf ("ai_chat", "mcp", "standard_agent"). Empty for a direct
+	// write. The UI marks these rows so a viewer can tell a change the user
+	// typed from one the AI made for them under their name.
+	Source string `json:"source,omitempty"`
+	// AgentRunID links an agent-authored change back to the turn that caused
+	// it. It is a link, not the telemetry itself: the history response stays a
+	// single-table read, and the model/tokens/cost behind the turn are fetched
+	// on demand from the run's usage endpoint.
+	AgentRunID *int `json:"agent_run_id,omitempty"`
 	// Resolved values for display (when value is an ID)
 	ResolvedOldValue *string `json:"resolved_old_value,omitempty"` // Human-readable version of old_value
 	ResolvedNewValue *string `json:"resolved_new_value,omitempty"` // Human-readable version of new_value
+}
+
+// ItemStatusDuration is the accumulated time an item has spent in one status.
+type ItemStatusDuration struct {
+	StatusID        int       `json:"status_id"`
+	StatusName      string    `json:"status_name"`
+	DurationSeconds int64     `json:"duration_seconds"`
+	FirstEnteredAt  time.Time `json:"first_entered_at"`
+	LastEnteredAt   time.Time `json:"last_entered_at"`
+	IsCurrent       bool      `json:"is_current"`
+}
+
+// ItemStatusDurations is computed from the item's status transition history.
+type ItemStatusDurations struct {
+	Statuses     []ItemStatusDuration `json:"statuses"`
+	CalculatedAt time.Time            `json:"calculated_at"`
 }
 
 // ItemDiagram represents a diagram associated with an item
@@ -157,8 +229,9 @@ type Comment struct {
 	ItemID           int       `json:"item_id"`                      // Changed from IssueID to ItemID
 	AuthorID         *int      `json:"author_id,omitempty"`          // User ID (nullable for portal customer comments)
 	PortalCustomerID *int      `json:"portal_customer_id,omitempty"` // Portal customer ID (for email-based comments)
-	Content          string    `json:"content"`                      // TipTap JSON content
-	IsPrivate        bool      `json:"is_private"`                   // For private notes (action automation)
+	Content          string    `json:"content"`                      // Untrusted Markdown source
+	ContentHTML      string    `json:"content_html,omitempty" db:"-"`
+	IsPrivate        bool      `json:"is_private"` // For private notes (action automation)
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 	// Joined fields for API responses
@@ -170,6 +243,8 @@ type Comment struct {
 	// IsAgent mirrors users.is_agent so the UI can mark agent-authored rows.
 	Source  string `json:"source"`
 	IsAgent bool   `json:"is_agent,omitempty"`
+	// AgentOwnerName is permission-filtered by the comment-list handler.
+	AgentOwnerName string `json:"agent_owner_name,omitempty"`
 }
 
 // Mention represents an @mention in a comment or item description
@@ -188,20 +263,31 @@ type Mention struct {
 
 // Attachment represents a file attached to an item
 type Attachment struct {
-	ID               int       `json:"id"`
-	ItemID           *int      `json:"item_id,omitempty"`
-	Filename         string    `json:"filename"`          // Stored filename (UUID-based)
-	OriginalFilename string    `json:"original_filename"` // Original user filename
-	FilePath         string    `json:"-"`                 // Full file path, not sent to client
-	MimeType         string    `json:"mime_type"`
-	FileSize         int64     `json:"file_size"`
-	UploadedBy       *int      `json:"uploaded_by,omitempty"`
-	HasThumbnail     bool      `json:"has_thumbnail"` // Whether thumbnail was generated
-	ThumbnailPath    string    `json:"-"`             // Thumbnail file path, not sent to client
-	CreatedAt        time.Time `json:"created_at"`
+	ID               int    `json:"id"`
+	ItemID           *int   `json:"item_id,omitempty"`
+	Filename         string `json:"filename"`          // Stored filename (UUID-based)
+	OriginalFilename string `json:"original_filename"` // Original user filename
+	FilePath         string `json:"-"`                 // Full file path, not sent to client
+	MimeType         string `json:"mime_type"`
+	FileSize         int64  `json:"file_size"`
+	UploadedBy       *int   `json:"uploaded_by,omitempty"`
+	// UploadedByPortalCustomerID carries the portal-customer uploader when
+	// the file was submitted through a portal or public form; UploadedBy is
+	// nil in that case.
+	UploadedByPortalCustomerID *int   `json:"uploaded_by_portal_customer_id,omitempty"`
+	HasThumbnail               bool   `json:"has_thumbnail"` // Whether thumbnail was generated
+	ThumbnailPath              string `json:"-"`             // Thumbnail file path, not sent to client
+	// IsInternal hides an attachment from portal customers (for example a
+	// file attached to an agent-only JSM note). Internal workspace members
+	// still see it.
+	IsInternal bool      `json:"is_internal"`
+	CreatedAt  time.Time `json:"created_at"`
 	// Joined fields for API responses
 	UploaderName  string `json:"uploader_name,omitempty"`
 	UploaderEmail string `json:"uploader_email,omitempty"`
+	// UploaderPortalCustomerName is the resolved portal-customer uploader
+	// name for portal/form submissions.
+	UploaderPortalCustomerName string `json:"uploader_portal_customer_name,omitempty"`
 }
 
 // AttachmentSettings represents system-wide attachment configuration
@@ -232,8 +318,11 @@ type AttachmentSettingsRequest struct {
 // LinkType represents a type of link between items
 type LinkType struct {
 	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
 	Name               string    `json:"name"`
+	DisplayName        string    `json:"display_name"`
 	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
 	ForwardLabel       string    `json:"forward_label"`
 	ReverseLabel       string    `json:"reverse_label"`
 	Color              string    `json:"color"`
@@ -301,17 +390,38 @@ type LinkableItem struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	// For work items
-	WorkspaceID   *int   `json:"workspace_id,omitempty"`
-	WorkspaceName string `json:"workspace_name,omitempty"`
-	Status        string `json:"status,omitempty"`
-	Priority      string `json:"priority,omitempty"`
-	ItemTypeID    *int   `json:"item_type_id,omitempty"`
-	ItemTypeName  string `json:"item_type_name,omitempty"`
+	WorkspaceID         *int   `json:"workspace_id,omitempty"`
+	WorkspaceName       string `json:"workspace_name,omitempty"`
+	WorkspaceKey        string `json:"workspace_key,omitempty"`
+	WorkspaceItemNumber *int   `json:"workspace_item_number,omitempty"`
+	Status              string `json:"status,omitempty"`
+	Priority            string `json:"priority,omitempty"`
+	ItemTypeID          *int   `json:"item_type_id,omitempty"`
+	ItemTypeName        string `json:"item_type_name,omitempty"`
+	ItemTypeIcon        string `json:"item_type_icon,omitempty"`
+	ItemTypeColor       string `json:"item_type_color,omitempty"`
 	// For assets
 	AssetSetID        *int   `json:"asset_set_id,omitempty"`
 	AssetSetName      string `json:"asset_set_name,omitempty"`
 	AssetTypeName     string `json:"asset_type_name,omitempty"`
 	AssetCategoryName string `json:"asset_category_name,omitempty"`
+}
+
+// LinkedAsset is a display row for an asset linked to an item. Direction is
+// "outgoing" when the item is the link source and "incoming" when the asset
+// is the link source.
+type LinkedAsset struct {
+	ID           int    `json:"id"`
+	Title        string `json:"title"`
+	Description  string `json:"description"`
+	SetID        int    `json:"set_id"`
+	SetName      string `json:"set_name"`
+	TypeName     string `json:"type_name"`
+	CategoryName string `json:"category_name"`
+	LinkID       int    `json:"link_id"`
+	LinkTypeName string `json:"link_type_name"`
+	LinkLabel    string `json:"link_label"`
+	Direction    string `json:"direction"` // "outgoing" or "incoming"
 }
 
 // CalendarScheduleEntry represents a user's calendar scheduling for an item
@@ -333,6 +443,7 @@ type Collection struct {
 	QLQuery     string  `json:"ql_query"`
 	FilterState *string `json:"filter_state"`
 	IsPublic    bool    `json:"is_public"`
+	IsPrivate   bool    `json:"is_private"`
 	WorkspaceID *int    `json:"workspace_id"`
 	CategoryID  *int    `json:"category_id,omitempty"`
 	CreatedBy   *int    `json:"created_by"`
@@ -368,13 +479,13 @@ type PersonalLabel struct {
 
 // RelationshipGraphNode represents a node in the asset relationship graph
 type RelationshipGraphNode struct {
-	ID       string                 `json:"id"` // Unique node key: "{type}-{entity_id}"
-	EntityID int                    `json:"entity_id"`
-	Type     string                 `json:"type"` // "asset", "item", "test_case"
-	Title    string                 `json:"title"`
-	IsOrigin bool                   `json:"is_origin"`
-	Hop      int                    `json:"hop"`
-	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	ID       string         `json:"id"` // Unique node key: "{type}-{entity_id}"
+	EntityID int            `json:"entity_id"`
+	Type     string         `json:"type"` // "asset", "item", "test_case"
+	Title    string         `json:"title"`
+	IsOrigin bool           `json:"is_origin"`
+	Hop      int            `json:"hop"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // RelationshipGraphEdge represents an edge in the asset relationship graph
@@ -400,6 +511,8 @@ type PaginatedItemsResponse struct {
 	Items          []Item         `json:"items"`
 	Pagination     PaginationMeta `json:"pagination"`
 	SortableFields []string       `json:"sortable_fields,omitempty"`
+	Watermark      int64          `json:"watermark,omitempty"`
+	NextCursor     string         `json:"next_cursor,omitempty"`
 }
 
 // PaginatedAttachmentsResponse represents a paginated list of attachments

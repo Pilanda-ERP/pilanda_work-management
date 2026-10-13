@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"windshift/internal/database"
 	"windshift/internal/models"
@@ -16,18 +17,17 @@ type ActionEventEmitter interface {
 	EmitActionEvent(event *models.ActionEvent)
 }
 
-// AssetActionEventEmitter is an interface for emitting asset action events.
-type AssetActionEventEmitter interface {
-	EmitAssetActionEvent(event *models.AssetActionEvent)
-}
-
 // ActionContext carries cascade context through event emission,
 // enabling cross-application loop prevention.
 type ActionContext struct {
 	TriggeredByAction bool
 	ExecutionChainID  string
+	CausationEventKey string
 	CascadeDepth      int
 	SourceApplication string
+	// TriggerCommentIsPrivate keeps a cascade internal when its root trigger
+	// was a private/internal comment.
+	TriggerCommentIsPrivate bool
 }
 
 // EventCoordinator centralizes side effect handling (notifications, webhooks, activity tracking, actions)
@@ -38,7 +38,6 @@ type EventCoordinator struct {
 	activityTracker     *ActivityTracker
 	webhookDispatcher   WebhookDispatcher
 	actionService       ActionEventEmitter
-	assetActionService  AssetActionEventEmitter
 	magicLinkService    *MagicLinkService
 }
 
@@ -69,21 +68,11 @@ func (ec *EventCoordinator) SetActionService(as ActionEventEmitter) {
 	ec.actionService = as
 }
 
-// SetAssetActionService sets the asset action service for asset automation workflows.
-func (ec *EventCoordinator) SetAssetActionService(as AssetActionEventEmitter) {
-	ec.assetActionService = as
-}
-
 // SetMagicLinkService wires the magic-link service so approval steps that
 // resolve to portal customers can send a magic-link email pointing at the
 // customer-facing decide page.
 func (ec *EventCoordinator) SetMagicLinkService(ml *MagicLinkService) {
 	ec.magicLinkService = ml
-}
-
-// GetAssetActionService returns the asset action service, if set.
-func (ec *EventCoordinator) GetAssetActionService() AssetActionEventEmitter {
-	return ec.assetActionService
 }
 
 // EmitItemCreated emits events for a newly created item.
@@ -114,7 +103,7 @@ func (ec *EventCoordinator) emitItemCreatedInternal(item *models.Item, actorUser
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   &actorUserID,
 			Title:       "New Item Created",
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":     item.Title,
 				"item.key":       itemKey,
 				"item.id":        item.ID,
@@ -132,11 +121,13 @@ func (ec *EventCoordinator) emitItemCreatedInternal(item *models.Item, actorUser
 			WorkspaceID: item.WorkspaceID,
 			ItemID:      item.ID,
 			ActorUserID: actorUserID,
-			NewValues: map[string]interface{}{
+			ItemTypeID:  item.ItemTypeID,
+			NewValues: map[string]any{
 				"title":        item.Title,
 				"status_id":    item.StatusID,
 				"item_type_id": item.ItemTypeID,
 				"assignee_id":  item.AssigneeID,
+				"team_id":      item.TeamID,
 				"creator_id":   item.CreatorID,
 				"priority_id":  item.PriorityID,
 			},
@@ -146,138 +137,86 @@ func (ec *EventCoordinator) emitItemCreatedInternal(item *models.Item, actorUser
 			event.ExecutionChainID = actionCtx.ExecutionChainID
 			event.CascadeDepth = actionCtx.CascadeDepth
 			event.SourceApplication = actionCtx.SourceApplication
+			event.TriggerCommentIsPrivate = actionCtx.TriggerCommentIsPrivate
 		}
 		ec.actionService.EmitActionEvent(event)
 	}
 
 	// Dispatch webhook event
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("item.created", item)
+		ec.webhookDispatcher.DispatchEvent("item.created", item)
 	}
 }
 
 // EmitItemUpdated emits events for an updated item.
 func (ec *EventCoordinator) EmitItemUpdated(original, updated *models.Item, statusChanged, assigneeChanged bool, actorUserID int, fieldChanges []HistoryEntry, actorUsername ...string) {
+	ec.emitItemUpdatedInternal(original, updated, statusChanged, assigneeChanged, actorUserID, fieldChanges, nil, actorUsername...)
+}
+
+// EmitItemUpdatedWithContext preserves automation cascade provenance while
+// sharing the notification, action, and webhook pipeline with user updates.
+func (ec *EventCoordinator) EmitItemUpdatedWithContext(original, updated *models.Item, statusChanged, assigneeChanged bool, actorUserID int, fieldChanges []HistoryEntry, actionContext ActionContext, actorUsername ...string) {
+	ec.emitItemUpdatedInternal(original, updated, statusChanged, assigneeChanged, actorUserID, fieldChanges, &actionContext, actorUsername...)
+}
+
+func (ec *EventCoordinator) emitItemUpdatedInternal(original, updated *models.Item, statusChanged, assigneeChanged bool, actorUserID int, fieldChanges []HistoryEntry, actionContext *ActionContext, actorUsername ...string) {
 	actorName := resolveActorName(actorUserID, actorUsername)
 
-	// Construct the item key (e.g., "TST-1")
-	itemKey := fmt.Sprintf("%s-%d", updated.WorkspaceKey, updated.WorkspaceItemNumber)
-
-	// Emit notification events
 	if ec.notificationService != nil {
-		// Get status name if status changed
 		var statusName string
-		if statusChanged && updated.StatusID != nil {
-			_ = ec.db.QueryRow("SELECT name FROM statuses WHERE id = ?", *updated.StatusID).Scan(&statusName)
-		}
-
-		// Emit status changed notification
 		if statusChanged {
-			ec.notificationService.EmitEvent(&NotificationEvent{
-				EventType:   models.EventStatusChanged,
-				WorkspaceID: updated.WorkspaceID,
-				ActorUserID: actorUserID,
-				ItemID:      updated.ID,
-				AssigneeID:  updated.AssigneeID,
-				CreatorID:   original.CreatorID,
-				Title:       "Status Changed",
-				TemplateData: map[string]interface{}{
-					"item.title":  updated.Title,
-					"item.key":    itemKey,
-					"item.id":     updated.ID,
-					"status.name": statusName,
-					"user.name":   actorName,
-				},
-			})
+			statusName, _ = itemUpdateStatusName(ec.db, updated.StatusID)
 		}
-
-		// Emit assignee changed notification
-		if assigneeChanged {
-			ec.notificationService.EmitEvent(&NotificationEvent{
-				EventType:   models.EventItemAssigned,
-				WorkspaceID: updated.WorkspaceID,
-				ActorUserID: actorUserID,
-				ItemID:      updated.ID,
-				AssigneeID:  updated.AssigneeID,
-				CreatorID:   original.CreatorID,
-				Title:       "Item Assigned",
-				TemplateData: map[string]interface{}{
-					"item.title": updated.Title,
-					"item.key":   itemKey,
-					"item.id":    updated.ID,
-					"user.name":  actorName,
-				},
-			})
-		}
-
-		// Emit item updated notification (when not status or assignee change)
-		if !statusChanged && !assigneeChanged {
-			ec.notificationService.EmitEvent(&NotificationEvent{
-				EventType:   models.EventItemUpdated,
-				WorkspaceID: updated.WorkspaceID,
-				ActorUserID: actorUserID,
-				ItemID:      updated.ID,
-				AssigneeID:  updated.AssigneeID,
-				CreatorID:   original.CreatorID,
-				Title:       "Item Updated",
-				TemplateData: map[string]interface{}{
-					"item.title": updated.Title,
-					"item.key":   itemKey,
-					"item.id":    updated.ID,
-					"user.name":  actorName,
-				},
-			})
-		}
+		emitItemUpdateNotifications(ec.notificationService.EmitEvent, original, updated,
+			statusChanged, assigneeChanged, actorUserID, actorName, statusName)
 	}
 
-	// Emit action events for automation
 	if ec.actionService != nil {
 		if statusChanged {
-			ec.actionService.EmitActionEvent(&models.ActionEvent{
-				EventType:   models.ActionTriggerStatusTransition,
-				WorkspaceID: updated.WorkspaceID,
-				ItemID:      updated.ID,
-				ActorUserID: actorUserID,
-				OldValues: map[string]interface{}{
-					"status_id": original.StatusID,
-				},
-				NewValues: map[string]interface{}{
-					"status_id":   updated.StatusID,
-					"title":       updated.Title,
-					"assignee_id": updated.AssigneeID,
-					"creator_id":  updated.CreatorID,
-				},
-			})
+			event := newStatusTransitionActionEvent(original, updated, actorUserID)
+			applyActionContext(event, actionContext)
+			ec.actionService.EmitActionEvent(event)
 		} else {
-			// Build OldValues/NewValues dynamically from field changes
-			oldVals := make(map[string]interface{})
-			newVals := make(map[string]interface{})
+			oldVals := make(map[string]any)
+			newVals := make(map[string]any)
 			for _, fc := range fieldChanges {
-				oldVals[fc.FieldName] = fc.OldValue
-				newVals[fc.FieldName] = fc.NewValue
+				fieldName := actionEventFieldName(fc.FieldName)
+				oldVals[fieldName] = fc.OldValue
+				newVals[fieldName] = fc.NewValue
 			}
-			ec.actionService.EmitActionEvent(&models.ActionEvent{
+			event := &models.ActionEvent{
 				EventType:   models.ActionTriggerItemUpdated,
 				WorkspaceID: updated.WorkspaceID,
 				ItemID:      updated.ID,
 				ActorUserID: actorUserID,
+				ItemTypeID:  updated.ItemTypeID,
 				OldValues:   oldVals,
 				NewValues:   newVals,
-			})
+			}
+			applyActionContext(event, actionContext)
+			ec.actionService.EmitActionEvent(event)
 		}
 	}
 
-	// Dispatch webhook events
-	if ec.webhookDispatcher != nil {
-		if statusChanged {
-			go ec.webhookDispatcher.DispatchEvent("status.changed", updated)
-		}
-		if assigneeChanged {
-			go ec.webhookDispatcher.DispatchEvent("item.assigned", updated)
-		}
-		// Always dispatch item.updated for any update
-		go ec.webhookDispatcher.DispatchEvent("item.updated", updated)
+	dispatchItemUpdateWebhooks(ec.webhookDispatcher, updated, statusChanged, assigneeChanged)
+}
+
+func actionEventFieldName(historyFieldName string) string {
+	if strings.HasPrefix(historyFieldName, "cf_") {
+		return "custom_field_" + strings.TrimPrefix(historyFieldName, "cf_")
 	}
+	return historyFieldName
+}
+
+func applyActionContext(event *models.ActionEvent, actionContext *ActionContext) {
+	if actionContext == nil {
+		return
+	}
+	event.TriggeredByAction = actionContext.TriggeredByAction
+	event.ExecutionChainID = actionContext.ExecutionChainID
+	event.CascadeDepth = actionContext.CascadeDepth
+	event.SourceApplication = actionContext.SourceApplication
+	event.TriggerCommentIsPrivate = actionContext.TriggerCommentIsPrivate
 }
 
 // EmitItemDeleted emits events for a deleted item.
@@ -294,7 +233,7 @@ func (ec *EventCoordinator) EmitItemDeleted(item *models.Item, actorUserID, desc
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       "Item Deleted",
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":  item.Title,
 				"item.id":     item.ID,
 				"user.name":   actorName,
@@ -305,7 +244,7 @@ func (ec *EventCoordinator) EmitItemDeleted(item *models.Item, actorUserID, desc
 
 	// Dispatch webhook event
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("item.deleted", item)
+		ec.webhookDispatcher.DispatchEvent("item.deleted", item)
 	}
 }
 
@@ -330,7 +269,7 @@ func (ec *EventCoordinator) EmitStatusChanged(item *models.Item, oldStatusID, ne
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       "Status Changed",
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":  item.Title,
 				"item.key":    itemKey,
 				"item.id":     item.ID,
@@ -347,13 +286,14 @@ func (ec *EventCoordinator) EmitStatusChanged(item *models.Item, oldStatusID, ne
 			WorkspaceID: item.WorkspaceID,
 			ItemID:      item.ID,
 			ActorUserID: actorUserID,
-			OldValues: map[string]interface{}{
+			OldValues: map[string]any{
 				"status_id": oldStatusID,
 			},
-			NewValues: map[string]interface{}{
+			NewValues: map[string]any{
 				"status_id":   newStatusID,
 				"title":       item.Title,
 				"assignee_id": item.AssigneeID,
+				"team_id":     item.TeamID,
 				"creator_id":  item.CreatorID,
 			},
 		})
@@ -361,7 +301,7 @@ func (ec *EventCoordinator) EmitStatusChanged(item *models.Item, oldStatusID, ne
 
 	// Dispatch webhook event
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("status.changed", item)
+		ec.webhookDispatcher.DispatchEvent("status.changed", item)
 	}
 }
 
@@ -394,24 +334,10 @@ func resolveActorName(actorUserID int, actorUsername []string) string {
 	return fmt.Sprintf("User #%d", actorUserID)
 }
 
-// ============================================================================
-// Approval events
-// ============================================================================
-//
-// Two delivery patterns:
-//
-//   - Rule-based broadcast (ec.notificationService.EmitEvent) — used for events
-//     whose audience is dynamic (assignee, creator, watchers). Subject to
-//     workspace notification_rules; a no-op if no matching rule is configured.
-//   - Direct delivery (ec.notificationService.NotifyUsers) — used when we
-//     already have a resolved recipient list (the approver pool snapshot).
-//     Bypasses rules so step approvers always get pinged.
-//
-// Webhooks come along for free via ec.webhookDispatcher; no extra wiring beyond
-// dispatching the relevant payload from each Emit call.
+// Approval events use rule-based broadcasts for dynamic audiences and direct
+// delivery for resolved approver pools. Emit calls also dispatch webhooks.
 
-// EmitApprovalRequested fires when a new approval request is opened. Broadcast
-// to assignee/creator/watchers via the rule pipeline.
+// EmitApprovalRequested notifies assignees, creators, and watchers by rule.
 func (ec *EventCoordinator) EmitApprovalRequested(req *models.ApprovalRequest, item *models.Item, actorUserID int, actorUsername ...string) {
 	if req == nil || item == nil {
 		return
@@ -428,7 +354,7 @@ func (ec *EventCoordinator) EmitApprovalRequested(req *models.ApprovalRequest, i
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       "Approval Requested",
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":         item.Title,
 				"item.key":           itemKey,
 				"item.id":            item.ID,
@@ -440,7 +366,7 @@ func (ec *EventCoordinator) EmitApprovalRequested(req *models.ApprovalRequest, i
 		})
 	}
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("approval.requested", item)
+		ec.webhookDispatcher.DispatchEvent("approval.requested", item)
 	}
 }
 
@@ -468,7 +394,7 @@ func (ec *EventCoordinator) EmitApprovalStepStarted(req *models.ApprovalRequest,
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       title,
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":              item.Title,
 				"item.key":                itemKey,
 				"approval.id":             req.ID,
@@ -482,17 +408,11 @@ func (ec *EventCoordinator) EmitApprovalStepStarted(req *models.ApprovalRequest,
 		ec.notifyPortalCustomersOfApprovalStep(req, approverPortalCustomerIDs, item, itemKey)
 	}
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("approval.step_started", item)
+		ec.webhookDispatcher.DispatchEvent("approval.step_started", item)
 	}
 }
 
-// notifyPortalCustomersOfApprovalStep sends a magic-link "approval requested"
-// email to each portal customer in the active pool. The portal slug is
-// resolved from the item's submission channel; if the channel has no
-// portal_slug configured, the email is skipped (logged at warn). Internal
-// users linked via portal_customers.user_id still get the email — they can
-// reach /api/approvals/{id}/decide directly without the link, but the email
-// gives them a single unified entry point.
+// notifyPortalCustomersOfApprovalStep emails active portal approvers; missing portal slugs are logged and skipped.
 func (ec *EventCoordinator) notifyPortalCustomersOfApprovalStep(req *models.ApprovalRequest, customerIDs []int, item *models.Item, itemKey string) {
 	if ec.magicLinkService == nil || len(customerIDs) == 0 {
 		return
@@ -541,7 +461,7 @@ func (ec *EventCoordinator) lookupPortalSlugForItem(item *models.Item) string {
 		return ""
 	}
 	var rawConfig sql.NullString
-	if err := ec.db.QueryRow(`SELECT config FROM channels WHERE id = ?`, *item.ChannelID).Scan(&rawConfig); err != nil {
+	if err := ec.db.QueryRow(`SELECT COALESCE(config, '{}') FROM channels WHERE id = ?`, *item.ChannelID).Scan(&rawConfig); err != nil {
 		return ""
 	}
 	if !rawConfig.Valid || rawConfig.String == "" {
@@ -578,7 +498,7 @@ func (ec *EventCoordinator) EmitApprovalDecided(req *models.ApprovalRequest, dec
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       fmt.Sprintf("Approval %s", decision.Decision),
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":        item.Title,
 				"item.key":          itemKey,
 				"approval.id":       req.ID,
@@ -588,7 +508,7 @@ func (ec *EventCoordinator) EmitApprovalDecided(req *models.ApprovalRequest, dec
 		})
 	}
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("approval.decided", item)
+		ec.webhookDispatcher.DispatchEvent("approval.decided", item)
 	}
 }
 
@@ -611,7 +531,7 @@ func (ec *EventCoordinator) EmitApprovalCompleted(req *models.ApprovalRequest, i
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       fmt.Sprintf("Approval %s", req.Status),
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":      item.Title,
 				"item.key":        itemKey,
 				"approval.id":     req.ID,
@@ -621,7 +541,7 @@ func (ec *EventCoordinator) EmitApprovalCompleted(req *models.ApprovalRequest, i
 		})
 	}
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("approval.completed", item)
+		ec.webhookDispatcher.DispatchEvent("approval.completed", item)
 	}
 }
 
@@ -643,7 +563,7 @@ func (ec *EventCoordinator) EmitApprovalCancelled(req *models.ApprovalRequest, i
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       "Approval Cancelled", //nolint:misspell // British spelling consistent with event_type value
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":      item.Title,
 				"item.key":        itemKey,
 				"approval.id":     req.ID,
@@ -653,7 +573,7 @@ func (ec *EventCoordinator) EmitApprovalCancelled(req *models.ApprovalRequest, i
 		})
 	}
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("approval.cancelled", item)
+		ec.webhookDispatcher.DispatchEvent("approval.cancelled", item)
 	}
 }
 
@@ -682,7 +602,7 @@ func (ec *EventCoordinator) EmitApprovalEscalated(req *models.ApprovalRequest, s
 			AssigneeID:  item.AssigneeID,
 			CreatorID:   item.CreatorID,
 			Title:       "Approval Escalated",
-			TemplateData: map[string]interface{}{
+			TemplateData: map[string]any{
 				"item.title":       item.Title,
 				"item.key":         itemKey,
 				"approval.id":      req.ID,
@@ -693,6 +613,6 @@ func (ec *EventCoordinator) EmitApprovalEscalated(req *models.ApprovalRequest, s
 		})
 	}
 	if ec.webhookDispatcher != nil {
-		go ec.webhookDispatcher.DispatchEvent("approval.escalated", item)
+		ec.webhookDispatcher.DispatchEvent("approval.escalated", item)
 	}
 }

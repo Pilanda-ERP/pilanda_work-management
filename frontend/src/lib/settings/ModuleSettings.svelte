@@ -1,11 +1,11 @@
 <script>
   import { onMount } from 'svelte';
-  import { CheckSquare, Puzzle, Upload, RefreshCw, Trash2, ToggleLeft, ToggleRight, Package } from '@lucide/svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import { Bot, CheckSquare, Puzzle, Upload, RefreshCw, Trash2, ToggleLeft, ToggleRight, Package } from '@lucide/svelte';
   import { moduleSettings } from '../stores/moduleSettings.js';
   import Toggle from '../components/Toggle.svelte';
   import Button from '../components/Button.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import Panel from '../components/Panel.svelte';
   import { api, getSecuritySettings, fetchAPI } from '../api.js';
@@ -13,6 +13,8 @@
   import { confirm } from '../composables/useConfirm.js';
   import DescriptionText from '../components/DescriptionText.svelte';
   import EmptyState from '../components/EmptyState.svelte';
+  import FileInput from '../components/FileInput.svelte';
+  import CopyButton from '../components/CopyButton.svelte';
 
   let saving = $state(false);
   let error = $state('');
@@ -27,9 +29,13 @@
   let dragActive = $state(false);
   let fileInput = $state(null);
   let manifestInput = $state(null);
+  let licenseInput = $state(null);
+  let selectedLicense = $state(null);
+  let instanceId = $state('');
 
   // Local toggle state
   let testManagementEnabled = $state(false);
+  let workspaceManagedAgents = $state(true);
   let initialLoad = $state(true);
 
   // Plugin system state (from server startup flag)
@@ -39,6 +45,7 @@
   $effect(() => {
     if ($moduleSettings.loaded && initialLoad) {
       testManagementEnabled = $moduleSettings.test_management_enabled;
+      workspaceManagedAgents = $moduleSettings.workspace_managed_agents ?? true;
       initialLoad = false;
     }
   });
@@ -49,7 +56,24 @@
     });
     loadPlugins();
     loadSecuritySettings();
+    loadInstanceID();
   });
+
+  async function loadInstanceID() {
+    try {
+      const data = await fetchAPI('/plugins/instance-id');
+      instanceId = data?.instance_id || '';
+    } catch (err) {
+      console.error('Failed to load instance ID:', err);
+    }
+  }
+
+  function handleLicenseSelect(event) {
+    const files = event.target.files;
+    if (files.length > 0) {
+      selectedLicense = files[0];
+    }
+  }
 
   async function loadSecuritySettings() {
     try {
@@ -124,6 +148,9 @@
     if (selectedManifest) {
       formData.append('manifest', selectedManifest);
     }
+    if (selectedLicense) {
+      formData.append('license', selectedLicense);
+    }
 
     try {
       const response = await fetch('/api/plugins/upload', {
@@ -140,6 +167,7 @@
       successMessage = t('settings.modules.pluginUploadedSuccess');
       selectedFile = null;
       selectedManifest = null;
+      selectedLicense = null;
       await loadPlugins();
 
       setTimeout(() => {
@@ -210,6 +238,7 @@
       const newSettings = {
         time_tracking_enabled: true, // Always enabled
         test_management_enabled: testManagementEnabled,
+        workspace_managed_agents: workspaceManagedAgents,
       };
 
       await moduleSettings.update(newSettings);
@@ -237,6 +266,7 @@
       const newSettings = {
         time_tracking_enabled: true, // Always enabled
         test_management_enabled: testManagementEnabled,
+        workspace_managed_agents: workspaceManagedAgents,
       };
 
       await moduleSettings.update(newSettings);
@@ -257,9 +287,7 @@
 />
 
   {#if $moduleSettings.loading}
-    <div class="flex items-center justify-center py-12">
-      <Spinner />
-    </div>
+    <StateDisplay type="loading" />
   {:else}
     <!-- Success Message -->
     {#if successMessage}
@@ -291,6 +319,26 @@
           <Toggle
             bind:checked={testManagementEnabled}
             onchange={autoSave}
+            dataTestid="module-test-management-toggle"
+          />
+        </div>
+      </Panel>
+
+      <Panel padding="spacious">
+        <div class="flex items-center justify-between gap-4">
+          <div class="flex items-center gap-3">
+            <Bot class="w-5 h-5" style="color: var(--ds-text-subtle);" />
+            <div>
+              <h3 class="text-lg font-medium" style="color: var(--ds-text);">Workspace-Managed Agents</h3>
+              <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
+                Allow workspace admins to create agent identities owned by their workspace. Existing agents remain available when disabled; new agents can instead use enabled centralized service identities.
+              </p>
+            </div>
+          </div>
+          <Toggle
+            bind:checked={workspaceManagedAgents}
+            dataTestid="workspace-managed-agents-toggle"
+            onchange={autoSave}
           />
         </div>
       </Panel>
@@ -310,6 +358,35 @@
           <AlertBox variant="info" message={t('settings.modules.pluginsDisabledMessage')} />
         </div>
       {:else}
+        <!-- Instance ID (plugin licensing) -->
+        <div
+          class="mb-4 rounded-lg border p-4"
+          style="border-color: var(--ds-border); background: var(--ds-background-neutral);"
+          data-testid="plugins-instance-id"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p class="text-sm font-medium" style="color: var(--ds-text);">
+                {t('settings.modules.instanceId')}
+              </p>
+              <p class="mt-0.5 text-xs" style="color: var(--ds-text-subtle);">
+                {t('settings.modules.instanceIdDescription')}
+              </p>
+            </div>
+            <div class="flex items-center gap-2">
+              <code
+                class="rounded px-2 py-1 text-sm font-mono"
+                style="background: var(--ds-surface-raised); border: 1px solid var(--ds-border); color: var(--ds-text);"
+              >
+                {instanceId || '…'}
+              </code>
+              {#if instanceId}
+                <CopyButton text={instanceId} />
+              {/if}
+            </div>
+          </div>
+        </div>
+
         <!-- Plugin Upload -->
         <div class="mb-4">
           <Panel padding="spacious">
@@ -331,12 +408,11 @@
             <p class="text-xs mb-4" style="color: var(--ds-text-subtle);">
               {t('settings.modules.supportedFormats')}
             </p>
-            <input
-              type="file"
+            <FileInput
               accept=".wasm,.zip"
               onchange={handleFileSelect}
               class="hidden"
-              bind:this={fileInput}
+              bind:inputRef={fileInput}
             />
             <Button variant="primary" onclick={() => fileInput?.click()}>
               {t('common.select')}
@@ -348,6 +424,29 @@
               </p>
             {/if}
 
+            {#if selectedFile && selectedFile.name.endsWith('.zip')}
+              <div class="mt-4">
+                <FileInput
+                  accept=".license,.txt,.token"
+                  onchange={handleLicenseSelect}
+                  class="hidden"
+                  bind:inputRef={licenseInput}
+                />
+                <Button variant="primary" size="sm" onclick={() => licenseInput?.click()}>
+                  {selectedLicense ? t('settings.modules.changeLicense') : t('settings.modules.chooseLicense')}
+                </Button>
+                {#if selectedLicense}
+                  <p class="mt-2 text-xs" style="color: var(--ds-text-success);">
+                    ✓ {t('settings.modules.licenseSelected', { name: selectedLicense.name })}
+                  </p>
+                {:else}
+                  <p class="mt-2 text-xs" style="color: var(--ds-text-subtle);">
+                    {t('settings.modules.licenseOptional')}
+                  </p>
+                {/if}
+              </div>
+            {/if}
+
             {#if selectedFile && selectedFile.name.endsWith('.wasm')}
               <div class="mt-4">
                 <AlertBox type="warning">
@@ -357,12 +456,11 @@
                   <p class="text-xs mb-3">
                     {t('settings.modules.wasmManifestRequiredDesc')}
                   </p>
-                  <input
-                    type="file"
+                  <FileInput
                     accept=".json"
                     onchange={handleManifestSelect}
                     class="hidden"
-                    bind:this={manifestInput}
+                    bind:inputRef={manifestInput}
                   />
                   <Button variant="primary" size="sm" onclick={() => manifestInput?.click()}>
                     {selectedManifest ? t('settings.modules.changeManifest') : t('settings.modules.chooseManifest')}
@@ -397,9 +495,7 @@
         <h3 class="text-lg font-medium mb-4" style="color: var(--ds-text);">{t('settings.modules.installedPlugins')}</h3>
 
         {#if loadingPlugins}
-          <div class="flex items-center justify-center py-8">
-            <Spinner />
-          </div>
+          <StateDisplay type="loading" />
         {:else if plugins.length === 0}
           <EmptyState icon={Puzzle} title={t('settings.modules.noPluginsInstalled')} />
         {:else}

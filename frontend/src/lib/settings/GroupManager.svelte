@@ -3,6 +3,7 @@
 	import { api } from '../api.js';
 	import { Plus, Edit, Trash2, UserStar, UserPlus, UserMinus, Circle, X } from '@lucide/svelte';
 	import Button from '../components/Button.svelte';
+	import Avatar from '../components/Avatar.svelte';
 	import Input from '../components/Input.svelte';
 	import Textarea from '../components/Textarea.svelte';
 	import DataTable from '../components/DataTable.svelte';
@@ -16,7 +17,6 @@
 	import { toHotkeyString } from '../utils/keyboardShortcuts.js';
 	import { t } from '../stores/i18n.svelte.js';
 	import { confirm } from '../composables/useConfirm.js';
-	import { formatDateSimple } from '../utils/dateFormatter.js';
 
 	let groups = $state([]);
 	let users = $state([]);
@@ -30,6 +30,11 @@
 	let selectedUserIds = $state([]);
 	let selectedUserId = $state(null);
 	let selectedUsersToAdd = $state([]);
+	let currentMembers = $derived(
+		(selectedGroup?.member_ids || [])
+			.map((id) => users.find((user) => user.id === id))
+			.filter(Boolean)
+	);
 
 	// Form data
 	let formData = $state({
@@ -40,7 +45,7 @@
 	async function loadGroups() {
 		loading = true;
 		try {
-			groups = await api.groups.getAll();
+			groups = await api.groups.getAdminAll();
 			error = '';
 		} catch (err) {
 			error = err.message || t('settings.groups.failedToLoad');
@@ -51,7 +56,7 @@
 
 	async function loadUsers() {
 		try {
-			users = await api.getUsers();
+			users = await api.getAdminUsers();
 		} catch (err) {
 			console.error('Failed to load users:', err);
 		}
@@ -62,7 +67,7 @@
 			if (editingGroup) {
 				await api.groups.update(editingGroup.id, {
 					...formData,
-					is_active: true // Always keep groups active when editing
+					is_active: editingGroup.is_active
 				});
 			} else {
 				await api.groups.create(formData);
@@ -114,7 +119,7 @@
 		
 		// Check if user is already in the "to add" list or already a member
 		const isAlreadyToAdd = selectedUsersToAdd.some(u => u.id === user.id);
-		const isAlreadyMember = selectedGroup.members && selectedGroup.members.some(m => m.user_id === user.id);
+		const isAlreadyMember = selectedGroup.member_ids?.includes(user.id);
 		
 		if (!isAlreadyToAdd && !isAlreadyMember) {
 			selectedUsersToAdd = [...selectedUsersToAdd, user];
@@ -357,44 +362,29 @@
 		<!-- Modal content -->
 		<div class="px-6 py-4 space-y-6 max-h-[60vh] overflow-y-auto">
 					<!-- Current Members -->
-					{#if selectedGroup.members && selectedGroup.members.length > 0}
+					{#if currentMembers.length > 0}
 						<div>
 							<h4 class="text-sm font-medium mb-3" style="color: var(--ds-text)">{t('settings.groups.currentMembers')}</h4>
 							<div class="space-y-2">
-								{#each selectedGroup.members as member}
+								{#each currentMembers as member}
 									<div class="flex items-center justify-between p-3 rounded border" style="background-color: var(--ds-surface); border-color: var(--ds-border)">
-										<div class="flex items-center">
-											<div class="h-8 w-8 rounded-full flex items-center justify-center mr-3" style="background-color: var(--ds-background-neutral)">
-												<span class="text-xs font-medium" style="color: var(--ds-text)">
-													{member.user_name ? member.user_name.split(' ').map(n => n.charAt(0)).join('') : '?'}
-												</span>
-											</div>
+											<Avatar size="sm" variant="neutral" name={member.full_name || '?'} class="mr-3" />
 											<div>
 												<div class="text-sm font-medium" style="color: var(--ds-text)">
-													{member.user_name || t('settings.groups.unknownUser')}
+													{member.full_name || t('settings.groups.unknownUser')}
 												</div>
 												<div class="text-xs" style="color: var(--ds-text-subtle)">
-													{member.user_email} • {t('settings.groups.added')} {formatDateSimple(member.added_at)}
-													{#if member.ldap_sync_enabled}
-														<span class="ml-2 inline-flex px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800 rounded">
-															LDAP
-														</span>
-													{/if}
+													{member.email}
 												</div>
 											</div>
-										</div>
-										{#if !member.ldap_sync_enabled}
 											<Button
 												variant="danger-ghost"
 												size="sm"
 												icon={UserMinus}
-												onclick={() => removeMember(member.user_id)}
+											onclick={() => removeMember(member.id)}
 											>
 												{t('settings.groups.remove')}
-											</Button>
-										{:else}
-											<span class="text-xs" style="color: var(--ds-text-subtlest)">{t('settings.groups.ldapManaged')}</span>
-										{/if}
+										</Button>
 									</div>
 								{/each}
 							</div>
@@ -420,13 +410,9 @@
 									<p class="text-sm mb-2" style="color: var(--ds-text-subtle)">{t('settings.groups.usersToAdd')} ({selectedUsersToAdd.length}):</p>
 									<div class="space-y-2 max-h-32 overflow-y-auto">
 										{#each selectedUsersToAdd as user}
-											<div class="flex items-center justify-between p-2 bg-blue-50 rounded border dark:bg-blue-900/20">
+											<div class="flex items-center justify-between p-2 bg-ds-accent-blue-subtle rounded border">
 												<div class="flex items-center">
-													<div class="h-6 w-6 rounded-full bg-blue-500 flex items-center justify-center mr-2">
-														<span class="text-xs font-medium text-white">
-															{user.first_name.charAt(0)}{user.last_name.charAt(0)}
-														</span>
-													</div>
+													<Avatar size="xs" variant="blue" firstName={user.first_name} lastName={user.last_name} class="mr-2" />
 													<div>
 														<div class="text-sm font-medium" style="color: var(--ds-text)">
 															{user.first_name} {user.last_name}

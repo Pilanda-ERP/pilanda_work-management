@@ -10,9 +10,14 @@
   import PageWorkItemsButton from './PageWorkItemsButton.svelte';
   import IconSelector from '../../pickers/IconSelector.svelte';
   import { workspaceIconMap } from '../../utils/icons.js';
-  import { IconX } from '@tabler/icons-svelte-runes';
+  import {
+    IconArrowsMaximize,
+    IconArrowsMinimize,
+    IconX,
+  } from '@tabler/icons-svelte-runes';
   import { parseMarkdownHeadings, slugify } from './markdownToc.js';
   import DropdownMenu from '../../layout/DropdownMenu.svelte';
+  import Tooltip from '../../components/Tooltip.svelte';
   import {
     IconBook as Book,
     IconDots as Dots,
@@ -20,24 +25,20 @@
     IconEye as Eye,
   } from '@tabler/icons-svelte-runes';
   import { confirm } from '../../composables/useConfirm.js';
+  import { autoGrow } from '../../utils/autoGrowTextarea.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { pagesTreeRefresh } from './pagesTreeRefresh.svelte.js';
   import { pagesFocusTitle } from './pagesFocusTitle.svelte.js';
+  import { createPageAutosaveQueue } from './pageAutosaveQueue.js';
+  import { mergePageUpdate } from './pageState.js';
   import { agentRuns } from '../../stores/agentRuns.svelte.js';
+  import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
 
-  /**
-   * Workspace knowledge-pages view: right pane only (the tree + new-page
-   * + actions live in PagesNavSidebar, which replaces the workspace
-   * sidebar while the user is on a /pages route). Owns the title +
-   * Markdown editor and the toolbar's `...` menu. Saves auto-flush on
-   * a short debounce — there is no explicit Save button.
-   */
+  /** Right-pane knowledge-page editor with sidebar-owned tree/actions and
+   * debounced autosave instead of an explicit Save button. */
   let { workspaceId, pageId = null } = $props();
 
-  // Wait this long after the last keystroke before pushing the save.
-  // 1.2s is long enough to coalesce a burst of typing into a single
-  // request but short enough that a user who alt-tabs mid-sentence
-  // won't lose noticeable work.
+  // Coalesce typing without noticeably delaying autosave.
   const AUTOSAVE_DEBOUNCE_MS = 1200;
 
   let selectedId = $state(null);
@@ -58,6 +59,11 @@
   let historyDrawerOpen = $state(false);
   let titleInputEl = $state(null);
   let pageEffectiveLevel = $state('');
+  let pagePermissionsLoaded = $state(false);
+  let canEditPage = $derived(
+    pagePermissionsLoaded &&
+      (pageEffectiveLevel === 'edit' || pageEffectiveLevel === 'admin')
+  );
   let appearanceSaving = $state(false);
   let pickerIcon = $state('Plus');
   let pickerColor = $state('#3b82f6');
@@ -69,11 +75,21 @@
   // succeeded; 'error' = last write failed.
   let saveStatus = $state('idle');
   let saveTimer = null;
-  // Guards flushSave against re-entry while a save is awaiting the
-  // server. Without this, a debounce that fires during an in-flight
-  // request would issue a second concurrent save whose response can
-  // arrive out of order and clobber state.
+  // True while the serialized queue is actively writing a snapshot.
   let saveInFlight = false;
+  // The latest server-confirmed hash for each page saved during this view's
+  // lifetime. A second snapshot may be queued while the first is in flight;
+  // resolving the hash at write time keeps that serialized follow-up from
+  // conflicting with our own immediately preceding save.
+  const contentHashByPageId = new Map();
+
+  const pageAutosaveQueue = createPageAutosaveQueue(
+    persistSaveSnapshot,
+    (left, right) =>
+      left.workspaceId === right.workspaceId &&
+      left.title === right.title &&
+      left.content === right.content
+  );
 
   // 'edit' (default) shows the formatting toolbar + lets the user type.
   // 'read' renders the body read-only, hides the toolbar (via
@@ -81,6 +97,7 @@
   // table of contents on the right. Resets to 'edit' when the route
   // changes — writing-first default matches Confluence/Notion.
   let mode = $state('edit');
+  let canvasExpanded = $state(false);
 
   let headings = $derived(parseMarkdownHeadings(draftContent));
 
@@ -89,6 +106,7 @@
   // the popover button's add/remove callbacks.
   let pageLinks = $state(/** @type {any[]} */ ([]));
   let loadingPageLinks = $state(false);
+  let loadPageLinksRequestSeq = 0;
   // System link types — used to locate the "Page" type id so the popover
   // can pass it to POST /links. One fetch per session is plenty; the
   // result is small and stable.
@@ -98,9 +116,11 @@
   );
 
   async function loadPageLinks(id) {
+    const requestSeq = ++loadPageLinksRequestSeq;
     loadingPageLinks = true;
     try {
       const resp = await api.links.getForPage(id);
+      if (requestSeq !== loadPageLinksRequestSeq || selectedPage?.id !== id) return;
       const outgoing = Array.isArray(resp?.outgoing) ? resp.outgoing : [];
       const incoming = Array.isArray(resp?.incoming) ? resp.incoming : [];
       // De-dup by id; outgoing and incoming should never share rows but
@@ -115,10 +135,11 @@
       }
       pageLinks = merged;
     } catch (err) {
+      if (requestSeq !== loadPageLinksRequestSeq || selectedPage?.id !== id) return;
       console.error('failed to load page links', err);
       pageLinks = [];
     } finally {
-      loadingPageLinks = false;
+      if (requestSeq === loadPageLinksRequestSeq) loadingPageLinks = false;
     }
   }
 
@@ -165,13 +186,13 @@
   }));
 
   onDestroy(() => {
-    // Don't leave a dangling timer. We deliberately do NOT flush here:
-    // onDestroy fires during navigation away from the whole view, and
-    // an in-flight save against the old workspace id would race with
-    // the new view's setup. The route-change effect handles the
-    // in-app flush; for tab close the user already saw "Saved" or
-    // accepts the (small) loss within the debounce window.
-    if (saveTimer) clearTimeout(saveTimer);
+    // Capture the pending draft before this view is torn down so in-app
+    // navigation cannot discard the debounce window.
+    if (dirty) {
+      void flushSave();
+    } else if (saveTimer) {
+      clearTimeout(saveTimer);
+    }
   });
 
   // Sync to route changes — navigating to a different page id loads
@@ -196,6 +217,8 @@
       saveStatus = 'idle';
       pageLinks = [];
       pageEffectiveLevel = '';
+      pagePermissionsLoaded = false;
+      pagePublication = null;
     }
   });
 
@@ -206,6 +229,7 @@
     pagesFocusTitle.tick;
     if (!pagesFocusTitle.pageId) return;
     if (!selectedPage || pagesFocusTitle.pageId !== selectedPage.id) return;
+    if (!canEditPage) return;
     if (!titleInputEl) return;
     titleInputEl.focus();
     titleInputEl.select();
@@ -220,6 +244,7 @@
       const page = await api.pages.getPage(workspaceId, id);
       if (requestSeq !== loadPageRequestSeq) return;
       selectedPage = page;
+      contentHashByPageId.set(page.id, page.content_hash);
       draftTitle = page.title;
       draftContent = page.content;
       pickerIcon = page.metadata?.icon || 'Plus';
@@ -227,18 +252,39 @@
       dirty = false;
       saveStatus = 'idle';
       pageEffectiveLevel = '';
+      pagePermissionsLoaded = false;
       // Run in parallel: linked work items / permissions are independent
       // of the page payload, and the link-types list is cached for the session.
       void loadPageLinks(id);
       void ensurePageEffectiveLevel(id);
       void ensureLinkTypesLoaded();
+      void loadPagePublication(id);
     } catch (err) {
       if (requestSeq !== loadPageRequestSeq) return;
       error = err?.message || t('pages.errorLoadPage');
       selectedPage = null;
       pageEffectiveLevel = '';
+      pagePermissionsLoaded = false;
+      pagePublication = null;
     } finally {
       if (requestSeq === loadPageRequestSeq) loadingPage = false;
+    }
+  }
+
+  // Portal knowledge-base publication state. Non-fatal: a failed lookup
+  // just means no public-viewable banner.
+  let pagePublication = $state(null);
+  let pagePublicationRequestSeq = 0;
+
+  async function loadPagePublication(id) {
+    const requestSeq = ++pagePublicationRequestSeq;
+    try {
+      const publication = await api.pages.getPublication(workspaceId, id);
+      if (requestSeq !== pagePublicationRequestSeq || selectedPage?.id !== id) return;
+      pagePublication = publication;
+    } catch (err) {
+      if (requestSeq !== pagePublicationRequestSeq) return;
+      pagePublication = null;
     }
   }
 
@@ -247,10 +293,15 @@
       const perms = await api.pages.getPermissions(workspaceId, id);
       if (selectedPage?.id === id) {
         pageEffectiveLevel = perms?.effective_level || '';
+        if (pageEffectiveLevel !== 'edit' && pageEffectiveLevel !== 'admin') {
+          mode = 'read';
+        }
       }
     } catch (err) {
       console.error('failed to load page permissions', err);
       if (selectedPage?.id === id) pageEffectiveLevel = '';
+    } finally {
+      if (selectedPage?.id === id) pagePermissionsLoaded = true;
     }
   }
 
@@ -305,40 +356,50 @@
    * window — we only fold the response back into draftTitle /
    * draftContent when the draft is still identical to what we sent.
    */
-  async function flushSave() {
-    if (!selectedPage || !dirty) return;
-    // Single-flight: a debounce that fires while a save is already
-    // in flight should defer rather than race. The pending input has
-    // already kept dirty=true, so the post-request reschedule below
-    // will pick it up.
-    if (saveInFlight) return;
+  function flushSave() {
+    if (!selectedPage || !dirty) return Promise.resolve();
     if (saveTimer) {
       clearTimeout(saveTimer);
       saveTimer = null;
     }
-    const targetId = selectedPage.id;
-    const prevTitle = selectedPage.title;
-    const titleSnap = draftTitle;
-    const contentSnap = draftContent;
-    saveStatus = 'saving';
-    error = '';
+
+    const snapshot = {
+      workspaceId,
+      pageId: selectedPage.id,
+      previousTitle: selectedPage.title,
+      title: draftTitle,
+      content: draftContent,
+      expectedContentHash: selectedPage.content_hash,
+    };
+    return pageAutosaveQueue.enqueue(snapshot.pageId, snapshot);
+  }
+
+  async function persistSaveSnapshot(snapshot) {
+    const { workspaceId: targetWorkspaceId, pageId: targetId } = snapshot;
+    if (selectedPage?.id === targetId) {
+      saveStatus = 'saving';
+      error = '';
+    }
     saveInFlight = true;
     try {
-      const updated = await api.pages.updatePage(workspaceId, targetId, {
-        title: titleSnap,
-        content: contentSnap,
+      const updated = await api.pages.updatePage(targetWorkspaceId, targetId, {
+        title: snapshot.title,
+        content: snapshot.content,
+        expectedContentHash:
+          contentHashByPageId.get(targetId) ?? snapshot.expectedContentHash,
       });
+      contentHashByPageId.set(targetId, updated.content_hash);
       // Only fold the response back into local state if we're still on
       // the same page; a fast-switching user has already moved on.
       if (selectedPage?.id === targetId) {
-        selectedPage = updated;
+        selectedPage = mergePageUpdate(selectedPage, updated);
         // If the user kept typing while the request was in flight,
         // the local draft is newer than what the server just echoed
         // back. Preserve the newer draft and let the next debounce
         // ship it; only clear `dirty` when the snapshot we sent is
         // still the current draft.
         const stillClean =
-          draftTitle === titleSnap && draftContent === contentSnap;
+          draftTitle === snapshot.title && draftContent === snapshot.content;
         if (stillClean) {
           draftTitle = updated.title;
           draftContent = updated.content;
@@ -353,12 +414,16 @@
       // sidebar update at all. Signal a targeted rename only when the title
       // actually changed — that patches one row in place instead of
       // refetching (and flashing) the whole tree.
-      if (updated.title !== prevTitle) {
+      if (updated.title !== snapshot.previousTitle) {
         pagesTreeRefresh.rename(updated.id, updated.title);
       }
     } catch (err) {
-      saveStatus = 'error';
-      error = err?.message || t('pages.errorSave');
+      if (selectedPage?.id === targetId) {
+        saveStatus = 'error';
+        error = err?.message || t('pages.errorSave');
+      } else {
+        console.error(`failed to save page ${targetId}`, err);
+      }
     } finally {
       saveInFlight = false;
     }
@@ -400,6 +465,23 @@
     }
   }
 
+  function onDiagramPersisted({ contentHash, pageContent }) {
+    if (!selectedPage) return;
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+    draftContent = pageContent;
+    selectedPage = {
+      ...selectedPage,
+      content: pageContent,
+      content_hash: contentHash,
+    };
+    contentHashByPageId.set(selectedPage.id, contentHash);
+    dirty = false;
+    saveStatus = 'saved';
+  }
+
   function onTitleInput(event) {
     if (!selectedPage) return;
     draftTitle = event.target.value;
@@ -411,35 +493,50 @@
 
   async function updatePageAppearance({ icon = pickerIcon, color = pickerColor, clear = false } = {}) {
     if (!selectedPage || appearanceSaving) return;
-    if (dirty && !saveInFlight) await flushSave();
-    const previous = selectedPage.metadata || {};
-    const metadata = { ...previous };
-    if (clear) {
-      delete metadata.icon;
-      delete metadata.color;
-    } else {
-      metadata.icon = icon;
-      metadata.color = color;
-    }
-    selectedPage.metadata = metadata;
-    selectedPage = selectedPage;
+    const targetWorkspaceId = workspaceId;
+    const targetPageId = selectedPage.id;
     appearanceSaving = true;
+    let previous = null;
     try {
-      const updated = await api.pages.updatePage(workspaceId, selectedPage.id, {
+      if (dirty) await flushSave();
+      if (selectedPage?.id !== targetPageId) return;
+
+      previous = selectedPage.metadata || {};
+      const metadata = { ...previous };
+      if (clear) {
+        delete metadata.icon;
+        delete metadata.color;
+      } else {
+        metadata.icon = icon;
+        metadata.color = color;
+      }
+      selectedPage.metadata = metadata;
+      selectedPage = selectedPage;
+
+      const updated = await api.pages.updatePage(targetWorkspaceId, targetPageId, {
         title: draftTitle,
         content: draftContent,
         metadata,
+        expectedContentHash:
+          contentHashByPageId.get(targetPageId) ?? selectedPage.content_hash,
       });
+      contentHashByPageId.set(targetPageId, updated.content_hash);
       if (selectedPage?.id === updated.id) {
-        selectedPage = { ...updated, content: draftContent };
+        selectedPage = mergePageUpdate(selectedPage, updated, draftContent);
         pickerIcon = updated.metadata?.icon || 'Plus';
         pickerColor = updated.metadata?.color || '#3b82f6';
       }
       pagesTreeRefresh.bump();
     } catch (err) {
-      selectedPage.metadata = previous;
-      selectedPage = selectedPage;
-      error = err?.message || t('pages.errorSave');
+      if (selectedPage?.id === targetPageId) {
+        if (previous) {
+          selectedPage.metadata = previous;
+          selectedPage = selectedPage;
+        }
+        error = err?.message || t('pages.errorSave');
+      } else {
+        console.error(`failed to update appearance for page ${targetPageId}`, err);
+      }
     } finally {
       appearanceSaving = false;
     }
@@ -455,19 +552,32 @@
     }
   }
 
+  // Toolbar actions mirror the server contract: move needs edit on the
+  // page, the ACL dialog needs admin. History and print are view-level.
+  let canAdminPage = $derived(pagePermissionsLoaded && pageEffectiveLevel === 'admin');
   let toolbarMenuItems = $derived([
-    {
-      id: 'move',
-      type: 'regular',
-      title: t('pages.menuMove'),
-      onClick: () => (moveDialogOpen = true),
-    },
-    {
-      id: 'permissions',
-      type: 'regular',
-      title: t('pages.menuPermissions'),
-      onClick: () => (permsDialogOpen = true),
-    },
+    ...(canEditPage
+      ? [
+          {
+            id: 'move',
+            type: 'regular',
+            title: t('pages.menuMove'),
+            testid: 'page-menu-move',
+            onClick: () => (moveDialogOpen = true),
+          },
+        ]
+      : []),
+    ...(canAdminPage
+      ? [
+          {
+            id: 'permissions',
+            type: 'regular',
+            title: t('pages.menuPermissions'),
+            testid: 'page-menu-permissions',
+            onClick: () => (permsDialogOpen = true),
+          },
+        ]
+      : []),
     {
       id: 'history',
       type: 'regular',
@@ -490,14 +600,21 @@
           'noopener'
         ),
     },
-    { id: 'divider', type: 'divider' },
-    {
-      id: 'archive',
-      type: 'regular',
-      title: t('pages.menuArchive'),
-      color: 'var(--ds-text-danger)',
-      onClick: archivePage,
-    },
+    // Archive needs per-page admin plus the workspace page.delete key,
+    // matching the application service's Archive contract.
+    ...(canAdminPage && workspacePermissions.canDeletePages(workspaceId)
+      ? [
+          { id: 'divider', type: 'divider' },
+          {
+            id: 'archive',
+            type: 'regular',
+            title: t('pages.menuArchive'),
+            color: 'var(--ds-text-danger)',
+            testid: 'page-menu-archive',
+            onClick: archivePage,
+          },
+        ]
+      : []),
   ]);
 
   let statusLabel = $derived.by(() => {
@@ -546,9 +663,9 @@
   });
 </script>
 
-<main class="page-pane">
+<main class="page-pane" data-testid="pages-view">
   {#if error}
-    <div class="error" role="alert">{error}</div>
+    <div class="error" role="alert" data-testid="page-error">{error}</div>
   {/if}
 
   {#if !selectedPage && !loadingPage}
@@ -560,30 +677,24 @@
   {:else if loadingPage}
     <p class="status">{t('pages.pageLoading')}</p>
   {:else if selectedPage}
-    <div class="page-frame">
+    {#if pagePublication?.publicly_viewable}
+      <div class="publication-banner" data-testid="page-publication-banner">
+        {pagePublication.portals?.length
+          ? t('pages.publiclyViewableBannerWithPortals', {
+              portals: pagePublication.portals.join(', '),
+            })
+          : t('pages.publiclyViewableBanner')}
+      </div>
+    {/if}
+    <div
+      class="page-frame"
+      class:canvas-expanded={canvasExpanded}
+      data-testid="page-canvas"
+      data-width={canvasExpanded ? 'wide' : 'comfortable'}
+    >
       <div class="toolbar">
-        <div class="title-wrap">
-          {#if PageTitleIcon}
-            <PageTitleIcon
-              size={22}
-              class="title-icon"
-              style="color: {pageTitleIconColor};"
-              aria-hidden="true"
-            />
-          {/if}
-          <input
-            id="page-title-input"
-            bind:this={titleInputEl}
-            class="title-input"
-            type="text"
-            value={draftTitle}
-            oninput={onTitleInput}
-            onkeydown={onTitleKeydown}
-            placeholder={t('pages.titlePlaceholder')}
-          />
-        </div>
         <div class="actions">
-          {#if statusLabel && mode === 'edit'}
+          {#if statusLabel && mode === 'edit' && canEditPage}
             <span
               class="save-status"
               class:save-status--error={saveStatus === 'error'}
@@ -610,17 +721,19 @@
             aria-label={t('pages.modeAria')}
             data-testid="page-mode-toggle"
           >
-            <button
-              type="button"
-              class="mode-toggle__btn"
-              class:active={mode === 'edit'}
-              aria-pressed={mode === 'edit'}
-              onclick={() => (mode = 'edit')}
-              data-testid="page-mode-edit"
-            >
-              <Pencil size={14} />
-              <span>{t('pages.modeEdit')}</span>
-            </button>
+            {#if canEditPage}
+              <button
+                type="button"
+                class="mode-toggle__btn"
+                class:active={mode === 'edit'}
+                aria-pressed={mode === 'edit'}
+                onclick={() => (mode = 'edit')}
+                data-testid="page-mode-edit"
+              >
+                <Pencil size={14} />
+                <span>{t('pages.modeEdit')}</span>
+              </button>
+            {/if}
             <button
               type="button"
               class="mode-toggle__btn"
@@ -633,21 +746,66 @@
               <span>{t('pages.modeRead')}</span>
             </button>
           </div>
-          <DropdownMenu
-            triggerIcon={Dots}
-            items={toolbarMenuItems}
-            showChevron={false}
-            iconOnly={true}
-            placement="bottom-end"
-            triggerClass="toolbar-kebab"
-            triggerTestid="page-toolbar-kebab"
-          />
+          <Tooltip
+            content={t(canvasExpanded ? 'pages.canvasComfortable' : 'pages.canvasWide')}
+            placement="bottom"
+            class="inline-flex"
+          >
+            <button
+              type="button"
+              class="canvas-width-toggle"
+              aria-label={t(canvasExpanded ? 'pages.canvasComfortable' : 'pages.canvasWide')}
+              aria-pressed={canvasExpanded}
+              onclick={() => (canvasExpanded = !canvasExpanded)}
+              data-testid="page-canvas-width-toggle"
+            >
+              {#if canvasExpanded}
+                <IconArrowsMinimize size={16} aria-hidden="true" />
+              {:else}
+                <IconArrowsMaximize size={16} aria-hidden="true" />
+              {/if}
+            </button>
+          </Tooltip>
+          {#if toolbarMenuItems.length > 0}
+            <DropdownMenu
+              triggerIcon={Dots}
+              items={toolbarMenuItems}
+              showChevron={false}
+              iconOnly={true}
+              placement="bottom-end"
+              triggerClass="toolbar-kebab"
+              triggerTestid="page-toolbar-kebab"
+            />
+          {/if}
+        </div>
+        <div class="title-wrap">
+          {#if PageTitleIcon}
+            <PageTitleIcon
+              size={22}
+              class="title-icon"
+              style="color: {pageTitleIconColor};"
+              aria-hidden="true"
+            />
+          {/if}
+          <textarea
+            id="page-title-input"
+            bind:this={titleInputEl}
+            class="title-input"
+            rows={1}
+            value={draftTitle}
+            oninput={onTitleInput}
+            onkeydown={onTitleKeydown}
+            placeholder={t('pages.titlePlaceholder')}
+            disabled={!canEditPage}
+            use:autoGrow={draftTitle}
+          ></textarea>
         </div>
       </div>
       <div class="label-row" data-testid="page-label-row">
-        {#if mode === 'edit'}
+        {#if mode === 'edit' && canEditPage}
           <div class="appearance-actions" aria-label="Page icon">
             <IconSelector
+              dataTestid="page-icon-picker"
               bind:selectedIcon={pickerIcon}
               bind:selectedColor={pickerColor}
               compact
@@ -684,7 +842,7 @@
               aria-hidden="true"
             ></span>
             {label.name}
-            {#if mode === 'edit'}
+            {#if mode === 'edit' && canEditPage}
               <button
                 type="button"
                 class="label-chip__remove"
@@ -697,7 +855,7 @@
             {/if}
           </span>
         {/each}
-        {#if mode === 'edit'}
+        {#if mode === 'edit' && canEditPage}
           <PageLabelPicker
             {workspaceId}
             selectedIds={selectedLabelIds}
@@ -712,11 +870,14 @@
             bind:content={draftContent}
             placeholder={t('pages.editorPlaceholder')}
             showToolbar={true}
-            readonly={mode === 'read'}
+            readonly={mode === 'read' || !canEditPage}
             entityType="page"
             entityId={selectedPage.id}
             enableDiagrams={true}
             {workspaceId}
+            expectedContentHash={selectedPage.content_hash}
+            onBeforeDiagramOpen={flushSave}
+            {onDiagramPersisted}
             onContentChange={onContentInput}
           />
         </div>
@@ -758,8 +919,13 @@
     bind:isOpen={moveDialogOpen}
     {workspaceId}
     page={selectedPage}
-    onMoved={async () => {
+    onMoved={async (moved) => {
       pagesTreeRefresh.bump();
+      if (moved?.workspace_id !== workspaceId) {
+        selectedPage = null;
+        navigate(`/workspaces/${workspaceId}/pages`);
+        return;
+      }
       if (selectedPage) await loadPage(selectedPage.id);
     }}
   />
@@ -778,28 +944,35 @@
   .page-pane {
     height: 100%;
     overflow-y: auto;
-    padding: 1.5rem 0;
+    padding: 0;
     display: flex;
     flex-direction: column;
     min-height: 0;
+    container-type: inline-size;
+    /* Shared by the page frame children and the full-bleed banner. */
+    --page-gutter: clamp(1rem, 4cqi, 3rem);
   }
 
   .page-frame {
     width: 100%;
-    /* No max-width — use the full pane. The right-hand TOC column
-       takes its own 220px slot in the editor-row, so the editor still
-       has a natural right margin when headings exist.
-       No horizontal padding either — that pad is pushed onto each
-       content child below so the toolbar's bottom border can run
-       edge-to-edge across the pane while the icons + body content
-       remain visually inset. */
+    max-width: none;
     margin: 0 auto;
     padding: 0;
     display: flex;
     flex-direction: column;
     gap: 1rem;
-    flex: 1;
-    min-height: 0;
+    /* Keep the complete document inside the pane's scrollable canvas. */
+    flex: 1 0 auto;
+  }
+
+  .page-frame.canvas-expanded {
+    max-width: none;
+  }
+
+  @media (min-width: 1281px) {
+    .page-frame:not(.canvas-expanded) {
+      max-width: 75%;
+    }
   }
 
   .empty-page {
@@ -825,9 +998,25 @@
 
   .toolbar {
     display: flex;
+    flex-direction: column;
     gap: 1rem;
+    align-items: stretch;
+    padding: 0 var(--page-gutter);
+  }
+
+  /* Green status bar above the page when a portal knowledge base
+     publishes it. Sits outside the centered page frame so the bar runs
+     edge to edge across the whole pane. */
+  .publication-banner {
+    display: flex;
     align-items: center;
-    padding: 0 3rem;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    padding: 0.5rem var(--page-gutter);
+    font-size: 0.8125rem;
+    color: var(--ds-text-success, #065f46);
+    background-color: var(--ds-status-success-bg, rgba(16, 185, 129, 0.12));
+    border-bottom: 1px solid var(--ds-status-success-border, rgba(16, 185, 129, 0.4));
   }
 
   .label-row {
@@ -835,7 +1024,7 @@
     flex-wrap: wrap;
     gap: 0.375rem;
     align-items: center;
-    padding: 0 3rem;
+    padding: 0 var(--page-gutter);
     margin-top: -0.5rem;
   }
 
@@ -862,21 +1051,29 @@
   }
 
   .title-wrap {
-    flex: 1;
+    width: 100%;
     min-width: 0;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.625rem;
   }
 
   :global(.title-icon) {
     flex-shrink: 0;
+    /* Center the icon on the title's first line. */
+    margin-top: 0.35rem;
   }
 
+  /* The title wraps instead of scrolling inside a single-line field, so
+     long titles are never clipped in edit or read mode. autoGrow keeps the
+     textarea sized to its content. */
   .title-input {
     flex: 1;
     min-width: 0;
-    font-size: 2rem;
+    width: 100%;
+    display: block;
+    font-family: inherit;
+    font-size: 1.75rem;
     font-weight: 700;
     line-height: 1.2;
     background: transparent;
@@ -884,31 +1081,52 @@
     color: var(--ds-text);
     outline: none;
     padding: 0;
+    resize: none;
+    overflow: hidden;
+    overflow-wrap: anywhere;
   }
 
   .actions {
     display: flex;
     gap: 0.5rem;
     align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    margin-left: auto;
   }
 
   .appearance-actions {
     display: inline-flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: 0;
+  }
+
+  .appearance-actions :global(.icon-selector-compact) {
+    width: auto;
   }
 
   .clear-icon-button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 1.5rem;
+    width: 1rem;
     height: 1.5rem;
+    margin-left: 0.125rem;
+    padding: 0;
     border: none;
     border-radius: 0.25rem;
     background: transparent;
     color: var(--ds-text-subtle);
     cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+  }
+
+  .appearance-actions:hover .clear-icon-button,
+  .appearance-actions:focus-within .clear-icon-button {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .clear-icon-button:hover:not(:disabled) {
@@ -970,6 +1188,31 @@
     color: var(--ds-text);
   }
 
+  .canvas-width-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    border: none;
+    border-radius: 0.25rem;
+    background: transparent;
+    color: var(--ds-text-subtle);
+    cursor: pointer;
+  }
+
+  .canvas-width-toggle:hover,
+  .canvas-width-toggle[aria-pressed='true'] {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .canvas-width-toggle:focus-visible {
+    outline: 2px solid var(--ds-border-focused);
+    outline-offset: 2px;
+  }
+
   :global(.toolbar-kebab) {
     display: inline-flex;
     align-items: center;
@@ -988,19 +1231,13 @@
     color: var(--ds-text);
   }
 
-  /* Single-column when no TOC; two-column only when there are
-     headings to show. Grid with a reserved 220px right column left
-     dead space below the editor frame, even when the TOC wasn't
-     rendered. */
+  /* The TOC gets a fixed supporting rail only when headings exist. */
   .editor-row {
     display: flex;
     flex-direction: row;
     gap: 2rem;
     flex: 1;
     min-height: 0;
-    /* No horizontal padding — the toolbar's bottom divider must hit
-       both walls flush. The TOC carries its own right margin (below)
-       so it doesn't kiss the right edge when present. */
   }
 
   /* Frameless editor: no border, no rounded corners, no background —
@@ -1031,7 +1268,7 @@
      originals; without that, the cascade tie silently restores the
      bordered card. Scope stays inside `.editor-frame` so inline
      editors and item descriptions keep their boxed look. */
-  :global(.editor-frame .milkdown-wrapper) {
+  :global(.editor-frame.editor-frame .milkdown-wrapper) {
     flex: 1;
     display: flex;
     flex-direction: column;
@@ -1060,29 +1297,24 @@
     overflow: visible;
   }
 
-  /* Confluence-style toolbar: floats on the page background with a
-     single hairline beneath it instead of being a tinted card top.
-     The 3rem left inset matches the title above and the body below;
-     the bottom border spans the full toolbar width (= full
-     .editor-frame width), so the hairline visually extends edge-to-
-     edge of the pane while the icons stay inset. */
+  /* The formatting toolbar stays frameless with one divider across the canvas. */
   :global(.editor-frame .milkdown-wrapper .milkdown-toolbar) {
     border: none;
     border-radius: 0;
     background: transparent;
-    padding: 0 3rem 0.375rem 3rem;
+    padding: 0 var(--page-gutter) 0.375rem;
     border-bottom: 1px solid var(--ds-border);
   }
 
   :global(.editor-frame .milkdown-wrapper .milkdown-editor .milkdown) {
     flex: 1;
     min-height: 0;
-    /* Top: breathing room below the toolbar divider.
-       Left/right: keeps the prose inset 3rem so it aligns with the
-       title above (the toolbar divider's left edge runs further out). */
-    padding: 1.5rem 3rem 0 3rem;
+    /* Keep the prose aligned with the title and below the toolbar divider. */
+    padding: 1.5rem var(--page-gutter) 0;
     display: flex;
     flex-direction: column;
+    font-size: 1rem;
+    line-height: 1.6;
   }
 
   /* ProseMirror itself must grow so the entire empty column is
@@ -1101,10 +1333,8 @@
     max-height: calc(100vh - 8rem);
     overflow-y: auto;
     padding-left: 1rem;
-    /* Inset from the pane's right wall. Carried here (instead of on
-       .editor-row) so the editor's toolbar divider can run flush to
-       the right edge in Edit mode when the TOC isn't shown. */
-    margin-right: 3rem;
+    /* Keep the supporting rail inset from the canvas edge. */
+    margin-right: var(--page-gutter);
     border-left: 1px solid var(--ds-border);
     font-size: 0.8125rem;
   }
@@ -1144,10 +1374,13 @@
   }
 
   @media (max-width: 1100px) {
-    .editor-row {
-      grid-template-columns: 1fr;
-    }
     .toc {
+      display: none;
+    }
+  }
+
+  @container (max-width: 52rem) {
+    .canvas-width-toggle {
       display: none;
     }
   }

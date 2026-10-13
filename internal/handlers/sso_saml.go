@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,6 +103,11 @@ func (h *SSOHandler) SAMLLogin(w http.ResponseWriter, r *http.Request) {
 	// Generate relay state containing a CSRF state token
 	state := generateRandomState()
 	rememberMe := ssoRememberMeFromRequest(r)
+	slog.Info("starting SAML login",
+		slog.String("component", "sso"),
+		slog.String("provider", provider.Slug),
+		slog.Bool("remember_me", rememberMe),
+	)
 
 	redirectURI := r.URL.Query().Get("redirect_uri")
 	if redirectURI == "" {
@@ -113,19 +119,20 @@ func (h *SSOHandler) SAMLLogin(w http.ResponseWriter, r *http.Request) {
 		redirectURI = "/"
 	}
 
-	// Store state token for CSRF protection
-	storeErr := repository.NewSSOStateRepository(h.db).Store(provider.ID, state, redirectURI, rememberMe, time.Now().Add(5*time.Minute))
-	if storeErr != nil {
-		slog.Error("failed to store SAML state token", "error", storeErr)
-		h.redirectWithError(w, r, "Internal server error")
-		return
-	}
-
-	// Create AuthnRequest and redirect to IdP
-	redirectURL, err := sp.MakeAuthenticationRequest(state)
+	// Create AuthnRequest first so its ID can be bound to the state token; the
+	// ACS handler requires the returned assertion's InResponseTo to match it.
+	redirectURL, requestID, err := sp.MakeAuthenticationRequest(state)
 	if err != nil {
 		slog.Error("failed to create SAML AuthnRequest", "error", err, "provider", provider.Slug)
 		h.redirectWithError(w, r, "Failed to create authentication request")
+		return
+	}
+
+	// Store state token for CSRF protection, bound to the AuthnRequest ID.
+	storeErr := repository.NewSSOStateRepository(h.db).Store(provider.ID, state, requestID, redirectURI, rememberMe, time.Now().Add(ssoStateTokenTTL))
+	if storeErr != nil {
+		slog.Error("failed to store SAML state token", "error", storeErr)
+		h.redirectWithError(w, r, "Internal server error")
 		return
 	}
 
@@ -144,10 +151,7 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 	// Reject IdP-initiated flows: every legitimate response originates from
 	// SAMLLogin, which always sets RelayState to a freshly minted state token.
 	// An empty RelayState means either an IdP-initiated flow we don't support
-	// or a malformed request — fail closed before parsing the assertion so
-	// the library's AllowIDPInitiated=true setting can't be exploited if the
-	// DB-lookup defense below is ever weakened. Track AuthnRequest IDs and
-	// flip AllowIDPInitiated to false as a follow-up.
+	// or a malformed request — fail closed before parsing the assertion.
 	relayState := r.FormValue("RelayState") //nolint:gosec // G120: SAML payload size is bounded by the SAML library and reverse-proxy upload limit; FormValue here only reads the state token we minted in SAMLLogin.
 	if relayState == "" {
 		slog.Warn("SAML request rejected: empty RelayState (IdP-initiated flow not supported)", "provider", provider.Slug)
@@ -155,15 +159,9 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Parse and validate the SAML response
-	assertionInfo, err := sp.ParseResponse(r)
-	if err != nil {
-		slog.Error("SAML assertion validation failed", "error", err, "provider", provider.Slug)
-		h.redirectWithError(w, r, "Authentication failed: invalid SAML response")
-		return
-	}
-
-	// Validate state token
+	// Validate the state token first so its recorded AuthnRequest ID can bind
+	// the assertion. Looking it up before parsing also means a replayed
+	// assertion whose state token was already consumed is rejected here.
 	token, err := repository.NewSSOStateRepository(h.db).GetValid(relayState, provider.ID, time.Now())
 	if err != nil {
 		slog.Warn("SAML state token not found, rejecting request", "provider", provider.Slug)
@@ -172,8 +170,22 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 	}
 	redirectURI := token.RedirectURI
 	rememberMe := token.RememberMe
+	slog.Info("restored SAML login state",
+		slog.String("component", "sso"),
+		slog.String("provider", provider.Slug),
+		slog.Bool("remember_me", rememberMe),
+	)
 	// Delete used state token (single-use)
 	_ = repository.NewSSOStateRepository(h.db).Delete(token.ID)
+
+	// Parse and validate the SAML response, requiring the assertion's
+	// InResponseTo to match the AuthnRequest we issued for this state token.
+	assertionInfo, err := sp.ParseResponse(r, token.RequestID)
+	if err != nil {
+		slog.Error("SAML assertion validation failed", "error", err, "provider", provider.Slug)
+		h.redirectWithError(w, r, "Authentication failed: invalid SAML response")
+		return
+	}
 
 	// Convert SAML attributes to OIDCClaims for reuse of FindOrCreateUser
 	claims := h.samlAssertionToClaims(assertionInfo, provider)
@@ -191,8 +203,6 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 		switch {
 		case err == sso.ErrAutoProvisionDisabled:
 			h.redirectWithError(w, r, "User account not found. Contact your administrator.")
-		case errors.Is(err, sso.ErrEmailNotVerified):
-			h.redirectWithError(w, r, "Your email address has not been verified by the identity provider")
 		case errors.Is(err, sso.ErrAccountLinkingRequiresVerification):
 			h.redirectWithError(w, r, "Cannot link to existing account: your identity provider must verify your email address first")
 		default:
@@ -203,14 +213,13 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 
 	user := result.User
 
-	// If IdP verified the email, update our DB to reflect that
-	if !result.NeedsEmailVerification && !user.EmailVerified {
-		if h.emailVerificationService != nil {
-			if err := h.emailVerificationService.SetEmailVerified(user.ID, true); err != nil {
-				slog.Warn("failed to set email verified from IdP", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.Any("error", err))
-			} else {
-				user.EmailVerified = true
-			}
+	// SSO authentication is itself evidence of account ownership: keep the
+	// verification column aligned so informational UI reflects the login.
+	if !user.EmailVerified && h.emailVerificationService != nil {
+		if err := h.emailVerificationService.SetEmailVerified(user.ID, true); err != nil {
+			slog.Warn("failed to mark SSO user email verified", slog.String("component", "sso"), slog.Int("user_id", user.ID), slog.Any("error", err))
+		} else {
+			user.EmailVerified = true
 		}
 	}
 
@@ -219,22 +228,16 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Handle email verification if needed
-	if result.NeedsEmailVerification && !user.EmailVerified {
-		if h.emailVerificationService != nil {
-			token, tokenErr := h.emailVerificationService.GenerateVerificationToken(user.ID)
-			if tokenErr == nil {
-				if sendErr := h.emailVerificationService.SendVerificationEmail(user, token); sendErr != nil {
-					slog.Warn("failed to send verification email", "user_id", user.ID, "error", sendErr)
-				}
-			}
-		}
-	}
-
 	// Get client IP
 	ipAddress := h.ipExtractor.GetClientIP(r)
 
 	// Create session
+	slog.Info("creating SAML session",
+		slog.String("component", "sso"),
+		slog.String("provider", provider.Slug),
+		slog.Int("user_id", user.ID),
+		slog.Bool("remember_me", rememberMe),
+	)
 	session, err := h.sessionManager.CreateSession(user.ID, ipAddress, r.UserAgent(), rememberMe)
 	if err != nil {
 		slog.Error("failed to create session after SAML login", "error", err, "user_id", user.ID)
@@ -261,7 +264,7 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 		ActionType:   logger.ActionLoginSuccess,
 		ResourceType: logger.ResourceUser,
 		ResourceName: user.Email,
-		Details: map[string]interface{}{
+		Details: map[string]any{
 			"provider":      provider.Slug,
 			"provider_type": sso.ProviderTypeSAML,
 			"method":        "saml",
@@ -272,16 +275,12 @@ func (h *SSOHandler) SAMLAssertionConsumerService(w http.ResponseWriter, r *http
 	}
 
 	// Redirect - validate redirect URI before using it
-	if result.NeedsEmailVerification && !user.EmailVerified {
-		http.Redirect(w, r, "/?verify_email=pending", http.StatusFound)
-	} else {
-		target := redirectURI
-		if target == "" || !isValidRedirectURI(target) {
-			target = "/"
-		}
-		// target is validated by isValidRedirectURI (relative path only).
-		http.Redirect(w, r, target, http.StatusFound) // #nosec G710
+	target := redirectURI
+	if target == "" || !isValidRedirectURI(target) {
+		target = "/"
 	}
+	// target is validated by isValidRedirectURI (relative path only).
+	http.Redirect(w, r, target, http.StatusFound) // #nosec G710
 }
 
 // samlAssertionToClaims converts SAML assertion attributes to OIDCClaims
@@ -290,17 +289,18 @@ func (h *SSOHandler) samlAssertionToClaims(info *sso.SAMLAssertionInfo, provider
 	attrMap, _ := provider.GetAttributeMap()
 	if attrMap == nil {
 		attrMap = &sso.AttributeMap{
-			Email:      "email",
-			Name:       "name",
-			GivenName:  "given_name",
-			FamilyName: "family_name",
-			Username:   "preferred_username",
+			Email:         "email",
+			EmailVerified: "email_verified",
+			Name:          "name",
+			GivenName:     "given_name",
+			FamilyName:    "family_name",
+			Username:      "preferred_username",
 		}
 	}
 
 	claims := &sso.OIDCClaims{
 		Subject: info.NameID,
-		Raw:     make(map[string]interface{}),
+		Raw:     make(map[string]any),
 	}
 
 	// Copy all attributes into Raw for profile_data
@@ -352,18 +352,20 @@ func (h *SSOHandler) samlAssertionToClaims(info *sso.SAMLAssertionInfo, provider
 		claims.Username = strings.Split(claims.Email, "@")[0]
 	}
 
-	// SAML has no standard email_verified claim. The assertion itself is
-	// signed by the IdP and the email attribute is asserted by that IdP, so
-	// in this deployment we treat IdP-authenticated SAML email as verified.
-	// This matches typical enterprise SAML deployments where the IdP is the
-	// source of truth for user identity.
-	//
-	// Without this, every SAML-provisioned new user lands with
-	// users.email_verified=false locally, which would gate them out of any
-	// future RequireVerifiedEmail-protected endpoint without ever giving them
-	// a way to verify (no IdP-side confirmation step exists for SAML).
-	claims.EmailVerified = true
+	// SAML lacks a standard verified-email claim. If the IdP asserts the mapped
+	// attribute, honor it; otherwise provider trust decides whether the
+	// asserted email can auto-link an existing account.
 	claims.EmailVerifiedProvided = true
+	if attrMap.EmailVerified != "" {
+		if v := info.GetAttribute(attrMap.EmailVerified); v != "" {
+			// Any value that isn't a recognizable "true" means not verified.
+			if verified, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+				claims.EmailVerified = verified
+			}
+			return claims
+		}
+	}
+	claims.EmailVerified = provider.RequireVerifiedEmail
 
 	return claims
 }
@@ -381,17 +383,11 @@ func getFirstSAMLAttribute(info *sso.SAMLAssertionInfo, names ...string) string 
 	return ""
 }
 
-// nativeRedirectURI is the sole custom-scheme callback the desktop/native SSO
-// flow (WI-446) is allowed to use. Keep this an exact-match allowlist: the
-// native branch hands a session back to whatever handles this scheme, so
-// anything looser would risk delivering credentials to an attacker-registered
-// scheme handler. The token never rides in the URL — only a one-time code that
-// is redeemed at /api/auth/native/exchange.
+// nativeRedirectURI is the sole exact-match native callback. It receives only
+// a one-time exchange code, never a session token.
 const nativeRedirectURI = "windshift://oauth/callback"
 
-// isValidNativeRedirectURI reports whether uri is the exact registered native
-// callback. Unlike isValidRedirectURI (relative paths only), this permits the
-// windshift:// custom scheme — but only that one literal value.
+// isValidNativeRedirectURI permits only the registered native callback.
 func isValidNativeRedirectURI(uri string) bool {
 	return uri == nativeRedirectURI
 }

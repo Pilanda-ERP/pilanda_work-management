@@ -60,6 +60,8 @@
 </script>
 
 <div
+  data-testid={`notification-card-${notification.id}`}
+  data-read={notification.read}
   class="notification-card p-4 cursor-pointer transition-colors relative group"
   class:unread={!notification.read}
   style="border-bottom: 1px solid var(--ds-border);"
@@ -101,7 +103,7 @@
         <!-- Dismiss button (shows on hover) -->
         <button
           onclick={handleDismiss}
-          class="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded dismiss-btn"
+          class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity p-1 rounded dismiss-btn"
           title={t('notifications.dismiss')}
           tabindex="-1"
         >

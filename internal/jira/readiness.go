@@ -1,5 +1,7 @@
 package jira
 
+import "strings"
+
 // readiness.go classifies how faithfully a Jira instance migrates into
 // Windshift. It is a pure layer on top of field_mapper.go — no I/O — so the
 // handler can feed it sampled issue data and the test suite can exercise the
@@ -32,11 +34,9 @@ type Finding struct {
 }
 
 // fieldTypeSeverity maps a resolved Windshift field type to its migration
-// fidelity. The importer now writes custom-field *values* (not just the
-// definitions) during issue import, so every recognized type lands cleanly:
-// user/multi_user resolve to Windshift users, asset fields resolve to objects
-// imported into Windshift asset sets, and the scalar/option types carry their
-// values through. Only types with no Windshift mapping at all are blocked.
+// fidelity. Native scalar, user, asset, and option mappings land cleanly.
+// Opaque app-owned structures are deliberately preserved as JSON text and are
+// classified separately by ClassifyField.
 func fieldTypeSeverity(t WindshiftFieldType) (severity Severity, reason string) {
 	switch t {
 	case FieldTypeUnmapped:
@@ -55,6 +55,24 @@ func fieldTypeSeverity(t WindshiftFieldType) (severity Severity, reason string) 
 // plus its observed usage into a Finding.
 func ClassifyField(s FieldMappingSuggestion, usageCount int) Finding {
 	sev, reason := fieldTypeSeverity(s.WindshiftFieldType)
+	switch s.JiraFieldType {
+	case "com.pyxis.greenhopper.jira:gh-lexo-rank":
+		sev = SeverityClean
+		reason = "Jira Rank controls import order; Windshift generates increasing fractional indexes in that order."
+	case "com.atlassian.servicedesk:vp-origin":
+		sev = SeverityClean
+		reason = "Jira Request Type maps to the item's first-class portal request type."
+	}
+	if s.PreserveRaw {
+		sev = SeverityLossy
+		reason = "No proven native Windshift shape; the complete Jira value is preserved as JSON text."
+	}
+	if s.WindshiftFieldType == FieldTypeDate &&
+		(strings.Contains(strings.ToLower(s.JiraFieldType), "datetime") ||
+			strings.Contains(s.Notes, "time-of-day editing is lossy")) {
+		sev = SeverityLossy
+		reason = "Jira datetime values are stored as calendar dates with the original timestamp retained in item metadata, but Windshift exposes calendar-date editing and rendering."
+	}
 	if s.Notes != "" {
 		reason += " " + s.Notes
 	}
@@ -68,17 +86,9 @@ func ClassifyField(s FieldMappingSuggestion, usageCount int) Finding {
 	}
 }
 
-// supportedADFNodes are the ADF node types the importer's ADF→Markdown
-// converter (ConvertADFToMarkdownWithUsers in field_mapper.go) renders with
-// full fidelity. Anything outside this set is flattened to its text content,
-// losing the original structure/formatting — so its presence is a lossy
-// signal. Keep this in sync with convertADFNode's switch (and its
-// helpers convertADFTable/TaskList/Panel/Expand/Media).
-//
-// This includes the structural child nodes of supported containers
-// (listItem, tableRow, tableCell/tableHeader, taskItem) which the converter
-// walks positionally rather than by type: they carry no information of their
-// own, so ScanADF must not flag them as lossy when their parent is supported.
+// supportedADFNodes are rendered faithfully by the ADF-to-Markdown converter;
+// other nodes are flattened and flagged as lossy. Include container children
+// walked positionally so supported structures are not falsely flagged.
 var supportedADFNodes = map[string]bool{
 	// Document + block structure.
 	"doc":          true,
@@ -119,18 +129,18 @@ var supportedADFNodes = map[string]bool{
 // ScanADF walks an ADF document (the shape Jira returns for description and
 // comment bodies) and returns a histogram of node `type` → occurrence count.
 // A nil or plain-string body yields an empty map.
-func ScanADF(adf interface{}) map[string]int {
+func ScanADF(adf any) map[string]int {
 	counts := make(map[string]int)
-	var walk func(node interface{})
-	walk = func(node interface{}) {
-		m, ok := node.(map[string]interface{})
+	var walk func(node any)
+	walk = func(node any) {
+		m, ok := node.(map[string]any)
 		if !ok {
 			return
 		}
 		if t, _ := m["type"].(string); t != "" {
 			counts[t]++
 		}
-		if content, ok := m["content"].([]interface{}); ok {
+		if content, ok := m["content"].([]any); ok {
 			for _, c := range content {
 				walk(c)
 			}

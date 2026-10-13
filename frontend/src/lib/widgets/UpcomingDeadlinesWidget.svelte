@@ -1,10 +1,9 @@
 <script>
   import { Calendar, CalendarDays, Flag, RefreshCw } from '@lucide/svelte';
   import { api } from '../api.js';
-  import { formatDueDate, getDueBadgeClass } from '../utils/dateFormatter.js';
+  import DueMark from './dashboard/DueMark.svelte';
   import WidgetState from './WidgetState.svelte';
   import { t } from '../stores/i18n.svelte.js';
-  import { normalizeDate, getDoneStatusIds } from './doneStatusHelper.js';
 
   let { workspaceId = null, collectionFilter = null } = $props();
 
@@ -16,8 +15,13 @@
   let error = $state(null);
   let currentWorkspaceId = $state(null);
   let currentCollectionFilter = $state(null);
-  let refreshInFlight = $state(false);
   let activeFetchId = $state(0);
+
+  function normalizeDate(dateString) {
+    if (!dateString) return null;
+    const date = new Date(dateString);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
 
   function isWithinWindow(dateString, now, cutoff) {
     const d = normalizeDate(dateString);
@@ -33,10 +37,8 @@
     const fetchId = ++activeFetchId;
     loading = true;
     error = null;
-    refreshInFlight = true;
 
     try {
-      const doneStatusIds = await getDoneStatusIds(api);
       const trimmedFilter = (collectionFilter || '').trim();
       const parts = [];
       if (trimmedFilter) {
@@ -44,10 +46,8 @@
       }
       parts.push(`workspace_id = ${workspaceId}`);
       parts.push('due_date >= now()');
-      let vql = parts.join(' AND ');
-      if (doneStatusIds.length > 0) {
-        vql += ` AND status_id NOT IN (${doneStatusIds.join(',')})`;
-      }
+      parts.push('status_completed = false');
+      const vql = parts.join(' AND ');
 
       const [itemsResponse, allMilestones, allIterations] = await Promise.all([
         api.items.getAll({ ql: vql, limit: 50 }),
@@ -55,7 +55,7 @@
         api.iterations.getAll({ workspace_id: workspaceId }),
       ]);
 
-      const items = Array.isArray(itemsResponse) ? itemsResponse : (itemsResponse?.items ?? []);
+      const items = itemsResponse?.data ?? [];
       const milestonesArr = Array.isArray(allMilestones) ? allMilestones : [];
       const iterationsArr = Array.isArray(allIterations) ? allIterations : [];
 
@@ -118,13 +118,12 @@
     } finally {
       if (fetchId === activeFetchId) {
         loading = false;
-        refreshInFlight = false;
       }
     }
   }
 
   function handleRefresh() {
-    if (!refreshInFlight) {
+    if (!loading) {
       loadUpcomingEntries();
     }
   }
@@ -192,7 +191,7 @@
                 </div>
               </div>
             </div>
-            <span class="text-xs font-medium whitespace-nowrap px-2 py-0.5 rounded {getDueBadgeClass(entry.deadline)}">{formatDueDate(entry.deadline)}</span>
+            <DueMark dueDate={entry.deadline} />
           </div>
         {/each}
       </div>

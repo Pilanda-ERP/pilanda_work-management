@@ -6,20 +6,24 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"windshift/internal/database"
 	"windshift/internal/models"
 	"windshift/internal/sanitize"
+	"windshift/internal/services"
 )
 
 type ReviewHandler struct {
-	db database.Database
+	db                database.Database
+	permissionService *services.PermissionService
 }
 
-func NewReviewHandler(db database.Database) *ReviewHandler {
+func NewReviewHandler(db database.Database, permissionService *services.PermissionService) *ReviewHandler {
 	return &ReviewHandler{
-		db: db,
+		db:                db,
+		permissionService: permissionService,
 	}
 }
 
@@ -75,7 +79,7 @@ func (h *ReviewHandler) GetReviews(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN users u ON r.user_id = u.id
 		WHERE r.user_id = ?`
 
-	args := []interface{}{userID}
+	args := []any{userID}
 
 	if reviewType != "" {
 		query += " AND r.review_type = ?"
@@ -204,6 +208,12 @@ func (h *ReviewHandler) CreateReview(w http.ResponseWriter, r *http.Request) {
 		respondValidationError(w, r, "Missing required fields: review_date, review_type, review_data")
 		return
 	}
+	// review_data is stored as JSON, so reject anything else before it
+	// reaches the database.
+	if err := sanitize.ValidateJSONPayload("review_data", req.ReviewData); err != nil {
+		respondValidationError(w, r, err.Error())
+		return
+	}
 
 	// Validate review type
 	if req.ReviewType != "daily" && req.ReviewType != "weekly" {
@@ -278,6 +288,10 @@ func (h *ReviewHandler) UpdateReview(w http.ResponseWriter, r *http.Request) {
 	// Validate required fields
 	if req.ReviewData == "" {
 		respondValidationError(w, r, "Missing required field: review_data")
+		return
+	}
+	if err := sanitize.ValidateJSONPayload("review_data", req.ReviewData); err != nil {
+		respondValidationError(w, r, err.Error())
 		return
 	}
 
@@ -374,7 +388,18 @@ func (h *ReviewHandler) GetCompletedItems(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	query := `
+	workspaceIDs, err := h.permissionService.AccessibleWorkspaceIDs(userID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if len(workspaceIDs) == 0 {
+		respondJSONOK(w, []models.Item{})
+		return
+	}
+	workspacePlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(workspaceIDs)), ",")
+
+	query := fmt.Sprintf(`
 		WITH completed_statuses AS (
 			SELECT s.id
 			FROM statuses s
@@ -400,11 +425,18 @@ func (h *ReviewHandler) GetCompletedItems(w http.ResponseWriter, r *http.Request
 		JOIN items i ON i.id = ce.item_id
 		JOIN workspaces w ON i.workspace_id = w.id
 		WHERE i.assignee_id = ?
+		  AND i.workspace_id IN (%s)
 		  AND DATE(ce.completed_at) >= ?
 		  AND DATE(ce.completed_at) <= ?
-		ORDER BY ce.completed_at DESC`
+		ORDER BY ce.completed_at DESC`, workspacePlaceholders)
 
-	rows, err := h.db.Query(query, userID, startDate, endDate)
+	args := make([]any, 0, len(workspaceIDs)+3)
+	args = append(args, userID)
+	for _, workspaceID := range workspaceIDs {
+		args = append(args, workspaceID)
+	}
+	args = append(args, startDate, endDate)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return

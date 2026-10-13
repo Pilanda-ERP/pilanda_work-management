@@ -41,6 +41,7 @@
 
 <a
   href={href || '#'}
+  data-testid={`hub-portal-card-${portal.slug || portal.id}`}
   class="portal-card group relative rounded-lg overflow-hidden cursor-pointer block no-underline w-full"
   class:border-2={hubStore.isEditing}
   class:border-dashed={hubStore.isEditing}
@@ -52,6 +53,7 @@
 >
   <!-- Gradient Header -->
   <div
+    data-testid={`hub-portal-card-gradient-${portal.slug || portal.id}`}
     class="h-24 relative"
     style="background: {headerBackground};"
   >
@@ -74,7 +76,7 @@
         tabindex="-1"
         onclick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(portal.id); }}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); onRemove(portal.id); } }}
-        class="absolute top-2 right-2 p-1 rounded bg-red-500/80 text-white hover:bg-red-600 transition-colors cursor-pointer"
+        class="absolute top-2 right-2 p-1 rounded bg-ds-background-danger-bold/80 text-white hover:bg-ds-background-danger-bold transition-colors cursor-pointer"
         title={t('common.remove', 'Remove')}
       >
         <X class="w-4 h-4" />
@@ -105,7 +107,7 @@
       </span>
 
       {#if !hubStore.isEditing}
-        <span class="text-xs flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity" style="color: var(--ds-text-subtle);">
+        <span class="text-xs flex items-center gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity" style="color: var(--ds-text-subtle);">
           {t('common.open', 'Open')}
           <ExternalLink class="w-3 h-3" />
         </span>

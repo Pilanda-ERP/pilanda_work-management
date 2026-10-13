@@ -1,11 +1,12 @@
 <script>
   import { onMount } from 'svelte';
-  import { Loader2 } from '@lucide/svelte';
+  import Spinner from '../components/Spinner.svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import {  } from '@lucide/svelte';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast, successToast } from '../stores/toasts.svelte.js';
   import { logbookStore } from '../stores/logbook.svelte.js';
-  import Spinner from '../components/Spinner.svelte';
   import Select from '../components/Select.svelte';
   import {
     IconMessageChatbot,
@@ -137,9 +138,7 @@
 </script>
 
 {#if loading}
-  <div class="flex items-center justify-center py-12">
-    <Spinner />
-  </div>
+  <StateDisplay type="loading" />
 {:else}
   {#if connections.length === 0}
     <div class="mb-6 text-sm rounded p-4 border" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text-subtle);">
@@ -171,7 +170,7 @@
 
           <div class="flex items-center gap-2 shrink-0">
             {#if saving}
-              <Loader2 class="w-4 h-4 animate-spin" style="color: var(--ds-text-subtle);" />
+              <Spinner size="sm" />
             {/if}
             <Select
               value={mode}

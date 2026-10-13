@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +21,7 @@ import (
 type AuthPolicy string
 
 const (
-	// AuthPolicyPassword is password-only authentication (default)
+	// AuthPolicyPassword allows password authentication (default); configured SSO remains available.
 	AuthPolicyPassword AuthPolicy = "password"
 	// AuthPolicyPasswordPasskey2FA requires password + passkey 2FA (when no SSO configured)
 	AuthPolicyPasswordPasskey2FA AuthPolicy = "password_passkey_2fa"
@@ -59,6 +61,14 @@ type AffectedUser struct {
 	HasPasskey bool   `json:"has_passkey"`
 	HasSSO     bool   `json:"has_sso"`
 	IsAdmin    bool   `json:"is_admin"`
+}
+
+// AffectedUsersPage is one bounded page of the affected-users listing.
+type AffectedUsersPage struct {
+	Users      []AffectedUser `json:"users"`
+	TotalCount int            `json:"total_count"`
+	HasMore    bool           `json:"has_more"`
+	NextCursor string         `json:"next_cursor"`
 }
 
 // AuthPolicyHandler handles authentication policy endpoints
@@ -112,12 +122,10 @@ func (h *AuthPolicyHandler) GetAuthPolicy(w http.ResponseWriter, r *http.Request
 	// Set fallback status
 	config.FallbackEnabled = h.fallbackEnabled
 
-	// Hide password form if:
-	// 1. Fallback is disabled (default)
-	// 2. AND policy is restrictive (passkey_only or sso_primary)
-	// 3. AND not in preview mode
-	isRestrictivePolicy := config.Policy == AuthPolicyPasskeyOnly || config.Policy == AuthPolicySSOPrimary
-	config.HidePasswordForm = !h.fallbackEnabled && isRestrictivePolicy && !config.PreviewMode
+	// SSO-primary has no password-based bootstrap. Passkey-only keeps the form
+	// visible because a user without a credential may use their password solely
+	// to enter the server-restricted first-passkey enrollment flow.
+	config.HidePasswordForm = !h.fallbackEnabled && config.Policy == AuthPolicySSOPrimary && !config.PreviewMode
 
 	respondJSONOK(w, config)
 }
@@ -129,7 +137,7 @@ func (h *AuthPolicyHandler) UpdateAuthPolicy(w http.ResponseWriter, r *http.Requ
 		PreviewMode bool       `json:"preview_mode"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "Invalid JSON")
 		return
 	}
@@ -161,53 +169,21 @@ func (h *AuthPolicyHandler) UpdateAuthPolicy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// When enabling passkey_only or sso_primary with fallback disabled,
-	// verify that ALL admin users have a passkey enrolled to prevent lockout
+	// Verify that every administrator can use the selected login method when
+	// emergency password fallback is unavailable.
 	if !h.fallbackEnabled && !req.PreviewMode && (req.Policy == AuthPolicyPasskeyOnly || req.Policy == AuthPolicySSOPrimary) {
-		var adminsWithoutPasskey int
-		// Check both direct user permissions AND group-based permissions
-		err := h.db.QueryRow(`
-			SELECT COUNT(DISTINCT admin_user_id) FROM (
-				-- Direct user permissions
-				SELECT ugp.user_id as admin_user_id
-				FROM user_global_permissions ugp
-				JOIN permissions gp ON ugp.permission_id = gp.id
-				JOIN users u ON ugp.user_id = u.id
-				WHERE gp.permission_key = 'system.admin'
-				AND u.is_active = true
-				AND NOT EXISTS(
-					SELECT 1 FROM user_credentials uc
-					WHERE uc.user_id = ugp.user_id
-					AND uc.credential_type = 'fido'
-					AND uc.is_active = true
-				)
-				UNION
-				-- Group-based permissions
-				SELECT gm.user_id as admin_user_id
-				FROM group_members gm
-				JOIN groups g ON gm.group_id = g.id
-				JOIN group_global_permissions ggp ON gm.group_id = ggp.group_id
-				JOIN permissions gp ON ggp.permission_id = gp.id
-				JOIN users u ON gm.user_id = u.id
-				WHERE gp.permission_key = 'system.admin'
-				AND g.is_active = true
-				AND u.is_active = true
-				AND NOT EXISTS(
-					SELECT 1 FROM user_credentials uc
-					WHERE uc.user_id = gm.user_id
-					AND uc.credential_type = 'fido'
-					AND uc.is_active = true
-				)
-			)
-		`).Scan(&adminsWithoutPasskey)
-
+		adminsWithoutRequiredLogin, err := h.countAdminsWithoutRequiredLogin(req.Policy)
 		if err != nil {
 			respondInternalError(w, r, err)
 			return
 		}
 
-		if adminsWithoutPasskey > 0 {
-			respondBadRequest(w, r, "Cannot enable this policy: some administrators do not have passkeys enrolled. Enable --enable-fallback flag or ensure all admins have passkeys.")
+		if adminsWithoutRequiredLogin > 0 {
+			message := "Cannot enable this policy: some administrators do not have passkeys enrolled. Enable --enable-fallback flag or ensure all admins have passkeys."
+			if req.Policy == AuthPolicySSOPrimary {
+				message = "Cannot enable SSO Required: some administrators do not have an account linked to an enabled SSO provider. Ask every administrator to sign in with SSO once to link their account, or enable emergency administrator password fallback by restarting the server with --enable-fallback or ENABLE_ADMIN_FALLBACK=true."
+			}
+			respondBadRequest(w, r, message)
 			return
 		}
 	}
@@ -237,7 +213,7 @@ func (h *AuthPolicyHandler) UpdateAuthPolicy(w http.ResponseWriter, r *http.Requ
 
 	if h.auditor != nil {
 		if user := utils.GetCurrentUser(r); user != nil {
-			h.auditor.LogWithDetails(r, user, logger.ActionAuthPolicyUpdate, logger.ResourceAuthPolicy, nil, string(req.Policy), map[string]interface{}{
+			h.auditor.LogWithDetails(r, user, logger.ActionAuthPolicyUpdate, logger.ResourceAuthPolicy, nil, string(req.Policy), map[string]any{
 				"previous_policy":       previousPolicy,
 				"new_policy":            req.Policy,
 				"previous_preview_mode": previousPreviewMode,
@@ -265,8 +241,9 @@ func (h *AuthPolicyHandler) GetAuthPolicyStats(w http.ResponseWriter, r *http.Re
 
 	// Users with at least one active passkey (FIDO credential)
 	if err := h.db.QueryRow(`
-		SELECT COUNT(DISTINCT user_id) FROM user_credentials
-		WHERE credential_type = 'fido' AND is_active = true
+		SELECT COUNT(*) FROM users u
+		WHERE u.is_active = true
+		AND EXISTS(SELECT 1 FROM webauthn_credentials wc WHERE wc.user_id = u.id)
 	`).Scan(&stats.UsersWithPasskey); err != nil {
 		slog.Warn("failed to get passkey users count", slog.Any("error", err))
 	}
@@ -307,19 +284,17 @@ func (h *AuthPolicyHandler) GetAuthPolicyStats(w http.ResponseWriter, r *http.Re
 			SELECT ugp.user_id as admin_user_id
 			FROM user_global_permissions ugp
 			JOIN permissions gp ON ugp.permission_id = gp.id
-			JOIN user_credentials uc ON ugp.user_id = uc.user_id
 			WHERE gp.permission_key = 'system.admin'
-			AND uc.credential_type = 'fido' AND uc.is_active = true
+			AND EXISTS(SELECT 1 FROM webauthn_credentials wc WHERE wc.user_id = ugp.user_id)
 			UNION
 			SELECT gm.user_id as admin_user_id
 			FROM group_members gm
 			JOIN groups g ON gm.group_id = g.id
 			JOIN group_global_permissions ggp ON gm.group_id = ggp.group_id
 			JOIN permissions gp ON ggp.permission_id = gp.id
-			JOIN user_credentials uc ON gm.user_id = uc.user_id
 			WHERE gp.permission_key = 'system.admin'
 			AND g.is_active = true
-			AND uc.credential_type = 'fido' AND uc.is_active = true
+			AND EXISTS(SELECT 1 FROM webauthn_credentials wc WHERE wc.user_id = gm.user_id)
 		)
 	`).Scan(&stats.AdminsWithPasskey); err != nil {
 		slog.Warn("failed to get admins with passkey count", slog.Any("error", err))
@@ -328,8 +303,24 @@ func (h *AuthPolicyHandler) GetAuthPolicyStats(w http.ResponseWriter, r *http.Re
 	respondJSONOK(w, stats)
 }
 
-// GetAffectedUsers returns users who would be affected by the current policy
+// GetAffectedUsers returns a bounded page of users who would be affected by
+// the current policy. Query params: limit (default 50, max 500) and cursor
+// (the last email of the previous page). The response carries total_count and
+// next_cursor so admins can page through large sets without one unbounded
+// response or scan.
 func (h *AuthPolicyHandler) GetAffectedUsers(w http.ResponseWriter, r *http.Request) {
+	const defaultAffectedLimit = 50
+	const maxAffectedLimit = 500
+
+	limit := defaultAffectedLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	limit = min(max(limit, 1), maxAffectedLimit)
+	cursor := r.URL.Query().Get("cursor")
+
 	// Get current policy
 	var policy = AuthPolicyPassword
 	var policyStr string
@@ -340,49 +331,52 @@ func (h *AuthPolicyHandler) GetAffectedUsers(w http.ResponseWriter, r *http.Requ
 
 	// If policy is just password, no users are affected
 	if policy == AuthPolicyPassword {
-		respondJSONOK(w, []AffectedUser{})
+		respondJSONOK(w, AffectedUsersPage{Users: []AffectedUser{}})
 		return
 	}
 
-	// Build query based on policy
-	var query string
+	// Predicate selecting the users the policy would affect
+	var affectedPredicate string
 	switch policy {
 	case AuthPolicyPasskeyOnly, AuthPolicyPasswordPasskey2FA:
 		// Users without passkeys (excluding system admins who have fallback)
-		query = `
-			SELECT u.id, u.email, u.username, u.first_name, u.last_name,
-				EXISTS(SELECT 1 FROM user_credentials uc WHERE uc.user_id = u.id AND uc.credential_type = 'fido' AND uc.is_active = true) as has_passkey,
-				EXISTS(SELECT 1 FROM user_external_accounts sea WHERE sea.user_id = u.id) as has_sso,
-				(
-					EXISTS(SELECT 1 FROM user_global_permissions ugp JOIN permissions gp ON ugp.permission_id = gp.id WHERE ugp.user_id = u.id AND gp.permission_key = 'system.admin')
-					OR EXISTS(SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id JOIN group_global_permissions ggp ON gm.group_id = ggp.group_id JOIN permissions gp ON ggp.permission_id = gp.id WHERE gm.user_id = u.id AND gp.permission_key = 'system.admin' AND g.is_active = true)
-				) as is_admin
-			FROM users u
-			WHERE u.is_active = true
-			AND NOT EXISTS(SELECT 1 FROM user_credentials uc WHERE uc.user_id = u.id AND uc.credential_type = 'fido' AND uc.is_active = true)
-			ORDER BY u.email
-		`
+		affectedPredicate = `NOT EXISTS(SELECT 1 FROM webauthn_credentials wc WHERE wc.user_id = u.id)`
 	case AuthPolicySSOPrimary:
 		// Users without SSO linked (excluding system admins who have fallback)
-		query = `
-			SELECT u.id, u.email, u.username, u.first_name, u.last_name,
-				EXISTS(SELECT 1 FROM user_credentials uc WHERE uc.user_id = u.id AND uc.credential_type = 'fido' AND uc.is_active = true) as has_passkey,
-				EXISTS(SELECT 1 FROM user_external_accounts sea WHERE sea.user_id = u.id) as has_sso,
-				(
-					EXISTS(SELECT 1 FROM user_global_permissions ugp JOIN permissions gp ON ugp.permission_id = gp.id WHERE ugp.user_id = u.id AND gp.permission_key = 'system.admin')
-					OR EXISTS(SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id JOIN group_global_permissions ggp ON gm.group_id = ggp.group_id JOIN permissions gp ON ggp.permission_id = gp.id WHERE gm.user_id = u.id AND gp.permission_key = 'system.admin' AND g.is_active = true)
-				) as is_admin
-			FROM users u
-			WHERE u.is_active = true
-			AND NOT EXISTS(SELECT 1 FROM user_external_accounts sea WHERE sea.user_id = u.id)
-			ORDER BY u.email
-		`
+		affectedPredicate = `NOT EXISTS(SELECT 1 FROM user_external_accounts sea WHERE sea.user_id = u.id)`
 	default:
-		respondJSONOK(w, []AffectedUser{})
+		respondJSONOK(w, AffectedUsersPage{Users: []AffectedUser{}})
 		return
 	}
 
-	rows, err := h.db.Query(query)
+	whereClause := "WHERE u.is_active = true AND " + affectedPredicate
+	args := []any{}
+	if cursor != "" {
+		whereClause += " AND u.email > ?"
+		args = append(args, cursor)
+	}
+
+	var totalCount int
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM users u "+whereClause, args...).Scan(&totalCount); err != nil {
+		respondInternalError(w, r, fmt.Errorf("count affected users: %w", err))
+		return
+	}
+
+	query := `
+		SELECT u.id, u.email, u.username, u.first_name, u.last_name,
+			EXISTS(SELECT 1 FROM webauthn_credentials wc WHERE wc.user_id = u.id) as has_passkey,
+			EXISTS(SELECT 1 FROM user_external_accounts sea WHERE sea.user_id = u.id) as has_sso,
+			(
+				EXISTS(SELECT 1 FROM user_global_permissions ugp JOIN permissions gp ON ugp.permission_id = gp.id WHERE ugp.user_id = u.id AND gp.permission_key = 'system.admin')
+				OR EXISTS(SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id JOIN group_global_permissions ggp ON gm.group_id = ggp.group_id JOIN permissions gp ON ggp.permission_id = gp.id WHERE gm.user_id = u.id AND gp.permission_key = 'system.admin' AND g.is_active = true)
+			) as is_admin
+		FROM users u
+		` + whereClause + `
+		ORDER BY u.email
+		LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
@@ -394,7 +388,8 @@ func (h *AuthPolicyHandler) GetAffectedUsers(w http.ResponseWriter, r *http.Requ
 		var u AffectedUser
 		var firstName, lastName string
 		if err := rows.Scan(&u.ID, &u.Email, &u.Username, &firstName, &lastName, &u.HasPasskey, &u.HasSSO, &u.IsAdmin); err != nil {
-			continue
+			respondInternalError(w, r, fmt.Errorf("scan affected user: %w", err))
+			return
 		}
 		u.FullName = strings.TrimSpace(firstName + " " + lastName)
 		users = append(users, u)
@@ -404,7 +399,17 @@ func (h *AuthPolicyHandler) GetAffectedUsers(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	respondJSONOK(w, users)
+	hasMore := len(users) == limit
+	nextCursor := ""
+	if hasMore {
+		nextCursor = users[len(users)-1].Email
+	}
+	respondJSONOK(w, AffectedUsersPage{
+		Users:      users,
+		TotalCount: totalCount,
+		HasMore:    hasMore,
+		NextCursor: nextCursor,
+	})
 }
 
 // isSSOConfigured checks if any SSO provider is configured and enabled
@@ -412,6 +417,59 @@ func (h *AuthPolicyHandler) isSSOConfigured() bool {
 	var count int
 	err := h.db.QueryRow("SELECT COUNT(*) FROM sso_providers WHERE enabled = true").Scan(&count)
 	return err == nil && count > 0
+}
+
+func (h *AuthPolicyHandler) countAdminsWithoutRequiredLogin(policy AuthPolicy) (int, error) {
+	const activeAdmins = `
+		WITH active_admins AS (
+			SELECT ugp.user_id
+			FROM user_global_permissions ugp
+			JOIN permissions p ON p.id = ugp.permission_id
+			JOIN users u ON u.id = ugp.user_id
+			WHERE p.permission_key = 'system.admin'
+			AND u.is_active = true
+			UNION
+			SELECT gm.user_id
+			FROM group_members gm
+			JOIN groups g ON g.id = gm.group_id
+			JOIN group_global_permissions ggp ON ggp.group_id = gm.group_id
+			JOIN permissions p ON p.id = ggp.permission_id
+			JOIN users u ON u.id = gm.user_id
+			WHERE p.permission_key = 'system.admin'
+			AND g.is_active = true
+			AND u.is_active = true
+		)
+	`
+
+	var query string
+	switch policy {
+	case AuthPolicyPasskeyOnly:
+		query = activeAdmins + `
+			SELECT COUNT(*)
+			FROM active_admins a
+			WHERE NOT EXISTS (
+				SELECT 1 FROM webauthn_credentials wc WHERE wc.user_id = a.user_id
+			)
+		`
+	case AuthPolicySSOPrimary:
+		query = activeAdmins + `
+			SELECT COUNT(*)
+			FROM active_admins a
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM user_external_accounts ea
+				JOIN sso_providers sp ON sp.id = ea.provider_id
+				WHERE ea.user_id = a.user_id
+				AND sp.enabled = true
+			)
+		`
+	default:
+		return 0, nil
+	}
+
+	var count int
+	err := h.db.QueryRow(query).Scan(&count)
+	return count, err
 }
 
 // upsertSetting updates or inserts a system setting
@@ -488,23 +546,20 @@ func (h *AuthPolicyHandler) GetPublicPolicyStatus(w http.ResponseWriter, r *http
 	// Derive passkey requirement
 	status.PasskeyRequired = policy == AuthPolicyPasskeyOnly || policy == AuthPolicyPasswordPasskey2FA
 
-	// Hide password form if:
-	// 1. Fallback is disabled (default)
-	// 2. AND policy is restrictive (passkey_only or sso_primary)
-	// 3. AND not in preview mode
-	isRestrictivePolicy := policy == AuthPolicyPasskeyOnly || policy == AuthPolicySSOPrimary
-	status.HidePasswordForm = !h.fallbackEnabled && isRestrictivePolicy && !previewMode
+	// Passkey-only retains password solely as a first-passkey enrollment
+	// credential, so its form remains available; SSO-primary hides it.
+	status.HidePasswordForm = !h.fallbackEnabled && policy == AuthPolicySSOPrimary && !previewMode
 
 	respondJSONOK(w, status)
 }
 
 // LogAuditEvent logs an auth policy related event
-func (h *AuthPolicyHandler) LogAuditEvent(userID int, eventType, ipAddress, userAgent string, details map[string]interface{}) error {
+func (h *AuthPolicyHandler) LogAuditEvent(userID int, eventType, ipAddress, userAgent string, details map[string]any) error {
 	policy := h.GetCurrentPolicy()
 
 	// details is JSONB on Postgres / TEXT on SQLite. Empty string isn't valid
 	// JSON, so when there's no details we send a Go nil interface (→ NULL).
-	var detailsArg interface{}
+	var detailsArg any
 	if details != nil {
 		detailsJSON, err := json.Marshal(details)
 		if err == nil {

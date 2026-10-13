@@ -12,12 +12,16 @@
   import '@xyflow/svelte/dist/style.css';
   import StatusNode from './StatusNode.svelte';
   import ReconnectableEdge from './ReconnectableEdge.svelte';
+  import AllIncomingEdge from './AllIncomingEdge.svelte';
   import {
     statusesToNodes,
     transitionsToEdges,
     nodesToStatuses,
     edgesToTransitions,
+    allIncomingEdgesToTransitions,
     createEdge,
+    createAllIncomingEdge,
+    isAllIncomingEdge,
     addPreservationTransitions,
     positionPersistence,
     DEFAULT_WORKFLOW_POSITIONS
@@ -25,8 +29,12 @@
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
   import { useEventListener } from 'runed';
+  import { api } from '../../api.js';
+  import { HelpCircle, Plus } from '@lucide/svelte';
+  import SearchInput from '../../components/SearchInput.svelte';
+  import StatusModal from '../../dialogs/StatusModal.svelte';
 
-  let { workflow, statuses = [], onSave, onCancel } = $props();
+  let { workflow, statuses = [], statusCategories = [], onSave, onCancel } = $props();
 
   // Local state
   let nodes = $state([]);
@@ -42,7 +50,8 @@
   };
 
   const edgeTypes = {
-    reconnectable: ReconnectableEdge
+    reconnectable: ReconnectableEdge,
+    'all-incoming': AllIncomingEdge
   };
 
   // Flow options
@@ -60,6 +69,7 @@
   useEventListener(() => window, 'workflow-edge-swap', (event) => handleEdgeSwap(event));
   useEventListener(() => window, 'workflow-set-initial', (/** @type {CustomEvent<{statusId?: any}>} */ event) => handleSetInitial(event.detail?.statusId));
   useEventListener(() => window, 'workflow-status-remove', (event) => onStatusRemove(event));
+  useEventListener(() => window, 'workflow-toggle-all-incoming', (/** @type {CustomEvent<{statusId?: any}>} */ event) => handleToggleAllIncoming(event.detail?.statusId));
 
   $effect(() => {
     const w = workflow;
@@ -92,18 +102,36 @@
       };
     }).filter(Boolean);
 
-    // Detect initial status from transition where from_status_id is NULL
-    const initialTransition = (workflow.transitions || []).find(t => t.from_status_id === null);
+    // Detect initial status from transition where from_status_id is NULL.
+    // From-all rows also have a NULL from status but are not initial.
+    const initialTransition = (workflow.transitions || []).find(
+      (t) => t.from_status_id === null && !t.from_all_statuses
+    );
     initialStatusId = initialTransition?.to_status_id || null;
 
+    // Statuses reachable from every other status get the special loop arrow
+    const allIncomingStatusIds = new Set(
+      (workflow.transitions || [])
+        .filter((t) => t.from_all_statuses)
+        .map((t) => t.to_status_id)
+    );
+
     // Load existing transitions (exclude self-preservation transitions)
-    workingTransitions = workflow.transitions?.filter(t => 
+    workingTransitions = workflow.transitions?.filter(t =>
       t.from_status_id !== null && t.from_status_id !== t.to_status_id
     ) || [];
 
     // Convert to Svelte Flow format
-    nodes = statusesToNodes(workflowStatuses, initialStatusId);
-    edges = calculateEdgeOffsets(transitionsToEdges(workingTransitions));
+    nodes = statusesToNodes(workflowStatuses, initialStatusId).map((node) => ({
+      ...node,
+      data: { ...node.data, fromAll: allIncomingStatusIds.has(node.data.statusId) }
+    }));
+    edges = [
+      ...calculateEdgeOffsets(transitionsToEdges(workingTransitions)),
+      ...[...allIncomingStatusIds]
+        .filter((statusId) => nodes.some((node) => node.data.statusId === statusId))
+        .map((statusId) => createAllIncomingEdge(statusId, workflow.id))
+    ];
 
     // If no initial status set, default to first node (if any)
     if (!initialStatusId && nodes.length > 0) {
@@ -168,6 +196,8 @@
     });
     // Recalculate offsets after edge changes
     edges = calculateEdgeOffsets(edges);
+    // Deleting the special arrow (e.g. via Delete key) unticks the checkbox
+    nodes = syncFromAllNodes(nodes, edges);
   }
 
   function handleEdgeSwap(event) {
@@ -211,11 +241,14 @@
   function calculateEdgeOffsets(edgeList) {
     const OFFSET_STEP = 12; // pixels between parallel edges
 
-    // Group edges by their connection points
+    // Group edges by their connection points. The special all-statuses loop
+    // stays out of the grouping so it does not displace regular arrows.
     const sourceGroups = {}; // key: "nodeId-handle" -> array of edge indices
     const targetGroups = {};
 
     edgeList.forEach((edge, index) => {
+      if (isAllIncomingEdge(edge)) return;
+
       const sourceKey = `${edge.source}-${edge.sourceHandle}`;
       const targetKey = `${edge.target}-${edge.targetHandle}`;
 
@@ -228,6 +261,10 @@
 
     // Calculate offsets for each edge
     return edgeList.map((edge, index) => {
+      if (isAllIncomingEdge(edge)) {
+        return { ...edge, data: { ...edge.data, offset: 0 } };
+      }
+
       const sourceKey = `${edge.source}-${edge.sourceHandle}`;
       const targetKey = `${edge.target}-${edge.targetHandle}`;
 
@@ -269,7 +306,8 @@
         name: status.name,
         category_color: status.category_color,
         category_name: status.category_name,
-        description: status.description
+        description: status.description,
+        fromAll: false
       }
     };
 
@@ -306,6 +344,29 @@
     removeStatusFromWorkflow(event.detail.statusId);
   }
 
+  // Keep the node checkbox in sync with the presence of its special arrow.
+  function syncFromAllNodes(nodeList, edgeList) {
+    const allEdgeTargets = new Set(
+      edgeList.filter(isAllIncomingEdge).map((edge) => parseInt(edge.target.replace('status-', ''), 10))
+    );
+    return nodeList.map((node) => ({
+      ...node,
+      data: { ...node.data, fromAll: allEdgeTargets.has(node.data.statusId) }
+    }));
+  }
+
+  function handleToggleAllIncoming(statusId) {
+    if (!statusId) return;
+    const nodeId = `status-${statusId}`;
+    const existing = edges.find((edge) => isAllIncomingEdge(edge) && edge.target === nodeId);
+    if (existing) {
+      edges = edges.filter((edge) => edge !== existing);
+    } else {
+      edges = [...edges, createAllIncomingEdge(statusId, workflow.id)];
+    }
+    nodes = syncFromAllNodes(nodes, edges);
+  }
+
   async function saveWorkflowDesign() {
     if (!workflow) return;
 
@@ -323,10 +384,17 @@
         workflow.id
       );
 
+      // From-all rows power the special "every other status" arrows and are
+      // appended after the initial row so they are never stripped as NULL-from
+      const transitionsWithAll = [
+        ...transitionsWithInitial,
+        ...allIncomingEdgesToTransitions(edges, workflow.id)
+      ];
+
       // Add preservation transitions for disconnected statuses
       const allTransitions = addPreservationTransitions(
-        currentStatuses, 
-        transitionsWithInitial, 
+        currentStatuses,
+        transitionsWithAll,
         workflow.id
       );
 
@@ -339,10 +407,67 @@
     }
   }
 
-  // Filter statuses not already in workflow
-  let availableStatuses = $derived(statuses.filter(status =>
-    !nodes.some(node => node.data.statusId === status.id)
-  ));
+  // Filter statuses not already in workflow. Statuses created inline are kept
+  // in their own list rather than appended to the `statuses` prop, which
+  // would re-run the workflow load effect and reset the canvas.
+  let createdStatuses = $state([]);
+  let lastCreatedStatusId = $state(null);
+  let availableStatuses = $derived.by(() => {
+    const available = [...statuses, ...createdStatuses].filter(status =>
+      !nodes.some(node => node.data.statusId === status.id)
+    );
+    // A freshly created status pins to the top so it cannot get buried in a
+    // long list; once added to the workflow it leaves the palette anyway.
+    if (lastCreatedStatusId == null) return available;
+    const created = available.filter(status => status.id === lastCreatedStatusId);
+    const rest = available.filter(status => status.id !== lastCreatedStatusId);
+    return [...created, ...rest];
+  });
+
+  // Palette filtering — large catalogs need a quick way to find a status.
+  let statusFilter = $state('');
+  let filteredAvailableStatuses = $derived.by(() => {
+    const query = statusFilter.trim().toLowerCase();
+    if (!query) return availableStatuses;
+    return availableStatuses.filter(status =>
+      status.name?.toLowerCase().includes(query) ||
+      status.display_name?.toLowerCase().includes(query)
+    );
+  });
+
+  // Inline status creation reuses the shared status dialog.
+  let showStatusModal = $state(false);
+  let creatingStatus = $state(false);
+  let statusFormData = $state({ name: '', description: '', category_id: null, is_default: false });
+  let showTransitionHints = $state(false);
+
+  function openStatusModal() {
+    statusFormData = {
+      name: '',
+      description: '',
+      category_id: statusCategories[0]?.id ?? null,
+      is_default: false
+    };
+    showStatusModal = true;
+  }
+
+  async function createStatusFromDesigner() {
+    if (creatingStatus || !statusFormData.name.trim() || statusFormData.category_id == null) return;
+    creatingStatus = true;
+    try {
+      const created = await api.statuses.create(statusFormData);
+      createdStatuses = [...createdStatuses, created];
+      lastCreatedStatusId = created.id;
+      showStatusModal = false;
+      statusFilter = '';
+      window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
+    } catch (error) {
+      console.error('Failed to create status:', error);
+      errorToast(t('dialogs.alerts.failedToCreate', { error: error.message || error }));
+    } finally {
+      creatingStatus = false;
+    }
+  }
 
   // Watch for node count changes and save positions to localStorage
   $effect(() => {
@@ -397,19 +522,60 @@
 <div class="flex h-full">
   <!-- Status Palette -->
   <div class="w-80 workflow-sidebar border-r p-6 overflow-y-auto flex-shrink-0">
-    <h3 class="text-lg font-medium sidebar-title mb-2">{t('workflows.availableStatuses')}</h3>
-    <div class="mb-4 p-3 sidebar-hint border rounded-md">
-      <div class="text-xs font-medium hint-heading">{t('workflows.transitionHintTitle')}</div>
-      <div class="text-xs hint-body">
-        {t('workflows.transitionHint1')}<br/>
-        {t('workflows.transitionHint2')}<br/>
-        {t('workflows.transitionHint3')}
-      </div>
-    </div>
-    <div class="space-y-3">
-      {#each availableStatuses as status}
+    <div class="flex items-center justify-between gap-2 mb-3">
+      <h3 class="text-lg font-medium sidebar-title">{t('workflows.availableStatuses')}</h3>
+      <div class="flex items-center gap-1">
         <button
           type="button"
+          data-testid="workflow-status-help"
+          class="p-1.5 rounded border workflow-icon-button cursor-pointer transition-colors"
+          aria-expanded={showTransitionHints}
+          title={t('workflows.transitionHelp')}
+          aria-label={t('workflows.transitionHelp')}
+          onclick={() => (showTransitionHints = !showTransitionHints)}
+        >
+          <HelpCircle class="w-4 h-4" />
+        </button>
+        <button
+          type="button"
+          data-testid="workflow-status-add"
+          class="p-1.5 rounded border workflow-icon-button cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          disabled={statusCategories.length === 0}
+          title={statusCategories.length === 0 ? t('categories.noCategories') : t('statuses.createStatus')}
+          aria-label={t('statuses.createStatus')}
+          onclick={openStatusModal}
+        >
+          <Plus class="w-4 h-4" />
+        </button>
+      </div>
+    </div>
+
+    {#if showTransitionHints}
+      <div class="mb-4 p-3 sidebar-hint border rounded-md" data-testid="workflow-transition-hints">
+        <div class="text-xs font-medium hint-heading">{t('workflows.transitionHintTitle')}</div>
+        <div class="text-xs hint-body">
+          {t('workflows.transitionHint1')}<br/>
+          {t('workflows.transitionHint2')}<br/>
+          {t('workflows.transitionHint3')}<br/>
+          {t('workflows.transitionHint4')}
+        </div>
+      </div>
+    {/if}
+
+    <div class="mb-3">
+      <SearchInput
+        bind:value={statusFilter}
+        placeholder={t('workflows.filterStatuses')}
+        size="small"
+        dataTestid="workflow-status-filter"
+      />
+    </div>
+
+    <div class="space-y-3">
+      {#each filteredAvailableStatuses as status (status.id)}
+        <button
+          type="button"
+          data-testid={`workflow-status-option-${status.id}`}
           class="appearance-none bg-transparent border-none font-[inherit] text-[inherit] text-left w-full p-3 rounded border status-card cursor-pointer transition-colors"
           onclick={() => addStatusToWorkflow(status)}
         >
@@ -426,9 +592,11 @@
         </button>
       {/each}
       
-      {#if availableStatuses.length === 0}
-        <div class="text-center py-8 status-empty">
-          <p class="text-sm">{t('workflows.allStatusesAdded')}</p>
+      {#if filteredAvailableStatuses.length === 0}
+        <div class="text-center py-8 status-empty" data-testid="workflow-status-empty">
+          <p class="text-sm">
+            {availableStatuses.length === 0 ? t('workflows.allStatusesAdded') : t('workflows.noStatusesMatchFilter')}
+          </p>
         </div>
       {/if}
     </div>
@@ -443,7 +611,7 @@
   </div>
 
   <!-- Svelte Flow Canvas -->
-  <div class="flex-1 relative">
+  <div class="flex-1 relative" data-testid="workflow-canvas">
     <SvelteFlow
       bind:nodes
       bind:edges
@@ -479,6 +647,20 @@
               stroke-width="1"
             />
           </marker>
+          <marker
+            id="workflow-all-arrowhead"
+            markerWidth="5"
+            markerHeight="5"
+            refX="4"
+            refY="2.5"
+            orient="auto"
+            markerUnits="strokeWidth"
+          >
+            <polygon
+              points="0,0.4 4.4,2.5 0,4.6 1.2,2.5"
+              fill="var(--workflow-accent, #3b82f6)"
+            />
+          </marker>
         </defs>
       </svg>
     </SvelteFlow>
@@ -497,14 +679,15 @@
     <!-- Save/Cancel buttons overlay -->
     <div class="absolute top-4 right-4 flex gap-2 z-10">
       <button
-        class="px-4 py-2 text-sm font-medium border rounded-md workflow-button-secondary focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+        class="px-4 py-2 text-sm font-medium border rounded-md workflow-button-secondary focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ds-border-focused"
         onclick={onCancel}
         disabled={savingTransitions}
       >
         {t('common.cancel')}
       </button>
       <button
-        class="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
+        data-testid="workflow-save"
+        class="px-4 py-2 text-sm font-medium text-white bg-ds-interactive border border-transparent rounded-md hover:bg-ds-interactive-hovered focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ds-border-focused disabled:opacity-50"
         onclick={saveWorkflowDesign}
         disabled={savingTransitions || nodes.length === 0}
       >
@@ -512,6 +695,16 @@
       </button>
     </div>
   </div>
+
+  <!-- Shared create-status dialog -->
+  <StatusModal
+    isOpen={showStatusModal}
+    bind:formData={statusFormData}
+    categories={statusCategories}
+    saving={creatingStatus}
+    onsave={createStatusFromDesigner}
+    oncancel={() => (showStatusModal = false)}
+  />
 </div>
 
 <style>
@@ -585,6 +778,18 @@
 
   .sidebar-counts {
     color: var(--workflow-text-subtle);
+  }
+
+  .workflow-icon-button {
+    color: var(--workflow-text-subtle);
+    background-color: var(--workflow-panel);
+    border-color: var(--workflow-border);
+  }
+
+  .workflow-icon-button:hover:enabled {
+    color: var(--workflow-text);
+    background-color: var(--workflow-panel-hover);
+    border-color: var(--workflow-accent);
   }
 
   .workflow-hint {

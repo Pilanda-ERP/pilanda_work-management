@@ -1,4 +1,5 @@
 <script>
+  import FileInput from './FileInput.svelte';
   import { Upload, Trash2 } from '@lucide/svelte';
   import { backgroundCategories, getPresetsByCategory } from '../utils/backgroundImages.js';
   import Button from './Button.svelte';
@@ -13,8 +14,8 @@
     onRemoveImage = () => {},
     onUploadImage = () => {},
     uploading = false,
-    uploadCategory = 'portal_background',
-    label = null
+    label = null,
+    presetAspectRatio = '4 / 3'
   } = $props();
 
   let showUploadSection = $state(false);
@@ -80,8 +81,8 @@
     {#each getPresetsByCategory(localSelectedCategory) as preset}
       <button
         onclick={() => onSelectImage(preset.url)}
-        class="group relative aspect-[4/3] rounded-lg overflow-hidden transition-all hover:scale-105"
-        style={currentImageUrl === preset.url ? 'box-shadow: 0 0 0 2px var(--ds-border-focused);' : ''}
+        class="group relative rounded-lg overflow-hidden transition-all hover:scale-105"
+        style={`aspect-ratio: ${presetAspectRatio};${currentImageUrl === preset.url ? ' box-shadow: 0 0 0 2px var(--ds-border-focused);' : ''}`}
         title={preset.name}
       >
         <img
@@ -119,15 +120,14 @@
 
     {#if showUploadSection && attachmentStatus.enabled}
       <div class="mt-3 p-4 rounded-lg border" style="border-color: var(--ds-border); background-color: var(--ds-surface);">
-        <input
-          type="file"
+        <FileInput
           accept="image/*"
           onchange={handleFileChange}
           disabled={uploading}
-          class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
+          class="block w-full text-sm text-ds-text-subtle file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-ds-background-neutral file:text-ds-text-link hover:file:bg-ds-background-neutral-hovered disabled:opacity-50"
         />
         {#if uploading}
-          <div class="mt-2 text-sm text-blue-600">{t('workspaceSettings.uploading')}</div>
+          <div class="mt-2 text-sm text-ds-interactive">{t('workspaceSettings.uploading')}</div>
         {/if}
         <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
           {t('lookAndFeel.backgroundUploadRecommendation')}

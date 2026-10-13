@@ -1,8 +1,10 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -16,9 +18,10 @@ import (
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/repository/actionutil"
+	"windshift/internal/sanitize"
 	"windshift/internal/utils"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // AssetActionService handles asynchronous asset action execution
@@ -31,20 +34,57 @@ type AssetActionService struct {
 	actionCache map[int][]*models.AssetAction
 	cacheMu     sync.RWMutex
 
-	// Event processing
-	eventChan chan *models.AssetActionEvent
-	stopChan  chan struct{}
-	wg        sync.WaitGroup
+	durableIngress *DurableAssetActionIngress
+	stopChan       chan struct{}
+	wg             sync.WaitGroup
 
 	// Dependencies
 	notificationService *NotificationService
-	eventCoordinator    *EventCoordinator
 	chainStore          *ExecutionChainStore
+	permissionService   *PermissionService
+	assetPermChecker    AssetSetPermissionChecker
+	itemCreation        *ItemCreationService
 
 	// Statistics
 	eventsProcessed int64
 	actionsExecuted int64
 	errors          int64
+}
+
+// AssetActionExecutionResult is the observable outcome of one action run.
+// Execution failures are represented by Status; Error is reserved for
+// infrastructure failures that prevent a trustworthy result from being stored.
+type AssetActionExecutionResult struct {
+	LogID        int                          `json:"log_id"`
+	Status       models.ActionExecutionStatus `json:"status"`
+	ErrorMessage string                       `json:"error,omitempty"`
+}
+
+var assetConditionFieldAliases = map[string]string{
+	"title":       "asset_title",
+	"description": "asset_description",
+	"type_id":     "asset_type_id",
+	"status_id":   "asset_status_id",
+	"type_name":   "asset_type_name",
+	"status_name": "asset_status_name",
+}
+
+var assetConditionFields = map[string]struct{}{
+	"asset_title":       {},
+	"asset_tag":         {},
+	"asset_description": {},
+	"asset_type_id":     {},
+	"asset_status_id":   {},
+	"asset_type_name":   {},
+	"asset_status_name": {},
+}
+
+func canonicalAssetConditionField(fieldName string) (string, bool) {
+	if canonical, ok := assetConditionFieldAliases[fieldName]; ok {
+		return canonical, true
+	}
+	_, ok := assetConditionFields[fieldName]
+	return fieldName, ok
 }
 
 // NewAssetActionService creates a new asset action service
@@ -53,13 +93,14 @@ func NewAssetActionService(db database.Database, config ActionServiceConfig, cha
 		chainStore = NewExecutionChainStore()
 	}
 	service := &AssetActionService{
-		db:          db,
-		repo:        repository.NewAssetActionRepository(db),
-		config:      config,
-		actionCache: make(map[int][]*models.AssetAction),
-		eventChan:   make(chan *models.AssetActionEvent, config.EventBufferSize),
-		stopChan:    make(chan struct{}),
-		chainStore:  chainStore,
+		db:             db,
+		repo:           repository.NewAssetActionRepository(db),
+		config:         config,
+		actionCache:    make(map[int][]*models.AssetAction),
+		durableIngress: NewDurableAssetActionIngress(db),
+		stopChan:       make(chan struct{}),
+		chainStore:     chainStore,
+		itemCreation:   NewItemCreationService(db, nil),
 	}
 
 	// Load initial cache
@@ -67,9 +108,7 @@ func NewAssetActionService(db database.Database, config ActionServiceConfig, cha
 		slog.Warn("failed to load initial asset action cache", slog.String("component", "asset-actions"), slog.Any("error", err))
 	}
 
-	// Start background workers
-	service.wg.Add(2)
-	go service.eventProcessor()
+	service.wg.Add(1)
 	go service.cacheRefresher()
 
 	slog.Debug("asset action service initialized", slog.String("component", "asset-actions"))
@@ -77,49 +116,122 @@ func NewAssetActionService(db database.Database, config ActionServiceConfig, cha
 	return service
 }
 
+// ValidateTaxonomyReferences rejects asset-action definitions that point at a
+// type or status outside the action's set. Execution repeats the ownership
+// checks so definitions cannot become unsafe if taxonomy data changes later.
+func (as *AssetActionService) ValidateTaxonomyReferences(setID int, triggerConfig string, nodes []models.AssetActionNode) error {
+	repo := repository.NewAssetRepository(as.db)
+	if triggerConfig != "" {
+		var config models.AssetTriggerConfig
+		if err := json.Unmarshal([]byte(triggerConfig), &config); err != nil {
+			return fmt.Errorf("trigger_config: %w", err)
+		}
+		if config.AssetTypeID != nil {
+			belongs, err := repo.AssetTypeBelongsToSet(*config.AssetTypeID, setID)
+			if err != nil {
+				return fmt.Errorf("validate trigger asset_type_id: %w", err)
+			}
+			if !belongs {
+				return fmt.Errorf("trigger asset_type_id %d does not belong to asset set %d", *config.AssetTypeID, setID)
+			}
+		}
+		for field, statusID := range map[string]*int{
+			"from_status_id": config.FromStatusID,
+			"to_status_id":   config.ToStatusID,
+		} {
+			if statusID == nil {
+				continue
+			}
+			belongs, err := repo.StatusBelongsToSet(*statusID, setID)
+			if err != nil {
+				return fmt.Errorf("validate trigger %s: %w", field, err)
+			}
+			if !belongs {
+				return fmt.Errorf("trigger %s %d does not belong to asset set %d", field, *statusID, setID)
+			}
+		}
+	}
+	for i, node := range nodes {
+		switch node.NodeType {
+		case models.AssetNodeSetStatus:
+			var config models.SetStatusNodeConfig
+			if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
+				return fmt.Errorf("nodes[%d].node_config: %w", i, err)
+			}
+			if config.StatusID <= 0 {
+				return fmt.Errorf("nodes[%d].node_config.status_id must be positive", i)
+			}
+			belongs, err := repo.StatusBelongsToSet(config.StatusID, setID)
+			if err != nil {
+				return fmt.Errorf("validate nodes[%d] status_id: %w", i, err)
+			}
+			if !belongs {
+				return fmt.Errorf("nodes[%d].node_config.status_id %d does not belong to asset set %d", i, config.StatusID, setID)
+			}
+		case models.AssetNodeCondition:
+			var config models.ConditionNodeConfig
+			if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
+				return fmt.Errorf("nodes[%d].node_config: %w", i, err)
+			}
+			if _, ok := canonicalAssetConditionField(config.FieldName); !ok {
+				return fmt.Errorf("nodes[%d].node_config.field_name %q is not a supported asset condition field", i, config.FieldName)
+			}
+		}
+	}
+	return nil
+}
+
 // SetNotificationService sets the notification service for notify_user actions
 func (as *AssetActionService) SetNotificationService(ns *NotificationService) {
 	as.notificationService = ns
 }
 
-// SetEventCoordinator sets the event coordinator for emitting item events
+// SetEventCoordinator routes action-driven item creation through the shared
+// event pipeline.
 func (as *AssetActionService) SetEventCoordinator(ec *EventCoordinator) {
-	as.eventCoordinator = ec
+	if as.itemCreation != nil {
+		as.itemCreation.SetEmitter(ec)
+	}
 }
 
-// EmitAssetActionEvent sends an event to be processed asynchronously (non-blocking)
-func (as *AssetActionService) EmitAssetActionEvent(event *models.AssetActionEvent) {
-	slog.Debug("queuing asset action event",
-		slog.String("component", "asset-actions"),
-		slog.String("event_type", string(event.EventType)),
-		slog.Int("set_id", event.SetID),
-		slog.Int("asset_id", event.AssetID),
-	)
+// SetPermissionService wires workspace RBAC for create_item nodes.
+func (as *AssetActionService) SetPermissionService(ps *PermissionService) {
+	as.permissionService = ps
+	if as.itemCreation != nil {
+		as.itemCreation.SetPermissionService(ps)
+	}
+}
 
-	select {
-	case as.eventChan <- event:
-	default:
-		slog.Warn("asset action event channel full, dropping event",
+// SetItemCreationService shares the canonical item creation pipeline with
+// asset action execution.
+func (as *AssetActionService) SetItemCreationService(service *ItemCreationService) {
+	if service != nil {
+		as.itemCreation = service
+	}
+}
+
+// SetAssetPermissionChecker wires asset-set RBAC for mutating asset nodes and
+// recipient visibility checks.
+func (as *AssetActionService) SetAssetPermissionChecker(checker AssetSetPermissionChecker) {
+	as.assetPermChecker = checker
+}
+
+// EmitAssetActionEvent durably admits a compatibility trigger before the
+// recorded canonical asset cutover.
+func (as *AssetActionService) EmitAssetActionEvent(event *models.AssetActionEvent) {
+	if event == nil {
+		return
+	}
+	if err := as.durableIngress.Emit(context.Background(), event); err != nil {
+		slog.Error("failed to persist asset action event",
 			slog.String("component", "asset-actions"),
 			slog.String("event_type", string(event.EventType)),
 			slog.Int("set_id", event.SetID),
+			slog.Int("asset_id", event.AssetID),
+			slog.Any("error", err),
 		)
 		atomic.AddInt64(&as.errors, 1)
 	}
-}
-
-// isActionStillEnabled returns true if the action is present in the enabled-actions
-// cache for its set. Used to short-circuit events that were queued before the
-// user disabled the action.
-func (as *AssetActionService) isActionStillEnabled(setID, actionID int) bool {
-	as.cacheMu.RLock()
-	defer as.cacheMu.RUnlock()
-	for _, a := range as.actionCache[setID] {
-		if a.ID == actionID {
-			return true
-		}
-	}
-	return false
 }
 
 // InvalidateSetCache invalidates the cache for a specific asset set
@@ -158,38 +270,6 @@ func (as *AssetActionService) Stop() {
 		slog.Debug("asset action service stopped successfully", slog.String("component", "asset-actions"))
 	case <-time.After(3 * time.Second):
 		slog.Warn("asset action service stop timed out after 3s", slog.String("component", "asset-actions"))
-	}
-}
-
-func (as *AssetActionService) eventProcessor() {
-	defer as.wg.Done()
-
-	for {
-		select {
-		case event := <-as.eventChan:
-			if err := as.processEvent(event); err != nil {
-				slog.Error("failed to process asset action event",
-					slog.String("component", "asset-actions"),
-					slog.String("event_type", string(event.EventType)),
-					slog.Any("error", err),
-				)
-				atomic.AddInt64(&as.errors, 1)
-			} else {
-				atomic.AddInt64(&as.eventsProcessed, 1)
-			}
-		case <-as.stopChan:
-			slog.Debug("stopping asset action event processor", slog.String("component", "asset-actions"))
-			for len(as.eventChan) > 0 {
-				event := <-as.eventChan
-				if err := as.processEvent(event); err != nil {
-					slog.Error("failed to process asset action event during shutdown",
-						slog.String("component", "asset-actions"),
-						slog.Any("error", err),
-					)
-				}
-			}
-			return
-		}
 	}
 }
 
@@ -253,80 +333,6 @@ func (as *AssetActionService) refreshActionCache() error {
 	return nil
 }
 
-func (as *AssetActionService) processEvent(event *models.AssetActionEvent) error { //nolint:unparam // error kept for interface consistency
-	slog.Debug("processing asset action event",
-		slog.String("component", "asset-actions"),
-		slog.String("event_type", string(event.EventType)),
-		slog.Int("set_id", event.SetID),
-		slog.Int("asset_id", event.AssetID),
-		slog.Bool("triggered_by_action", event.TriggeredByAction),
-		slog.Int("cascade_depth", event.CascadeDepth),
-	)
-
-	// Check cascade depth limit
-	if event.CascadeDepth >= MaxCascadeDepth {
-		slog.Warn("asset action execution depth limit reached",
-			slog.String("component", "asset-actions"),
-			slog.String("chain_id", event.ExecutionChainID),
-			slog.Int("depth", event.CascadeDepth),
-		)
-		return nil
-	}
-
-	// Get chain state for cycle detection
-	var chain *ExecutionChain
-	if event.ExecutionChainID != "" {
-		chain = as.chainStore.GetChain(event.ExecutionChainID)
-	}
-
-	// Get actions for this set from cache
-	as.cacheMu.RLock()
-	actions := as.actionCache[event.SetID]
-	as.cacheMu.RUnlock()
-
-	if len(actions) == 0 {
-		return nil
-	}
-
-	for _, action := range actions {
-		// Cycle detection
-		actionKey := fmt.Sprintf("asset:%d", action.ID)
-		if chain != nil && chain.HasExecuted(actionKey) {
-			slog.Debug("skipping asset action - already executed in chain",
-				slog.String("component", "asset-actions"),
-				slog.Int("action_id", action.ID),
-				slog.String("chain_id", event.ExecutionChainID),
-			)
-			continue
-		}
-
-		if as.matchesTrigger(action, event) {
-			// Re-check enablement against the live cache: an earlier event in
-			// this batch may have been queued before the user disabled the
-			// action. InvalidateSetCache rewrites actionCache[setID] to only
-			// enabled actions, so absence == disabled.
-			if !as.isActionStillEnabled(event.SetID, action.ID) {
-				slog.Debug("skipping asset action - disabled mid-queue",
-					slog.String("component", "asset-actions"),
-					slog.Int("action_id", action.ID),
-				)
-				continue
-			}
-			if err := as.executeAction(action, event, chain); err != nil {
-				slog.Error("failed to execute asset action",
-					slog.String("component", "asset-actions"),
-					slog.Int("action_id", action.ID),
-					slog.Any("error", err),
-				)
-			} else {
-				atomic.AddInt64(&as.actionsExecuted, 1)
-			}
-		}
-	}
-
-	return nil
-}
-
 func (as *AssetActionService) matchesTrigger(action *models.AssetAction, event *models.AssetActionEvent) bool {
 	if action.TriggerType != event.EventType {
 		return false
@@ -353,41 +359,50 @@ func (as *AssetActionService) matchesTrigger(action *models.AssetAction, event *
 		return true
 	}
 
-	switch event.EventType {
-	case models.AssetTriggerAssetCreated, models.AssetTriggerAssetUpdated:
-		if config.AssetTypeID != nil {
-			assetTypeID := utils.InterfaceToIntPtr(event.NewValues["asset_type_id"])
-			if assetTypeID == nil {
-				// Also check from a direct DB lookup for asset_created events
-				var typeID int
-				err := as.db.QueryRow(`SELECT asset_type_id FROM assets WHERE id = ?`, event.AssetID).Scan(&typeID)
-				if err != nil || typeID != *config.AssetTypeID {
-					return false
-				}
-			} else if *assetTypeID != *config.AssetTypeID {
+	if config.AssetTypeID != nil {
+		assetTypeID := utils.InterfaceToIntPtr(event.NewValues["asset_type_id"])
+		if assetTypeID == nil {
+			assetTypeID = utils.InterfaceToIntPtr(event.OldValues["asset_type_id"])
+		}
+		if assetTypeID == nil {
+			var typeID int
+			if err := as.db.QueryRow(`SELECT asset_type_id FROM assets WHERE id = ?`, event.AssetID).Scan(&typeID); err != nil {
 				return false
 			}
+			assetTypeID = &typeID
 		}
+		if *assetTypeID != *config.AssetTypeID {
+			return false
+		}
+	}
 
-	case models.AssetTriggerAssetStatusChanged:
-		if config.FromStatusID != nil {
-			oldStatusID := utils.InterfaceToIntPtr(event.OldValues["status_id"])
-			if oldStatusID == nil || *oldStatusID != *config.FromStatusID {
-				return false
-			}
-		}
-		if config.ToStatusID != nil {
-			newStatusID := utils.InterfaceToIntPtr(event.NewValues["status_id"])
-			if newStatusID == nil || *newStatusID != *config.ToStatusID {
-				return false
-			}
-		}
+	if event.EventType == models.AssetTriggerAssetStatusChanged {
+		return matchesStatusTransition(config.FromStatusID, config.ToStatusID, event.OldValues, event.NewValues)
 	}
 
 	return true
 }
 
-func (as *AssetActionService) executeAction(action *models.AssetAction, event *models.AssetActionEvent, chain *ExecutionChain) error {
+func (as *AssetActionService) executeActionWithResult(action *models.AssetAction, event *models.AssetActionEvent, chain *ExecutionChain) (*AssetActionExecutionResult, error) {
+	return as.executeActionWithResultForEvent(context.Background(), action, event, chain, "")
+}
+
+func (as *AssetActionService) executeActionWithResultForEvent(executionCtx context.Context, action *models.AssetAction, event *models.AssetActionEvent, chain *ExecutionChain, durableEventKey string) (*AssetActionExecutionResult, error) {
+	if executionCtx == nil {
+		executionCtx = context.Background()
+	}
+	if err := executionCtx.Err(); err != nil {
+		return nil, err
+	}
+	if action == nil {
+		return nil, fmt.Errorf("asset action is required")
+	}
+	if !action.IsEnabled {
+		return nil, fmt.Errorf("asset action %d is disabled", action.ID)
+	}
+	if event == nil {
+		return nil, fmt.Errorf("asset action event is required")
+	}
 	startTime := time.Now()
 
 	// Get or create execution chain
@@ -405,27 +420,38 @@ func (as *AssetActionService) executeAction(action *models.AssetAction, event *m
 
 	// Create execution log
 	log := &models.AssetActionExecutionLog{
-		ActionID:     action.ID,
-		AssetID:      &event.AssetID,
-		TriggerEvent: string(event.EventType),
-		Status:       models.ActionStatusRunning,
-		StartedAt:    startTime,
+		ActionID:        action.ID,
+		AssetID:         &event.AssetID,
+		TriggerEvent:    string(event.EventType),
+		Status:          models.ActionStatusRunning,
+		StartedAt:       startTime,
+		DurableEventKey: durableEventKey,
 	}
-	logID, err := as.repo.CreateExecutionLog(log)
-	if err != nil {
-		slog.Warn("failed to create asset action execution log",
-			slog.String("component", "asset-actions"),
-			slog.Int("action_id", action.ID),
-			slog.Any("error", err),
-		)
+	if durableEventKey != "" {
+		existing, loadErr := as.repo.GetExecutionLogByDurableTarget(durableEventKey, action.ID)
+		if loadErr == nil {
+			if existing.Status == models.ActionStatusCompleted || existing.Status == models.ActionStatusSkipped {
+				return &AssetActionExecutionResult{LogID: existing.ID, Status: existing.Status, ErrorMessage: existing.ErrorMessage}, nil
+			}
+			log.ID = existing.ID
+		} else if !errors.Is(loadErr, sql.ErrNoRows) {
+			return nil, fmt.Errorf("load durable asset action execution: %w", loadErr)
+		}
 	}
-	log.ID = logID
+	if log.ID == 0 {
+		logID, err := as.repo.CreateExecutionLog(log)
+		if err != nil {
+			return nil, fmt.Errorf("create asset action execution log: %w", err)
+		}
+		log.ID = logID
+	}
 
 	// Build execution context
 	ctx := &models.AssetActionExecutionContext{
+		Context:     executionCtx,
 		Action:      action,
 		Event:       event,
-		Variables:   make(map[string]interface{}),
+		Variables:   make(map[string]any),
 		StepResults: []models.StepResult{},
 		ChainID:     chainID,
 	}
@@ -445,68 +471,60 @@ func (as *AssetActionService) executeAction(action *models.AssetAction, event *m
 		ctx.Variables["new_"+k] = v
 	}
 
-	// Topological sort
-	sortedNodes, err := as.topologicalSort(action.Nodes, action.Edges)
-	if err != nil {
-		log.Status = models.ActionStatusFailed
-		log.ErrorMessage = fmt.Sprintf("failed to sort nodes: %v", err)
-		completedAt := time.Now()
-		log.CompletedAt = &completedAt
-		if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
-			slog.Error("failed to update asset execution log", slog.Any("error", logErr))
-		}
-		return fmt.Errorf("failed to topologically sort nodes: %w", err)
-	}
-
 	// Execute nodes
-	executedNodes := make(map[int]bool)
-	for _, node := range sortedNodes {
-		if node.NodeType == models.AssetNodeTrigger {
-			executedNodes[node.ID] = true
-			continue
-		}
-
-		canExecute := as.canExecuteNode(node.ID, action.Edges, executedNodes, ctx)
-		if !canExecute {
-			continue
-		}
-
-		stepResult := models.StepResult{
-			NodeID:    node.ID,
-			NodeType:  models.ActionNodeType(node.NodeType),
-			Status:    models.ActionStatusRunning,
-			StartedAt: time.Now(),
-		}
-
-		err := as.executeNode(&node, ctx, &stepResult)
-		completedAt := time.Now()
-		stepResult.CompletedAt = &completedAt
-
-		if err != nil {
-			stepResult.Status = models.ActionStatusFailed
-			stepResult.ErrorMessage = err.Error()
-			ctx.StepResults = append(ctx.StepResults, stepResult)
+	_, err := actionutil.RunFlow(executionCtx, action.Nodes, action.Edges, actionutil.FlowOptions{
+		TriggerNodeType: string(models.AssetNodeTrigger),
+		OnStep:          func(step *models.StepResult) { ctx.StepResults = append(ctx.StepResults, *step) },
+	}, func(node *models.AssetActionNode, step *models.StepResult, _ func(int)) error {
+		if err := as.executeNode(node, ctx, step); err != nil {
 			slog.Warn("asset action node execution failed",
 				slog.String("component", "asset-actions"),
 				slog.Int("node_id", node.ID),
 				slog.String("node_type", string(node.NodeType)),
 				slog.Any("error", err),
 			)
-		} else {
-			stepResult.Status = models.ActionStatusCompleted
-			ctx.StepResults = append(ctx.StepResults, stepResult)
-			executedNodes[node.ID] = true
+			return err
 		}
+		return nil
+	})
+	if err != nil {
+		completedAt := time.Now()
+		if errors.Is(err, actionutil.ErrCycleDetected) {
+			log.Status = models.ActionStatusFailed
+			log.ErrorMessage = fmt.Sprintf("failed to sort nodes: %v", err)
+			log.CompletedAt = &completedAt
+			if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
+				slog.Error("failed to update asset execution log", slog.Any("error", logErr))
+			}
+			return &AssetActionExecutionResult{
+				LogID:        log.ID,
+				Status:       log.Status,
+				ErrorMessage: log.ErrorMessage,
+			}, fmt.Errorf("failed to topologically sort nodes: %w", err)
+		}
+		// Canceled mid-step; the runner already recorded the in-flight step.
+		log.CompletedAt, log.Status, log.ErrorMessage, log.ExecutionTrace = actionutil.FinalizeExecutionLog(ctx.StepResults)
+		if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
+			return nil, fmt.Errorf("cancel asset action execution log: %w", logErr)
+		}
+		return &AssetActionExecutionResult{LogID: log.ID, Status: log.Status, ErrorMessage: log.ErrorMessage}, err
 	}
 
 	// Update execution log
 	log.CompletedAt, log.Status, log.ErrorMessage, log.ExecutionTrace = actionutil.FinalizeExecutionLog(ctx.StepResults)
-
-	if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
-		slog.Error("failed to update asset execution log", slog.Any("error", logErr))
+	if len(ctx.StepResults) == 0 {
+		log.Status = models.ActionStatusSkipped
 	}
 
-	return nil
+	if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
+		return nil, fmt.Errorf("update asset action execution log: %w", logErr)
+	}
+
+	return &AssetActionExecutionResult{
+		LogID:        log.ID,
+		Status:       log.Status,
+		ErrorMessage: log.ErrorMessage,
+	}, nil
 }
 
 func (as *AssetActionService) loadAssetVariables(ctx *models.AssetActionExecutionContext) {
@@ -559,8 +577,14 @@ func (as *AssetActionService) executeNode(node *models.AssetActionNode, ctx *mod
 	case models.AssetNodeCreateItem:
 		return as.executeCreateItem(node, ctx, stepResult)
 	case models.AssetNodeSetField:
+		if err := as.authorizeAssetActionMutation(ctx.Event.ActorUserID, ctx.Event.SetID, AssetPermissionKeyEdit); err != nil {
+			return err
+		}
 		return as.executeSetField(node, ctx, stepResult)
 	case models.AssetNodeSetStatus:
+		if err := as.authorizeAssetActionMutation(ctx.Event.ActorUserID, ctx.Event.SetID, AssetPermissionKeyEdit); err != nil {
+			return err
+		}
 		return as.executeSetStatus(node, ctx, stepResult)
 	case models.AssetNodeCondition:
 		return as.executeCondition(node, ctx, stepResult)
@@ -577,52 +601,84 @@ func (as *AssetActionService) executeCreateItem(node *models.AssetActionNode, ct
 	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
 		return fmt.Errorf("failed to parse create_item config: %w", err)
 	}
+	if err := as.authorizeAssetActionWorkspaceMutation(ctx.Event.ActorUserID, config.WorkspaceID, models.PermissionItemCreate); err != nil {
+		return err
+	}
 
 	title := as.substituteVariables(config.Title, ctx)
 	if title == "" {
 		title = "Asset Action: " + fmt.Sprintf("%v", ctx.Variables["asset_title"])
 	}
 	description := as.substituteVariables(config.Description, ctx)
+	sanitize.ApplyAll(
+		sanitize.Pair{Target: &title, Policy: sanitize.PlainTextField},
+		sanitize.Pair{Target: &description, Policy: sanitize.RichText},
+	)
+	if title == "" {
+		return fmt.Errorf("create_item title is empty after sanitization")
+	}
 
+	if as.itemCreation == nil {
+		return fmt.Errorf("item creation application service not configured")
+	}
 	creatorID := ctx.Event.ActorUserID
 	itemTypeID := config.ItemTypeID
-
-	itemID, err := CreateItem(as.db, ItemCreationParams{
+	result, err := as.itemCreation.CreateWithContext(creatorID, "", ItemCreateInput{
 		WorkspaceID: config.WorkspaceID,
 		Title:       title,
 		Description: description,
 		ItemTypeID:  &itemTypeID,
-		CreatorID:   &creatorID,
+	}, ActionContext{
+		TriggeredByAction: true,
+		ExecutionChainID:  ctx.ChainID,
+		CascadeDepth:      ctx.Event.CascadeDepth + 1,
+		SourceApplication: "asset",
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create item: %w", err)
 	}
+	itemID := result.Item.ID
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"item_id":      itemID,
 		"title":        title,
 		"workspace_id": config.WorkspaceID,
 	}
 
-	// Emit item created event with cascade context
-	if as.eventCoordinator != nil {
-		item := &models.Item{
-			ID:          int(itemID),
-			WorkspaceID: config.WorkspaceID,
-			Title:       title,
-			ItemTypeID:  &itemTypeID,
-			CreatorID:   &creatorID,
-		}
-		_ = as.db.QueryRow(`SELECT key FROM workspaces WHERE id = ?`, config.WorkspaceID).Scan(&item.WorkspaceKey)
+	return nil
+}
 
-		as.eventCoordinator.EmitItemCreatedWithContext(item, creatorID, ActionContext{
-			TriggeredByAction: true,
-			ExecutionChainID:  ctx.ChainID,
-			CascadeDepth:      ctx.Event.CascadeDepth + 1,
-			SourceApplication: "asset",
-		})
+func (as *AssetActionService) authorizeAssetActionMutation(actorUserID, setID int, permissionKey string) error {
+	if actorUserID <= 0 {
+		return fmt.Errorf("asset action mutation requires an identified actor (set %d)", setID)
 	}
+	if as.assetPermChecker == nil {
+		return fmt.Errorf("asset action mutation blocked: asset permission checker not configured")
+	}
+	allowed, err := as.assetPermChecker.HasAssetSetPermission(actorUserID, setID, permissionKey)
+	if err != nil {
+		return fmt.Errorf("failed to check asset set %d permission: %w", setID, err)
+	}
+	if !allowed {
+		return fmt.Errorf("user %d not authorized (%s) on asset set %d", actorUserID, permissionKey, setID)
+	}
+	return nil
+}
 
+func (as *AssetActionService) authorizeAssetActionWorkspaceMutation(actorUserID, workspaceID int, permissionKey string) error {
+	if actorUserID <= 0 {
+		return fmt.Errorf("asset action workspace mutation requires an identified actor (workspace %d)", workspaceID)
+	}
+	if as.permissionService == nil {
+		return fmt.Errorf("asset action workspace mutation blocked: permission service not configured")
+	}
+	allowed, err := as.permissionService.HasWorkspacePermission(actorUserID, workspaceID, permissionKey)
+	if err != nil {
+		return fmt.Errorf("failed to check workspace %d permission: %w", workspaceID, err)
+	}
+	if !allowed {
+		return fmt.Errorf("user %d not authorized (%s) on workspace %d", actorUserID, permissionKey, workspaceID)
+	}
 	return nil
 }
 
@@ -634,121 +690,71 @@ func (as *AssetActionService) executeSetField(node *models.AssetActionNode, ctx 
 	}
 
 	value := as.substituteVariables(config.Value, ctx)
-
-	// Substituted variables can carry user content — built-in columns get
-	// the same per-column input policy the asset create/update path applies
-	// via sanitizeAssetText (WI-319) before the value reaches the UPDATE.
-	// Custom-field values get the asset CF text pass in the default branch.
 	value = sanitizeAssetBuiltinFieldValue(config.FieldName, value)
 
-	var oldValue interface{}
+	assetRepo := repository.NewAssetRepository(as.db)
+	row, err := assetRepo.FindAssetFullByID(ctx.Event.AssetID)
+	if err != nil {
+		return fmt.Errorf("load asset for set_field: %w", err)
+	}
+	current := repository.AssetRowToModel(*row)
+	if current.SetID != ctx.Event.SetID {
+		return fmt.Errorf("asset %d does not belong to set %d", ctx.Event.AssetID, ctx.Event.SetID)
+	}
 
-	// Built-in asset fields use hard-coded SQL per column — never interpolate
-	// config.FieldName into a query string, even with a switch whitelist above,
-	// to keep any future edits of this block from accidentally opening SQLi.
+	var oldValue, newValue any
+	patch := AssetMutationPatch{}
 	switch config.FieldName {
 	case "title":
-		var oldStr sql.NullString
-		if err := as.db.QueryRow(`SELECT title FROM assets WHERE id = ?`, ctx.Event.AssetID).Scan(&oldStr); err != nil {
-			return fmt.Errorf("failed to get current title: %w", err)
-		}
-		if oldStr.Valid {
-			oldValue = oldStr.String
-		}
-		if _, err := as.db.ExecWrite(`UPDATE assets SET title = ?, updated_at = ? WHERE id = ?`,
-			value, time.Now(), ctx.Event.AssetID); err != nil {
-			return fmt.Errorf("failed to update asset title: %w", err)
-		}
-
+		oldValue = current.Title
+		patch.Title = &value
 	case "asset_tag":
-		var oldStr sql.NullString
-		if err := as.db.QueryRow(`SELECT asset_tag FROM assets WHERE id = ?`, ctx.Event.AssetID).Scan(&oldStr); err != nil {
-			return fmt.Errorf("failed to get current asset_tag: %w", err)
-		}
-		if oldStr.Valid {
-			oldValue = oldStr.String
-		}
-		if _, err := as.db.ExecWrite(`UPDATE assets SET asset_tag = ?, updated_at = ? WHERE id = ?`,
-			value, time.Now(), ctx.Event.AssetID); err != nil {
-			return fmt.Errorf("failed to update asset asset_tag: %w", err)
-		}
-
+		oldValue = current.AssetTag
+		patch.AssetTag = &value
 	case "description":
-		var oldStr sql.NullString
-		if err := as.db.QueryRow(`SELECT description FROM assets WHERE id = ?`, ctx.Event.AssetID).Scan(&oldStr); err != nil {
-			return fmt.Errorf("failed to get current description: %w", err)
-		}
-		if oldStr.Valid {
-			oldValue = oldStr.String
-		}
-		if _, err := as.db.ExecWrite(`UPDATE assets SET description = ?, updated_at = ? WHERE id = ?`,
-			value, time.Now(), ctx.Event.AssetID); err != nil {
-			return fmt.Errorf("failed to update asset description: %w", err)
-		}
-
+		oldValue = current.Description
+		patch.Description = &value
 	default:
-		// Custom field: update custom_field_values JSON
-		var assetTypeID sql.NullInt64
-		var customFieldsJSON sql.NullString
-		err := as.db.QueryRow(`SELECT asset_type_id, custom_field_values FROM assets WHERE id = ?`, ctx.Event.AssetID).Scan(&assetTypeID, &customFieldsJSON)
-		if err != nil {
-			return fmt.Errorf("failed to get asset custom_field_values: %w", err)
+		customFields := make(map[string]any, len(current.CustomFieldValues)+1)
+		for key, currentValue := range current.CustomFieldValues {
+			customFields[key] = currentValue
 		}
-
-		var customFields map[string]interface{}
-		if customFieldsJSON.Valid && customFieldsJSON.String != "" {
-			if err = json.Unmarshal([]byte(customFieldsJSON.String), &customFields); err != nil {
-				customFields = make(map[string]interface{})
-			}
-		} else {
-			customFields = make(map[string]interface{})
-		}
-
 		oldValue = customFields[config.FieldName]
 		customFields[config.FieldName] = value
-
-		// Same text/textarea sanitize pass the asset CF write paths apply
-		// (WI-319) before the merged map is persisted. Refresh the local
-		// value so the step output / cascade event carry the sanitized form.
-		if err := NewAssetService(as.db, repository.NewAssetRepository(as.db)).SanitizeCustomFieldTextValues(int(assetTypeID.Int64), customFields); err != nil {
-			return fmt.Errorf("failed to sanitize asset custom_field_values: %w", err)
-		}
-		if sanitized, ok := customFields[config.FieldName].(string); ok {
-			value = sanitized
-		}
-
-		updatedJSON, err := json.Marshal(customFields)
-		if err != nil {
-			return fmt.Errorf("failed to serialize custom_field_values: %w", err)
-		}
-
-		_, err = as.db.ExecWrite(`UPDATE assets SET custom_field_values = ?, updated_at = ? WHERE id = ?`,
-			string(updatedJSON), time.Now(), ctx.Event.AssetID)
-		if err != nil {
-			return fmt.Errorf("failed to update asset: %w", err)
-		}
+		patch.CustomFieldValues = customFields
 	}
 
-	stepResult.Output = map[string]interface{}{
+	assetService := NewAssetService(as.db, assetRepo)
+	updated, err := assetService.MutateAsset(
+		automationAuditActor(as.db, ctx.Event.ActorUserID, "asset_action"),
+		ctx.Event.AssetID,
+		patch,
+		AssetAutomationContext{
+			TriggeredByAction: true,
+			ExecutionChainID:  ctx.ChainID,
+			CascadeDepth:      ctx.Event.CascadeDepth + 1,
+			SourceApplication: "asset",
+			CausationEventKey: ctx.Event.CausationEventKey,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("mutate asset field %q: %w", config.FieldName, err)
+	}
+	switch config.FieldName {
+	case "title":
+		newValue = updated.Title
+	case "asset_tag":
+		newValue = updated.AssetTag
+	case "description":
+		newValue = updated.Description
+	default:
+		newValue = updated.CustomFieldValues[config.FieldName]
+	}
+	stepResult.Output = map[string]any{
 		"field_name": config.FieldName,
 		"old_value":  oldValue,
-		"new_value":  value,
+		"new_value":  newValue,
 	}
-
-	// Emit cascaded asset_updated event
-	as.EmitAssetActionEvent(&models.AssetActionEvent{
-		EventType:         models.AssetTriggerAssetUpdated,
-		SetID:             ctx.Event.SetID,
-		AssetID:           ctx.Event.AssetID,
-		ActorUserID:       ctx.Event.ActorUserID,
-		OldValues:         map[string]interface{}{config.FieldName: oldValue},
-		NewValues:         map[string]interface{}{config.FieldName: value},
-		TriggeredByAction: true,
-		ExecutionChainID:  ctx.ChainID,
-		CascadeDepth:      ctx.Event.CascadeDepth + 1,
-		SourceApplication: "asset",
-	})
-
 	return nil
 }
 
@@ -787,41 +793,42 @@ func (as *AssetActionService) executeSetStatus(node *models.AssetActionNode, ctx
 	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
 		return fmt.Errorf("failed to parse set_status config: %w", err)
 	}
-
-	// Get current status
-	var oldStatusID int
-	err := as.db.QueryRow(`SELECT COALESCE(status_id, 0) FROM assets WHERE id = ?`, ctx.Event.AssetID).Scan(&oldStatusID)
+	if config.StatusID <= 0 {
+		return fmt.Errorf("set_status requires a positive status_id")
+	}
+	assetRepo := repository.NewAssetRepository(as.db)
+	row, err := assetRepo.FindAssetFullByID(ctx.Event.AssetID)
 	if err != nil {
-		return fmt.Errorf("failed to get current asset status: %w", err)
+		return fmt.Errorf("load asset for set_status: %w", err)
 	}
-
-	_, err = as.db.ExecWrite(`UPDATE assets SET status_id = ?, updated_at = ? WHERE id = ?`,
-		config.StatusID, time.Now(), ctx.Event.AssetID)
-	if err != nil {
-		return fmt.Errorf("failed to update asset status: %w", err)
+	current := repository.AssetRowToModel(*row)
+	if current.SetID != ctx.Event.SetID {
+		return fmt.Errorf("asset %d does not belong to set %d", ctx.Event.AssetID, ctx.Event.SetID)
 	}
-
-	stepResult.Output = map[string]interface{}{
-		"old_status_id": oldStatusID,
-		"new_status_id": config.StatusID,
+	oldStatusID := 0
+	if current.StatusID != nil {
+		oldStatusID = *current.StatusID
 	}
-
-	// Emit cascaded status_changed event if changed
-	if oldStatusID != config.StatusID {
-		as.EmitAssetActionEvent(&models.AssetActionEvent{
-			EventType:         models.AssetTriggerAssetStatusChanged,
-			SetID:             ctx.Event.SetID,
-			AssetID:           ctx.Event.AssetID,
-			ActorUserID:       ctx.Event.ActorUserID,
-			OldValues:         map[string]interface{}{"status_id": oldStatusID},
-			NewValues:         map[string]interface{}{"status_id": config.StatusID},
+	assetService := NewAssetService(as.db, assetRepo)
+	if _, err := assetService.MutateAsset(
+		automationAuditActor(as.db, ctx.Event.ActorUserID, "asset_action"),
+		ctx.Event.AssetID,
+		AssetMutationPatch{StatusID: &config.StatusID},
+		AssetAutomationContext{
 			TriggeredByAction: true,
 			ExecutionChainID:  ctx.ChainID,
 			CascadeDepth:      ctx.Event.CascadeDepth + 1,
 			SourceApplication: "asset",
-		})
+			CausationEventKey: ctx.Event.CausationEventKey,
+		},
+	); err != nil {
+		return fmt.Errorf("mutate asset status: %w", err)
 	}
 
+	stepResult.Output = map[string]any{
+		"old_status_id": oldStatusID,
+		"new_status_id": config.StatusID,
+	}
 	return nil
 }
 
@@ -832,16 +839,24 @@ func (as *AssetActionService) executeCondition(node *models.AssetActionNode, ctx
 		return fmt.Errorf("failed to parse condition config: %w", err)
 	}
 
-	fieldValue := ctx.Variables[config.FieldName]
+	canonicalField, ok := canonicalAssetConditionField(config.FieldName)
+	if !ok {
+		return fmt.Errorf("unsupported asset condition field %q", config.FieldName)
+	}
+
+	fieldValue := ctx.Variables[canonicalField]
 	if fieldValue == nil {
+		fieldValue = ctx.Variables["new_"+canonicalField]
+	}
+	if fieldValue == nil && canonicalField != config.FieldName {
 		fieldValue = ctx.Variables["new_"+config.FieldName]
 	}
 
-	result := evaluateCondition(fieldValue, config.Operator, config.Value)
+	result := evaluateAssetActionCondition(fieldValue, config.Operator, config.Value)
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"condition_result": result,
-		"field_name":       config.FieldName,
+		"field_name":       canonicalField,
 		"field_value":      fieldValue,
 		"operator":         config.Operator,
 		"compare_value":    config.Value,
@@ -853,12 +868,7 @@ func (as *AssetActionService) executeCondition(node *models.AssetActionNode, ctx
 // executeNotifyUser sends notifications
 func (as *AssetActionService) executeNotifyUser(node *models.AssetActionNode, ctx *models.AssetActionExecutionContext, stepResult *models.StepResult) error {
 	if as.notificationService == nil {
-		stepResult.Output = map[string]interface{}{
-			"recipient_count": 0,
-			"skipped":         true,
-			"reason":          "notification service not configured",
-		}
-		return nil
+		return fmt.Errorf("notify_user: notification service not configured")
 	}
 
 	var config models.NotifyUserNodeConfig
@@ -866,9 +876,13 @@ func (as *AssetActionService) executeNotifyUser(node *models.AssetActionNode, ct
 		return fmt.Errorf("failed to parse notify_user config: %w", err)
 	}
 
+	recipients := config.Recipients
+	if len(recipients) == 0 && config.RecipientType != "" {
+		recipients = []string{config.RecipientType}
+	}
 	userIDs := []int{}
-	for _, recipient := range config.Recipients {
-		if id, err := strconv.Atoi(recipient); err == nil {
+	for _, recipient := range recipients {
+		if id, err := strconv.Atoi(recipient); err == nil && id > 0 {
 			userIDs = append(userIDs, id)
 		}
 	}
@@ -876,19 +890,24 @@ func (as *AssetActionService) executeNotifyUser(node *models.AssetActionNode, ct
 	message := as.substituteVariables(config.Message, ctx)
 	title := as.substituteVariables(config.Title, ctx)
 
-	for range userIDs {
-		as.notificationService.EmitEvent(&NotificationEvent{
-			EventType:   "action.notification",
-			ActorUserID: ctx.Event.ActorUserID,
-			Title:       title,
-			TemplateData: map[string]interface{}{
-				"message": message,
-			},
-		})
+	deliveredUserIDs, err := as.notificationService.NotifyUsersForAsset(
+		userIDs,
+		ctx.Event.SetID,
+		ctx.Event.AssetID,
+		ctx.Event.ActorUserID,
+		"action",
+		title,
+		message,
+		config.IncludeLink,
+		as.assetPermChecker,
+	)
+	if err != nil {
+		return fmt.Errorf("notify_user failed: %w", err)
 	}
 
-	stepResult.Output = map[string]interface{}{
-		"recipient_count": len(userIDs),
+	stepResult.Output = map[string]any{
+		"recipient_count": len(deliveredUserIDs),
+		"recipient_ids":   deliveredUserIDs,
 		"title":           title,
 		"message":         message,
 	}
@@ -927,33 +946,12 @@ func (as *AssetActionService) substituteVariables(template string, ctx *models.A
 	})
 }
 
-// Shared topology and execution helpers
-
-func (as *AssetActionService) topologicalSort(nodes []models.AssetActionNode, edges []models.AssetActionEdge) ([]models.AssetActionNode, error) {
-	return actionutil.TopologicalSort(nodes, edges)
-}
-
-func (as *AssetActionService) canExecuteNode(nodeID int, edges []models.AssetActionEdge, executedNodes map[int]bool, ctx *models.AssetActionExecutionContext) bool {
-	return actionutil.CanExecuteNodeTyped(nodeID, edges, executedNodes, ctx.StepResults)
-}
-
-// evaluateCondition evaluates a condition (reused from workspace action service)
-func evaluateCondition(value interface{}, operator, compareValue string) bool {
+func evaluateAssetActionCondition(value any, operator, compareValue string) bool {
 	strValue := fmt.Sprintf("%v", value)
-
+	if result, handled := evaluateStringActionCondition(strValue, operator, compareValue); handled {
+		return result
+	}
 	switch operator {
-	case "eq", "==", "equals":
-		return strValue == compareValue
-	case "ne", "!=", "not_equals":
-		return strValue != compareValue
-	case "contains":
-		return strings.Contains(strValue, compareValue)
-	case "not_contains":
-		return !strings.Contains(strValue, compareValue)
-	case "starts_with":
-		return strings.HasPrefix(strValue, compareValue)
-	case "ends_with":
-		return strings.HasSuffix(strValue, compareValue)
 	case "gt", ">":
 		if numVal, err := strconv.ParseFloat(strValue, 64); err == nil {
 			if numCompare, err := strconv.ParseFloat(compareValue, 64); err == nil {
@@ -968,10 +966,6 @@ func evaluateCondition(value interface{}, operator, compareValue string) bool {
 			}
 		}
 		return strValue < compareValue
-	case "is_empty":
-		return strValue == "" || strValue == "null" || strValue == "<nil>"
-	case "is_not_empty":
-		return strValue != "" && strValue != "null" && strValue != "<nil>"
 	default:
 		return false
 	}
@@ -979,22 +973,35 @@ func evaluateCondition(value interface{}, operator, compareValue string) bool {
 
 // ExecuteActionManually executes an asset action manually for a given asset.
 func (as *AssetActionService) ExecuteActionManually(action *models.AssetAction, assetID, actorUserID int) error {
+	_, err := as.ExecuteActionManuallyWithResult(action, assetID, actorUserID)
+	return err
+}
+
+// ExecuteActionManuallyWithResult executes an asset action manually and
+// returns the same final status persisted in its execution log.
+func (as *AssetActionService) ExecuteActionManuallyWithResult(action *models.AssetAction, assetID, actorUserID int) (*AssetActionExecutionResult, error) {
 	event := &models.AssetActionEvent{
 		EventType:         models.AssetTriggerManual,
 		SetID:             action.SetID,
 		AssetID:           assetID,
 		ActorUserID:       actorUserID,
-		OldValues:         map[string]interface{}{},
-		NewValues:         map[string]interface{}{},
+		OldValues:         map[string]any{},
+		NewValues:         map[string]any{},
 		TriggeredByAction: false,
 		CascadeDepth:      0,
 	}
 
-	if err := as.executeAction(action, event, nil); err != nil {
+	result, err := as.executeActionWithResult(action, event, nil)
+	if err != nil {
 		atomic.AddInt64(&as.errors, 1)
-		return err
+		return result, err
 	}
 
-	atomic.AddInt64(&as.actionsExecuted, 1)
-	return nil
+	switch result.Status {
+	case models.ActionStatusFailed:
+		atomic.AddInt64(&as.errors, 1)
+	case models.ActionStatusCompleted:
+		atomic.AddInt64(&as.actionsExecuted, 1)
+	}
+	return result, nil
 }

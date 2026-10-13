@@ -1,11 +1,13 @@
 <script>
   import Modal from './Modal.svelte';
   import Button from '../components/Button.svelte';
-  import Textarea from '../components/Textarea.svelte';
   import IconSelector from '../pickers/IconSelector.svelte';
   import Label from '../components/Label.svelte';
   import Checkbox from '../components/Checkbox.svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import LocalizedObjectFields from '../settings/LocalizedObjectFields.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let {
     isOpen = false,
@@ -17,6 +19,10 @@
       is_completed: false
     }),
     isEditing = false,
+    objectId = null,
+    displayName = '',
+    displayDescription = '',
+    translationEditor = $bindable(null),
     onsave = undefined,
     oncancel = undefined
   } = $props();
@@ -46,30 +52,42 @@
         {isEditing ? t('statusCategory.editStatusCategory') : t('statusCategory.createStatusCategory')}
       </h3>
 
-      <div class="mb-6">
-        <Label required class="mb-2">{t('common.name')}</Label>
-        <input
-          type="text"
-          bind:value={formData.name}
-          placeholder={t('statusCategory.namePlaceholder')}
-          class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-          style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-          required
-        />
-      </div>
+      {#if isEditing}
+        {#key objectId}
+          <LocalizedObjectFields
+            bind:this={translationEditor}
+            objectType="status_category"
+            {objectId}
+            bind:canonicalName={formData.name}
+            bind:canonicalDescription={formData.description}
+            {displayName}
+            {displayDescription}
+          />
+        {/key}
+      {:else}
+        <div class="mb-6">
+          <TextField
+            label={t('common.name')}
+            required
+            type="text"
+            placeholder={t('statusCategory.namePlaceholder')}
+            size="medium"
+            dataTestid="status-category-name"
+            bind:value={formData.name}
+          />
+        </div>
+      {/if}
 
       <div class="mb-6">
         <Label required class="mb-2">{t('statusCategory.color')}</Label>
         <IconSelector bind:selectedColor={formData.color} colorOnly compact />
       </div>
 
-      <div class="mb-6">
-        <Label class="mb-2">{t('common.description')}</Label>
-        <Textarea
-          bind:value={formData.description}
-          rows={2}
-        />
-      </div>
+      {#if !isEditing}
+        <div class="mb-6">
+          <TextareaField label={t('common.description')} rows={2} bind:value={formData.description} />
+        </div>
+      {/if}
 
       <div class="mt-6 flex flex-col gap-4">
         <Checkbox
@@ -93,6 +111,7 @@
           disabled={!formData.name.trim()}
           size="medium"
           keyboardHint={submitHint}
+          dataTestid="status-category-save"
         >
           {isEditing ? t('statusCategory.updateCategory') : t('statusCategory.createCategory')}
         </Button>
@@ -109,4 +128,3 @@
     {/snippet}
   </Modal>
 {/if}
-

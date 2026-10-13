@@ -37,7 +37,7 @@ func NewWorkflowRepository(db database.Database) *WorkflowRepository {
 // The result is never nil.
 func (r *WorkflowRepository) List() ([]models.Workflow, error) {
 	rows, err := r.db.Query(`
-		SELECT id, name, description, is_default, created_at, updated_at
+		SELECT id, COALESCE(builtin_key, ''), name, description, is_default, created_at, updated_at
 		FROM workflows
 		ORDER BY is_default DESC, name ASC`)
 	if err != nil {
@@ -48,7 +48,7 @@ func (r *WorkflowRepository) List() ([]models.Workflow, error) {
 	var workflows []models.Workflow
 	for rows.Next() {
 		var workflow models.Workflow
-		if err := rows.Scan(&workflow.ID, &workflow.Name, &workflow.Description,
+		if err := rows.Scan(&workflow.ID, &workflow.BuiltinKey, &workflow.Name, &workflow.Description,
 			&workflow.IsDefault, &workflow.CreatedAt, &workflow.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -65,15 +65,46 @@ func (r *WorkflowRepository) List() ([]models.Workflow, error) {
 	return workflows, nil
 }
 
+// ListByIDs returns workflows for the supplied IDs ordered by name.
+func (r *WorkflowRepository) ListByIDs(ids []int) ([]models.Workflow, error) {
+	if len(ids) == 0 {
+		return []models.Workflow{}, nil
+	}
+	placeholders, args := inPlaceholders(ids)
+	rows, err := r.db.Query(`
+		SELECT id, COALESCE(builtin_key, ''), name, description, is_default, created_at, updated_at
+		FROM workflows
+		WHERE id IN (`+placeholders+`)
+		ORDER BY name
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list workflows by id: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []models.Workflow{}
+	for rows.Next() {
+		var workflow models.Workflow
+		if err := rows.Scan(&workflow.ID, &workflow.BuiltinKey, &workflow.Name, &workflow.Description,
+			&workflow.IsDefault, &workflow.CreatedAt, &workflow.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan workflow by id: %w", err)
+		}
+		out = append(out, workflow)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workflows by id: %w", err)
+	}
+	return out, nil
+}
+
 // Get returns a workflow by id, without its transitions.
 // Returns ErrNotFound when no workflow with that id exists.
 func (r *WorkflowRepository) Get(id int) (*models.Workflow, error) {
 	var workflow models.Workflow
 	err := r.db.QueryRow(`
-		SELECT id, name, description, is_default, created_at, updated_at
+		SELECT id, COALESCE(builtin_key, ''), name, description, is_default, created_at, updated_at
 		FROM workflows
 		WHERE id = ?
-	`, id).Scan(&workflow.ID, &workflow.Name, &workflow.Description,
+	`, id).Scan(&workflow.ID, &workflow.BuiltinKey, &workflow.Name, &workflow.Description,
 		&workflow.IsDefault, &workflow.CreatedAt, &workflow.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -110,6 +141,48 @@ func (r *WorkflowRepository) Create(name, description string, isDefault bool) (i
 		return 0, err
 	}
 	return int(id), nil
+}
+
+// CreateImported creates a workflow and its complete imported transition graph.
+func (r *WorkflowRepository) CreateImported(
+	name string,
+	statusIDs []int,
+	fromAnywhere map[int]bool,
+) (int, error) {
+	workflowID, err := r.Create(name, "", false)
+	if err != nil {
+		return 0, err
+	}
+	order := 0
+	transitions := make([]models.WorkflowTransition, 0, len(statusIDs)*len(statusIDs))
+	for _, statusID := range statusIDs {
+		if fromAnywhere[statusID] {
+			order++
+			transitions = append(transitions, models.WorkflowTransition{
+				ToStatusID:   statusID,
+				DisplayOrder: order,
+			})
+		}
+	}
+	for _, fromID := range statusIDs {
+		for _, toID := range statusIDs {
+			if fromID == toID {
+				continue
+			}
+			order++
+			sourceID := fromID
+			transitions = append(transitions, models.WorkflowTransition{
+				FromStatusID: &sourceID,
+				ToStatusID:   toID,
+				DisplayOrder: order,
+			})
+		}
+	}
+	if _, err := r.ReplaceTransitions(workflowID, transitions); err != nil {
+		_, _ = r.Delete(workflowID)
+		return 0, err
+	}
+	return workflowID, nil
 }
 
 // Update rewrites a workflow's mutable fields.
@@ -169,6 +242,21 @@ func (r *WorkflowRepository) Delete(id int) (cancelledApprovalIDs []int, err err
 		return nil, err
 	}
 
+	// Condition sets and approval sets cascade-delete with the workflow. Their
+	// referencing columns are plain integers without foreign keys, so clear the
+	// references first to avoid leaving configuration sets and item-type
+	// overrides pointing at deleted rows (which would disable their gates).
+	for _, cleanup := range []string{
+		`UPDATE configuration_sets SET condition_set_id = NULL WHERE condition_set_id IN (SELECT id FROM condition_sets WHERE workflow_id = ?)`,
+		`UPDATE configuration_sets SET approval_set_id = NULL WHERE approval_set_id IN (SELECT id FROM approval_sets WHERE workflow_id = ?)`,
+		`UPDATE configuration_set_item_types SET condition_set_id = NULL WHERE condition_set_id IN (SELECT id FROM condition_sets WHERE workflow_id = ?)`,
+		`UPDATE configuration_set_item_types SET approval_set_id = NULL WHERE approval_set_id IN (SELECT id FROM approval_sets WHERE workflow_id = ?)`,
+	} {
+		if _, err = tx.Exec(cleanup, id); err != nil {
+			return nil, err
+		}
+	}
+
 	// Delete workflow transitions first
 	if _, err = tx.Exec("DELETE FROM workflow_transitions WHERE workflow_id = ?", id); err != nil {
 		return nil, err
@@ -189,32 +277,65 @@ func (r *WorkflowRepository) Delete(id int) (cancelledApprovalIDs []int, err err
 // workflow names. The result is never nil.
 func (r *WorkflowRepository) ListTransitions(workflowID int) ([]models.WorkflowTransition, error) {
 	query := `
-		SELECT wt.id, wt.workflow_id, wt.from_status_id, wt.to_status_id, wt.display_order, wt.source_handle, wt.target_handle, wt.created_at,
-		       fs.name as from_status_name, ts.name as to_status_name, w.name as workflow_name
+		SELECT wt.id, wt.workflow_id, wt.from_status_id, wt.to_status_id, wt.from_all_statuses, wt.display_order, wt.source_handle, wt.target_handle, wt.created_at,
+		       fs.name as from_status_name, ts.name as to_status_name, w.name as workflow_name,
+		       fs.builtin_key, fsc.builtin_key, fsc.name, fsc.color,
+		       COALESCE(ts.builtin_key, ''), COALESCE(tsc.builtin_key, ''), tsc.name, tsc.color
 		FROM workflow_transitions wt
 		LEFT JOIN statuses fs ON wt.from_status_id = fs.id
 		JOIN statuses ts ON wt.to_status_id = ts.id
+		LEFT JOIN status_categories fsc ON fs.category_id = fsc.id
+		JOIN status_categories tsc ON ts.category_id = tsc.id
 		JOIN workflows w ON wt.workflow_id = w.id
 		WHERE wt.workflow_id = ?
-		ORDER BY wt.from_status_id NULLS FIRST, wt.display_order ASC`
+		ORDER BY CASE WHEN wt.from_all_statuses THEN 1 ELSE 0 END, wt.from_status_id NULLS FIRST, wt.display_order ASC`
 
 	rows, err := r.db.Query(query, workflowID)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+	return scanWorkflowTransitions(rows)
+}
 
+// ListAllTransitions returns every workflow transition in one bounded query
+// for enriched workflow list responses.
+func (r *WorkflowRepository) ListAllTransitions() ([]models.WorkflowTransition, error) {
+	rows, err := r.db.Query(`
+		SELECT wt.id, wt.workflow_id, wt.from_status_id, wt.to_status_id, wt.from_all_statuses, wt.display_order, wt.source_handle, wt.target_handle, wt.created_at,
+		       fs.name as from_status_name, ts.name as to_status_name, w.name as workflow_name,
+		       fs.builtin_key, fsc.builtin_key, fsc.name, fsc.color,
+		       COALESCE(ts.builtin_key, ''), COALESCE(tsc.builtin_key, ''), tsc.name, tsc.color
+		FROM workflow_transitions wt
+		LEFT JOIN statuses fs ON wt.from_status_id = fs.id
+		JOIN statuses ts ON wt.to_status_id = ts.id
+		LEFT JOIN status_categories fsc ON fs.category_id = fsc.id
+		JOIN status_categories tsc ON ts.category_id = tsc.id
+		JOIN workflows w ON wt.workflow_id = w.id
+		ORDER BY wt.workflow_id, CASE WHEN wt.from_all_statuses THEN 1 ELSE 0 END, wt.from_status_id NULLS FIRST, wt.display_order ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanWorkflowTransitions(rows)
+}
+
+func scanWorkflowTransitions(rows *sql.Rows) ([]models.WorkflowTransition, error) {
 	var transitions []models.WorkflowTransition
 	for rows.Next() {
 		var transition models.WorkflowTransition
 		var fromStatusID sql.NullInt64
 		var fromStatusName sql.NullString
+		var fromStatusBuiltinKey, fromCategoryBuiltinKey, fromCategoryName, fromCategoryColor sql.NullString
 		var sourceHandle sql.NullString
 		var targetHandle sql.NullString
 
 		err := rows.Scan(&transition.ID, &transition.WorkflowID, &fromStatusID, &transition.ToStatusID,
-			&transition.DisplayOrder, &sourceHandle, &targetHandle, &transition.CreatedAt, &fromStatusName,
-			&transition.ToStatusName, &transition.WorkflowName)
+			&transition.FromAllStatuses, &transition.DisplayOrder, &sourceHandle, &targetHandle, &transition.CreatedAt, &fromStatusName,
+			&transition.ToStatusName, &transition.WorkflowName,
+			&fromStatusBuiltinKey, &fromCategoryBuiltinKey, &fromCategoryName, &fromCategoryColor,
+			&transition.ToStatusBuiltinKey, &transition.ToCategoryBuiltinKey, &transition.ToCategoryName, &transition.ToCategoryColor)
 		if err != nil {
 			return nil, err
 		}
@@ -227,6 +348,10 @@ func (r *WorkflowRepository) ListTransitions(workflowID int) ([]models.WorkflowT
 		if fromStatusName.Valid {
 			transition.FromStatusName = fromStatusName.String
 		}
+		transition.FromStatusBuiltinKey = fromStatusBuiltinKey.String
+		transition.FromCategoryBuiltinKey = fromCategoryBuiltinKey.String
+		transition.FromCategoryName = fromCategoryName.String
+		transition.FromCategoryColor = fromCategoryColor.String
 
 		// Handle nullable handle fields
 		if sourceHandle.Valid {
@@ -249,21 +374,32 @@ func (r *WorkflowRepository) ListTransitions(workflowID int) ([]models.WorkflowT
 	return transitions, nil
 }
 
-// ListAvailableTransitions returns the transitions a workflow allows out of a
-// given status (including from-anywhere transitions with a NULL from-status).
-// The result is never nil.
+// ListAvailableTransitions returns the directed transitions a workflow allows
+// out of a given status: rows from that status plus from-all rows targeting
+// statuses without a direct edge. NULL from-status rows that are not
+// from-all are creation-only initial transitions and must never appear as
+// moves from an existing item. The result is never nil.
 func (r *WorkflowRepository) ListAvailableTransitions(workflowID, statusID int) ([]models.WorkflowTransition, error) {
 	query := `
-		SELECT wt.id, wt.workflow_id, wt.from_status_id, wt.to_status_id, wt.display_order, wt.created_at,
+		SELECT wt.id, wt.workflow_id, wt.from_status_id, wt.to_status_id, wt.from_all_statuses, wt.display_order, wt.created_at,
 		       fs.name as from_status_name, ts.name as to_status_name, w.name as workflow_name
 		FROM workflow_transitions wt
 		LEFT JOIN statuses fs ON wt.from_status_id = fs.id
 		JOIN statuses ts ON wt.to_status_id = ts.id
 		JOIN workflows w ON wt.workflow_id = w.id
-		WHERE wt.workflow_id = ? AND (wt.from_status_id = ? OR wt.from_status_id IS NULL)
-		ORDER BY wt.display_order ASC`
+		WHERE wt.workflow_id = ?
+		  AND (
+			wt.from_status_id = ?
+			OR (
+				wt.from_all_statuses = TRUE
+			AND wt.to_status_id NOT IN (
+				SELECT to_status_id FROM workflow_transitions WHERE workflow_id = ? AND from_status_id = ?
+			)
+			)
+		  )
+		ORDER BY CASE WHEN wt.from_all_statuses THEN 1 ELSE 0 END, wt.display_order ASC`
 
-	rows, err := r.db.Query(query, workflowID, statusID)
+	rows, err := r.db.Query(query, workflowID, statusID, workflowID, statusID)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +412,7 @@ func (r *WorkflowRepository) ListAvailableTransitions(workflowID, statusID int) 
 		var fromStatusName sql.NullString
 
 		err := rows.Scan(&transition.ID, &transition.WorkflowID, &fromStatusID, &transition.ToStatusID,
-			&transition.DisplayOrder, &transition.CreatedAt, &fromStatusName,
+			&transition.FromAllStatuses, &transition.DisplayOrder, &transition.CreatedAt, &fromStatusName,
 			&transition.ToStatusName, &transition.WorkflowName)
 		if err != nil {
 			return nil, err
@@ -306,7 +442,8 @@ func (r *WorkflowRepository) ListAvailableTransitions(workflowID, statusID int) 
 
 // ReplaceTransitions reconciles a workflow's transitions with the given
 // payload inside a single transaction. Identity is the (from_status_id,
-// to_status_id) pair, not the row id: unchanged transitions keep their id,
+// from_all_statuses, to_status_id) triple, not the row id: unchanged
+// transitions keep their id,
 // which is what keeps condition_set_transitions / approval_set_statuses
 // references intact and stops cosmetic edits from tripping the CASCADE →
 // RESTRICT chain into approval_requests.
@@ -322,8 +459,8 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Load current transitions keyed by (from_status_id, to_status_id). We diff
-	// the payload against this map below.
+	// Load current transitions keyed by (from_status_id, from_all_statuses,
+	// to_status_id). We diff the payload against this map below.
 	type oldTransition struct {
 		id           int
 		displayOrder int
@@ -333,7 +470,7 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 	oldByKey := map[string]oldTransition{}
 	{
 		oldRows, qErr := tx.Query(
-			"SELECT id, from_status_id, to_status_id, display_order, source_handle, target_handle FROM workflow_transitions WHERE workflow_id = ?",
+			"SELECT id, from_status_id, to_status_id, from_all_statuses, display_order, source_handle, target_handle FROM workflow_transitions WHERE workflow_id = ?",
 			workflowID,
 		)
 		if qErr != nil {
@@ -343,11 +480,12 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 			var ot oldTransition
 			var fromID sql.NullInt64
 			var toID int
-			if sErr := oldRows.Scan(&ot.id, &fromID, &toID, &ot.displayOrder, &ot.sourceHandle, &ot.targetHandle); sErr != nil {
+			var fromAll bool
+			if sErr := oldRows.Scan(&ot.id, &fromID, &toID, &fromAll, &ot.displayOrder, &ot.sourceHandle, &ot.targetHandle); sErr != nil {
 				_ = oldRows.Close()
 				return nil, sErr
 			}
-			oldByKey[transitionKey(fromID, toID)] = ot
+			oldByKey[transitionKey(fromID, toID, fromAll)] = ot
 		}
 		if rerr := oldRows.Err(); rerr != nil {
 			_ = oldRows.Close()
@@ -374,6 +512,12 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 			return nil, ErrTransitionToStatusNotFound
 		}
 
+		// From-all transitions apply to every other status, so they carry no
+		// concrete from-status.
+		if transition.FromAllStatuses {
+			transition.FromStatusID = nil
+		}
+
 		if transition.FromStatusID != nil {
 			var fromStatusExists bool
 			if sErr := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM statuses WHERE id = ?)", *transition.FromStatusID).Scan(&fromStatusExists); sErr != nil {
@@ -388,7 +532,7 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 		if transition.FromStatusID != nil {
 			fromNullInt = sql.NullInt64{Int64: int64(*transition.FromStatusID), Valid: true}
 		}
-		newByKey[transitionKey(fromNullInt, transition.ToStatusID)] = transition
+		newByKey[transitionKey(fromNullInt, transition.ToStatusID, transition.FromAllStatuses)] = transition
 	}
 
 	// Diff: anything in old but not in new is being removed.
@@ -409,7 +553,7 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 
 	if len(toDeleteIDs) > 0 {
 		delPlaceholders := make([]string, len(toDeleteIDs))
-		delArgs := make([]interface{}, len(toDeleteIDs))
+		delArgs := make([]any, len(toDeleteIDs))
 		for i, id := range toDeleteIDs {
 			delPlaceholders[i] = "?"
 			delArgs[i] = id
@@ -445,9 +589,9 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 		}
 
 		if _, err = tx.Exec(`
-			INSERT INTO workflow_transitions (workflow_id, from_status_id, to_status_id, display_order, source_handle, target_handle, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, workflowID, fromNullInt, transition.ToStatusID, transition.DisplayOrder, transition.SourceHandle, transition.TargetHandle, time.Now()); err != nil {
+			INSERT INTO workflow_transitions (workflow_id, from_status_id, to_status_id, from_all_statuses, display_order, source_handle, target_handle, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, workflowID, fromNullInt, transition.ToStatusID, transition.FromAllStatuses, transition.DisplayOrder, transition.SourceHandle, transition.TargetHandle, time.Now()); err != nil {
 			return nil, err
 		}
 	}
@@ -458,31 +602,23 @@ func (r *WorkflowRepository) ReplaceTransitions(workflowID int, transitions []mo
 	return cancelledApprovalIDs, nil
 }
 
-// transitionKey creates a unique key for a transition by its from/to status IDs.
-func transitionKey(fromStatusID sql.NullInt64, toStatusID int) string {
+// transitionKey creates a unique key for a transition by its from/to status
+// IDs and from-all flag. NULL-from rows split into initial ("nil") and
+// from-all ("all") namespaces so the two wildcard kinds never collide.
+func transitionKey(fromStatusID sql.NullInt64, toStatusID int, fromAll bool) string {
+	if fromAll {
+		return fmt.Sprintf("all:%d", toStatusID)
+	}
 	if fromStatusID.Valid {
 		return fmt.Sprintf("%d:%d", fromStatusID.Int64, toStatusID)
 	}
 	return fmt.Sprintf("nil:%d", toStatusID)
 }
 
-// CancelApprovalRequestsForTransitions hard-deletes approval_requests pinned to
-// approval_set_statuses whose approve_transition_id or deny_transition_id is in
-// transitionIDs. Returns the deleted request ids so the caller can record a
-// single audit_logs entry after the surrounding transaction commits.
-//
-// Why hard-delete: approval_requests.approval_set_status_id is ON DELETE
-// RESTRICT, so the CASCADE-delete chain from workflow_transitions →
-// approval_set_statuses → approval_requests would otherwise fail with
-// SQLITE_CONSTRAINT_FOREIGNKEY (1811). The soft-archive model on
-// approval_set_statuses (is_active=0) keeps RESTRICT-FKs even for completed
-// requests, so there is no purely-reconfiguration way out. We sacrifice the
-// per-request approval_decisions trail (it CASCADEs away with the request) in
-// exchange for letting admins edit the workflow; the durable record is the
-// audit_logs row the caller writes.
-//
-// Exported because the Jira importer cancels blocking approval requests inside
-// its own workflow-replacement transaction.
+// CancelApprovalRequestsForTransitions hard-deletes requests blocking removed
+// approval transitions. RESTRICT foreign keys otherwise prevent workflow edits;
+// callers record the deleted IDs in the durable audit log. Exported for the
+// Jira importer's workflow-replacement transaction.
 func CancelApprovalRequestsForTransitions(tx database.Tx, transitionIDs []int) ([]int, error) {
 	if len(transitionIDs) == 0 {
 		return nil, nil
@@ -494,7 +630,7 @@ func CancelApprovalRequestsForTransitions(tx database.Tx, transitionIDs []int) (
 	}
 	placeholderList := strings.Join(placeholders, ",")
 
-	args := make([]interface{}, 0, len(transitionIDs)*2)
+	args := make([]any, 0, len(transitionIDs)*2)
 	for _, id := range transitionIDs {
 		args = append(args, id)
 	}
@@ -532,7 +668,7 @@ func CancelApprovalRequestsForTransitions(tx database.Tx, transitionIDs []int) (
 	}
 
 	delPlaceholders := make([]string, len(requestIDs))
-	delArgs := make([]interface{}, len(requestIDs))
+	delArgs := make([]any, len(requestIDs))
 	for i, id := range requestIDs {
 		delPlaceholders[i] = "?"
 		delArgs[i] = id

@@ -1,13 +1,17 @@
 package services
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/validation"
@@ -39,14 +43,26 @@ func (s *ItemUpdateService) WithPermissionService(permService *PermissionService
 	// they pass. CanViewProject is pure-SQL plus the global-admin check on the
 	// supplied permission service, so this reuses the same identity.
 	s.validator = s.validator.WithProjectAccessChecker(NewTimePermissionService(s.db, permService))
+	if permService == nil {
+		s.validator = s.validator.WithWorkspaceAssigneeChecker(nil)
+	} else {
+		s.validator = s.validator.WithWorkspaceAssigneeChecker(NewWorkspaceUserResolver(s.db, permService))
+	}
 	return s
 }
 
 // UpdateItemRequest contains the data needed to update an item
 type UpdateItemRequest struct {
-	ItemID     int
-	UpdateData map[string]interface{}
-	UserID     int
+	ItemID        int
+	UpdateData    map[string]any
+	UserID        int
+	EventMetadata itemevents.Metadata
+}
+
+// FindItem loads an item through the item repository for pre-update
+// authorization checks, keeping persistence access behind the service layer.
+func (s *ItemUpdateService) FindItem(itemID int) (*models.Item, error) {
+	return repository.NewItemRepository(s.db).FindByID(itemID)
 }
 
 // UpdateItemResult contains the result of an item update operation
@@ -57,172 +73,255 @@ type UpdateItemResult struct {
 	FieldChanges  []HistoryEntry
 }
 
-// HistoryEntry represents a single field change in item history
-type HistoryEntry struct {
-	ItemID    int
-	UserID    int
-	FieldName string
-	OldValue  string
-	NewValue  string
-	ChangedAt time.Time
+// ItemUpdateTransactionHook extends the canonical update transaction with
+// source-owned records that must commit atomically with the item mutation.
+type ItemUpdateTransactionHook func(context.Context, database.Tx, *models.Item, *models.Item) error
+
+type itemUpdateOptions struct {
+	allowStatus             bool
+	recordHistory           bool
+	triggerAssignee         bool
+	publish                 bool
+	beforeUpdateTransaction ItemUpdateTransactionHook
+	afterUpdateTransaction  ItemUpdateTransactionHook
 }
+
+// HistoryEntry represents a single field change in item history.
+// It aliases the repository record so services can hand history rows straight
+// to ItemRepository.RecordHistory/RecordHistoryBatch without converting.
+type HistoryEntry = repository.HistoryEntry
 
 // UpdateItem updates an item with validation, transaction safety, and history tracking.
 //
-// Workflow-status changes must NOT go through this path — callers should use
-// WorkflowService.PerformTransition directly (via the HTTP transition endpoint
-// or an action executor). Accepting status_id here would skip the transition
-// validation + event emission pipeline, so we reject it defensively.
+// Workflow and workspace moves must not go through this path. Each has a
+// dedicated service that enforces its authorization, mapping, and cleanup
+// invariants, so reject those fields before opening a transaction.
 func (s *ItemUpdateService) UpdateItem(req UpdateItemRequest) (*UpdateItemResult, error) {
-	if _, hasStatus := req.UpdateData["status_id"]; hasStatus {
-		return nil, &validation.ValidationError{
-			Field:   "status_id",
-			Message: "must be changed via the transition endpoint, not item update",
-		}
-	}
-	if _, hasItemType := req.UpdateData["item_type_id"]; hasItemType {
-		return nil, &validation.ValidationError{
-			Field:   "item_type_id",
-			Message: "must be changed via the item type change endpoint, not item update",
-		}
-	}
+	return s.updateItem(context.Background(), req, itemUpdateOptions{
+		recordHistory:   true,
+		triggerAssignee: true,
+		publish:         true,
+	})
+}
 
-	// Start transaction first so the read-modify-write is atomic
-	tx, err := s.db.Begin()
+func (s *ItemUpdateService) updateItem(ctx context.Context, req UpdateItemRequest, opts itemUpdateOptions) (*UpdateItemResult, error) {
+	// A merged duplicate is a read-only redirect to its canonical ticket
+	// (WI-1528); edits must go to the canonical.
+	if mergedInto, err := repository.NewItemRepository(s.db).MergedIntoItemID(ctx, req.ItemID); err == nil && mergedInto != nil {
+		return nil, NewServiceError(409, fmt.Sprintf("item %d was merged into item %d and is read-only", req.ItemID, *mergedInto))
+	}
+	if err := validateItemUpdateRequest(ctx, req, opts); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }() // Will be ignored if transaction is committed
+	defer func() { _ = tx.Rollback() }()
 
-	// Load existing item inside the transaction (with FOR UPDATE on Postgres for row-level locking)
-	originalItem, err := s.loadItemInTx(tx, req.ItemID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load item: %w", err)
-	}
-
-	// Create a copy for updates
-	existingItem := *originalItem
-
-	// Apply validation and updates
-	if err = s.validator.ValidateAndApplyUpdates(&existingItem, req.UpdateData, req.UserID); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
-	}
-
-	// Update the item in database (the repository marshals custom field
-	// values and bumps updated_at)
-	now := time.Now()
-	if err := repository.NewItemRepository(s.db).Update(tx, &existingItem); err != nil {
+	update := itemUpdateOperation{service: s, ctx: ctx, req: req, opts: opts, tx: tx}
+	if err := update.apply(); err != nil {
 		return nil, err
 	}
-
-	// Apply milestone-set replace if the validator parsed milestone_ids. The
-	// validator stashes ID-only Milestone stubs on existingItem.Milestones
-	// when "milestone_ids" appeared in updateData; otherwise the field is
-	// untouched and we leave the join table alone.
-	var milestoneOldIDs, milestoneNewIDs []int
-	hasMilestoneIDs := false
-	if _, ok := req.UpdateData["milestone_ids"]; ok {
-		hasMilestoneIDs = true
-
-		// Snapshot current milestone IDs in the transaction for history.
-		oldRows, err := tx.Query("SELECT milestone_id FROM item_milestones WHERE item_id = ? ORDER BY milestone_id", req.ItemID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read existing item_milestones: %w", err)
-		}
-		for oldRows.Next() {
-			var mID int
-			if err := oldRows.Scan(&mID); err != nil {
-				_ = oldRows.Close()
-				return nil, fmt.Errorf("failed to scan existing milestone id: %w", err)
-			}
-			milestoneOldIDs = append(milestoneOldIDs, mID)
-		}
-		if err := oldRows.Err(); err != nil {
-			_ = oldRows.Close()
-			return nil, fmt.Errorf("failed to iterate existing milestone ids: %w", err)
-		}
-		_ = oldRows.Close()
-
-		if _, err := tx.Exec("DELETE FROM item_milestones WHERE item_id = ?", req.ItemID); err != nil {
-			return nil, fmt.Errorf("failed to clear item_milestones: %w", err)
-		}
-		for _, m := range existingItem.Milestones {
-			milestoneNewIDs = append(milestoneNewIDs, m.ID)
-			if _, err := tx.Exec(
-				"INSERT INTO item_milestones (item_id, milestone_id, created_at) VALUES (?, ?, ?)",
-				req.ItemID, m.ID, now,
-			); err != nil {
-				return nil, fmt.Errorf("failed to attach milestone %d: %w", m.ID, err)
-			}
-		}
-	}
-
-	// Generate and record history entries
-	history := s.compareAndGenerateHistory(originalItem, &existingItem, req.UserID)
-	if hasMilestoneIDs {
-		oldStr := joinIntsCSV(milestoneOldIDs)
-		newStr := joinIntsCSV(milestoneNewIDs)
-		if oldStr != newStr {
-			history = append(history, HistoryEntry{
-				ItemID:    req.ItemID,
-				UserID:    req.UserID,
-				FieldName: "milestones",
-				OldValue:  oldStr,
-				NewValue:  newStr,
-				ChangedAt: now,
-			})
-		}
-	}
-	if err = s.recordItemHistory(tx, history); err != nil {
-		return nil, fmt.Errorf("failed to record history: %w", err)
-	}
-
-	// Commit the transaction
-	if err = tx.Commit(); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
+	return update.result()
+}
 
-	// Load the updated item with joins for response
+// AddMilestone atomically adds one milestone to an item while preserving the
+// rest of the set. It returns changed=false for a duplicate attachment so
+// retries do not repeat history or downstream effects.
+func (s *ItemUpdateService) AddMilestone(req UpdateItemRequest, milestoneID int) (*UpdateItemResult, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	originalItem, err := s.loadItemInTx(tx, req.ItemID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to load item: %w", err)
+	}
+	oldIDs, alreadyAttached, err := loadItemMilestoneIDs(tx, req.ItemID, milestoneID)
+	if err != nil {
+		return nil, false, err
+	}
+	newIDs := append(append([]int(nil), oldIDs...), milestoneID)
+	sort.Ints(newIDs)
+	if alreadyAttached {
+		return s.finishUnchangedMilestoneUpdate(tx, originalItem, req.ItemID, false)
+	}
+	if err := validation.ValidatePlanningAssignments(tx, originalItem.WorkspaceID, newIDs, originalItem.IterationID); err != nil {
+		return nil, false, fmt.Errorf("validation failed: %w", err)
+	}
+
+	now := time.Now()
+	inserted, err := insertItemMilestone(tx, req.ItemID, milestoneID, now)
+	if err != nil {
+		return nil, false, err
+	}
+	if !inserted {
+		return s.finishUnchangedMilestoneUpdate(tx, originalItem, req.ItemID, true)
+	}
+	history, err := s.recordMilestoneAddition(tx, req, originalItem, oldIDs, newIDs, now)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	updatedItem, err := s.loadItemWithJoins(req.ItemID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load updated item: %w", err)
+		return nil, false, fmt.Errorf("failed to load updated item: %w", err)
 	}
-
-	// Check if status changed (for event emission)
-	statusChanged := s.hasStatusChanged(originalItem, updatedItem)
-
-	// Coding-agent binding trigger (WI-88), fired here so every update
-	// surface — cookie handlers, REST v1, MCP/AI tools, automation actions —
-	// gets it. The trigger no-ops when the assignee did not change or no
-	// binding matches the new assignee.
-	maybeTriggerAssigneeRun(updatedItem.WorkspaceID, updatedItem.ID, originalItem.AssigneeID, updatedItem.AssigneeID, req.UserID)
-
-	// Live-update publish (WI-483): the update has committed. Announce the item
-	// (status kind when the status changed), and on a reparent refresh both the
-	// old and new parents' child lists.
-	updateKind := ItemChangeUpdated
-	if statusChanged {
-		updateKind = ItemChangeStatus
-	}
-	PublishItemChange(updatedItem.ID, updateKind)
-	oldParent, newParent := originalItem.ParentID, updatedItem.ParentID
-	reparented := (oldParent == nil) != (newParent == nil) ||
-		(oldParent != nil && newParent != nil && *oldParent != *newParent)
-	if reparented {
-		if oldParent != nil {
-			PublishItemChange(*oldParent, ItemChangeUpdated)
-		}
-		if newParent != nil {
-			PublishItemChange(*newParent, ItemChangeUpdated)
-		}
-	}
-
+	PublishItemChange(updatedItem.ID)
+	PublishWorkspaceChange(updatedItem.WorkspaceID)
 	return &UpdateItemResult{
-		OriginalItem:  originalItem,
-		Item:          updatedItem,
-		StatusChanged: statusChanged,
-		FieldChanges:  history,
-	}, nil
+		OriginalItem: originalItem,
+		Item:         updatedItem,
+		FieldChanges: history,
+	}, true, nil
+}
+
+func loadItemMilestoneIDs(tx database.Tx, itemID, targetID int) (ids []int, found bool, err error) {
+	rows, err := tx.Query(`
+		SELECT milestone_id
+		FROM item_milestones
+		WHERE item_id = ?
+		ORDER BY milestone_id
+	`, itemID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to read existing item milestones: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, false, fmt.Errorf("failed to scan existing item milestone: %w", err)
+		}
+		ids = append(ids, id)
+		found = found || id == targetID
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("failed to iterate existing item milestones: %w", err)
+	}
+	return ids, found, nil
+}
+
+func (s *ItemUpdateService) finishUnchangedMilestoneUpdate(
+	tx database.Tx,
+	originalItem *models.Item,
+	itemID int,
+	concurrent bool,
+) (*UpdateItemResult, bool, error) {
+	transactionKind := "duplicate milestone"
+	loadKind := "unchanged"
+	if concurrent {
+		transactionKind = "concurrent duplicate"
+		loadKind = "concurrently updated"
+	}
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		return nil, false, fmt.Errorf("failed to close %s transaction: %w", transactionKind, err)
+	}
+	current, err := s.loadItemWithJoins(itemID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to load %s item: %w", loadKind, err)
+	}
+	return &UpdateItemResult{OriginalItem: originalItem, Item: current}, false, nil
+}
+
+func insertItemMilestone(tx database.Tx, itemID, milestoneID int, now time.Time) (bool, error) {
+	result, err := tx.Exec(`
+		INSERT INTO item_milestones (item_id, milestone_id, created_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(item_id, milestone_id) DO NOTHING
+	`, itemID, milestoneID, now)
+	if err != nil {
+		return false, fmt.Errorf("failed to attach milestone %d: %w", milestoneID, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect milestone attachment: %w", err)
+	}
+	return rowsAffected > 0, nil
+}
+
+func (s *ItemUpdateService) recordMilestoneAddition(
+	tx database.Tx,
+	req UpdateItemRequest,
+	originalItem *models.Item,
+	oldIDs, newIDs []int,
+	now time.Time,
+) ([]HistoryEntry, error) {
+	if _, err := tx.Exec(`
+		UPDATE items
+		SET updated_at = ?, last_active_at = ?
+		WHERE id = ?
+	`, now, now, req.ItemID); err != nil {
+		return nil, fmt.Errorf("failed to update item activity time: %w", err)
+	}
+	history := []HistoryEntry{{
+		ItemID:    req.ItemID,
+		UserID:    req.UserID,
+		FieldName: "milestones",
+		OldValue:  joinIntsCSV(oldIDs),
+		NewValue:  joinIntsCSV(newIDs),
+		ChangedAt: now,
+	}}
+	metadata := mergeItemEventMetadata(req.EventMetadata, itemEventMetadata(req.UserID, "application", nil))
+	if metadata.OccurredAt.IsZero() {
+		metadata.OccurredAt = now
+	}
+	stampHistorySource(history, metadata)
+	if err := s.recordItemHistory(tx, history); err != nil {
+		return nil, fmt.Errorf("failed to record history: %w", err)
+	}
+	if _, err := itemevents.NewRecorder(s.db).Updated(
+		context.Background(), tx, originalItem, itemHistoryEventChanges(history), metadata,
+	); err != nil {
+		return nil, err
+	}
+	return history, nil
+}
+
+func hasAnyItemUpdateField(updateData map[string]any, fields ...string) bool {
+	for _, field := range fields {
+		if _, ok := updateData[field]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func planningMilestoneIDsForUpdate(tx database.Tx, itemID int, item *models.Item, changed bool) ([]int, error) {
+	if changed {
+		ids := make([]int, 0, len(item.Milestones))
+		for _, milestone := range item.Milestones {
+			ids = append(ids, milestone.ID)
+		}
+		return ids, nil
+	}
+
+	rows, err := tx.Query("SELECT milestone_id FROM item_milestones WHERE item_id = ? ORDER BY milestone_id", itemID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load item milestones for scope validation: %w", err)
+	}
+	defer rows.Close()
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan item milestone for scope validation: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate item milestones for scope validation: %w", err)
+	}
+	return ids, nil
 }
 
 // loadItemInTx loads an item inside a transaction. On Postgres, the repository
@@ -284,8 +383,13 @@ func (s *ItemUpdateService) compareAndGenerateHistory(original, updated *models.
 	addHistory("project_id", intPtrToString(original.ProjectID), intPtrToString(updated.ProjectID))
 	addHistory("time_project_id", intPtrToString(original.TimeProjectID), intPtrToString(updated.TimeProjectID))
 	addHistory("assignee_id", intPtrToString(original.AssigneeID), intPtrToString(updated.AssigneeID))
+	addHistory("team_id", intPtrToString(original.TeamID), intPtrToString(updated.TeamID))
 	addHistory("creator_id", intPtrToString(original.CreatorID), intPtrToString(updated.CreatorID))
 	addHistory("parent_id", intPtrToString(original.ParentID), intPtrToString(updated.ParentID))
+	addHistory("related_work_item_id", intPtrToString(original.RelatedWorkItemID), intPtrToString(updated.RelatedWorkItemID))
+	if original.IsTask != updated.IsTask {
+		addHistory("is_task", fmt.Sprintf("%t", original.IsTask), fmt.Sprintf("%t", updated.IsTask))
+	}
 
 	// Compare date fields
 	addHistory("due_date", timePtrToString(original.DueDate), timePtrToString(updated.DueDate))
@@ -325,88 +429,9 @@ func (s *ItemUpdateService) compareAndGenerateHistory(original, updated *models.
 	return history
 }
 
-// RecordItemCreationHistory records the initial values when an item is created
-// This ensures that the item history shows the creation event with initial values
-func (s *ItemUpdateService) RecordItemCreationHistory(db database.Database, itemID, userID int) error {
-	return s.recordItemCreationHistory(db, itemID, userID)
-}
-
-// recordItemCreationHistory records the initial values when an item is created
-func (s *ItemUpdateService) recordItemCreationHistory(db database.Database, itemID, userID int) error {
-	// Load the newly created item to get all its initial values.
-	item, err := repository.NewItemRepository(db).FindByID(itemID)
-	if err != nil {
-		return fmt.Errorf("failed to load created item: %w", err)
-	}
-
-	// Generate history entries for all initial values
-	var history []HistoryEntry
-	now := time.Now()
-
-	// Helper to add history entry (old_value is always empty for creation)
-	addHistory := func(fieldName, newValue string) {
-		if newValue != "" {
-			history = append(history, HistoryEntry{
-				ItemID:    itemID,
-				UserID:    userID,
-				FieldName: fieldName,
-				OldValue:  "",
-				NewValue:  newValue,
-				ChangedAt: now,
-			})
-		}
-	}
-
-	// Add entries for all fields
-	addHistory("title", item.Title)
-	addHistory("description", item.Description)
-	addHistory("item_type_id", intPtrToString(item.ItemTypeID))
-	addHistory("status_id", intPtrToString(item.StatusID))
-	addHistory("priority_id", intPtrToString(item.PriorityID))
-	addHistory("iteration_id", intPtrToString(item.IterationID))
-	addHistory("project_id", intPtrToString(item.ProjectID))
-	addHistory("time_project_id", intPtrToString(item.TimeProjectID))
-	addHistory("assignee_id", intPtrToString(item.AssigneeID))
-	addHistory("creator_id", intPtrToString(item.CreatorID))
-	addHistory("parent_id", intPtrToString(item.ParentID))
-	addHistory("due_date", timePtrToString(item.DueDate))
-	addHistory("start_date", timePtrToString(item.StartDate))
-	addHistory("end_date", timePtrToString(item.EndDate))
-	addHistory("workspace_id", fmt.Sprintf("%d", item.WorkspaceID))
-	addHistory("story_points", float64PtrToString(item.StoryPoints))
-	addHistory("estimate_minutes", intPtrToString(item.EstimateMinutes))
-	// Only record inherit_project when set; the default (false) on root items
-	// would otherwise add a no-op entry to every creation event.
-	if item.InheritProject {
-		addHistory("inherit_project", "true")
-	}
-
-	// Record history entries directly (no transaction needed here, caller should manage)
-	for _, entry := range history {
-		_, err := db.ExecWrite(`
-			INSERT INTO item_history (item_id, user_id, field_name, old_value, new_value, changed_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, entry.ItemID, entry.UserID, entry.FieldName, entry.OldValue, entry.NewValue, entry.ChangedAt)
-		if err != nil {
-			return fmt.Errorf("failed to record creation history: %w", err)
-		}
-	}
-
-	return nil
-}
-
 // recordItemHistory records history entries in the database
 func (s *ItemUpdateService) recordItemHistory(tx database.Tx, history []HistoryEntry) error {
-	for _, entry := range history {
-		_, err := tx.Exec(`
-			INSERT INTO item_history (item_id, user_id, field_name, old_value, new_value, changed_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, entry.ItemID, entry.UserID, entry.FieldName, entry.OldValue, entry.NewValue, entry.ChangedAt)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return repository.NewItemRepository(s.db).RecordHistoryBatch(tx, history)
 }
 
 // joinIntsCSV renders a sorted slice of ints as "1,2,3" — used as the
@@ -444,7 +469,7 @@ func float64PtrToString(val *float64) string {
 	return fmt.Sprintf("%g", *val)
 }
 
-func customFieldValueToString(val interface{}) string {
+func customFieldValueToString(val any) string {
 	if val == nil {
 		return ""
 	}

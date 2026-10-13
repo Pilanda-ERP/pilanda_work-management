@@ -1,10 +1,4 @@
-/**
- * Shared SVG progress-chart helpers for IterationDetail / MilestoneDetail.
- *
- * Both detail pages render an identical donut chart (status breakdown) and
- * status-category toggle list. Constants and pure helpers live here; the
- * progress data fetch + the surrounding template stay per-page.
- */
+/** Shared pure donut-chart helpers for iteration and milestone detail views. */
 
 export const PROGRESS_CHART_RADIUS = 48;
 export const PROGRESS_CHART_CIRCUMFERENCE = 2 * Math.PI * PROGRESS_CHART_RADIUS;
@@ -27,6 +21,22 @@ export function formatPercent(value) {
     return Math.min(100, Math.max(0, Math.round(value)));
   }
   return 0;
+}
+
+/**
+ * Calculate completion from the item counts returned alongside a progress
+ * report. Counts are the source of truth; `fallbackPercent` supports older or
+ * partial responses that do not include them.
+ */
+export function calculatePercentComplete(completedItems, totalItems, fallbackPercent = 0) {
+  const completed = Number(completedItems);
+  const total = Number(totalItems);
+
+  if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+    return formatPercent((completed / total) * 100);
+  }
+
+  return formatPercent(fallbackPercent);
 }
 
 /**

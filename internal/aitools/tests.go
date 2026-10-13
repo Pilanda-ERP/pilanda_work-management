@@ -15,14 +15,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"windshift/internal/auth"
 	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
-	"windshift/internal/sanitize"
 	"windshift/internal/services"
 )
 
@@ -267,6 +265,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[listTestCasesArgs]{
 		Name:        "list_test_cases",
+		Group:       CapabilityTests,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Scopes:      []string{auth.ScopeTestsRead},
 		Description: "List test cases in a workspace, optionally filtered to one test folder.",
 		Run: func(_ context.Context, env *Env, args listTestCasesArgs) (any, error) {
@@ -294,6 +295,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[getTestCaseArgs]{
 		Name:        "get_test_case",
+		Group:       CapabilityTests,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Scopes:      []string{auth.ScopeTestsRead},
 		Description: "Get a test case by ID, including its steps (action / data / expected result).",
 		Run: func(_ context.Context, env *Env, args getTestCaseArgs) (any, error) {
@@ -342,6 +346,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[listTestRunsArgs]{
 		Name:        "list_test_runs",
+		Group:       CapabilityTests,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Scopes:      []string{auth.ScopeTestsRead},
 		Description: "List test runs in a workspace, optionally filtered by test set or assignee.",
 		Run: func(_ context.Context, env *Env, args listTestRunsArgs) (any, error) {
@@ -370,6 +377,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[getTestRunArgs]{
 		Name:        "get_test_run",
+		Group:       CapabilityTests,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Scopes:      []string{auth.ScopeTestsRead},
 		Description: "Get a test run by ID, including its per-test-case results and a pass/fail summary.",
 		Run: func(_ context.Context, env *Env, args getTestRunArgs) (any, error) {
@@ -408,6 +418,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[startTestRunArgs]{
 		Name:        "start_test_run",
+		Group:       CapabilityTests,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Scopes:      []string{auth.ScopeTestsWrite},
 		Description: "Start a new test run from a test set (set_id) or a saved run template (template_id). Initializes a not_run result for every test case in the set.",
 		Run: func(_ context.Context, env *Env, args startTestRunArgs) (any, error) {
@@ -427,6 +440,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[endTestRunArgs]{
 		Name:        "end_test_run",
+		Group:       CapabilityTests,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Scopes:      []string{auth.ScopeTestsWrite},
 		Description: "Mark a test run as ended and return its final result summary.",
 		Run: func(_ context.Context, env *Env, args endTestRunArgs) (any, error) {
@@ -465,6 +481,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[recordTestResultArgs]{
 		Name:        "record_test_result",
+		Group:       CapabilityTests,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Scopes:      []string{auth.ScopeTestsWrite},
 		Description: "Record the result of a test case in a test run (status passed | failed | blocked | skipped, with optional notes and actual result).",
 		Run: func(_ context.Context, env *Env, args recordTestResultArgs) (any, error) {
@@ -496,14 +515,12 @@ func init() {
 			if target == nil {
 				return testToolError(fmt.Sprintf("test case %d not found in run %d", args.TestCaseID, args.RunID)), nil
 			}
-			// Match the v1 surface's XSS handling for result text fields.
-			actual := sanitize.RichText.Sanitize(args.ActualResult)
-			notes := sanitize.RichText.Sanitize(args.Notes)
-			if err := runSvc.UpdateResult(args.RunID, target.ID, services.TestResultUpdateRequest{
+			updatedFields, err := runSvc.UpdateResult(wsID, args.RunID, target.ID, services.TestResultUpdateRequest{
 				Status:       args.Status,
-				ActualResult: actual,
-				Notes:        notes,
-			}); err != nil {
+				ActualResult: args.ActualResult,
+				Notes:        args.Notes,
+			})
+			if err != nil {
 				if errors.Is(err, repository.ErrNotFound) {
 					return testToolError("test result not found"), nil
 				}
@@ -512,11 +529,10 @@ func init() {
 			env.AuditWrite(resourceTestResult, target.ID, "record_test_result",
 				fmt.Sprintf("%s: %s", target.TestCaseTitle, args.Status))
 			updated := target.TestResult
-			updated.Status = args.Status
-			updated.ActualResult = actual
-			updated.Notes = notes
-			now := time.Now()
-			updated.ExecutedAt = &now
+			updated.Status = updatedFields.Status
+			updated.ActualResult = updatedFields.ActualResult
+			updated.Notes = updatedFields.Notes
+			updated.ExecutedAt = updatedFields.ExecutedAt
 			return map[string]any{
 				"success": true,
 				"result":  testResultToDTO(&updated, target.TestCaseTitle),
@@ -533,17 +549,17 @@ func init() {
 // `ws test run start <set>`): the run name defaults to "<set name> - Run".
 func startTestRunFromSet(env *Env, args startTestRunArgs) (any, error) {
 	setID := *args.SetID
-	setRepo := repository.NewTestSetRepository(env.DB)
-	wsID, err := setRepo.GetWorkspaceID(setID)
+	setSvc := services.NewTestSetService(env.DB)
+	wsID, err := setSvc.GetWorkspaceID(setID)
 	if err != nil || !hasTestPermission(env, wsID, models.PermissionTestExecute) {
 		return testToolError("test set not found"), nil //nolint:nilerr // 404-style JSON error, never reveal existence
 	}
 	if args.WorkspaceID != nil && *args.WorkspaceID > 0 && *args.WorkspaceID != wsID {
 		return testToolError("test set not found"), nil
 	}
-	name := sanitize.PlainTextField.Sanitize(args.Name)
+	name := args.Name
 	if name == "" {
-		set, err := setRepo.FindByID(setID, wsID)
+		set, err := setSvc.Get(setID, wsID)
 		if err != nil {
 			return testToolError("test set not found"), nil //nolint:nilerr // 404-style JSON error
 		}
@@ -565,28 +581,18 @@ func startTestRunFromSet(env *Env, args startTestRunArgs) (any, error) {
 // the run name is auto-generated as "<template name> - Run <N>".
 func startTestRunFromTemplate(env *Env, args startTestRunArgs) (any, error) {
 	templateID := *args.TemplateID
-	templateRepo := repository.NewTestRunTemplateRepository(env.DB)
+	templateSvc := services.NewTestRunTemplateService(env.DB)
 	wsID, ok := resolveTestEntityWorkspace(env, args.WorkspaceID, models.PermissionTestExecute, func(wsID int) (bool, error) {
-		_, err := templateRepo.FindCore(templateID, wsID)
-		if errors.Is(err, repository.ErrNotFound) {
-			return false, nil
-		}
-		return err == nil, err
+		return templateSvc.Exists(templateID, wsID)
 	})
 	if !ok {
 		return testToolError("test run template not found"), nil
 	}
-	template, err := templateRepo.FindCore(templateID, wsID)
+	run, err := templateSvc.Execute(templateID, wsID)
 	if err != nil {
-		return testToolError("test run template not found"), nil //nolint:nilerr // 404-style JSON error
-	}
-	runCount, err := templateRepo.CountExecutions(templateID, wsID)
-	if err != nil {
-		return nil, err
-	}
-	runName := template.Name + " - Run " + strconv.Itoa(runCount+1)
-	run, err := templateRepo.Execute(wsID, templateID, template.SetID, runName)
-	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return testToolError("test run template not found"), nil //nolint:nilerr // 404-style JSON error
+		}
 		return nil, err
 	}
 	env.AuditWrite(logger.ResourceTestRun, run.ID, "start_test_run", run.Name)

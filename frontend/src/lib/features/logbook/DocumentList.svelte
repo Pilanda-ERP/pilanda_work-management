@@ -1,6 +1,8 @@
 <script>
+  import { onDestroy, untrack } from 'svelte';
   import { navigate } from '../../router.js';
   import { logbookStore } from '../../stores/logbook.svelte.js';
+  import { canRunBackgroundSync, onBackgroundSyncAvailable } from '../../utils/backgroundSync.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { api } from '../../api.js';
   import { successToast, errorToast } from '../../stores/toasts.svelte.js';
@@ -11,7 +13,9 @@
   import Progress from '../../components/Progress.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
+  import Modal from '../../dialogs/Modal.svelte';
   import SearchInput from '../../components/SearchInput.svelte';
+  import Input from '../../components/Input.svelte';
   import DocumentUpload from './DocumentUpload.svelte';
   import { computeDocumentHealth } from './healthScore.js';
   import {
@@ -34,49 +38,102 @@
     activeBucketId ? logbookStore.buckets.find(b => b.id === activeBucketId) : null
   );
 
-  // Search handler
+  // Search handler. A monotonic version plus the bucket captured at request
+  // time keep a superseded query from replacing the newest results.
   let searchTimeout;
+  let searchVersion = 0;
   let searchMatchIds = $state(null); // null = no active search, Set = active filter
-  function handleSearch(e) {
-    clearTimeout(searchTimeout);
+
+  function runSearch() {
+    const version = ++searchVersion;
+    const query = searchQuery.trim();
+    const bucketId = activeBucketId;
+    if (!query) {
+      searchMatchIds = null;
+      return;
+    }
     searchTimeout = setTimeout(async () => {
-      if (searchQuery.trim()) {
-        try {
-          const params = {};
-          if (activeBucketId) params.bucket_id = activeBucketId;
-          const result = await api.logbook.keywordSearch(searchQuery, params);
-          const results = result?.data ?? result;
-          if (Array.isArray(results)) {
-            searchMatchIds = new Set(results.map(r => r.document_id));
-          }
-        } catch (error) {
-          console.error('Search failed:', error);
+      try {
+        const params = {};
+        if (bucketId) params.bucket_id = bucketId;
+        const result = await api.logbook.keywordSearch(query, params);
+        if (version !== searchVersion) return;
+        const results = result?.data ?? result;
+        if (Array.isArray(results)) {
+          searchMatchIds = new Set(results.map(r => r.document_id));
         }
-      } else {
-        searchMatchIds = null;
+      } catch (error) {
+        if (version !== searchVersion) return;
+        console.error('Search failed:', error);
       }
     }, 300);
   }
+
+  function handleSearch() {
+    clearTimeout(searchTimeout);
+    runSearch();
+  }
+
+  // A bucket change invalidates any in-flight search and restarts it for the
+  // new scope so results cannot carry over from the previous bucket.
+  $effect(() => {
+    activeBucketId;
+    untrack(() => {
+      clearTimeout(searchTimeout);
+      searchMatchIds = null;
+      if (searchQuery.trim()) runSearch();
+    });
+  });
+
+  onDestroy(() => {
+    clearTimeout(searchTimeout);
+    searchVersion += 1;
+  });
 
   let filteredDocuments = $derived(
     searchMatchIds ? logbookStore.documents.filter(d => searchMatchIds.has(d.id)) : logbookStore.documents
   );
 
-  // Poll while any visible documents are still processing
+  // Poll while any visible documents are still processing. The next refresh is
+  // scheduled only after the previous one settles so requests never overlap.
   let hasProcessingDocs = $derived(
     filteredDocuments.some(d => d.status === 'pending' || d.status === 'processing')
   );
 
   $effect(() => {
+    const bucketId = activeBucketId;
     if (!hasProcessingDocs) return;
-    const interval = setInterval(() => {
-      if (activeBucketId) {
-        logbookStore.loadDocuments(activeBucketId, {}, { silent: true });
-      } else {
-        logbookStore.loadAllDocuments({}, { silent: true });
+
+    let cancelled = false;
+    let timer = null;
+
+    const refresh = async () => {
+      if (cancelled) return;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
       }
-    }, 3000);
-    return () => clearInterval(interval);
+      if (canRunBackgroundSync()) {
+        if (bucketId) {
+          await logbookStore.loadDocuments(bucketId, {}, { silent: true });
+        } else {
+          await logbookStore.loadAllDocuments({}, { silent: true });
+        }
+      }
+      if (cancelled) return;
+      timer = setTimeout(refresh, 3000);
+    };
+
+    timer = setTimeout(refresh, 3000);
+    const stopRecovery = onBackgroundSyncAvailable(() => {
+      if (!cancelled) void refresh();
+    });
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      stopRecovery();
+    };
   });
 
   function getSourceIcon(sourceType) {
@@ -169,6 +226,7 @@
       {#if activeBucketId}
         <div class="flex items-center gap-2">
           <Button
+            dataTestid="logbook-new-note"
             variant="default"
             icon={StickyNote}
             onclick={() => { showNoteModal = true; }}
@@ -191,6 +249,7 @@
   <div class="mb-6">
     <SearchInput
       bind:value={searchQuery}
+      dataTestid="logbook-search"
       placeholder={t('logbook.search')}
       on_input={handleSearch}
     />
@@ -214,10 +273,9 @@
         {@const health = computeDocumentHealth(doc)}
         <a
           href={`/logbook/documents/${doc.id}`}
-          class="group text-left rounded-xl border transition-all duration-200 hover:shadow-md cursor-pointer overflow-hidden flex flex-col no-underline"
-          style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: inherit;"
-          onmouseenter={(e) => e.currentTarget.style.borderColor = 'var(--ds-border-focused)'}
-          onmouseleave={(e) => e.currentTarget.style.borderColor = 'var(--ds-border)'}
+          data-testid={`logbook-document-${doc.id}`}
+          class="doc-card group text-left rounded-xl border transition-all duration-200 hover:shadow-md cursor-pointer overflow-hidden flex flex-col no-underline"
+          style="background-color: var(--ds-surface-raised); color: inherit;"
         >
           <div class="relative aspect-[210/297] w-full overflow-hidden" style="background-color: var(--ds-surface);">
             {#if doc.status === 'pending' || doc.status === 'processing'}
@@ -246,7 +304,7 @@
             {/if}
 
             <!-- Hover action buttons -->
-            <div class="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <div class="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity">
               {#if doc.source_type === 'upload'}
                 <button
                   onclick={(e) => openFile(e, doc.id)}
@@ -317,20 +375,7 @@
 {/if}
 
 <!-- Create Note Modal -->
-{#if showNoteModal}
-  <div
-    class="fixed inset-0 z-50 flex items-center justify-center"
-    style="background-color: rgba(0, 0, 0, 0.4); backdrop-filter: blur(2px);"
-    onclick={(e) => { if (e.target === e.currentTarget) { showNoteModal = false; } }}
-    onkeydown={(e) => { if (e.key === 'Escape') showNoteModal = false; }}
-    role="dialog"
-    aria-modal="true"
-    tabindex="-1"
-  >
-    <div
-      class="w-full max-w-2xl rounded-xl border shadow-xl"
-      style="background-color: var(--ds-surface-overlay); border-color: var(--ds-border);"
-    >
+<Modal bind:isOpen={showNoteModal} maxWidth="max-w-2xl" dataTestid="logbook-note-dialog">
       <!-- Header -->
       <ModalHeader title={t('logbook.newNote')} showCloseButton={false} />
 
@@ -338,14 +383,13 @@
       <div class="px-6 py-4 space-y-4">
         <div>
           <label for="note-title" class="block text-sm font-medium mb-1" style="color: var(--ds-text);">
-            {t('logbook.noteTitle')} <span class="text-red-500">*</span>
+            {t('logbook.noteTitle')} <span class="text-ds-text-danger">*</span>
           </label>
-          <input
+          <Input
             id="note-title"
+            dataTestid="logbook-note-title"
             type="text"
             bind:value={noteFormData.title}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
             placeholder={t('logbook.noteTitlePlaceholder')}
           />
         </div>
@@ -357,6 +401,7 @@
           <div style="min-height: 300px;">
             <LazyMilkdownEditor
               bind:content={noteFormData.content}
+              testId="logbook-note-editor"
               placeholder={t('logbook.noteContentPlaceholder')}
               showToolbar={true}
             />
@@ -369,7 +414,9 @@
         <Button variant="default" onclick={() => { showNoteModal = false; noteFormData = { title: '', content: '' }; }}>
           {t('common.cancel')}
         </Button>
+        <!-- shortcut-guard-exempt: dialog submit action; this is not a global create shortcut -->
         <Button
+          dataTestid="logbook-note-create"
           variant="primary"
           onclick={createNote}
           disabled={!noteFormData.title.trim()}
@@ -377,9 +424,7 @@
           {t('common.create')}
         </Button>
       </div>
-    </div>
-  </div>
-{/if}
+</Modal>
 
 <style>
   .doc-shimmer {
@@ -396,5 +441,12 @@
   @keyframes shimmer-pulse {
     0% { background-position: 200% 0; }
     100% { background-position: -200% 0; }
+  }
+  .doc-card {
+    border-color: var(--ds-border);
+  }
+
+  .doc-card:hover {
+    border-color: var(--ds-border-focused);
   }
 </style>

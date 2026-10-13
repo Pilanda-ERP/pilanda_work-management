@@ -1,16 +1,19 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { ChevronLeft, Send, Sparkles, Loader, Trash2 } from '@lucide/svelte';
-  import { chatStore } from '../stores/chatStore.svelte.js';
+  import { chatStore, preprocessItemKeys } from '../stores/chatStore.svelte.js';
   import { buildChatContext } from '../features/chat/chatContext.js';
   import { currentRoute, navigate } from '../router.js';
-  import { renderMarkdown } from '../utils/render-markdown.js';
+  import LazyMilkdownEditor from '../editors/LazyMilkdownEditor.svelte';
+  import Textarea from '../components/Textarea.svelte';
+  import { t } from '../stores/i18n.svelte.js';
 
   let text = $state('');
   let scrollEl = $state(null);
 
   const messages = $derived(chatStore.messages);
   const loading = $derived(chatStore.loading);
+  const conversationLoading = $derived(chatStore.conversationLoading);
 
   function back() {
     if (window.history.length > 1) window.history.back();
@@ -19,7 +22,7 @@
 
   async function send() {
     const t = text.trim();
-    if (!t || loading) return;
+    if (!t || loading || conversationLoading) return;
     text = '';
     // Same global chatStore the desktop drives; context is derived from the
     // current route (general assistant on the mobile surface).
@@ -45,15 +48,16 @@
 
   onMount(() => {
     chatStore.loadConnections();
+    void chatStore.startNewGeneralChat();
   });
 </script>
 
 <div class="chat">
 <header class="chat-header" data-testid="mobile-chat-header">
-  <button class="back" onclick={back} aria-label="Back" type="button"><ChevronLeft size={24} /></button>
-  <span class="title"><Sparkles size={17} /> Assistant</span>
+  <button class="back" onclick={back} aria-label={t('common.back')} type="button"><ChevronLeft size={24} /></button>
+  <span class="title"><Sparkles size={17} /> {t('mobile.chat.title')}</span>
   {#if messages.length > 0}
-    <button class="clear" onclick={() => chatStore.clearHistory()} aria-label="Clear conversation" type="button"><Trash2 size={18} /></button>
+    <button class="clear" onclick={() => chatStore.clearHistory()} aria-label={t('mobile.chat.clear')} type="button"><Trash2 size={18} /></button>
   {:else}
     <span class="spacer"></span>
   {/if}
@@ -63,8 +67,8 @@
   {#if messages.length === 0}
     <div class="empty" data-testid="chat-empty">
       <Sparkles size={28} />
-      <p>Ask about your work</p>
-      <span>The assistant can search items, summarize, and help you plan.</span>
+      <p>{t('mobile.chat.intro')}</p>
+      <span>{t('mobile.chat.help')}</span>
     </div>
   {:else}
     {#each messages as msg, i (i)}
@@ -75,9 +79,16 @@
           {#if msg.error}
             <p class="err">{msg.error}</p>
           {:else}
-            <div class="html-content">{@html renderMarkdown(msg.content)}</div>
+            <div class="html-content">
+              <LazyMilkdownEditor
+                content={preprocessItemKeys(msg.content)}
+                readonly={true}
+                showToolbar={false}
+                compact={true}
+              />
+            </div>
             {#if msg.needsReview}
-              <p class="review">⚠ This answer may need review.</p>
+              <p class="review">⚠ {t('mobile.chat.review')}</p>
             {/if}
           {/if}
         </div>
@@ -85,19 +96,20 @@
     {/each}
   {/if}
   {#if loading}
-    <div class="msg assistant thinking" data-testid="chat-thinking"><Loader class="spin" size={16} /> Thinking…</div>
+    <div class="msg assistant thinking" data-testid="chat-thinking"><Loader class="spin" size={16} /> {t('mobile.chat.thinking')}</div>
   {/if}
 </div>
 
 <form class="composer" onsubmit={(e) => { e.preventDefault(); send(); }}>
-  <textarea
+  <Textarea
     bind:value={text}
     onkeydown={onKeydown}
-    placeholder="Message the assistant…"
-    rows="1"
+    placeholder={t('mobile.chat.placeholder')}
+    rows={1}
     data-testid="chat-input"
-  ></textarea>
-  <button class="send" disabled={!text.trim() || loading} data-testid="chat-send" aria-label="Send" type="submit">
+    class="mobile-chat-input"
+  />
+  <button class="send" disabled={!text.trim() || loading || conversationLoading} data-testid="chat-send" aria-label={t('mobile.chat.send')} type="submit">
     <Send size={18} />
   </button>
 </form>
@@ -148,7 +160,7 @@
     padding: 0.6rem 0.75rem; padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 0.6rem);
     background-color: var(--ds-surface); border-top: 1px solid var(--ds-border);
   }
-  .composer textarea {
+  .composer :global(.mobile-chat-input) {
     flex: 1; min-width: 0; max-height: 8rem; resize: none;
     padding: 0.55rem 0.7rem; border: 1px solid var(--ds-border); border-radius: var(--radius-lg, 8px);
     background-color: var(--ds-background-input, var(--ds-surface)); color: var(--ds-text);

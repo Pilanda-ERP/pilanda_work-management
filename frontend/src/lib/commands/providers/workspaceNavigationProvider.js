@@ -4,6 +4,8 @@ import {
   workspaceViewItems,
 } from '../../navigation/workspaceNavigation.js';
 import { workspacePermissions } from '../../stores';
+import { t } from '../../stores/i18n.svelte.js';
+import { viewSettingsStore } from '../../stores/viewSettings.svelte.js';
 import { BUCKET } from '../buckets.js';
 import { createCommand } from '../types.js';
 
@@ -12,26 +14,20 @@ function buildViewUrl(workspaceId, view, collectionId) {
   return `/workspaces/${workspaceId}${prefix}/${view}`;
 }
 
-/**
- * Workspace view navigation. Emits whenever the user is inside a workspace
- * (workspaceId set) — including iterations/milestones/analytics/test pages,
- * which the previous WORKSPACE_CONTEXT_VIEWS gate silently excluded. Phase 0
- * audit fix: removes the `dashboard` keyword from the overview command so
- * it stops polluting `board` searches.
- */
+/** Workspace navigation for every workspace route, without the overview
+ * dashboard keyword that polluted board searches. */
 export function workspaceNavigationProvider(ctx) {
   const { workspaceId, workspace, collectionId, route, modules } = ctx;
   if (!workspaceId) return [];
 
-  const name = workspace?.name || 'Workspace';
-  const collectionSuffix = collectionId ? ' in this collection' : '';
+  const name = workspace?.name || t('common.workspace');
   const out = [];
 
   out.push(
     createCommand({
       id: 'workspace-overview',
-      label: `${name} Overview`,
-      description: collectionId ? 'Open this collection overview' : 'Open workspace overview',
+      label: t('commandPalette.commands.workspaceOverview.label', { name }),
+      description: t('commandPalette.commands.workspaceOverview.description'),
       bucket: BUCKET.WORKSPACE_NAVIGATION,
       keywords: ['overview', 'workspace', 'stats', name.toLowerCase()],
       url: collectionId
@@ -40,28 +36,35 @@ export function workspaceNavigationProvider(ctx) {
     })
   );
 
+  const enabledViews = new Set(viewSettingsStore.enabledViewIds(workspaceId, collectionId));
   for (const view of workspaceViewItems) {
+    if (!enabledViews.has(view.id)) continue;
+    const label = t(view.labelKey);
     out.push(
       createCommand({
         id: `workspace-${view.id}-view`,
-        label: `Open ${name} ${view.label}`,
-        description: `Switch to ${view.label.toLowerCase()} view${collectionSuffix}`,
+        label: `${name}: ${label}`,
+        description: t(view.tooltipKey || view.labelKey),
         bucket: BUCKET.WORKSPACE_NAVIGATION,
-        keywords: [view.id, view.label.toLowerCase(), name.toLowerCase()],
+        keywords: [view.id, label.toLowerCase(), name.toLowerCase()],
         url: buildViewUrl(workspaceId, view.id, collectionId),
       })
     );
   }
 
   if (!collectionId) {
+    const enabledNav = new Set(viewSettingsStore.enabledNavIds(workspaceId));
     for (const view of workspaceOnlyViews) {
+      if (!enabledNav.has(view.id)) continue;
+      if (view.id === 'agents' && !workspacePermissions.canAdminWorkspace(workspaceId)) continue;
+      const label = t(view.labelKey);
       out.push(
         createCommand({
           id: `workspace-${view.id}-view`,
-          label: `Open ${name} ${view.label}`,
-          description: view.tooltip || '',
+          label: `${name}: ${label}`,
+          description: t(view.tooltipKey || view.labelKey),
           bucket: BUCKET.WORKSPACE_NAVIGATION,
-          keywords: [view.id, view.label.toLowerCase(), name.toLowerCase()],
+          keywords: [view.id, label.toLowerCase(), name.toLowerCase()],
           url: buildViewUrl(workspaceId, view.id, null),
         })
       );
@@ -73,15 +76,18 @@ export function workspaceNavigationProvider(ctx) {
     workspacePermissions.canViewTests(workspaceId) &&
     !collectionId
   ) {
+    // Test entries are not nav-configurable; module and permission gating
+    // decide their visibility.
     for (const view of testNavigationItems) {
       const slug = view.id === 'test-cases' ? 'tests' : `tests/${view.id.replace(/^test-/, '')}`;
+      const label = t(view.labelKey);
       out.push(
         createCommand({
           id: `workspace-${view.id}`,
-          label: `${name} ${view.label}`,
-          description: view.tooltip || '',
+          label: `${name}: ${label}`,
+          description: t(view.tooltipKey || view.labelKey),
           bucket: BUCKET.WORKSPACE_NAVIGATION,
-          keywords: ['test', 'testing', 'qa', view.id, view.label.toLowerCase()],
+          keywords: ['test', 'testing', 'qa', view.id, label.toLowerCase()],
           url: `/workspaces/${workspaceId}/${slug}`,
         })
       );

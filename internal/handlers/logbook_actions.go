@@ -25,24 +25,18 @@ import (
 // performing a write.
 type LogbookNodeExecutionHandler struct {
 	secret            string
-	eventCoordinator  *services.EventCoordinator
 	permissionService *services.PermissionService
 	assetHandler      *AssetHandler
-	createItem        func(services.ItemCreationParams) (int64, error)
-	workspaceRepo     *repository.WorkspaceRepository
-	assetRepo         *repository.AssetRepository
+	itemCreation      *services.ItemCreationService
 }
 
 // NewLogbookNodeExecutionHandler creates a new node execution handler.
-func NewLogbookNodeExecutionHandler(secret string, eventCoordinator *services.EventCoordinator, permissionService *services.PermissionService, assetHandler *AssetHandler, createItem func(services.ItemCreationParams) (int64, error), workspaceRepo *repository.WorkspaceRepository, assetRepo *repository.AssetRepository) *LogbookNodeExecutionHandler {
+func NewLogbookNodeExecutionHandler(secret string, permissionService *services.PermissionService, assetHandler *AssetHandler, itemCreation *services.ItemCreationService) *LogbookNodeExecutionHandler {
 	return &LogbookNodeExecutionHandler{
 		secret:            secret,
-		eventCoordinator:  eventCoordinator,
 		permissionService: permissionService,
 		assetHandler:      assetHandler,
-		createItem:        createItem,
-		workspaceRepo:     workspaceRepo,
-		assetRepo:         assetRepo,
+		itemCreation:      itemCreation,
 	}
 }
 
@@ -58,7 +52,7 @@ func (h *LogbookNodeExecutionHandler) HandleNodeExecution(w http.ResponseWriter,
 	}
 
 	var req models.NodeExecutionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondJSON(w, http.StatusBadRequest, models.NodeExecutionResponse{
 			Error: "invalid request body",
 		})
@@ -74,7 +68,7 @@ func (h *LogbookNodeExecutionHandler) HandleNodeExecution(w http.ResponseWriter,
 		slog.String("document_id", req.Event.DocumentID),
 	)
 
-	var output map[string]interface{}
+	var output map[string]any
 	var execErr error
 
 	switch models.LogbookActionNodeType(req.NodeType) {
@@ -93,7 +87,6 @@ func (h *LogbookNodeExecutionHandler) HandleNodeExecution(w http.ResponseWriter,
 		slog.Error("node execution failed",
 			slog.String("component", "logbook-actions"),
 			slog.String("node_type", req.NodeType),
-			slog.String("node_config", req.NodeConfig),
 			slog.Any("error", execErr),
 		)
 		respondJSON(w, http.StatusInternalServerError, models.NodeExecutionResponse{
@@ -107,10 +100,16 @@ func (h *LogbookNodeExecutionHandler) HandleNodeExecution(w http.ResponseWriter,
 	})
 }
 
-func (h *LogbookNodeExecutionHandler) executeCreateItem(nodeConfig string, event *models.LogbookActionEvent, req *models.NodeExecutionRequest) (map[string]interface{}, error) {
+func (h *LogbookNodeExecutionHandler) executeCreateItem(nodeConfig string, event *models.LogbookActionEvent, req *models.NodeExecutionRequest) (map[string]any, error) {
 	var config models.CreateItemNodeConfig
 	if err := json.Unmarshal([]byte(nodeConfig), &config); err != nil {
 		return nil, fmt.Errorf("failed to parse create_item config: %w", err)
+	}
+	if config.WorkspaceID <= 0 || config.ItemTypeID <= 0 {
+		return nil, fmt.Errorf("create_item requires positive workspace_id and item_type_id")
+	}
+	if event.ActorUserID <= 0 {
+		return nil, fmt.Errorf("create_item requires an identified actor")
 	}
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &config.Title, Policy: sanitize.PlainTextField},
@@ -127,74 +126,63 @@ func (h *LogbookNodeExecutionHandler) executeCreateItem(nodeConfig string, event
 
 	// Authorize: the action config may target any workspace, so verify the
 	// acting user has edit permission on the target before creating an item.
-	if h.permissionService != nil {
-		hasPerm, permErr := h.permissionService.HasWorkspacePermission(creatorID, config.WorkspaceID, models.PermissionItemEdit)
-		if permErr != nil {
-			return nil, fmt.Errorf("failed to check workspace permission: %w", permErr)
-		}
-		if !hasPerm {
-			return nil, fmt.Errorf("user %d not authorized to create items in workspace %d", creatorID, config.WorkspaceID)
-		}
+	if h.permissionService == nil || h.itemCreation == nil {
+		return nil, fmt.Errorf("create_item blocked: permission or item service not configured")
+	}
+	hasPerm, permErr := h.permissionService.HasWorkspacePermission(creatorID, config.WorkspaceID, models.PermissionItemCreate)
+	if permErr != nil {
+		return nil, fmt.Errorf("failed to check workspace permission: %w", permErr)
+	}
+	if !hasPerm {
+		return nil, fmt.Errorf("user %d not authorized to create items in workspace %d", creatorID, config.WorkspaceID)
 	}
 
 	slog.Info("creating item from logbook action",
 		slog.String("component", "logbook-actions"),
 		slog.Int("workspace_id", config.WorkspaceID),
 		slog.Int("item_type_id", itemTypeID),
-		slog.String("title", title),
 		slog.Int("creator_id", creatorID),
 	)
 
-	itemID, err := h.createItem(services.ItemCreationParams{
+	result, err := h.itemCreation.CreateWithContext(creatorID, "", services.ItemCreateInput{
 		WorkspaceID: config.WorkspaceID,
 		Title:       title,
 		Description: config.Description,
 		ItemTypeID:  &itemTypeID,
-		CreatorID:   &creatorID,
+	}, services.ActionContext{
+		TriggeredByAction: true,
+		ExecutionChainID:  req.ExecutionChainID,
+		CascadeDepth:      req.CascadeDepth + 1,
+		SourceApplication: "logbook",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create item: %w", err)
 	}
+	itemID := result.Item.ID
 
 	slog.Info("item created from logbook action",
 		slog.String("component", "logbook-actions"),
-		slog.Int64("item_id", itemID),
+		slog.Int("item_id", itemID),
 		slog.Int("workspace_id", config.WorkspaceID),
 	)
 
-	// Emit item created event with cascade context so workspace actions can fire
-	if h.eventCoordinator != nil {
-		item := &models.Item{
-			ID:          int(itemID),
-			WorkspaceID: config.WorkspaceID,
-			Title:       title,
-			ItemTypeID:  &itemTypeID,
-			CreatorID:   &creatorID,
-		}
-		// Load workspace key for event emission
-		if key, err := h.workspaceRepo.GetKey(config.WorkspaceID); err == nil {
-			item.WorkspaceKey = key
-		}
-
-		h.eventCoordinator.EmitItemCreatedWithContext(item, creatorID, services.ActionContext{
-			TriggeredByAction: true,
-			ExecutionChainID:  req.ExecutionChainID,
-			CascadeDepth:      req.CascadeDepth + 1,
-			SourceApplication: "logbook",
-		})
-	}
-
-	return map[string]interface{}{
+	return map[string]any{
 		"item_id":      itemID,
 		"title":        title,
 		"workspace_id": config.WorkspaceID,
 	}, nil
 }
 
-func (h *LogbookNodeExecutionHandler) executeCreateAsset(nodeConfig string, event *models.LogbookActionEvent, req *models.NodeExecutionRequest) (map[string]interface{}, error) {
+func (h *LogbookNodeExecutionHandler) executeCreateAsset(nodeConfig string, event *models.LogbookActionEvent, req *models.NodeExecutionRequest) (map[string]any, error) {
 	var config models.CreateAssetNodeConfig
 	if err := json.Unmarshal([]byte(nodeConfig), &config); err != nil {
 		return nil, fmt.Errorf("failed to parse create_asset config: %w", err)
+	}
+	if config.AssetSetID <= 0 || config.AssetTypeID <= 0 {
+		return nil, fmt.Errorf("create_asset requires positive asset_set_id and asset_type_id")
+	}
+	if event.ActorUserID <= 0 {
+		return nil, fmt.Errorf("create_asset requires an identified actor")
 	}
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &config.Title, Policy: sanitize.PlainTextField},
@@ -209,18 +197,20 @@ func (h *LogbookNodeExecutionHandler) executeCreateAsset(nodeConfig string, even
 
 	// Authorize: the action config may target any asset set, so verify the
 	// acting user has create permission on the target set before inserting.
-	if h.assetHandler != nil {
-		hasPerm, permErr := h.assetHandler.HasAssetSetPermission(event.ActorUserID, config.AssetSetID, services.AssetPermissionKeyCreate)
-		if permErr != nil {
-			return nil, fmt.Errorf("failed to check asset set permission: %w", permErr)
-		}
-		if !hasPerm {
-			return nil, fmt.Errorf("user %d not authorized to create assets in set %d", event.ActorUserID, config.AssetSetID)
-		}
+	if h.assetHandler == nil || h.assetHandler.AssetService() == nil {
+		return nil, fmt.Errorf("create_asset blocked: asset permission or mutation service not configured")
 	}
-
+	hasPerm, permErr := h.assetHandler.HasAssetSetPermission(event.ActorUserID, config.AssetSetID, services.AssetPermissionKeyCreate)
+	if permErr != nil {
+		return nil, fmt.Errorf("failed to check asset set permission: %w", permErr)
+	}
+	if !hasPerm {
+		return nil, fmt.Errorf("user %d not authorized to create assets in set %d", event.ActorUserID, config.AssetSetID)
+	}
 	createdAt := time.Now()
-	assetID, err := h.assetRepo.CreateAsset(repository.CreateAssetInput{
+	asset, err := h.assetHandler.AssetService().CreateAssetWithContext(services.AuditActor{
+		UserID: event.ActorUserID, Source: "logbook_action",
+	}, repository.CreateAssetInput{
 		SetID:       config.AssetSetID,
 		AssetTypeID: config.AssetTypeID,
 		CategoryID:  config.CategoryID,
@@ -230,26 +220,18 @@ func (h *LogbookNodeExecutionHandler) executeCreateAsset(nodeConfig string, even
 		AssetTag:    config.AssetTag,
 		CreatedBy:   event.ActorUserID,
 		CreatedAt:   createdAt,
+	}, nil, services.AssetAutomationContext{
+		TriggeredByAction: true,
+		ExecutionChainID:  req.ExecutionChainID,
+		CascadeDepth:      req.CascadeDepth + 1,
+		SourceApplication: "logbook",
 	})
 	if err != nil {
 		return nil, err
 	}
+	assetID := asset.ID
 
-	// Emit asset action event with cascade context (once asset action service exists)
-	if h.eventCoordinator != nil && h.eventCoordinator.GetAssetActionService() != nil {
-		h.eventCoordinator.GetAssetActionService().EmitAssetActionEvent(&models.AssetActionEvent{
-			EventType:         models.AssetTriggerAssetCreated,
-			SetID:             config.AssetSetID,
-			AssetID:           assetID,
-			ActorUserID:       event.ActorUserID,
-			TriggeredByAction: true,
-			ExecutionChainID:  req.ExecutionChainID,
-			CascadeDepth:      req.CascadeDepth + 1,
-			SourceApplication: "logbook",
-		})
-	}
-
-	return map[string]interface{}{
+	return map[string]any{
 		"asset_id":     assetID,
 		"title":        title,
 		"asset_set_id": config.AssetSetID,

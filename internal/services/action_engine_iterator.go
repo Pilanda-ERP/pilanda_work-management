@@ -2,63 +2,31 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/repository/actionutil"
 )
 
-// defaultIteratorMaxItems caps the per-iterator emission count when the node
-// config doesn't override it. Prevents a misconfigured `descendants` iterator
-// on a pathological tree from running thousands of transitions.
+// defaultIteratorMaxItems bounds unconfigured iterator fan-out.
 const defaultIteratorMaxItems = 1000
 
-// maxStepsPerFlow caps the total node executions a single action invocation
-// may perform, including iterator bodies summed across iterations. Per-iterator
-// caps (defaultIteratorMaxItems) only protect a single level — a 1000-item
-// outer iterator wrapping a 1000-item inner iterator multiplies to 1M body
-// executions, which the cascade-depth guard does not catch (those are within
-// one action, not across actions). Bail at this budget instead.
+// maxStepsPerFlow bounds total execution, including multiplicative nested
+// iterator bodies that per-iterator limits cannot contain.
 const maxStepsPerFlow = 10_000
 
-// errStepBudgetExceeded is returned when an action invocation tries to execute
-// more nodes than maxStepsPerFlow allows. The caller marks the action
-// execution failed and records this error on the trace.
+// errStepBudgetExceeded fails and traces action invocations over the budget.
 var errStepBudgetExceeded = fmt.Errorf("action step budget exceeded (%d): nested iterator likely fanned out beyond safe bounds", maxStepsPerFlow)
 
-// iteratorBodyNodes computes the set of nodes that form an iterator's body —
-// all nodes reachable from the iterator's outgoing edges. The engine runs
-// this subgraph once per emitted item with ctx.Item swapped, then marks the
-// body as executed in the outer loop.
-//
-// v1 constraint: a body node's incoming edges must all originate from
-// iterator-body nodes (no joining back from outside). The runtime trusts the
-// validator at action-creation time and doesn't re-check here.
+// iteratorBodyNodes finds nodes reachable from iterator edges for each emitted
+// item. It trusts creation-time validation that no outside edges join the body.
 func iteratorBodyNodes(iteratorNodeID int, edges []models.ActionEdge) map[int]bool {
-	body := map[int]bool{}
-	queue := []int{}
-
-	for _, e := range edges {
-		if e.SourceNodeID == iteratorNodeID && !body[e.TargetNodeID] {
-			body[e.TargetNodeID] = true
-			queue = append(queue, e.TargetNodeID)
-		}
-	}
-
-	for len(queue) > 0 {
-		next := queue[0]
-		queue = queue[1:]
-		for _, e := range edges {
-			if e.SourceNodeID == next && !body[e.TargetNodeID] {
-				body[e.TargetNodeID] = true
-				queue = append(queue, e.TargetNodeID)
-			}
-		}
-	}
-
-	return body
+	return actionutil.Descendants(iteratorNodeID, edges, func(edge models.ActionEdge) (int, int) {
+		return edge.SourceNodeID, edge.TargetNodeID
+	})
 }
 
 // runIterator handles a single iterator node: it executes the iterator's
@@ -71,7 +39,7 @@ func (as *ActionService) runIterator(
 	stepResult *models.StepResult,
 	allNodes []models.ActionNode,
 	allEdges []models.ActionEdge,
-	executedNodes map[int]bool,
+	markExecuted func(int),
 ) error {
 	// Run the iterator-specific executor, which populates stepResult.Output.
 	// Currently only related_items is an iterator; future iterators get added
@@ -128,7 +96,7 @@ func (as *ActionService) runIterator(
 
 	// Mark every body node as executed so the outer loop doesn't re-run them.
 	for nodeID := range body {
-		executedNodes[nodeID] = true
+		markExecuted(nodeID)
 	}
 
 	// Replace the items slice with a JSON-friendly summary in the step output
@@ -163,76 +131,48 @@ func (as *ActionService) runBodyOnce(
 		}
 	}
 
-	sorted, err := as.topologicalSort(bodyNodes, bodyEdges)
-	if err != nil {
-		return nil, fmt.Errorf("iterator body subgraph: %w", err)
-	}
-
-	executed := map[int]bool{}
-	var results []models.StepResult
-
-	for _, n := range sorted {
-		// Reuse the outer canExecuteNode logic with this body's local step
-		// results. Entry nodes have no incoming edge after the iterator->body
-		// edge is stripped, so allow roots within the body subgraph.
-		if !as.canExecuteNodeWithResults(n.ID, bodyEdges, executed, results, true) {
-			continue
-		}
-
-		ctx.TotalSteps++
-		if ctx.TotalSteps > maxStepsPerFlow {
-			return results, errStepBudgetExceeded
-		}
-
-		nodeCopy := n
-		step := models.StepResult{
-			NodeID:    n.ID,
-			NodeType:  n.NodeType,
-			Status:    models.ActionStatusRunning,
-			StartedAt: time.Now(),
-		}
-
+	run, err := actionutil.RunFlow(ctx.Context, bodyNodes, bodyEdges, actionutil.FlowOptions{
+		// Entry nodes have no incoming edge after the iterator->body edge is
+		// stripped, so allow roots within the body subgraph.
+		AllowRoots:        true,
+		MaxSteps:          maxStepsPerFlow,
+		BudgetExceededErr: errStepBudgetExceeded,
+		TotalSteps:        &ctx.TotalSteps,
+	}, func(node *models.ActionNode, step *models.StepResult, markExecuted func(int)) error {
 		// Iterators inside iterator bodies are valid — recurse.
-		if n.NodeType.IsIterator() {
-			err := as.runIterator(&nodeCopy, ctx, &step, allNodes, allEdges, executed)
-			completedAt := time.Now()
-			step.CompletedAt = &completedAt
-			if err != nil {
-				step.Status = models.ActionStatusFailed
-				step.ErrorMessage = err.Error()
+		if node.NodeType.IsIterator() {
+			if err := as.runIterator(node, ctx, step, allNodes, allEdges, markExecuted); err != nil {
 				slog.Warn("nested iterator failed",
 					slog.String("component", "actions"),
-					slog.Int("node_id", n.ID),
+					slog.Int("node_id", node.ID),
 					slog.Any("error", err),
 				)
-			} else {
-				step.Status = models.ActionStatusCompleted
-				executed[n.ID] = true
+				return err
 			}
-			results = append(results, step)
-			continue
+			return nil
 		}
-
-		err := as.executeNode(&nodeCopy, ctx, &step)
-		completedAt := time.Now()
-		step.CompletedAt = &completedAt
-		if err != nil {
-			step.Status = models.ActionStatusFailed
-			step.ErrorMessage = err.Error()
+		if err := as.executeNode(node, ctx, step); err != nil {
 			slog.Warn("iterator body node failed",
 				slog.String("component", "actions"),
-				slog.Int("node_id", n.ID),
-				slog.String("node_type", string(n.NodeType)),
+				slog.Int("node_id", node.ID),
+				slog.String("node_type", string(node.NodeType)),
 				slog.Any("error", err),
 			)
-		} else {
-			step.Status = models.ActionStatusCompleted
-			executed[n.ID] = true
+			return err
 		}
-		results = append(results, step)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, actionutil.ErrCycleDetected) {
+			return run.Steps, fmt.Errorf("iterator body subgraph: %w", err)
+		}
+		// The body loop only fails on a canceled context; abort the iterator.
+		return run.Steps, err
 	}
-
-	return results, nil
+	if run.BudgetExceeded {
+		return run.Steps, errStepBudgetExceeded
+	}
+	return run.Steps, nil
 }
 
 // executeRelatedItems is the iterator's per-execution producer: it fetches
@@ -276,7 +216,7 @@ func (as *ActionService) executeRelatedItems(node *models.ActionNode, ctx *model
 			return fmt.Errorf("related_items: source-workspace permission check: %w", err)
 		}
 		if !ok {
-			stepResult.Output = map[string]interface{}{
+			stepResult.Output = map[string]any{
 				"relation":   config.Relation,
 				"item_count": 0,
 				"items":      []*models.Item{},
@@ -349,7 +289,7 @@ func (as *ActionService) executeRelatedItems(node *models.ActionNode, ctx *model
 		truncated = true
 	}
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"relation":   config.Relation,
 		"item_count": len(items),
 		"items":      items, // consumed by runIterator, then deleted before trace serialization

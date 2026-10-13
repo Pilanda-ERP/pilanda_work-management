@@ -1,76 +1,77 @@
 <script>
-  import { onMount } from 'svelte';
-  import { slide } from 'svelte/transition';
-  import { currentRoute, navigate, isWorkspaceRoute, GLOBAL_COLLECTION_VIEWS } from '../router.js';
-  import { authStore, permissionStore, uiStore, currentWorkspace, workspacesStore, workspacePermissions, ssoStore, workspaceDataStore, activityStore, collectionStore } from '../stores';
-  import EmailVerificationBanner from '../features/notifications/EmailVerificationBanner.svelte';
-  import { moduleSettings } from '../stores/moduleSettings.js';
-  import { attachmentStatus } from '../stores/attachmentStatus.svelte.js';
-  import { aiStore } from '../stores/aiStore.svelte.js';
-  import { chatStore } from '../stores/chatStore.svelte.js';
-  import { logbookStore } from '../stores/logbook.svelte.js';
-  import { capabilitiesStore } from '../stores/capabilities.svelte.js';
-  import { startNotificationPoller } from '../stores/notifications.js';
-  import { desktopBridge } from '../desktop/bridge.svelte.js';
-  import { initDesktopFocusRefresh } from '../utils/desktopFocusRefresh.svelte.js';
-  import { api } from '../api.js';
-  import { t } from '../stores/i18n.svelte.js';
-  import NotFound from './NotFound.svelte';
-  import Workspaces from '../workspaces/Workspaces.svelte';
-  import WorkspaceSettings from '../workspaces/WorkspaceSettings.svelte';
-  import Collections from '../features/collections/Collections.svelte';
-  import CollectionsList from '../features/collections/CollectionsList.svelte';
-  import NotificationsPage from './NotificationsPage.svelte';
-  import ApprovalsInbox from './ApprovalsInbox.svelte';
-  import UserProfile from './UserProfile.svelte';
-  import Security from './Security.svelte';
-  import SearchPage from './SearchPage.svelte';
-  import About from './About.svelte';
-  import ApiDocs from './ApiDocs.svelte';
-  import CliAuthorize from './CliAuthorize.svelte';
-  import OAuthAuthorize from './OAuthAuthorize.svelte';
-  import Channels from '../features/channels/Channels.svelte';
-  import Customers from '../workspaces/Customers.svelte';
-  import TeamsList from '../teams/TeamsList.svelte';
-  import TeamDetail from '../teams/TeamDetail.svelte';
-  import Hub from '../layout/Hub.svelte';
-  import Footer from '../layout/Footer.svelte';
-  import {
-    Layers3, BarChart3, Sheet, Target, User, Notebook, GitBranch, MapPin, Shield, Home, CheckSquare, MoreHorizontal, Inbox, SquareKanban, FolderOpen
-  } from '@lucide/svelte';
-  import GlobalConfirmDialog from '../dialogs/GlobalConfirmDialog.svelte';
-  import FloatingTimer from '../features/time/FloatingTimer.svelte';
-  import ToastContainer from '../features/notifications/ToastContainer.svelte';
-  import Spinner from '../components/Spinner.svelte';
-  import ModalBackdrop from '../components/ModalBackdrop.svelte';
-  import Button from '../components/Button.svelte';
-  import PermissionGuard from '../layout/PermissionGuard.svelte';
-  import UnauthorizedAccess from './UnauthorizedAccess.svelte';
-  import WorkspaceNavigation from '../workspaces/WorkspaceNavigation.svelte';
-  import CollectionNavigation from '../features/collections/CollectionNavigation.svelte';
-  import { clearWorkspaceGradient } from '../stores/workspaceGradient.svelte.js';
+  import { Menu } from '@lucide/svelte';
   import { useEventListener } from 'runed';
-  import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+  import { api } from '../api.js';
+  import Button from '../components/Button.svelte';
+  import Spinner from '../components/Spinner.svelte';
+  import EmailVerificationBanner from '../features/notifications/EmailVerificationBanner.svelte';
+  import CollectionNavigation from '../features/collections/CollectionNavigation.svelte';
+  import Footer from '../layout/Footer.svelte';
   import MainSidebar from '../layout/MainSidebar.svelte';
+  import {
+    GLOBAL_COLLECTION_VIEWS,
+    currentRoute,
+    isWorkspaceRoute,
+    navigate,
+  } from '../router.js';
+  import { hydrateCurrentWorkspaceFromSharedData } from '../services/authenticatedShellUI.js';
+  import {
+    authStore,
+    currentWorkspace,
+    uiStore,
+    workspaceDataStore,
+    workspacesStore,
+  } from '../stores';
+  import { aiStore } from '../stores/aiStore.svelte.js';
   import { terminalStore } from '../stores/terminalStore.svelte.js';
+  import { clearWorkspaceGradient } from '../stores/workspaceGradient.svelte.js';
+  import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+  import { LazyComponentLoader } from '../utils/lazyComponentLoader.svelte.js';
+  import { hasSessionExpired, reloadIfBuildChanged } from '../utils/lazyLoadRecovery.js';
+  import WorkspaceNavigation from '../workspaces/WorkspaceNavigation.svelte';
+  import WorkspaceBreadcrumbs from '../workspaces/WorkspaceBreadcrumbs.svelte';
+  import MainAppOverlays from './MainAppOverlays.svelte';
+  import MainRouteContent from './MainRouteContent.svelte';
+  import { useMainAppLifecycle } from './useMainAppLifecycle.js';
+  import {
+    CREATE_MODAL_WORKSPACE_VIEWS,
+    MAIN_APP_COMPONENT_LOADERS,
+    MAIN_APP_TEST_VIEWS,
+    resolveEffectiveMainAppView,
+  } from './mainAppRoutes.js';
+  import {
+    getMainAppWorkspaceRedirect,
+    resolveMainAppWorkspaceContext,
+  } from './mainAppWorkspaceContext.js';
+  import { getDisabledViewRedirect } from './mainAppViewGuard.js';
+  import { viewSettingsStore } from '../stores/viewSettings.svelte.js';
 
   let showCommandPalette = $state(false);
   let showCreateModal = $state(false);
   let showChatPanel = $state(false);
+  let activeSidebarSurface = $state(null);
   let createModalInitialType = $state('work-item');
   let createModalSkipNavigate = $state(false);
+  let createModalWorkspaceId = $state(null);
+  let createModalParentContext = $state(null);
   let showEmailVerificationBanner = $state(false);
+  let mobileWorkspaceNavOpen = $state(false);
 
-  // Terminal panel state
   let terminalState = $derived($terminalStore);
   let TerminalPanelComponent = $state(null);
   let terminalLoading = $state(false);
   let isResizingTerminal = $state(false);
   let resizeStartX = $state(0);
   let resizeStartPercent = $state(50);
-  let PomodoroSettingsModalComponent = $state(null);
-  let AboutModalComponent = $state(null);
-  let desktopModalLoading = $state(false);
+
+  let sessionRevalidationPromise = null;
+
+  const lazyComponents = new LazyComponentLoader(MAIN_APP_COMPONENT_LOADERS, {
+    onError: (view, error) => {
+      console.error(`Failed to load component for ${view}:`, error);
+      void recoverFromLazyLoadFailure();
+    },
+  });
 
   async function loadTerminalPanel() {
     if (TerminalPanelComponent || terminalLoading) return;
@@ -78,56 +79,32 @@
     try {
       const module = await import('../features/terminal/TerminalPanel.svelte');
       TerminalPanelComponent = module.default;
-    } catch (err) {
-      console.error('Failed to load terminal panel:', err);
+    } catch (error) {
+      console.error('Failed to load terminal panel:', error);
     } finally {
       terminalLoading = false;
     }
   }
 
   function toggleTerminal() {
+    closeAllSidebarSurfaces();
     terminalStore.toggle();
-    if (!TerminalPanelComponent) {
-      loadTerminalPanel();
-    }
+    if (!TerminalPanelComponent) void loadTerminalPanel();
   }
 
-  async function loadDesktopModal(modal) {
-    if (desktopModalLoading) return;
-    if (modal === 'pomodoro-settings' && PomodoroSettingsModalComponent) return;
-    if (modal === 'about' && AboutModalComponent) return;
-
-    desktopModalLoading = true;
-    try {
-      if (modal === 'pomodoro-settings') {
-        const module = await import('../dialogs/PomodoroSettingsModal.svelte');
-        PomodoroSettingsModalComponent = module.default;
-      } else if (modal === 'about') {
-        const module = await import('../dialogs/AboutModal.svelte');
-        AboutModalComponent = module.default;
-      }
-    } catch (err) {
-      console.error('Failed to load desktop modal:', err);
-    } finally {
-      desktopModalLoading = false;
-    }
-  }
-
-  function handleTerminalResizeStart(e) {
-    e.preventDefault();
-    resizeStartX = e.clientX;
+  function handleTerminalResizeStart(event) {
+    event.preventDefault();
+    resizeStartX = event.clientX;
     resizeStartPercent = terminalState.splitPercent;
     isResizingTerminal = true;
   }
 
-  function onTerminalMouseMove(e) {
+  function onTerminalMouseMove(event) {
     const container = document.querySelector('.main-split-container');
     if (!container) return;
     const rect = container.getBoundingClientRect();
-    const deltaX = e.clientX - resizeStartX;
-    const deltaPercent = (deltaX / rect.width) * 100;
-    const newPercent = resizeStartPercent + deltaPercent;
-    terminalStore.setSplitPercent(newPercent);
+    const deltaX = event.clientX - resizeStartX;
+    terminalStore.setSplitPercent(resizeStartPercent + (deltaX / rect.width) * 100);
   }
 
   function onTerminalMouseUp() {
@@ -147,661 +124,149 @@
     };
   });
 
-  // Lazy loaded components registry
-  let componentRegistry = $state(new Map());
-  let loadingRoutes = $state(new Set());
-  let lastSpaceTime = 0;
-  const DOUBLE_SPACE_THRESHOLD = 300; // milliseconds
+  async function recoverFromLazyLoadFailure() {
+    if (!authStore.isAuthenticated) return;
 
-  // Component loaders with literal import paths for Vite's static analysis
-  const componentLoaders = {
-    'admin': () => import('./Admin.svelte'),
-    'time': () => import('../features/time/Time.svelte'),
-    'test-cases': () => import('../features/testing/TestCases.svelte'),
-    'test-sets': () => import('../features/testing/TestSets.svelte'),
-    'test-templates': () => import('../features/testing/TestTemplates.svelte'),
-    'test-runs': () => import('../features/testing/TestRuns.svelte'),
-    'test-reports': () => import('../features/testing/TestReports.svelte'),
-    'test-steps': () => import('../features/testing/TestSteps.svelte'),
-    'test-execution': () => import('../features/testing/TestExecution.svelte'),
-    'test-run-detail': () => import('../features/testing/TestRunDetail.svelte'),
-    'test-template-detail': () => import('../features/testing/TestTemplateDetail.svelte'),
-    'milestones': () => import('../features/milestones/Milestones.svelte'),
-    'milestone-detail': () => import('../features/milestones/MilestoneDetail.svelte'),
-    'iterations': () => import('../features/iterations/Iterations.svelte'),
-    'iteration-detail': () => import('../features/iterations/IterationDetail.svelte'),
-    'iteration-dependencies': () => import('../features/iterations/IterationDependencies.svelte'),
-    'assets': () => import('../features/assets/AssetBrowser.svelte'),
-    'asset-detail': () => import('../features/assets/AssetBrowser.svelte'),
-    'asset-settings': () => import('../features/assets/AssetManager.svelte'),
-    'workspace-board': () => import('../features/collections/CollectionBoard.svelte'),
-    'workspace-board-config': () => import('../settings/BoardConfigurationPage.svelte'),
-    'workspace-backlog': () => import('../features/collections/CollectionBacklog.svelte'),
-    'workspace-list': () => import('../features/collections/CollectionList.svelte'),
-    'workspace-tree': () => import('../features/collections/CollectionTree.svelte'),
-    'workspace-map': () => import('../features/collections/CollectionMap.svelte'),
-    'workspace-roadmap': () => import('../features/collections/CollectionRoadmap.svelte'),
-    'workspace-pages': () => import('../features/pages/PagesView.svelte'),
-    'workspace-pages-archived': () => import('../features/pages/ArchivedPagesPage.svelte'),
-    // Global collection views (no workspace)
-    'collection-board': () => import('../features/collections/CollectionBoard.svelte'),
-    'collection-board-config': () => import('../settings/BoardConfigurationPage.svelte'),
-    'collection-backlog': () => import('../features/collections/CollectionBacklog.svelte'),
-    'collection-list': () => import('../features/collections/CollectionList.svelte'),
-    'collection-tree': () => import('../features/collections/CollectionTree.svelte'),
-    'collection-map': () => import('../features/collections/CollectionMap.svelte'),
-    'collection-roadmap': () => import('../features/collections/CollectionRoadmap.svelte'),
-    'workspace-iterations': () => import('../features/iterations/Iterations.svelte'),
-    'workspace-milestones': () => import('../features/milestones/Milestones.svelte'),
-    'workspace-actions': () => import('../features/actions/ActionsSettings.svelte'),
-    'workspace-analytics': () => import('../features/analytics/WorkspaceAnalytics.svelte'),
-    'command-palette': () => import('../layout/CommandPalette.svelte'),
-    'create-modal': () => import('../dialogs/CreateModal.svelte'),
-    'homepage': () => import('./Homepage.svelte'),
-    'item-detail': () => import('../features/items/ItemDetail.svelte'),
-    'personal-task-detail': () => import('../features/personal/PersonalTaskDetail.svelte'),
-    'workspace-detail': () => import('../workspaces/WorkspaceWelcome.svelte'),
-    'workspace-overview': () => import('../workspaces/WorkspaceWelcome.svelte'),
-    'personal-workspace': () => import('../workspaces/WorkspaceDetail.svelte'),
-    'workspace-calendar': () => import('../features/time/WeeklyCalendar.svelte'),
-    'workspace-reviews': () => import('../features/personal/PersonalReview.svelte'),
-    'workflow-designer': () => import('../features/workflows/WorkflowDesigner.svelte'),
-    'configuration-set-detail': () => import('../settings/ConfigurationSetDetail.svelte'),
-    'workspace-look-and-feel': () => import('../workspaces/WorkspaceLookAndFeel.svelte'),
-    'personal-plan': () => import('../features/personal/PlanMyDay.svelte'),
-    'logbook': () => import('../features/logbook/Logbook.svelte'),
-    'logbook-document': () => import('../features/logbook/DocumentDetail.svelte'),
-    'chat-panel': () => import('../features/chat/ChatPanel.svelte'),
-    'terminal-panel': () => import('../features/terminal/TerminalPanel.svelte')
-  };
+    sessionRevalidationPromise ??= hasSessionExpired(api.auth.getCurrentUser);
+    const sessionExpired = await sessionRevalidationPromise;
+    sessionRevalidationPromise = null;
 
-  // Preload all chunks after initial load for faster navigation
-  function preloadChunks() {
-    // Use requestIdleCallback for non-blocking preload, fallback to setTimeout
-    const schedulePreload = window.requestIdleCallback || ((cb) => setTimeout(cb, 1000));
+    if (sessionExpired) {
+      authStore.clearAuth();
+      showCommandPalette = false;
+      closeCreateModal();
+      showChatPanel = false;
+      return;
+    }
 
-    schedulePreload(() => {
-      Object.entries(componentLoaders).forEach(([view, loader]) => {
-        loader().then(module => {
-          if (!componentRegistry.has(view)) {
-            componentRegistry = new Map(componentRegistry).set(view, module.default);
-          }
-        }).catch(() => {});
-      });
-    });
+    await reloadIfBuildChanged();
   }
 
-  // Route configuration for lazy-loaded components (metadata only)
-  const routeConfig = {
-    'admin': {
-      loadingMsg: 'Loading Admin Panel...',
-      errorMsg: 'Failed to load Admin Panel',
-      requirePermission: 'systemAdmin'
-    },
-    'time': {
-      loadingMsg: 'Loading Time & Projects...',
-      errorMsg: 'Failed to load Time & Projects'
-    },
-    'test-cases': {
-      loadingMsg: 'Loading Test Cases...',
-      errorMsg: 'Failed to load Test Cases',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'test-sets': {
-      loadingMsg: 'Loading Test Plans...',
-      errorMsg: 'Failed to load Test Plans',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'test-templates': {
-      loadingMsg: 'Loading Test Templates...',
-      errorMsg: 'Failed to load Test Templates',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'test-runs': {
-      loadingMsg: 'Loading Test Runs...',
-      errorMsg: 'Failed to load Test Runs',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'test-reports': {
-      loadingMsg: 'Loading Test Reports...',
-      errorMsg: 'Failed to load Test Reports',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'test-steps': {
-      loadingMsg: 'Loading Test Steps...',
-      errorMsg: 'Failed to load Test Steps',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'test-execution': {
-      loadingMsg: 'Loading Test Execution...',
-      errorMsg: 'Failed to load Test Execution',
-      wrapper: 'none'
-    },
-    'test-run-detail': {
-      loadingMsg: 'Loading Test Run Details...',
-      errorMsg: 'Failed to load Test Run Details',
-      wrapper: 'none'
-    },
-    'test-template-detail': {
-      loadingMsg: 'Loading Template Details...',
-      errorMsg: 'Failed to load Template Details',
-      wrapper: 'none'
-    },
-    'milestones': {
-      loadingMsg: 'Loading Milestones...',
-      errorMsg: 'Failed to load Milestones',
-      wrapper: 'surface-full'
-    },
-    'milestone-detail': {
-      loadingMsg: 'Loading Milestone...',
-      errorMsg: 'Failed to load Milestone',
-      wrapper: 'surface-full',
-      getProps: (route) => ({
-        milestoneId: route.params.id,
-        workspaceId: route.query?.workspaceId || null
-      })
-    },
-    'iterations': {
-      loadingMsg: 'Loading Iterations...',
-      errorMsg: 'Failed to load Iterations',
-      wrapper: 'surface-full',
-      getProps: (route) => ({ typeId: route.params.typeId })
-    },
-    'iteration-detail': {
-      loadingMsg: 'Loading Iteration...',
-      errorMsg: 'Failed to load Iteration',
-      wrapper: 'surface-full',
-      getProps: (route) => ({
-        iterationId: route.params.id,
-        workspaceId: route.query?.workspaceId || null
-      })
-    },
-    'iteration-dependencies': {
-      loadingMsg: 'Loading Dependency Analysis...',
-      errorMsg: 'Failed to load Dependency Analysis',
-      wrapper: 'surface-full',
-      getProps: (route) => ({
-        iterationId: route.params.id,
-      })
-    },
-    'assets': {
-      loadingMsg: 'Loading Assets...',
-      errorMsg: 'Failed to load Assets',
-      wrapper: 'surface-full'
-    },
-    'asset-detail': {
-      loadingMsg: 'Loading Asset...',
-      errorMsg: 'Failed to load Asset',
-      wrapper: 'surface-full',
-      getProps: (route) => ({ assetId: route.params.id })
-    },
-    'asset-settings': {
-      loadingMsg: 'Loading Asset Settings...',
-      errorMsg: 'Failed to load Asset Settings',
-      wrapper: 'surface-admin'
-    },
-    'workspace-board': {
-      loadingMsg: 'Loading Board View...',
-      errorMsg: 'Failed to load Board View',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-board-config': {
-      loadingMsg: 'Loading Board Configuration...',
-      errorMsg: 'Failed to load Board Configuration',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-backlog': {
-      loadingMsg: 'Loading Backlog View...',
-      errorMsg: 'Failed to load Backlog View',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-list': {
-      loadingMsg: 'Loading List View...',
-      errorMsg: 'Failed to load List View',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-tree': {
-      loadingMsg: 'Loading Tree View...',
-      errorMsg: 'Failed to load Tree View',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-map': {
-      loadingMsg: 'Loading Map View...',
-      errorMsg: 'Failed to load Map View',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-roadmap': {
-      loadingMsg: 'Loading Roadmap...',
-      errorMsg: 'Failed to load Roadmap',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-pages': {
-      loadingMsg: 'Loading Pages...',
-      errorMsg: 'Failed to load Pages',
-      wrapper: 'none',
-      getProps: (route) => ({
-        workspaceId: Number(route.params.id),
-        pageId: route.params.pageId ? Number(route.params.pageId) : null,
-      })
-    },
-    'workspace-pages-archived': {
-      loadingMsg: 'Loading Archived Pages...',
-      errorMsg: 'Failed to load Archived Pages',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: Number(route.params.id) })
-    },
-    // Global collection views (no workspace)
-    'collection-board': {
-      loadingMsg: 'Loading Board View...',
-      errorMsg: 'Failed to load Board View',
-      getProps: (route) => ({ workspaceId: null, collectionId: route.params.id })
-    },
-    'collection-board-config': {
-      loadingMsg: 'Loading Board Configuration...',
-      errorMsg: 'Failed to load Board Configuration',
-      getProps: (route) => ({ workspaceId: null, collectionId: route.params.id })
-    },
-    'collection-backlog': {
-      loadingMsg: 'Loading Backlog View...',
-      errorMsg: 'Failed to load Backlog View',
-      getProps: (route) => ({ workspaceId: null, collectionId: route.params.id })
-    },
-    'collection-list': {
-      loadingMsg: 'Loading List View...',
-      errorMsg: 'Failed to load List View',
-      getProps: (route) => ({ workspaceId: null, collectionId: route.params.id })
-    },
-    'collection-tree': {
-      loadingMsg: 'Loading Tree View...',
-      errorMsg: 'Failed to load Tree View',
-      getProps: (route) => ({ workspaceId: null, collectionId: route.params.id })
-    },
-    'collection-map': {
-      loadingMsg: 'Loading Map View...',
-      errorMsg: 'Failed to load Map View',
-      getProps: (route) => ({ workspaceId: null, collectionId: route.params.id })
-    },
-    'collection-roadmap': {
-      loadingMsg: 'Loading Roadmap...',
-      errorMsg: 'Failed to load Roadmap',
-      getProps: (route) => ({ workspaceId: null, collectionId: route.params.id })
-    },
-    'workspace-iterations': {
-      loadingMsg: 'Loading Iterations...',
-      errorMsg: 'Failed to load Iterations',
-      wrapper: 'surface-full',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'workspace-milestones': {
-      loadingMsg: 'Loading Milestones...',
-      errorMsg: 'Failed to load Milestones',
-      wrapper: 'surface-full',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'workspace-actions': {
-      loadingMsg: 'Loading Actions...',
-      errorMsg: 'Failed to load Actions',
-      wrapper: 'none',
-      getProps: (route) => ({
-        workspaceId: route.params.id,
-        actionId: Number(route.params.actionId) || 0,
-      })
-    },
-    'workspace-analytics': {
-      loadingMsg: 'Loading Analytics...',
-      errorMsg: 'Failed to load Analytics',
-      wrapper: 'surface-full',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'command-palette': {
-      trigger: 'showCommandPalette'
-    },
-    'create-modal': {
-      trigger: 'showCreateModal'
-    },
-    'homepage': {
-      loadingMsg: 'Loading Homepage...',
-      errorMsg: 'Failed to load Homepage',
-      wrapper: 'surface-full'
-    },
-    'item-detail': {
-      loadingMsg: 'Loading Item Details...',
-      errorMsg: 'Failed to load Item Details',
-      getProps: (route) => {
-        const personal = route.path.startsWith('/personal');
-        const workspaceParam = route.params.workspaceKey || route.params.id;
-        const itemParam = route.params.itemKey || route.params.itemNumber || route.params.itemId;
-        const fullKeyMatch = !personal ? String(itemParam || '').match(/^([^/\s-]+)-(\d+)$/) : null;
-        const workspaceParamIsKey = !!workspaceParam && !/^\d+$/.test(String(workspaceParam));
-        const keyWorkspace = fullKeyMatch?.[1] || (workspaceParamIsKey ? workspaceParam : null);
-        const keyItemNumber = fullKeyMatch?.[2] || (keyWorkspace ? itemParam : null);
-        return {
-          workspaceId: personal ? $workspacesStore.personalWorkspace?.id : (keyWorkspace ? null : workspaceParam),
-          itemId: keyItemNumber || itemParam,
-          workspaceKey: !personal ? keyWorkspace : null,
-          itemNumber: !personal ? keyItemNumber : null,
-          canonicalizeKeyRoute: !personal && !!keyWorkspace,
-          tab: route.query.tab || 'comments',
-          moduleSettings: $moduleSettings
-        };
-      }
-    },
-    'personal-task-detail': {
-      loadingMsg: 'Loading Task...',
-      errorMsg: 'Failed to load Task',
-      getProps: (route) => ({
-        workspaceId: route.path.startsWith('/personal') ? $workspacesStore.personalWorkspace?.id : route.params.id,
-        itemId: route.params.itemId,
-        isModal: false
-      })
-    },
-    'workspace-detail': {
-      loadingMsg: 'Loading Workspace...',
-      errorMsg: 'Failed to load Workspace',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'workspace-overview': {
-      loadingMsg: 'Loading Workspace...',
-      errorMsg: 'Failed to load Workspace',
-      getProps: (route) => ({ workspaceId: route.params.id, collectionId: route.params.collectionId })
-    },
-    'personal-workspace': {
-      loadingMsg: 'Loading Personal Workspace...',
-      errorMsg: 'Failed to load Personal Workspace',
-      getProps: () => ({ workspaceId: $workspacesStore.personalWorkspace?.id })
-    },
-    'workspace-calendar': {
-      loadingMsg: 'Loading Calendar...',
-      errorMsg: 'Failed to load Calendar',
-      wrapper: 'surface-full',
-      getProps: (route) => ({
-        workspaceId: route.path.startsWith('/personal') ? $workspacesStore.personalWorkspace?.id : route.params.id
-      })
-    },
-    'workspace-reviews': {
-      loadingMsg: 'Loading Reviews...',
-      errorMsg: 'Failed to load Reviews',
-      wrapper: 'surface-full',
-      getProps: (route) => ({
-        currentUser: authStore.currentUser,
-        workspaceId: route.path.startsWith('/personal') ? $workspacesStore.personalWorkspace?.id : route.params.id
-      })
-    },
-    'workflow-designer': {
-      loadingMsg: 'Loading workflow designer...',
-      errorMsg: 'Failed to load workflow designer'
-    },
-    'configuration-set-detail': {
-      loadingMsg: 'Loading configuration set...',
-      errorMsg: 'Failed to load configuration set'
-    },
-    'workspace-look-and-feel': {
-      loadingMsg: 'Loading Look and Feel...',
-      errorMsg: 'Failed to load Look and Feel',
-      wrapper: 'none',
-      getProps: (route) => ({ workspaceId: route.params.id })
-    },
-    'personal-plan': {
-      loadingMsg: 'Loading Plan My Day...',
-      errorMsg: 'Failed to load Plan My Day',
-      wrapper: 'surface-full'
-    },
-    'logbook': {
-      loadingMsg: 'Loading Knowledge Base...',
-      errorMsg: 'Failed to load Knowledge Base',
-      wrapper: 'surface-full'
-    },
-    'logbook-document': {
-      loadingMsg: 'Loading Document...',
-      errorMsg: 'Failed to load Document',
-      wrapper: 'surface-full',
-      getProps: (route) => ({ documentId: route.params.documentId })
-    }
-  };
-
-  const testViews = new Set([
-    'test-cases',
-    'test-sets',
-    'test-templates',
-    'test-runs',
-    'test-reports',
-    'test-steps',
-    'test-run-detail',
-    'test-template-detail',
-    'test-execution',
-    'test-case-detail',
-    'test-set-detail'
-  ]);
-
-  function resolveRouteConfig(view) {
-    if (!view) {
-      return { key: null, config: null };
-    }
-
-    if (routeConfig[view]) {
-      return { key: view, config: routeConfig[view] };
-    }
-
-    for (const [key, config] of Object.entries(routeConfig)) {
-      if (config.matchViews?.includes(view)) {
-        return { key, config };
-      }
-    }
-
-    return { key: null, config: null };
+  function closeCreateModal() {
+    showCreateModal = false;
+    if (activeSidebarSurface === 'create') activeSidebarSurface = null;
+    createModalInitialType = 'work-item';
+    createModalSkipNavigate = false;
+    createModalWorkspaceId = null;
+    createModalParentContext = null;
   }
 
-  // Compute the effective view, replacing item-detail with personal-task-detail for personal workspaces
-  let effectiveView = $derived.by(() => {
-    const view = $currentRoute.view;
+  function closeAllSidebarSurfaces() {
+    activeSidebarSurface = null;
+    showCommandPalette = false;
+    showCreateModal = false;
+    showChatPanel = false;
+    createModalInitialType = 'work-item';
+    createModalSkipNavigate = false;
+    createModalWorkspaceId = null;
+    createModalParentContext = null;
+  }
 
-    // Check if this is an item-detail view and if the workspace is personal
-    if (view === 'item-detail') {
-      const workspaceId = $currentRoute.path?.startsWith('/personal')
-        ? $workspacesStore.personalWorkspace?.id
-        : parseInt($currentRoute.params?.id);
+  function activateSidebarSurface(surface) {
+    const shouldClose = activeSidebarSurface === surface;
+    closeAllSidebarSurfaces();
+    if (shouldClose) return;
 
-      // Check if this workspace is the personal workspace
-      if ($workspacesStore.personalWorkspace?.id && workspaceId === $workspacesStore.personalWorkspace?.id) {
-        return 'personal-task-detail';
+    activeSidebarSurface = surface;
+    showCommandPalette = surface === 'search';
+    showCreateModal = surface === 'create';
+    showChatPanel = surface === 'chat';
+  }
+
+  function handleSidebarSurfaceChange(surface) {
+    if (surface === null) {
+      if (['workspaces', 'notifications', 'profile'].includes(activeSidebarSurface)) {
+        activeSidebarSurface = null;
       }
+      return;
     }
+    activateSidebarSurface(surface);
+  }
 
-    return view;
+  function closeCommandPalette() {
+    showCommandPalette = false;
+    if (activeSidebarSurface === 'search') activeSidebarSurface = null;
+  }
+
+  function closeChatPanel() {
+    showChatPanel = false;
+    if (activeSidebarSurface === 'chat') activeSidebarSurface = null;
+  }
+
+  function showCreateDropdown() {
+    closeAllSidebarSurfaces();
+    createModalWorkspaceId = null;
+    createModalParentContext = null;
+    const currentWorkspaceId = $currentRoute.params?.id;
+    if (currentWorkspaceId && CREATE_MODAL_WORKSPACE_VIEWS.has($currentRoute.view)) {
+      createModalWorkspaceId = Number.parseInt(currentWorkspaceId, 10);
+    }
+    activeSidebarSurface = 'create';
+    showCreateModal = true;
+  }
+
+  function showCreateModalFromEvent(detail) {
+    closeAllSidebarSurfaces();
+    if (detail.type) createModalInitialType = detail.type;
+    createModalSkipNavigate = detail.skipNavigate || false;
+    createModalParentContext = detail.parentContext ?? null;
+    createModalWorkspaceId = detail.workspaceId
+      ? Number.parseInt(String(detail.workspaceId), 10)
+      : null;
+    activeSidebarSurface = 'create';
+    showCreateModal = true;
+  }
+
+  useMainAppLifecycle({
+    onEmailVerificationChange: (show) => showEmailVerificationBanner = show,
+    onShowCommandPalette: () => activateSidebarSurface('search'),
+    onShowCreateModal: showCreateModalFromEvent,
   });
 
-  let showWorkspaceNav = $derived(
-    !$uiStore.reviewFullscreen &&
-    $currentRoute.view !== 'workspaces' &&
-    !!$currentWorkspace &&
-    (isWorkspaceRoute($currentRoute.view) || effectiveView === 'personal-task-detail' || testViews.has($currentRoute.view))
+  const effectiveView = $derived(
+    resolveEffectiveMainAppView($currentRoute, $workspacesStore.personalWorkspace?.id)
   );
-
-  let showCollectionNav = $derived(
+  // Route-only predicate for surfaces that frame workspace content. The
+  // breadcrumb bar must not wait for workspace hydration: mounting it late
+  // shifts the whole app content down and breaks scroll positions.
+  const onWorkspaceSurfaceRoute = $derived(
+    $currentRoute.view !== 'workspaces' &&
+      (isWorkspaceRoute($currentRoute.view) ||
+        effectiveView === 'personal-task-detail' ||
+        MAIN_APP_TEST_VIEWS.has($currentRoute.view))
+  );
+  const showWorkspaceNav = $derived(
+    !$uiStore.reviewFullscreen && !!$currentWorkspace && onWorkspaceSurfaceRoute
+  );
+  const showWorkspaceBreadcrumbs = $derived(
+    !$uiStore.reviewFullscreen &&
+      (onWorkspaceSurfaceRoute || ['homepage', 'workspaces'].includes($currentRoute.view))
+  );
+  const showCollectionNav = $derived(
     !$uiStore.reviewFullscreen && GLOBAL_COLLECTION_VIEWS.has($currentRoute.view)
   );
 
-  let routeProps = $derived.by(() => getPropsForRoute(effectiveView));
-
-  onMount(async () => {
-    // Initialize activity tracking for adaptive polling
-    activityStore.init();
-
-    // Desktop (Tauri) clients: refresh open views on window/tab focus so
-    // backend changes (CLI edits, other users, agents) appear without a
-    // manual reload. Browser-only no-op.
-    initDesktopFocusRefresh();
-    desktopBridge.init();
-
-    // Start the shared notification poller (feeds tray, toasts, and the
-    // new-notification bus used by item views to refresh instantly).
-    startNotificationPoller();
-
-    // Load full app data for authenticated users
-    // (MainApp only renders when user is authenticated, App.svelte handles auth/setup)
-    await workspacesStore.load();
-    // Also load personal workspace so it's available immediately
-    workspacesStore.loadPersonalWorkspace();
-    moduleSettings.load();
-    attachmentStatus.load();
-    aiStore.load();
-    capabilitiesStore.load();
-    // Check logbook availability
-    logbookStore.checkAvailability().then(() => {
-      permissionStore.setLogbookAvailable(logbookStore.available);
-    });
-    // Load all permissions for permission checking (admin only)
-    await permissionStore.loadAllPermissions(authStore.currentUser);
-    // Load user and workspace permissions for current user
-    const userId = authStore.currentUser?.id;
-    if (userId) {
-      await Promise.all([
-        permissionStore.loadUserPermissions(userId),
-        workspacePermissions.loadPermissions(userId)
-      ]);
-    }
-
-    // Check asset sets availability for navigation visibility
-    try {
-      const sets = await api.assetSets.getAll();
-      permissionStore.setHasAssetSets(sets && sets.length > 0);
-    } catch (err) {
-      console.warn('Failed to check asset sets:', err);
-      permissionStore.setHasAssetSets(false);
-    }
-
-    // Check active portals for hub visibility
-    try {
-      const hubData = await api.hub.get();
-      permissionStore.setHasActivePortals(hubData.portals && hubData.portals.length > 0);
-    } catch (err) {
-      console.warn('Failed to check portals:', err);
-      permissionStore.setHasActivePortals(false);
-    }
-
-    // Check for email verification pending (after SSO callback redirect)
-    if (ssoStore.checkForEmailVerificationPending()) {
-      showEmailVerificationBanner = true;
-    } else {
-      // Also check current verification status from API
-      try {
-        const status = await ssoStore.getVerificationStatus();
-        if (status.configured && !status.email_verified) {
-          showEmailVerificationBanner = true;
-        }
-      } catch (err) {
-        console.warn('Failed to check email verification status:', err);
-      }
-    }
-
-    // Re-fetch collection data now that auth is established (fixes empty board after login)
-    collectionStore.reload();
-
-    // Preload chunks after app is ready for faster navigation
-    preloadChunks();
-  });
-
-  // Double-space handler for command palette (manual — not a simple hotkey)
-  useEventListener(() => document, 'keydown', (e) => {
-    if (e.code !== 'Space') return;
-
-    const target = /** @type {HTMLElement} */ (e.target);
-    const isInInputField = target.tagName === 'INPUT' ||
-                          target.tagName === 'TEXTAREA' ||
-                          target.contentEditable === 'true' ||
-                          target.closest('[contenteditable="true"]');
-    if (isInInputField) return;
-
-    const now = Date.now();
-    if (now - lastSpaceTime < DOUBLE_SPACE_THRESHOLD) {
-      e.preventDefault();
-      showCommandPalette = true;
-    } else {
-      e.preventDefault();
-    }
-    lastSpaceTime = now;
-  });
-
-  // Listen for create modal events and workspace refresh from other components
-  onMount(() => {
-    const pendingTimeouts = new Set();
-
-    function handleShowCreateModal(event) {
-      const detail = event.detail || {};
-
-      if (detail.type) {
-        createModalInitialType = detail.type;
-      }
-      createModalSkipNavigate = detail.skipNavigate || false;
-
-      showCreateModal = true;
-
-      if (detail.workspaceId) {
-        const workspaceId = typeof detail.workspaceId === 'string'
-          ? parseInt(detail.workspaceId, 10)
-          : detail.workspaceId;
-
-        const timeoutId = setTimeout(() => {
-          pendingTimeouts.delete(timeoutId);
-          window.dispatchEvent(new CustomEvent('set-create-workspace', {
-            detail: { workspaceId }
-          }));
-        }, detail.type ? 250 : 200);
-        pendingTimeouts.add(timeoutId);
-      }
-    }
-
-    window.addEventListener('show-create-modal', handleShowCreateModal);
-
-    function handleRefreshWorkspaces() {
-      workspacesStore.reload();
-    }
-
-    function handleRefreshWorkspaceData() {
-      workspaceDataStore.refresh();
-    }
-
-    window.addEventListener('refresh-workspaces', handleRefreshWorkspaces);
-    window.addEventListener('refresh-workspace-data', handleRefreshWorkspaceData);
-
-    return () => {
-      window.removeEventListener('show-create-modal', handleShowCreateModal);
-      window.removeEventListener('refresh-workspaces', handleRefreshWorkspaces);
-      window.removeEventListener('refresh-workspace-data', handleRefreshWorkspaceData);
-      for (const id of pendingTimeouts) clearTimeout(id);
-      pendingTimeouts.clear();
-    };
-  });
-
-
-
-  // Load current workspace when route changes (only for workspace routes)
+  let previousRoutePath = $state(null);
   $effect(() => {
-    // Handle personal workspace routes
-    if ($currentRoute.path?.startsWith('/personal') && ($currentRoute.view?.startsWith('workspace-') || $currentRoute.view === 'personal-workspace' || $currentRoute.view === 'personal-plan' || $currentRoute.view === 'item-detail')) {
-      const personalWorkspaceId = $workspacesStore.personalWorkspace?.id;
-      if (personalWorkspaceId) {
-        currentWorkspace.load(personalWorkspaceId);
-        workspaceDataStore.initialize(personalWorkspaceId);
-      } else {
-        // Personal workspace not loaded yet - trigger loading
-        // The effect will re-run when personalWorkspace is set in the store
-        workspacesStore.loadPersonalWorkspace();
-      }
+    const routePath = $currentRoute.path;
+    if (previousRoutePath !== null && previousRoutePath !== routePath) {
+      closeAllSidebarSurfaces();
     }
-    // Handle regular workspace routes
-    else if ($currentRoute.params?.id && /^\d+$/.test(String($currentRoute.params.id)) && ($currentRoute.view?.startsWith('workspace-') || $currentRoute.view === 'workspace' || $currentRoute.view === 'item-detail' || $currentRoute.view === 'item' || testViews.has($currentRoute.view))) {
-      currentWorkspace.load($currentRoute.params.id);
-      workspaceDataStore.initialize($currentRoute.params.id);
-    }
-    // Handle global collection views (no workspace)
-    else if (GLOBAL_COLLECTION_VIEWS.has($currentRoute.view)) {
+    previousRoutePath = routePath;
+  });
+
+  $effect(() => {
+    const route = $currentRoute;
+    const context = resolveMainAppWorkspaceContext(
+      route,
+      $workspacesStore.personalWorkspace?.id
+    );
+
+    if (context.kind === 'workspace') {
+      void hydrateCurrentWorkspaceFromSharedData(context.workspaceId);
+    } else if (context.kind === 'personal-pending') {
+      void workspacesStore.loadPersonalWorkspace();
+    } else if (context.kind === 'global-collection') {
       if ($currentWorkspace) currentWorkspace.clear();
       workspaceDataStore.initializeGlobal();
       clearWorkspaceGradient();
@@ -812,366 +277,130 @@
     }
   });
 
-  // Collection store is self-activating via route subscription in constructor — no need to manually activate
-
-  // Redirect from workspace-detail to the configured default view
   $effect(() => {
-    if ($currentRoute.view === 'workspace-detail' && $currentWorkspace) {
-      const wsId = $currentRoute.params?.id;
-      if (wsId) {
-        const defaultView = $currentWorkspace.default_view || 'board';
-        if (defaultView === 'overview') {
-          navigate(`/workspaces/${wsId}/overview`, { replace: true });
-        } else {
-          navigate(`/workspaces/${wsId}/${defaultView}`, { replace: true });
-        }
-      }
-    }
+    const redirect = getMainAppWorkspaceRedirect($currentRoute, $currentWorkspace);
+    if (redirect) navigate(redirect, { replace: true });
   });
 
-  // Load terminal panel when terminal becomes visible
+  // Redirect direct navigation to a collection view the scope has disabled.
+  // The load is awaited through the reactive entry so the decision uses real
+  // settings, and waits for the workspace record so the default view is
+  // known. Workspace-only tools entries are visibility toggles and stay
+  // reachable, so they are not part of this guard.
   $effect(() => {
-    if (terminalState.visible && !TerminalPanelComponent) {
-      loadTerminalPanel();
-    }
+    const route = $currentRoute;
+    const viewId = route.view?.startsWith('workspace-') ? route.view.slice('workspace-'.length) : route.view;
+    if (!viewId || !viewSettingsStore.allViewIds.includes(viewId)) return;
+    const workspaceId = route.params?.id;
+    if (!workspaceId) return;
+    if (!$currentWorkspace?.id) return; // hydration re-runs this effect
+    const collectionId = route.params?.collectionId ?? null;
+
+    void viewSettingsStore.load(workspaceId, collectionId);
+    const entry = viewSettingsStore.entryFor(workspaceId, collectionId);
+    if (!entry?.loaded) return;
+
+    const redirect = getDisabledViewRedirect(route, $currentWorkspace);
+    if (redirect) navigate(redirect, { replace: true });
   });
 
   $effect(() => {
-    if (desktopBridge.modal) {
-      loadDesktopModal(desktopBridge.modal);
-    }
+    if (terminalState.visible && !TerminalPanelComponent) void loadTerminalPanel();
   });
-
-  // Single effect to load components based on current route
-  $effect(() => {
-    const view = effectiveView;
-
-    // Load component for current route view
-    if (view) {
-      const { key } = resolveRouteConfig(view);
-      if (key) {
-        loadComponentForRoute(key);
-      }
-    }
-
-    // Load command palette when opened
-    if (showCommandPalette) {
-      loadComponentForRoute('command-palette');
-    }
-
-    // Load create modal when opened
-    if (showCreateModal) {
-      loadComponentForRoute('create-modal');
-    }
-  });
-
-
-
-  function showCreateDropdown() {
-    showCreateModal = true;
-    
-    // Pre-select current workspace if we're in a workspace context
-    const currentWorkspaceId = $currentRoute.params?.id;
-    if (currentWorkspaceId && ['workspace-detail', 'workspace-calendar', 'workspace-reviews', 'workspace-settings', 'workspace-settings-general', 'workspace-settings-categories', 'workspace-settings-members', 'workspace-settings-configuration', 'workspace-settings-source-control', 'workspace-settings-coding-agents', 'workspace-settings-issue-sync', 'workspace-settings-templates', 'workspace-settings-danger', 'workspace-look-and-feel', 'workspace-board', 'workspace-backlog', 'workspace-list', 'workspace-tree', 'workspace-map', 'workspace-roadmap', 'workspace-actions', 'item-detail'].includes($currentRoute.view)) {
-      // Dispatch event to pre-select the workspace
-      setTimeout(() => {
-        window.dispatchEvent(new CustomEvent('set-create-workspace', { 
-          detail: { workspaceId: parseInt(currentWorkspaceId) } 
-        }));
-      }, 50);
-    }
-  }
-
-  // Generic lazy loader function for all routes
-  async function loadComponentForRoute(view) {
-    const loader = componentLoaders[view];
-    if (!loader) return;
-
-    // Skip if already loading or loaded
-    if (loadingRoutes.has(view) || componentRegistry.has(view)) return;
-
-    // Create new Set with added view (triggers Svelte 5 reactivity)
-    loadingRoutes = new Set(loadingRoutes).add(view);
-
-    try {
-      const module = await loader();
-      // Create new Map with added component (triggers Svelte 5 reactivity)
-      componentRegistry = new Map(componentRegistry).set(view, module.default);
-    } catch (error) {
-      console.error(`Failed to load component for ${view}:`, error);
-    } finally {
-      // Create new Set without the view (triggers Svelte 5 reactivity)
-      const newLoadingRoutes = new Set(loadingRoutes);
-      newLoadingRoutes.delete(view);
-      loadingRoutes = newLoadingRoutes;
-    }
-  }
-
-  // Helper to get component for current view (supports matchViews)
-  function getComponentForView(view) {
-    // Direct match
-    if (componentRegistry.has(view)) {
-      return componentRegistry.get(view);
-    }
-
-    const { key } = resolveRouteConfig(view);
-    if (key && componentRegistry.has(key)) {
-      return componentRegistry.get(key);
-    }
-
-    return null;
-  }
-
-  // Helper to check if component is loading
-  function isComponentLoading(view) {
-    if (loadingRoutes.has(view)) return true;
-
-    const { key } = resolveRouteConfig(view);
-    if (key && loadingRoutes.has(key)) {
-      return true;
-    }
-
-    return false;
-  }
-
-  // Get props for current route's component
-  function getPropsForRoute(view) {
-    const { config } = resolveRouteConfig(view);
-    if (!config || !config.getProps) return {};
-    return config.getProps($currentRoute);
-  }
-
-  // Check if a route requires wrapper styling
-  function getWrapperClass(view) {
-    const { config } = resolveRouteConfig(view);
-    return config?.wrapper || null;
-  }
 </script>
 
-{#snippet loadingState(message)}
-  <div class="flex items-center justify-center h-full">
-    <div class="text-center">
-      <Spinner class="mx-auto mb-4" />
-      <p class="text-gray-600">{message}</p>
-    </div>
-  </div>
-{/snippet}
-
-{#snippet errorState(message, retryFn)}
-  <div class="flex items-center justify-center h-full">
-    <div class="text-center">
-      <p class="text-red-600">{message}</p>
-      {#if retryFn}
-        <Button variant="primary" onclick={retryFn} class="mt-4">
-          {t('nav.retry')}
-        </Button>
-      {/if}
-    </div>
-  </div>
-{/snippet}
-
-{#snippet lazyLoadedComponent(view, props)}
-  {@const component = getComponentForView(view)}
-  {@const loading = isComponentLoading(view)}
-  {@const routeEntry = resolveRouteConfig(view)}
-  {@const config = routeEntry.config}
-  {@const loaderKey = routeEntry.key || view}
-
-  {#if loading}
-    {@render loadingState(config?.loadingMsg || 'Loading...')}
-  {:else if component}
-    {@const LazyComponent = component}
-    <LazyComponent {...props} />
-  {:else}
-    {@render errorState(config?.errorMsg || 'Failed to load component', () => loadComponentForRoute(loaderKey))}
-  {/if}
-{/snippet}
-
-<!-- Main Internal App - Rendered only when user is authenticated -->
-<div class="min-h-screen flex flex-col" style="background-color: var(--ds-surface);">
-  <!-- Email Verification Banner -->
+<div class="desktop-app-shell h-dvh min-h-0 overflow-hidden flex flex-col" style="background-color: var(--ds-surface);">
   <EmailVerificationBanner
     show={showEmailVerificationBanner}
     ondismiss={() => showEmailVerificationBanner = false}
   />
 
-  <!-- Vertical Left Sidebar Navigation -->
   {#if !$uiStore.reviewFullscreen}
     <MainSidebar
-      onShowCommandPalette={() => showCommandPalette = true}
+      onShowCommandPalette={() => activateSidebarSurface('search')}
       onShowCreateModal={showCreateDropdown}
-      onShowChatPanel={() => { showChatPanel = true; loadComponentForRoute('chat-panel'); }}
+      onShowChatPanel={() => activateSidebarSurface('chat')}
       onToggleTerminal={toggleTerminal}
+      activeSurface={activeSidebarSurface}
+      onSurfaceChange={handleSidebarSurfaceChange}
     />
   {/if}
 
-  <!-- Hidden hotkey buttons for global shortcuts -->
-  <Button class="sr-only" onclick={() => showCommandPalette = true} hotkeyConfig={{ key: toHotkeyString('global', 'commandPalette') }}>Command Palette</Button>
+  <Button class="sr-only" onclick={() => activateSidebarSurface('search')} hotkeyConfig={{ key: toHotkeyString('global', 'commandPalette') }}>Command Palette</Button>
   <Button class="sr-only" onclick={showCreateDropdown} hotkeyConfig={{ key: toHotkeyString('global', 'create') }}>Create</Button>
   {#if aiStore.chatAvailable}
-    <Button class="sr-only" onclick={() => { showChatPanel = !showChatPanel; loadComponentForRoute('chat-panel'); }} hotkeyConfig={{ key: toHotkeyString('global', 'aiChat') }}>AI Chat</Button>
+    <Button class="sr-only" onclick={() => activateSidebarSurface('chat')} hotkeyConfig={{ key: toHotkeyString('global', 'aiChat') }}>AI Chat</Button>
   {/if}
   <Button class="sr-only" onclick={toggleTerminal} hotkeyConfig={{ key: 'Mod+`' }}>Toggle Terminal</Button>
 
-    <!-- Main Content Area with Sidebar Layout -->
-    <div
-      class="flex flex-1 transition-[margin] duration-200 ease-out"
-      style={!$uiStore.reviewFullscreen ? `margin-left: ${$uiStore.navExpanded ? '200px' : '64px'}` : ''}
-    >
-      <!-- Left Sidebar for Workspace/Admin Navigation -->
+  <div
+    class="authenticated-content flex flex-col flex-1 min-h-0 overflow-hidden transition-[margin] duration-200 ease-[cubic-bezier(0.25,1,0.5,1)] motion-reduce:transition-none"
+    class:has-mobile-context-nav={showWorkspaceNav}
+    style={!$uiStore.reviewFullscreen ? `margin-left: ${$uiStore.navExpanded ? '200px' : '64px'}` : ''}
+  >
+    {#if showWorkspaceBreadcrumbs}
+      <WorkspaceBreadcrumbs
+        workspace={showWorkspaceNav ? $currentWorkspace : null}
+        onOpen={closeAllSidebarSurfaces}
+      />
+    {/if}
+    <div class="authenticated-body flex flex-1 min-h-0 overflow-hidden">
       {#if showWorkspaceNav}
-        <div out:slide={{ duration: 200, axis: 'x' }}>
-          <WorkspaceNavigation workspaceId={$currentRoute.path?.startsWith('/personal') ? $workspacesStore.personalWorkspace?.id : $currentRoute.params.id} />
+        <Button
+          class="mobile-workspace-nav-trigger"
+          variant="default"
+          size="small"
+          icon={Menu}
+          title={mobileWorkspaceNavOpen ? 'Close workspace navigation' : 'Open workspace navigation'}
+          dataTestid="mobile-workspace-nav-trigger"
+          onclick={() => mobileWorkspaceNavOpen = !mobileWorkspaceNavOpen}
+        >
+          Workspace
+        </Button>
+        {#if mobileWorkspaceNavOpen}
+          <button
+            type="button"
+            class="mobile-workspace-nav-backdrop"
+            aria-label="Close workspace navigation"
+            data-testid="mobile-workspace-nav-backdrop"
+            onclick={() => mobileWorkspaceNavOpen = false}
+          ></button>
+        {/if}
+        <div
+          class="workspace-context-nav h-full min-h-0"
+          class:mobile-open={mobileWorkspaceNavOpen}
+        >
+          <WorkspaceNavigation
+            workspaceId={$currentRoute.path?.startsWith('/personal')
+              ? $workspacesStore.personalWorkspace?.id
+              : $currentRoute.params.id}
+          />
         </div>
       {:else if showCollectionNav}
-        <div out:slide={{ duration: 200, axis: 'x' }}>
+        <div class="h-full min-h-0">
           <CollectionNavigation collectionId={$currentRoute.params.id} />
         </div>
       {/if}
 
-      <!-- Main Content Column (with optional terminal split) -->
-      <div class="flex-1 flex min-w-0 main-split-container">
-        <!-- Left Pane: Main Content -->
+      <div class="flex-1 flex min-w-0 min-h-0 overflow-hidden main-split-container">
         <div
-          class="flex flex-col min-w-0"
-          style={terminalState.visible ? `width: ${terminalState.splitPercent}%; flex-shrink: 0;` : 'flex: 1;'}
+          class="flex flex-col min-w-0 min-h-0"
+          style={terminalState.visible
+            ? `width: ${terminalState.splitPercent}%; flex-shrink: 0;`
+            : 'flex: 1;'}
         >
-        <!-- Main Content -->
-        <main class="flex-1">
-    {#if true}
-      {@const view = effectiveView}
-      {@const wrapper = getWrapperClass(view)}
-      {@const routeEntry = resolveRouteConfig(view)}
-      {@const hasLazyRoute = !!routeEntry.config}
-
-      {#if view === 'workspaces'}
-      <Workspaces showAdminHeader={false} />
-
-    {:else if ['workspace-settings', 'workspace-settings-general', 'workspace-settings-categories', 'workspace-settings-members', 'workspace-settings-configuration', 'workspace-settings-source-control', 'workspace-settings-coding-agents', 'workspace-settings-issue-sync', 'workspace-settings-recurrence', 'workspace-settings-templates', 'workspace-settings-danger'].includes(view)}
-      <div class="p-6" style="background-color: var(--ds-surface);">
-        <WorkspaceSettings
-          workspaceId={$currentRoute.params.id}
-          activeTab={
-            view === 'workspace-settings-categories' ? 'categories' :
-            view === 'workspace-settings-members' ? 'members' :
-            view === 'workspace-settings-configuration' ? 'configuration' :
-            view === 'workspace-settings-source-control' ? 'source-control' :
-            view === 'workspace-settings-coding-agents' ? 'coding-agents' :
-            view === 'workspace-settings-issue-sync' ? 'issue-sync' :
-            view === 'workspace-settings-recurrence' ? 'recurrence' :
-            view === 'workspace-settings-templates' ? 'templates' :
-            view === 'workspace-settings-danger' ? 'danger' :
-            'general'
-          }
-        />
-      </div>
-
-    {:else if view === 'collections-list'}
-      <CollectionsList />
-    {:else if view === 'collections-edit'}
-      <Collections collectionId={$currentRoute.params.id} />
-
-    {:else if view === 'channels'}
-      <div style="background-color: var(--ds-surface);">
-        <Channels />
-      </div>
-    {:else if view === 'hub' || view === 'hub-inbox'}
-      <div style="background-color: var(--ds-surface);">
-        <Hub />
-      </div>
-    {:else if view === 'organizations' || view === 'organization-contact-detail'}
-      <Customers />
-
-    {:else if view === 'teams-list'}
-      <div class="p-6" style="background-color: var(--ds-surface);">
-        <TeamsList />
-      </div>
-    {:else if view === 'team-detail'}
-      <div class="p-6" style="background-color: var(--ds-surface);">
-        <TeamDetail teamId={$currentRoute.params.id} section={$currentRoute.params.section || 'overview'} />
-      </div>
-
-    {:else if view === 'notifications'}
-      <NotificationsPage />
-    {:else if view === 'approvals-inbox'}
-      <ApprovalsInbox />
-    {:else if view === 'search'}
-      <SearchPage />
-
-    {:else if view === 'profile'}
-      <div class="p-6" style="background-color: var(--ds-surface);">
-        <UserProfile />
-      </div>
-    {:else if view === 'security'}
-      <div class="p-6" style="background-color: var(--ds-surface);">
-        <Security />
-      </div>
-
-    {:else if view === 'about'}
-      <About />
-    {:else if view === 'api-docs'}
-      <ApiDocs />
-    {:else if view === 'cli-authorize'}
-      <CliAuthorize />
-    {:else if view === 'oauth-authorize'}
-      <OAuthAuthorize />
-    {:else if view === '404'}
-      <div class="p-6" style="background-color: var(--ds-surface);">
-        <NotFound />
-      </div>
-
-    {:else if view === 'admin'}
-      <PermissionGuard requireSystemAdmin={true}>
-        {#snippet children()}
-          {@render lazyLoadedComponent(view, routeProps)}
-        {/snippet}
-        {#snippet fallback(requiredPermissionDisplay)}
-          <UnauthorizedAccess
-            message="You need system administrator privileges to access the administration panel."
-            requiredPermission={requiredPermissionDisplay}
-          />
-        {/snippet}
-      </PermissionGuard>
-
-    {:else if view === 'workspace-actions'}
-      <div class="h-full" style="background-color: var(--ds-surface); height: calc(100vh - 56px);">
-        {@render lazyLoadedComponent(view, routeProps)}
-      </div>
-
-    {:else if hasLazyRoute}
-      {#if wrapper === 'surface-full'}
-        <div style="background-color: var(--ds-surface);">
-          {@render lazyLoadedComponent(view, routeProps)}
+          <main data-testid="main-content-scroll" class="flex-1 min-h-0 overflow-y-auto overscroll-contain">
+            <MainRouteContent view={effectiveView} route={$currentRoute} {lazyComponents} />
+          </main>
         </div>
-      {:else if wrapper === 'surface-padded'}
-        <div class="p-6" style="background-color: var(--ds-surface);">
-          {@render lazyLoadedComponent(view, routeProps)}
-        </div>
-      {:else if wrapper === 'surface-admin'}
-        <div class="px-16 py-12 flex-1 overflow-y-auto" style="background-color: var(--ds-surface);">
-          {@render lazyLoadedComponent(view, routeProps)}
-        </div>
-      {:else}
-        {@render lazyLoadedComponent(view, routeProps)}
-      {/if}
-
-      {:else}
-        <Workspaces showAdminHeader={false} />
-      {/if}
-    {/if}
-      </main>
-      </div>
 
         {#if terminalState.visible}
-          <!-- Resize Handle -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="terminal-resize-handle w-1 cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors flex-shrink-0"
+            class="terminal-resize-handle w-1 cursor-col-resize hover:bg-ds-interactive/40 active:bg-ds-interactive/60 transition-colors flex-shrink-0"
             style="background-color: var(--ds-border);"
             onmousedown={handleTerminalResizeStart}
           ></div>
-
-          <!-- Right Pane: Terminal -->
           <div
             class="flex flex-col min-w-0"
             style="width: {100 - terminalState.splitPercent}%; flex-shrink: 0;"
@@ -1187,122 +416,104 @@
         {/if}
       </div>
     </div>
-    
-    <!-- Footer with proper sidebar margin -->
-    <footer
-      class="transition-transform duration-200 ease-out {!$uiStore.reviewFullscreen ? 'ml-16' : ''}"
-      style={!$uiStore.reviewFullscreen ? `transform: translateX(${$uiStore.navExpanded ? '136px' : '0px'})` : ''}
-    >
-      <Footer />
-    </footer>
+  </div>
+
+  <footer
+    class="authenticated-footer flex-shrink-0 transition-[margin] duration-200 ease-[cubic-bezier(0.25,1,0.5,1)] motion-reduce:transition-none"
+    style={!$uiStore.reviewFullscreen
+      ? `margin-left: ${$uiStore.navExpanded ? '200px' : '64px'}`
+      : ''}
+  >
+    <Footer />
+  </footer>
 </div>
 
-
-<!-- Command Palette -->
-{#if true}
-  {@const commandPaletteComponent = getComponentForView('command-palette')}
-  {@const commandPaletteLoading = isComponentLoading('command-palette')}
-
-  {#if commandPaletteLoading}
-    <ModalBackdrop show={true} opacity={0.4} blur={8} extraFilter="saturate(120%)" zIndex={60} align="top" paddingTop="pt-[20vh]" closeOnClick={false} closeOnEscape={false} transition={false}>
-      <div class="rounded-xl p-6" style="background-color: var(--ds-surface-raised); color: var(--ds-text-subtle);">
-        <Spinner class="mx-auto mb-4" />
-        <p>{t('nav.loadingSearch')}</p>
-      </div>
-    </ModalBackdrop>
-  {:else if commandPaletteComponent && showCommandPalette}
-    {@const CommandPalette = commandPaletteComponent}
-    <CommandPalette
-      bind:isOpen={showCommandPalette}
-      onclose={() => showCommandPalette = false}
-    />
-  {/if}
-{/if}
-
-<!-- Create Modal -->
-{#if true}
-  {@const createModalComponent = getComponentForView('create-modal')}
-  {@const createModalLoading = isComponentLoading('create-modal')}
-
-  {#if createModalLoading}
-    <ModalBackdrop show={true} opacity={0.4} closeOnClick={false} closeOnEscape={false} transition={false}>
-      <div class="rounded-xl p-6" style="background-color: var(--ds-surface-raised); color: var(--ds-text-subtle);">
-        <Spinner class="mx-auto mb-4" />
-        <p>{t('nav.loadingCreateForm')}</p>
-      </div>
-    </ModalBackdrop>
-  {:else if createModalComponent && showCreateModal}
-    {@const CreateModal = createModalComponent}
-    <CreateModal
-      bind:isOpen={showCreateModal}
-      initialType={createModalInitialType}
-      skipNavigate={createModalSkipNavigate}
-      onclose={() => {
-        showCreateModal = false;
-        createModalInitialType = 'work-item';
-        createModalSkipNavigate = false;
-      }}
-    />
-  {/if}
-{/if}
-
-<!-- Global Confirmation Dialog -->
-<GlobalConfirmDialog />
-
-{#if desktopBridge.modal === 'pomodoro-settings' && PomodoroSettingsModalComponent}
-  <PomodoroSettingsModalComponent
-    show={true}
-    onclose={() => desktopBridge.close()}
-  />
-{:else if desktopBridge.modal === 'about' && AboutModalComponent}
-  <AboutModalComponent
-    show={true}
-    onclose={() => desktopBridge.close()}
-  />
-{/if}
-
-<!-- Floating Timer -->
-<FloatingTimer />
-
-<!-- AI Chat Panel -->
-{#if aiStore.chatAvailable && showChatPanel}
-  {@const ChatPanelComponent = getComponentForView('chat-panel')}
-  {#if ChatPanelComponent}
-    <ChatPanelComponent
-      bind:isOpen={showChatPanel}
-      onclose={() => { showChatPanel = false; chatStore.clearHistory(); }}
-    />
-  {/if}
-{/if}
-
-<!-- Toast Container -->
-<ToastContainer />
+<MainAppOverlays
+  {lazyComponents}
+  bind:showCommandPalette
+  bind:showCreateModal
+  bind:showChatPanel
+  {createModalInitialType}
+  {createModalWorkspaceId}
+  {createModalParentContext}
+  {createModalSkipNavigate}
+  onclosecreate={closeCreateModal}
+  onclosecommand={closeCommandPalette}
+  onclosechat={closeChatPanel}
+/>
 
 <style>
-  /* Global CSS custom properties for theming - uses design tokens */
   :global(html) {
     --nav-bg-color: var(--ds-surface-raised);
     --nav-text-color: var(--ds-text);
   }
 
-  /* Themed navigation styles */
+  :global(.mobile-workspace-nav-trigger),
+  .mobile-workspace-nav-backdrop {
+    display: none;
+  }
+
+  @media (max-width: 767px) {
+    .authenticated-content {
+      margin-left: 4rem !important;
+      min-width: 0;
+    }
+
+    .authenticated-content.has-mobile-context-nav .authenticated-body {
+      padding-top: 3.5rem;
+    }
+
+    .workspace-context-nav {
+      position: fixed;
+      z-index: 45;
+      top: 3rem;
+      bottom: 0;
+      left: 4rem;
+      transform: translateX(-100%);
+      transition: transform var(--duration-normal, 200ms) var(--ease-smooth, ease);
+    }
+
+    .workspace-context-nav.mobile-open {
+      transform: translateX(0);
+    }
+
+    :global(.mobile-workspace-nav-trigger) {
+      display: inline-flex;
+      position: fixed;
+      z-index: 50;
+      top: 3.75rem;
+      left: 4.75rem;
+    }
+
+    .mobile-workspace-nav-backdrop {
+      display: block;
+      position: fixed;
+      z-index: 30;
+      inset: 3rem 0 0 4rem;
+      border: 0;
+      background: color-mix(in srgb, var(--ds-blanket, #091e42) 54%, transparent);
+    }
+
+    .authenticated-footer {
+      margin-left: 4rem !important;
+      transform: none !important;
+    }
+  }
+
   :global(.themed-nav) {
     background-color: var(--nav-bg-color);
     color: var(--nav-text-color);
   }
 
-  /* Ensure child elements inherit the theme colors */
   :global(.themed-nav *) {
     color: inherit;
   }
 
-  /* Override any specific text colors for navigation elements */
   :global(.themed-nav a),
   :global(.themed-nav button) {
     color: var(--nav-text-color);
   }
 
-  /* Theme-aware navigation button classes with enhanced animations */
   :global(.themed-nav .nav-button) {
     color: var(--nav-text-color);
     position: relative;
@@ -1311,36 +522,52 @@
       box-shadow var(--duration-normal, 200ms) var(--ease-smooth, ease);
   }
 
-  /* Subtle glow effect on hover */
-  :global(.themed-nav .nav-button::before) {
-    content: '';
-    position: absolute;
-    inset: -2px;
-    border-radius: 8px;
-    background: radial-gradient(
-      circle at center,
-      var(--ds-interactive) 0%,
-      transparent 70%
-    );
-    opacity: 0;
-    transition: opacity var(--duration-normal, 200ms) var(--ease-smooth, ease);
-    pointer-events: none;
-    z-index: -1;
-  }
-
   :global(.themed-nav .nav-button:hover) {
     background-color: var(--ds-background-neutral-hovered);
   }
 
-  :global(.themed-nav .nav-button:hover::before) {
-    opacity: 0.12;
+  :global(.themed-nav .nav-button.nav-button-accent) {
+    color: var(--ds-text-link);
+    background-color: color-mix(in srgb, var(--ds-interactive-subtle) 72%, transparent);
   }
 
-  :global(.themed-nav .nav-button.nav-button-emphasized) {
-    background-color: color-mix(in srgb, var(--ds-interactive) 8%, transparent);
+  :global(.themed-nav .nav-button.nav-button-accent:hover),
+  :global(.themed-nav .nav-button.nav-button-accent.nav-button-selected) {
+    color: var(--ds-text-link-hovered);
+    background-color: var(--ds-interactive-subtle);
   }
 
-  /* Exception: Primary buttons should keep their original colors and hover behavior */
+  :global(.themed-nav .nav-shortcut) {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 0.1875rem;
+  }
+
+  :global(.themed-nav .nav-shortcut-key) {
+    display: inline-flex;
+    min-width: 1.5rem;
+    height: 1.5rem;
+    padding-inline: 0.3125rem;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--ds-border);
+    border-radius: 0.25rem;
+    color: var(--ds-text-subtle);
+    background: color-mix(in srgb, var(--ds-surface) 65%, transparent);
+    box-shadow: 0 1px 0 var(--ds-border-bold);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-weight: 600;
+    font-size: 0.6875rem;
+    line-height: 1rem;
+    text-align: center;
+  }
+
+  :global(.themed-nav .nav-button:focus-visible) {
+    outline: 2px solid var(--ds-border-focused);
+    outline-offset: 2px;
+  }
+
   :global(.themed-nav .bg-primary) {
     color: var(--ds-text-inverse) !important;
     background-color: var(--ds-interactive) !important;
@@ -1360,19 +587,18 @@
     transform: scale(0.95);
   }
 
-  /* Reduced motion support */
   @media (prefers-reduced-motion: reduce) {
     :global(.themed-nav .nav-button),
     :global(.themed-nav .bg-primary) {
       transition: none;
     }
+
     :global(.themed-nav .bg-primary:hover),
     :global(.themed-nav .bg-primary:active) {
       transform: none;
     }
   }
 
-  /* Terminal resize handle */
   .terminal-resize-handle {
     position: relative;
     z-index: 10;

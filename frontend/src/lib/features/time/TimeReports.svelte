@@ -11,10 +11,26 @@
   import StatCard from '../../components/StatCard.svelte';
   import Chart from '../../widgets/Chart.svelte';
   import { t } from '../../stores/i18n.svelte.js';
-  import { formatDate, formatDateSimple, formatDateWithOptions } from '../../utils/dateFormatter.js';
-  import { escapeHtml } from '../../utils/sanitize.ts';
+  import { formatDateOnly, getUserTimezone } from '../../utils/dateFormatter.js';
+  import { formatAuthenticatedInstant } from '../../utils/authenticatedDateFormatter.js';
+  import { authStore } from '../../stores/auth.svelte.js';
+  import { dateKeyInZone, monthBoundsInZone } from '../../utils/worklogTimezone.js';
+  import { openMarkdownPrintView } from '../print/markdownPrintWindow.js';
+  import { buildTimeReportMarkdown } from './timeReportMarkdown.js';
+  import { buildSummary, buildMemberBreakdown, buildDailyChartData } from './timeReportAggregates.js';
 
+  // Reports group and label worklogs by civil date in the reporting timezone,
+  // derived from the stored timestamps and split at local midnight.
+  const reportTimezone = $derived(getUserTimezone(authStore?.currentUser));
+
+  // Raw entries are paged (WI-1449): statistics derive from the server
+  // aggregate, the tables mount a bounded window, and exports fetch the
+  // remaining pages on demand.
+  const ENTRY_PAGE_SIZE = 100;
+  const EXPORT_PAGE_SIZE = 1000;
   let worklogs = $state([]);
+  let entryTotal = $state(0);
+  let loadingMoreEntries = $state(false);
   let customers = $state([]);
   let projects = $state([]);
   let loading = $state(false);
@@ -36,7 +52,7 @@
   let selectedProjectId = $state('');
   let projectDateFrom = $state('');
   let projectDateTo = $state('');
-  let projectWorklogs = $state([]);
+  let projectAggregate = $state({ daily: [], totals: [] });
   let projectLoading = $state(false);
 
   // Summary data (personal mode)
@@ -57,16 +73,16 @@
 
   // Project mode computed data
   const projectSummary = $derived.by(() => {
-    if (projectWorklogs.length === 0) {
+    if (projectAggregate.totals.length === 0) {
       return { totalHours: 0, budgetPercent: null, budgetLabel: '', contributors: 0, avgPerDay: 0 };
     }
 
-    const totalMinutes = projectWorklogs.reduce((sum, w) => sum + w.duration_minutes, 0);
+    const totalMinutes = projectAggregate.totals.reduce((sum, t) => sum + t.duration_minutes, 0);
     const totalHours = Math.round((totalMinutes / 60) * 100) / 100;
 
-    // All-time total hours from backend (unaffected by date filters)
-    const allTimeTotal = projectWorklogs[0]?.project_total_hours
-      ? Math.round(projectWorklogs[0].project_total_hours * 100) / 100
+    // All-time total hours from the project catalog (unaffected by date filters)
+    const allTimeTotal = selectedProject?.total_hours
+      ? Math.round(selectedProject.total_hours * 100) / 100
       : totalHours;
 
     // Budget from project settings
@@ -79,7 +95,7 @@
     }
 
     // Unique contributors
-    const uniqueUsers = new Set(projectWorklogs.map(w => w.user_id).filter(Boolean));
+    const uniqueUsers = new Set(projectAggregate.totals.map(t => t.user_id).filter(Boolean));
     const contributors = uniqueUsers.size;
 
     // Avg hours per day
@@ -92,53 +108,12 @@
     return { totalHours, budgetPercent, budgetLabel, contributors, avgPerDay };
   });
 
-  // Member breakdown data
-  const memberBreakdown = $derived.by(() => {
-    if (projectWorklogs.length === 0) return [];
+  // Member breakdown derives from the server aggregate (duration totals per
+  // user; active days from the day-split groups).
+  const memberBreakdown = $derived(buildMemberBreakdown(projectAggregate.daily, projectAggregate.totals));
 
-    const memberMap = {};
-    const dateSet = new Set();
-
-    projectWorklogs.forEach(w => {
-      const key = w.user_id || 0;
-      if (!memberMap[key]) {
-        memberMap[key] = { user_name: w.user_name || 'Unknown', totalMinutes: 0, entries: 0, dates: new Set() };
-      }
-      memberMap[key].totalMinutes += w.duration_minutes;
-      memberMap[key].entries += 1;
-      const dateStr = formatDateSimple(new Date(w.date * 1000));
-      memberMap[key].dates.add(dateStr);
-      dateSet.add(dateStr);
-    });
-
-    return Object.values(memberMap)
-      .map(m => ({
-        user_name: m.user_name,
-        hours: Math.round((m.totalMinutes / 60) * 100) / 100,
-        entries: m.entries,
-        avgPerDay: m.dates.size > 0 ? Math.round(((m.totalMinutes / 60) / m.dates.size) * 100) / 100 : 0
-      }))
-      .sort((a, b) => b.hours - a.hours);
-  });
-
-  // Daily hours chart data
-  const dailyChartData = $derived.by(() => {
-    if (projectWorklogs.length === 0) return [];
-
-    const dailyMap = {};
-    projectWorklogs.forEach(w => {
-      const dateStr = formatDate(new Date(w.date * 1000));
-      dailyMap[dateStr] = (dailyMap[dateStr] || 0) + w.duration_minutes;
-    });
-
-    return Object.keys(dailyMap)
-      .sort()
-      .map(date => ({
-        date: new Date(date),
-        count: Math.round((dailyMap[date] / 60) * 100) / 100,
-        label: formatDateSimple(new Date(date))
-      }));
-  });
+  // Daily hours chart data from the day-split aggregate groups.
+  const dailyChartData = $derived(buildDailyChartData(projectAggregate.daily));
 
   const memberColumns = $derived([
     { key: 'user_name', label: t('time.reports.member') },
@@ -148,7 +123,7 @@
   ]);
 
   const reportColumns = $derived([
-    { key: 'date', label: t('common.date'), render: (w) => formatDateSimple(new Date(w.date * 1000)) },
+    { key: 'date', label: t('common.date'), render: (w) => formatDateOnly(dateKeyInZone(w.start_time, reportTimezone)) },
     { key: 'customer_name', label: t('time.reports.customer') },
     { key: 'project_name', label: t('time.reports.project'), slot: 'project' },
     { key: 'description', label: t('common.description') },
@@ -159,15 +134,13 @@
   onMount(async () => {
     await Promise.all([loadCustomers(), loadProjects()]);
 
-    // Set default date range to current month
-    const now = new Date();
-    const monthStart = formatDate(new Date(now.getFullYear(), now.getMonth(), 1));
-    const monthEnd = formatDate(new Date(now.getFullYear(), now.getMonth() + 1, 0));
+    // Set default date range to current month in the reporting timezone
+    const { from, to } = monthBoundsInZone(reportTimezone);
 
-    filters.date_from = monthStart;
-    filters.date_to = monthEnd;
-    projectDateFrom = monthStart;
-    projectDateTo = monthEnd;
+    filters.date_from = from;
+    filters.date_to = to;
+    projectDateFrom = from;
+    projectDateTo = to;
 
     await loadReports();
   });
@@ -191,69 +164,107 @@
   }
 
   async function loadReports() {
+    if (!filters.date_from || !filters.date_to) {
+      return;
+    }
     loading = true;
     try {
-      worklogs = (await api.time.worklogs.getAll(filters)) || [];
-      calculateSummary();
+      const query = { ...filters, timezone: reportTimezone };
+      const [aggregate, page] = await Promise.all([
+        api.time.worklogs.aggregate(query),
+        api.time.worklogs.getPage({ ...query, page_size: ENTRY_PAGE_SIZE, page: 1 }),
+      ]);
+      summary = buildSummary(aggregate?.totals, { dateFrom: filters.date_from, dateTo: filters.date_to });
+      worklogs = page?.data || [];
+      entryTotal = page?.pagination?.total ?? worklogs.length;
     } catch (error) {
       console.error('Failed to load reports:', error);
-      worklogs = [];
     } finally {
       loading = false;
     }
   }
 
+  async function loadMoreEntries() {
+    if (loadingMoreEntries) return;
+    const nextPage = Math.floor(worklogs.length / ENTRY_PAGE_SIZE) + 1;
+    loadingMoreEntries = true;
+    try {
+      const page = await api.time.worklogs.getPage(
+        { ...filters, timezone: reportTimezone, page_size: ENTRY_PAGE_SIZE, page: nextPage }
+      );
+      worklogs = [...worklogs, ...(page?.data || [])];
+      entryTotal = page?.pagination?.total ?? entryTotal;
+    } catch (error) {
+      console.error('Failed to load more worklogs:', error);
+    } finally {
+      loadingMoreEntries = false;
+    }
+  }
+
+  // Fetches every remaining entry page (server-side paging, large pages) for
+  // the CSV/PDF exports, which keep their full raw-entry contract.
+  async function fetchAllPersonalEntries() {
+    const seen = new Set();
+    const rows = [];
+    let page = 1;
+    let totalPages = 1;
+    while (page <= totalPages) {
+      const document = await api.time.worklogs.getPage(
+        { ...filters, timezone: reportTimezone, page_size: EXPORT_PAGE_SIZE, page }
+      );
+      for (const row of document?.data || []) {
+        const key = row.id ?? `${row.user_id}:${row.start_time}:${row.end_time}:${row.description}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push(row);
+      }
+      totalPages = document?.pagination?.total_pages || 1;
+      page += 1;
+    }
+    return rows;
+  }
+
   async function loadProjectWorklogs() {
     if (!selectedProjectId) {
-      projectWorklogs = [];
+      projectAggregate = { daily: [], totals: [] };
+      return;
+    }
+    if (!projectDateFrom || !projectDateTo) {
       return;
     }
     projectLoading = true;
     try {
-      const dateFilters = {};
-      if (projectDateFrom) dateFilters.date_from = projectDateFrom;
-      if (projectDateTo) dateFilters.date_to = projectDateTo;
-      projectWorklogs = (await api.time.projects.getWorklogs(selectedProjectId, dateFilters)) || [];
+      const dateFilters = {
+        timezone: reportTimezone,
+        project_id: selectedProjectId,
+        date_from: projectDateFrom,
+        date_to: projectDateTo,
+      };
+      const aggregate = await api.time.worklogs.aggregate(dateFilters);
+      projectAggregate = aggregate || { daily: [], totals: [] };
     } catch (error) {
       console.error('Failed to load project worklogs:', error);
-      projectWorklogs = [];
     } finally {
       projectLoading = false;
     }
   }
 
-  function calculateSummary() {
-    if (worklogs.length === 0) {
-      summary = { totalHours: 0, totalEntries: 0, averageHoursPerDay: 0, topProject: null, topCustomer: null };
-      return;
+  async function fetchAllProjectEntries() {
+    const rows = [];
+    let page = 1;
+    let totalPages = 1;
+    while (page <= totalPages) {
+      const dateFilters = { timezone: reportTimezone, project_id: selectedProjectId };
+      if (projectDateFrom) dateFilters.date_from = projectDateFrom;
+      if (projectDateTo) dateFilters.date_to = projectDateTo;
+      const document = await api.time.projects.getWorklogsPage(selectedProjectId, {
+        ...dateFilters, page_size: EXPORT_PAGE_SIZE, page,
+      });
+      rows.push(...(document?.data || []));
+      totalPages = document?.pagination?.total_pages || 1;
+      page += 1;
     }
-
-    const totalMinutes = worklogs.reduce((sum, w) => sum + w.duration_minutes, 0);
-    summary.totalHours = Math.round((totalMinutes / 60) * 100) / 100;
-    summary.totalEntries = worklogs.length;
-
-    if (filters.date_from && filters.date_to) {
-      const daysDiff = Math.ceil((new Date(filters.date_to).getTime() - new Date(filters.date_from).getTime()) / (1000 * 60 * 60 * 24)) + 1;
-      summary.averageHoursPerDay = Math.round((summary.totalHours / daysDiff) * 100) / 100;
-    }
-
-    // Top project
-    const projectHours = {};
-    worklogs.forEach(w => {
-      projectHours[w.project_name] = (projectHours[w.project_name] || 0) + w.duration_minutes / 60;
-    });
-    const topProjectName = Object.keys(projectHours).reduce((a, b) =>
-      projectHours[a] > projectHours[b] ? a : b, Object.keys(projectHours)[0]);
-    summary.topProject = { name: topProjectName, hours: Math.round(projectHours[topProjectName] * 100) / 100 };
-
-    // Top customer
-    const customerHours = {};
-    worklogs.forEach(w => {
-      customerHours[w.customer_name] = (customerHours[w.customer_name] || 0) + w.duration_minutes / 60;
-    });
-    const topCustomerName = Object.keys(customerHours).reduce((a, b) =>
-      customerHours[a] > customerHours[b] ? a : b, Object.keys(customerHours)[0]);
-    summary.topCustomer = { name: topCustomerName, hours: Math.round(customerHours[topCustomerName] * 100) / 100 };
+    return rows;
   }
 
   async function applyFilters() {
@@ -261,12 +272,12 @@
   }
 
   function clearFilters() {
-    const now = new Date();
+    const { from, to } = monthBoundsInZone(reportTimezone);
     filters = {
       customer_id: '',
       project_id: '',
-      date_from: formatDate(new Date(now.getFullYear(), now.getMonth(), 1)),
-      date_to: formatDate(new Date(now.getFullYear(), now.getMonth() + 1, 0)),
+      date_from: from,
+      date_to: to,
       description_filter: ''
     };
     loadReports();
@@ -281,8 +292,7 @@
   }
 
   function formatTime(unixTimestamp) {
-    const date = new Date(unixTimestamp * 1000);
-    return formatDateWithOptions(date, { hour: '2-digit', minute: '2-digit', hour12: false });
+    return formatAuthenticatedInstant(unixTimestamp * 1000, { hour: '2-digit', minute: '2-digit', hour12: false });
   }
 
   // Export functions
@@ -298,14 +308,15 @@
     exportLoading = false;
   }
 
-  function exportPersonalCSV() {
+  async function exportPersonalCSV() {
+    const allEntries = await fetchAllPersonalEntries();
     const headers = ['Date', 'Customer', 'Project', 'Description', 'Start Time', 'End Time', 'Duration (hours)'];
     /** @type {(string | number)[][]} */
     const csvData = [headers];
 
-    worklogs.forEach(worklog => {
+    allEntries.forEach(worklog => {
       csvData.push([
-        formatDateSimple(new Date(worklog.date * 1000)),
+        dateKeyInZone(worklog.start_time, reportTimezone),
         worklog.customer_name,
         worklog.project_name,
         worklog.description,
@@ -329,14 +340,15 @@
     downloadCSV(csvData, `time-report-${filters.date_from}-to-${filters.date_to}.csv`);
   }
 
-  function exportProjectCSV() {
+  async function exportProjectCSV() {
+    const allEntries = await fetchAllProjectEntries();
     const headers = ['Date', 'Member', 'Customer', 'Project', 'Description', 'Start Time', 'End Time', 'Duration (hours)'];
     /** @type {(string | number)[][]} */
     const csvData = [headers];
 
-    projectWorklogs.forEach(worklog => {
+    allEntries.forEach(worklog => {
       csvData.push([
-        formatDateSimple(new Date(worklog.date * 1000)),
+        dateKeyInZone(worklog.start_time, reportTimezone),
         worklog.user_name || 'Unknown',
         worklog.customer_name,
         worklog.project_name,
@@ -374,6 +386,7 @@
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   }
 
   async function exportToPDF() {
@@ -392,163 +405,80 @@
     }
   }
 
-  function exportPersonalPDF() {
-    const template = localStorage.getItem('ostime_export_template') || getDefaultTemplate();
+  async function exportPersonalPDF() {
+    const allEntries = await fetchAllPersonalEntries();
+    const report = buildTimeReportMarkdown({
+      title: 'Time Tracking Report',
+      period: {
+        from: filters.date_from || 'All time',
+        to: filters.date_to || 'Present',
+      },
+      generated: formatAuthenticatedInstant(new Date(), { year: 'numeric', month: 'short', day: 'numeric' }),
+      summary: [
+        { label: 'Total Hours', value: `${summary.totalHours}h` },
+        { label: 'Total Entries', value: summary.totalEntries },
+        { label: 'Average Hours per Day', value: `${summary.averageHoursPerDay}h` },
+        { label: 'Top Project', value: `${summary.topProject?.name || 'N/A'} (${summary.topProject?.hours || 0}h)` },
+        { label: 'Top Customer', value: `${summary.topCustomer?.name || 'N/A'} (${summary.topCustomer?.hours || 0}h)` },
+      ],
+      entries: allEntries.map((worklog) => ({
+        heading: `${formatDateOnly(dateKeyInZone(worklog.start_time, reportTimezone))} — ${worklog.project_name}`,
+        fields: [
+          { label: 'Customer', value: worklog.customer_name },
+          { label: 'Duration', value: formatDuration(worklog.duration_minutes) },
+          { label: 'Description', value: worklog.description },
+          { label: 'Time', value: `${formatTime(worklog.start_time)} – ${formatTime(worklog.end_time)}` },
+        ],
+      })),
+      totalSummary: `Grand Total: ${summary.totalHours} hours across ${summary.totalEntries} entries.`,
+    });
 
-    const templateData = {
-      date_from: filters.date_from || 'All time',
-      date_to: filters.date_to || 'Present',
-      generated_date: formatDateSimple(new Date()),
-      total_hours: summary.totalHours.toString(),
-      total_entries: summary.totalEntries.toString(),
-      average_hours_per_day: summary.averageHoursPerDay.toString(),
-      top_project_name: summary.topProject?.name || 'N/A',
-      top_project_hours: summary.topProject?.hours?.toString() || '0',
-      top_customer_name: summary.topCustomer?.name || 'N/A',
-      top_customer_hours: summary.topCustomer?.hours?.toString() || '0',
-      entries: worklogs.map(worklog => ({
-        date: formatDateSimple(new Date(worklog.date * 1000)),
-        project_name: worklog.project_name,
-        customer_name: worklog.customer_name,
-        duration: formatDuration(worklog.duration_minutes),
-        description: worklog.description,
-        start_time: formatTime(worklog.start_time),
-        end_time: formatTime(worklog.end_time)
-      }))
-    };
-
-    let processedContent = processTemplate(template, templateData);
-    openPrintWindow(processedContent);
+    openTimeReport(report, 'Time Tracking Report');
   }
 
-  function exportProjectPDF() {
+  async function exportProjectPDF() {
+    const allEntries = await fetchAllProjectEntries();
     const projectName = selectedProject?.name || 'Project';
-    let html = `<h1>Project Time Report: ${escapeHtml(projectName)}</h1>`;
-    html += `<p><strong>Report Period:</strong> ${escapeHtml(projectDateFrom || 'All time')} to ${escapeHtml(projectDateTo || 'Present')}<br>`;
-    html += `<strong>Generated:</strong> ${escapeHtml(formatDateSimple(new Date()))}</p><hr>`;
-    html += `<h2>Summary</h2><ul>`;
-    html += `<li><strong>Total Hours:</strong> ${projectSummary.totalHours}h</li>`;
-    html += `<li><strong>Contributors:</strong> ${projectSummary.contributors}</li>`;
-    html += `<li><strong>Avg Hours/Day:</strong> ${projectSummary.avgPerDay}h</li>`;
+    const summaryRows = [
+      { label: 'Total Hours', value: `${projectSummary.totalHours}h` },
+      { label: 'Contributors', value: projectSummary.contributors },
+      { label: 'Avg Hours/Day', value: `${projectSummary.avgPerDay}h` },
+    ];
     if (projectSummary.budgetLabel) {
-      html += `<li><strong>Budget:</strong> ${escapeHtml(projectSummary.budgetLabel)}</li>`;
-    }
-    html += `</ul><hr>`;
-    html += `<h2>Team Breakdown</h2>`;
-    html += `<table style="width:100%;border-collapse:collapse;"><thead><tr>`;
-    html += `<th style="text-align:left;padding:8px;border-bottom:2px solid #e5e7eb;">Member</th>`;
-    html += `<th style="text-align:right;padding:8px;border-bottom:2px solid #e5e7eb;">Hours</th>`;
-    html += `<th style="text-align:right;padding:8px;border-bottom:2px solid #e5e7eb;">Entries</th>`;
-    html += `<th style="text-align:right;padding:8px;border-bottom:2px solid #e5e7eb;">Avg/Day</th>`;
-    html += `</tr></thead><tbody>`;
-    memberBreakdown.forEach(m => {
-      html += `<tr>`;
-      html += `<td style="padding:8px;border-bottom:1px solid #e5e7eb;">${escapeHtml(m.user_name)}</td>`;
-      html += `<td style="text-align:right;padding:8px;border-bottom:1px solid #e5e7eb;">${m.hours}h</td>`;
-      html += `<td style="text-align:right;padding:8px;border-bottom:1px solid #e5e7eb;">${m.entries}</td>`;
-      html += `<td style="text-align:right;padding:8px;border-bottom:1px solid #e5e7eb;">${m.avgPerDay}h</td>`;
-      html += `</tr>`;
-    });
-    html += `</tbody></table><hr>`;
-    html += `<h2>Time Entries</h2>`;
-    projectWorklogs.forEach(w => {
-      html += `<h3>${escapeHtml(formatDateSimple(new Date(w.date * 1000)))} - ${escapeHtml(w.user_name || 'Unknown')}</h3>`;
-      html += `<p><strong>Duration:</strong> ${escapeHtml(formatDuration(w.duration_minutes))}<br>`;
-      html += `<strong>Description:</strong> ${escapeHtml(w.description)}<br>`;
-      html += `<strong>Time:</strong> ${escapeHtml(formatTime(w.start_time))} - ${escapeHtml(formatTime(w.end_time))}</p><hr>`;
-    });
-    html += `<p><em>Generated by ostime Time Management System</em></p>`;
-
-    openPrintWindow(html);
-  }
-
-  function openPrintWindow(content) {
-    const printWindow = window.open('', '_blank');
-    const printContent = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Time Tracking Report</title>
-        <style>
-          body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }
-          h1 { color: #2563eb; font-size: 2em; margin-bottom: 0.5em; }
-          h2 { color: #2563eb; font-size: 1.5em; margin: 1em 0 0.5em 0; }
-          h3 { color: #374151; font-size: 1.2em; margin: 0.8em 0 0.3em 0; }
-          hr { border: none; border-top: 2px solid #e5e7eb; margin: 1.5em 0; }
-          strong { color: #374151; }
-          ul, ol { padding-left: 1.5em; }
-          li { margin-bottom: 0.3em; }
-          table { font-size: 0.9em; }
-          .page-break { page-break-before: always; }
-        </style>
-      </head>
-      <body>
-        ${content}
-      </body>
-      </html>
-    `;
-
-    printWindow.document.write(printContent);
-    printWindow.document.close();
-
-    setTimeout(() => {
-      printWindow.print();
-    }, 500);
-  }
-
-  function getDefaultTemplate() {
-    return `<h1>Time Tracking Report</h1>
-<p><strong>Report Period:</strong> {{date_from}} to {{date_to}}<br><strong>Generated:</strong> {{generated_date}}</p>
-<hr>
-<h2>Summary</h2>
-<ul>
-<li><strong>Total Hours:</strong> {{total_hours}}h</li>
-<li><strong>Total Entries:</strong> {{total_entries}}</li>
-<li><strong>Average Hours per Day:</strong> {{average_hours_per_day}}h</li>
-<li><strong>Top Project:</strong> {{top_project_name}} ({{top_project_hours}}h)</li>
-<li><strong>Top Customer:</strong> {{top_customer_name}} ({{top_customer_hours}}h)</li>
-</ul>
-<hr>
-<h2>Time Entries</h2>
-{{#each entries}}
-<h3>{{date}} - {{project_name}}</h3>
-<p><strong>Customer:</strong> {{customer_name}}<br><strong>Duration:</strong> {{duration}}<br><strong>Description:</strong> {{description}}<br><strong>Time:</strong> {{start_time}} - {{end_time}}</p>
-<hr>
-{{/each}}
-<h2>Total Summary</h2>
-<p><strong>Grand Total:</strong> {{total_hours}} hours across {{total_entries}} entries.</p>
-<hr>
-<p><em>Generated by ostime Time Management System</em></p>`;
-  }
-
-  function processTemplate(template, data) {
-    let processed = template;
-
-    Object.keys(data).forEach(key => {
-      if (key !== 'entries') {
-        const regex = new RegExp(`{{${key}}}`, 'g');
-        processed = processed.replace(regex, escapeHtml(data[key]));
-      }
-    });
-
-    const entriesMatch = processed.match(/{{#each entries}}(.*?){{\/each}}/s);
-    if (entriesMatch && data.entries) {
-      const entryTemplate = entriesMatch[1];
-      let entriesContent = '';
-
-      data.entries.forEach(entry => {
-        let entryContent = entryTemplate;
-        Object.keys(entry).forEach(key => {
-          const regex = new RegExp(`{{${key}}}`, 'g');
-          entryContent = entryContent.replace(regex, escapeHtml(entry[key]));
-        });
-        entriesContent += entryContent;
-      });
-
-      processed = processed.replace(/{{#each entries}}.*?{{\/each}}/s, entriesContent);
+      summaryRows.push({ label: 'Budget', value: projectSummary.budgetLabel });
     }
 
-    return processed;
+    const report = buildTimeReportMarkdown({
+      title: `Project Time Report: ${projectName}`,
+      period: {
+        from: projectDateFrom || 'All time',
+        to: projectDateTo || 'Present',
+      },
+      generated: formatAuthenticatedInstant(new Date(), { year: 'numeric', month: 'short', day: 'numeric' }),
+      summary: summaryRows,
+      team: memberBreakdown.map((member) => ({
+        name: member.user_name,
+        hours: `${member.hours}h`,
+        entries: member.entries,
+        average: `${member.avgPerDay}h`,
+      })),
+      entries: allEntries.map((worklog) => ({
+        heading: `${formatDateOnly(dateKeyInZone(worklog.start_time, reportTimezone))} — ${worklog.user_name || 'Unknown'}`,
+        fields: [
+          { label: 'Duration', value: formatDuration(worklog.duration_minutes) },
+          { label: 'Description', value: worklog.description },
+          { label: 'Time', value: `${formatTime(worklog.start_time)} – ${formatTime(worklog.end_time)}` },
+        ],
+      })),
+    });
+
+    openTimeReport(report, `Project Time Report - ${projectName}`);
+  }
+
+  function openTimeReport(content, title) {
+    if (!openMarkdownPrintView('/time/worklogs/print', 'time-report', { content, title })) {
+      throw new Error('The browser blocked the report window');
+    }
   }
 
   // Reactive filtering for projects based on selected customer
@@ -563,7 +493,7 @@
 
   // Current export data source
   const currentExportDisabled = $derived(
-    mode === 'personal' ? worklogs.length === 0 : projectWorklogs.length === 0
+    mode === 'personal' ? entryTotal === 0 : projectAggregate.totals.length === 0
   );
 </script>
 
@@ -581,6 +511,7 @@
         loading={exportLoading}
         icon={Download}
         size="medium"
+        dataTestid="time-report-export-csv"
       >
         {t('time.reports.exportCSV')}
       </Button>
@@ -591,6 +522,7 @@
         loading={exportLoading}
         icon={FileText}
         size="medium"
+        dataTestid="time-report-export-pdf"
       >
         {t('time.reports.exportPDF')}
       </Button>
@@ -678,6 +610,7 @@
         loading={loading}
         icon={Filter}
         size="medium"
+        dataTestid="time-report-apply-filters"
       >
         {t('time.reports.applyFilters')}
       </Button>
@@ -733,8 +666,22 @@
       <div class="px-6 py-4 border-t" style="background-color: var(--ds-surface); border-color: var(--ds-border);">
         <div class="text-sm font-semibold" style="color: var(--ds-text);">
           {t('time.reports.totalTime')}: {summary.totalHours}h
-          <span class="ml-2 font-normal" style="color: var(--ds-text-subtle);">({t('time.reports.entriesShown', { count: filteredWorklogs.length })})</span>
+          <span class="ml-2 font-normal" style="color: var(--ds-text-subtle);">({t('time.reports.entriesShown', { count: filteredWorklogs.length })}{worklogs.length < entryTotal ? ` · ${entryTotal}` : ''})</span>
         </div>
+      </div>
+    {/if}
+
+    {#if worklogs.length < entryTotal}
+      <div class="flex justify-center py-4 border-t" style="border-color: var(--ds-border);">
+        <Button
+          variant="secondary"
+          size="small"
+          dataTestid="time-report-load-more"
+          disabled={loadingMoreEntries}
+          onclick={loadMoreEntries}
+        >
+          {loadingMoreEntries ? t('common.loading') : t('common.loadMore')}
+        </Button>
       </div>
     {/if}
   </Card>
@@ -775,6 +722,7 @@
         loading={projectLoading}
         icon={Filter}
         size="medium"
+        dataTestid="project-report-apply-filters"
       >
         {t('time.reports.applyFilters')}
       </Button>
@@ -788,7 +736,7 @@
         <p class="text-sm">{t('time.reports.noProjectSelected')}</p>
       </div>
     </Card>
-  {:else if projectWorklogs.length === 0 && !projectLoading}
+  {:else if projectAggregate.totals.length === 0 && !projectLoading}
     <Card rounded="xl" shadow padding="spacious">
       <div class="text-center py-12" style="color: var(--ds-text-subtle);">
         <p class="text-sm">{t('time.reports.noEntriesFound')}</p>
@@ -815,7 +763,7 @@
         <Chart
           type="line"
           series={[{ key: 'hours', label: t('time.reports.hoursLogged'), color: 'var(--ds-accent-blue)', values: dailyChartData.map(d => d.count ?? 0) }]}
-          categories={dailyChartData.map(d => d.label || formatDateSimple(d.date))}
+          categories={dailyChartData.map(d => d.label)}
           valueFormat={(v) => `${v}h`}
           showYAxis={true}
           yAxisFormat={(v) => `${Math.round(v)}h`}

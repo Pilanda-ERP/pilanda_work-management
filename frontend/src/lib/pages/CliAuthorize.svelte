@@ -13,17 +13,15 @@
 	import ConsentCard from '../components/ConsentCard.svelte';
 	import Button from '../components/Button.svelte';
 	import Spinner from '../components/Spinner.svelte';
+	import { scopeCatalogStore } from '../stores/scopeCatalog.svelte.js';
 
-	const SCOPE_DESCRIPTIONS = {
-		'items:read': 'Read work items and comments',
-		'items:write': 'Create and update work items',
-		'items:delete': 'Delete work items',
-		'workspaces:read': 'Read workspaces and configuration',
-		'workspaces:write': 'Modify workspaces and configuration',
-		'workspaces:delete': 'Delete workspaces',
-		'collections:read': 'Read collections and reports',
-		'users:read': 'Read user directory',
-	};
+	// Scope descriptions come from the server catalog (auth.ScopeCatalog) so the
+	// consent screen can explain every scope a client might request. The previous
+	// hand-written map covered 8 of them and silently fell back to showing the
+	// raw scope string for the rest.
+	let scopeDescriptions = $derived(
+		Object.fromEntries(scopeCatalogStore.catalog.map((s) => [s.scope, s.description]))
+	);
 
 	let params = $derived($currentRoute.query || {});
 	let callbackURL = $derived(params.callback || '');
@@ -46,6 +44,7 @@
 	let error = $state('');
 
 	onMount(async () => {
+		scopeCatalogStore.load();
 		try {
 			caps = await api.cliAuth.capabilities();
 		} catch (err) {
@@ -138,6 +137,7 @@
 	<div
 		class="min-h-screen flex items-center justify-center px-4 py-10"
 		style="background-color: var(--ds-surface);"
+		data-testid="cli-parameters-error"
 	>
 		<div
 			class="w-full max-w-lg rounded-lg border p-6 shadow-sm"
@@ -158,6 +158,7 @@
 	<div
 		class="min-h-screen flex items-center justify-center px-4 py-10"
 		style="background-color: var(--ds-surface);"
+		data-testid="cli-disabled"
 	>
 		<div
 			class="w-full max-w-lg rounded-lg border p-6 shadow-sm"
@@ -200,7 +201,7 @@
 		icon={Terminal}
 		title="Authorize Windshift CLI"
 		{scopes}
-		scopeDescriptions={SCOPE_DESCRIPTIONS}
+		{scopeDescriptions}
 		{error}
 		onAllow={approve}
 		onDeny={deny}

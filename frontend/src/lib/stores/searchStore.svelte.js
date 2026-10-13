@@ -2,8 +2,23 @@ import { derived, get, writable } from 'svelte/store';
 import { api } from '../api.js';
 import { confirm } from '../composables/useConfirm.js';
 import { QLBuilder } from '../utils/ql.js';
+import { completionFieldToFilterField } from '../utils/qlCompletion.js';
 import { t } from './i18n.svelte.js';
 import { warningToast } from './toasts.svelte.js';
+import { workspacesStore } from './workspaces.svelte.js';
+
+// A dynamic filter carries a condition when it has a field plus a value, an
+// IN list, or a value-free null predicate. Null predicates are meaningful even
+// though their value and values are empty.
+function isMeaningfulDynamicFilter(filter) {
+  return Boolean(
+    filter?.field &&
+      (filter.operator === 'IS NULL' ||
+        filter.operator === 'IS NOT NULL' ||
+        filter.value !== '' ||
+        (filter.values && filter.values.length > 0))
+  );
+}
 
 /**
  * Factory that creates a fresh work-item search/filter store.
@@ -14,7 +29,7 @@ import { warningToast } from './toasts.svelte.js';
  * URL round-trip, and the polished raw-mode UX (confirm-then-snapshot,
  * tryParseToBuilder on reset, warning toast for dropped clauses).
  */
-export function createWorkItemSearchStore() {
+export function createWorkItemSearchStore({ allowEmptyQuery = false } = {}) {
   // ===== Filter state =====
   const searchQuery = writable('');
   const selectedWorkspaces = writable([]);
@@ -52,7 +67,7 @@ export function createWorkItemSearchStore() {
     ],
     ([$ws, $st, $pr, $q, $df, $wsRef]) =>
       QLBuilder.buildQuery({
-        workspaces: $ws.map((id) => $wsRef.find((w) => w.id === id)?.name).filter(Boolean),
+        workspaces: $ws.map((id) => $wsRef.find((w) => w.id === id)?.key).filter(Boolean),
         statuses: $st,
         priorities: $pr,
         search: $q,
@@ -76,9 +91,7 @@ export function createWorkItemSearchStore() {
     ],
     ([$ws, $st, $pr, $q, $df, $raw, $rawQl]) => {
       if ($raw) return $rawQl.trim().length > 0;
-      const hasDyn = $df.some(
-        (f) => f.field && (f.value !== '' || (f.values && f.values.length > 0))
-      );
+      const hasDyn = $df.some(isMeaningfulDynamicFilter);
       return $ws.length > 0 || $st.length > 0 || $pr.length > 0 || $q.trim().length > 0 || hasDyn;
     }
   );
@@ -149,7 +162,7 @@ export function createWorkItemSearchStore() {
   async function loadReferenceData() {
     try {
       const [wsData, stData, prData, catData] = await Promise.all([
-        api.workspaces.getAll(),
+        workspacesStore.load(),
         api.statuses.getAll(),
         api.priorities.getAll(),
         api.statusCategories.getAll(),
@@ -171,32 +184,40 @@ export function createWorkItemSearchStore() {
   }
 
   // ===== Search execution =====
+  // Only the most recent request may update results, pagination, error, and
+  // loading state; an earlier response that resolves late is discarded.
+  let searchGeneration = 0;
+
   async function executeSearch({ page = 1, limit = 50 } = {}) {
+    const generation = ++searchGeneration;
     const finalQl = get(qlQuery);
-    if (!finalQl?.trim()) {
+    if (!allowEmptyQuery && !finalQl?.trim()) {
       workItems.set([]);
       pagination.set(null);
       qlError.set(null);
+      loadingItems.set(false);
       return;
     }
     loadingItems.set(true);
     qlError.set(null);
     try {
       const response = await api.items.getAll({ ql: finalQl, page, limit });
-      if (response?.items) {
-        workItems.set(response.items);
+      if (generation !== searchGeneration) return;
+      if (response?.data) {
+        workItems.set(response.data);
         pagination.set(response.pagination || null);
       } else {
         workItems.set(response || []);
         pagination.set(null);
       }
     } catch (err) {
+      if (generation !== searchGeneration) return;
       console.error('Search failed:', err);
       qlError.set(err.message || 'Search failed');
       workItems.set([]);
       pagination.set(null);
     } finally {
-      loadingItems.set(false);
+      if (generation === searchGeneration) loadingItems.set(false);
     }
   }
 
@@ -232,16 +253,14 @@ export function createWorkItemSearchStore() {
     let statusCatalog = get(allStatuses);
     let priorityCatalog = get(allPriorities);
     try {
-      const [cf, st, pr] = await Promise.all([
-        api.customFields.getAll(),
+      const [catalog, st, pr] = await Promise.all([
+        api.queryLanguage.getCatalog(),
         statusCatalog.length ? null : api.statuses.getAll(),
         priorityCatalog.length ? null : api.priorities.getAll(),
       ]);
-      customFieldsCatalog = (cf?.data || []).map((field) => ({
-        id: `cf_${field.name}`,
-        name: field.name,
-        type: field.field_type,
-      }));
+      customFieldsCatalog = (catalog?.fields || [])
+        .filter((field) => /^cfid_\d+$/i.test(field.name))
+        .map(completionFieldToFilterField);
       if (st) {
         statusCatalog = (st || []).map((s) => ({ id: s.id, name: s.name || s.key || '' }));
       }
@@ -252,16 +271,19 @@ export function createWorkItemSearchStore() {
       console.warn('Failed to load reference data for builder recovery:', err);
     }
 
+    const wsList = get(workspaces);
     const parsed = QLBuilder.tryParseToBuilder(qlString, {
       customFields: customFieldsCatalog,
       statuses: statusCatalog,
       priorities: priorityCatalog,
+      workspaces: wsList,
     });
 
-    const wsList = get(workspaces);
     selectedWorkspaces.set(
       parsed
-        ? parsed.workspaces.map((name) => wsList.find((w) => w.name === name)?.id).filter(Boolean)
+        ? parsed.workspaces
+            .map((reference) => wsList.find((w) => w.key === reference || w.name === reference)?.id)
+            .filter(Boolean)
         : []
     );
     selectedStatuses.set(parsed ? parsed.statuses : []);
@@ -325,9 +347,7 @@ export function createWorkItemSearchStore() {
       if (sp.length > 0) url.searchParams.set('priorities', sp.join(','));
       if (sq.trim()) url.searchParams.set('search', sq);
 
-      const dfSerializable = df.filter(
-        (f) => f.field && (f.value !== '' || (f.values && f.values.length > 0))
-      );
+      const dfSerializable = df.filter(isMeaningfulDynamicFilter);
       if (dfSerializable.length > 0) {
         url.searchParams.set('dynamicFilters', JSON.stringify(dfSerializable));
       }
@@ -343,6 +363,18 @@ export function createWorkItemSearchStore() {
 
   function restoreFromURL() {
     const params = new URLSearchParams(window.location.search);
+
+    // A restore can happen more than once while SearchPage stays mounted
+    // (browser Back/Forward after syncToURL's pushState). Reset first so a
+    // parameter removed by the history entry also disappears from the UI.
+    searchQuery.set('');
+    selectedWorkspaces.set([]);
+    selectedStatuses.set([]);
+    selectedPriorities.set([]);
+    dynamicFilters.set([]);
+    rawQlQuery.set('');
+    rawMode.set(false);
+    qlError.set(null);
 
     // Raw mode (`?raw=…` is canonical; `?ql=…` is accepted for backwards compat).
     const rawParam = params.get('raw') ?? params.get('ql');

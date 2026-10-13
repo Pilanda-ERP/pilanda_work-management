@@ -13,6 +13,11 @@
 package authz
 
 import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
 	"windshift/internal/database"
 	"windshift/internal/models"
 	"windshift/internal/repository"
@@ -54,6 +59,15 @@ func (a *Authz) CanViewWorkspace(userID, workspaceID int) (bool, error) {
 	return a.canViewWorkspaceFallback(userID, workspaceID), nil
 }
 
+// CanCreateItems checks if a user can create items in a workspace.
+// Equivalent to HasWorkspacePermission(userID, workspaceID, PermissionItemCreate).
+func (a *Authz) CanCreateItems(userID, workspaceID int) (bool, error) {
+	if a.permissionService != nil {
+		return a.permissionService.HasWorkspacePermission(userID, workspaceID, models.PermissionItemCreate)
+	}
+	return a.canEditWorkspaceFallback(userID, workspaceID)
+}
+
 // CanEditWorkspace checks if a user can edit items in a workspace.
 // Equivalent to HasWorkspacePermission(userID, workspaceID, PermissionItemEdit).
 func (a *Authz) CanEditWorkspace(userID, workspaceID int) (bool, error) {
@@ -73,6 +87,33 @@ func (a *Authz) CanAdminWorkspace(userID, workspaceID int) (bool, error) {
 	// No permission service configured (open-by-default test setups): fall back
 	// to the edit check, which is the strictest fallback available here.
 	return a.canEditWorkspaceFallback(userID, workspaceID)
+}
+
+// WorkspaceVisibility returns a request-scoped evaluator that answers view
+// and admin checks for many workspaces from one permission snapshot. Paged
+// catalog readers use it to decode the snapshot once per request instead of
+// once per candidate workspace.
+func (a *Authz) WorkspaceVisibility(userID int) (services.WorkspaceVisibility, error) {
+	if a.permissionService != nil {
+		return a.permissionService.WorkspaceVisibility(userID)
+	}
+	return fallbackWorkspaceVisibility{authz: a, userID: userID}, nil
+}
+
+// fallbackWorkspaceVisibility routes per-workspace decisions through the
+// legacy SQL checks used when no permission service is configured (open
+// test setups).
+type fallbackWorkspaceVisibility struct {
+	authz  *Authz
+	userID int
+}
+
+func (f fallbackWorkspaceVisibility) CanView(workspaceID int) (bool, error) {
+	return f.authz.canViewWorkspaceFallback(f.userID, workspaceID), nil
+}
+
+func (f fallbackWorkspaceVisibility) CanAdmin(workspaceID int) (bool, error) {
+	return f.authz.canEditWorkspaceFallback(f.userID, workspaceID)
 }
 
 // HasGlobalPermission checks if a user has a global permission
@@ -108,6 +149,142 @@ func (a *Authz) GetAccessibleWorkspaceIDs(userID int) ([]int, error) {
 	return repository.GetAccessibleWorkspaceIDs(a.db, userID)
 }
 
+// CanViewWorkspaceTx applies the same item.view rule as CanViewWorkspace, but
+// reads through the caller's transaction so template-source visibility and the
+// cloned snapshot come from one consistent database state. It resolves agent
+// ownership, system-admin grants, explicit user/group role permissions, and
+// the open-role "everyone" fallback exactly like the permission cache build.
+func (a *Authz) CanViewWorkspaceTx(ctx context.Context, tx database.Tx, userID, workspaceID int) (bool, error) {
+	// Owned agents inherit their owner's permissions.
+	var ownerID sql.NullInt64
+	var isAgent sql.NullBool
+	err := tx.QueryRowContext(ctx,
+		"SELECT COALESCE(is_agent, false), agent_owner_user_id FROM users WHERE id = ?", userID,
+	).Scan(&isAgent, &ownerID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("resolve template access user: %w", err)
+	}
+	if isAgent.Valid && isAgent.Bool && ownerID.Valid {
+		userID = int(ownerID.Int64)
+	}
+
+	// System admins pass every workspace check.
+	var hasSystemAdmin bool
+	err = tx.QueryRowContext(ctx, repository.SystemAdminGrantQuery, userID, userID).Scan(&hasSystemAdmin)
+	if err != nil {
+		return false, fmt.Errorf("check template access system admin: %w", err)
+	}
+	if hasSystemAdmin {
+		return true, nil
+	}
+
+	// Explicit user or active-group role grants carrying item.view.
+	var hasRolePerm bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM user_workspace_roles uwr
+			JOIN workspace_roles wr ON wr.id = uwr.role_id AND wr.permissions_enabled = true
+			JOIN role_permissions rp ON rp.role_id = uwr.role_id
+			JOIN permissions p ON p.id = rp.permission_id
+			WHERE uwr.workspace_id = ? AND uwr.user_id = ? AND p.permission_key = ?
+			UNION
+			SELECT 1 FROM group_workspace_roles gwr
+			JOIN group_members gm ON gm.group_id = gwr.group_id
+			JOIN groups g ON g.id = gm.group_id AND g.is_active = true
+			JOIN workspace_roles wr ON wr.id = gwr.role_id AND wr.permissions_enabled = true
+			JOIN role_permissions rp ON rp.role_id = gwr.role_id
+			JOIN permissions p ON p.id = rp.permission_id
+			WHERE gwr.workspace_id = ? AND gm.user_id = ? AND p.permission_key = ?
+		)
+	`, workspaceID, userID, models.PermissionItemView, workspaceID, userID, models.PermissionItemView).Scan(&hasRolePerm)
+	if err != nil {
+		return false, fmt.Errorf("check template access role permission: %w", err)
+	}
+	if hasRolePerm {
+		return true, nil
+	}
+
+	// Open-role fallback: only active, non-personal workspaces grant the
+	// unassigned Viewer/Editor/Tester union to everyone.
+	var active, isPersonal bool
+	err = tx.QueryRowContext(ctx,
+		"SELECT active, COALESCE(is_personal, false) FROM workspaces WHERE id = ?", workspaceID,
+	).Scan(&active, &isPersonal)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load template access workspace: %w", err)
+	}
+	if !active || isPersonal {
+		return false, nil
+	}
+
+	roleHasPermission := func(roleKey string) (bool, error) {
+		var has int
+		err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM role_permissions rp
+			JOIN permissions p ON p.id = rp.permission_id
+			JOIN workspace_roles wr ON wr.id = rp.role_id
+			WHERE wr.builtin_key = ? AND p.permission_key = ?
+		`, roleKey, models.PermissionItemView).Scan(&has)
+		return has > 0, err
+	}
+	roleAssigned := func(roleKey string) (bool, error) {
+		var assigned int
+		err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM workspace_roles wr
+			WHERE wr.builtin_key = ? AND wr.id IN (
+				SELECT role_id FROM user_workspace_roles WHERE workspace_id = ?
+				UNION
+				SELECT role_id FROM group_workspace_roles WHERE workspace_id = ?
+			)
+		`, roleKey, workspaceID, workspaceID).Scan(&assigned)
+		return assigned > 0, err
+	}
+
+	viewerAssigned, err := roleAssigned(models.RoleBuiltinViewer)
+	if err != nil {
+		return false, fmt.Errorf("check template access viewer gating: %w", err)
+	}
+	if viewerAssigned {
+		return false, nil
+	}
+	viewerHas, err := roleHasPermission(models.RoleBuiltinViewer)
+	if err != nil {
+		return false, fmt.Errorf("check template access viewer permission: %w", err)
+	}
+	if viewerHas {
+		return true, nil
+	}
+
+	editorAssigned, err := roleAssigned(models.RoleBuiltinEditor)
+	if err != nil {
+		return false, fmt.Errorf("check template access editor gating: %w", err)
+	}
+	if !editorAssigned {
+		editorHas, err := roleHasPermission(models.RoleBuiltinEditor)
+		if err != nil {
+			return false, fmt.Errorf("check template access editor permission: %w", err)
+		}
+		if editorHas {
+			return true, nil
+		}
+		testerAssigned, err := roleAssigned(models.RoleBuiltinTester)
+		if err != nil {
+			return false, fmt.Errorf("check template access tester gating: %w", err)
+		}
+		if !testerAssigned {
+			testerHas, err := roleHasPermission(models.RoleBuiltinTester)
+			if err != nil {
+				return false, fmt.Errorf("check template access tester permission: %w", err)
+			}
+			return testerHas, nil
+		}
+	}
+	return false, nil
+}
+
 // canViewWorkspaceFallback runs the legacy SQL check used when the
 // permission service is not available (e.g. some test paths).
 func (a *Authz) canViewWorkspaceFallback(userID, workspaceID int) bool {
@@ -130,24 +307,27 @@ func (a *Authz) canViewWorkspaceFallback(userID, workspaceID int) bool {
 	`, userID, userID, workspaceID, userID).Scan(&exists)
 	return err == nil
 }
-
-// canEditWorkspaceFallback runs the legacy SQL check used when the
-// permission service is not available.
 func (a *Authz) canEditWorkspaceFallback(userID, workspaceID int) (bool, error) {
 	var hasPermission int
 	err := a.db.QueryRow(`
 		SELECT 1 FROM user_workspace_roles uwr
 		JOIN workspace_roles wr ON uwr.role_id = wr.id
-		WHERE uwr.workspace_id = ? AND uwr.user_id = ? AND wr.name IN ('Editor', 'Administrator')
+		WHERE uwr.workspace_id = ? AND uwr.user_id = ? AND wr.builtin_key IN (?, ?)
 		UNION
 		SELECT 1 FROM group_workspace_roles gwr
 		JOIN workspace_roles wr ON gwr.role_id = wr.id
 		JOIN group_members gm ON gwr.group_id = gm.group_id
-		WHERE gwr.workspace_id = ? AND gm.user_id = ? AND wr.name IN ('Editor', 'Administrator')
+		WHERE gwr.workspace_id = ? AND gm.user_id = ? AND wr.builtin_key IN (?, ?)
 		UNION
 		SELECT 1 FROM workspaces WHERE id = ? AND is_personal = true AND owner_id = ?
 		LIMIT 1
-	`, workspaceID, userID, workspaceID, userID, workspaceID, userID).Scan(&hasPermission)
+	`, workspaceID, userID, models.RoleBuiltinEditor, models.RoleBuiltinAdministrator,
+		workspaceID, userID, models.RoleBuiltinEditor, models.RoleBuiltinAdministrator,
+		workspaceID, userID).Scan(&hasPermission)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No role and not a personal-workspace owner: a plain denial, not an error.
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

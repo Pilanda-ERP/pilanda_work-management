@@ -1,6 +1,5 @@
 <script>
   import { tick } from 'svelte';
-  import { fade } from 'svelte/transition';
 
   let {
     show = $bindable(false),
@@ -13,7 +12,6 @@
     scrollable = false,
     closeOnClick = true,
     closeOnEscape = true,
-    transition = true,
     ariaLabelledBy = undefined,
     /** CSS selector for the element that should receive focus first. */
     initialFocus = '[data-autofocus], [autofocus]',
@@ -66,6 +64,18 @@
     }
   });
 
+  // Some callers conditionally render the entire ModalBackdrop. In that case
+  // the component is destroyed in the same update that closes it, before the
+  // effect above can observe `show === false`. Restore the trigger on teardown
+  // as well so both persistent and conditionally rendered dialogs behave the
+  // same for keyboard users.
+  $effect(() => {
+    return () => {
+      previouslyFocusedElement?.focus?.();
+      previouslyFocusedElement = null;
+    };
+  });
+
   function getFocusableElements() {
     if (!backdropRef) return [];
     return Array.from(backdropRef.querySelectorAll(focusableSelector)).filter((el) => {
@@ -88,10 +98,6 @@
 
     const [first] = getFocusableElements();
     (first || backdropRef)?.focus();
-  }
-
-  function handleIntroEnd() {
-    void focusInitialElement();
   }
 
   function handleClick(event) {
@@ -145,8 +151,6 @@
 {#if show}
   <div
     bind:this={backdropRef}
-    transition:fade={{ duration: transition ? 150 : 0 }}
-    onintroend={handleIntroEnd}
     class="fixed inset-0 {layoutClasses} focus:outline-none"
     style="z-index: {zIndex}; background-color: {bgStyle}; backdrop-filter: {filterStyle};"
     onclick={handleClick}

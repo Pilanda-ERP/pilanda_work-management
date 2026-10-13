@@ -1,42 +1,44 @@
 <script>
-	// Unified admin page for both directions of OAuth-shaped integrations.
-	//
-	// Outbound: Windshift acts as the OAuth *client* against external apps
-	//           (Notion, Confluence, etc). Backed by `integration_providers`.
-	//
-	// Inbound:  Windshift acts as the OAuth *server*; third-party apps
-	//           authorize Windshift users to mint per-user API tokens.
-	//           Backed by `oauth_clients`.
-	//
-	// They model the same protocol from opposite sides, so they live in one
-	// place but get distinct tabs (and distinct managers underneath) so the
-	// admin form for each stays tight to its concept.
+	// OAuth integrations share a page: outbound providers connect Windshift to
+	// external apps, while inbound clients authorize apps to mint user tokens.
 
+	import { onMount } from 'svelte';
 	import Tabs from '../components/Tabs.svelte';
 	import IntegrationProviderManager from './IntegrationProviderManager.svelte';
 	import OAuthClientManager from './OAuthClientManager.svelte';
-	import { ArrowUpRight, ArrowDownLeft } from '@lucide/svelte';
+	import ZammadConnectionManager from './ZammadConnectionManager.svelte';
+	import { ArrowUpRight, ArrowDownLeft, TicketCheck } from '@lucide/svelte';
+	import { t } from '../stores/i18n.svelte.js';
 
 	let activeTab = $state('outbound');
 
-	const tabs = [
-		{ id: 'outbound', label: 'Outbound', icon: ArrowUpRight },
-		{ id: 'inbound', label: 'Inbound', icon: ArrowDownLeft },
-	];
+	onMount(() => {
+		if (new URLSearchParams(window.location.search).get('tab') === 'zammad') {
+			activeTab = 'zammad';
+		}
+	});
+
+	const tabs = $derived([
+		{ id: 'outbound', label: t('integrations.directions.outbound'), icon: ArrowUpRight, testid: 'integrations-tab-outbound' },
+		{ id: 'inbound', label: t('integrations.directions.inbound'), icon: ArrowDownLeft, testid: 'integrations-tab-inbound' },
+		{ id: 'zammad', label: t('zammad.tab'), icon: TicketCheck, testid: 'integrations-tab-zammad' },
+	]);
 </script>
 
 <div class="space-y-4">
 	<Tabs {tabs} bind:activeTab>
 		{#if activeTab === 'outbound'}
 			<p class="text-sm mb-4" style="color: var(--ds-text-subtle);">
-				Apps that <strong>Windshift connects to</strong>. Add the OAuth credentials Windshift uses to read data from external services like Notion or Confluence.
+				{t('integrations.directions.outboundDescription')}
 			</p>
 			<IntegrationProviderManager />
 		{:else if activeTab === 'inbound'}
 			<p class="text-sm mb-4" style="color: var(--ds-text-subtle);">
-				Apps that <strong>connect to Windshift</strong> on a user's behalf. Register a third-party app once; users then authorize it via OAuth 2.0 (authorization code + PKCE) to mint per-user Windshift API tokens.
+				{t('integrations.directions.inboundDescription')}
 			</p>
 			<OAuthClientManager />
+		{:else if activeTab === 'zammad'}
+			<ZammadConnectionManager />
 		{/if}
 	</Tabs>
 </div>

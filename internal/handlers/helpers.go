@@ -2,40 +2,73 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 
 	"windshift/internal/database"
 	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/restapi"
 )
+
+const emailOAuthStateRandomBytes = 32
+
+// newEmailOAuthState binds an otherwise-random OAuth state to the exact raw
+// channel config present when the flow started. The state row still provides
+// one-time authenticity; the suffix lets callbacks reject an old browser tab
+// after another admin changes the channel while the user is at the provider.
+func newEmailOAuthState(configJSON string) (string, error) {
+	random := make([]byte, emailOAuthStateRandomBytes)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(configJSON))
+	return hex.EncodeToString(random) + "." + hex.EncodeToString(digest[:]), nil
+}
+
+func emailOAuthStateMatchesConfig(state, configJSON string) bool {
+	const randomHexLen = emailOAuthStateRandomBytes * 2
+	const digestHexLen = sha256.Size * 2
+	if len(state) != randomHexLen+1+digestHexLen || state[randomHexLen] != '.' {
+		return false
+	}
+	expected, err := hex.DecodeString(state[randomHexLen+1:])
+	if err != nil || len(expected) != sha256.Size {
+		return false
+	}
+	actual := sha256.Sum256([]byte(configJSON))
+	return subtle.ConstantTimeCompare(expected, actual[:]) == 1
+}
 
 // rowScanner abstracts sql.Row and sql.Rows for Scan.
 type rowScanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }
 
 // respondJSON sends a JSON response with the given status code
-func respondJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+func respondJSON(w http.ResponseWriter, statusCode int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	_ = json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(restapi.NormalizeEmptySlice(data))
 }
 
 // respondJSONOK sends a JSON response with 200 OK
-func respondJSONOK(w http.ResponseWriter, data interface{}) {
+func respondJSONOK(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(restapi.NormalizeEmptySlice(data))
 }
 
 // respondJSONCreated sends a JSON response with 201 Created
-func respondJSONCreated(w http.ResponseWriter, data interface{}) {
+func respondJSONCreated(w http.ResponseWriter, data any) {
 	respondJSON(w, http.StatusCreated, data)
 }
 
@@ -59,19 +92,54 @@ func requireIDParam(w http.ResponseWriter, r *http.Request, paramName string) (i
 // (error response already written).
 func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
 	var v T
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
+	if err := restapi.DecodeJSONBody(w, r, &v); err != nil {
+		if isRequestBodyTooLarge(err) {
+			respondRequestTooLarge(w, r)
+			return v, false
+		}
 		respondBadRequest(w, r, "Invalid request body")
 		return v, false
 	}
 	return v, true
 }
 
+// decodeJSONWithFields decodes an object and records which fields were sent.
+// Update handlers use the field map to distinguish omission from zero values.
+func decodeJSONWithFields[T any](w http.ResponseWriter, r *http.Request) (value T, fields map[string]json.RawMessage, ok bool) {
+	body, err := restapi.ReadJSONBody(w, r)
+	if err != nil {
+		if isRequestBodyTooLarge(err) {
+			respondRequestTooLarge(w, r)
+			return value, nil, false
+		}
+		respondBadRequest(w, r, "Invalid request body")
+		return value, nil, false
+	}
+
+	if err := json.Unmarshal(body, &fields); err != nil {
+		respondBadRequest(w, r, "Invalid request body")
+		return value, nil, false
+	}
+	if fields == nil {
+		respondBadRequest(w, r, "Invalid request body")
+		return value, nil, false
+	}
+	if err := json.Unmarshal(body, &value); err != nil {
+		respondBadRequest(w, r, "Invalid request body")
+		return value, nil, false
+	}
+	return value, fields, true
+}
+
+func newJSONDecoder(w http.ResponseWriter, r *http.Request) *json.Decoder {
+	return restapi.NewJSONDecoder(w, r)
+}
+
 // isRequestBodyTooLarge reports whether err is the error http.MaxBytesReader
 // returns once a request body exceeds its cap. Used to distinguish an
 // oversized body (413) from otherwise-malformed input (400) after a decode.
 func isRequestBodyTooLarge(err error) bool {
-	var maxErr *http.MaxBytesError
-	return errors.As(err, &maxErr)
+	return restapi.IsRequestBodyTooLarge(err)
 }
 
 // decodeOptionalJSON decodes a JSON request body into a value of type T when one
@@ -83,9 +151,13 @@ func decodeOptionalJSON[T any](w http.ResponseWriter, r *http.Request) (T, bool)
 	if r.Body == nil {
 		return v, true
 	}
-	err := json.NewDecoder(r.Body).Decode(&v)
+	err := restapi.DecodeJSONBody(w, r, &v)
 	if err == nil || errors.Is(err, io.EOF) {
 		return v, true
+	}
+	if isRequestBodyTooLarge(err) {
+		respondRequestTooLarge(w, r)
+		return v, false
 	}
 	respondBadRequest(w, r, "Invalid request body")
 	return v, false
@@ -110,12 +182,13 @@ func requireWorkspaceIDParam(w http.ResponseWriter, r *http.Request, cache *Work
 // respondJSONWithWarnings sends a JSON response with warnings if any exist
 // If there are warnings, the response is wrapped in {"data": ..., "warnings": [...]}
 // If there are no warnings, the response is sent as-is for backward compatibility
-func respondJSONWithWarnings(w http.ResponseWriter, statusCode int, data interface{}, warnings []models.APIWarning) {
+func respondJSONWithWarnings(w http.ResponseWriter, statusCode int, data any, warnings []models.APIWarning) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 
+	data = restapi.NormalizeEmptySlice(data)
 	if len(warnings) > 0 {
-		response := map[string]interface{}{
+		response := map[string]any{
 			"data":     data,
 			"warnings": warnings,
 		}
@@ -126,12 +199,12 @@ func respondJSONWithWarnings(w http.ResponseWriter, statusCode int, data interfa
 }
 
 // respondJSONOKWithWarnings sends 200 OK with optional warnings
-func respondJSONOKWithWarnings(w http.ResponseWriter, data interface{}, warnings []models.APIWarning) {
+func respondJSONOKWithWarnings(w http.ResponseWriter, data any, warnings []models.APIWarning) {
 	respondJSONWithWarnings(w, http.StatusOK, data, warnings)
 }
 
 // respondJSONCreatedWithWarnings sends 201 Created with optional warnings
-func respondJSONCreatedWithWarnings(w http.ResponseWriter, data interface{}, warnings []models.APIWarning) {
+func respondJSONCreatedWithWarnings(w http.ResponseWriter, data any, warnings []models.APIWarning) {
 	respondJSONWithWarnings(w, http.StatusCreated, data, warnings)
 }
 
@@ -151,7 +224,7 @@ func logAudit(db database.Database, r *http.Request, user *models.User, actionTy
 
 // logAuditWithDetails logs a successful resource action audit event with extra
 // structured details (serialized to JSON in the audit log row).
-func logAuditWithDetails(db database.Database, r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName string, details map[string]interface{}) {
+func logAuditWithDetails(db database.Database, r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName string, details map[string]any) {
 	_ = logger.LogAudit(db, logger.NewRequestAuditEvent(r, user, actionType, resourceType, resourceID, resourceName, details))
 }
 
@@ -176,43 +249,24 @@ type channelResult struct {
 	config  models.ChannelConfig
 }
 
-// findChannelBySlug queries all channels of the given type, parses each
-// channel's JSON config, and returns the first enabled channel whose slug
-// (extracted via slugFromConfig) matches the provided slug. This is the
-// single implementation behind PortalHandler.findChannelByPortalSlug and
-// FormHandler.findChannelByFormSlug.
+// findChannelBySlug resolves through channels.public_slug's unique partial
+// index, then verifies that the derived column still matches the JSON config.
+// This is the single implementation behind PortalHandler and FormHandler.
 func findChannelBySlug(ctx context.Context, db database.Database, channelType, slug string, slugFromConfig func(*models.ChannelConfig) string) (*channelResult, error) {
-	candidates, err := repository.NewChannelRepository(db).ListSlugCandidates(ctx, channelType)
+	candidate, err := repository.NewChannelRepository(db).FindEnabledByPublicSlug(ctx, channelType, slug)
 	if err != nil {
 		return nil, err
 	}
-	for _, candidate := range candidates {
-		cfg := candidate.Config
-		if slugFromConfig(&cfg) == slug && candidate.Channel.Status == "enabled" {
-			return &channelResult{channel: candidate.Channel, config: candidate.Config}, nil
-		}
+	if slugFromConfig(&candidate.Config) != slug {
+		return nil, fmt.Errorf("%s channel not found", channelType)
 	}
-	return nil, fmt.Errorf("%s channel not found", channelType)
+	return &channelResult{channel: candidate.Channel, config: candidate.Config}, nil
 }
 
 // visibilityInput holds the decoded visibility update request.
 type visibilityInput struct {
 	GroupIDs []int `json:"group_ids"`
 	OrgIDs   []int `json:"org_ids"`
-}
-
-// verifyResourceInWorkspace checks that a row with the given ID exists in the
-// specified table and belongs to the given workspace. Returns true if found,
-// or writes a 404 and returns false. The table parameter is validated by the
-// repository against an allow-list — passing an unknown table fails the
-// check rather than silently 404'ing.
-func verifyResourceInWorkspace(checker *repository.WorkspaceResourceRepository, w http.ResponseWriter, r *http.Request, table string, resourceID, workspaceID int, resourceLabel string) bool {
-	exists, err := checker.ExistsInWorkspace(table, resourceID, workspaceID)
-	if err != nil || !exists {
-		respondNotFound(w, r, resourceLabel)
-		return false
-	}
-	return true
 }
 
 // PaginationParams holds parsed pagination values.
@@ -237,23 +291,4 @@ func parseOffsetPagination(r *http.Request, defaultLimit, maxLimit int) (limit, 
 		}
 	}
 	return limit, offset
-}
-
-// addDateRangeFilter appends date_from/date_to query parameter filters to a SQL query.
-// Expects dates in "2006-01-02" format. Compares against a Unix timestamp column.
-func addDateRangeFilter(r *http.Request, query *string, args *[]interface{}, column string) {
-	if dateFrom := r.URL.Query().Get("date_from"); dateFrom != "" {
-		t, err := time.Parse("2006-01-02", dateFrom)
-		if err == nil {
-			*query += " AND " + column + " >= ?"
-			*args = append(*args, t.Unix())
-		}
-	}
-	if dateTo := r.URL.Query().Get("date_to"); dateTo != "" {
-		t, err := time.Parse("2006-01-02", dateTo)
-		if err == nil {
-			*query += " AND " + column + " <= ?"
-			*args = append(*args, t.Add(24*time.Hour-time.Second).Unix())
-		}
-	}
 }

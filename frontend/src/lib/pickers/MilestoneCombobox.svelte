@@ -2,6 +2,13 @@
   import ItemPicker from './ItemPicker.svelte';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
+  import { errorToast } from '../stores/toasts.svelte.js';
+  import { milestonesStore } from '../stores/milestones.js';
+  import { permissionStore, isSystemAdmin } from '../stores/permissions.svelte.js';
+  import { workspacePermissions } from '../stores/workspacePermissions.svelte.js';
+  import MilestoneFormDialog from '../features/milestones/MilestoneFormDialog.svelte';
+  import { Plus } from '@lucide/svelte';
+  import Checkbox from '../components/Checkbox.svelte';
 
   // When `multiple` is false (the default), `value` is a single milestone ID
   // (or null) and onSelect emits `{ value, milestone }`.
@@ -13,10 +20,16 @@
     class: className = '',
     disabled = false,
     workspaceId = null,
+    milestones: providedMilestones = null,
+    loading: providedLoading = false,
     showUnassigned = true,
     unassignedLabel = '',
     children = null,
     multiple = false,
+    // (value) => string | null. Labels a selected milestone that is not in the
+    // loaded options yet; forwarded to ItemPicker's trigger rendering.
+    resolveMissingLabel = null,
+    onOpen = null,
     onSelect = () => {},
     onCancel = () => {}
   } = $props();
@@ -26,9 +39,53 @@
   );
   const resolvedUnassignedLabel = $derived(unassignedLabel || t('pickers.noMilestone'));
 
-  let milestones = $state([]);
-  let loading = $state(false);
+  let loadedMilestones = $state([]);
+  let createdMilestones = $state([]);
+  let internalLoading = $state(false);
   let loadToken = 0;
+  let previousWorkspaceId = $state(null);
+  const baseMilestones = $derived(providedMilestones ?? loadedMilestones);
+  const milestones = $derived.by(() => {
+    const seen = new Set();
+    return [...baseMilestones, ...createdMilestones].filter((milestone) => {
+      if (seen.has(milestone.id)) return false;
+      seen.add(milestone.id);
+      return true;
+    });
+  });
+  const loading = $derived(providedMilestones === null ? internalLoading : providedLoading);
+
+  $effect(() => {
+    if (previousWorkspaceId === workspaceId) return;
+    previousWorkspaceId = workspaceId;
+    createdMilestones = [];
+  });
+
+  const hasWorkspaceContext = $derived(workspaceId !== null && workspaceId !== undefined && workspaceId !== '');
+  const canCreateGlobal = $derived(
+    $permissionStore.userPermissionKeys?.has('milestone.create') || $isSystemAdmin
+  );
+  const canCreateWorkspace = $derived(
+    hasWorkspaceContext && (
+      workspacePermissions.canAdminWorkspace(workspaceId) ||
+      workspacePermissions.hasPermission(workspaceId, 'item.edit')
+    )
+  );
+  const canCreate = $derived(
+    hasWorkspaceContext ? canCreateWorkspace || canCreateGlobal : canCreateGlobal
+  );
+
+  let showCreateDialog = $state(false);
+  let savingCreate = $state(false);
+  let createFormData = $state({
+    name: '',
+    description: '',
+    target_date: '',
+    status: 'planning',
+    category_id: null,
+    is_global: true,
+    workspace_id: null
+  });
 
   // Terminal milestone lifecycle statuses are hidden from the list by default
   // so completed/cancelled milestones no longer look identical to active ones
@@ -41,12 +98,16 @@
   // Reload when workspaceId changes. Capture the ID for this request so an
   // earlier global load cannot overwrite a later workspace-scoped result.
   $effect(() => {
-    loadMilestones(workspaceId);
+    if (providedMilestones !== null) return;
+
+    const controller = new AbortController();
+    loadMilestones(workspaceId, { signal: controller.signal });
+    return () => controller.abort();
   });
 
-  async function loadMilestones(currentWorkspaceId) {
+  async function loadMilestones(currentWorkspaceId, requestOptions = {}) {
     const token = ++loadToken;
-    loading = true;
+    internalLoading = true;
 
     try {
       const filters = {};
@@ -55,16 +116,17 @@
         filters.include_global = true;
       }
 
-      const response = await api.milestones.getAll(filters);
+      const response = await api.milestones.getAll(filters, requestOptions);
       if (token !== loadToken) return;
-      milestones = response || [];
+      loadedMilestones = response || [];
+      createdMilestones = [];
     } catch (err) {
-      if (token !== loadToken) return;
+      if (token !== loadToken || err?.name === 'AbortError') return;
       console.error('Failed to load milestones:', err);
-      milestones = [];
+      loadedMilestones = [];
     } finally {
       if (token === loadToken) {
-        loading = false;
+        internalLoading = false;
       }
     }
   }
@@ -82,6 +144,67 @@
       .map((id) => milestones.find((m) => m.id === id))
       .filter(Boolean);
     onSelect({ ids: safe, milestones: selected });
+  }
+
+  function createScope() {
+    const workspace = hasWorkspaceContext ? Number.parseInt(String(workspaceId), 10) : null;
+    const isGlobal = !hasWorkspaceContext || !canCreateWorkspace;
+    return {
+      is_global: isGlobal,
+      workspace_id: isGlobal || !Number.isFinite(workspace) ? null : workspace
+    };
+  }
+
+  function openCreateDialog(name) {
+    if (!canCreate) return;
+    const scope = createScope();
+    createFormData = {
+      name: name.trim(),
+      description: '',
+      target_date: '',
+      status: 'planning',
+      category_id: null,
+      ...scope
+    };
+    showCreateDialog = true;
+  }
+
+  async function saveCreatedMilestone() {
+    if (savingCreate) return;
+    savingCreate = true;
+
+    try {
+      const data = {
+        ...createFormData,
+        target_date: createFormData.target_date || null
+      };
+      if (data.is_global) data.workspace_id = null;
+
+      const created = await milestonesStore.add(data);
+      createdMilestones = [...createdMilestones, created];
+
+      if (multiple) {
+        const nextIds = [
+          ...(Array.isArray(value) ? value : []),
+          created.id
+        ];
+        value = nextIds;
+        onSelect({
+          ids: nextIds,
+          milestones: nextIds.map((id) => milestones.find((item) => item.id === id)).filter(Boolean)
+        });
+      } else {
+        value = created.id;
+        onSelect({ value: created.id, milestone: created });
+      }
+
+      showCreateDialog = false;
+    } catch (error) {
+      console.error('Failed to create milestone:', error);
+      errorToast(error?.message || String(error), t('errors.failedToSave'));
+    } finally {
+      savingCreate = false;
+    }
   }
 
   // Terminal milestones hidden by default; surfaced via the footer toggle.
@@ -166,20 +289,41 @@
     class={className}
     {children}
     keepOpenOnFooterTab={hasCompletedMilestones}
+    allowCreate={canCreate}
+    onCreate={openCreateDialog}
     onSelect={handleSelectMulti}
+    {resolveMissingLabel}
+    onOpen={() => onOpen?.()}
     onCancel={() => onCancel()}
   >
     {#snippet footer()}
       {#if hasCompletedMilestones}
-        <label
-          class="flex items-center gap-2 px-4 py-2.5 cursor-pointer text-sm select-none"
-          style="color: var(--ds-text);"
-          data-testid="milestone-show-completed-toggle"
-        >
-          <input type="checkbox" bind:checked={showCompleted} class="accent-[var(--ds-interactive)]" />
-          <span>{t('pickers.showCompletedMilestones')}</span>
-        </label>
+        <Checkbox
+          bind:checked={showCompleted}
+          label={t('pickers.showCompletedMilestones')}
+          class="px-4 py-2.5"
+          dataTestid="milestone-show-completed-toggle"
+          size="small"
+        />
       {/if}
+    {/snippet}
+
+    {#snippet noResultsSnippet({ searchQuery, onCreate })}
+      <div class="p-4 text-center text-sm" style="color: var(--ds-text-subtle);">
+        <div>{t('pickers.noResultsFor', { query: searchQuery })}</div>
+        {#if canCreate}
+          <button
+            type="button"
+            data-testid="milestone-create-option"
+            class="inline-flex items-center gap-2 mt-3 px-3 py-1.5 rounded transition-colors"
+            style="background-color: var(--ds-background-accent-blue-subtlest); color: var(--ds-interactive);"
+            onclick={onCreate}
+          >
+            <Plus class="w-4 h-4" />
+            {t('pickers.createItem', { value: searchQuery })}
+          </button>
+        {/if}
+      </div>
     {/snippet}
   </ItemPicker>
 {:else}
@@ -196,20 +340,52 @@
     class={className}
     {children}
     keepOpenOnFooterTab={hasCompletedMilestones}
+    allowCreate={canCreate}
+    onCreate={openCreateDialog}
     onSelect={handleSelectSingle}
+    {resolveMissingLabel}
+    onOpen={() => onOpen?.()}
     onCancel={() => onCancel()}
   >
     {#snippet footer()}
       {#if hasCompletedMilestones}
-        <label
-          class="flex items-center gap-2 px-4 py-2.5 cursor-pointer text-sm select-none"
-          style="color: var(--ds-text);"
-          data-testid="milestone-show-completed-toggle"
-        >
-          <input type="checkbox" bind:checked={showCompleted} class="accent-[var(--ds-interactive)]" />
-          <span>{t('pickers.showCompletedMilestones')}</span>
-        </label>
+        <Checkbox
+          bind:checked={showCompleted}
+          label={t('pickers.showCompletedMilestones')}
+          class="px-4 py-2.5"
+          dataTestid="milestone-show-completed-toggle"
+          size="small"
+        />
       {/if}
+    {/snippet}
+
+    {#snippet noResultsSnippet({ searchQuery, onCreate })}
+      <div class="p-4 text-center text-sm" style="color: var(--ds-text-subtle);">
+        <div>{t('pickers.noResultsFor', { query: searchQuery })}</div>
+        {#if canCreate}
+          <button
+            type="button"
+            data-testid="milestone-create-option"
+            class="inline-flex items-center gap-2 mt-3 px-3 py-1.5 rounded transition-colors"
+            style="background-color: var(--ds-background-accent-blue-subtlest); color: var(--ds-interactive);"
+            onclick={onCreate}
+          >
+            <Plus class="w-4 h-4" />
+            {t('pickers.createItem', { value: searchQuery })}
+          </button>
+        {/if}
+      </div>
     {/snippet}
   </ItemPicker>
 {/if}
+
+<MilestoneFormDialog
+  bind:isOpen={showCreateDialog}
+  bind:formData={createFormData}
+  workspaceId={workspaceId}
+  isGlobalView={!hasWorkspaceContext}
+  canManageGlobal={canCreateGlobal}
+  canManageWorkspace={canCreateWorkspace}
+  saving={savingCreate}
+  onSubmit={saveCreatedMilestone}
+/>

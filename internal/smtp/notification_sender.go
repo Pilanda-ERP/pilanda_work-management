@@ -3,15 +3,17 @@
 package smtp
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"mime"
 	"net"
+	"net/mail"
 	"net/smtp"
-	"os"
 	"strings"
 	"time"
 
@@ -22,21 +24,43 @@ import (
 	"windshift/internal/utils"
 )
 
-// e2eInsecureSMTPEnv, when set to "1", unlocks plaintext SMTP over loopback.
-// Used solely by the e2e harness (run-e2e.sh exports it) so Mailpit can
-// capture transactional sends without a TLS dance. Production deployments
-// must never set this — leaving it unset preserves the dispatch() rejection
-// of encryption="none" and SafeNetDialer's loopback block.
-const e2eInsecureSMTPEnv = "WINDSHIFT_E2E_INSECURE_SMTP"
+// EncryptionModeAllowed reports whether the sender can dispatch with the
+// configured mode. Unknown and empty modes are rejected so a typo can never
+// silently downgrade a connection to plaintext.
+func EncryptionModeAllowed(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "tls", "starttls", "ssl", "none":
+		return true
+	default:
+		return false
+	}
+}
 
-func e2eInsecureSMTPEnabled() bool {
-	return os.Getenv(e2eInsecureSMTPEnv) == "1"
+// ValidateTransport rejects unsupported modes and authentication without TLS.
+// Plaintext SMTP is intended for trusted relays that authorize by network;
+// credentials must never be exposed on the connection.
+func ValidateTransport(config *models.ChannelConfig) error {
+	if config == nil {
+		return fmt.Errorf("SMTP config is required")
+	}
+	mode := strings.ToLower(strings.TrimSpace(config.SMTPEncryption))
+	if !EncryptionModeAllowed(mode) {
+		return fmt.Errorf("SMTP encryption %q not allowed; use \"tls\", \"starttls\", \"ssl\", or \"none\"", config.SMTPEncryption)
+	}
+	if mode == "none" && (strings.TrimSpace(config.SMTPUsername) != "" || config.SMTPPassword != "") {
+		return ErrSMTPAuthenticationRequiresTLS
+	}
+	return nil
 }
 
 // ErrSMTPNotConfigured is returned when a transactional send is attempted but
 // SMTP isn't configured. Re-exported by `internal/services` so existing
 // callers (e.g. internal/handlers/auth.go) keep working.
 var ErrSMTPNotConfigured = errors.New("SMTP is not configured")
+
+// ErrSMTPAuthenticationRequiresTLS is returned when a plaintext channel
+// contains credentials that would otherwise be exposed on the connection.
+var ErrSMTPAuthenticationRequiresTLS = errors.New("SMTP authentication requires TLS")
 
 // Encryptor mirrors email.Encryptor — duplicated here to avoid an
 // smtp→email→services→smtp import cycle. *sso.SecretEncryption (the same
@@ -47,7 +71,9 @@ type Encryptor interface {
 	Decrypt(ciphertext string) (string, error)
 }
 
-// decryptOrLegacy mirrors email/credentials.go::decryptOrLegacy. The legacy-
+const encryptedSecretPrefix = "enc:v1:"
+
+// decryptOrLegacy mirrors email/credentials.go::DecryptOrLegacy. The legacy-
 // plaintext fallback (return value verbatim if it's not a valid AES-GCM
 // ciphertext) lets pre-encryption rows keep working through a rolling
 // migration of SMTPPassword from plaintext to AES-GCM. AES-GCM minimum is
@@ -56,6 +82,13 @@ func decryptOrLegacy(enc Encryptor, value string) (string, error) {
 	if value == "" || enc == nil {
 		return value, nil
 	}
+	if strings.HasPrefix(value, encryptedSecretPrefix) {
+		plain, err := enc.Decrypt(strings.TrimPrefix(value, encryptedSecretPrefix))
+		if err != nil {
+			return "", fmt.Errorf("decrypt SMTP secret: %w", err)
+		}
+		return plain, nil
+	}
 	const minCipherBytes = 28
 	raw, err := base64.StdEncoding.DecodeString(value)
 	if err != nil || len(raw) < minCipherBytes {
@@ -63,7 +96,7 @@ func decryptOrLegacy(enc Encryptor, value string) (string, error) {
 	}
 	plain, err := enc.Decrypt(value)
 	if err != nil {
-		return "", fmt.Errorf("decrypt SMTP secret: %w", err)
+		return value, nil //nolint:nilerr // legacy plaintext may itself be long base64
 	}
 	return plain, nil
 }
@@ -72,6 +105,7 @@ func decryptOrLegacy(enc Encryptor, value string) (string, error) {
 // to an SMTP server. Without this the scheduler can hang its 5-minute tick
 // on a single wedged MX, stalling notifications for every other user.
 const smtpDialTimeout = 15 * time.Second
+const smtpOperationTimeout = 30 * time.Second
 
 // hostFromAddr returns just the host portion of an SMTP address, handling
 // IPv6 bracketed notation safely. The old `strings.Split(addr, ":")[0]` path
@@ -117,6 +151,19 @@ func encodeMailbox(name, addr string) string {
 	return fmt.Sprintf("%s <%s>", encodeHeaderWord(name), addr)
 }
 
+// normalizeEnvelopeAddress accepts only a bare addr-spec for SMTP MAIL/RCPT
+// commands. Header sanitization alone is insufficient at this layer: display
+// names, address lists, or control characters must never reach net/smtp's
+// command formatter.
+func normalizeEnvelopeAddress(raw string) (string, error) {
+	address := strings.TrimSpace(raw)
+	parsed, err := mail.ParseAddress(address)
+	if err != nil || parsed.Address == "" || parsed.Address != address {
+		return "", fmt.Errorf("invalid bare email address")
+	}
+	return address, nil
+}
+
 // NotificationSMTPSender handles sending batched notifications via email.
 // Encryptor is optional: when non-nil, getSMTPConfig decrypts SMTPPassword
 // before handing the config to dispatch(). If unset (e.g. in tests), the
@@ -126,6 +173,7 @@ type NotificationSMTPSender struct {
 	db         database.Database
 	templates  *repository.EmailTemplateRepository
 	encryption Encryptor
+	baseURL    string
 }
 
 // NewNotificationSMTPSender creates a new SMTP notification sender
@@ -134,6 +182,13 @@ func NewNotificationSMTPSender(db database.Database) *NotificationSMTPSender {
 		db:        db,
 		templates: repository.NewEmailTemplateRepository(db),
 	}
+}
+
+// SetBaseURL sets the browser-visible base URL used to turn notification
+// action paths into clickable links in digest emails. Called from server
+// startup.
+func (s *NotificationSMTPSender) SetBaseURL(baseURL string) {
+	s.baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 }
 
 // SetEncryption wires the at-rest encryption service used to decrypt
@@ -149,14 +204,38 @@ func (s *NotificationSMTPSender) SetEncryption(enc Encryptor) {
 // `{{.Subject}}` (used by the shared shell's <title> tag), so each call site
 // only has to pass its native fields without remembering to mirror the
 // subject in the struct.
-func (s *NotificationSMTPSender) RenderEmail(templateName string, data interface{}) (subject, htmlBody, textBody string, err error) {
-	subjectSrc, htmlSrc, textSrc := s.resolveTemplate(templateName)
+func (s *NotificationSMTPSender) RenderEmail(templateName string, data any) (subject, htmlBody, textBody string, err error) {
+	subjectSrc, htmlSrc, textSrc, fromDB := s.resolveTemplate(templateName)
 
-	subject, _, err = emailutil.RenderTemplates(subjectSrc, subjectSrc, data)
+	subject, htmlBody, textBody, err = renderEmailTemplates(subjectSrc, htmlSrc, textSrc, data)
+	if err == nil {
+		return subject, htmlBody, textBody, nil
+	}
+
+	// A broken admin-edited template must not take down the whole email family.
+	// Fall back to the embedded default and leave a trail for operators.
+	if !fromDB {
+		return "", "", "", err
+	}
+	def, ok := defaultTemplate(templateName)
+	if !ok {
+		return "", "", "", err
+	}
+	slog.Warn("admin email template failed to render; using built-in default",
+		slog.String("component", "smtp"),
+		slog.String("template", templateName),
+		slog.Any("error", err),
+	)
+	return renderEmailTemplates(def.Subject, def.HTMLBody, def.TextBody, data)
+}
+
+// renderEmailTemplates renders subject then body, exposing the rendered subject
+// to the body as {{.Subject}} (used by the shared shell's <title> tag).
+func renderEmailTemplates(subjectSrc, htmlSrc, textSrc string, data any) (subject, htmlBody, textBody string, err error) {
+	_, subject, err = emailutil.RenderTemplates(subjectSrc, subjectSrc, data)
 	if err != nil {
 		return "", "", "", err
 	}
-
 	enriched := emailutil.EnrichWithSubject(data, subject)
 	htmlBody, textBody, err = emailutil.RenderTemplates(htmlSrc, textSrc, enriched)
 	if err != nil {
@@ -165,11 +244,28 @@ func (s *NotificationSMTPSender) RenderEmail(templateName string, data interface
 	return subject, htmlBody, textBody, nil
 }
 
+// defaultTemplate returns the embedded fallback for a template name.
+func defaultTemplate(name string) (emailutil.DefaultTemplate, bool) {
+	for _, t := range emailutil.DefaultTemplates() {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return emailutil.DefaultTemplate{}, false
+}
+
 // SendTransactional renders a named template against `data` and sends it via
 // SMTP to `toEmail`. Returns ErrSMTPNotConfigured if SMTP isn't set up. This
 // is the shared one-call surface used by the magic-link / verification /
 // invitation services so each one stays a thin URL-builder + caller.
-func (s *NotificationSMTPSender) SendTransactional(toEmail, templateName string, data interface{}) error {
+func (s *NotificationSMTPSender) SendTransactional(toEmail, templateName string, data any) error {
+	return s.SendTransactionalContext(context.Background(), toEmail, templateName, data)
+}
+
+// SendTransactionalContext is SendTransactional with cancellation propagated
+// through SMTP dialing, handshake, commands, and DATA completion. The
+// mention-email outbox uses it so a scheduler shutdown cannot wedge a send.
+func (s *NotificationSMTPSender) SendTransactionalContext(ctx context.Context, toEmail, templateName string, data any) error {
 	if !s.IsSMTPConfigured() {
 		return ErrSMTPNotConfigured
 	}
@@ -177,21 +273,32 @@ func (s *NotificationSMTPSender) SendTransactional(toEmail, templateName string,
 	if err != nil {
 		return fmt.Errorf("render %s: %w", templateName, err)
 	}
-	return s.SendCustomEmail(toEmail, subject, htmlBody, textBody)
+	config, err := s.getSMTPConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get SMTP config: %w", err)
+	}
+	return s.sendEmailContext(ctx, config, toEmail, subject, htmlBody, textBody)
 }
 
-func (s *NotificationSMTPSender) resolveTemplate(name string) (subject, html, text string) {
+// AbsoluteActionURL turns a stored relative notification action path into a
+// clickable absolute URL. Exported so out-of-band email builders share the
+// exact normalization the notification digest uses.
+func AbsoluteActionURL(baseURL, actionURL string) string {
+	return absoluteActionURL(baseURL, actionURL)
+}
+
+// resolveTemplate returns the template sources and whether they came from the
+// admin-editable DB row (as opposed to the embedded default).
+func (s *NotificationSMTPSender) resolveTemplate(name string) (subject, html, text string, fromDB bool) {
 	if s.templates != nil {
 		if t, err := s.templates.GetByName(name); err == nil && t != nil {
-			return t.Subject, t.HTMLBody, t.TextBody
+			return t.Subject, t.HTMLBody, t.TextBody, true
 		}
 	}
-	for _, t := range emailutil.DefaultTemplates() {
-		if t.Name == name {
-			return t.Subject, t.HTMLBody, t.TextBody
-		}
+	if t, ok := defaultTemplate(name); ok {
+		return t.Subject, t.HTMLBody, t.TextBody, false
 	}
-	return "", "", ""
+	return "", "", "", false
 }
 
 // IsSMTPConfigured checks if SMTP is properly configured
@@ -210,9 +317,10 @@ func (s *NotificationSMTPSender) IsSMTPConfigured() bool {
 // getSMTPConfig retrieves the active SMTP configuration
 func (s *NotificationSMTPSender) getSMTPConfig() (*models.ChannelConfig, error) {
 	query := `
-		SELECT config FROM channels
-		WHERE type = 'smtp' AND direction = 'outbound' AND status = 'enabled'
-		ORDER BY updated_at DESC, is_default DESC
+		SELECT COALESCE(config, '{}') FROM channels
+		WHERE type = 'smtp' AND direction = 'outbound'
+		  AND status = 'enabled' AND is_default = true
+		ORDER BY updated_at DESC
 		LIMIT 1
 	`
 
@@ -235,8 +343,17 @@ func (s *NotificationSMTPSender) getSMTPConfig() (*models.ChannelConfig, error) 
 
 // SendBatchedNotifications sends a batch of notifications to a user via email
 func (s *NotificationSMTPSender) SendBatchedNotifications(userEmail, userName string, notifications []models.Notification) error {
+	return s.SendBatchedNotificationsContext(context.Background(), userEmail, userName, notifications)
+}
+
+// SendBatchedNotificationsContext sends a batch with cancellation propagated
+// through SMTP dialing, handshake, commands, and DATA completion.
+func (s *NotificationSMTPSender) SendBatchedNotificationsContext(ctx context.Context, userEmail, userName string, notifications []models.Notification) error {
 	if len(notifications) == 0 {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	config, err := s.getSMTPConfig()
@@ -244,12 +361,12 @@ func (s *NotificationSMTPSender) SendBatchedNotifications(userEmail, userName st
 		return fmt.Errorf("failed to get SMTP config: %w", err)
 	}
 
-	subject, htmlBody, textBody, err := s.RenderEmail(emailutil.TemplateNotificationBatch, buildNotificationBatchData(userName, notifications))
+	subject, htmlBody, textBody, err := s.RenderEmail(emailutil.TemplateNotificationBatch, buildNotificationBatchData(s.baseURL, userName, notifications))
 	if err != nil {
 		return fmt.Errorf("failed to render notification email: %w", err)
 	}
 
-	return s.sendEmail(config, userEmail, subject, htmlBody, textBody)
+	return s.sendEmailContext(ctx, config, userEmail, subject, htmlBody, textBody)
 }
 
 // notificationBatchEntry mirrors the per-row data exposed to the
@@ -261,9 +378,10 @@ type notificationBatchEntry struct {
 	Type          string
 	AccentColor   string
 	FormattedTime string
+	ActionURL     string
 }
 
-func buildNotificationBatchData(userName string, notifications []models.Notification) interface{} {
+func buildNotificationBatchData(baseURL, userName string, notifications []models.Notification) any {
 	data := struct {
 		UserName          string
 		NotificationCount int
@@ -279,9 +397,28 @@ func buildNotificationBatchData(userName string, notifications []models.Notifica
 			Type:          n.Type,
 			AccentColor:   notificationAccentColor(n.Type),
 			FormattedTime: n.Timestamp.Format("January 2, 2006 at 3:04 PM"),
+			ActionURL:     absoluteActionURL(baseURL, n.ActionURL),
 		})
 	}
 	return data
+}
+
+// absoluteActionURL turns a stored relative notification action path into a
+// clickable absolute URL. Already-absolute URLs pass through, and an empty
+// base URL leaves the path as-is so the template can still omit the link.
+func absoluteActionURL(baseURL, actionURL string) string {
+	actionURL = strings.TrimSpace(actionURL)
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if actionURL == "" || baseURL == "" {
+		return actionURL
+	}
+	if strings.HasPrefix(actionURL, "http://") || strings.HasPrefix(actionURL, "https://") || strings.HasPrefix(actionURL, "//") {
+		return actionURL
+	}
+	if !strings.HasPrefix(actionURL, "/") {
+		actionURL = "/" + actionURL
+	}
+	return baseURL + actionURL
 }
 
 // notificationAccentColor maps notification types to a brand-aligned accent
@@ -319,6 +456,8 @@ func notificationAccentColor(t string) string {
 type mimeOptions struct {
 	FromEmail, FromName  string
 	ToEmail, ToName      string
+	ReplyToEmail         string
+	ReplyToName          string
 	Subject              string
 	HTMLBody, TextBody   string
 	MessageID, InReplyTo string
@@ -341,18 +480,28 @@ func buildMime(opts mimeOptions) string {
 	headers := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=%s\r\n",
 		from, to, encodeHeaderWord(opts.Subject), boundary)
 
-	if opts.MessageID != "" {
-		headers += fmt.Sprintf("Message-ID: %s\r\n", sanitizeHeader(opts.MessageID))
+	// Route customer replies to the monitored inbox rather than the SMTP
+	// sender. Omit the header when there is no distinct monitored address, so
+	// the transport falls back to From exactly as before.
+	if replyTo := strings.TrimSpace(opts.ReplyToEmail); replyTo != "" && !strings.EqualFold(replyTo, opts.FromEmail) {
+		headers += fmt.Sprintf("Reply-To: %s\r\n", encodeMailbox(opts.ReplyToName, replyTo))
 	}
-	if opts.InReplyTo != "" {
-		headers += fmt.Sprintf("In-Reply-To: %s\r\n", sanitizeHeader(opts.InReplyTo))
+	if messageID := formatMessageIDHeader(opts.MessageID); messageID != "" {
+		headers += fmt.Sprintf("Message-ID: %s\r\n", messageID)
+	}
+	if inReplyTo := formatMessageIDHeader(opts.InReplyTo); inReplyTo != "" {
+		headers += fmt.Sprintf("In-Reply-To: %s\r\n", inReplyTo)
 	}
 	if len(opts.References) > 0 {
 		clean := make([]string, 0, len(opts.References))
 		for _, ref := range opts.References {
-			clean = append(clean, sanitizeHeader(ref))
+			if formatted := formatMessageIDHeader(ref); formatted != "" {
+				clean = append(clean, formatted)
+			}
 		}
-		headers += fmt.Sprintf("References: %s\r\n", strings.Join(clean, " "))
+		if len(clean) > 0 {
+			headers += foldHeaderValue("References", strings.Join(clean, " "))
+		}
 	}
 
 	headers += "\r\n"
@@ -366,19 +515,74 @@ func buildMime(opts mimeOptions) string {
 	return headers + textPart + htmlPart + ending
 }
 
-// dispatch picks the encryption path (TLS/SSL) and sends the assembled MIME
+// foldHeaderValue folds a space-separated header value at 78 columns per RFC
+// 5322, keeping every line inside the 998-octet SMTP hard limit. Long Message-ID
+// chains (References) would otherwise exceed the limit on long threads.
+func foldHeaderValue(name, value string) string {
+	const softLimit = 78
+	var b strings.Builder
+	b.WriteString(name)
+	b.WriteString(": ")
+	column := len(name) + 2
+	for i, field := range strings.Fields(value) {
+		if i > 0 {
+			if column+1+len(field) > softLimit {
+				b.WriteString("\r\n ")
+				column = 1
+			} else {
+				b.WriteString(" ")
+				column++
+			}
+		}
+		b.WriteString(field)
+		column += len(field)
+	}
+	b.WriteString("\r\n")
+	return b.String()
+}
+
+// formatMessageIDHeader tolerates historical tracking rows that stored the
+// go-imap ENVELOPE form without angle brackets and always emits RFC 5322's
+// bracketed form on the wire.
+func formatMessageIDHeader(value string) string {
+	value = strings.TrimSpace(sanitizeHeader(value))
+	value = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(value, "<"), ">"))
+	if value == "" || strings.ContainsAny(value, "<> \t") {
+		return ""
+	}
+	return "<" + value + ">"
+}
+
+// dispatchContext picks the configured transport and sends the assembled MIME
 // message. Shared by sendEmail and SendThreadedEmail so the encryption switch
-// lives in exactly one place. Plaintext SMTP is refused — it ships AUTH PLAIN
-// credentials in the clear and bypasses the server-identity check, mirroring
-// how email/imap_client.go rejects plaintext IMAP. Misconfigurations (empty
-// or typo'd SMTPEncryption) are surfaced as errors instead of silently
-// downgrading.
+// lives in exactly one place. Plaintext SMTP is allowed only without
+// authentication; empty or unknown modes are errors rather than downgrades.
 //
-// dispatch is a method (rather than a free function) so it can decrypt the
-// at-rest SMTPPassword before passing it to AUTH PLAIN — every caller goes
-// through the encryption-aware sender, even the channel-test path that loads
-// raw config from the DB on its own.
-func (s *NotificationSMTPSender) dispatch(config *models.ChannelConfig, toEmail, message string) error {
+// It is a method (rather than a free function) so it can decrypt the at-rest
+// SMTPPassword before passing it to AUTH PLAIN — every caller goes through the
+// encryption-aware sender, even the channel-test path that loads raw config
+// from the DB on its own.
+func (s *NotificationSMTPSender) dispatchContext(ctx context.Context, config *models.ChannelConfig, toEmail, message string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if config == nil {
+		return fmt.Errorf("SMTP config is required")
+	}
+	fromEmail, err := normalizeEnvelopeAddress(config.SMTPFromEmail)
+	if err != nil {
+		return fmt.Errorf("invalid SMTP from address: %w", err)
+	}
+	toEmail, err = normalizeEnvelopeAddress(toEmail)
+	if err != nil {
+		return fmt.Errorf("invalid SMTP recipient address: %w", err)
+	}
+	if strings.TrimSpace(config.SMTPHost) == "" || config.SMTPPort <= 0 || config.SMTPPort > 65535 {
+		return fmt.Errorf("invalid SMTP host or port")
+	}
+	if err := ValidateTransport(config); err != nil {
+		return err
+	}
 	password, err := decryptOrLegacy(s.encryption, config.SMTPPassword)
 	if err != nil {
 		return err
@@ -391,24 +595,25 @@ func (s *NotificationSMTPSender) dispatch(config *models.ChannelConfig, toEmail,
 
 	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
 
-	switch strings.ToLower(config.SMTPEncryption) {
+	switch strings.ToLower(strings.TrimSpace(config.SMTPEncryption)) {
 	case "tls", "starttls":
-		return sendWithStartTLS(addr, auth, config.SMTPFromEmail, toEmail, message)
+		return sendWithStartTLSContext(ctx, addr, auth, fromEmail, toEmail, message, config.SMTPSkipTLSVerify)
 	case "ssl":
-		return sendWithSSL(addr, auth, config.SMTPFromEmail, toEmail, message)
+		return sendWithSSLContext(ctx, addr, auth, fromEmail, toEmail, message, config.SMTPSkipTLSVerify)
 	case "none":
-		if e2eInsecureSMTPEnabled() {
-			return sendPlaintext(addr, auth, config.SMTPFromEmail, toEmail, message)
-		}
-		fallthrough
+		return sendPlaintextContext(ctx, addr, fromEmail, toEmail, message)
 	default:
-		return fmt.Errorf("SMTP encryption %q not allowed; use \"tls\", \"starttls\", or \"ssl\"", config.SMTPEncryption)
+		return fmt.Errorf("SMTP encryption %q not allowed", config.SMTPEncryption)
 	}
 }
 
 // sendEmail sends a transactional (non-threaded) email using the SMTP config.
 func (s *NotificationSMTPSender) sendEmail(config *models.ChannelConfig, toEmail, subject, htmlBody, textBody string) error {
-	return s.dispatch(config, toEmail, buildMime(mimeOptions{
+	return s.sendEmailContext(context.Background(), config, toEmail, subject, htmlBody, textBody)
+}
+
+func (s *NotificationSMTPSender) sendEmailContext(ctx context.Context, config *models.ChannelConfig, toEmail, subject, htmlBody, textBody string) error {
+	return s.dispatchContext(ctx, config, toEmail, buildMime(mimeOptions{
 		FromEmail: config.SMTPFromEmail,
 		FromName:  config.SMTPFromName,
 		ToEmail:   toEmail,
@@ -421,11 +626,17 @@ func (s *NotificationSMTPSender) sendEmail(config *models.ChannelConfig, toEmail
 // sendWithStartTLS sends email using STARTTLS encryption. The dial goes
 // through utils.SafeNetDialer so a maliciously-configured SMTPHost cannot
 // reach loopback / private-IP / link-local / CGNAT targets.
-func sendWithStartTLS(addr string, auth smtp.Auth, from, to, message string) error {
-	conn, err := utils.SafeNetDialer(smtpDialTimeout).Dial("tcp", addr)
+func sendWithStartTLSContext(ctx context.Context, addr string, auth smtp.Auth, from, to, message string, skipTLSVerify bool) error {
+	conn, err := utils.SafeNetDialer(smtpDialTimeout).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}
+	if err := setSMTPDeadline(ctx, conn); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 	client, err := smtp.NewClient(conn, hostFromAddr(addr))
 	if err != nil {
 		_ = conn.Close()
@@ -433,28 +644,32 @@ func sendWithStartTLS(addr string, auth smtp.Auth, from, to, message string) err
 	}
 	defer func() { _ = client.Close() }()
 
-	tlsConfig := &tls.Config{
-		ServerName: hostFromAddr(addr),
-		MinVersion: tls.VersionTLS12,
-	}
+	tlsConfig := smtpTLSConfig(addr, skipTLSVerify)
 
 	if err = client.StartTLS(tlsConfig); err != nil { //nolint:gocritic
 		return err
 	}
 
-	return sendWithClient(client, auth, from, to, message)
+	return sendWithClientContext(ctx, client, auth, from, to, message)
 }
 
 // sendWithSSL sends email using SSL/TLS encryption. SafeNetDialer enforces
 // the SSRF reject list before the TLS handshake.
-func sendWithSSL(addr string, auth smtp.Auth, from, to, message string) error {
-	tlsConfig := &tls.Config{
-		ServerName: hostFromAddr(addr),
-		MinVersion: tls.VersionTLS12,
-	}
-
-	conn, err := tls.DialWithDialer(utils.SafeNetDialer(smtpDialTimeout), "tcp", addr, tlsConfig)
+func sendWithSSLContext(ctx context.Context, addr string, auth smtp.Auth, from, to, message string, skipTLSVerify bool) error {
+	tlsConfig := smtpTLSConfig(addr, skipTLSVerify)
+	rawConn, err := utils.SafeNetDialer(smtpDialTimeout).DialContext(ctx, "tcp", addr)
 	if err != nil {
+		return err
+	}
+	if err := setSMTPDeadline(ctx, rawConn); err != nil {
+		_ = rawConn.Close()
+		return err
+	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+	defer stopCancellation()
+	conn := tls.Client(rawConn, tlsConfig)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
 		return err
 	}
 	defer func() { _ = conn.Close() }()
@@ -465,18 +680,29 @@ func sendWithSSL(addr string, auth smtp.Auth, from, to, message string) error {
 	}
 	defer func() { _ = client.Close() }()
 
-	return sendWithClient(client, auth, from, to, message)
+	return sendWithClientContext(ctx, client, auth, from, to, message)
 }
 
-// sendPlaintext sends email over an unencrypted SMTP connection. Gated by
-// WINDSHIFT_E2E_INSECURE_SMTP=1 (set only by the e2e harness so Mailpit on
-// loopback can capture transactional sends). Uses a plain net.Dialer rather
-// than utils.SafeNetDialer so 127.0.0.1 is reachable.
-func sendPlaintext(addr string, auth smtp.Auth, from, to, message string) error {
-	conn, err := (&net.Dialer{Timeout: smtpDialTimeout}).Dial("tcp", addr)
+func smtpTLSConfig(addr string, skipTLSVerify bool) *tls.Config {
+	config := utils.OutboundTLSConfig(hostFromAddr(addr))
+	config.InsecureSkipVerify = config.InsecureSkipVerify || skipTLSVerify //nolint:gosec // Explicit SMTP channel or process-wide opt-in.
+	return config
+}
+
+// sendPlaintext sends unauthenticated email over an unencrypted connection.
+// SafeNetDialer keeps the process-wide local-connection policy effective for
+// this transport just as it is for TLS SMTP.
+func sendPlaintextContext(ctx context.Context, addr, from, to, message string) error {
+	conn, err := utils.SafeNetDialer(smtpDialTimeout).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}
+	if err := setSMTPDeadline(ctx, conn); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 	client, err := smtp.NewClient(conn, hostFromAddr(addr))
 	if err != nil {
 		_ = conn.Close()
@@ -484,33 +710,57 @@ func sendPlaintext(addr string, auth smtp.Auth, from, to, message string) error 
 	}
 	defer func() { _ = client.Close() }()
 
-	return sendWithClient(client, auth, from, to, message)
+	return sendWithClientContext(ctx, client, nil, from, to, message)
 }
 
 // sendWithClient performs authentication, addressing, and message delivery on an established SMTP client.
-func sendWithClient(client *smtp.Client, auth smtp.Auth, from, to, message string) error {
+func sendWithClientContext(ctx context.Context, client *smtp.Client, auth smtp.Auth, from, to, message string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if auth != nil {
 		if err := client.Auth(auth); err != nil { //nolint:gocritic
 			return err
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := client.Mail(from); err != nil { //nolint:gocritic
 		return err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := client.Rcpt(to); err != nil { //nolint:gocritic
 		return err
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	writer, err := client.Data()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = writer.Close() }()
+	if _, err = writer.Write([]byte(message)); err != nil {
+		_ = writer.Close()
+		return err
+	}
+	// DATA is not accepted until the writer is closed; servers report final
+	// policy/recipient failures (for example 550) here. Discarding this error
+	// falsely reported rejected mail as delivered.
+	return writer.Close()
+}
 
-	_, err = writer.Write([]byte(message))
-	return err
+func setSMTPDeadline(ctx context.Context, conn net.Conn) error {
+	deadline := time.Now().Add(smtpOperationTimeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	return conn.SetDeadline(deadline)
 }
 
 // SendCustomEmail sends a custom email with the provided subject and body
@@ -534,34 +784,44 @@ func (s *NotificationSMTPSender) SendEmailWithConfig(config *models.ChannelConfi
 
 // ThreadedEmailParams contains the parameters for sending a threaded email reply.
 type ThreadedEmailParams struct {
-	ToEmail    string
-	ToName     string
-	Subject    string
-	HTMLBody   string
-	TextBody   string
-	MessageID  string
-	InReplyTo  string
-	References []string
+	ToEmail      string
+	ToName       string
+	ReplyToEmail string
+	ReplyToName  string
+	Subject      string
+	HTMLBody     string
+	TextBody     string
+	MessageID    string
+	InReplyTo    string
+	References   []string
 }
 
 // SendThreadedEmail sends an email with RFC 5322 threading headers
 // (Message-ID, In-Reply-To, References) so reply-tracking email clients
 // keep the conversation grouped.
 func (s *NotificationSMTPSender) SendThreadedEmail(params ThreadedEmailParams) error {
+	return s.SendThreadedEmailContext(context.Background(), params)
+}
+
+// SendThreadedEmailContext is SendThreadedEmail with cancellation propagated
+// through SMTP dialing, handshake, commands, and DATA completion.
+func (s *NotificationSMTPSender) SendThreadedEmailContext(ctx context.Context, params ThreadedEmailParams) error {
 	config, err := s.getSMTPConfig()
 	if err != nil {
 		return fmt.Errorf("failed to get SMTP config: %w", err)
 	}
-	return s.dispatch(config, params.ToEmail, buildMime(mimeOptions{
-		FromEmail:  config.SMTPFromEmail,
-		FromName:   config.SMTPFromName,
-		ToEmail:    params.ToEmail,
-		ToName:     params.ToName,
-		Subject:    params.Subject,
-		HTMLBody:   params.HTMLBody,
-		TextBody:   params.TextBody,
-		MessageID:  params.MessageID,
-		InReplyTo:  params.InReplyTo,
-		References: params.References,
+	return s.dispatchContext(ctx, config, params.ToEmail, buildMime(mimeOptions{
+		FromEmail:    config.SMTPFromEmail,
+		FromName:     config.SMTPFromName,
+		ToEmail:      params.ToEmail,
+		ToName:       params.ToName,
+		ReplyToEmail: params.ReplyToEmail,
+		ReplyToName:  params.ReplyToName,
+		Subject:      params.Subject,
+		HTMLBody:     params.HTMLBody,
+		TextBody:     params.TextBody,
+		MessageID:    params.MessageID,
+		InReplyTo:    params.InReplyTo,
+		References:   params.References,
 	}))
 }

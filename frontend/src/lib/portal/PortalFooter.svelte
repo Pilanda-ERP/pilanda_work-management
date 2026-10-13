@@ -1,22 +1,30 @@
 <script>
   import { Plus, X } from '@lucide/svelte';
   import { APP_NAME } from '../constants.js';
-  import { portalStore } from '../stores/portal.svelte.js';
+  import { portalCustomizationStore as portalStore } from '../stores/portal.svelte.js';
+  import Input from '../components/Input.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import { safeHref } from '../utils/sanitize';
+
+  let hasFooterContent = $derived(
+    portalStore.footerColumns.some(
+      (column) => column.title || column.links.some((link) => link.text && link.url)
+    )
+  );
 </script>
 
 <!-- Footer -->
 <footer class="border-t mt-auto" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-  <div class="w-full px-6 py-8">
-    <div class="max-w-7xl mx-auto">
+  <div class="w-full px-4 sm:px-6 {portalStore.isEditing || hasFooterContent ? 'py-8' : 'py-4'}">
+    <div class="max-w-6xl mx-auto">
       <!-- 3-Column Footer Layout -->
+      {#if portalStore.isEditing || hasFooterContent}
       <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-6">
         {#each portalStore.footerColumns as column, columnIndex}
           <div>
             <!-- Column Title -->
             {#if portalStore.isEditing}
-              <input
+              <Input
                 type="text"
                 value={column.title}
                 oninput={(e) => portalStore.updateColumnTitle(columnIndex, /** @type {HTMLInputElement} */ (e.target).value)}
@@ -36,7 +44,7 @@
                 <div class="flex items-center gap-2">
                   {#if portalStore.isEditing}
                     <div class="flex-1 space-y-1">
-                      <input
+                      <Input
                         type="text"
                         value={link.text}
                         oninput={(e) => portalStore.updateFooterLink(columnIndex, linkIndex, 'text', /** @type {HTMLInputElement} */ (e.target).value)}
@@ -44,7 +52,7 @@
                         style="color: var(--ds-text-subtle); border-color: var(--ds-border);"
                         placeholder="Link text"
                       />
-                      <input
+                      <Input
                         type="text"
                         value={link.url}
                         oninput={(e) => portalStore.updateFooterLink(columnIndex, linkIndex, 'url', /** @type {HTMLInputElement} */ (e.target).value)}
@@ -55,10 +63,10 @@
                     </div>
                     <button
                       onclick={() => portalStore.removeFooterLink(columnIndex, linkIndex)}
-                      class="p-1 rounded transition-all hover:bg-red-100"
+                      class="p-1 rounded transition-all hover:bg-ds-danger-subtle"
                       title={t('portal.removeLink')}
                     >
-                      <X class="w-3 h-3 text-red-600" />
+                      <X class="w-3 h-3 text-ds-text-danger" />
                     </button>
                   {:else if link.text && link.url}
                     <a
@@ -89,9 +97,10 @@
           </div>
         {/each}
       </div>
+      {/if}
 
       <!-- "Powered by {APP_NAME}" - Not configurable -->
-      <div class="border-t pt-3 text-center" style="border-color: var(--ds-border);">
+      <div class="{portalStore.isEditing || hasFooterContent ? 'border-t pt-3' : ''} text-center" style="border-color: var(--ds-border);">
         <p class="text-xs" style="color: var(--ds-text-subtle);">
           Powered by <a href="https://windshift.sh" target="_blank" rel="noopener noreferrer" class="hover:underline" style="color: var(--ds-text-subtle);">{APP_NAME}</a>
         </p>

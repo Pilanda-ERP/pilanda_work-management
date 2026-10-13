@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/gherkin"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/sanitize"
@@ -12,15 +13,17 @@ import (
 
 // TestCaseService handles test case business logic
 type TestCaseService struct {
-	db   database.Database
-	repo *repository.TestCaseRepository
+	db      database.Database
+	repo    *repository.TestCaseRepository
+	bddRepo *repository.TestCaseBDDRepository
 }
 
 // NewTestCaseService creates a new test case service
 func NewTestCaseService(db database.Database) *TestCaseService {
 	return &TestCaseService{
-		db:   db,
-		repo: repository.NewTestCaseRepository(db),
+		db:      db,
+		repo:    repository.NewTestCaseRepository(db),
+		bddRepo: repository.NewTestCaseBDDRepository(db),
 	}
 }
 
@@ -29,6 +32,10 @@ type TestCaseListParams struct {
 	WorkspaceID int
 	FolderID    *int
 	All         bool
+	Limit       int
+	Offset      int
+	Search      string
+	LabelID     *int
 }
 
 // List retrieves test cases with optional folder filtering
@@ -37,6 +44,10 @@ func (s *TestCaseService) List(params TestCaseListParams) ([]models.TestCase, er
 		WorkspaceID: params.WorkspaceID,
 		FolderID:    params.FolderID,
 		All:         params.All,
+		Limit:       params.Limit,
+		Offset:      params.Offset,
+		Search:      params.Search,
+		LabelID:     params.LabelID,
 	})
 	if err != nil {
 		return nil, err
@@ -54,12 +65,24 @@ func (s *TestCaseService) List(params TestCaseListParams) ([]models.TestCase, er
 	return testCases, nil
 }
 
+func (s *TestCaseService) CountAll(workspaceID int) (int, error) {
+	return s.repo.CountAll(workspaceID)
+}
+
+func (s *TestCaseService) Count(params TestCaseListParams) (int, error) {
+	return s.repo.Count(repository.TestCaseListParams{
+		WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, All: params.All,
+		Search: params.Search, LabelID: params.LabelID,
+	})
+}
+
 // GetByID retrieves a single test case
 func (s *TestCaseService) GetByID(id, workspaceID int) (*models.TestCase, error) {
 	return s.repo.FindByID(id, workspaceID)
 }
 
 // TestCaseCreateRequest contains data for creating a test case
+// Format defaults to steps; "bdd" requires Gherkin and validates it.
 type TestCaseCreateRequest struct {
 	Title             string
 	Preconditions     string
@@ -67,6 +90,8 @@ type TestCaseCreateRequest struct {
 	Status            string
 	EstimatedDuration int
 	FolderID          *int
+	Format            string
+	Gherkin           string
 }
 
 // Create creates a new test case
@@ -75,8 +100,33 @@ func (s *TestCaseService) Create(workspaceID int, req TestCaseCreateRequest) (*m
 	req.Title = sanitize.PlainTextField.Sanitize(req.Title)
 	req.Preconditions = sanitize.Comment.Sanitize(req.Preconditions)
 
+	// Resolve and validate the format before anything else: a BDD case's
+	// title comes from its scenario name.
+	if req.Format == "" {
+		req.Format = TestFormatSteps
+	}
+	if req.Format != TestFormatSteps && req.Format != TestFormatBDD {
+		return nil, &TestManagementValidationError{Msg: "invalid format: must be steps or bdd"}
+	}
+	var bddSpec *gherkin.ScenarioSpec
+	if req.Format == TestFormatBDD {
+		source, err := capGherkin(req.Gherkin)
+		if err != nil {
+			return nil, err
+		}
+		spec, errs := BuildScenarioSpec(source)
+		if !errs.Empty() {
+			return nil, &TestBDDValidationError{Errors: errs.Errors}
+		}
+		bddSpec = spec
+		req.Gherkin = source
+		if req.Title == "" {
+			req.Title = spec.ScenarioName
+		}
+	}
+
 	if req.Title == "" {
-		return nil, fmt.Errorf("test case title is required")
+		return nil, &TestManagementValidationError{Msg: "test case title is required"}
 	}
 
 	// Set defaults
@@ -89,17 +139,17 @@ func (s *TestCaseService) Create(workspaceID int, req TestCaseCreateRequest) (*m
 
 	// Validate priority
 	if !isValidTestCasePriority(req.Priority) {
-		return nil, fmt.Errorf("invalid priority value: must be low, medium, high, or critical")
+		return nil, &TestManagementValidationError{Msg: "invalid priority value: must be low, medium, high, or critical"}
 	}
 
 	// Validate status
 	if !isValidTestCaseStatus(req.Status) {
-		return nil, fmt.Errorf("invalid status value: must be active, inactive, or draft")
+		return nil, &TestManagementValidationError{Msg: "invalid status value: must be active, inactive, or draft"}
 	}
 
 	// Validate estimated duration
 	if req.EstimatedDuration < 0 {
-		return nil, fmt.Errorf("estimated duration cannot be negative")
+		return nil, &TestManagementValidationError{Msg: "estimated duration cannot be negative"}
 	}
 
 	if err := s.validateFolderInWorkspace(workspaceID, req.FolderID); err != nil {
@@ -117,6 +167,7 @@ func (s *TestCaseService) Create(workspaceID int, req TestCaseCreateRequest) (*m
 		WorkspaceID:       workspaceID,
 		FolderID:          req.FolderID,
 		Title:             req.Title,
+		Format:            req.Format,
 		Preconditions:     req.Preconditions,
 		Priority:          req.Priority,
 		Status:            req.Status,
@@ -132,6 +183,25 @@ func (s *TestCaseService) Create(workspaceID int, req TestCaseCreateRequest) (*m
 			return nil, err
 		}
 		tc.ID = id
+		if bddSpec != nil {
+			encoded, err := encodeScenarioSpec(bddSpec)
+			if err != nil {
+				return nil, err
+			}
+			keyword := bddSpec.ScenarioKeyword
+			if keyword == "" {
+				keyword = "Scenario"
+			}
+			if err := s.bddRepo.Upsert(tx, &models.TestCaseBDD{
+				TestCaseID:      id,
+				Gherkin:         req.Gherkin,
+				FeatureName:     bddSpec.FeatureName,
+				ScenarioKeyword: keyword,
+				Spec:            encoded,
+			}); err != nil {
+				return nil, err
+			}
+		}
 		return tc, nil
 	})
 }
@@ -154,22 +224,22 @@ func (s *TestCaseService) Update(id, workspaceID int, req TestCaseUpdateRequest)
 	req.Preconditions = sanitize.Comment.Sanitize(req.Preconditions)
 
 	if req.Title == "" {
-		return nil, fmt.Errorf("test case title is required")
+		return nil, &TestManagementValidationError{Msg: "test case title is required"}
 	}
 
 	// Validate priority if provided
 	if req.Priority != "" && !isValidTestCasePriority(req.Priority) {
-		return nil, fmt.Errorf("invalid priority value: must be low, medium, high, or critical")
+		return nil, &TestManagementValidationError{Msg: "invalid priority value: must be low, medium, high, or critical"}
 	}
 
 	// Validate status if provided
 	if req.Status != "" && !isValidTestCaseStatus(req.Status) {
-		return nil, fmt.Errorf("invalid status value: must be active, inactive, or draft")
+		return nil, &TestManagementValidationError{Msg: "invalid status value: must be active, inactive, or draft"}
 	}
 
 	// Validate estimated duration
 	if req.EstimatedDuration < 0 {
-		return nil, fmt.Errorf("estimated duration cannot be negative")
+		return nil, &TestManagementValidationError{Msg: "estimated duration cannot be negative"}
 	}
 
 	if err := s.validateFolderInWorkspace(workspaceID, req.FolderID); err != nil {
@@ -353,6 +423,10 @@ func (s *TestCaseService) GetLabelsForTestCase(testCaseID int) ([]models.TestLab
 	return s.repo.FindLabelsByTestCaseID(testCaseID)
 }
 
+var (
+	ErrTestLabelNameRequired = &TestManagementValidationError{Msg: "label name is required"}
+)
+
 // TestLabelCreateRequest contains data for creating a label
 type TestLabelCreateRequest struct {
 	Name        string
@@ -362,6 +436,11 @@ type TestLabelCreateRequest struct {
 
 // CreateLabel creates a new test label
 func (s *TestCaseService) CreateLabel(workspaceID int, req TestLabelCreateRequest) (*models.TestLabel, error) {
+	req.Name = sanitize.ShortIdentifier.Sanitize(req.Name)
+	req.Description = sanitize.RichText.Sanitize(req.Description)
+	if req.Name == "" {
+		return nil, ErrTestLabelNameRequired
+	}
 	if req.Color == "" {
 		req.Color = "#3B82F6" // Default blue
 	}
@@ -393,6 +472,11 @@ type TestLabelUpdateRequest struct {
 
 // UpdateLabel updates an existing test label
 func (s *TestCaseService) UpdateLabel(labelID, workspaceID int, req TestLabelUpdateRequest) (*models.TestLabel, error) {
+	req.Name = sanitize.ShortIdentifier.Sanitize(req.Name)
+	req.Description = sanitize.RichText.Sanitize(req.Description)
+	if req.Name == "" {
+		return nil, ErrTestLabelNameRequired
+	}
 	label := &models.TestLabel{
 		ID:          labelID,
 		WorkspaceID: workspaceID,

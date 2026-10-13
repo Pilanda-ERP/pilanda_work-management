@@ -2,6 +2,7 @@
   import { Link2, Plus, Paperclip, PenTool, Zap, ChevronDown } from '@lucide/svelte';
   import { tick } from 'svelte';
   import Button from '../../components/Button.svelte';
+  import FileInput from '../../components/FileInput.svelte';
   import MilkdownEditor from '../../editors/LazyMilkdownEditor.svelte';
   import AttachmentDiagramList from '../assets/AttachmentDiagramList.svelte';
   import AIActionsDropdown from './AIActionsDropdown.svelte';
@@ -27,6 +28,10 @@
     showAIActions = true,
     manualActions = [],
     canCreate = false,
+    // Write affordances (edit description, add link, attach, diagram) are
+    // offered only when the user may edit the item; personal tasks stay
+    // editable via the default.
+    canEdit = true,
     onsavefield = undefined,
     oncanceledit = undefined,
     onstartEditingDescription = undefined,
@@ -77,6 +82,24 @@
 
   function startEditingDescription() {
     onstartEditingDescription?.();
+  }
+
+  // The description display is one big click-to-edit target. Links rendered
+  // inside it must keep their native behaviour: entering edit mode re-creates
+  // the editor and removes the anchor, which cancels the pending navigation in
+  // some browsers. Ignore clicks that land on a link so the browser follows it.
+  function isLinkTarget(event) {
+    return !!event.target?.closest?.('a[href]');
+  }
+
+  function handleDescriptionClick(event) {
+    if (isLinkTarget(event)) return;
+    startEditingDescription();
+  }
+
+  function handleDescriptionKeydown(event) {
+    if (event.key !== 'Enter' || isLinkTarget(event)) return;
+    startEditingDescription();
   }
 
   // Initialize editor content when editing starts
@@ -154,6 +177,7 @@
         placeholder={t('items.enterDescription')}
         showToolbar={true}
         itemId={item.id}
+        workspaceId={item.workspace_id}
         onImageInsert={handleImageInsert}
       />
       <div class="flex items-center gap-2">
@@ -166,38 +190,50 @@
       </div>
     </div>
   {:else if item.description}
-    <div
-      onclick={startEditingDescription}
-      onkeydown={(e) => e.key === 'Enter' && startEditingDescription()}
-      role="button"
-      tabindex="0"
-      class="description-hover text-left w-full rounded cursor-pointer transition-all duration-150"
-      style="color: var(--ds-text);"
-      title={t('items.clickToEditDescription')}
-      data-testid="item-description-display"
-    >
-      <MilkdownEditor
-        content={item.description}
-        readonly={true}
-        showToolbar={false}
-      />
-    </div>
-  {:else}
+    {#if canEdit}
+      <div
+        onclick={handleDescriptionClick}
+        onkeydown={handleDescriptionKeydown}
+        role="button"
+        tabindex="0"
+        class="description-hover text-left rounded cursor-pointer transition-colors duration-150"
+        style="color: var(--ds-text);"
+        title={t('items.clickToEditDescription')}
+        data-testid="item-description-display"
+      >
+        <MilkdownEditor content={item.description} readonly={true} showToolbar={false} />
+      </div>
+    {:else}
+      <div
+        class="text-left rounded"
+        style="color: var(--ds-text);"
+        data-testid="item-description-display"
+      >
+        <MilkdownEditor content={item.description} readonly={true} showToolbar={false} />
+      </div>
+    {/if}
+  {:else if canEdit}
     <button
+      data-testid="item-description-empty"
       onclick={startEditingDescription}
-      class="text-left w-full py-2 text-sm transition-colors cursor-pointer"
-      style="color: var(--ds-text-subtle);"
-      onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text)'}
-      onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
+      class="description-empty text-left w-full py-2 text-sm transition-colors cursor-pointer"
       title={t('items.clickToAddDescription')}
     >
       {t('items.noDescriptionProvided')}
     </button>
+  {:else}
+    <p
+      data-testid="item-description-empty"
+      class="text-left w-full py-2 text-sm"
+      style="color: var(--ds-text-subtle);"
+    >
+      {t('items.noDescriptionProvided')}
+    </p>
   {/if}
   
   <!-- Action buttons - icon only, label slides in on hover -->
   <div class="mt-5 flex gap-1">
-    {#if showLinkButton}
+    {#if showLinkButton && canEdit}
       <button
         data-testid="add-link-button"
         class="action-btn inline-flex items-center gap-1.5 px-2 py-1.5 rounded text-xs transition-all"
@@ -211,6 +247,7 @@
     {/if}
     {#if availableSubIssueTypes.length > 0}
       <button
+        data-testid="item-create-child"
         class="action-btn inline-flex items-center gap-1.5 px-2 py-1.5 rounded text-xs transition-all"
         style="color: var(--ds-text-subtle);"
         onclick={() => oncreateSubIssue?.()}
@@ -220,16 +257,16 @@
         <span class="action-label">{t('items.child')}</span>
       </button>
     {/if}
-    {#if attachmentStatus.enabled}
+    {#if attachmentStatus.enabled && canEdit}
       <label
+        data-testid="item-attachment-upload"
         class="action-btn inline-flex items-center gap-1.5 px-2 py-1.5 rounded text-xs transition-all cursor-pointer"
         style="color: var(--ds-text-subtle);"
         title={t('items.attachFile')}
       >
         <Paperclip class="w-4 h-4 flex-shrink-0" />
         <span class="action-label">{t('items.attach')}</span>
-        <input
-          type="file"
+        <FileInput
           class="hidden"
           multiple
           onchange={(e) => {
@@ -241,7 +278,7 @@
           }}
         />
       </label>
-      {#if showDiagramButton}
+      {#if showDiagramButton && canEdit}
         <button
           class="action-btn inline-flex items-center gap-1.5 px-2 py-1.5 rounded text-xs transition-all"
           style="color: var(--ds-text-subtle);"
@@ -270,13 +307,10 @@
           <div class="absolute left-0 top-full mt-1 z-50 min-w-[200px] rounded-md shadow-lg py-1" style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);">
             {#each manualActions as action}
               <button
-                class="w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
-                style="color: var(--ds-text);"
-                onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                class="manual-action w-full px-3 py-2 text-left text-sm flex items-center gap-2 transition-colors"
                 onclick={() => handleExecuteAction(action)}
               >
-                <Zap class="w-4 h-4 text-amber-500 flex-shrink-0" />
+                <Zap class="w-4 h-4 text-ds-accent-yellow flex-shrink-0" />
                 {action.name}
               </button>
             {/each}
@@ -308,10 +342,14 @@
 
 <style>
   .description-hover {
-    padding: 0;
+    /* constant padding with compensating negative margin: hover must only
+       repaint — a padding change on hover resizes the box and re-wraps the
+       description text, which reads as a wiggle */
+    width: calc(100% + 1rem);
+    padding: 0.5rem;
+    margin: -0.5rem;
   }
   .description-hover:hover {
-    padding: 0.5rem;
     background-color: var(--ds-background-input-hovered);
   }
   .action-btn {
@@ -325,11 +363,28 @@
     max-width: 0;
     opacity: 0;
     overflow: hidden;
+    transform: translateX(-0.25rem);
     white-space: nowrap;
-    transition: max-width 0.2s ease, opacity 0.2s ease;
+    transition: opacity 0.2s ease, transform 0.2s ease;
   }
   .action-btn:hover .action-label {
     max-width: 80px;
     opacity: 1;
+    transform: translateX(0);
+  }
+  .description-empty {
+    color: var(--ds-text-subtle);
+  }
+
+  .description-empty:hover {
+    color: var(--ds-text);
+  }
+
+  .manual-action {
+    color: var(--ds-text);
+  }
+
+  .manual-action:hover {
+    background-color: var(--ds-background-neutral-hovered);
   }
 </style>

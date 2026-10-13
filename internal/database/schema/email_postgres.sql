@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS email_channel_state (
 	last_checked_at TIMESTAMPTZ,
 	error_count INTEGER DEFAULT 0,
 	last_error TEXT,
+	failed_message_uid INTEGER NOT NULL DEFAULT 0,
+	failed_message_uid_validity BIGINT NOT NULL DEFAULT 0,
+	failed_message_count INTEGER NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
@@ -38,11 +41,69 @@ CREATE TABLE IF NOT EXISTS email_channel_state (
 
 CREATE INDEX IF NOT EXISTS idx_email_channel_state_channel_id ON email_channel_state(channel_id);
 
+-- Intakes (WI-1644); see email.sql for the contract.
+CREATE TABLE IF NOT EXISTS intakes (
+	id SERIAL PRIMARY KEY,
+	mailbox_id INTEGER NOT NULL,
+	folder TEXT NOT NULL DEFAULT 'INBOX',
+	workspace_id INTEGER,
+	portal_channel_id INTEGER,
+	request_type_id INTEGER,
+	item_type_id INTEGER,
+	rate_limit_per_hour INTEGER,
+	processing_disposition TEXT NOT NULL DEFAULT '',
+	send_confirmation BOOLEAN NOT NULL DEFAULT false,
+	status TEXT NOT NULL DEFAULT 'enabled',
+	status_reason TEXT NOT NULL DEFAULT '',
+	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY (mailbox_id) REFERENCES channels(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_intakes_mailbox_folder ON intakes(mailbox_id, folder);
+CREATE INDEX IF NOT EXISTS idx_intakes_portal ON intakes(portal_channel_id);
+
+CREATE TABLE IF NOT EXISTS email_intake_state (
+	intake_id INTEGER PRIMARY KEY,
+	last_uid INTEGER DEFAULT 0,
+	uid_validity BIGINT DEFAULT 0,
+	failed_message_uid INTEGER NOT NULL DEFAULT 0,
+	failed_message_uid_validity BIGINT NOT NULL DEFAULT 0,
+	failed_message_count INTEGER NOT NULL DEFAULT 0,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY (intake_id) REFERENCES intakes(id) ON DELETE CASCADE
+);
+
+-- Cross-process lease for OAuth token refresh/callback mutations. A process
+-- crash is recovered by expires_at rather than wedging a channel forever.
+CREATE TABLE IF NOT EXISTS email_credential_leases (
+	channel_id INTEGER PRIMARY KEY,
+	owner_token TEXT NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL,
+	FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_credential_leases_expires_at
+	ON email_credential_leases(expires_at);
+
+-- Cross-process lease for mailbox polling. See email.sql for the invariant.
+CREATE TABLE IF NOT EXISTS email_processing_leases (
+	channel_id INTEGER PRIMARY KEY,
+	owner_token TEXT NOT NULL,
+	expires_at TIMESTAMPTZ NOT NULL,
+	FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_processing_leases_expires_at
+	ON email_processing_leases(expires_at);
+
 -- Email message tracking for deduplication and reply threading.
 -- See email.sql for the dedup_key contract.
 CREATE TABLE IF NOT EXISTS email_message_tracking (
 	id SERIAL PRIMARY KEY,
 	channel_id INTEGER NOT NULL,
+	intake_id INTEGER,
 	message_id TEXT NOT NULL,
 	dedup_key TEXT NOT NULL DEFAULT '',
 	in_reply_to TEXT,
@@ -54,6 +115,11 @@ CREATE TABLE IF NOT EXISTS email_message_tracking (
 	-- attachments_status: see email.sql for the column contract.
 	attachments_status TEXT CHECK(attachments_status IN ('ok','partial','failed') OR attachments_status IS NULL),
 	direction TEXT DEFAULT 'inbound' CHECK(direction IN ('inbound', 'outbound')),
+	-- uid/uid_validity/rate_limited_at/completed_at: see email.sql for the column contract.
+	uid BIGINT NOT NULL DEFAULT 0,
+	uid_validity BIGINT NOT NULL DEFAULT 0,
+	rate_limited_at TIMESTAMPTZ,
+	completed_at TIMESTAMPTZ,
 	processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
 	FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE SET NULL,
@@ -64,14 +130,59 @@ CREATE INDEX IF NOT EXISTS idx_email_message_tracking_channel_id ON email_messag
 CREATE INDEX IF NOT EXISTS idx_email_message_tracking_message_id ON email_message_tracking(message_id);
 CREATE INDEX IF NOT EXISTS idx_email_message_tracking_in_reply_to ON email_message_tracking(in_reply_to);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_email_message_tracking_dedup ON email_message_tracking(channel_id, dedup_key);
+CREATE INDEX IF NOT EXISTS idx_email_message_tracking_sender ON email_message_tracking(from_email);
+CREATE INDEX IF NOT EXISTS idx_email_message_tracking_channel_sender_time ON email_message_tracking(channel_id, LOWER(from_email), processed_at);
+
+-- Durable at-least-once queue for comment replies. See email.sql.
+CREATE TABLE IF NOT EXISTS email_reply_outbox (
+	id SERIAL PRIMARY KEY,
+	comment_id INTEGER NOT NULL,
+	channel_id INTEGER NOT NULL,
+	item_id INTEGER NOT NULL,
+	to_email TEXT NOT NULL,
+	to_name TEXT NOT NULL DEFAULT '',
+	subject TEXT NOT NULL,
+	html_body TEXT NOT NULL,
+	text_body TEXT NOT NULL,
+	message_id TEXT NOT NULL,
+	in_reply_to TEXT NOT NULL DEFAULT '',
+	references_json TEXT NOT NULL DEFAULT '[]',
+	from_email TEXT NOT NULL,
+	from_name TEXT NOT NULL DEFAULT '',
+	-- reply_to_*: see email.sql for the column contract.
+	reply_to_email TEXT NOT NULL DEFAULT '',
+	reply_to_name TEXT NOT NULL DEFAULT '',
+	attempt_count INTEGER NOT NULL DEFAULT 0,
+	next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	-- Set while a worker holds a delivery lease; NULL means next_attempt_at
+	-- is retry backoff rather than a claim.
+	lease_owner TEXT,
+	last_error TEXT,
+	delivered_at TIMESTAMPTZ,
+	-- discarded_at: see email.sql for the column contract.
+	discarded_at TIMESTAMPTZ,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY (comment_id) REFERENCES comments(id) ON DELETE CASCADE,
+	FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+	FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_reply_outbox_pending
+	ON email_reply_outbox(delivered_at, next_attempt_at);
+
+-- One outbound reply per comment recipient (WI-1136).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_email_reply_outbox_comment_recipient
+	ON email_reply_outbox(comment_id, to_email);
 
 -- Email OAuth state for tracking OAuth flow state
 CREATE TABLE IF NOT EXISTS email_oauth_state (
 	id SERIAL PRIMARY KEY,
-	provider_id INTEGER NOT NULL,
+	provider_id INTEGER,
 	channel_id INTEGER,
 	state TEXT UNIQUE NOT NULL,
 	user_id INTEGER NOT NULL,
+	restore_channel_enabled BOOLEAN NOT NULL DEFAULT false,
 	expires_at TIMESTAMPTZ NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (provider_id) REFERENCES email_providers(id) ON DELETE CASCADE,

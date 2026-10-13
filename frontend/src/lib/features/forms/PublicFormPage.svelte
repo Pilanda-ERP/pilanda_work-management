@@ -1,26 +1,36 @@
 <script>
-  import { onMount } from 'svelte';
   import { useResizeObserver } from 'runed';
-  import { currentRoute } from '../../router.js';
-  import { api } from '../../api.js';
-  import Spinner from '../../components/Spinner.svelte';
+  import { ArrowLeft, ChevronRight, FileText } from '@lucide/svelte';
+  import { currentRoute, navigate } from '../../router.js';
+  import { authStore } from '../../stores';
+  import EmptyState from '../../components/EmptyState.svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
   import FormRenderer from './FormRenderer.svelte';
+  import { loadPublicFormBootstrap } from './publicFormData.js';
 
   let slug = $derived($currentRoute.params?.slug || '');
+  let requestedFormId = $derived(parseRequestedFormId($currentRoute.params?.formId));
   let embed = $derived(new URLSearchParams(window.location.search).get('embed') === 'true');
 
   let channel = $state(null);
   let forms = $state([]);
   let selectedFormId = $state(null);
+  let selectedFormDetail = $state(null);
   let loading = $state(true);
   let error = $state(null);
+  let routeLoadVersion = 0;
 
   let isDarkMode = $derived(channel?.theme === 'dark' || (channel?.theme === 'auto' && window.matchMedia?.('(prefers-color-scheme: dark)').matches));
-  let brandColor = $derived(channel?.brand_color || '#14b8a6');
+  let brandColor = $derived(channel?.brand_color || null);
   let logoUrl = $derived(channel?.logo_url || '');
 
-  onMount(async () => {
-    await loadFormChannel();
+  // The router keeps this root component mounted while switching between the
+  // channel list and individual form URLs. Treat route params as authoritative
+  // so browser Back/Forward follows the URL instead of stale local selection.
+  $effect(() => {
+    const routeSlug = slug;
+    const routeFormId = requestedFormId;
+    void loadFormChannel(routeSlug, routeFormId);
   });
 
   // Tell the parent window (widget.js iframe host) how tall we are so it can
@@ -38,170 +48,232 @@
     postHeight
   );
 
-  async function loadFormChannel() {
+  function parseRequestedFormId(rawFormId) {
+    if (rawFormId === undefined) return null;
+    if (!/^[1-9]\d*$/.test(rawFormId)) return NaN;
+    const parsed = Number(rawFormId);
+    return Number.isSafeInteger(parsed) ? parsed : NaN;
+  }
+
+  async function loadFormChannel(routeSlug, routeFormId) {
+    const version = ++routeLoadVersion;
     try {
       loading = true;
       error = null;
 
-      const [channelData, formsData] = await Promise.all([
-        api.forms.getChannel(slug),
-        api.forms.getForms(slug),
-      ]);
+      const bootstrap = await loadPublicFormBootstrap(routeSlug);
+      if (version !== routeLoadVersion) return;
 
-      channel = channelData;
-      forms = formsData || [];
+      channel = bootstrap.channel;
+      forms = bootstrap.forms || [];
+      selectedFormId = null;
+      selectedFormDetail = null;
 
-      // If only one form, select it automatically
-      if (forms.length === 1) {
+      if (routeFormId !== null) {
+        if (!Number.isSafeInteger(routeFormId) || !forms.some(form => form.id === routeFormId)) {
+          throw new Error('Form not found');
+        }
+        selectedFormId = routeFormId;
+        if (bootstrap.form_detail?.form_id === routeFormId) {
+          selectedFormDetail = bootstrap.form_detail;
+        }
+      } else if (forms.length === 1) {
+        // Keep the channel URL canonical for sole-form channels.
         selectedFormId = forms[0].id;
+        selectedFormDetail = bootstrap.form_detail || null;
       }
     } catch (err) {
+      if (version !== routeLoadVersion) return;
       console.error('Failed to load form channel:', err);
       error = err.message || 'Form not found';
     } finally {
-      loading = false;
+      if (version === routeLoadVersion) loading = false;
     }
   }
 
   function selectForm(formId) {
     selectedFormId = formId;
+    selectedFormDetail = null;
+    navigate(`/forms/${encodeURIComponent(slug)}/${formId}${embed ? '?embed=true' : ''}`);
   }
 
   function backToList() {
     selectedFormId = null;
+    selectedFormDetail = null;
+    navigate(`/forms/${encodeURIComponent(slug)}${embed ? '?embed=true' : ''}`);
   }
 </script>
 
 <div
-  class="min-h-screen flex flex-col"
-  style="background-color: {isDarkMode ? '#0f172a' : '#f8fafc'};"
+  class="public-form-shell min-h-screen flex flex-col"
+  class:ds-brand-scope={Boolean(brandColor)}
+  data-ds-color-mode={isDarkMode ? 'dark' : 'light'}
+  style={brandColor ? `--ds-brand-color: ${brandColor}` : undefined}
+  data-testid="public-form-page"
+  data-ready={!loading && !error}
 >
-  {#if loading}
-    <div class="flex-1 flex items-center justify-center">
-      <Spinner />
-    </div>
-  {:else if error}
-    <div class="flex-1 flex items-center justify-center">
-      <div class="text-center">
-        <div class="text-6xl mb-4">404</div>
-        <p style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">{error}</p>
-      </div>
-    </div>
-  {:else}
-    <!-- Header (hidden in embed mode) -->
-    {#if !embed}
-      <header
-        class="border-b"
-        style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; border-color: {isDarkMode ? '#334155' : '#e2e8f0'};"
-      >
-        <div class="max-w-2xl mx-auto px-6 py-4 flex items-center gap-4">
-          {#if logoUrl}
-            <img src={logoUrl} alt="" class="h-8 w-auto" />
-          {/if}
-          <h1 class="text-lg font-semibold" style="color: {isDarkMode ? '#f1f5f9' : '#0f172a'};">
-            {channel?.name || 'Form'}
+  {#if !embed}
+    <header
+      class="relative z-40 border-b"
+      style="background-color: color-mix(in srgb, var(--ds-surface-card) 94%, transparent); border-color: var(--ds-border);"
+    >
+      <div class="mx-auto flex h-16 max-w-6xl items-center gap-3 px-4 sm:px-6">
+        {#if logoUrl}
+          <img src={logoUrl} alt="" class="h-8 w-8 flex-none object-contain sm:w-auto sm:max-w-28" />
+        {/if}
+        <div class="min-w-0">
+          <h1 class="truncate text-sm font-semibold sm:text-base" style="color: var(--ds-text);">
+            {channel?.name || 'Forms'}
           </h1>
         </div>
-      </header>
-    {/if}
+      </div>
+    </header>
+  {/if}
 
-    <!-- Content -->
-    <main class="flex-1 flex items-start justify-center {embed ? 'p-4' : 'p-6'}">
-      <div class="w-full max-w-2xl">
-        {#if selectedFormId}
-          <!-- Show form -->
+  <main class="flex-1" style="background-color: var(--ds-surface);">
+    <div class="{embed ? 'p-3' : 'mx-auto max-w-6xl px-4 py-8 sm:px-6 sm:py-12'}">
+      {#if loading}
+        <StateDisplay type="loading" message="Loading form…" />
+      {:else if error}
+        <StateDisplay
+          type="error"
+          title="Form unavailable"
+          message={error}
+        />
+      {:else if selectedFormId}
+        {@const selectedForm = forms.find(f => f.id === selectedFormId)}
+        <div class={embed ? 'w-full' : 'mx-auto max-w-3xl'}>
           {#if forms.length > 1 && !embed}
             <button
+              type="button"
               onclick={backToList}
-              class="mb-4 text-sm font-medium flex items-center gap-1 transition-colors"
-              style="color: {brandColor};"
+              data-testid="public-form-back"
+              class="mb-6 flex items-center gap-2 text-sm font-medium focus:outline-none focus-visible:ring-2"
+              style="color: var(--ds-text-link); --tw-ring-color: var(--ds-border-focused);"
             >
-              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M19 12H5M12 19l-7-7 7-7" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
+              <ArrowLeft class="h-4 w-4" />
               Back to forms
             </button>
           {/if}
 
-          {@const selectedForm = forms.find(f => f.id === selectedFormId)}
-          <div
-            class="rounded-xl border p-6 {embed ? '' : 'shadow-sm'}"
-            style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; border-color: {isDarkMode ? '#334155' : '#e2e8f0'};"
-          >
-            {#if selectedForm}
-              <div class="mb-6">
-                <h2 class="text-xl font-bold" style="color: {isDarkMode ? '#f1f5f9' : '#0f172a'};">
-                  {selectedForm.name}
-                </h2>
-                {#if selectedForm.description}
-                  <p class="text-sm mt-1" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
-                    {selectedForm.description}
-                  </p>
-                {/if}
-              </div>
-            {/if}
+          {#if selectedForm}
+            <div class="mb-6">
+              <h2
+                data-testid="public-form-title"
+                class="text-2xl font-semibold leading-8 sm:text-3xl"
+                style="color: var(--ds-text);"
+              >
+                {selectedForm.name}
+              </h2>
+              <p class="mt-1 text-sm leading-5" style="color: var(--ds-text-subtle);">
+                {selectedForm.description || 'Complete the fields below to send your request.'}
+              </p>
+            </div>
+          {/if}
 
+          <div
+            class="{embed ? '' : 'rounded-lg border p-5 sm:p-6'}"
+            style={embed ? '' : 'background-color: var(--ds-surface-card); border-color: var(--ds-border);'}
+          >
             <FormRenderer
               formSlug={slug}
               formId={selectedFormId}
               formConfig={selectedForm?.config}
+              attachmentConfig={selectedForm?.config?.allow_attachments ? channel?.attachments : null}
+              initialDetail={selectedFormDetail}
+              authenticationRequired={selectedForm?.config?.require_auth === true && !$authStore.isAuthenticated}
+              {embed}
               {brandColor}
               {isDarkMode}
             />
           </div>
-        {:else if forms.length === 0}
-          <!-- No forms -->
-          <div class="text-center py-12">
-            <div class="w-16 h-16 mx-auto mb-4 rounded-full flex items-center justify-center" style="background-color: {brandColor}20;">
-              <svg class="w-8 h-8" style="color: {brandColor};" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </div>
-            <p class="text-sm" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">No forms available</p>
-          </div>
-        {:else}
-          <!-- Form list -->
-          <div class="space-y-3">
+        </div>
+      {:else if forms.length === 0}
+        <div
+          class="rounded-md border p-6"
+          style="background-color: var(--ds-surface-card); border-color: var(--ds-border);"
+        >
+          <EmptyState
+            icon={FileText}
+            title="No forms available"
+            description="This channel has not published any forms yet."
+          />
+        </div>
+      {:else}
+        <section>
+          <h2 class="mb-1 text-xl font-medium" style="color: var(--ds-text);">How can we help?</h2>
+          <p class="text-sm" style="color: var(--ds-text-subtle);">
+            Select the form that best matches your request.
+          </p>
+
+          <div class="mt-5 grid grid-cols-1 gap-3 md:grid-cols-2">
             {#each forms as form}
               <button
+                type="button"
                 onclick={() => selectForm(form.id)}
-                class="w-full text-left p-5 rounded-xl border transition-all hover:shadow-md"
-                style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; border-color: {isDarkMode ? '#334155' : '#e2e8f0'};"
+                data-testid={`public-form-option-${form.id}`}
+                class="form-option group relative m-0 w-full cursor-pointer appearance-none rounded-md border p-4 text-left font-[inherit] text-[inherit] transition-colors focus:outline-none focus-visible:ring-2"
               >
-                <div class="flex items-center gap-4">
-                  <div class="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0" style="background-color: {form.color || brandColor}20;">
-                    <svg class="w-5 h-5" style="color: {form.color || brandColor};" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" stroke-linecap="round" stroke-linejoin="round"/>
-                    </svg>
+                <div class="flex items-start gap-3.5">
+                  <div
+                    class="flex h-9 w-9 flex-none items-center justify-center rounded-md"
+                    style="background-color: color-mix(in srgb, {form.color || 'var(--ds-text-subtle)'} 12%, transparent); color: {form.color || 'var(--ds-text-subtle)'};"
+                  >
+                    <FileText class="h-[18px] w-[18px]" />
                   </div>
-                  <div class="flex-1 min-w-0">
-                    <div class="font-medium" style="color: {isDarkMode ? '#f1f5f9' : '#0f172a'};">
-                      {form.name}
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 text-sm font-medium leading-5" style="color: var(--ds-text);">
+                      <span class="truncate">{form.name}</span>
+                    {#if form.config?.require_auth}
+                        <span
+                          class="rounded px-1.5 py-0.5 text-[10px] font-medium"
+                          style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);"
+                        >
+                          SIGN-IN
+                        </span>
+                    {/if}
                     </div>
                     {#if form.description}
-                      <div class="text-sm mt-0.5 truncate" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
+                      <p class="mt-1.5 line-clamp-2 text-sm leading-5" style="color: var(--ds-text-subtle);">
                         {form.description}
-                      </div>
+                      </p>
                     {/if}
                   </div>
-                  <svg class="w-5 h-5 flex-shrink-0" style="color: {isDarkMode ? '#475569' : '#9ca3af'};" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M9 18l6-6-6-6" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
+                  <ChevronRight class="mt-2 h-4 w-4 flex-none" style="color: var(--ds-text-subtle);" />
                 </div>
               </button>
             {/each}
           </div>
-        {/if}
-      </div>
-    </main>
+        </section>
+      {/if}
+    </div>
+  </main>
 
-    <!-- Footer (hidden in embed mode) -->
-    {#if !embed}
-      <footer class="py-4 text-center">
-        <p class="text-xs" style="color: {isDarkMode ? '#475569' : '#9ca3af'};">
-          Powered by Windshift
-        </p>
-      </footer>
-    {/if}
+  {#if !embed}
+    <footer
+      class="mt-auto border-t"
+      style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
+    >
+      <div class="mx-auto max-w-6xl px-4 py-4 text-center sm:px-6">
+        <p class="text-xs" style="color: var(--ds-text-subtle);">Powered by Windshift</p>
+      </div>
+    </footer>
   {/if}
 </div>
+
+<style>
+  .public-form-shell {
+    background: var(--ds-surface);
+    color: var(--ds-text);
+  }
+
+  .form-option {
+    background-color: var(--ds-surface-card);
+    border-color: var(--ds-border);
+    --tw-ring-color: var(--ds-border-focused);
+  }
+
+  .form-option:hover {
+    border-color: var(--ds-border-focused);
+  }
+</style>

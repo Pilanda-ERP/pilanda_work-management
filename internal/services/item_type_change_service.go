@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/validation"
@@ -77,7 +78,7 @@ func (s *ItemTypeChangeService) Analyze(item *models.Item, targetTypeID int) (*I
 	if err := s.validateItemTypeAllowedForWorkspace(item.WorkspaceID, targetTypeID); err != nil {
 		return nil, err
 	}
-	if err := s.validateItemTypeHierarchyCompatibility(item, target.HierarchyLevel); err != nil {
+	if err := s.validateItemTypeHierarchyCompatibility(item, targetTypeID); err != nil {
 		return nil, err
 	}
 
@@ -206,8 +207,15 @@ func (s *ItemTypeChangeService) ValidateStatusMapping(ctx context.Context, item 
 // and records the history rows. Callers must have already validated inputs via
 // Analyze + ValidateStatusMapping.
 func (s *ItemTypeChangeService) ApplyChange(itemID, userID, targetTypeID int, nextStatusID *int, original *models.Item) ([]HistoryEntry, error) {
+	finalStatusID := original.StatusID
+	if nextStatusID != nil {
+		finalStatusID = nextStatusID
+	}
+	if err := validation.ValidateTaskState(s.db, original.WorkspaceID, userID, original.IsTask, finalStatusID); err != nil {
+		return nil, err
+	}
 	now := time.Now()
-	fields := map[string]interface{}{"item_type_id": targetTypeID}
+	fields := map[string]any{"item_type_id": targetTypeID}
 	if nextStatusID != nil {
 		fields["status_id"] = *nextStatusID
 	}
@@ -235,33 +243,35 @@ func (s *ItemTypeChangeService) ApplyChange(itemID, userID, targetTypeID int, ne
 		if err := s.itemRepo.UpdateFields(tx, itemID, fields); err != nil {
 			return err
 		}
-		repoEntries := make([]repository.HistoryEntry, len(history))
-		for i, h := range history {
-			repoEntries[i] = repository.HistoryEntry{
-				ItemID:    h.ItemID,
-				UserID:    h.UserID,
-				FieldName: h.FieldName,
-				OldValue:  h.OldValue,
-				NewValue:  h.NewValue,
-				ChangedAt: h.ChangedAt,
-			}
-		}
-		if err := s.itemRepo.RecordHistoryBatch(tx, repoEntries); err != nil {
+		if err := s.itemRepo.RecordHistoryBatch(tx, history); err != nil {
 			return fmt.Errorf("record item history: %w", err)
 		}
-		return nil
+		updated := *original
+		updated.ItemTypeID = &targetTypeID
+		if nextStatusID != nil {
+			updated.StatusID = nextStatusID
+		}
+		metadata := itemevents.User(userID, "application")
+		metadata.OccurredAt = now
+		recorder := itemevents.NewRecorder(s.db)
+		changes := itemevents.Changes(original, &updated)
+		if nextStatusID != nil {
+			if _, err := recorder.StatusChanged(context.Background(), tx, &updated, original.StatusID, nextStatusID, changes, metadata); err != nil {
+				return err
+			}
+			return nil
+		}
+		_, err := recorder.Updated(context.Background(), tx, &updated, changes, metadata)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	// Live-update publish (WI-483): the type change (and optional status change)
-	// committed. A status kind triggers the status-aware reload on the client.
-	kind := ItemChangeUpdated
-	if nextStatusID != nil {
-		kind = ItemChangeStatus
-	}
-	PublishItemChange(itemID, kind)
+	// committed.
+	PublishItemChange(itemID)
+	PublishWorkspaceChange(original.WorkspaceID)
 
 	return history, nil
 }
@@ -285,30 +295,8 @@ func (s *ItemTypeChangeService) loadItemTypeTarget(id int) (*itemTypeTargetDetai
 }
 
 func (s *ItemTypeChangeService) validateItemTypeAllowedForWorkspace(workspaceID, targetTypeID int) error {
-	var configSetID sql.NullInt64
-	err := s.db.QueryRow(`SELECT configuration_set_id FROM workspace_configuration_sets WHERE workspace_id = ?`, workspaceID).Scan(&configSetID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if !configSetID.Valid {
-		return nil
-	}
-
-	var configuredCount int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM configuration_set_item_types WHERE configuration_set_id = ?`, configSetID.Int64).Scan(&configuredCount); err != nil {
-		return err
-	}
-	if configuredCount == 0 {
-		return nil
-	}
-
-	var allowed bool
-	if err := s.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM configuration_set_item_types
-			WHERE configuration_set_id = ? AND item_type_id = ?
-		)
-	`, configSetID.Int64, targetTypeID).Scan(&allowed); err != nil {
+	allowed, err := repository.NewConfigurationSetRepository(s.db).ItemTypeAllowed(workspaceID, targetTypeID)
+	if err != nil {
 		return err
 	}
 	if !allowed {
@@ -317,26 +305,16 @@ func (s *ItemTypeChangeService) validateItemTypeAllowedForWorkspace(workspaceID,
 	return nil
 }
 
-func (s *ItemTypeChangeService) validateItemTypeHierarchyCompatibility(item *models.Item, targetLevel int) error {
-	itemRepo := repository.NewItemRepository(s.db)
-	if item.ParentID != nil {
-		parentLevel, err := itemRepo.GetItemHierarchyLevel(*item.ParentID)
-		if err != nil {
-			return err
-		}
-		if parentLevel != nil && targetLevel != *parentLevel+1 {
-			return &validation.ValidationError{Field: "target_item_type_id", Message: "Item type is not compatible with the current parent hierarchy"}
+func (s *ItemTypeChangeService) validateItemTypeHierarchyCompatibility(item *models.Item, targetTypeID int) error {
+	err := validation.ValidateItemTypePlacement(s.db, item.ID, targetTypeID, item.ParentID)
+	var placementErr *validation.ValidationError
+	if errors.As(err, &placementErr) {
+		return &validation.ValidationError{
+			Field:   "target_item_type_id",
+			Message: placementErr.Message,
 		}
 	}
-
-	incompatibleChildren, err := itemRepo.CountChildrenWithHierarchyLevelNot(item.ID, targetLevel+1)
-	if err != nil {
-		return err
-	}
-	if incompatibleChildren > 0 {
-		return &validation.ValidationError{Field: "target_item_type_id", Message: "Item type is not compatible with existing child hierarchy"}
-	}
-	return nil
+	return err
 }
 
 func (s *ItemTypeChangeService) listWorkflowStatuses(workflowID int) ([]StatusChangeInfo, error) {
@@ -417,8 +395,12 @@ func (s *ItemTypeChangeService) findWorkflowTransitionID(workflowID, fromStatusI
 	var id int
 	err := s.db.QueryRow(`
 		SELECT id FROM workflow_transitions
-		WHERE workflow_id = ? AND from_status_id = ? AND to_status_id = ?
-	`, workflowID, fromStatusID, toStatusID).Scan(&id)
+		WHERE workflow_id = ?
+		  AND to_status_id = ?
+		  AND (from_status_id = ? OR from_all_statuses = TRUE)
+		ORDER BY CASE WHEN from_status_id IS NULL THEN 1 ELSE 0 END, display_order
+		LIMIT 1
+	`, workflowID, toStatusID, fromStatusID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

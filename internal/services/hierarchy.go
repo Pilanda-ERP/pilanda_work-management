@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -95,12 +96,28 @@ func (h *HierarchyService) GetAncestors(itemID int) ([]models.Item, error) {
 	return repository.NewItemRepository(h.db).GetAncestorsForHierarchy(itemID, maxHierarchyDepth)
 }
 
+// GetAncestorsContext is the request-aware form of GetAncestors.
+func (h *HierarchyService) GetAncestorsContext(ctx context.Context, itemID int) ([]models.Item, error) {
+	return repository.NewItemRepository(h.db).GetAncestorsForHierarchyContext(ctx, itemID, maxHierarchyDepth)
+}
+
+// GetAncestorsForItemsContext resolves ancestor chains for many items in one
+// recursive walk. Chains exclude the items themselves.
+func (h *HierarchyService) GetAncestorsForItemsContext(ctx context.Context, itemIDs []int) (map[int][]models.Item, error) {
+	return repository.NewItemRepository(h.db).GetAncestorsForItemsContext(ctx, itemIDs, maxHierarchyDepth)
+}
+
 // GetDescendants returns all descendants of an item
 func (h *HierarchyService) GetDescendants(itemID, maxDepth int) ([]models.Item, error) {
+	return h.GetDescendantsContext(context.Background(), itemID, maxDepth)
+}
+
+// GetDescendantsContext is the request-aware form of GetDescendants.
+func (h *HierarchyService) GetDescendantsContext(ctx context.Context, itemID, maxDepth int) ([]models.Item, error) {
 	if maxDepth <= 0 || maxDepth > maxHierarchyDepth {
 		maxDepth = maxHierarchyDepth
 	}
-	items, err := repository.NewItemRepository(h.db).GetDescendantsWithMaxDepth(itemID, maxDepth)
+	items, err := repository.NewItemRepository(h.db).GetDescendantsWithMaxDepthContext(ctx, itemID, maxDepth)
 	if err != nil {
 		return nil, err
 	}
@@ -114,9 +131,30 @@ func (h *HierarchyService) CountDescendants(itemID int) (int, error) {
 	return repository.NewItemRepository(h.db).CountDescendants(itemID)
 }
 
+// CountDescendantsContext is the request-aware form of CountDescendants.
+func (h *HierarchyService) CountDescendantsContext(ctx context.Context, itemID int) (int, error) {
+	return repository.NewItemRepository(h.db).CountDescendantsContext(ctx, itemID)
+}
+
 // GetChildren returns direct children of an item
 func (h *HierarchyService) GetChildren(itemID int) ([]models.Item, error) {
-	items, err := repository.NewItemRepository(h.db).GetChildren(itemID)
+	return h.GetChildrenContext(context.Background(), itemID)
+}
+
+// GetChildrenContext is the request-aware form of GetChildren.
+func (h *HierarchyService) GetChildrenContext(ctx context.Context, itemID int) ([]models.Item, error) {
+	items, err := repository.NewItemRepository(h.db).GetChildrenContext(ctx, itemID)
+	if err != nil {
+		return nil, err
+	}
+	return itemPtrsToValues(items), nil
+}
+
+// GetChildrenInWorkspacesContext returns direct children restricted to the
+// given accessible workspaces, so cross-workspace children are not disclosed
+// through a visible parent.
+func (h *HierarchyService) GetChildrenInWorkspacesContext(ctx context.Context, itemID int, workspaceIDs []int) ([]models.Item, error) {
+	items, err := repository.NewItemRepository(h.db).GetChildrenInWorkspacesContext(ctx, itemID, workspaceIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +171,7 @@ func (h *HierarchyService) GetRoot(itemID int) (*models.Item, error) {
 	repo := repository.NewItemRepository(h.db)
 	current := itemID
 	for depth := 0; depth < maxHierarchyDepth; depth++ {
-		parentID, err := repo.GetParentID(current)
+		parentID, hierarchyLevel, err := repo.GetParentIDAndHierarchyLevel(current)
 		if errors.Is(err, repository.ErrNotFound) {
 			if depth == 0 {
 				return nil, nil
@@ -143,7 +181,7 @@ func (h *HierarchyService) GetRoot(itemID int) (*models.Item, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to walk hierarchy: %w", err)
 		}
-		if parentID == nil {
+		if parentID == nil || (hierarchyLevel != nil && *hierarchyLevel == 0) {
 			return repo.FindByIDWithDetails(current)
 		}
 		current = *parentID

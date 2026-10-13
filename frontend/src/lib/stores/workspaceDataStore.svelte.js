@@ -1,4 +1,9 @@
 import { api } from '../api.js';
+import {
+  canRunBackgroundSync,
+  isExpectedBackgroundSyncError,
+  onBackgroundSyncAvailable,
+} from '../utils/backgroundSync.js';
 
 const AUTO_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
@@ -9,7 +14,15 @@ const AUTO_REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
  */
 class WorkspaceDataStore {
   workspaceId = $state(null);
+
+  /** @type {Map<string, Promise<object>>} */
+  #screenConfigPromises = new Map();
+  /** @type {Map<number, Promise<object|null>>} */
+  #userHydrationPromises = new Map();
+  /** @type {Set<number>} */
+  #userHydrationFailed = new Set();
   workspace = $state(null);
+  homepageLayout = $state(null);
   statuses = $state([]);
   statusCategories = $state([]);
   itemTypes = $state([]);
@@ -20,6 +33,9 @@ class WorkspaceDataStore {
   projects = $state([]);
   customFieldDefinitions = $state([]);
   labels = $state([]);
+  // Resolved effective configuration per item type, keyed by item type id or
+  // 'default'. Fetched once per workspace, invalidated on workspace switch.
+  screenConfigs = $state({});
 
   initialLoading = $state(false);
   initialized = $state(false);
@@ -30,6 +46,10 @@ class WorkspaceDataStore {
   _initPromise = null;
   /** @type {number|null} */
   _refreshTimer = null;
+  /** @type {Promise<void>|null} */
+  _refreshPromise = null;
+  /** @type {null|(() => void)} */
+  _stopReconnectListener = null;
 
   /**
    * Initialize store for a workspace. Idempotent — if already initialized
@@ -53,12 +73,14 @@ class WorkspaceDataStore {
 
     // Different workspace or first init — reset and start fresh
     this._stopAutoRefresh();
+    this._refreshPromise = null;
     this.workspaceId = id;
+    this._clearData();
     this.initialLoading = true;
     this.initialized = false;
     this.error = null;
 
-    this._initPromise = this._fetchAll(id)
+    const request = this._fetchAll(id)
       .then(() => {
         // Race condition guard: make sure we're still on the same workspace
         if (this.workspaceId !== id) return;
@@ -69,6 +91,10 @@ class WorkspaceDataStore {
       })
       .catch((err) => {
         if (this.workspaceId !== id) return;
+        // A navigation/reload aborts outstanding fetches as the document is
+        // torn down. That is expected control flow, not an initialization
+        // failure to surface in the UI or browser console.
+        if (isExpectedBackgroundSyncError(err)) return;
         this.error = err.message || 'Failed to load workspace data';
         console.error('WorkspaceDataStore: initialization failed', err);
       })
@@ -76,10 +102,11 @@ class WorkspaceDataStore {
         if (this.workspaceId === id) {
           this.initialLoading = false;
         }
-        this._initPromise = null;
+        if (this._initPromise === request) this._initPromise = null;
       });
 
-    return this._initPromise;
+    this._initPromise = request;
+    return request;
   }
 
   /**
@@ -100,12 +127,14 @@ class WorkspaceDataStore {
     }
 
     this._stopAutoRefresh();
+    this._refreshPromise = null;
     this.workspaceId = GLOBAL_SENTINEL;
+    this._clearData();
     this.initialLoading = true;
     this.initialized = false;
     this.error = null;
 
-    this._initPromise = this._fetchAllGlobal()
+    const request = this._fetchAllGlobal()
       .then(() => {
         if (this.workspaceId !== GLOBAL_SENTINEL) return;
         this.initialized = true;
@@ -114,6 +143,7 @@ class WorkspaceDataStore {
       })
       .catch((err) => {
         if (this.workspaceId !== GLOBAL_SENTINEL) return;
+        if (isExpectedBackgroundSyncError(err)) return;
         this.error = err.message || 'Failed to load global data';
         console.error('WorkspaceDataStore: global initialization failed', err);
       })
@@ -121,10 +151,11 @@ class WorkspaceDataStore {
         if (this.workspaceId === GLOBAL_SENTINEL) {
           this.initialLoading = false;
         }
-        this._initPromise = null;
+        if (this._initPromise === request) this._initPromise = null;
       });
 
-    return this._initPromise;
+    this._initPromise = request;
+    return request;
   }
 
   /**
@@ -132,19 +163,33 @@ class WorkspaceDataStore {
    */
   async refresh() {
     if (!this.workspaceId) return;
+    if (!canRunBackgroundSync()) return;
+    if (this._refreshPromise) return this._refreshPromise;
 
     const id = this.workspaceId;
+    const request = (async () => {
+      try {
+        if (id === 'global') {
+          await this._fetchAllGlobal();
+        } else {
+          await this._fetchAll(id);
+        }
+        await this.#refreshScreenConfigs(id);
+        if (this.workspaceId === id) {
+          this.lastRefreshedAt = Date.now();
+        }
+      } catch (err) {
+        if (!isExpectedBackgroundSyncError(err)) {
+          console.warn('WorkspaceDataStore: background refresh failed, keeping stale data', err);
+        }
+      }
+    })();
+
+    this._refreshPromise = request;
     try {
-      if (id === 'global') {
-        await this._fetchAllGlobal();
-      } else {
-        await this._fetchAll(id);
-      }
-      if (this.workspaceId === id) {
-        this.lastRefreshedAt = Date.now();
-      }
-    } catch (err) {
-      console.warn('WorkspaceDataStore: background refresh failed, keeping stale data', err);
+      await request;
+    } finally {
+      if (this._refreshPromise === request) this._refreshPromise = null;
     }
   }
 
@@ -154,8 +199,18 @@ class WorkspaceDataStore {
   reset() {
     this._stopAutoRefresh();
     this._initPromise = null;
+    this._refreshPromise = null;
     this.workspaceId = null;
+    this._clearData();
+    this.initialLoading = false;
+    this.initialized = false;
+    this.error = null;
+  }
+
+  /** @private */
+  _clearData() {
     this.workspace = null;
+    this.homepageLayout = null;
     this.statuses = [];
     this.statusCategories = [];
     this.itemTypes = [];
@@ -166,10 +221,123 @@ class WorkspaceDataStore {
     this.projects = [];
     this.customFieldDefinitions = [];
     this.labels = [];
-    this.initialLoading = false;
-    this.initialized = false;
-    this.error = null;
+    this.screenConfigs = {};
+    this.#screenConfigPromises.clear();
+    this.#userHydrationPromises.clear();
+    this.#userHydrationFailed.clear();
     this.lastRefreshedAt = null;
+  }
+
+  /**
+   * Fetch display records for the referenced user IDs only, reusing users that
+   * are already loaded. A workspace switch discards results from the old scope.
+   * @param {Array<number|string>} ids
+   */
+  async hydrateUsers(ids = []) {
+    const wanted = [
+      ...new Set(ids.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)),
+    ];
+    if (wanted.length === 0) return;
+
+    const known = new Set(this.users.map((user) => user.id));
+    const missing = wanted.filter((id) => !known.has(id) && !this.#userHydrationFailed.has(id));
+    if (missing.length === 0) return;
+
+    const workspaceId = this.workspaceId;
+    const results = await Promise.all(
+      missing.map((id) => {
+        const pending = this.#userHydrationPromises.get(id);
+        if (pending) return pending;
+        const promise = api
+          .getUser(id)
+          .catch((error) => {
+            // A denied or missing user is permanent for this scope; do not
+            // retry it on every row update. Transient failures may retry.
+            if (error?.status === 403 || error?.status === 404) {
+              this.#userHydrationFailed.add(id);
+            }
+            return null;
+          })
+          .finally(() => {
+            if (this.#userHydrationPromises.get(id) === promise) {
+              this.#userHydrationPromises.delete(id);
+            }
+          });
+        this.#userHydrationPromises.set(id, promise);
+        return promise;
+      })
+    );
+
+    if (this.workspaceId !== workspaceId) return;
+    const fetched = results.filter(Boolean);
+    if (fetched.length === 0) return;
+
+    const byId = new Map(this.users.map((user) => [user.id, user]));
+    for (const user of fetched) byId.set(user.id, user);
+    this.users = [...byId.values()];
+  }
+
+  /**
+   * Resolved effective configuration for the current workspace and optional
+   * item type: assigned config set (else the global default), its effective
+   * screens with fields, and config-set priorities. Cached per item type;
+   * in-flight requests are shared.
+   */
+  async screenConfig(itemTypeId = null) {
+    if (!this.workspaceId || this.workspaceId === 'global') return null;
+    const key = itemTypeId == null ? 'default' : String(itemTypeId);
+    const cached = this.screenConfigs[key];
+    if (cached) return cached;
+
+    const pending = this.#screenConfigPromises.get(key);
+    if (pending) return pending;
+
+    const workspaceId = this.workspaceId;
+    const promise = api.workspaces
+      .getEffectiveConfig(workspaceId, itemTypeId)
+      .then((config) => {
+        if (this.workspaceId === workspaceId) {
+          this.screenConfigs = { ...this.screenConfigs, [key]: config };
+        }
+        return config;
+      })
+      .finally(() => {
+        if (this.#screenConfigPromises.get(key) === promise) {
+          this.#screenConfigPromises.delete(key);
+        }
+      });
+    this.#screenConfigPromises.set(key, promise);
+    return promise;
+  }
+
+  /** Drop cached effective configurations (after admin config changes). */
+  invalidateScreenConfigs() {
+    this.screenConfigs = {};
+    this.#screenConfigPromises.clear();
+  }
+
+  // Silent re-fetch of cached screen configurations; keeps stale data on error.
+  async #refreshScreenConfigs(workspaceId) {
+    const keys = Object.keys(this.screenConfigs);
+    if (keys.length === 0) return;
+    await Promise.all(
+      keys.map(async (key) => {
+        const itemTypeId = key === 'default' ? null : Number(key);
+        try {
+          const config = await api.workspaces.getEffectiveConfig(workspaceId, itemTypeId);
+          if (this.workspaceId === workspaceId) {
+            this.screenConfigs = { ...this.screenConfigs, [key]: config };
+          }
+        } catch (err) {
+          if (!isExpectedBackgroundSyncError(err)) {
+            console.warn(
+              'WorkspaceDataStore: screen config refresh failed, keeping stale data',
+              err
+            );
+          }
+        }
+      })
+    );
   }
 
   /**
@@ -196,65 +364,37 @@ class WorkspaceDataStore {
 
   /** @private */
   async _fetchAll(workspaceId) {
-    const [
-      workspaceData,
-      itemTypesData,
-      statusesData,
-      statusCategoriesData,
-      usersData,
-      milestonesData,
-      iterationsData,
-      prioritiesData,
-      projectsData,
-    ] = await Promise.all([
-      api.workspaces.get(workspaceId),
-      api.itemTypes.getAll(),
-      api.workspaces.getStatuses(workspaceId),
-      api.statusCategories.getAll(),
-      api.getUsers(),
-      api.milestones.getAll({ workspace_id: workspaceId, include_global: true }),
-      api.iterations.getAll({ workspace_id: workspaceId }),
-      api.priorities.getAll(),
-      api.workspaces.getProjects ? api.workspaces.getProjects(workspaceId) : Promise.resolve([]),
-    ]);
+    const bootstrap = await api.workspaces.getBootstrap(workspaceId);
 
     // Race condition guard
     if (this.workspaceId !== workspaceId) return;
 
-    this.workspace = workspaceData;
-    this.itemTypes = itemTypesData || [];
-    this.statuses = statusesData || [];
-    this.statusCategories = statusCategoriesData || [];
-    this.users = usersData || [];
-    this.milestones = milestonesData || [];
-    this.iterations = iterationsData || [];
-    this.priorities = prioritiesData || [];
-    this.projects = projectsData || [];
+    this.workspace = bootstrap?.workspace ?? null;
+    this.homepageLayout = bootstrap?.homepage_layout ?? null;
+    this.itemTypes = bootstrap?.item_types ?? [];
+    this.statuses = bootstrap?.statuses ?? [];
+    this.statusCategories = bootstrap?.status_categories ?? [];
+    this.users = bootstrap?.users ?? [];
+    this.milestones = bootstrap?.milestones ?? [];
+    this.iterations = bootstrap?.iterations ?? [];
+    this.priorities = bootstrap?.priorities ?? [];
+    this.projects = bootstrap?.projects ?? [];
+    this.customFieldDefinitions = bootstrap?.custom_field_definitions ?? [];
+  }
 
-    // Custom fields loaded separately since it can fail independently
-    try {
-      const cfData = await api.customFields.getAll();
-      if (this.workspaceId === workspaceId) {
-        this.customFieldDefinitions = cfData?.data || [];
-      }
-    } catch (e) {
-      console.warn('WorkspaceDataStore: failed to load custom field definitions', e);
-      if (this.workspaceId === workspaceId) {
-        this.customFieldDefinitions = [];
-      }
-    }
+  hydrateHomepageLayout(workspaceId, layout) {
+    const id = typeof workspaceId === 'string' ? parseInt(workspaceId, 10) : workspaceId;
+    if (this.workspaceId === id) this.homepageLayout = layout;
   }
 
   /** @private */
   async _fetchAllGlobal() {
-    const [itemTypesData, statusesData, statusCategoriesData, usersData, prioritiesData] =
-      await Promise.all([
-        api.itemTypes.getAll(),
-        api.statuses.getAll(),
-        api.statusCategories.getAll(),
-        api.getUsers(),
-        api.priorities.getAll(),
-      ]);
+    const [itemTypesData, statusesData, statusCategoriesData, prioritiesData] = await Promise.all([
+      api.itemTypes.getAll(),
+      api.statuses.getAll(),
+      api.statusCategories.getAll(),
+      api.priorities.getAll(),
+    ]);
 
     if (this.workspaceId !== 'global') return;
 
@@ -262,7 +402,10 @@ class WorkspaceDataStore {
     this.itemTypes = itemTypesData || [];
     this.statuses = statusesData || [];
     this.statusCategories = statusCategoriesData || [];
-    this.users = usersData || [];
+    // The global roster is deliberately not enumerated here: with a large
+    // directory that is many sequential pages before anything can render.
+    // Views hydrate only the users their visible rows reference.
+    this.users = [];
     this.priorities = prioritiesData || [];
     this.milestones = [];
     this.iterations = [];
@@ -272,7 +415,7 @@ class WorkspaceDataStore {
     try {
       const cfData = await api.customFields.getAll();
       if (this.workspaceId === 'global') {
-        this.customFieldDefinitions = cfData?.data || [];
+        this.customFieldDefinitions = cfData || [];
       }
     } catch (e) {
       console.warn('WorkspaceDataStore: failed to load custom field definitions', e);
@@ -286,10 +429,16 @@ class WorkspaceDataStore {
   async _fetchField(workspaceId, field) {
     const fetchers = {
       workspace: () => api.workspaces.get(workspaceId),
+      homepageLayout: () => api.workspaces.getHomepageLayout(workspaceId),
       statuses: () => api.workspaces.getStatuses(workspaceId),
       statusCategories: () => api.statusCategories.getAll(),
       itemTypes: () => api.itemTypes.getAll(),
-      users: () => api.getUsers(),
+      // Global users are hydrated per referenced ID by hydrateUsers(); a field
+      // refresh must not fall back to enumerating the whole directory.
+      users: () =>
+        workspaceId === 'global'
+          ? Promise.resolve(this.users)
+          : api.getAssignableUsers(workspaceId),
       milestones: () =>
         workspaceId === 'global'
           ? api.milestones.getAll()
@@ -300,7 +449,7 @@ class WorkspaceDataStore {
         api.workspaces.getProjects ? api.workspaces.getProjects(workspaceId) : Promise.resolve([]),
       customFieldDefinitions: async () => {
         const res = await api.customFields.getAll();
-        return res?.data || [];
+        return res || [];
       },
     };
 
@@ -318,8 +467,11 @@ class WorkspaceDataStore {
   _startAutoRefresh() {
     this._stopAutoRefresh();
     this._refreshTimer = window.setInterval(() => {
-      this.refresh();
+      if (canRunBackgroundSync()) void this.refresh();
     }, AUTO_REFRESH_INTERVAL);
+    this._stopReconnectListener = onBackgroundSyncAvailable(() => {
+      void this.refresh();
+    });
   }
 
   /** @private */
@@ -328,6 +480,8 @@ class WorkspaceDataStore {
       window.clearInterval(this._refreshTimer);
       this._refreshTimer = null;
     }
+    this._stopReconnectListener?.();
+    this._stopReconnectListener = null;
   }
 }
 

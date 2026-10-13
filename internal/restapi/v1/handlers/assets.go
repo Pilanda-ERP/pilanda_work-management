@@ -377,11 +377,8 @@ func (h *AssetHandler) Update(w http.ResponseWriter, r *http.Request) {
 			in.StatusID = &sid
 		}
 	}
-	// suppliedCustomFields is the map the service validates schema against.
-	// On a partial update where the caller omitted custom_field_values, we
-	// pass nil (skip schema check) and re-encode the row's current values
-	// so the stored JSON doesn't drift across writes.
-	var suppliedCustomFields map[string]interface{}
+	// Validate supplied custom fields; preserve stored values when omitted.
+	var suppliedCustomFields map[string]any
 	if req.CustomFieldValues != nil {
 		cfJSON, err := encodeCustomFieldValues(*req.CustomFieldValues)
 		if err != nil {
@@ -396,14 +393,7 @@ func (h *AssetHandler) Update(w http.ResponseWriter, r *http.Request) {
 			in.CustomFieldValuesJSON = cfJSON
 		}
 	}
-	// requireAssetAccess gave us the *full* asset row; build the update
-	// snapshot the service needs (set_id, status_id, asset_type_id) from
-	// that so we don't re-roundtrip the DB.
-	snap := repository.AssetUpdateSnapshot{
-		SetID:       row.SetID,
-		StatusID:    row.StatusID,
-		AssetTypeID: row.AssetTypeID,
-	}
+	snap := row.UpdateSnapshot()
 	asset, err := h.assetService.UpdateAsset(
 		services.NewAuditActorFromRequest(r, user, middleware.GetAPIToken(r.Context()), "bearer"),
 		row.ID,
@@ -411,6 +401,10 @@ func (h *AssetHandler) Update(w http.ResponseWriter, r *http.Request) {
 		in,
 		suppliedCustomFields,
 	)
+	if errors.Is(err, services.ErrAssetVersionConflict) {
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeConflict, err.Error()))
+		return
+	}
 	if errors.Is(err, repository.ErrNotFound) {
 		h.RespondError(w, r, restapi.ErrAssetNotFound)
 		return
@@ -826,7 +820,7 @@ func (h *AssetHandler) validateResourceBelongsToSet(w http.ResponseWriter, r *ht
 // encodeCustomFieldValues marshals the values map for storage. Returns
 // nil pointer for nil / empty maps so the column stores NULL rather than
 // "null" / "{}".
-func encodeCustomFieldValues(m map[string]interface{}) (*string, error) {
+func encodeCustomFieldValues(m map[string]any) (*string, error) {
 	if len(m) == 0 {
 		return nil, nil
 	}

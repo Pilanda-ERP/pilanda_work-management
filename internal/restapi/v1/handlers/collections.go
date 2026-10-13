@@ -201,11 +201,11 @@ func (h *CollectionHandler) respondCollectionItems(w http.ResponseWriter, r *htt
 		SortAsc: pagination.SortAsc,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "QL query error:") {
+		if errors.Is(err, services.ErrQLQuery) {
 			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, err.Error()))
 			return
 		}
-		if strings.Contains(err.Error(), "collection not found") {
+		if errors.Is(err, services.ErrCollectionNotFound) {
 			h.RespondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "Collection not found"))
 			return
 		}
@@ -277,29 +277,25 @@ func (h *CollectionHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.RespondOK(w, map[string]interface{}{
+	h.RespondOK(w, map[string]any{
 		"items": results,
 		"total": len(results),
 	})
 }
 
 // canViewCollection decides whether the caller may see a slug-addressed
-// collection's metadata + items. Workspace-scoped collections are visible to
-// anyone with `item.view` on that workspace (matches the natural mental model
-// for embedded reports). Global collections fall back to the legacy
-// is_public-or-creator check from internal/handlers/collections.go.
+// collection's metadata + items. Private collections are owner-only; shared
+// workspace-scoped collections need `item.view` on that workspace, and shared
+// global collections are visible to any authenticated caller.
 func (h *CollectionHandler) canViewCollection(userID int, row *repository.CollectionRecord) bool {
+	if row.IsPrivate && (row.CreatedBy == nil || *row.CreatedBy != userID) {
+		return false
+	}
 	if row.WorkspaceID != nil {
 		allowed, err := h.Perms.CanViewWorkspace(userID, *row.WorkspaceID)
 		return err == nil && allowed
 	}
-	if row.IsPublic {
-		return true
-	}
-	if row.CreatedBy != nil && *row.CreatedBy == userID {
-		return true
-	}
-	return false
+	return true
 }
 
 func mapCollectionRecordToResponse(row *repository.CollectionRecord) CollectionResponse {

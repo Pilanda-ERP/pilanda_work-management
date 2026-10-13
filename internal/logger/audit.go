@@ -42,14 +42,14 @@ func (a *Auditor) LogEvent(event AuditEvent) {
 
 // LogWithDetails records a successful resource action with extra structured
 // details (serialized to JSON in the audit log row).
-func (a *Auditor) LogWithDetails(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName string, details map[string]interface{}) {
+func (a *Auditor) LogWithDetails(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName string, details map[string]any) {
 	_ = LogAudit(a.db, NewRequestAuditEvent(r, user, actionType, resourceType, resourceID, resourceName, details))
 }
 
 // LogFailure records an attempted resource action that failed after the caller
 // was identified. It is intended for security-relevant mutation failures where
 // operators need visibility into attempted actions as well as successful ones.
-func (a *Auditor) LogFailure(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName, errorMessage string, details map[string]interface{}) {
+func (a *Auditor) LogFailure(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName, errorMessage string, details map[string]any) {
 	userID, username := auditActor(user)
 	_ = LogAudit(a.db, AuditEvent{
 		UserID:       userID,
@@ -67,9 +67,9 @@ func (a *Auditor) LogFailure(r *http.Request, user *models.User, actionType, res
 }
 
 // LogDenied records an authorization/permission denial for an attempted action.
-func (a *Auditor) LogDenied(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName, requiredPermission string, details map[string]interface{}) {
+func (a *Auditor) LogDenied(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName, requiredPermission string, details map[string]any) {
 	if details == nil {
-		details = map[string]interface{}{}
+		details = map[string]any{}
 	}
 	if requiredPermission != "" {
 		details["required_permission"] = requiredPermission
@@ -87,7 +87,7 @@ func auditActor(user *models.User) (userID int, username string) {
 }
 
 // NewRequestAuditEvent builds a successful HTTP-driven audit event.
-func NewRequestAuditEvent(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName string, details map[string]interface{}) AuditEvent {
+func NewRequestAuditEvent(r *http.Request, user *models.User, actionType, resourceType string, resourceID *int, resourceName string, details map[string]any) AuditEvent {
 	return AuditEvent{
 		UserID:       user.ID,
 		Username:     user.Username,
@@ -104,18 +104,18 @@ func NewRequestAuditEvent(r *http.Request, user *models.User, actionType, resour
 
 // AuditEvent represents a security or admin event that should be logged
 type AuditEvent struct {
-	UserID       int                    // User who performed the action
-	Username     string                 // Username for quick reference
-	IPAddress    string                 // Client IP address
-	UserAgent    string                 // Client user agent
-	ActionType   string                 // e.g., "user.create", "permission.grant"
-	ResourceType string                 // e.g., "user", "workspace", "permission"
-	ResourceID   *int                   // ID of the resource (nullable)
-	ResourceName string                 // Human-readable resource name
-	Details      map[string]interface{} // Additional details (old_value, new_value, etc.)
-	Success      bool                   // Whether the operation succeeded
-	ErrorMessage string                 // Error message if failed
-	Timestamp    time.Time              // When the event occurred (set automatically if zero)
+	UserID       int            // User who performed the action
+	Username     string         // Username for quick reference
+	IPAddress    string         // Client IP address
+	UserAgent    string         // Client user agent
+	ActionType   string         // e.g., "user.create", "permission.grant"
+	ResourceType string         // e.g., "user", "workspace", "permission"
+	ResourceID   *int           // ID of the resource (nullable)
+	ResourceName string         // Human-readable resource name
+	Details      map[string]any // Additional details (old_value, new_value, etc.)
+	Success      bool           // Whether the operation succeeded
+	ErrorMessage string         // Error message if failed
+	Timestamp    time.Time      // When the event occurred (set automatically if zero)
 }
 
 const (
@@ -132,7 +132,7 @@ func LogAudit(db database.Database, event AuditEvent) error {
 	// 81 sites discard LogAudit's error) believe rich details were saved.
 	var detailsJSON *string
 	if len(event.Details) > 0 {
-		safeDetails, _ := sanitizeAuditDetails(event.Details).(map[string]interface{})
+		safeDetails, _ := sanitizeAuditDetails(event.Details).(map[string]any)
 		detailsBytes, err := json.Marshal(safeDetails)
 		if err != nil {
 			slog.Warn("failed to marshal audit details", "error", err)
@@ -146,7 +146,7 @@ func LogAudit(db database.Database, event AuditEvent) error {
 			}
 		} else {
 			if len(detailsBytes) > auditDetailsMaxBytes {
-				detailsBytes, _ = json.Marshal(map[string]interface{}{
+				detailsBytes, _ = json.Marshal(map[string]any{
 					"details_truncated": true,
 					"original_bytes":    len(detailsBytes),
 				})
@@ -238,10 +238,10 @@ func LogAudit(db database.Database, event AuditEvent) error {
 	return nil
 }
 
-func sanitizeAuditDetails(v interface{}) interface{} {
+func sanitizeAuditDetails(v any) any {
 	switch x := v.(type) {
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(x))
+	case map[string]any:
+		out := make(map[string]any, len(x))
 		for k, val := range x {
 			if isSensitiveAuditKey(k) {
 				out[k] = auditDetailsRedactedValue
@@ -251,7 +251,7 @@ func sanitizeAuditDetails(v interface{}) interface{} {
 		}
 		return out
 	case map[string]string:
-		out := make(map[string]interface{}, len(x))
+		out := make(map[string]any, len(x))
 		for k, val := range x {
 			if isSensitiveAuditKey(k) {
 				out[k] = auditDetailsRedactedValue
@@ -260,14 +260,14 @@ func sanitizeAuditDetails(v interface{}) interface{} {
 			out[k] = val
 		}
 		return out
-	case []interface{}:
-		out := make([]interface{}, len(x))
+	case []any:
+		out := make([]any, len(x))
 		for i, val := range x {
 			out[i] = sanitizeAuditDetails(val)
 		}
 		return out
-	case []map[string]interface{}:
-		out := make([]interface{}, len(x))
+	case []map[string]any:
+		out := make([]any, len(x))
 		for i, val := range x {
 			out[i] = sanitizeAuditDetails(val)
 		}
@@ -310,6 +310,7 @@ const (
 	ActionUserPasswordReset = "user.password_reset"
 	ActionUserActivate      = "user.activate"
 	ActionUserDeactivate    = "user.deactivate"
+	ActionUserErase         = "user.erase"
 
 	// Authentication
 	ActionLoginSuccess   = "login.success"
@@ -325,14 +326,16 @@ const (
 	ActionRoleAssign = "role.assign"
 	ActionRoleRevoke = "role.revoke"
 
-	// Workspace role CRUD (custom/label-only roles created via admin UI).
+	// Workspace role management.
 	ActionWorkspaceRoleCreate = "workspace_role.create"
+	ActionWorkspaceRoleUpdate = "workspace_role.update"
 	ActionWorkspaceRoleDelete = "workspace_role.delete"
 
 	// Workspace management
-	ActionWorkspaceCreate = "workspace.create"
-	ActionWorkspaceUpdate = "workspace.update"
-	ActionWorkspaceDelete = "workspace.delete"
+	ActionWorkspaceCreate             = "workspace.create"
+	ActionWorkspaceCreateFromTemplate = "workspace.create_from_template"
+	ActionWorkspaceUpdate             = "workspace.update"
+	ActionWorkspaceDelete             = "workspace.delete"
 
 	// Group management
 	ActionGroupCreate       = "group.create"
@@ -347,6 +350,11 @@ const (
 	ActionConfigSetDelete               = "config_set.delete"
 	ActionConfigSetExport               = "config_set.export"
 	ActionConfigSetImport               = "config_set.import"
+	ActionConfigSetConformanceCheck     = "config_set.conformance_check"
+	ActionConfigSetConformanceRepair    = "config_set.conformance_repair"
+	ActionWorkspaceBundleExport         = "workspace.bundle_export"
+	ActionWorkspaceBundleImport         = "workspace.bundle_import"
+	ActionPackApply                     = "pack.apply"
 	ActionConfigSetNotificationAssign   = "config_set.notification_assign"
 	ActionConfigSetNotificationUnassign = "config_set.notification_unassign"
 
@@ -372,8 +380,18 @@ const (
 	// captured in work item history; central audit starts with destructive gaps.
 	ActionItemDelete        = "item.delete"
 	ActionItemDeleteCascade = "item.delete_cascade"
+	ActionItemMoveWorkspace = "item.move_workspace"
+	ActionItemAssign        = "item.assign"
+	ActionItemMerge         = "item.merge"
+	ActionItemSplit         = "item.split"
+	ActionItemBulkUpdate    = "item.bulk_update"
 	ActionCommentDelete     = "comment.delete"
+	ActionCommentCreate     = "comment.create"
 	ActionAttachmentDelete  = "attachment.delete"
+
+	// External request participants (WI-1136).
+	ActionItemParticipantAdd    = "item.participant_add"
+	ActionItemParticipantRemove = "item.participant_remove"
 
 	// Item type management
 	ActionItemTypeCreate = "item_type.create"
@@ -392,8 +410,8 @@ const (
 	ActionThemeActivate = "theme.activate"
 
 	// Module settings
-	ActionModuleEnable  = "module.enable"
-	ActionModuleDisable = "module.disable"
+	ActionModuleSettingsUpdate    = "module_settings.update"
+	ActionWorkItemStalenessUpdate = "work_item_staleness.update"
 
 	// API Token management
 	ActionAPITokenCreate      = "api_token.create"
@@ -410,6 +428,7 @@ const (
 
 	// Agent management (user-managed agents, distinct from admin-provisioned service users)
 	ActionAgentCreate     = "agent.create"
+	ActionAgentUpdate     = "agent.update"
 	ActionAgentDelete     = "agent.delete"
 	ActionAgentDeactivate = "agent.deactivate"
 
@@ -462,6 +481,8 @@ const (
 	ActionChannelDelete        = "channel.delete"
 	ActionChannelActivate      = "channel.activate"
 	ActionChannelDeactivate    = "channel.deactivate"
+	ActionChannelKBPublish     = "channel.kb_publish"   // Portal knowledge base publish scope changed
+	ActionCustomerView         = "portal_customer.view" // Customer-data detail view
 	ActionChannelAddManager    = "channel.add_manager"
 	ActionChannelRemoveManager = "channel.remove_manager"
 
@@ -474,9 +495,10 @@ const (
 	ActionTimeProjectDelete = "time_project.delete"
 
 	// Milestone management
-	ActionMilestoneCreate = "milestone.create"
-	ActionMilestoneUpdate = "milestone.update"
-	ActionMilestoneDelete = "milestone.delete"
+	ActionMilestoneCreate  = "milestone.create"
+	ActionMilestoneUpdate  = "milestone.update"
+	ActionMilestoneDelete  = "milestone.delete"
+	ActionMilestoneReorder = "milestone.reorder"
 
 	// Milestone category management
 	ActionMilestoneCategoryCreate = "milestone_category.create"
@@ -487,11 +509,6 @@ const (
 	ActionCollectionCreate = "collection.create"
 	ActionCollectionUpdate = "collection.update"
 	ActionCollectionDelete = "collection.delete"
-
-	// Personal label management
-	ActionPersonalLabelCreate = "personal_label.create"
-	ActionPersonalLabelUpdate = "personal_label.update"
-	ActionPersonalLabelDelete = "personal_label.delete"
 
 	// Test case management
 	ActionTestCaseCreate = "test_case.create"
@@ -529,8 +546,10 @@ const (
 	ActionConfigSetComprehensiveMigrationExecute = "config_set.comprehensive_migration_execute"
 
 	// Admin diagnostics / retention maintenance
-	ActionDiagnosticsWebhookDeliveriesPurge = "diagnostics.webhook_deliveries.purge"
-	ActionDiagnosticsSchedulerRunsPurge     = "diagnostics.scheduler_runs.purge"
+	ActionDiagnosticsWebhookDeliveriesPurge     = "diagnostics.webhook_deliveries.purge"
+	ActionDiagnosticsSchedulerRunsPurge         = "diagnostics.scheduler_runs.purge"
+	ActionDiagnosticsRecurrenceVolumeUpdate     = "diagnostics.recurrence_volume.update"
+	ActionDiagnosticsGlobalRankMigrationControl = "diagnostics.global_rank_migration.control"
 
 	// LLM Connections
 	ActionLLMConnectionCreate = "llm_connection.create"
@@ -538,11 +557,23 @@ const (
 	ActionLLMConnectionDelete = "llm_connection.delete"
 
 	// Integration Providers
-	ActionIntegrationProviderCreate = "integration_provider.create"
-	ActionIntegrationProviderUpdate = "integration_provider.update"
-	ActionIntegrationProviderDelete = "integration_provider.delete"
-	ActionIntegrationItemLinkCreate = "integration_item_link.create"
-	ActionIntegrationItemLinkDelete = "integration_item_link.delete"
+	ActionIntegrationProviderCreate             = "integration_provider.create"
+	ActionIntegrationProviderUpdate             = "integration_provider.update"
+	ActionIntegrationProviderDelete             = "integration_provider.delete"
+	ActionIntegrationItemLinkCreate             = "integration_item_link.create"
+	ActionIntegrationItemLinkDelete             = "integration_item_link.delete"
+	ActionZammadConnectionCreate                = "zammad_connection.create"
+	ActionZammadConnectionUpdate                = "zammad_connection.update"
+	ActionZammadConnectionDelete                = "zammad_connection.delete"
+	ActionZammadConnectionTest                  = "zammad_connection.test"
+	ActionIntegrationProviderOAuthCredentialSet = "integration_provider.oauth_credential_set" // #nosec G101 -- audit action name, not a credential
+	ActionZammadTicketCreate                    = "zammad_ticket.create"
+	ActionZammadTicketLinkExisting              = "zammad_ticket.link_existing"
+	ActionZammadTicketUpdate                    = "zammad_ticket.update"
+	ActionZammadTicketUnlink                    = "zammad_ticket.unlink"
+	ActionZammadTicketDetachLocal               = "zammad_ticket.detach_local"
+	ActionZammadTicketRefresh                   = "zammad_ticket.refresh"
+	ActionZammadTicketRefreshAll                = "zammad_ticket.refresh_all"
 
 	// Issue sync configuration
 	ActionIssueSyncConfigCreate = "issue_sync_config.create"
@@ -592,7 +623,7 @@ const (
 	ActionAutomationDelete           = "automation.delete"
 	ActionAutomationToggle           = "automation.toggle"
 	ActionAutomationSetActor         = "automation.set_actor" // Granted action.set_actor permission used to impersonate
-	ActionAutomationExecute          = "automation.execute"   // Every action execution (records trigger vs effective actor)
+	ActionAutomationExecute          = "automation.execute"
 	ActionAutomationCapabilityCreate = "automation_capability.create"
 	ActionAutomationCapabilityUpdate = "automation_capability.update"
 	ActionAutomationCapabilityDelete = "automation_capability.delete"
@@ -617,10 +648,15 @@ const (
 	ActionTimeCustomerDelete = "time_customer.delete"
 
 	// Portal customer (contact) management
-	ActionPortalCustomerCreate    = "portal_customer.create"
-	ActionPortalCustomerUpdate    = "portal_customer.update"
-	ActionPortalCustomerDelete    = "portal_customer.delete"
-	ActionPortalCustomerUpdateOrg = "portal_customer.update_organisation" //nolint:misspell // British spelling
+	ActionPortalCustomerCreate      = "portal_customer.create"
+	ActionPortalCustomerUpdate      = "portal_customer.update"
+	ActionPortalCustomerDelete      = "portal_customer.delete"
+	ActionPortalCustomerUpdateOrg   = "portal_customer.update_organisation" //nolint:misspell // British spelling
+	ActionPortalCustomerErase       = "portal_customer.erase"
+	ActionPortalCustomerDataExport  = "portal_customer.data_export"
+	ActionPortalCustomerDeactivate  = "portal_customer.deactivate"
+	ActionPortalCustomerActivate    = "portal_customer.activate"
+	ActionPortalCustomerBulkCleanup = "portal_customer.bulk_cleanup"
 
 	// Time project permission management
 	ActionTimeProjectAddManager    = "time_project.add_manager"
@@ -648,6 +684,22 @@ const (
 	ActionPageLabelCreate = "page_label.create"
 	ActionPageLabelUpdate = "page_label.update"
 	ActionPageLabelDelete = "page_label.delete"
+
+	// Canned response management (WI-1138, workspace-level reply snippets)
+	ActionCannedResponseCreate = "canned_response.create"
+	ActionCannedResponseUpdate = "canned_response.update"
+	ActionCannedResponseDelete = "canned_response.delete"
+
+	// Knowledge page lifecycle and ACL management.
+	ActionPageCreate           = "page.create"
+	ActionPageUpdate           = "page.update"
+	ActionPageMove             = "page.move"
+	ActionPageArchive          = "page.archive"
+	ActionPageRestore          = "page.restore"
+	ActionPagePermissionGrant  = "page.permission_grant"
+	ActionPagePermissionRevoke = "page.permission_revoke"
+	ActionPageInheritanceSet   = "page.inheritance_set"
+	ActionPageUnarchive        = "page.unarchive"
 
 	// Asset management
 	ActionAssetCreate = "asset.create"
@@ -677,6 +729,10 @@ const (
 	// Asset set role management
 	ActionAssetSetRoleAssign = "asset_set_role.assign"
 	ActionAssetSetRoleRevoke = "asset_set_role.revoke"
+
+	// Asset set portal exposure
+	ActionAssetSetPortalAccessGrant  = "asset_set_portal_access.grant"
+	ActionAssetSetPortalAccessRevoke = "asset_set_portal_access.revoke"
 
 	// Notification setting management
 	ActionNotificationSettingCreate = "notification_setting.create"
@@ -710,6 +766,8 @@ const (
 	ActionTeamDelete       = "team.delete"
 	ActionTeamAddMember    = "team.add_member"
 	ActionTeamRemoveMember = "team.remove_member"
+	ActionTeamAddGroup     = "team.add_group"
+	ActionTeamRemoveGroup  = "team.remove_group"
 
 	// Condition set management
 	ActionConditionSetCreate = "condition_set.create"
@@ -727,6 +785,42 @@ const (
 	ActionApprovalDelegate = "approval.delegate"
 	ActionApprovalRefresh  = "approval.refresh_approvers"
 	ActionApprovalEscalate = "approval.escalate"
+
+	// Recurrence rules
+	ActionRecurrenceCreate        = "recurrence.create"
+	ActionRecurrenceUpdate        = "recurrence.update"
+	ActionRecurrenceDelete        = "recurrence.delete"
+	ActionRecurrenceForceGenerate = "recurrence.force_generate"
+
+	// Team membership
+	ActionTeamUpdateMemberRole = "team.update_member_role"
+
+	// On-call administration (operational swap/incident user activity is kept
+	// in its domain history rather than the administrative audit log).
+	ActionOnCallScheduleCreate  = "oncall.schedule.create"
+	ActionOnCallScheduleUpdate  = "oncall.schedule.update"
+	ActionOnCallScheduleDelete  = "oncall.schedule.delete"
+	ActionOnCallLayerCreate     = "oncall.layer.create"
+	ActionOnCallLayerUpdate     = "oncall.layer.update"
+	ActionOnCallLayerDelete     = "oncall.layer.delete"
+	ActionOnCallSetLayerMembers = "oncall.layer.set_members"
+	ActionOnCallOverrideCreate  = "oncall.override.create"
+	ActionOnCallOverrideDelete  = "oncall.override.delete"
+	ActionOnCallPolicyCreate    = "oncall.policy.create"
+	ActionOnCallPolicyUpdate    = "oncall.policy.update"
+	ActionOnCallPolicyDelete    = "oncall.policy.delete"
+	ActionOnCallPolicySetRules  = "oncall.policy.set_rules"
+
+	// Board configuration
+	ActionBoardConfigCreate = "board_configuration.create"
+	ActionBoardConfigUpdate = "board_configuration.update"
+	ActionBoardConfigDelete = "board_configuration.delete"
+
+	// Webhook dispatch
+	ActionWebhookTrigger = "webhook.trigger"
+
+	// Public form administration
+	ActionRequestTypeConfigUpdate = "request_type_config.update"
 )
 
 // Resource type constants
@@ -761,7 +855,6 @@ const (
 	ResourceMilestone            = "milestone"
 	ResourceMilestoneCategory    = "milestone_category"
 	ResourceCollection           = "collection"
-	ResourcePersonalLabel        = "personal_label"
 	ResourceTestCase             = "test_case"
 	ResourceTestRun              = "test_run"
 	ResourceTestSet              = "test_set"
@@ -776,7 +869,10 @@ const (
 	ResourceLLMConnection        = "llm_connection"
 	ResourceIntegrationProvider  = "integration_provider"
 	ResourceIntegrationItemLink  = "integration_item_link"
+	ResourceZammadConnection     = "zammad_connection"
+	ResourceZammadTicket         = "zammad_ticket"
 	ResourceIssueSyncConfig      = "issue_sync_config"
+	ResourceWorkItemStaleness    = "work_item_staleness"
 	ResourceEmailProvider        = "email_provider"
 	ResourceWebAuthn             = "webauthn"
 	ResourceCredential           = "credential"
@@ -792,6 +888,8 @@ const (
 	ResourcePortalCustomer       = "portal_customer"
 	ResourceLabel                = "label"
 	ResourceItemTemplate         = "item_template"
+	ResourceCannedResponse       = "canned_response"
+	ResourcePage                 = "page"
 	ResourcePageLabel            = "page_label"
 	ResourceAsset                = "asset"
 	ResourceAssetType            = "asset_type"
@@ -799,6 +897,7 @@ const (
 	ResourceAssetCategory        = "asset_category"
 	ResourceAssetSet             = "asset_set"
 	ResourceAssetSetRole         = "asset_set_role"
+	ResourceAssetSetPortalAccess = "asset_set_portal_access"
 	ResourceNotificationSetting  = "notification_setting"
 	ResourceIterationType        = "iteration_type"
 	ResourceChannelCategory      = "channel_category"
@@ -810,4 +909,12 @@ const (
 	ResourceConditionSet         = "condition_set"
 	ResourceApprovalSet          = "approval_set"
 	ResourceApprovalRequest      = "approval_request"
+	ResourceRecurrenceRule       = "recurrence_rule"
+	ResourceOnCallSchedule       = "oncall_schedule"
+	ResourceOnCallLayer          = "oncall_layer"
+	ResourceOnCallOverride       = "oncall_override"
+	ResourceOnCallPolicy         = "oncall_policy"
+	ResourceBoardConfiguration   = "board_configuration"
+	ResourceWebhook              = "webhook"
+	ResourceRequestTypeConfig    = "request_type_config"
 )

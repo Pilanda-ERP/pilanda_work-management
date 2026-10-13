@@ -6,12 +6,22 @@ function createModuleSettingsStore() {
   const { subscribe, set, update } = writable({
     time_tracking_enabled: true,
     test_management_enabled: true,
+    workspace_managed_agents: true,
     loaded: false,
     loading: false,
   });
 
   return {
     subscribe,
+
+    hydrate(settings) {
+      if (!settings) return;
+      set({
+        ...settings,
+        loaded: true,
+        loading: false,
+      });
+    },
 
     // Load module settings from API (only if not already loaded)
     async load() {
@@ -59,6 +69,7 @@ function createModuleSettingsStore() {
       set({
         time_tracking_enabled: true,
         test_management_enabled: true,
+        workspace_managed_agents: true,
         loaded: false,
         loading: false,
       });

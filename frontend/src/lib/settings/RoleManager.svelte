@@ -8,19 +8,28 @@
   import Modal from '../dialogs/Modal.svelte';
   import ModalHeader from '../dialogs/ModalHeader.svelte';
   import Button from '../components/Button.svelte';
-  import Label from '../components/Label.svelte';
   import Lozenge from '../components/Lozenge.svelte';
-  import Textarea from '../components/Textarea.svelte';
   import DialogFooter from '../dialogs/DialogFooter.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast, successToast } from '../stores/toasts.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+  import {
+    systemPermissionDescription,
+    systemPermissionName,
+    objectDisplayDescription,
+    objectDisplayName,
+  } from '../utils/systemLabels.js';
+  import LocalizedObjectFields from './LocalizedObjectFields.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let roles = $state([]);
   let loading = $state(true);
   let selectedRole = $state(null);
   let rolePermissions = $state([]);
+  let translationEditor = $state(null);
+  let savingTranslations = $state(false);
 
   // Add-custom-role modal state
   let creating = $state(false);
@@ -29,8 +38,8 @@
   let newDescription = $state('');
 
   const columns = $derived([
-    { key: 'name', label: t('roles.roleName'), sortable: true },
-    { key: 'description', label: t('common.description') },
+    { key: 'name', label: t('roles.roleName'), sortable: true, slot: 'name' },
+    { key: 'description', label: t('common.description'), slot: 'description' },
     {
       key: 'kind',
       label: t('common.type'),
@@ -82,6 +91,25 @@
   function closeDetails() {
     selectedRole = null;
     rolePermissions = [];
+  }
+
+  async function saveRoleTranslations() {
+    try {
+      savingTranslations = true;
+      translationEditor?.validate();
+      await api.workspaceRoles.update(selectedRole.id, {
+        name: selectedRole.name,
+        description: selectedRole.description,
+      });
+      await translationEditor?.save();
+      selectedRole = await api.workspaceRoles.get(selectedRole.id);
+      await loadRoles();
+      successToast(t('common.saved'));
+    } catch (error) {
+      errorToast(error?.message || t('dialogs.alerts.failedToSave'));
+    } finally {
+      savingTranslations = false;
+    }
   }
 
   function startCreating() {
@@ -189,12 +217,30 @@
     maxWidth="max-w-2xl"
   >
     <ModalHeader
-      title={selectedRole?.name}
-      subtitle={selectedRole?.description}
+      title={objectDisplayName(selectedRole, 'workspace_role')}
+      subtitle={objectDisplayDescription(selectedRole, 'workspace_role')}
       icon={BadgeCheck}
       onClose={closeDetails}
     />
     <div class="px-6 py-4">
+      {#if selectedRole}
+        {#key selectedRole.id}
+          <LocalizedObjectFields
+            bind:this={translationEditor}
+            objectType="workspace_role"
+            objectId={selectedRole.id}
+            bind:canonicalName={selectedRole.name}
+            bind:canonicalDescription={selectedRole.description}
+            displayName={selectedRole.display_name || selectedRole.name}
+            displayDescription={selectedRole.display_description || selectedRole.description}
+          />
+        {/key}
+        <div class="mt-4 flex justify-end">
+          <Button variant="primary" onclick={saveRoleTranslations} loading={savingTranslations}>
+            {t('common.save')}
+          </Button>
+        </div>
+      {/if}
       {#if selectedRole?.permissions_enabled}
         <h4 class="font-medium mb-3" style="color: var(--ds-text);">{t('roles.permissions')}</h4>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-96 overflow-y-auto">
@@ -202,8 +248,8 @@
             <div class="flex items-start space-x-2 p-3 rounded-md" style="background-color: var(--ds-interactive-subtle);">
               <CheckCircle class="w-5 h-5 mt-0.5 flex-shrink-0" style="color: var(--ds-text-success);" />
               <div>
-                <div class="font-medium text-sm" style="color: var(--ds-text);">{permission.permission_name}</div>
-                <div class="text-xs" style="color: var(--ds-text-subtle);">{permission.description}</div>
+                <div class="font-medium text-sm" style="color: var(--ds-text);">{systemPermissionName(permission)}</div>
+                <div class="text-xs" style="color: var(--ds-text-subtle);">{systemPermissionDescription(permission)}</div>
                 <div class="text-xs mt-0.5" style="color: var(--ds-text-subtlest);">{permission.permission_key}</div>
               </div>
             </div>
@@ -239,22 +285,22 @@
         </AlertBox>
 
         <div>
-          <Label required>{t('roles.roleName')}</Label>
-          <input
+          <TextField
+            label={t('roles.roleName')}
+            required
             type="text"
-            class="w-full px-3 py-2 border rounded text-sm"
-            style="border-color: var(--ds-border); background: var(--ds-surface-raised); color: var(--ds-text);"
+            size="small"
             placeholder={t('settings.workspaceRoles.namePlaceholder')}
+            dataTestid="workspace-role-name"
             bind:value={newName}
-            data-testid="workspace-role-name"
           />
         </div>
         <div>
-          <Label>{t('common.description')}</Label>
-          <Textarea
+          <TextareaField
+            label={t('common.description')}
             placeholder={t('settings.workspaceRoles.descriptionPlaceholder')}
-            bind:value={newDescription}
             rows={2}
+            bind:value={newDescription}
           />
         </div>
       </div>
@@ -278,7 +324,14 @@
     {loading}
     actionItems={buildRoleDropdownItems}
     emptyMessage={t('roles.noRoles')}
-  />
+  >
+    {#snippet name(item)}
+      {objectDisplayName(item, 'workspace_role')}
+    {/snippet}
+    {#snippet description(item)}
+      {objectDisplayDescription(item, 'workspace_role')}
+    {/snippet}
+  </DataTable>
 
   <AlertBox variant="info">
     <p class="text-sm">

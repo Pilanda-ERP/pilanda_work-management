@@ -1,7 +1,8 @@
 <script>
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
+  import Spinner from '../../components/Spinner.svelte';
   import { api } from '../../api.js';
-  import { ExternalLink, Plus, RefreshCw, Trash2, ChevronDown, ChevronRight, Loader2, Link2 } from '@lucide/svelte';
+  import { ExternalLink, Plus, RefreshCw, Trash2, ChevronDown, ChevronRight, Link2 } from '@lucide/svelte';
   import Button from '../../components/Button.svelte';
   import Text from '../../components/Text.svelte';
   import { t } from '../../stores/i18n.svelte.js';
@@ -22,21 +23,26 @@
   let hasProviders = $state(false);
   let hasConnection = $state(false);
   let checkingStatus = $state(true);
+  const loadController = new AbortController();
 
   onMount(async () => {
-    await checkStatus();
-    await loadLinks();
+    await checkStatus(loadController.signal);
+    if (!loadController.signal.aborted) {
+      await loadLinks(loadController.signal);
+    }
   });
 
-  async function checkStatus() {
+  onDestroy(() => loadController.abort());
+
+  async function checkStatus(signal) {
     try {
-      const available = await api.userIntegrations.getAvailableProviders() || [];
+      const available = await api.userIntegrations.getAvailableProviders({ signal }) || [];
       const linkableProviders = available.filter((provider) =>
         LINKABLE_PROVIDER_TYPES.has(provider.provider_type?.toLowerCase())
       );
       hasProviders = linkableProviders.length > 0;
       if (hasProviders) {
-        const connections = await api.userIntegrations.getConnections() || [];
+        const connections = await api.userIntegrations.getConnections({ signal }) || [];
         const connectedProviderIds = new Set(
           connections.map((connection) => connection.integration_provider_id)
         );
@@ -45,20 +51,22 @@
         );
       }
     } catch (err) {
+      if (err?.name === 'AbortError') return;
       console.error('Failed to check integration status:', err);
     } finally {
       checkingStatus = false;
     }
   }
 
-  export async function loadLinks() {
+  export async function loadLinks(signal) {
     if (!itemId) return;
     loading = true;
     error = null;
 
     try {
-      links = await api.itemIntegrationLinks.get(itemId) || [];
+      links = await api.itemIntegrationLinks.get(itemId, signal ? { signal } : undefined) || [];
     } catch (err) {
+      if (signal?.aborted || err?.name === 'AbortError' || err?.status === 404) return;
       console.error('Failed to load integration links:', err);
       error = t('integrations.failedToLoadLinks');
       links = [];
@@ -135,7 +143,7 @@
     <div class="flex items-center gap-1">
       {#if hasConnection}
         <button
-          class="p-1 rounded transition-colors opacity-0 group-hover:opacity-100"
+          class="p-1 rounded transition-colors opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
           class:invisible={!expanded}
           onclick={e => { e.stopPropagation(); onaddlink?.(); }}
           title={t('integrations.linkPage')}
@@ -155,7 +163,7 @@
     <div class="space-y-2 mt-1">
       {#if checkingStatus || loading}
         <div class="flex items-center justify-center py-3">
-          <Loader2 class="w-4 h-4 animate-spin" style="color: var(--ds-text-subtle);" />
+          <Spinner size="sm" />
         </div>
       {:else if !hasConnection && hasProviders}
         <div class="py-3 px-3 rounded-md" style="background-color: var(--ds-background-neutral);">
@@ -209,7 +217,7 @@
               </div>
             </div>
 
-            <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity">
               <button
                 class="p-1 rounded hover:bg-[var(--ds-background-neutral-hovered)]"
                 onclick={() => refreshLink(link.id)}
@@ -217,7 +225,7 @@
                 disabled={refreshingId === link.id}
               >
                 {#if refreshingId === link.id}
-                  <Loader2 class="w-3.5 h-3.5 animate-spin" style="color: var(--ds-text-subtle);" />
+                  <Spinner size="sm" />
                 {:else}
                   <RefreshCw class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" />
                 {/if}

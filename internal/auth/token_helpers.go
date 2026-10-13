@@ -12,7 +12,7 @@ import (
 
 // scanner is the interface satisfied by both *sql.Row and *sql.Rows.
 type scanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }
 
 // checkTokenFormat validates that a raw token has the expected prefix and minimum length.
@@ -60,13 +60,7 @@ func scanAPITokenListRow(s scanner) (models.APIToken, error) {
 	return token, nil
 }
 
-// scanSCIMTokenRow scans a row that selects:
-//
-//	t.id, t.name, t.token_prefix, t.is_active,
-//	t.created_by, t.expires_at, t.last_used_at, t.created_at, t.updated_at,
-//	created_by_name
-//
-// This is the projection used by GetTokenByID and ListTokens.
+// scanSCIMTokenRow scans the GetTokenByID/ListTokens projection.
 func scanSCIMTokenRow(s scanner) (models.SCIMToken, error) {
 	var token models.SCIMToken
 	var createdBy sql.NullInt64
@@ -95,13 +89,7 @@ func scanSCIMTokenRow(s scanner) (models.SCIMToken, error) {
 	return token, nil
 }
 
-// scanSCIMTokenValidateRow scans a row from the ValidateToken query that selects:
-//
-//	t.id, t.name, t.token_hash, t.token_prefix, t.is_active,
-//	t.created_by, t.expires_at, t.last_used_at, t.created_at, t.updated_at,
-//	created_by_name
-//
-// Returns the token and the raw hash string for bcrypt verification.
+// scanSCIMTokenValidateRow returns ValidateToken data and its bcrypt hash.
 func scanSCIMTokenValidateRow(s scanner) (models.SCIMToken, string, error) {
 	var token models.SCIMToken
 	var tokenHash string

@@ -10,20 +10,28 @@
   import Modal from '../dialogs/Modal.svelte';
   import ModalHeader from '../dialogs/ModalHeader.svelte';
   import DataTable from '../components/DataTable.svelte';
-  import Textarea from '../components/Textarea.svelte';
   import Lozenge from '../components/Lozenge.svelte';
-  import Label from '../components/Label.svelte';
   import Checkbox from '../components/Checkbox.svelte';
   import { Plus, Link, Edit, Trash2, Power, PowerOff } from '@lucide/svelte';
   import IconSelector from '../pickers/IconSelector.svelte';
   import DialogFooter from '../dialogs/DialogFooter.svelte';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
   import DescriptionText from '../components/DescriptionText.svelte';
+  import { objectDisplayValue } from '../utils/systemLabels.js';
+  import LocalizedObjectFields from './LocalizedObjectFields.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   const linkTypes = writable([]);
 
   let showForm = $state(false);
   let editingLinkType = $state(null);
+  let translationEditor = $state(null);
+
+  function getLinkTypeDisplayValue(linkType, field) {
+    return objectDisplayValue(linkType, field);
+  }
+
   let formData = $state({
     name: '',
     description: '',
@@ -79,7 +87,9 @@
 
     try {
       if (editingLinkType) {
+        translationEditor?.validate();
         await api.linkTypes.update(editingLinkType.id, formData);
+        await translationEditor?.save();
       } else {
         await api.linkTypes.create(formData);
       }
@@ -87,7 +97,7 @@
       showForm = false;
     } catch (error) {
       console.error('Failed to save link type:', error);
-      errorToast(t('settings.linkTypes.failedToSave') + ' ' + error.message);
+      errorToast(t('settings.linkTypes.failedToSave'));
     }
   }
 
@@ -117,10 +127,7 @@
 
   async function toggleActive(linkType) {
     try {
-      await api.linkTypes.update(linkType.id, {
-        ...linkType,
-        active: !linkType.active
-      });
+      await api.linkTypes.update(linkType.id, { active: !linkType.active });
       await loadLinkTypes();
     } catch (error) {
       console.error('Failed to toggle link type status:', error);
@@ -193,7 +200,7 @@
       icon: linkType.active ? PowerOff : Power,
       title: linkType.active ? t('common.deactivate') : t('common.activate'),
       color: linkType.active ? '#f59e0b' : '#10b981',
-      hoverClass: linkType.active ? 'hover:bg-orange-50' : 'hover:bg-green-50',
+      hoverClass: linkType.active ? 'hover:bg-ds-accent-orange-subtle' : 'hover:bg-ds-success-subtle',
       onClick: () => toggleActive(linkType)
     });
 
@@ -234,58 +241,80 @@
   <!-- Modal content -->
   <div class="px-6 py-4">
     <form onsubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-        <div>
-          <Label color="default" class="mb-2">{t('settings.linkTypes.name')}</Label>
-          <input
-            type="text"
-            bind:value={formData.name}
-            required
-            placeholder="e.g., Implements"
-            class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+      {#if editingLinkType}
+        {#key editingLinkType.id}
+          <LocalizedObjectFields
+            bind:this={translationEditor}
+            objectType="link_type"
+            objectId={editingLinkType.id}
+            bind:canonicalName={formData.name}
+            bind:canonicalDescription={formData.description}
+            displayName={editingLinkType.display_name || editingLinkType.name}
+            displayDescription={editingLinkType.display_description || editingLinkType.description}
           />
+        {/key}
+      {:else}
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div>
+            <TextField
+              label={t('settings.linkTypes.name')}
+              required
+              labelColor="default"
+              type="text"
+              placeholder={t('settings.linkTypes.namePlaceholder')}
+              size="small"
+              bind:value={formData.name}
+            />
+          </div>
+          <div>
+            <IconSelector bind:selectedColor={formData.color} colorOnly compact />
+          </div>
         </div>
+      {/if}
+      {#if editingLinkType}
         <div>
           <IconSelector bind:selectedColor={formData.color} colorOnly compact />
         </div>
-      </div>
+      {/if}
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
         <div>
-          <Label color="default" class="mb-2">{t('settings.linkTypes.forwardLabel')}</Label>
-          <input
-            type="text"
-            bind:value={formData.forward_label}
+          <TextField
+            label={t('settings.linkTypes.forwardLabel')}
             required
-            placeholder="e.g., implements"
-            class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+            labelColor="default"
+            type="text"
+            placeholder={t('settings.linkTypes.forwardPlaceholder')}
+            size="small"
+            bind:value={formData.forward_label}
           />
-          <DescriptionText>When A links to B, show as "A implements B"</DescriptionText>
+          <DescriptionText>{t('settings.linkTypes.forwardHint')}</DescriptionText>
         </div>
         <div>
-          <Label color="default" class="mb-2">{t('settings.linkTypes.reverseLabel')}</Label>
-          <input
-            type="text"
-            bind:value={formData.reverse_label}
+          <TextField
+            label={t('settings.linkTypes.reverseLabel')}
             required
-            placeholder="e.g., implemented by"
-            class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+            labelColor="default"
+            type="text"
+            placeholder={t('settings.linkTypes.reversePlaceholder')}
+            size="small"
+            bind:value={formData.reverse_label}
           />
-          <DescriptionText>When B is linked from A, show as "B implemented by A"</DescriptionText>
+          <DescriptionText>{t('settings.linkTypes.reverseHint')}</DescriptionText>
         </div>
       </div>
 
-      <div class="mb-4">
-        <Label color="default" class="mb-2">{t('settings.linkTypes.description')}</Label>
-        <Textarea
-          bind:value={formData.description}
-          rows={3}
-          placeholder="Optional description of this relationship type"
-        />
-      </div>
+      {#if !editingLinkType}
+        <div class="mb-4">
+          <TextareaField
+            label={t('settings.linkTypes.description')}
+            labelColor="default"
+            rows={3}
+            placeholder={t('settings.linkTypes.descriptionPlaceholder')}
+            bind:value={formData.description}
+          />
+        </div>
+      {/if}
 
       <div class="mb-4">
         <Checkbox
@@ -312,16 +341,16 @@
   columns={linkTypeColumns}
   data={$linkTypes}
   keyField="id"
-  emptyMessage="No link types found. Create your first link type to enable item relationships."
+  emptyMessage={t('settings.linkTypes.empty')}
   emptyIcon={Link}
   actionItems={buildLinkTypeActionItems}
 >
   <!-- Name column with description -->
   {#snippet name(linkType)}
     <div>
-      <div class="text-sm font-medium" style="color: var(--ds-text);">{linkType.name}</div>
+      <div class="text-sm font-medium" style="color: var(--ds-text);">{getLinkTypeDisplayValue(linkType, 'name')}</div>
       {#if linkType.description}
-        <div class="text-sm" style="color: var(--ds-text-subtle);">{linkType.description}</div>
+        <div class="text-sm" style="color: var(--ds-text-subtle);">{getLinkTypeDisplayValue(linkType, 'description')}</div>
       {/if}
     </div>
   {/snippet}
@@ -330,7 +359,7 @@
   {#snippet color(linkType)}
     <div class="flex items-center gap-2">
       <div
-        class="w-6 h-6 rounded border border-gray-300"
+        class="w-6 h-6 rounded border border-ds-border-bold"
         style="background-color: {linkType.color};"
       ></div>
       <span class="text-sm font-mono" style="color: var(--ds-text-subtle);">{linkType.color}</span>

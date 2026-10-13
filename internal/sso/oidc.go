@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,9 +20,9 @@ import (
 // (discovery, JWKS fetch, token exchange).
 const oidcHTTPTimeout = 15 * time.Second
 
-// newSSRFSafeOIDCClient returns an *http.Client whose Transport refuses
-// to dial loopback / RFC1918 / link-local / CGNAT addresses unless the global
-// --allow-local-connections switch is set. Used as a defense-in-depth layer
+// newSSRFSafeOIDCClient returns an *http.Client whose Transport can be set to
+// refuse loopback / RFC1918 / link-local / CGNAT addresses by explicitly
+// disabling --allow-local-connections. Used as a defense-in-depth layer
 // beneath upfront IssuerURL validation: closes the validate-then-dial gap (DNS
 // rebinding) and also covers the JWKS URL and token endpoint that the IdP
 // advertises via discovery — those are not validated upfront because we don't
@@ -29,9 +30,9 @@ const oidcHTTPTimeout = 15 * time.Second
 func newSSRFSafeOIDCClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
-		Transport: &http.Transport{
+		Transport: utils.ConfigureHTTPTransport(&http.Transport{
 			DialContext: utils.SafeNetDialer(timeout).DialContext,
-		},
+		}),
 	}
 }
 
@@ -44,16 +45,16 @@ var (
 
 // OIDCClaims represents the extracted claims from an OIDC ID token
 type OIDCClaims struct {
-	Subject               string                 `json:"sub"`
-	Email                 string                 `json:"email"`
-	EmailVerified         bool                   `json:"email_verified"`
-	EmailVerifiedProvided bool                   `json:"email_verified_provided"` // True if IdP included email_verified in claims
-	Name                  string                 `json:"name"`
-	GivenName             string                 `json:"given_name"`
-	FamilyName            string                 `json:"family_name"`
-	Username              string                 `json:"preferred_username"`
-	Picture               string                 `json:"picture"`
-	Raw                   map[string]interface{} `json:"raw"` // All claims for debugging
+	Subject               string         `json:"sub"`
+	Email                 string         `json:"email"`
+	EmailVerified         bool           `json:"email_verified"`
+	EmailVerifiedProvided bool           `json:"email_verified_provided"` // True if IdP included email_verified in claims
+	Name                  string         `json:"name"`
+	GivenName             string         `json:"given_name"`
+	FamilyName            string         `json:"family_name"`
+	Username              string         `json:"preferred_username"`
+	Picture               string         `json:"picture"`
+	Raw                   map[string]any `json:"raw"` // All claims for debugging
 }
 
 // OIDCService handles OIDC authentication flows using zitadel/oidc library
@@ -64,8 +65,8 @@ type OIDCService struct {
 
 // NewOIDCService creates a new OIDC service.
 // cookieKey should be a 32-byte key for secure cookie encryption. Discovery /
-// JWKS / token calls are SSRF-safe (private/loopback blocked) unless the global
-// --allow-local-connections switch is set.
+// JWKS / token calls can block private/loopback destinations when the global
+// --allow-local-connections switch is explicitly disabled.
 func NewOIDCService(cookieKey []byte) *OIDCService {
 	if len(cookieKey) < 32 {
 		// Pad key if too short (should not happen in production)
@@ -161,7 +162,7 @@ func (s *OIDCService) ExtractClaims(tokens *oidc.Tokens[*oidc.IDTokenClaims], at
 
 	claims := &OIDCClaims{
 		Subject: idTokenClaims.Subject,
-		Raw:     make(map[string]interface{}),
+		Raw:     make(map[string]any),
 	}
 
 	// Get all claims for debugging
@@ -181,15 +182,21 @@ func (s *OIDCService) ExtractClaims(tokens *oidc.Tokens[*oidc.IDTokenClaims], at
 		claims.Email = idTokenClaims.Email
 	}
 
-	// Check if email_verified was explicitly provided by the IdP
-	// The zitadel/oidc library returns a special type that defaults to false
-	// We need to check the raw claims to know if it was actually provided
-	if allClaims != nil {
-		if _, exists := allClaims["email_verified"]; exists {
-			claims.EmailVerifiedProvided = true
-		}
+	// Check if email_verified was explicitly provided by the IdP.
+	// The claim name is configurable via the attribute mapping; it falls back
+	// to the standard OIDC "email_verified" claim. The zitadel/oidc library
+	// returns a special type that defaults to false, so we inspect the raw
+	// claims to know whether the IdP actually sent a value.
+	emailVerifiedClaim := "email_verified"
+	if attributeMap != nil && attributeMap.EmailVerified != "" {
+		emailVerifiedClaim = attributeMap.EmailVerified
 	}
-	claims.EmailVerified = bool(idTokenClaims.EmailVerified)
+	if emailVerifiedValue, exists := allClaims[emailVerifiedClaim]; exists {
+		claims.EmailVerifiedProvided = true
+		claims.EmailVerified = claimToBool(emailVerifiedValue)
+	} else if emailVerifiedClaim == "email_verified" {
+		claims.EmailVerified = bool(idTokenClaims.EmailVerified)
+	}
 
 	// Extract name fields using attribute mapping or standard claims
 	if attributeMap != nil {
@@ -263,7 +270,7 @@ func (s *OIDCService) TestConnection(ctx context.Context, provider *SSOProvider,
 }
 
 // getClaimString extracts a string value from claims map
-func getClaimString(claims map[string]interface{}, key string) (string, bool) {
+func getClaimString(claims map[string]any, key string) (string, bool) {
 	if claims == nil {
 		return "", false
 	}
@@ -273,4 +280,18 @@ func getClaimString(claims map[string]interface{}, key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// claimToBool coerces a raw claim value to a bool. IdPs normally send a JSON
+// boolean for email_verified, but some send the string "true"/"false".
+func claimToBool(v any) bool {
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		return err == nil && b
+	default:
+		return false
+	}
 }

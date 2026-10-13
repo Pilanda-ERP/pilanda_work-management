@@ -1,10 +1,13 @@
 <script>
   import { FileText, Package, Trash2 } from '@lucide/svelte';
-  import Spinner from '../components/Spinner.svelte';
-  import Panel from '../components/Panel.svelte';
-  import { portalStore, iconMap } from '../stores/portal.svelte.js';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import PageHeader from '../layout/PageHeader.svelte';
+  import { portalCatalogStore as portalStore } from '../stores/portal.svelte.js';
+  import { portalDraftsStore } from '../stores/portalActivity.svelte.js';
+  import { iconMap } from '../stores/portalPresentation.js';
   import { t } from '../stores/i18n.svelte.js';
   import { formatRelativeTime } from '../utils/dateFormatter.js';
+  import { confirm } from '../composables/useConfirm.js';
 
   // onresume({ requestType }) is wired by Portal.svelte to open
   // RequestFormModal, which then auto-loads the draft and jumps to the saved
@@ -21,43 +24,35 @@
   }
 
   async function deleteDraft(draft) {
-    if (!window.confirm(t('portal.draftDeleteConfirm'))) return;
-    await portalStore.deleteDraft(draft.request_type_id);
+    if (!(await confirm({ message: t('portal.draftDeleteConfirm') }))) return;
+    await portalDraftsStore.delete(draft.request_type_id);
   }
 </script>
 
-<div class="space-y-6">
-  <div>
-    <h2 class="text-2xl font-semibold" style="color: var(--ds-text);">
-      {t('portal.draftsTitle')}
-    </h2>
-    <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
-      {t('portal.draftsSubtitle')}
-    </p>
-  </div>
+<div>
+  <PageHeader title={t('portal.draftsTitle')} subtitle={t('portal.draftsSubtitle')} />
 
-  {#if portalStore.loadingDrafts}
-    <div class="flex justify-center py-12">
-      <Spinner size="lg" />
-    </div>
-  {:else if portalStore.myDrafts.length === 0}
-    <Panel padding="spacious">
-      <div class="text-center py-8">
-        <div class="w-16 h-16 rounded-full mx-auto mb-4 flex items-center justify-center" style="background-color: var(--ds-background-neutral);">
-          <FileText class="w-8 h-8" style="color: var(--ds-text-subtle);" />
+  {#if portalDraftsStore.loading}
+    <StateDisplay type="loading" size="lg" />
+  {:else if portalDraftsStore.drafts.length === 0}
+    <div class="max-w-xl mt-7 py-8 border-t" style="border-color: var(--ds-border);">
+      <div class="flex items-start gap-3">
+        <FileText class="w-5 h-5 mt-0.5" style="color: var(--ds-text-subtle);" />
+        <div>
+          <h2 class="text-base font-medium" style="color: var(--ds-text);">No drafts yet</h2>
+          <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
+            {t('portal.draftsEmpty')}
+          </p>
         </div>
-        <p class="text-sm" style="color: var(--ds-text-subtle);">
-          {t('portal.draftsEmpty')}
-        </p>
       </div>
-    </Panel>
+    </div>
   {:else}
-    <div class="space-y-4">
-      {#each portalStore.myDrafts as draft (draft.id)}
+    <div class="mt-7 border rounded-md overflow-hidden" style="border-color: var(--ds-border); background-color: var(--ds-surface-card);">
+      {#each portalDraftsStore.drafts as draft (draft.id)}
         {@const Icon = iconMap[draft.request_type_icon] || Package}
         <div
-          class="w-full p-4 rounded text-left transition-all hover:shadow-md flex items-start gap-4"
-          style="background-color: var(--ds-surface-card); border: 1px solid var(--ds-border);"
+          class="w-full p-4 border-b last:border-b-0 text-left flex items-start gap-4"
+          style="border-color: var(--ds-border);"
         >
           <button
             type="button"
@@ -65,7 +60,7 @@
             class="flex-1 flex items-start gap-4 text-left cursor-pointer"
             data-testid="portal-draft-row"
           >
-            <div class="w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0" style="background-color: var(--ds-background-neutral);">
+            <div class="w-9 h-9 rounded-md flex items-center justify-center flex-shrink-0" style="background-color: var(--ds-background-neutral);">
               <Icon class="w-5 h-5" style="color: var(--ds-text);" />
             </div>
             <div class="flex-1 min-w-0">

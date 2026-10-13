@@ -7,6 +7,7 @@ import (
 
 	"windshift/internal/logger"
 	"windshift/internal/models"
+	"windshift/internal/objecttranslation"
 	"windshift/internal/repository"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
@@ -14,8 +15,14 @@ import (
 )
 
 type ThemeHandler struct {
-	service *services.ThemeService
-	auditor *logger.Auditor
+	service      *services.ThemeService
+	auditor      *logger.Auditor
+	translations *objecttranslation.Service
+}
+
+func (h *ThemeHandler) WithObjectTranslations(service *objecttranslation.Service) *ThemeHandler {
+	h.translations = service
+	return h
 }
 
 func NewThemeHandler(service *services.ThemeService, auditor *logger.Auditor) *ThemeHandler {
@@ -27,6 +34,9 @@ func (h *ThemeHandler) GetThemes(w http.ResponseWriter, r *http.Request) {
 	themes, err := h.service.List()
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to query themes: %w", err))
+		return
+	}
+	if !localizeObjectResponse(w, r, h.translations, "theme", themes) {
 		return
 	}
 	respondJSONOK(w, themes)
@@ -45,16 +55,19 @@ func (h *ThemeHandler) GetActiveTheme(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, fmt.Errorf("failed to get active theme: %w", err))
 		return
 	}
+	if !localizeObjectResponse(w, r, h.translations, "theme", &theme) {
+		return
+	}
 	respondJSONOK(w, theme)
 }
 
 // sanitizeThemeFields runs the canonical sanitize policies against the
-// six free-form text fields on a theme create/update payload (Name +
-// Description plus the four nav-color CSS values). Returns the labeled
-// warnings so the handler can surface them on the response. Colors are
-// short identifier-shaped CSS values (hex / rgb / hsl); HTML inside
-// them would corrupt the rendered CSS rule.
-func sanitizeThemeFields(name, description, navBgLight, navTextLight, navBgDark, navTextDark *string) []string {
+// free-form text fields on a theme create/update payload (Name +
+// Description, the four nav-color CSS values, and the optional light and
+// dark logo URLs). Returns the labeled warnings so the handler can surface
+// them on the response. Colors are short identifier-shaped CSS values (hex /
+// rgb / hsl); HTML inside them would corrupt the rendered CSS rule.
+func sanitizeThemeFields(name, description, navBgLight, navTextLight, navBgDark, navTextDark, logoURL, logoURLDark *string) []string {
 	return sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: name, Policy: sanitize.PlainTextField, Label: "Name"},
 		sanitize.Pair{Target: description, Policy: sanitize.RichText, Label: "Description"},
@@ -62,7 +75,18 @@ func sanitizeThemeFields(name, description, navBgLight, navTextLight, navBgDark,
 		sanitize.Pair{Target: navTextLight, Policy: sanitize.ShortIdentifier, Label: "Light navigation text color"},
 		sanitize.Pair{Target: navBgDark, Policy: sanitize.ShortIdentifier, Label: "Dark navigation background color"},
 		sanitize.Pair{Target: navTextDark, Policy: sanitize.ShortIdentifier, Label: "Dark navigation text color"},
+		sanitize.Pair{Target: logoURL, Policy: sanitize.PlainTextField, Label: "Logo URL"},
+		sanitize.Pair{Target: logoURLDark, Policy: sanitize.PlainTextField, Label: "Dark mode logo URL"},
 	)
+}
+
+// validateLogoURL rejects logo URLs that are not same-origin paths or
+// HTTP(S) URLs, mirroring the hub-config logo contract.
+func validateLogoURL(label, logoURL string) string {
+	if err := utils.ValidateBrowserAssetURL(logoURL); err != nil {
+		return label + " is invalid: " + err.Error()
+	}
+	return ""
 }
 
 // validateThemeFields checks the required color and name fields shared by create and update requests.
@@ -93,8 +117,16 @@ func (h *ThemeHandler) CreateTheme(w http.ResponseWriter, r *http.Request) {
 	}
 	warnings := sanitizeThemeFields(&req.Name, &req.Description,
 		&req.NavBackgroundColorLight, &req.NavTextColorLight,
-		&req.NavBackgroundColorDark, &req.NavTextColorDark)
+		&req.NavBackgroundColorDark, &req.NavTextColorDark, &req.LogoURL, &req.LogoURLDark)
 	if msg := validateThemeFields(req.Name, req.NavBackgroundColorLight, req.NavTextColorLight, req.NavBackgroundColorDark, req.NavTextColorDark); msg != "" {
+		respondValidationError(w, r, msg)
+		return
+	}
+	if msg := validateLogoURL("Logo URL", req.LogoURL); msg != "" {
+		respondValidationError(w, r, msg)
+		return
+	}
+	if msg := validateLogoURL("Dark mode logo URL", req.LogoURLDark); msg != "" {
 		respondValidationError(w, r, msg)
 		return
 	}
@@ -108,6 +140,9 @@ func (h *ThemeHandler) CreateTheme(w http.ResponseWriter, r *http.Request) {
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
 		h.auditor.Log(r, currentUser, logger.ActionThemeCreate, logger.ResourceTheme, &theme.ID, theme.Name)
+	}
+	if !localizeObjectResponse(w, r, h.translations, "theme", &theme) {
+		return
 	}
 	respondJSONCreated(w, struct {
 		models.Theme
@@ -127,8 +162,16 @@ func (h *ThemeHandler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 	}
 	warnings := sanitizeThemeFields(&req.Name, &req.Description,
 		&req.NavBackgroundColorLight, &req.NavTextColorLight,
-		&req.NavBackgroundColorDark, &req.NavTextColorDark)
+		&req.NavBackgroundColorDark, &req.NavTextColorDark, &req.LogoURL, &req.LogoURLDark)
 	if msg := validateThemeFields(req.Name, req.NavBackgroundColorLight, req.NavTextColorLight, req.NavBackgroundColorDark, req.NavTextColorDark); msg != "" {
+		respondValidationError(w, r, msg)
+		return
+	}
+	if msg := validateLogoURL("Logo URL", req.LogoURL); msg != "" {
+		respondValidationError(w, r, msg)
+		return
+	}
+	if msg := validateLogoURL("Dark mode logo URL", req.LogoURLDark); msg != "" {
 		respondValidationError(w, r, msg)
 		return
 	}
@@ -146,6 +189,9 @@ func (h *ThemeHandler) UpdateTheme(w http.ResponseWriter, r *http.Request) {
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
 		h.auditor.Log(r, currentUser, logger.ActionThemeUpdate, logger.ResourceTheme, &themeID, theme.Name)
+	}
+	if !localizeObjectResponse(w, r, h.translations, "theme", &theme) {
+		return
 	}
 	respondJSONOK(w, struct {
 		models.Theme

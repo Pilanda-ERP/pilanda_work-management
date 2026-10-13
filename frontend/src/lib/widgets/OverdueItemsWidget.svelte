@@ -1,10 +1,11 @@
 <script>
   import { AlertCircle, RefreshCw } from '@lucide/svelte';
   import { api } from '../api.js';
-  import { formatDueDate, getDaysOverdue } from '../utils/dateFormatter.js';
+  import { dateOnlyKey, formatDate, formatDueDate, getDaysOverdue } from '../utils/dateFormatter.js';
+  import { serverNow } from '../utils/serverClock.js';
   import WidgetState from './WidgetState.svelte';
+  import ItemKey from '../components/ItemKey.svelte';
   import { t } from '../stores/i18n.svelte.js';
-  import { normalizeDate, getDoneStatusIds } from './doneStatusHelper.js';
 
   let { workspaceId = null, collectionFilter = null } = $props();
 
@@ -14,7 +15,6 @@
   let loading = $state(false);
   let error = $state(null);
   let currentWorkspaceId = $state(null);
-  let refreshInFlight = $state(false);
   let activeFetchId = $state(0);
   let currentCollectionFilter = $state(null);
 
@@ -27,10 +27,8 @@
     const fetchId = ++activeFetchId;
     loading = true;
     error = null;
-    refreshInFlight = true;
 
     try {
-      const doneStatusIds = await getDoneStatusIds(api);
       const trimmedFilter = (collectionFilter || '').trim();
       const parts = [];
       if (trimmedFilter) {
@@ -38,15 +36,13 @@
       }
       parts.push(`workspace_id = ${workspaceId}`);
       parts.push('due_date < now()');
-      let vql = parts.join(' AND ');
-      if (doneStatusIds.length > 0) {
-        vql += ` AND status_id NOT IN (${doneStatusIds.join(',')})`;
-      }
+      parts.push('status_completed = false');
+      const vql = parts.join(' AND ');
       const response = await api.items.getAll({
         ql: vql,
         limit: 50 // fetch more than needed, filter client-side
       });
-      const items = Array.isArray(response) ? response : (response?.items ?? []);
+      const items = response?.data ?? [];
       const parsedItems = items
         .map(item => ({
           id: item.id,
@@ -57,8 +53,8 @@
           workspace_item_number: item.workspace_item_number
         }))
         .filter(item => {
-          const dueDate = normalizeDate(item.due_date);
-          return dueDate && dueDate.getTime() < Date.now();
+          const dueDate = dateOnlyKey(item.due_date);
+          return dueDate && dueDate < formatDate(serverNow());
         })
         .sort((a, b) => {
           const dateA = new Date(a.due_date);
@@ -80,7 +76,6 @@
     } finally {
       if (fetchId === activeFetchId) {
         loading = false;
-        refreshInFlight = false;
       }
     }
   }
@@ -93,7 +88,7 @@
   }
 
   function handleRefresh() {
-    if (!refreshInFlight) {
+    if (!loading) {
       loadOverdueItems();
     }
   }
@@ -146,7 +141,7 @@
               <div class="min-w-0">
                 <p class="text-sm truncate" style="color: var(--ds-text);">{item.title}</p>
                 <div class="flex flex-wrap items-center gap-3 text-xs mt-1" style="color: var(--ds-text-subtle);">
-                  <span class="font-mono">{getItemKey(item)}</span>
+                  <ItemKey itemKey={getItemKey(item)} />
                   <span class="font-medium" style="color: var(--ds-text-danger);">{formatDueDate(item.due_date)}</span>
                 </div>
               </div>

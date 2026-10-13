@@ -68,13 +68,15 @@ type SetupUser struct {
 	Username  string `json:"username"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
+	Language  string `json:"language"`
 	Password  string `json:"password"` // Plaintext; hashed server-side
 }
 
 // ModuleSettings represents module visibility settings
 type ModuleSettings struct {
-	TimeTrackingEnabled   bool `json:"time_tracking_enabled"`
-	TestManagementEnabled bool `json:"test_management_enabled"`
+	TimeTrackingEnabled    bool `json:"time_tracking_enabled"`
+	TestManagementEnabled  bool `json:"test_management_enabled"`
+	WorkspaceManagedAgents bool `json:"workspace_managed_agents"`
 }
 
 // APIToken represents a bearer token for API authentication
@@ -90,6 +92,12 @@ type APIToken struct {
 	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
+	// OAuthClientID and OAuthResource are internal token-binding metadata.
+	// They stay empty for user-created PATs and are never exposed through token
+	// management APIs. MCP uses them to reject OAuth tokens minted for another
+	// resource while preserving the existing PAT fallback.
+	OAuthClientID string `json:"-"`
+	OAuthResource string `json:"-"`
 	// Joined fields
 	UserEmail string `json:"user_email,omitempty"`
 	UserName  string `json:"user_name,omitempty"`
@@ -97,11 +105,14 @@ type APIToken struct {
 
 // APITokenCreate represents the request for creating an API token
 type APITokenCreate struct {
-	Name        string     `json:"name"`
-	UserID      *int       `json:"user_id,omitempty"` // Optional: admins can create tokens for other users
-	Permissions []string   `json:"permissions"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	IsTemporary bool       `json:"-"` // Internal-only: hide ephemeral server-minted tokens from user/admin token lists
+	Name          string     `json:"name"`
+	UserID        *int       `json:"user_id,omitempty"` // Optional: admins can create tokens for other users
+	Permissions   []string   `json:"permissions"`
+	ExpiresOn     *string    `json:"expires_on,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	IsTemporary   bool       `json:"-"` // Internal-only: hide ephemeral server-minted tokens from user/admin token lists
+	OAuthClientID string     `json:"-"` // Internal-only: OAuth client that requested this token
+	OAuthResource string     `json:"-"` // Internal-only: RFC 8707 resource audience
 }
 
 // APITokenResponse represents the response when creating an API token
@@ -112,10 +123,13 @@ type APITokenResponse struct {
 
 // CacheStats represents permission cache performance metrics
 type CacheStats struct {
-	Hits        int64   `json:"hits"`
-	Misses      int64   `json:"misses"`
-	Errors      int64   `json:"errors"`
-	HitRatio    float64 `json:"hit_ratio"`
-	AvgLoadTime int64   `json:"avg_load_time_ms"`
-	TotalUsers  int64   `json:"total_cached_users"`
+	Hits                       int64   `json:"hits"`
+	Misses                     int64   `json:"misses"`
+	Errors                     int64   `json:"errors"`
+	HitRatio                   float64 `json:"hit_ratio"`
+	AvgLoadTime                int64   `json:"avg_load_time_ms"`
+	TotalUsers                 int64   `json:"total_cached_users"`
+	PermissionSnapshotDecodes  uint64  `json:"permission_snapshot_decodes"`
+	ActiveWorkspaceCacheHits   uint64  `json:"active_workspace_cache_hits"`
+	ActiveWorkspaceCacheMisses uint64  `json:"active_workspace_cache_misses"`
 }

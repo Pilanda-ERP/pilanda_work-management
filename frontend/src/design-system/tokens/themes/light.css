@@ -5,7 +5,8 @@
 
 :root,
 html,
-html[data-color-mode="light"] {
+html[data-color-mode="light"],
+[data-ds-color-mode="light"] {
   /* =================================================================
      SURFACE COLORS
      Background colors for UI layers
@@ -146,6 +147,48 @@ html[data-color-mode="light"] {
   --ds-accent-orange-subtler: #ffe2b8;
   --ds-icon-accent-orange: #d94800;
 
+  /* Red */
+  --ds-accent-red: var(--color-red-600);
+  --ds-accent-red-subtle: #ffebe6;
+  --ds-accent-red-subtler: #ffbdad;
+  --ds-icon-accent-red: #bf2600;
+
+  /* Yellow */
+  --ds-accent-yellow: var(--color-yellow-600);
+  --ds-accent-yellow-subtle: #fff7d6;
+  --ds-accent-yellow-subtler: #ffe380;
+  --ds-icon-accent-yellow: #b38600;
+
+  /* Gray — neutral badge ink. #767676 is the lightest gray holding
+     WCAG AA (4.5:1) on white, so it reads lighter than the zinc it
+     replaced without sacrificing readability. */
+  --ds-accent-gray: #767676;
+  --ds-accent-gray-subtle: #94a3b8;
+
+  /* Accent text — readable-on-subtle text for badges and chips */
+  --ds-text-accent-blue: var(--color-blue-800);
+  --ds-text-accent-green: var(--color-green-800);
+  --ds-text-accent-purple: var(--color-purple-800);
+  --ds-text-accent-teal: var(--color-teal-800);
+  --ds-text-accent-orange: var(--color-orange-800);
+  --ds-text-accent-red: var(--color-red-800);
+  --ds-text-accent-yellow: var(--color-yellow-800);
+
+  /* Section navigation chip gradients. Same ramp in both themes so a
+     section keeps its identity color regardless of color mode. */
+  --ds-nav-blue-from: var(--color-blue-400);
+  --ds-nav-blue-to: var(--color-blue-600);
+  --ds-nav-green-from: var(--color-green-400);
+  --ds-nav-green-to: var(--color-green-600);
+  --ds-nav-teal-from: var(--color-teal-400);
+  --ds-nav-teal-to: var(--color-teal-600);
+  --ds-nav-purple-from: var(--color-purple-400);
+  --ds-nav-purple-to: var(--color-purple-600);
+  --ds-nav-orange-from: var(--color-orange-400);
+  --ds-nav-orange-to: var(--color-orange-600);
+  --ds-nav-gray-from: var(--color-gray-400);
+  --ds-nav-gray-to: var(--color-gray-600);
+
   /* =================================================================
      STATUS COLORS
      For test status badges, progress indicators, and status buttons
@@ -196,7 +239,12 @@ html[data-color-mode="light"] {
      ================================================================= */
   --ds-glass-bg: rgba(255, 255, 255, 0.7);
   --ds-glass-bg-subtle: rgba(255, 255, 255, 0.5);
-  --ds-glass-border: rgba(255, 255, 255, 0.3);
+  /* Glass surfaces in light mode are a white wash (0.7 alpha), and they stack:
+     a board swimlane, its column and its cards are three layers of it. A white
+     border disappears against that, so the light theme edges glass with the
+     same ink as --ds-border instead (dark mode keeps a white hairline, which
+     reads fine on its dark surfaces). */
+  --ds-glass-border: rgba(9, 30, 66, 0.16);
   --ds-glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
   --ds-glow-nav: 0 0 12px rgba(40, 116, 187, 0.2);
   --ds-glow-primary: 0 0 20px rgba(40, 116, 187, 0.25);

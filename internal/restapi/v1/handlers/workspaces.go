@@ -1,11 +1,15 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
+	"windshift/internal/authz"
 	"windshift/internal/database"
+	"windshift/internal/logger"
 	"windshift/internal/models"
+	"windshift/internal/repository"
 	"windshift/internal/restapi"
 	"windshift/internal/restapi/v1/dto"
 	"windshift/internal/sanitize"
@@ -18,16 +22,28 @@ type WorkspaceHandler struct {
 	db               database.Database
 	workspaceService *services.WorkspaceService
 	itemCRUD         *services.ItemCRUDService
+	cacheInvalidator *services.AuthorizationCacheInvalidator
 }
 
 // NewWorkspaceHandler creates a new workspace handler
-func NewWorkspaceHandler(db database.Database, permissionService *services.PermissionService) *WorkspaceHandler {
+func NewWorkspaceHandler(db database.Database, permissionService *services.PermissionService, invalidators ...*services.AuthorizationCacheInvalidator) *WorkspaceHandler {
+	cacheInvalidator := services.NewAuthorizationCacheInvalidator(permissionService, nil)
+	if len(invalidators) > 0 && invalidators[0] != nil {
+		cacheInvalidator = invalidators[0]
+	}
 	return &WorkspaceHandler{
 		BaseHandler:      NewBaseHandler(db, permissionService),
 		db:               db,
-		workspaceService: services.NewWorkspaceService(db),
+		workspaceService: services.NewWorkspaceServiceWithAccess(db, authz.New(db, permissionService)),
 		itemCRUD:         services.NewItemCRUDService(db),
+		cacheInvalidator: cacheInvalidator,
 	}
+}
+
+// SetPackProvisioner forwards the create-from-template-pack provisioner to the
+// handler's workspace service.
+func (h *WorkspaceHandler) SetPackProvisioner(provisioner services.WorkspacePackProvisioner) {
+	h.workspaceService.SetPackProvisioner(provisioner)
 }
 
 // WorkspaceResponse is the public API representation of a Workspace.
@@ -40,7 +56,9 @@ type WorkspaceResponse struct {
 	Key                     string   `json:"key"`
 	Description             string   `json:"description"`
 	Active                  bool     `json:"active"`
+	TimeProjectID           *int     `json:"time_project_id,omitempty"`
 	IsPersonal              bool     `json:"is_personal"`
+	IsTemplate              bool     `json:"is_template"`
 	InternalCommentsEnabled bool     `json:"internal_comments_enabled"`
 	Icon                    string   `json:"icon,omitempty"`
 	Color                   string   `json:"color,omitempty"`
@@ -50,35 +68,58 @@ type WorkspaceResponse struct {
 }
 
 // WorkspaceCreateRequest is the request body for creating a workspace
+// `template_workspace_id` optionally names a visible template workspace whose
+// configuration-set assignment, work-item templates, and seed items are cloned
+// into the new workspace.
 type WorkspaceCreateRequest struct {
-	Name        string `json:"name" validate:"required,max=100"`
-	Key         string `json:"key" validate:"required,min=2,max=10,alphanum"`
-	Description string `json:"description,omitempty"`
-	Icon        string `json:"icon,omitempty"`
-	Color       string `json:"color,omitempty"`
+	Name                string `json:"name" validate:"required,max=100"`
+	Key                 string `json:"key" validate:"required,min=2,max=10,alphanum"`
+	Description         string `json:"description,omitempty"`
+	Icon                string `json:"icon,omitempty"`
+	Color               string `json:"color,omitempty"`
+	TemplateWorkspaceID *int   `json:"template_workspace_id,omitempty"`
+	TemplatePack        string `json:"template_pack,omitempty"`
 }
 
 // WorkspaceUpdateRequest is the request body for updating a workspace
 type WorkspaceUpdateRequest struct {
 	Name        *string `json:"name,omitempty"`
+	Key         *string `json:"key,omitempty"`
 	Description *string `json:"description,omitempty"`
 	Active      *bool   `json:"active,omitempty"`
 	Icon        *string `json:"icon,omitempty"`
 	Color       *string `json:"color,omitempty"`
+	IsTemplate  *bool   `json:"is_template,omitempty"`
 }
 
-func toWorkspaceResponse(ws *services.WorkspaceListResult) WorkspaceResponse {
+// WorkspaceTemplateSummaryResponse is the public API representation of a
+// workspace usable as a creation template.
+type WorkspaceTemplateSummaryResponse struct {
+	ID                   int    `json:"id"`
+	Name                 string `json:"name"`
+	Description          string `json:"description"`
+	Icon                 string `json:"icon,omitempty"`
+	Color                string `json:"color,omitempty"`
+	ConfigurationSetName string `json:"configuration_set_name,omitempty"`
+	TemplateCount        int    `json:"template_count"`
+	ItemCount            int    `json:"item_count"`
+}
+
+func toWorkspaceResponse(ws *models.Workspace) WorkspaceResponse {
 	return WorkspaceResponse{
-		ID:          ws.ID,
-		Name:        ws.Name,
-		Key:         ws.Key,
-		Description: ws.Description,
-		Active:      ws.Active,
-		IsPersonal:  ws.IsPersonal,
-		Icon:        ws.Icon,
-		Color:       ws.Color,
-		CreatedAt:   ws.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-		UpdatedAt:   ws.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		ID:                      ws.ID,
+		Name:                    ws.Name,
+		Key:                     ws.Key,
+		Description:             ws.Description,
+		Active:                  ws.Active,
+		TimeProjectID:           ws.TimeProjectID,
+		IsPersonal:              ws.IsPersonal,
+		IsTemplate:              ws.IsTemplate,
+		InternalCommentsEnabled: ws.InternalCommentsEnabled,
+		Icon:                    ws.Icon,
+		Color:                   ws.Color,
+		CreatedAt:               ws.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt:               ws.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
 }
 
@@ -90,6 +131,7 @@ func toWorkspaceResponse(ws *services.WorkspaceListResult) WorkspaceResponse {
 // @Security     BearerAuth
 // @Param        page   query     int     false  "Page number (1-based)"
 // @Param        limit  query     int     false  "Items per page (max 100)"
+// @Param        search query     string  false  "Case-insensitive substring match on name, key, and description"
 // @Param        sort   query     string  false  "Sort field"
 // @Param        order  query     string  false  "Sort order: asc or desc"
 // @Success      200    {object}  handlers.PaginatedResponse{data=[]handlers.WorkspaceResponse}
@@ -104,11 +146,17 @@ func (h *WorkspaceHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pagination := h.ParsePagination(r)
+	accessibleWorkspaceIDs, err := h.Perms.GetAccessibleWorkspaceIDs(user.ID)
+	if err != nil {
+		h.RespondInternalError(w, r)
+		return
+	}
 
 	results, total, err := h.workspaceService.List(services.WorkspaceListParams{
-		UserID: user.ID,
-		Limit:  pagination.Limit,
-		Offset: pagination.Offset,
+		WorkspaceIDs: accessibleWorkspaceIDs,
+		Search:       r.URL.Query().Get("search"),
+		Limit:        pagination.Limit,
+		Offset:       pagination.Offset,
 	})
 	if err != nil {
 		h.RespondInternalError(w, r)
@@ -160,7 +208,7 @@ func (h *WorkspaceHandler) Get(w http.ResponseWriter, r *http.Request) {
 // Create handles POST /rest/api/v1/workspaces
 //
 // @Summary      Create a workspace
-// @Description  Requires the global `workspace.create` permission in addition to the workspaces:write token scope.
+// @Description  Requires the global `workspace.create` permission in addition to the workspaces:write token scope. Optionally pass template_workspace_id to clone a visible template workspace's configuration-set assignment, work-item templates, and seed items.
 // @Tags         workspaces
 // @Accept       json
 // @Produce      json
@@ -170,7 +218,9 @@ func (h *WorkspaceHandler) Get(w http.ResponseWriter, r *http.Request) {
 // @Failure      400   {object}  handlers.ErrorResponse  "Invalid request body or missing required field"
 // @Failure      401   {object}  handlers.ErrorResponse
 // @Failure      403   {object}  handlers.ErrorResponse  "Token lacks workspaces:write or caller lacks workspace.create"
+// @Failure      404   {object}  handlers.ErrorResponse  "TEMPLATE_WORKSPACE_NOT_FOUND: template workspace missing or not visible"
 // @Failure      409   {object}  handlers.ErrorResponse  "A workspace with this key already exists"
+// @Failure      422   {object}  handlers.ErrorResponse  "INVALID_WORKSPACE_TEMPLATE or WORKSPACE_TEMPLATE_TOO_LARGE"
 // @Failure      500   {object}  handlers.ErrorResponse
 // @Router       /workspaces [post]
 func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -202,25 +252,66 @@ func (h *WorkspaceHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keyExists, err := h.workspaceService.KeyExists(req.Key)
-	if err == nil && keyExists {
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeAlreadyExists, "Workspace key already exists"))
-		return
-	}
-
-	result, err := h.workspaceService.Create(services.CreateWorkspaceParams{
-		Name:        req.Name,
-		Key:         req.Key,
-		Description: req.Description,
-		Icon:        req.Icon,
-		Color:       req.Color,
-		CreatorID:   user.ID,
+	result, err := h.workspaceService.Create(r.Context(), services.CreateWorkspaceParams{
+		Name:                req.Name,
+		Key:                 req.Key,
+		Description:         req.Description,
+		Icon:                req.Icon,
+		Color:               req.Color,
+		CreatorID:           user.ID,
+		TemplateWorkspaceID: req.TemplateWorkspaceID,
+		TemplatePack:        req.TemplatePack,
 	})
 	if err != nil {
+		if errors.Is(err, repository.ErrDuplicateEntry) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeAlreadyExists, "Workspace key already exists"))
+			return
+		}
+		if errors.Is(err, services.ErrTemplateWorkspaceNotFound) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeTemplateWorkspaceNotFound, "Template workspace not found or not visible"))
+			return
+		}
+		if errors.Is(err, services.ErrInvalidWorkspaceTemplate) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusUnprocessableEntity, restapi.ErrCodeInvalidWorkspaceTemplate, "Workspace cannot be used as a template"))
+			return
+		}
+		if errors.Is(err, services.ErrWorkspaceTemplateTooLarge) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusUnprocessableEntity, restapi.ErrCodeWorkspaceTemplateTooLarge, "Template workspace exceeds the seed item limit"))
+			return
+		}
+		if errors.Is(err, services.ErrWorkspacePackNotFound) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusUnprocessableEntity, "unknown_pack", "Template pack was not found"))
+			return
+		}
+		if errors.Is(err, services.ErrWorkspacePackProvisioning) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusUnprocessableEntity, "pack_provisioning_failed", err.Error()))
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
 
+	if err := h.cacheInvalidator.Apply(services.AuthorizationInvalidation{
+		ResetPermissions:        true,
+		ActiveWorkspacesChanged: true,
+		WorkspaceKeysChanged:    true,
+	}); err != nil {
+		h.RespondInternalError(w, r)
+		return
+	}
+
+	if req.TemplateWorkspaceID != nil {
+		h.Auditor.LogWithDetails(r, user, logger.ActionWorkspaceCreateFromTemplate, logger.ResourceWorkspace,
+			&result.Workspace.ID, result.Workspace.Name, map[string]any{
+				"source_workspace_id":         result.SourceWorkspaceID,
+				"config_set_attached":         result.ConfigSetAttached,
+				"templates_copied":            result.TemplatesCopied,
+				"items_copied":                result.ItemsCopied,
+				"omitted_custom_field_values": result.OmittedCustomFieldValues,
+			})
+	} else {
+		h.Auditor.Log(r, user, logger.ActionWorkspaceCreate, logger.ResourceWorkspace, &result.Workspace.ID, result.Workspace.Name)
+	}
 	resp := toWorkspaceResponse(result.Workspace)
 	resp.Warnings = warnings
 	h.RespondCreated(w, resp)
@@ -253,8 +344,10 @@ func (h *WorkspaceHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	canEdit, err := h.Perms.CanEditWorkspace(user.ID, wsID)
-	if err != nil || !canEdit {
+	// Renaming/deactivating the workspace record is a workspace-administration
+	// action, not item editing — require workspace.admin, not item.edit.
+	canAdmin, err := h.Perms.CanAdminWorkspace(user.ID, wsID)
+	if err != nil || !canAdmin {
 		h.RespondError(w, r, restapi.ErrWorkspaceNotFound)
 		return
 	}
@@ -263,30 +356,72 @@ func (h *WorkspaceHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if !h.DecodeBodyOrRespond(w, r, &req) {
 		return
 	}
+	if req.Key != nil {
+		*req.Key = strings.ToUpper(strings.TrimSpace(*req.Key))
+		if !services.ValidWorkspaceKey(*req.Key) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput,
+				"Workspace key must contain 2 to 10 alphanumeric characters"))
+			return
+		}
+	}
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: req.Name, Policy: sanitize.PlainTextField, Label: "Workspace name"},
+		sanitize.Pair{Target: req.Key, Policy: sanitize.ShortIdentifier, Label: "Workspace key"},
 		sanitize.Pair{Target: req.Description, Policy: sanitize.RichText, Label: "Description"},
 		sanitize.Pair{Target: req.Icon, Policy: sanitize.ShortIdentifier, Label: "Icon"},
 		sanitize.Pair{Target: req.Color, Policy: sanitize.ShortIdentifier, Label: "Color"},
 	)
 
+	before, err := h.workspaceService.GetByID(wsID)
+	if err != nil {
+		h.RespondError(w, r, restapi.ErrWorkspaceNotFound)
+		return
+	}
+
 	ws, err := h.workspaceService.Update(services.UpdateWorkspaceParams{
 		ID:          wsID,
 		Name:        req.Name,
+		Key:         req.Key,
 		Description: req.Description,
 		Active:      req.Active,
 		Icon:        req.Icon,
 		Color:       req.Color,
+		IsTemplate:  req.IsTemplate,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, repository.ErrNotFound) {
 			h.RespondError(w, r, restapi.ErrWorkspaceNotFound)
+			return
+		}
+		if errors.Is(err, services.ErrPersonalWorkspaceTemplate) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusUnprocessableEntity, restapi.ErrCodeInvalidWorkspaceTemplate, "Personal workspaces cannot be templates"))
+			return
+		}
+		if errors.Is(err, services.ErrPersonalWorkspaceDeactivation) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusUnprocessableEntity, restapi.ErrCodeInvalidInput, "Personal workspaces cannot be deactivated"))
+			return
+		}
+		if errors.Is(err, services.ErrWorkspaceKeyImmutable) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusUnprocessableEntity, restapi.ErrCodeInvalidInput, "Workspace keys can only be changed for personal workspaces"))
+			return
+		}
+		if errors.Is(err, repository.ErrDuplicateEntry) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeConflict, "A workspace with this key already exists"))
 			return
 		}
 		h.RespondInternalError(w, r)
 		return
 	}
+	if err := h.cacheInvalidator.Apply(services.AuthorizationInvalidation{
+		ResetPermissions:        before.Active != ws.Active,
+		ActiveWorkspacesChanged: before.Active != ws.Active,
+		WorkspaceKeysChanged:    before.Key != ws.Key,
+	}); err != nil {
+		h.RespondInternalError(w, r)
+		return
+	}
 
+	h.Auditor.Log(r, user, logger.ActionWorkspaceUpdate, logger.ResourceWorkspace, &ws.ID, ws.Name)
 	resp := toWorkspaceResponse(ws)
 	resp.Warnings = warnings
 	h.RespondOK(w, resp)
@@ -303,6 +438,7 @@ func (h *WorkspaceHandler) Update(w http.ResponseWriter, r *http.Request) {
 // @Failure      401  {object}  handlers.ErrorResponse
 // @Failure      403  {object}  handlers.ErrorResponse  "Token lacks the workspaces:delete scope"
 // @Failure      404  {object}  handlers.ErrorResponse  "Workspace not found or caller cannot delete it"
+// @Failure      409  {object}  handlers.ErrorResponse  "Workspace still has externally linked items"
 // @Failure      500  {object}  handlers.ErrorResponse
 // @Router       /workspaces/{id} [delete]
 func (h *WorkspaceHandler) Delete(w http.ResponseWriter, r *http.Request) {
@@ -316,23 +452,91 @@ func (h *WorkspaceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	canEdit, _ := h.Perms.CanEditWorkspace(user.ID, wsID)
-	if !canEdit {
+	// Deleting the workspace is a destructive administration action —
+	// require workspace.admin, not item.edit.
+	canAdmin, _ := h.Perms.CanAdminWorkspace(user.ID, wsID)
+	if !canAdmin {
 		h.RespondError(w, r, restapi.ErrWorkspaceNotFound)
 		return
 	}
 
 	err := h.workspaceService.Delete(wsID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, repository.ErrNotFound) {
 			h.RespondError(w, r, restapi.ErrWorkspaceNotFound)
+			return
+		}
+		if errors.Is(err, services.ErrWorkspaceHasProtectedIntegrationLinks) {
+			h.RespondError(w, r, restapi.NewAPIError(
+				http.StatusConflict,
+				restapi.ErrCodeConflict,
+				"Remove all protected integration links from this workspace before deleting it.",
+			))
 			return
 		}
 		h.RespondInternalError(w, r)
 		return
 	}
+	if err := h.cacheInvalidator.Apply(services.AuthorizationInvalidation{
+		ResetPermissions:        true,
+		ActiveWorkspacesChanged: true,
+		WorkspaceKeysChanged:    true,
+	}); err != nil {
+		h.RespondInternalError(w, r)
+		return
+	}
 
+	h.Auditor.Log(r, user, logger.ActionWorkspaceDelete, logger.ResourceWorkspace, &wsID, "")
 	h.RespondNoContent(w)
+}
+
+// ListTemplates handles GET /rest/api/v1/workspace-templates
+//
+// @Summary      List workspaces usable as creation templates
+// @Description  Active, non-personal workspaces marked as templates and visible to the caller, with configuration-set name and copy counts.
+// @Tags         workspaces
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {array}   handlers.WorkspaceTemplateSummaryResponse
+// @Failure      401  {object}  handlers.ErrorResponse
+// @Failure      403  {object}  handlers.ErrorResponse  "Token lacks the workspaces:read scope"
+// @Failure      500  {object}  handlers.ErrorResponse
+// @Router       /workspace-templates [get]
+func (h *WorkspaceHandler) ListTemplates(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.RequireAuth(w, r)
+	if !ok {
+		return
+	}
+
+	summaries, err := h.workspaceService.ListTemplateSummaries(r.Context())
+	if err != nil {
+		h.RespondInternalError(w, r)
+		return
+	}
+
+	visible := make([]WorkspaceTemplateSummaryResponse, 0, len(summaries))
+	for _, summary := range summaries {
+		canView, err := h.Perms.HasWorkspacePermission(user.ID, summary.ID, models.PermissionItemView)
+		if err != nil {
+			h.RespondInternalError(w, r)
+			return
+		}
+		if !canView {
+			continue
+		}
+		visible = append(visible, WorkspaceTemplateSummaryResponse{
+			ID:                   summary.ID,
+			Name:                 summary.Name,
+			Description:          summary.Description,
+			Icon:                 summary.Icon,
+			Color:                summary.Color,
+			ConfigurationSetName: summary.ConfigurationSetName,
+			TemplateCount:        summary.TemplateCount,
+			ItemCount:            summary.ItemCount,
+		})
+	}
+
+	h.RespondOK(w, visible)
 }
 
 // GetItems handles GET /rest/api/v1/workspaces/{id}/items
@@ -499,6 +703,48 @@ func (h *WorkspaceHandler) GetItemTypes(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.RespondOK(w, result)
+}
+
+// GetWorkflows handles GET /rest/api/v1/workspaces/{id}/workflows
+//
+// @Summary      List workflows effective for a workspace
+// @Description  Returns the distinct workflows selected by the workspace configuration set and its item-type overrides.
+// @Tags         workspaces, workflows
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      int  true  "Workspace ID"
+// @Success      200  {array}   handlers.WorkflowResponse
+// @Failure      400  {object}  handlers.ErrorResponse  "Invalid workspace ID"
+// @Failure      401  {object}  handlers.ErrorResponse
+// @Failure      403  {object}  handlers.ErrorResponse  "Token lacks the workspaces:read scope"
+// @Failure      404  {object}  handlers.ErrorResponse  "Workspace not found or not visible to caller"
+// @Failure      500  {object}  handlers.ErrorResponse
+// @Router       /workspaces/{id}/workflows [get]
+func (h *WorkspaceHandler) GetWorkflows(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := h.RequireWorkspaceViewAccess(w, r)
+	if !ok {
+		return
+	}
+
+	results, err := services.NewWorkflowService(h.db).ListForWorkspace(workspaceID)
+	if err != nil {
+		h.RespondInternalError(w, r)
+		return
+	}
+
+	workflows := make([]WorkflowResponse, 0, len(results))
+	for _, wf := range results {
+		workflows = append(workflows, WorkflowResponse{
+			ID:          wf.ID,
+			BuiltinKey:  wf.BuiltinKey,
+			Name:        wf.Name,
+			Description: wf.Description,
+			IsDefault:   wf.IsDefault,
+			CreatedAt:   wf.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			UpdatedAt:   wf.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+	}
+	h.RespondOK(w, workflows)
 }
 
 // GetPriorities handles GET /rest/api/v1/workspaces/{id}/priorities

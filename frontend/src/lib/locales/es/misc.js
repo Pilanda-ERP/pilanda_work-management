@@ -19,6 +19,7 @@ export default {
     steps: {
       connect: 'Conectar',
       projects: 'Proyectos',
+      xray: 'Xray',
       mapping: 'Mapeo',
       preview: 'Vista previa',
       import: 'Importar',
@@ -35,11 +36,11 @@ export default {
       email: 'Correo electrónico',
       username: 'Nombre de usuario',
       apiToken: 'Token de API',
-      password: 'Contraseña o Token de Acceso Personal',
+      personalAccessToken: 'Token de Acceso Personal',
       generateToken: 'Generar un token',
       tokenHelpCloud: 'desde la configuración de tu cuenta de Atlassian',
       tokenHelpDatacenter:
-        'Usa tu contraseña o un Token de Acceso Personal desde la configuración de tu perfil en Jira',
+        'Crea un Token de Acceso Personal en la configuración de tu perfil de Jira',
     },
     buttons: {
       connect: 'Conectar',
@@ -61,7 +62,7 @@ export default {
       credentialsHelpCloud:
         'Ingresa tus credenciales de Jira Cloud. Puedes generar un token de API desde la configuración de tu cuenta de Atlassian.',
       credentialsHelpDatacenter:
-        'Ingresa tus credenciales de Jira Data Center. Usa tu nombre de usuario y contraseña o un Token de Acceso Personal.',
+        'Ingresa un Token de Acceso Personal desde la configuración de tu perfil de Jira Data Center.',
       reviewSummary:
         'Revisa el resumen de importación antes de continuar. Esta operación puede tardar varios minutos para proyectos grandes.',
       noAttachments: 'No se importarán los archivos adjuntos',
@@ -106,6 +107,7 @@ export default {
       importing: 'Importando...',
       starting: 'Iniciando importación...',
       complete: '¡Importación completada!',
+      completeWithErrors: 'Importación completada con errores',
       success: 'Se importaron {count} elementos correctamente.',
       failed: '{count} elementos no se pudieron importar.',
       ready: 'Listo para importar',
@@ -148,6 +150,7 @@ export default {
     createField: 'Crear campo',
     editField: 'Editar campo',
     deleteField: 'Eliminar campo',
+    returnToBoard: 'Volver a campos del tablero',
     fieldName: 'Nombre del campo',
     fieldType: 'Tipo de campo',
     fieldDescription: 'Descripción',
@@ -691,6 +694,9 @@ export default {
   },
 
   setup: {
+    chooseLanguage: 'Elige tu idioma',
+    chooseLanguageDesc: 'Selecciona el idioma que se usará durante la configuración y en la aplicación.',
+    language: 'Idioma',
     welcomeTo: 'Bienvenido a {appName}',
     setupMessage: 'Vamos a configurar tu sistema de gestión de trabajo',
     setupProgress: 'Progreso de configuración',
@@ -751,6 +757,13 @@ export default {
     workspaceName: 'Nombre del {type}',
     workspaceKeyPlaceholder: 'Clave del espacio de trabajo (ej.: PROJ, TEAM)',
     addDescription: 'Agregar descripción...',
+    workspaceTemplate: 'Plantilla',
+    workspaceTemplateBlank: 'Espacio de trabajo en blanco',
+    workspaceTemplateLoading: 'Cargando plantillas...',
+    workspaceTemplateError: 'No se pudieron cargar las plantillas de espacios de trabajo',
+    workspaceRestrict: 'Restringir visibilidad',
+    workspaceRestrictHint: 'Solo tú y las personas asignadas pueden ver este espacio de trabajo',
+    workspaceTemplateMeta: '{templates} plantillas · {items} elementos',
     // Field labels
     type: 'Tipo',
     priority: 'Prioridad',

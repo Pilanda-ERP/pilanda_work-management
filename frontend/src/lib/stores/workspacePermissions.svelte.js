@@ -1,7 +1,7 @@
 // Workspace Permission Store - manages workspace-scoped permissions
 // Uses Svelte 5 runes for reactive state management
-import { api } from '../api.js';
 import { authStore } from './auth.svelte.js';
+import { clearPermissionProfiles, loadPermissionProfile } from './permissionProfile.js';
 
 function normalizeWorkspaceId(workspaceId) {
   if (workspaceId === null || workspaceId === undefined || workspaceId === '') return workspaceId;
@@ -31,18 +31,13 @@ class WorkspacePermissionStore {
     this.error = null;
 
     try {
-      const response = await api.permissions.getUserPermissions(userId);
+      const response = await loadPermissionProfile(userId);
 
-      // Parse workspace permissions into Map<workspaceId, Set<permissionKey>>
+      // The profile groups permission keys by workspace ID (compact WI-1444
+      // encoding); fold it in one pass into Map<workspaceId, Set<key>>.
       const wsPerms = new Map();
-      for (const wp of response.workspace_permissions || []) {
-        const wsId = normalizeWorkspaceId(wp.workspace_id);
-        if (!wsPerms.has(wsId)) {
-          wsPerms.set(wsId, new Set());
-        }
-        if (wp.permission?.permission_key) {
-          wsPerms.get(wsId).add(wp.permission.permission_key);
-        }
+      for (const [wsId, keys] of Object.entries(response.workspace_permissions || {})) {
+        wsPerms.set(normalizeWorkspaceId(wsId), new Set(keys));
       }
       this.permissions = wsPerms;
     } catch (err) {
@@ -102,6 +97,24 @@ class WorkspacePermissionStore {
     return this.hasPermission(workspaceId, 'workspace.admin');
   }
 
+  // Page permissions. Create mirrors the server's canCreate fallback chain;
+  // archive additionally requires per-page admin on the target page.
+  canViewPages(workspaceId) {
+    return this.hasPermission(workspaceId, 'page.view');
+  }
+
+  canCreatePages(workspaceId) {
+    return (
+      this.hasPermission(workspaceId, 'page.create') ||
+      this.hasPermission(workspaceId, 'page.admin') ||
+      this.hasPermission(workspaceId, 'workspace.admin')
+    );
+  }
+
+  canDeletePages(workspaceId) {
+    return this.hasPermission(workspaceId, 'page.delete');
+  }
+
   // Action management permission
   canManageActions(workspaceId) {
     return this.hasPermission(workspaceId, 'action.manage');
@@ -120,8 +133,18 @@ class WorkspacePermissionStore {
     return perms && perms.size > 0;
   }
 
+  // Refresh from the server, discarding the cached permission profile. Needed
+  // after the user gains a new grant (e.g. creating a workspace makes them its
+  // administrator) — the profile cache would otherwise serve stale data until
+  // the next full page load.
+  async reload() {
+    clearPermissionProfiles();
+    await this.loadPermissions(authStore.currentUser?.id);
+  }
+
   // Clear all permissions
   clear() {
+    clearPermissionProfiles();
     this.permissions = new Map();
     this.loading = false;
     this.error = null;

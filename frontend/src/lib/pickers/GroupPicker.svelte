@@ -2,7 +2,7 @@
   import { BasePicker } from '.';
   import { createAsyncLoader } from '../composables';
   import { api } from '../api.js';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { Users } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
 
@@ -21,6 +21,7 @@
   const groups = createAsyncLoader(() => api.get('/groups'));
 
   onMount(() => groups.load());
+  onDestroy(() => groups.dispose());
 </script>
 
 <BasePicker
@@ -42,7 +43,7 @@
     <div class="flex items-center gap-3 flex-1 min-w-0">
       <!-- Group Icon -->
       <div class="flex-shrink-0">
-        <div class="w-8 h-8 rounded-full bg-green-500 flex items-center justify-center text-white">
+        <div class="w-8 h-8 rounded-full bg-ds-accent-green flex items-center justify-center text-ds-text-inverse">
           <Users class="w-4 h-4" />
         </div>
       </div>

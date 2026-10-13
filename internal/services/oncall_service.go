@@ -24,31 +24,30 @@ func NewOnCallService(db database.Database, onCallRepo *repository.OnCallReposit
 	}
 }
 
-// ComputeRotationForLayer determines which member is on call for the given layer
-// at the specified time. Returns nil if no member is on call (e.g. outside the
-// layer's active window or no members configured).
-func (s *OnCallService) ComputeRotationForLayer(layer *models.OnCallScheduleLayer, t time.Time) *int {
-	startDate, err := time.Parse("2006-01-02", layer.StartDate)
+func (s *OnCallService) computeRotationForLayer(layer *models.OnCallScheduleLayer, instant time.Time, location *time.Location) *int {
+	startDate, err := parseOnCallDate(layer.StartDate)
 	if err != nil {
 		return nil
 	}
-	if t.Before(startDate) {
+	local := instant.In(location)
+	currentDate := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC)
+	startDate = time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
+	if currentDate.Before(startDate) {
 		return nil
 	}
 
 	if layer.EndDate != nil {
-		endDate, err := time.Parse("2006-01-02", *layer.EndDate)
+		endDate, err := parseOnCallDate(*layer.EndDate)
 		if err != nil {
 			return nil
 		}
-		// End date is inclusive, so the layer is active through the end of that day.
-		endOfDay := endDate.Add(24 * time.Hour)
-		if t.After(endOfDay) || t.Equal(endOfDay) {
+		endDate = time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 0, 0, 0, 0, time.UTC)
+		if currentDate.After(endDate) {
 			return nil
 		}
 	}
 
-	handoff, err := time.Parse("15:04", layer.HandoffTime)
+	handoff, err := onCallHandoffBoundary(currentDate, layer.HandoffTime, location)
 	if err != nil {
 		return nil
 	}
@@ -64,13 +63,11 @@ func (s *OnCallService) ComputeRotationForLayer(layer *models.OnCallScheduleLaye
 	})
 
 	// Calculate the number of full days since the start date.
-	daysSinceStart := int(t.Sub(startDate).Hours() / 24)
+	daysSinceStart := int(currentDate.Sub(startDate) / (24 * time.Hour))
 
 	// If we have not yet reached the handoff time today, the previous rotation
 	// slot is still active, so we shift back by one period.
-	handoffHour, handoffMin := handoff.Hour(), handoff.Minute()
-	currentHour, currentMin := t.Hour(), t.Minute()
-	beforeHandoff := currentHour < handoffHour || (currentHour == handoffHour && currentMin < handoffMin)
+	beforeHandoff := instant.Before(handoff)
 
 	var rotationIndex int
 	switch layer.RotationType {
@@ -107,6 +104,14 @@ func (s *OnCallService) ComputeRotationForLayer(layer *models.OnCallScheduleLaye
 	return &userID
 }
 
+func parseOnCallDate(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.DateOnly, value)
+	if err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339, value)
+}
+
 // GetCurrentOnCall resolves who is currently on call for the given schedule,
 // taking overrides and layer priorities into account.
 func (s *OnCallService) GetCurrentOnCall(scheduleID int) (*models.CurrentOnCallResponse, error) {
@@ -115,35 +120,40 @@ func (s *OnCallService) GetCurrentOnCall(scheduleID int) (*models.CurrentOnCallR
 		return nil, fmt.Errorf("failed to get schedule: %w", err)
 	}
 
-	overrides, err := s.onCallRepo.GetActiveOverrides(scheduleID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get overrides: %w", err)
+	return s.CurrentOnCallForSchedule(schedule, time.Now()), nil
+}
+
+// CurrentOnCallForSchedule resolves a fully hydrated schedule without database
+// reads. It is shared by the single-schedule endpoint and the team overview.
+func (s *OnCallService) CurrentOnCallForSchedule(schedule *models.OnCallSchedule, now time.Time) *models.CurrentOnCallResponse {
+	resp := &models.CurrentOnCallResponse{
+		ScheduleID: schedule.ID,
+		OnCall:     []models.OnCallUserEntry{},
 	}
 
-	now := time.Now()
-
-	resp := &models.CurrentOnCallResponse{
-		ScheduleID: scheduleID,
-		OnCall:     []models.OnCallUserEntry{},
+	_, location, err := ResolveTimezone(schedule.Timezone)
+	if err != nil {
+		// Existing invalid rows predate request validation. UTC preserves the old
+		// behavior without making every rotation disappear.
+		location = time.UTC
 	}
 
 	// Check overrides first. An override replaces the original user with the
 	// override user for the duration of the override window.
-	for _, o := range overrides {
-		if now.After(o.StartTime) && now.Before(o.EndTime) {
-			resp.OnCall = append(resp.OnCall, models.OnCallUserEntry{
-				UserID:     o.OverrideUserID,
-				UserName:   o.OverrideUserName,
-				IsOverride: true,
-			})
-		}
-	}
-
-	// Build a set of user IDs already covered by overrides so we don't
-	// duplicate entries from layer resolution.
+	replacedUserIDs := make(map[int]bool)
 	overrideUserIDs := make(map[int]bool)
-	for _, entry := range resp.OnCall {
-		overrideUserIDs[entry.UserID] = true
+	for _, o := range schedule.Overrides {
+		if now.After(o.StartTime) && now.Before(o.EndTime) {
+			replacedUserIDs[o.UserID] = true
+			if !overrideUserIDs[o.OverrideUserID] {
+				resp.OnCall = append(resp.OnCall, models.OnCallUserEntry{
+					UserID:     o.OverrideUserID,
+					UserName:   o.OverrideUserName,
+					IsOverride: true,
+				})
+				overrideUserIDs[o.OverrideUserID] = true
+			}
+		}
 	}
 
 	// Process layers by priority (lowest priority number = highest importance).
@@ -154,70 +164,30 @@ func (s *OnCallService) GetCurrentOnCall(scheduleID int) (*models.CurrentOnCallR
 	})
 
 	for _, layer := range layers {
-		userID := s.ComputeRotationForLayer(&layer, now)
+		userID := s.computeRotationForLayer(&layer, now, location)
 		if userID == nil {
 			continue
 		}
-		if overrideUserIDs[*userID] {
+		if replacedUserIDs[*userID] || overrideUserIDs[*userID] {
 			continue
+		}
+		var userName, userEmail string
+		for _, member := range layer.Members {
+			if member.UserID == *userID {
+				userName = member.UserName
+				userEmail = member.UserEmail
+				break
+			}
 		}
 		resp.OnCall = append(resp.OnCall, models.OnCallUserEntry{
 			UserID:    *userID,
+			UserName:  userName,
+			UserEmail: userEmail,
 			LayerName: layer.Name,
 		})
 	}
 
-	return resp, nil
-}
-
-// AcknowledgeIncident marks an incident as acknowledged by the given user.
-func (s *OnCallService) AcknowledgeIncident(incidentID, userID int) error {
-	incident, err := s.onCallRepo.GetIncidentByID(incidentID)
-	if err != nil {
-		return fmt.Errorf("failed to get incident: %w", err)
-	}
-
-	now := time.Now()
-	err = s.onCallRepo.UpdateIncident(
-		incident.ID,
-		"acknowledged",
-		&now,
-		&userID,
-		incident.ResolvedAt,
-		incident.ResolvedBy,
-		incident.CurrentEscalationStep,
-		incident.EscalationRepeatCount,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to acknowledge incident: %w", err)
-	}
-
-	return nil
-}
-
-// ResolveIncident marks an incident as resolved by the given user.
-func (s *OnCallService) ResolveIncident(incidentID, userID int) error {
-	incident, err := s.onCallRepo.GetIncidentByID(incidentID)
-	if err != nil {
-		return fmt.Errorf("failed to get incident: %w", err)
-	}
-
-	now := time.Now()
-	err = s.onCallRepo.UpdateIncident(
-		incident.ID,
-		"resolved",
-		incident.AcknowledgedAt,
-		incident.AcknowledgedBy,
-		&now,
-		&userID,
-		incident.CurrentEscalationStep,
-		incident.EscalationRepeatCount,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to resolve incident: %w", err)
-	}
-
-	return nil
+	return resp
 }
 
 // CreateSwapOverride converts an approved swap request into a schedule override,

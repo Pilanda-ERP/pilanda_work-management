@@ -27,10 +27,11 @@ CREATE TABLE IF NOT EXISTS system_settings (
 CREATE INDEX IF NOT EXISTS idx_system_settings_key ON system_settings(key);
 CREATE INDEX IF NOT EXISTS idx_system_settings_category ON system_settings(category);
 
--- Personal labels table
+-- Personal labels table. Name uniqueness is scoped per user (shared labels
+-- have user_id NULL and share one namespace).
 CREATE TABLE IF NOT EXISTS personal_labels (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	name TEXT NOT NULL UNIQUE,
+	name TEXT NOT NULL,
 	color TEXT DEFAULT '#3B82F6',
 	user_id INTEGER,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS personal_labels (
 );
 
 CREATE INDEX IF NOT EXISTS idx_personal_labels_user_id ON personal_labels(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_personal_labels_user_name ON personal_labels(COALESCE(user_id, 0), name);
 
 -- Reviews table
 CREATE TABLE IF NOT EXISTS reviews (
@@ -84,6 +86,8 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	expires_at DATETIME NULL,
 	last_used_at DATETIME NULL,
 	is_temporary BOOLEAN DEFAULT false,
+	oauth_client_id TEXT,
+	oauth_resource TEXT,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -108,7 +112,8 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 	client_secret_hash TEXT,             -- bcrypt; null for public clients
 	redirect_uris TEXT NOT NULL DEFAULT '[]',
 	allowed_scopes TEXT NOT NULL DEFAULT '[]',
-	enabled BOOLEAN NOT NULL DEFAULT 1,
+	resource_uri TEXT,
+	enabled BOOLEAN NOT NULL DEFAULT TRUE,
 	created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -132,6 +137,7 @@ CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
 	code_challenge TEXT,
 	code_challenge_method TEXT,          -- 'S256' only (plain PKCE is rejected at /authorize and /token)
 	state TEXT,
+	resource_uri TEXT,
 	expires_at DATETIME NOT NULL,
 	consumed_at DATETIME,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -153,6 +159,7 @@ CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
 	user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
 	agent_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
 	scopes TEXT NOT NULL DEFAULT '[]',
+	resource_uri TEXT,
 	expires_at DATETIME NOT NULL,
 	revoked_at DATETIME,
 	rotated_to_id INTEGER REFERENCES oauth_refresh_tokens(id) ON DELETE SET NULL,
@@ -183,6 +190,7 @@ CREATE TABLE IF NOT EXISTS collections (
 	ql_query TEXT,
 	filter_state TEXT,
 	is_public BOOLEAN DEFAULT false,
+	is_private BOOLEAN NOT NULL DEFAULT false,
 	workspace_id INTEGER,
 	category_id INTEGER,
 	created_by INTEGER,
@@ -232,6 +240,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_active_timers_user_id ON active_timers(use
 -- Themes table
 CREATE TABLE IF NOT EXISTS themes (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	builtin_key TEXT,
 	name TEXT NOT NULL,
 	description TEXT,
 	is_default BOOLEAN DEFAULT false,
@@ -240,9 +249,13 @@ CREATE TABLE IF NOT EXISTS themes (
 	nav_text_color_light TEXT NOT NULL DEFAULT '#374151',
 	nav_background_color_dark TEXT NOT NULL DEFAULT '#1f2937',
 	nav_text_color_dark TEXT NOT NULL DEFAULT '#f3f4f6',
+	logo_url TEXT,
+	logo_url_dark TEXT,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_themes_builtin_key ON themes(builtin_key) WHERE builtin_key IS NOT NULL;
 
 -- Board configuration tables
 CREATE TABLE IF NOT EXISTS board_configurations (
@@ -253,7 +266,9 @@ CREATE TABLE IF NOT EXISTS board_configurations (
 	list_columns TEXT, -- JSON array of list column configurations
 	roadmap_config TEXT, -- JSON object with roadmap view settings
 	card_fields TEXT, -- JSON array of card field configurations
+	view_settings TEXT, -- JSON object of view-scoped settings (enabled_views)
 	show_rightmost_column_last_50 BOOLEAN DEFAULT false,
+	completed_item_retention_days INTEGER,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -317,7 +332,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 	resource_id INTEGER,
 	resource_name TEXT,
 	details TEXT,
-	success BOOLEAN NOT NULL DEFAULT 1,
+	success BOOLEAN NOT NULL DEFAULT TRUE,
 	error_message TEXT,
 	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 );
@@ -487,6 +502,24 @@ CREATE TABLE IF NOT EXISTS cli_auth_codes (
 CREATE INDEX IF NOT EXISTS idx_cli_auth_codes_code ON cli_auth_codes(code);
 CREATE INDEX IF NOT EXISTS idx_cli_auth_codes_expires_at ON cli_auth_codes(expires_at);
 
+-- Native auth codes (short-lived, single-use). Bridge a system-browser SSO
+-- login back into a native client (desktop/iOS, WI-446): each code is bound
+-- to a session and redeemed once at /api/auth/native/exchange for the encoded
+-- session cookie.
+CREATE TABLE IF NOT EXISTS native_auth_codes (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	code TEXT NOT NULL UNIQUE,
+	session_token TEXT NOT NULL,
+	session_expires_at DATETIME NOT NULL,
+	status TEXT NOT NULL DEFAULT 'valid',
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	expires_at DATETIME NOT NULL,
+	consumed_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_native_auth_codes_code ON native_auth_codes(code);
+CREATE INDEX IF NOT EXISTS idx_native_auth_codes_expires_at ON native_auth_codes(expires_at);
+
 -- Background scheduler runs: one row per tick of each in-process scheduler
 -- (briefing, email, recurrence, notification). Surfaced on the admin
 -- Diagnostics page so admins can see whether jobs ran on time, how long they
@@ -498,7 +531,7 @@ CREATE TABLE IF NOT EXISTS scheduler_runs (
 	completed_at DATETIME,
 	duration_ms INTEGER,
 	items_processed INTEGER,
-	success BOOLEAN NOT NULL DEFAULT 0,
+	success BOOLEAN NOT NULL DEFAULT FALSE,
 	error_message TEXT
 );
 
@@ -528,7 +561,11 @@ CREATE TABLE IF NOT EXISTS pending_custom_field_cleanups (
 	started_at DATETIME,
 	completed_at DATETIME,
 	items_processed INTEGER NOT NULL DEFAULT 0,
+	attempt_count INTEGER NOT NULL DEFAULT 0,
+	next_attempt_at DATETIME,
 	error_message TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_cfv_cleanups_status ON pending_custom_field_cleanups(status, created_at);
+
+-- migration: 0000_baseline

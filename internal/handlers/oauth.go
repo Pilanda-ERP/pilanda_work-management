@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -28,16 +30,19 @@ import (
 // OAuth 2.0 server lifetimes. Hardcoded constants in v1; configurable via
 // system_settings later if needed.
 const (
-	oauthCodeTTL     = 60 * time.Second
-	oauthAccessTTL   = 1 * time.Hour
-	oauthRefreshTTL  = 30 * 24 * time.Hour
-	oauthAgentPrefix = "oauth-" // agent username = oauth-{slug}-{user_id}
+	oauthCodeTTL          = 60 * time.Second
+	oauthAccessTTL        = 1 * time.Hour
+	oauthRefreshTTL       = 30 * 24 * time.Hour
+	oauthAgentPrefix      = "oauth-" // agent username = oauth-{slug}-{user_id}
+	maxOAuthAgentUsername = 32
 
 	// oauthTokenRequestMaxBytes caps the /token request body. Token requests
 	// carry only a handful of short form/JSON fields; 64 KiB is generous while
 	// bounding the per-request memory/CPU an unauthenticated caller can spend.
 	oauthTokenRequestMaxBytes = 64 << 10
 )
+
+var errOAuthRefreshAlreadyRedeemed = errors.New("refresh token already redeemed")
 
 // Standard RFC 6749 §5.2 error codes used in /token + redirect-back error
 // query strings. Strings are part of the wire contract — don't rename.
@@ -77,18 +82,32 @@ type OAuthHandler struct {
 	tokenManager      *auth.TokenManager
 	apiToken          *APITokenHandler
 	permissionService *services.PermissionService
+	issuerURL         string
+	mcpResourceURI    string
+	mcpMetadataURI    string
+}
+
+// OAuthServerConfig identifies this Windshift deployment on the OAuth wire.
+// IssuerURL is the externally visible BASE_URL, including any context path.
+type OAuthServerConfig struct {
+	IssuerURL  string
+	MCPEnabled bool
 }
 
 // NewOAuthHandler wires the handler. All deps are required; the routes
 // refuse to register otherwise (see routes/admin.go).
-func NewOAuthHandler(db database.Database, ah *AgentHandler, tm *auth.TokenManager, ath *APITokenHandler, ps *services.PermissionService) *OAuthHandler {
-	return &OAuthHandler{
+func NewOAuthHandler(db database.Database, ah *AgentHandler, tm *auth.TokenManager, ath *APITokenHandler, ps *services.PermissionService, cfg ...OAuthServerConfig) *OAuthHandler {
+	h := &OAuthHandler{
 		db:                db,
 		agent:             ah,
 		tokenManager:      tm,
 		apiToken:          ath,
 		permissionService: ps,
 	}
+	if len(cfg) > 0 {
+		h.configureOAuthServer(cfg[0])
+	}
+	return h
 }
 
 // AuthorizeInfoResponse is the SPA consent page's view of an /authorize
@@ -102,6 +121,7 @@ type AuthorizeInfoResponse struct {
 	State               string   `json:"state"`
 	CodeChallenge       string   `json:"code_challenge,omitempty"`
 	CodeChallengeMethod string   `json:"code_challenge_method,omitempty"`
+	Resource            string   `json:"resource,omitempty"`
 }
 
 // AuthorizeInfo answers the consent page's "what is this request?" query.
@@ -118,6 +138,7 @@ func (h *OAuthHandler) AuthorizeInfo(w http.ResponseWriter, r *http.Request) {
 	state := q.Get("state")
 	codeChallenge := q.Get("code_challenge")
 	codeChallengeMethod := q.Get("code_challenge_method")
+	resource := q.Get("resource")
 
 	if responseType != "code" {
 		respondBadRequest(w, r, "response_type must be 'code'")
@@ -126,9 +147,7 @@ func (h *OAuthHandler) AuthorizeInfo(w http.ResponseWriter, r *http.Request) {
 
 	client, err := h.lookupEnabledClientByClientID(clientID)
 	if err != nil {
-		// Don't leak whether the client_id exists — the user shouldn't see
-		// fingerprint-able errors here. The admin's audit log still records
-		// the failed lookup if/when we plumb it.
+		// Keep unknown-client responses indistinguishable to avoid client-ID probing.
 		respondBadRequest(w, r, "Unknown or disabled client_id")
 		return
 	}
@@ -137,22 +156,19 @@ func (h *OAuthHandler) AuthorizeInfo(w http.ResponseWriter, r *http.Request) {
 		respondBadRequest(w, r, "redirect_uri does not match a registered URI for this client")
 		return
 	}
-
-	requested := splitOAuthScopes(scopeStr)
-	if len(requested) == 0 {
-		respondBadRequest(w, r, "at least one scope is required")
-		return
-	}
-	granted, err := intersectScopes(requested, client.AllowedScopes)
+	resource, err = h.validateOAuthResource(client, resource)
 	if err != nil {
 		respondBadRequest(w, r, err.Error())
 		return
 	}
 
-	// Public clients must use PKCE. Confidential clients may use it. When PKCE
-	// is in play we require S256: `plain` (and the RFC 7636 default of `plain`
-	// when the method is omitted) exposes the verifier-equivalent challenge in
-	// the authorization request, defeating interception protection.
+	granted, err := grantedScopes(scopeStr, client.AllowedScopes)
+	if err != nil {
+		respondBadRequest(w, r, err.Error())
+		return
+	}
+
+	// Public clients require PKCE; S256 prevents exposing the verifier-equivalent challenge.
 	if client.ClientType == "public" && codeChallenge == "" {
 		respondBadRequest(w, r, "code_challenge is required for public clients")
 		return
@@ -172,6 +188,7 @@ func (h *OAuthHandler) AuthorizeInfo(w http.ResponseWriter, r *http.Request) {
 		State:               state,
 		CodeChallenge:       codeChallenge,
 		CodeChallengeMethod: codeChallengeMethod,
+		Resource:            resource,
 	})
 }
 
@@ -187,6 +204,7 @@ type AuthorizeApproveRequest struct {
 	State               string `json:"state"`
 	CodeChallenge       string `json:"code_challenge,omitempty"`
 	CodeChallengeMethod string `json:"code_challenge_method,omitempty"`
+	Resource            string `json:"resource,omitempty"`
 }
 
 // AuthorizeApproveResponse tells the SPA where to send the browser next.
@@ -222,16 +240,19 @@ func (h *OAuthHandler) AuthorizeApprove(w http.ResponseWriter, r *http.Request) 
 		respondBadRequest(w, r, "redirect_uri does not match a registered URI for this client")
 		return
 	}
-
-	requested := splitOAuthScopes(req.Scope)
-	granted, err := intersectScopes(requested, client.AllowedScopes)
+	resource, err := h.validateOAuthResource(client, req.Resource)
 	if err != nil {
 		respondBadRequest(w, r, err.Error())
 		return
 	}
 
-	// Enforce S256 here too — the SPA echoes the /authorize/info params back,
-	// but a caller could POST straight to /approve and bypass that check.
+	granted, err := grantedScopes(req.Scope, client.AllowedScopes)
+	if err != nil {
+		respondBadRequest(w, r, err.Error())
+		return
+	}
+
+	// Repeat the S256 check because callers can post directly to /approve.
 	if client.ClientType == "public" && req.CodeChallenge == "" {
 		respondBadRequest(w, r, "code_challenge is required for public clients")
 		return
@@ -243,11 +264,10 @@ func (h *OAuthHandler) AuthorizeApprove(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Same gate the CLI flow uses — refuses to mint a token for a user
-	// whose api_key_creation_policy is disabled.
+	// Match the CLI gate so disabled token creation cannot mint OAuth tokens.
 	if err := h.apiToken.checkCreationPolicy(user.ID); err != nil {
 		h.audit(r, user, "oauth.approve", &client.ID, client.DisplayName, false,
-			map[string]interface{}{"reason": "token_policy_disabled"})
+			map[string]any{"reason": "token_policy_disabled"})
 		respondForbidden(w, r)
 		return
 	}
@@ -275,18 +295,19 @@ func (h *OAuthHandler) AuthorizeApprove(w http.ResponseWriter, r *http.Request) 
 	if _, err := h.db.ExecWrite(`
 		INSERT INTO oauth_authorization_codes (
 			code, client_id, user_id, agent_id, redirect_uri, scopes,
-			code_challenge, code_challenge_method, state, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			code_challenge, code_challenge_method, state, resource_uri, expires_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, code, client.ClientID, user.ID, agent.ID, req.RedirectURI, string(scopesJSON),
-		codeChallenge, codeChallengeMethod, req.State, expires); err != nil {
+		codeChallenge, codeChallengeMethod, req.State, nullStringOrEmpty(resource), expires); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 
-	h.audit(r, user, "oauth.approve", &client.ID, client.DisplayName, true, map[string]interface{}{
+	h.audit(r, user, "oauth.approve", &client.ID, client.DisplayName, true, map[string]any{
 		"client_id": client.ClientID,
 		"scopes":    granted,
 		"agent_id":  agent.ID,
+		"resource":  resource,
 	})
 
 	respondJSONOK(w, AuthorizeApproveResponse{
@@ -310,9 +331,7 @@ func (h *OAuthHandler) AuthorizeDeny(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Best-effort lookup so we can reject obviously bad redirect URIs even
-	// on deny. If the client doesn't exist, return without redirecting —
-	// a malformed deny shouldn't bounce to an attacker URL.
+	// Validate the redirect before denying; never bounce an unknown client to an untrusted URL.
 	client, err := h.lookupEnabledClientByClientID(req.ClientID)
 	if err != nil {
 		respondBadRequest(w, r, "Unknown or disabled client_id")
@@ -322,8 +341,12 @@ func (h *OAuthHandler) AuthorizeDeny(w http.ResponseWriter, r *http.Request) {
 		respondBadRequest(w, r, "redirect_uri does not match a registered URI for this client")
 		return
 	}
+	if _, err := h.validateOAuthResource(client, req.Resource); err != nil {
+		respondBadRequest(w, r, err.Error())
+		return
+	}
 
-	h.audit(r, user, "oauth.deny", &client.ID, client.DisplayName, true, map[string]interface{}{
+	h.audit(r, user, "oauth.deny", &client.ID, client.DisplayName, true, map[string]any{
 		"client_id": client.ClientID,
 	})
 
@@ -359,7 +382,7 @@ func (h *OAuthHandler) Userinfo(w http.ResponseWriter, r *http.Request) {
 		respondUnauthorized(w, r)
 		return
 	}
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"sub":      fmt.Sprintf("%d", user.ID),
 		"email":    user.Email,
 		"name":     firstNonEmpty(user.FullName, user.Username),
@@ -371,18 +394,14 @@ func (h *OAuthHandler) Userinfo(w http.ResponseWriter, r *http.Request) {
 // application/x-www-form-urlencoded or application/json bodies. Two grant
 // types are supported: authorization_code and refresh_token.
 func (h *OAuthHandler) Token(w http.ResponseWriter, r *http.Request) {
-	// RFC 6749 §2.3.1 mandates that confidential clients NOT pass credentials
-	// in the URL. Reject query-string client_secret outright — it would leak
-	// into webserver/proxy access logs and browser history if a misbehaving
-	// client put it there.
+	// Reject URL credentials because logs and browser history can expose them.
 	if r.URL.Query().Get("client_secret") != "" {
 		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidRequest,
 			"client_secret must not be sent in the URL — use the request body or HTTP Basic auth")
 		return
 	}
 
-	// Cap the body before parsing (form or JSON) so an oversized request can't
-	// exhaust memory/CPU on this unauthenticated endpoint.
+	// Bound the unauthenticated request body before parsing.
 	r.Body = http.MaxBytesReader(w, r.Body, oauthTokenRequestMaxBytes)
 
 	params, err := parseTokenRequest(r)
@@ -418,6 +437,7 @@ func (h *OAuthHandler) tokenAuthorizationCode(w http.ResponseWriter, r *http.Req
 	code := params.Get("code")
 	redirectURI := params.Get("redirect_uri")
 	codeVerifier := params.Get("code_verifier")
+	resource := params.Get("resource")
 
 	if clientID == "" || code == "" || redirectURI == "" {
 		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidRequest,
@@ -447,10 +467,13 @@ func (h *OAuthHandler) tokenAuthorizationCode(w http.ResponseWriter, r *http.Req
 			"redirect_uri does not match the value used in /authorize")
 		return
 	}
+	resource, err = matchStoredOAuthResource(authCode.ResourceURI, resource)
+	if err != nil {
+		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidGrant, err.Error())
+		return
+	}
 
-	// PKCE verifier check. Required for public clients (authenticateClient
-	// allowed an empty secret only if PKCE is in play); optional but
-	// honored for confidential clients that set a code_challenge.
+	// Validate PKCE when supplied; public clients must always provide it.
 	if authCode.CodeChallenge != "" {
 		if codeVerifier == "" {
 			writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidGrant,
@@ -462,8 +485,7 @@ func (h *OAuthHandler) tokenAuthorizationCode(w http.ResponseWriter, r *http.Req
 			return
 		}
 	} else if client.ClientType == "public" {
-		// Public client without PKCE. Should have been caught at /authorize
-		// but enforce here too as a safety net.
+		// Enforce the public-client requirement again at token exchange.
 		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidGrant,
 			"PKCE is required for public clients")
 		return
@@ -475,17 +497,18 @@ func (h *OAuthHandler) tokenAuthorizationCode(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	resp, err := h.mintAccessAndRefresh(client, authCode.UserID, authCode.AgentID, scopes)
+	resp, err := h.mintAccessAndRefresh(client, authCode.UserID, authCode.AgentID, scopes, resource)
 	if err != nil {
 		writeOAuthTokenError(w, http.StatusInternalServerError, oauthErrServerError, err.Error())
 		return
 	}
 
-	h.auditClient(r, client, "oauth.token.issue", map[string]interface{}{
+	h.auditClient(r, client, "oauth.token.issue", map[string]any{
 		"grant_type": "authorization_code",
 		"user_id":    authCode.UserID,
 		"agent_id":   authCode.AgentID,
 		"scopes":     scopes,
+		"resource":   resource,
 	})
 
 	respondJSONOK(w, resp)
@@ -499,6 +522,7 @@ func (h *OAuthHandler) tokenRefreshToken(w http.ResponseWriter, r *http.Request,
 	clientID := params.Get("client_id")
 	clientSecret := params.Get("client_secret")
 	refreshPlain := params.Get("refresh_token")
+	resource := params.Get("resource")
 
 	if clientID == "" || refreshPlain == "" {
 		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidRequest,
@@ -527,14 +551,20 @@ func (h *OAuthHandler) tokenRefreshToken(w http.ResponseWriter, r *http.Request,
 			"refresh_token was issued to a different client")
 		return
 	}
+	resource, err = matchStoredOAuthResource(row.ResourceURI, resource)
+	if err != nil {
+		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidGrant, err.Error())
+		return
+	}
 
-	// Replay detection — an already-revoked token presented again means the
-	// chain is compromised. Cascade-revoke everything reachable via
-	// rotated_to_id from this row, including the new tokens the attacker
-	// might already hold.
+	// A replayed refresh token compromises its whole rotation chain.
 	if row.RevokedAt.Valid {
-		h.cascadeRevokeRefreshChain(row.ID)
-		h.auditClient(r, client, "oauth.token.refresh_replay", map[string]interface{}{
+		if err := h.cascadeRevokeRefreshChain(r.Context(), row.ID); err != nil {
+			writeOAuthTokenError(w, http.StatusInternalServerError, oauthErrServerError,
+				"failed to revoke compromised refresh-token family")
+			return
+		}
+		h.auditClient(r, client, "oauth.token.refresh_replay", map[string]any{
 			"refresh_id": row.ID,
 		})
 		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidGrant,
@@ -553,46 +583,44 @@ func (h *OAuthHandler) tokenRefreshToken(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	resp, err := h.mintAccessAndRefresh(client, row.UserID, row.AgentID, scopes)
+	rotation, err := h.rotateRefreshToken(r.Context(), client, row, scopes, resource)
+	if errors.Is(err, errOAuthRefreshAlreadyRedeemed) {
+		// A concurrent claim is also replay; revoke the complete family.
+		if revokeErr := h.cascadeRevokeRefreshChain(r.Context(), row.ID); revokeErr != nil {
+			writeOAuthTokenError(w, http.StatusInternalServerError, oauthErrServerError,
+				"failed to revoke compromised refresh-token family")
+			return
+		}
+		h.auditClient(r, client, "oauth.token.refresh_replay", map[string]any{
+			"refresh_id": row.ID,
+		})
+		writeOAuthTokenError(w, http.StatusBadRequest, oauthErrInvalidGrant,
+			"refresh_token has been revoked")
+		return
+	}
 	if err != nil {
 		writeOAuthTokenError(w, http.StatusInternalServerError, oauthErrServerError, err.Error())
 		return
 	}
 
-	// Rotate: the just-presented refresh is marked revoked + rotated_to the
-	// new id. The new id was returned by mintAccessAndRefresh; we need to
-	// look it up to write rotated_to_id (small extra query — could be
-	// folded into mintAccessAndRefresh later).
-	newRefreshHash := hashRefreshToken(resp.RefreshToken)
-	var newID int
-	if err := h.db.QueryRow(
-		`SELECT id FROM oauth_refresh_tokens WHERE token_hash = ?`, newRefreshHash,
-	).Scan(&newID); err == nil {
-		_, _ = h.db.ExecWrite(
-			`UPDATE oauth_refresh_tokens SET revoked_at = CURRENT_TIMESTAMP, rotated_to_id = ? WHERE id = ?`,
-			newID, row.ID,
-		)
-	}
-
-	// Revoke the old access token alongside the rotation so a leaked old
-	// access token doesn't keep working past its natural 1h.
-	_ = h.tokenManager.AdminRevokeToken(row.APITokenID)
-
-	h.auditClient(r, client, "oauth.token.refresh", map[string]interface{}{
+	h.auditClient(r, client, "oauth.token.refresh", map[string]any{
 		"old_refresh_id": row.ID,
-		"new_refresh_id": newID,
+		"new_refresh_id": rotation.NewRefreshID,
 		"user_id":        row.UserID,
 		"agent_id":       row.AgentID,
+		"resource":       resource,
 	})
 
-	respondJSONOK(w, resp)
+	respondJSONOK(w, rotation.Response)
 }
 
 // findOrCreateClientAgent returns the per-(client, user) agent that all
 // OAuth-issued tokens for this pair are bound to. Username convention is
-// `oauth-{slug}-{user_id}` — collision-free across clients and users.
+// `oauth-{slug}-{user_id}` when it fits. Long client slugs fall back to
+// `oauth-{client_id}-{user_id}`, which stays collision-free while respecting
+// the agent username contract.
 func (h *OAuthHandler) findOrCreateClientAgent(user *models.User, client *oauthClientRow) (*models.User, error) {
-	username := fmt.Sprintf("%s%s-%d", oauthAgentPrefix, client.Slug, user.ID)
+	username := oauthAgentUsername(client.ID, client.Slug, user.ID)
 	existing, err := h.agent.FindOwnedAgentByUsername(user.ID, username)
 	if err != nil {
 		return nil, err
@@ -609,14 +637,8 @@ func (h *OAuthHandler) findOrCreateClientAgent(user *models.User, client *oauthC
 		FirstName: client.DisplayName,
 		LastName:  fmt.Sprintf("for %s", firstNonEmpty(user.Username, fmt.Sprintf("user-%d", user.ID))),
 	}
-	// CreateOAuthAgent (vs CreateOwnedAgent) carves OAuth-issued agents out
-	// of the user-managed agents policy: 'allow_user_managed_agents' gates
-	// the human-facing "create agent" UI, NOT third-party OAuth integrations.
-	// Conflating them meant non-admin OAuth would 4xx on instances where the
-	// policy is off, while admins silently bypassed it — privilege-dependent
-	// behavior that defeated the policy's intent. CreateOAuthAgent persists
-	// agent_provenance='oauth' + oauth_client_id, which the schema CHECK
-	// constraints require to coexist.
+	// OAuth agents bypass the human-facing user-managed-agent policy and persist
+	// required oauth provenance/client fields through CreateOAuthAgent.
 	created, createErr := h.agent.CreateOAuthAgent(user.ID, client.ID, createReq)
 	if createErr != nil {
 		switch {
@@ -629,6 +651,14 @@ func (h *OAuthHandler) findOrCreateClientAgent(user *models.User, client *oauthC
 		}
 	}
 	return created, nil
+}
+
+func oauthAgentUsername(clientID int, clientSlug string, userID int) string {
+	username := fmt.Sprintf("%s%s-%d", oauthAgentPrefix, clientSlug, userID)
+	if utf8.RuneCountInString(username) <= maxOAuthAgentUsername {
+		return username
+	}
+	return fmt.Sprintf("%s%d-%d", oauthAgentPrefix, clientID, userID)
 }
 
 // TokenResponse is the RFC 6749 §5.1 successful response.
@@ -644,16 +674,18 @@ type oauthTokenResponse struct {
 // (30d), inserting a row into oauth_refresh_tokens that points at the
 // access token's api_tokens row. Used by both the authorization-code and
 // refresh-token grant paths.
-func (h *OAuthHandler) mintAccessAndRefresh(client *oauthClientRow, userID, agentID int, scopes []string) (*oauthTokenResponse, error) {
+func (h *OAuthHandler) mintAccessAndRefresh(client *oauthClientRow, userID, agentID int, scopes []string, resource string) (*oauthTokenResponse, error) {
 	// Mint the `crw_…` access token. Bound to the agent (not the human
 	// user) so audit logs and Windshift's per-actor accounting attribute
 	// the actions to the OAuth client identity, not the human directly.
 	expiresAt := time.Now().Add(oauthAccessTTL)
 	tokenName := fmt.Sprintf("oauth-%s", client.Slug)
 	tr, err := h.tokenManager.CreateToken(agentID, models.APITokenCreate{
-		Name:        tokenName,
-		Permissions: scopes,
-		ExpiresAt:   &expiresAt,
+		Name:          tokenName,
+		Permissions:   scopes,
+		ExpiresAt:     &expiresAt,
+		OAuthClientID: client.ClientID,
+		OAuthResource: resource,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to mint access token: %w", err)
@@ -673,10 +705,10 @@ func (h *OAuthHandler) mintAccessAndRefresh(client *oauthClientRow, userID, agen
 	if _, err := h.db.ExecWrite(`
 		INSERT INTO oauth_refresh_tokens (
 			token_hash, api_token_id, client_id, user_id, agent_id,
-			scopes, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+			scopes, resource_uri, expires_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, refreshHash, tr.APIToken.ID, client.ClientID, userID, agentID,
-		string(scopesJSON), time.Now().Add(oauthRefreshTTL)); err != nil {
+		string(scopesJSON), nullStringOrEmpty(resource), time.Now().Add(oauthRefreshTTL)); err != nil {
 		// Best-effort: revoke the just-minted access token so we don't
 		// leave a live credential stranded if the refresh insert fails.
 		_ = h.tokenManager.AdminRevokeToken(tr.APIToken.ID)
@@ -689,6 +721,123 @@ func (h *OAuthHandler) mintAccessAndRefresh(client *oauthClientRow, userID, agen
 		ExpiresIn:    int(oauthAccessTTL.Seconds()),
 		RefreshToken: refreshPlain,
 		Scope:        strings.Join(scopes, " "),
+	}, nil
+}
+
+type oauthRefreshRotation struct {
+	Response     *oauthTokenResponse
+	NewRefreshID int
+}
+
+// rotateRefreshToken atomically claims the presented refresh token, creates
+// its replacement credential pair, links the lineage, and expires the old
+// access token. No credential is returned unless every write commits.
+func (h *OAuthHandler) rotateRefreshToken(ctx context.Context, client *oauthClientRow, old *oauthRefreshTokenRow, scopes []string, resource string) (*oauthRefreshRotation, error) {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin refresh rotation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	claim, err := tx.ExecWriteContext(ctx, `
+		UPDATE oauth_refresh_tokens
+		SET revoked_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND revoked_at IS NULL
+	`, old.ID)
+	if err != nil {
+		return nil, fmt.Errorf("claim refresh token: %w", err)
+	}
+	affected, err := claim.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("check refresh-token claim: %w", err)
+	}
+	if affected != 1 {
+		return nil, errOAuthRefreshAlreadyRedeemed
+	}
+
+	accessExpiresAt := time.Now().Add(oauthAccessTTL)
+	tokenName := fmt.Sprintf("oauth-%s", client.Slug)
+	access, err := h.tokenManager.CreateTokenInTx(tx, old.AgentID, models.APITokenCreate{
+		Name:          tokenName,
+		Permissions:   scopes,
+		ExpiresAt:     &accessExpiresAt,
+		OAuthClientID: client.ClientID,
+		OAuthResource: resource,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mint replacement access token: %w", err)
+	}
+
+	refreshPlain, err := generateOAuthRefreshToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate replacement refresh token: %w", err)
+	}
+	scopesJSON, err := json.Marshal(scopes)
+	if err != nil {
+		return nil, fmt.Errorf("marshal replacement scopes: %w", err)
+	}
+	var newRefreshID int
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO oauth_refresh_tokens (
+			token_hash, api_token_id, client_id, user_id, agent_id,
+			scopes, resource_uri, expires_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING id
+	`, hashRefreshToken(refreshPlain), access.APIToken.ID, client.ClientID,
+		old.UserID, old.AgentID, string(scopesJSON), nullStringOrEmpty(resource),
+		time.Now().Add(oauthRefreshTTL)).Scan(&newRefreshID); err != nil {
+		return nil, fmt.Errorf("record replacement refresh token: %w", err)
+	}
+
+	link, err := tx.ExecWriteContext(ctx, `
+		UPDATE oauth_refresh_tokens
+		SET rotated_to_id = ?
+		WHERE id = ? AND revoked_at IS NOT NULL AND rotated_to_id IS NULL
+	`, newRefreshID, old.ID)
+	if err != nil {
+		return nil, fmt.Errorf("link refresh-token rotation: %w", err)
+	}
+	linked, err := link.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("check refresh-token link: %w", err)
+	}
+	if linked != 1 {
+		return nil, fmt.Errorf("link refresh-token rotation: expected one row, updated %d", linked)
+	}
+
+	// Keep the api_tokens row so its ON DELETE CASCADE cannot erase the old
+	// refresh row and defeat replay detection. Expiry makes the bearer token
+	// unusable while preserving the refresh lineage for later replay checks.
+	expire, err := tx.ExecWriteContext(ctx, `
+		UPDATE api_tokens
+		SET expires_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, old.APITokenID)
+	if err != nil {
+		return nil, fmt.Errorf("expire rotated access token: %w", err)
+	}
+	expired, err := expire.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("check rotated access-token expiry: %w", err)
+	}
+	if expired != 1 {
+		return nil, fmt.Errorf("expire rotated access token: expected one row, updated %d", expired)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit refresh rotation: %w", err)
+	}
+	h.tokenManager.InvalidateTokens([]int{old.APITokenID})
+
+	return &oauthRefreshRotation{
+		Response: &oauthTokenResponse{
+			AccessToken:  access.Token,
+			TokenType:    "Bearer",
+			ExpiresIn:    int(oauthAccessTTL.Seconds()),
+			RefreshToken: refreshPlain,
+			Scope:        strings.Join(scopes, " "),
+		},
+		NewRefreshID: newRefreshID,
 	}, nil
 }
 
@@ -732,21 +881,23 @@ func (h *OAuthHandler) consumeAuthorizationCode(code string) (*oauthAuthCodeRow,
 		codeChallengeMethod sql.NullString
 		consumedAt          sql.NullTime
 		state               sql.NullString
+		resourceURI         sql.NullString
 	)
 	err := h.db.QueryRow(`
 		SELECT id, code, client_id, user_id, agent_id, redirect_uri, scopes,
-			code_challenge, code_challenge_method, state, expires_at, consumed_at
+			code_challenge, code_challenge_method, state, resource_uri, expires_at, consumed_at
 		FROM oauth_authorization_codes
 		WHERE code = ?
 	`, code).Scan(&row.ID, &row.Code, &row.ClientID, &row.UserID, &row.AgentID,
 		&row.RedirectURI, &row.Scopes, &codeChallenge, &codeChallengeMethod,
-		&state, &row.ExpiresAt, &consumedAt)
+		&state, &resourceURI, &row.ExpiresAt, &consumedAt)
 	if err != nil {
 		return nil, err
 	}
 	row.CodeChallenge = codeChallenge.String
 	row.CodeChallengeMethod = codeChallengeMethod.String
 	row.State = state.String
+	row.ResourceURI = resourceURI.String
 
 	if consumedAt.Valid {
 		return nil, fmt.Errorf("authorization code has already been consumed")
@@ -777,17 +928,19 @@ func (h *OAuthHandler) lookupRefreshToken(plain string) (*oauthRefreshTokenRow, 
 	row := &oauthRefreshTokenRow{}
 	var revokedAt sql.NullTime
 	var rotatedToID sql.NullInt64
+	var resourceURI sql.NullString
 	err := h.db.QueryRow(`
 		SELECT id, token_hash, api_token_id, client_id, user_id, agent_id,
-			scopes, expires_at, revoked_at, rotated_to_id
+			scopes, resource_uri, expires_at, revoked_at, rotated_to_id
 		FROM oauth_refresh_tokens
 		WHERE token_hash = ?
 	`, hashHex).Scan(&row.ID, &row.TokenHash, &row.APITokenID, &row.ClientID,
-		&row.UserID, &row.AgentID, &row.Scopes, &row.ExpiresAt, &revokedAt, &rotatedToID)
+		&row.UserID, &row.AgentID, &row.Scopes, &resourceURI, &row.ExpiresAt, &revokedAt, &rotatedToID)
 	if err != nil {
 		return nil, err
 	}
 	row.RevokedAt = revokedAt
+	row.ResourceURI = resourceURI.String
 	if rotatedToID.Valid {
 		v := int(rotatedToID.Int64)
 		row.RotatedToID = &v
@@ -802,11 +955,16 @@ func (h *OAuthHandler) lookupRefreshToken(plain string) (*oauthRefreshTokenRow, 
 //
 // Also revokes the api_tokens that those refresh rows point at, so leaked
 // access tokens get cut off at the same time.
-func (h *OAuthHandler) cascadeRevokeRefreshChain(startID int) {
-	// Walk the chain forward, collecting ids + api_token_ids.
+func (h *OAuthHandler) cascadeRevokeRefreshChain(ctx context.Context, startID int) error {
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin refresh-family revocation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Lock each row while walking forward and collect its access-token IDs.
 	var (
 		visited     = map[int]struct{}{}
-		ids         = []int{}
 		apiTokenIDs = []int{}
 		queue       = []int{startID}
 	)
@@ -817,16 +975,35 @@ func (h *OAuthHandler) cascadeRevokeRefreshChain(startID int) {
 			continue
 		}
 		visited[current] = struct{}{}
-		ids = append(ids, current)
+
+		// Lock before reading the successor so concurrent redemption cannot hide it.
+		locked, err := tx.ExecWriteContext(ctx, `
+			UPDATE oauth_refresh_tokens
+			SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP)
+			WHERE id = ?
+		`, current)
+		if err != nil {
+			return fmt.Errorf("lock refresh-token family row %d: %w", current, err)
+		}
+		affected, err := locked.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("check refresh-token family row %d: %w", current, err)
+		}
+		if affected == 0 {
+			continue
+		}
 
 		var apiTokenID int
 		var rotatedTo sql.NullInt64
-		err := h.db.QueryRow(
+		err = tx.QueryRowContext(ctx,
 			`SELECT api_token_id, rotated_to_id FROM oauth_refresh_tokens WHERE id = ?`,
 			current,
 		).Scan(&apiTokenID, &rotatedTo)
-		if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load refresh-token family row %d: %w", current, err)
 		}
 		apiTokenIDs = append(apiTokenIDs, apiTokenID)
 		if rotatedTo.Valid {
@@ -834,14 +1011,20 @@ func (h *OAuthHandler) cascadeRevokeRefreshChain(startID int) {
 		}
 	}
 
-	for _, id := range ids {
-		_, _ = h.db.ExecWrite(
-			`UPDATE oauth_refresh_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE id = ? AND revoked_at IS NULL`, id,
-		)
-	}
 	for _, tid := range apiTokenIDs {
-		_ = h.tokenManager.AdminRevokeToken(tid)
+		if _, err := tx.ExecWriteContext(ctx, `
+			UPDATE api_tokens
+			SET expires_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, tid); err != nil {
+			return fmt.Errorf("expire refresh-family access token %d: %w", tid, err)
+		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit refresh-family revocation: %w", err)
+	}
+	h.tokenManager.InvalidateTokens(apiTokenIDs)
+	return nil
 }
 
 // oauthClientRow is the in-memory shape we use for client lookups inside
@@ -857,6 +1040,7 @@ type oauthClientRow struct {
 	ClientSecretHash string
 	RedirectURIs     []string
 	AllowedScopes    []string
+	ResourceURI      string
 	Enabled          bool
 }
 
@@ -868,14 +1052,15 @@ func (h *OAuthHandler) lookupEnabledClientByClientID(clientID string) (*oauthCli
 	}
 	c := &oauthClientRow{}
 	var secretHash sql.NullString
+	var resourceURI sql.NullString
 	var redirectsJSON, scopesJSON string
 	err := h.db.QueryRow(`
 		SELECT id, slug, display_name, client_id, client_type, client_secret_hash,
-			redirect_uris, allowed_scopes, enabled
+			redirect_uris, allowed_scopes, resource_uri, enabled
 		FROM oauth_clients
 		WHERE client_id = ?
 	`, clientID).Scan(&c.ID, &c.Slug, &c.DisplayName, &c.ClientID, &c.ClientType,
-		&secretHash, &redirectsJSON, &scopesJSON, &c.Enabled)
+		&secretHash, &redirectsJSON, &scopesJSON, &resourceURI, &c.Enabled)
 	if err != nil {
 		return nil, err
 	}
@@ -884,6 +1069,7 @@ func (h *OAuthHandler) lookupEnabledClientByClientID(clientID string) (*oauthCli
 	}
 	c.HasSecret = secretHash.Valid && secretHash.String != ""
 	c.ClientSecretHash = secretHash.String
+	c.ResourceURI = resourceURI.String
 	if redirectsJSON != "" {
 		_ = json.Unmarshal([]byte(redirectsJSON), &c.RedirectURIs)
 	}
@@ -905,6 +1091,7 @@ type oauthAuthCodeRow struct {
 	CodeChallenge       string
 	CodeChallengeMethod string
 	State               string
+	ResourceURI         string
 	ExpiresAt           time.Time
 }
 
@@ -917,13 +1104,14 @@ type oauthRefreshTokenRow struct {
 	UserID      int
 	AgentID     int
 	Scopes      string // JSON
+	ResourceURI string
 	ExpiresAt   time.Time
 	RevokedAt   sql.NullTime
 	RotatedToID *int
 }
 
 // audit emits a single audit-log entry for an OAuth event from the user side.
-func (h *OAuthHandler) audit(r *http.Request, user *models.User, action string, resourceID *int, resourceName string, success bool, details map[string]interface{}) {
+func (h *OAuthHandler) audit(r *http.Request, user *models.User, action string, resourceID *int, resourceName string, success bool, details map[string]any) {
 	_ = logger.LogAudit(h.db, logger.AuditEvent{
 		UserID:       user.ID,
 		Username:     user.Username,
@@ -941,7 +1129,7 @@ func (h *OAuthHandler) audit(r *http.Request, user *models.User, action string, 
 // auditClient emits an audit entry for a /token-side event where there's no
 // authenticated user — only the OAuth client and (sometimes) a user_id in
 // the details bag.
-func (h *OAuthHandler) auditClient(r *http.Request, client *oauthClientRow, action string, details map[string]interface{}) {
+func (h *OAuthHandler) auditClient(r *http.Request, client *oauthClientRow, action string, details map[string]any) {
 	_ = logger.LogAudit(h.db, logger.AuditEvent{
 		IPAddress:    utils.GetClientIP(r),
 		UserAgent:    r.UserAgent(),
@@ -1002,6 +1190,43 @@ func splitOAuthScopes(scopeStr string) []string {
 		return nil
 	}
 	return strings.Fields(scopeStr)
+}
+
+// grantedScopes resolves the scope set an authorization request should be
+// granted. A client that named scopes gets the strict subset check below; a
+// client that omitted the scope parameter falls back to auth.DefaultAgentScopes
+// so an MCP client that only follows the protected-resource challenge lands on
+// the same capabilities a `ws` CLI token receives (WI-960).
+func grantedScopes(scopeStr string, allowed []string) ([]string, error) {
+	if requested := splitOAuthScopes(scopeStr); len(requested) > 0 {
+		return intersectScopes(requested, allowed)
+	}
+	granted := defaultGrantScopes(allowed)
+	if len(granted) == 0 {
+		return nil, fmt.Errorf("this client has no grantable scopes")
+	}
+	return granted, nil
+}
+
+// defaultGrantScopes narrows DefaultAgentScopes to what a client is allowed to
+// hold. Unlike intersectScopes it drops non-allowed scopes rather than
+// erroring: the client never asked for them — the server substituted them — so
+// a narrowly configured client must still be able to complete the flow.
+func defaultGrantScopes(allowed []string) []string {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, s := range allowed {
+		allowedSet[s] = struct{}{}
+	}
+	out := make([]string, 0, len(auth.DefaultAgentScopes))
+	for _, s := range auth.DefaultAgentScopes {
+		if auth.IsAdminScope(s) {
+			continue
+		}
+		if _, ok := allowedSet[s]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // intersectScopes returns the requested scopes that are in the client's
@@ -1120,7 +1345,7 @@ func generateOAuthRefreshToken() (string, error) {
 // nullStringOrEmpty turns "" into a NULL-safe value for sql.Exec where the
 // column is nullable. Plain empty string would be stored as ”; we want NULL
 // so the consumed_at-style UPDATE-where-NULL guard works.
-func nullStringOrEmpty(s string) interface{} {
+func nullStringOrEmpty(s string) any {
 	if s == "" {
 		return nil
 	}

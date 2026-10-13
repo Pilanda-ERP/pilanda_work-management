@@ -2,62 +2,30 @@ package handlers
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
 	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
-	"windshift/internal/repository/actionutil"
-	"windshift/internal/restapi"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
-	"windshift/internal/services/actioncatalog"
 	"windshift/internal/utils"
 )
 
-// ActionsHandler handles action automation API endpoints
+// ActionsHandler retains the session-only capability administration surface.
 type ActionsHandler struct {
-	repo              *repository.ActionRepository
-	credentialRepo    *repository.ActionCredentialRepository
-	itemRepo          *repository.ItemRepository
-	auditor           *logger.Auditor
-	actionService     *services.ActionService
-	permissionService *services.PermissionService
-	keyCache          *WorkspaceKeyCache
+	repo           *repository.ActionRepository
+	credentialRepo *repository.ActionCredentialRepository
+	auditor        *logger.Auditor
+	keyCache       *WorkspaceKeyCache
 }
 
-// NewActionsHandler creates a new actions handler
-func NewActionsHandler(repo *repository.ActionRepository, credentialRepo *repository.ActionCredentialRepository, itemRepo *repository.ItemRepository, auditor *logger.Auditor, actionService *services.ActionService, permissionService *services.PermissionService, keyCache *WorkspaceKeyCache) *ActionsHandler {
-	return &ActionsHandler{
-		repo:              repo,
-		credentialRepo:    credentialRepo,
-		itemRepo:          itemRepo,
-		auditor:           auditor,
-		actionService:     actionService,
-		permissionService: permissionService,
-		keyCache:          keyCache,
-	}
+func NewActionsHandler(repo *repository.ActionRepository, credentialRepo *repository.ActionCredentialRepository, auditor *logger.Auditor, keyCache *WorkspaceKeyCache) *ActionsHandler {
+	return &ActionsHandler{repo: repo, credentialRepo: credentialRepo, auditor: auditor, keyCache: keyCache}
 }
 
-// requireWorkspaceAction parses workspace+action IDs and verifies ownership.
-func (h *ActionsHandler) requireWorkspaceAction(w http.ResponseWriter, r *http.Request) (workspaceID int, action *models.Action, ok bool) {
-	workspaceID, ok = requireWorkspaceIDParam(w, r, h.keyCache, "workspaceId")
-	if !ok {
-		return 0, nil, false
-	}
-	actionID, ok := requireIDParam(w, r, "id")
-	if !ok {
-		return 0, nil, false
-	}
-	action, ok = h.requireAction(w, r, actionID, workspaceID)
-	return workspaceID, action, ok
-}
-
-// requireCapability parses capability ID and fetches it.
 func (h *ActionsHandler) requireCapability(w http.ResponseWriter, r *http.Request) (*models.ActionCapability, bool) {
 	capID, ok := requireIDParam(w, r, "capabilityId")
 	if !ok {
@@ -73,531 +41,6 @@ func (h *ActionsHandler) requireCapability(w http.ResponseWriter, r *http.Reques
 		return nil, false
 	}
 	return capability, true
-}
-
-// HasCapability implements actioncatalog.CapabilityResolver. A capability is
-// reachable when it exists, is enabled, and is either workspace-wide or
-// explicitly scoped to the given workspace via the join table.
-func (h *ActionsHandler) HasCapability(workspaceID, capabilityID int) bool {
-	capability, err := h.repo.GetCapabilityByID(capabilityID)
-	if err != nil || capability == nil || !capability.IsEnabled {
-		return false
-	}
-	scoped, err := h.repo.IsCapabilityScopedToWorkspace(capabilityID, workspaceID)
-	return err == nil && scoped
-}
-
-func (h *ActionsHandler) HasCapabilityOfType(workspaceID, capabilityID int, capabilityType models.CapabilityType) bool {
-	capability, err := h.repo.GetCapabilityByID(capabilityID)
-	if err != nil || capability == nil || !capability.IsEnabled || capability.CapabilityType != capabilityType {
-		return false
-	}
-	scoped, err := h.repo.IsCapabilityScopedToWorkspace(capabilityID, workspaceID)
-	return err == nil && scoped
-}
-
-// validateActionDefinition runs the unified actioncatalog validator and
-// responds with a structured 400 if any errors were found. Returns true
-// when the action is safe to persist. The legacy surface emits the first
-// error's message as the human-readable text and the full list under
-// details.errors so older clients still see something useful.
-func (h *ActionsHandler) validateActionDefinition(w http.ResponseWriter, r *http.Request, workspaceID int, def actioncatalog.ActionDefinition) bool {
-	errs := actioncatalog.Validate(actioncatalog.Default(), def, workspaceID, h)
-	if len(errs) == 0 {
-		return true
-	}
-	apiErr := restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, errs[0].Message).
-		WithDetails(map[string]any{"errors": errs})
-	restapi.RespondError(w, r, apiErr)
-	return false
-}
-
-// requireAction fetches an action by ID and verifies workspace ownership.
-// Returns nil, false if not found or mismatched (error already written).
-// last review: ser, 260503, FIXME: requireWorkspaceAction overlap
-func (h *ActionsHandler) requireAction(w http.ResponseWriter, r *http.Request, actionID, workspaceID int) (*models.Action, bool) {
-	action, err := h.repo.GetByID(actionID)
-	if err == repository.ErrNotFound || (err == nil && action.WorkspaceID != workspaceID) {
-		respondNotFound(w, r, "action")
-		return nil, false
-	}
-	if err != nil {
-		respondInternalError(w, r, err)
-		return nil, false
-	}
-	return action, true
-}
-
-// actionCatalogResponse is the shape the cookie-auth /action-catalog
-// endpoint and (separately) the v1 surface return. Kept in handlers since
-// only the legacy palette consumes the cookie-auth variant — v1 has its
-// own DTOs in restapi/v1/handlers/actions.go.
-type actionCatalogResponse struct {
-	Scope        string                     `json:"scope"`
-	Triggers     []catalogTriggerEntry      `json:"triggers"`
-	Nodes        []catalogNodeEntry         `json:"nodes"`
-	Capabilities []catalogCapabilitySummary `json:"capabilities"`
-}
-
-type catalogTriggerEntry struct {
-	Type         models.ActionTriggerType `json:"type"`
-	Label        string                   `json:"label"`
-	Description  string                   `json:"description"`
-	ConfigSchema json.RawMessage          `json:"config_schema"`
-}
-
-type catalogNodeEntry struct {
-	Type         models.ActionNodeType `json:"type"`
-	Label        string                `json:"label"`
-	Description  string                `json:"description"`
-	Category     string                `json:"category"`
-	ConfigSchema json.RawMessage       `json:"config_schema"`
-	IsIterator   bool                  `json:"is_iterator"`
-	Outputs      []string              `json:"outputs"`
-}
-
-type catalogCapabilitySummary struct {
-	ID             int                   `json:"id"`
-	Name           string                `json:"name"`
-	CapabilityType models.CapabilityType `json:"capability_type"`
-}
-
-// GetActionCatalog returns the workspace-scoped action catalog used by the
-// visual palette. Gated by the same action.manage permission as the rest
-// of the actions surface; the catalog itself is workspace-independent but
-// the included capabilities list is filtered to the workspace's reach.
-func (h *ActionsHandler) GetActionCatalog(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := requireWorkspaceIDParam(w, r, h.keyCache, "workspaceId")
-	if !ok {
-		return
-	}
-
-	cat := actioncatalog.Default()
-	resp := actionCatalogResponse{Scope: "workspace"}
-	for _, t := range cat.Triggers() {
-		schemaJSON, _ := json.Marshal(t.ConfigSchema)
-		resp.Triggers = append(resp.Triggers, catalogTriggerEntry{
-			Type:         t.Type,
-			Label:        t.Label,
-			Description:  t.Description,
-			ConfigSchema: schemaJSON,
-		})
-	}
-	for _, n := range cat.Nodes() {
-		schemaJSON, _ := json.Marshal(n.ConfigSchema)
-		resp.Nodes = append(resp.Nodes, catalogNodeEntry{
-			Type:         n.Type,
-			Label:        n.Label,
-			Description:  n.Description,
-			Category:     n.Category,
-			ConfigSchema: schemaJSON,
-			IsIterator:   n.IsIterator,
-			Outputs:      n.Outputs,
-		})
-	}
-	caps, err := h.repo.ListCapabilitiesForWorkspace(workspaceID, "")
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	for _, c := range caps {
-		resp.Capabilities = append(resp.Capabilities, catalogCapabilitySummary{
-			ID:             c.ID,
-			Name:           c.Name,
-			CapabilityType: c.CapabilityType,
-		})
-	}
-	if resp.Capabilities == nil {
-		resp.Capabilities = []catalogCapabilitySummary{}
-	}
-	respondJSONOK(w, resp)
-}
-
-// ListActions lists all actions for a workspace
-func (h *ActionsHandler) ListActions(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := requireWorkspaceIDParam(w, r, h.keyCache, "workspaceId")
-	if !ok {
-		return
-	}
-
-	actions, err := h.repo.ListByWorkspace(workspaceID)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	if actions == nil {
-		actions = []*models.Action{}
-	}
-
-	respondJSONOK(w, actions)
-}
-
-// GetAction gets a single action by ID
-func (h *ActionsHandler) GetAction(w http.ResponseWriter, r *http.Request) {
-	_, action, ok := h.requireWorkspaceAction(w, r)
-	if !ok {
-		return
-	}
-	respondJSONOK(w, action)
-}
-
-// CreateAction creates a new action
-// last review: ser, 260503,
-func (h *ActionsHandler) CreateAction(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := requireWorkspaceIDParam(w, r, h.keyCache, "workspaceId")
-	if !ok {
-		return
-	}
-
-	// Parse request body
-	req, ok := decodeJSON[models.CreateActionRequest](w, r)
-	if !ok {
-		return
-	}
-	warnings := sanitize.ApplyAllWithWarnings(
-		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
-		sanitize.Pair{Target: &req.Description, Policy: sanitize.RichText, Label: "Description"},
-	)
-
-	// Unified validator covers required fields, trigger/node config schemas,
-	// edge sanity, graph cycles, iterator-body containment, and capability
-	// existence in one pass — replacing the older required-fields +
-	// ambiguous-flow split that lived inline here.
-	if !h.validateActionDefinition(w, r, workspaceID, actioncatalog.FromCreateRequest(&req)) {
-		return
-	}
-
-	// Get current user
-	currentUser, ok := RequireAuth(w, r)
-	if !ok {
-		return
-	}
-
-	// Setting an actor override requires the global action.set_actor permission.
-	// The override grants cross-workspace impersonation at execution time, so it
-	// cannot be governed by workspace-scoped action.manage alone.
-	if req.ActorUserID != nil {
-		hasSetActor, err := h.permissionService.HasGlobalPermission(currentUser.ID, models.PermissionActionSetActor)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-		if !hasSetActor {
-			respondForbidden(w, r)
-			return
-		}
-	}
-
-	// Create action
-	action := &models.Action{
-		WorkspaceID:   workspaceID,
-		Name:          req.Name,
-		Description:   req.Description,
-		IsEnabled:     true,
-		TriggerType:   req.TriggerType,
-		TriggerConfig: req.TriggerConfig,
-		CreatedBy:     &currentUser.ID,
-		ActorUserID:   req.ActorUserID,
-	}
-
-	actionID, err := h.repo.Create(action)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	action.ID = actionID
-
-	// Create nodes and edges if provided
-	if flowErr := actionutil.CreateFlowNodesAndEdges[
-		models.ActionNode, *models.ActionNode,
-		models.ActionEdge, *models.ActionEdge,
-	](
-		actionID, req.Nodes, req.Edges,
-		func(n *models.ActionNode) (int, error) { return h.repo.CreateNode(n) },
-		func(e *models.ActionEdge) (int, error) { return h.repo.CreateEdge(e) },
-		func() { _ = h.repo.Delete(actionID) },
-	); flowErr != nil {
-		respondInternalError(w, r, flowErr)
-		return
-	}
-
-	// Invalidate cache
-	if h.actionService != nil {
-		h.actionService.InvalidateWorkspaceCache(workspaceID)
-	}
-
-	// Fetch the created action with nodes and edges
-	createdAction, err := h.repo.GetByID(actionID)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	h.auditor.Log(r, currentUser, logger.ActionAutomationCreate, logger.ResourceAutomation, &createdAction.ID, createdAction.Name)
-	if createdAction.ActorUserID != nil {
-		h.auditor.LogWithDetails(r, currentUser, logger.ActionAutomationSetActor, logger.ResourceAutomation, &createdAction.ID, createdAction.Name, map[string]interface{}{
-			"actor_user_id": *createdAction.ActorUserID,
-			"context":       "create",
-		})
-	}
-
-	respondJSONCreated(w, struct {
-		*models.Action
-		Warnings []string `json:"warnings,omitempty"`
-	}{createdAction, warnings})
-}
-
-// applyActionUpdateFields applies non-nil fields from the update request to the action.
-func applyActionUpdateFields(action *models.Action, req *models.UpdateActionRequest) {
-	if req.Name != nil {
-		action.Name = *req.Name
-	}
-	if req.Description != nil {
-		action.Description = *req.Description
-	}
-	if req.TriggerType != nil {
-		action.TriggerType = *req.TriggerType
-	}
-	if req.TriggerConfig != nil {
-		action.TriggerConfig = *req.TriggerConfig
-	}
-	if req.IsEnabled != nil {
-		action.IsEnabled = *req.IsEnabled
-	}
-}
-
-// UpdateAction updates an existing action
-func (h *ActionsHandler) UpdateAction(w http.ResponseWriter, r *http.Request) {
-	workspaceID, action, ok := h.requireWorkspaceAction(w, r)
-	if !ok {
-		return
-	}
-	actionID := action.ID
-	previousActor := action.ActorUserID
-
-	// Parse request body
-	req, ok := decodeJSON[models.UpdateActionRequest](w, r)
-	if !ok {
-		return
-	}
-	warnings := sanitize.ApplyAllWithWarnings(
-		sanitize.Pair{Target: req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
-		sanitize.Pair{Target: req.Description, Policy: sanitize.RichText, Label: "Description"},
-	)
-
-	currentUser := utils.GetCurrentUser(r)
-
-	// If the request is changing actor_user_id (including clearing it), the caller
-	// needs the global action.set_actor permission. Only the actor-change path
-	// requires that permission — other fields remain governed by action.manage.
-	actorChanging := req.ActorUserID.Present && !equalIntPtr(req.ActorUserID.Value, previousActor)
-	if actorChanging {
-		if currentUser == nil {
-			respondUnauthorized(w, r)
-			return
-		}
-		hasSetActor, err := h.permissionService.HasGlobalPermission(currentUser.ID, models.PermissionActionSetActor)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-		if !hasSetActor {
-			respondForbidden(w, r)
-			return
-		}
-	}
-
-	var err error
-
-	applyActionUpdateFields(action, &req)
-
-	// If nodes and edges are provided, update them atomically. Run the
-	// unified validator against the post-merge effective state so a partial
-	// update can't violate the catalog invariants (schema shape, cycle
-	// freedom, iterator-body containment, capability scope).
-	if req.Nodes != nil {
-		def := actioncatalog.ActionDefinition{
-			Name:          action.Name,
-			Description:   action.Description,
-			TriggerType:   action.TriggerType,
-			TriggerConfig: action.TriggerConfig,
-			Nodes:         req.Nodes,
-			Edges:         req.Edges,
-		}
-		if !h.validateActionDefinition(w, r, workspaceID, def) {
-			return
-		}
-		err = h.repo.SaveActionWithNodesAndEdges(action, req.Nodes, req.Edges)
-		if err != nil {
-			respondInternalError(w, r, fmt.Errorf("failed to save action: %w", err))
-			return
-		}
-	} else {
-		// Just update the action metadata
-		err = h.repo.Update(action)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-	}
-
-	// Actor override lives in its own patch path so other updates don't need
-	// the elevated permission.
-	if actorChanging {
-		if err := h.repo.SetActor(actionID, req.ActorUserID.Value); err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-	}
-
-	// Invalidate cache
-	if h.actionService != nil {
-		h.actionService.InvalidateWorkspaceCache(workspaceID)
-	}
-
-	// Fetch updated action
-	updatedAction, err := h.repo.GetByID(actionID)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	if currentUser != nil {
-		h.auditor.Log(r, currentUser, logger.ActionAutomationUpdate, logger.ResourceAutomation, &actionID, updatedAction.Name)
-		if actorChanging {
-			details := map[string]interface{}{
-				"previous_actor_user_id": intPtrForAudit(previousActor),
-				"new_actor_user_id":      intPtrForAudit(req.ActorUserID.Value),
-				"context":                "update",
-			}
-			h.auditor.LogWithDetails(r, currentUser, logger.ActionAutomationSetActor, logger.ResourceAutomation, &actionID, updatedAction.Name, details)
-		}
-	}
-
-	respondJSONOK(w, struct {
-		*models.Action
-		Warnings []string `json:"warnings,omitempty"`
-	}{updatedAction, warnings})
-}
-
-// equalIntPtr returns true when both pointers are nil or both point to the same int.
-func equalIntPtr(a, b *int) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return *a == *b
-}
-
-// intPtrForAudit returns the pointed-to int or nil (which serializes as JSON null).
-func intPtrForAudit(p *int) interface{} {
-	if p == nil {
-		return nil
-	}
-	return *p
-}
-
-// DeleteAction deletes an action
-func (h *ActionsHandler) DeleteAction(w http.ResponseWriter, r *http.Request) {
-	workspaceID, action, ok := h.requireWorkspaceAction(w, r)
-	if !ok {
-		return
-	}
-	actionID := action.ID
-
-	err := h.repo.Delete(actionID)
-	if err == repository.ErrNotFound {
-		respondNotFound(w, r, "action")
-		return
-	}
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Invalidate cache
-	if h.actionService != nil {
-		h.actionService.InvalidateWorkspaceCache(workspaceID)
-	}
-
-	currentUser := utils.GetCurrentUser(r)
-	if currentUser != nil {
-		h.auditor.Log(r, currentUser, logger.ActionAutomationDelete, logger.ResourceAutomation, &actionID, "")
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// ToggleAction enables or disables an action
-func (h *ActionsHandler) ToggleAction(w http.ResponseWriter, r *http.Request) {
-	_, action, ok := h.requireWorkspaceAction(w, r)
-	if !ok {
-		return
-	}
-	actionID := action.ID
-
-	// Parse request body to get new state
-	var req struct {
-		IsEnabled bool `json:"is_enabled"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		if !errors.Is(err, io.EOF) {
-			respondBadRequest(w, r, "Invalid JSON request body")
-			return
-		}
-		// If no body, toggle the current state
-		req.IsEnabled = !action.IsEnabled
-	}
-
-	if err := h.repo.SetEnabled(actionID, req.IsEnabled); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Invalidate cache
-	if h.actionService != nil {
-		h.actionService.InvalidateWorkspaceCache(action.WorkspaceID)
-	}
-
-	// Return updated action
-	updatedAction, err := h.repo.GetByID(actionID)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	currentUser := utils.GetCurrentUser(r)
-	if currentUser != nil {
-		h.auditor.Log(r, currentUser, logger.ActionAutomationToggle, logger.ResourceAutomation, &actionID, updatedAction.Name)
-	}
-
-	respondJSONOK(w, updatedAction)
-}
-
-// GetActionLogs gets execution logs for an action
-func (h *ActionsHandler) GetActionLogs(w http.ResponseWriter, r *http.Request) {
-	_, action, ok := h.requireWorkspaceAction(w, r)
-	if !ok {
-		return
-	}
-	actionID := action.ID
-
-	limit, offset := parseOffsetPagination(r, 50, 100)
-
-	logs, err := h.repo.GetExecutionLogsByActionID(actionID, limit, offset)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	if logs == nil {
-		logs = []*models.ActionExecutionLog{}
-	}
-
-	respondJSONOK(w, logs)
 }
 
 // GetWorkspaceLogs gets all execution logs for a workspace
@@ -622,80 +65,6 @@ func (h *ActionsHandler) GetWorkspaceLogs(w http.ResponseWriter, r *http.Request
 
 	respondJSONOK(w, logs)
 }
-
-// ExecuteActionRequest represents the request body for manual action execution
-type ExecuteActionRequest struct {
-	ItemID int `json:"item_id"`
-}
-
-// ExecuteAction manually executes an action for a specific item
-func (h *ActionsHandler) ExecuteAction(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := requireWorkspaceIDParam(w, r, h.keyCache, "workspaceId")
-	if !ok {
-		return
-	}
-
-	actionID, ok := requireIDParam(w, r, "id")
-	if !ok {
-		return
-	}
-
-	var err error
-
-	// Parse request body
-	req, ok := decodeJSON[ExecuteActionRequest](w, r)
-	if !ok {
-		return
-	}
-
-	if req.ItemID == 0 {
-		respondValidationError(w, r, "item_id is required")
-		return
-	}
-
-	// Get action and verify workspace ownership
-	action, ok := h.requireAction(w, r, actionID, workspaceID)
-	if !ok {
-		return
-	}
-
-	// A disabled action must not run, even from the manual-execute endpoint —
-	// the toggle is load-bearing (it's how admins quarantine a misbehaving
-	// automation) and the background processor already skips disabled actions
-	// via the enabled-only cache.
-	if !action.IsEnabled {
-		respondValidationError(w, r, "action is disabled")
-		return
-	}
-
-	// Verify user has edit permission on the item's workspace
-	if !CheckItemPermission(w, r, h.itemRepo, h.permissionService, req.ItemID, models.PermissionItemEdit) {
-		return
-	}
-
-	// Get current user
-	currentUser, ok := RequireAuth(w, r)
-	if !ok {
-		return
-	}
-
-	// Execute action manually
-	if h.actionService == nil {
-		respondInternalError(w, r, fmt.Errorf("action service not available"))
-		return
-	}
-
-	// Execute the action (this is synchronous for immediate feedback)
-	err = h.actionService.ExecuteActionManually(action, req.ItemID, currentUser.ID)
-	if err != nil {
-		respondInternalError(w, r, fmt.Errorf("failed to execute action: %w", err))
-		return
-	}
-
-	respondJSONOK(w, map[string]string{"status": "completed"})
-}
-
-// --- Capability management endpoints ---
 
 func (h *ActionsHandler) isEnabledLLMConnection(connectionID int) bool {
 	return h.repo.IsEnabledLLMConnection(connectionID)
@@ -738,10 +107,21 @@ func (h *ActionsHandler) validateCapabilityConfig(w http.ResponseWriter, r *http
 				return false
 			}
 		}
+		seenHeaders := make(map[string]string, len(config.DefaultHeaders))
 		// default_headers must hold non-sensitive literals only. Auth tokens
 		// live in the credential store; an inline Authorization header here
 		// would be readable by anyone who can list workspace capabilities.
 		for header := range config.DefaultHeaders {
+			if !models.IsValidHTTPHeaderName(header) {
+				respondValidationError(w, r, fmt.Sprintf("Invalid HTTP header name %q in default_headers", header))
+				return false
+			}
+			normalized := strings.ToLower(strings.TrimSpace(header))
+			if previous, exists := seenHeaders[normalized]; exists {
+				respondValidationError(w, r, fmt.Sprintf("Headers %q and %q differ only by case or surrounding whitespace", previous, header))
+				return false
+			}
+			seenHeaders[normalized] = header
 			if models.IsSensitiveHeaderName(header) {
 				respondValidationError(w, r, fmt.Sprintf("Header %q is sensitive — use auth/secret_header_refs to reference a credential instead of placing it in default_headers", header))
 				return false
@@ -816,6 +196,7 @@ func (h *ActionsHandler) validateHTTPAuthRefs(w http.ResponseWriter, r *http.Req
 		return false
 	}
 
+	seenSecretHeaders := make(map[string]string, len(config.SecretHeaderRefs)+1)
 	if config.Auth != nil {
 		if config.Auth.CredentialID <= 0 {
 			respondValidationError(w, r, "auth.credential_id is required when auth is set")
@@ -825,12 +206,22 @@ func (h *ActionsHandler) validateHTTPAuthRefs(w http.ResponseWriter, r *http.Req
 			respondValidationError(w, r, "auth.header_name is required when auth is set")
 			return false
 		}
+		if !models.IsValidHTTPHeaderName(config.Auth.HeaderName) {
+			respondValidationError(w, r, fmt.Sprintf("Invalid auth.header_name %q", config.Auth.HeaderName))
+			return false
+		}
 		if !models.IsSensitiveHeaderName(config.Auth.HeaderName) {
 			respondValidationError(w, r, fmt.Sprintf("auth.header_name %q is not in the sensitive-header allowlist; rename it to a known auth header (e.g. Authorization, X-API-Key) or use default_headers for non-secret literals", config.Auth.HeaderName))
 			return false
 		}
+		normalized := strings.ToLower(strings.TrimSpace(config.Auth.HeaderName))
+		seenSecretHeaders[normalized] = config.Auth.HeaderName
 		if config.Auth.Placement != "" && config.Auth.Placement != "header" {
 			respondValidationError(w, r, fmt.Sprintf("auth.placement %q is not supported (use \"header\")", config.Auth.Placement))
+			return false
+		}
+		if !models.IsValidHTTPAuthScheme(config.Auth.Scheme) {
+			respondValidationError(w, r, "auth.scheme must be a single HTTP auth-scheme token without spaces")
 			return false
 		}
 		if !checkCredScope(config.Auth.CredentialID, "auth") {
@@ -842,10 +233,20 @@ func (h *ActionsHandler) validateHTTPAuthRefs(w http.ResponseWriter, r *http.Req
 			respondValidationError(w, r, "secret_header_refs contains an empty header name")
 			return false
 		}
+		if !models.IsValidHTTPHeaderName(headerName) {
+			respondValidationError(w, r, fmt.Sprintf("Invalid secret_header_refs header name %q", headerName))
+			return false
+		}
 		if !models.IsSensitiveHeaderName(headerName) {
 			respondValidationError(w, r, fmt.Sprintf("secret_header_refs header %q is not in the sensitive-header allowlist; use default_headers for non-secret literals", headerName))
 			return false
 		}
+		normalized := strings.ToLower(strings.TrimSpace(headerName))
+		if previous, exists := seenSecretHeaders[normalized]; exists {
+			respondValidationError(w, r, fmt.Sprintf("Secret headers %q and %q target the same HTTP header", previous, headerName))
+			return false
+		}
+		seenSecretHeaders[normalized] = headerName
 		if credentialID <= 0 {
 			respondValidationError(w, r, fmt.Sprintf("secret_header_refs[%q] must reference a credential id > 0", headerName))
 			return false
@@ -934,11 +335,19 @@ func (h *ActionsHandler) CreateCapability(w http.ResponseWriter, r *http.Request
 	if req.AppliesToAllWorkspaces != nil {
 		appliesAll = *req.AppliesToAllWorkspaces
 	}
-	if !appliesAll && len(req.WorkspaceIDs) == 0 {
+	workspaceIDs, err := normalizeCapabilityWorkspaceIDs(req.WorkspaceIDs)
+	if err != nil {
+		respondValidationError(w, r, err.Error())
+		return
+	}
+	if !appliesAll && len(workspaceIDs) == 0 {
 		respondValidationError(w, r, "At least one workspace is required when restricting capability scope")
 		return
 	}
-	if !h.validateCapabilityConfig(w, r, req.CapabilityType, req.Config, appliesAll, req.WorkspaceIDs) {
+	if appliesAll {
+		workspaceIDs = nil
+	}
+	if !h.validateCapabilityConfig(w, r, req.CapabilityType, req.Config, appliesAll, workspaceIDs) {
 		return
 	}
 
@@ -958,20 +367,14 @@ func (h *ActionsHandler) CreateCapability(w http.ResponseWriter, r *http.Request
 		Config:                 req.Config,
 		IsEnabled:              isEnabled,
 		AppliesToAllWorkspaces: appliesAll,
+		WorkspaceIDs:           workspaceIDs,
 		CreatedBy:              &currentUser.ID,
 	}
 
-	id, err := h.repo.CreateCapability(capability)
+	id, err := h.repo.CreateCapabilityWithWorkspaces(capability, workspaceIDs)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
-	}
-
-	if !appliesAll {
-		if err := h.repo.SetCapabilityWorkspaces(id, req.WorkspaceIDs); err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
 	}
 
 	created, err := h.repo.GetCapabilityByID(id)
@@ -998,6 +401,10 @@ func (h *ActionsHandler) UpdateCapability(w http.ResponseWriter, r *http.Request
 	sanitize.Apply(req.Name, sanitize.PlainTextField)
 
 	if req.Name != nil {
+		if *req.Name == "" {
+			respondValidationError(w, r, "Name is required")
+			return
+		}
 		capability.Name = *req.Name
 	}
 	if req.IsEnabled != nil {
@@ -1012,7 +419,12 @@ func (h *ActionsHandler) UpdateCapability(w http.ResponseWriter, r *http.Request
 	effectiveWorkspaceIDs := capability.WorkspaceIDs
 	if !capability.AppliesToAllWorkspaces {
 		if req.WorkspaceIDs != nil {
-			effectiveWorkspaceIDs = *req.WorkspaceIDs
+			var err error
+			effectiveWorkspaceIDs, err = normalizeCapabilityWorkspaceIDs(*req.WorkspaceIDs)
+			if err != nil {
+				respondValidationError(w, r, err.Error())
+				return
+			}
 		}
 		if len(effectiveWorkspaceIDs) == 0 {
 			respondValidationError(w, r, "At least one workspace is required when restricting capability scope")
@@ -1021,33 +433,25 @@ func (h *ActionsHandler) UpdateCapability(w http.ResponseWriter, r *http.Request
 	} else {
 		effectiveWorkspaceIDs = nil
 	}
+	candidateConfig := capability.Config
 	if req.Config != nil {
-		if !h.validateCapabilityConfig(w, r, capability.CapabilityType, *req.Config, capability.AppliesToAllWorkspaces, effectiveWorkspaceIDs) {
+		candidateConfig = *req.Config
+	}
+	// Config references and workspace scope form one authorization invariant.
+	// Revalidate the existing config when only the scope changes; otherwise a
+	// workspace-only credential can be stranded behind a newly-global HTTP
+	// capability without the update endpoint noticing.
+	if req.Config != nil || req.AppliesToAllWorkspaces != nil || req.WorkspaceIDs != nil || (req.IsEnabled != nil && *req.IsEnabled) {
+		if !h.validateCapabilityConfig(w, r, capability.CapabilityType, candidateConfig, capability.AppliesToAllWorkspaces, effectiveWorkspaceIDs) {
 			return
 		}
-		capability.Config = *req.Config
 	}
+	capability.Config = candidateConfig
+	capability.WorkspaceIDs = effectiveWorkspaceIDs
 
-	if err := h.repo.UpdateCapability(capability); err != nil {
+	if err := h.repo.UpdateCapabilityWithWorkspaces(capability, effectiveWorkspaceIDs); err != nil {
 		respondInternalError(w, r, err)
 		return
-	}
-
-	// Persist scope changes. We rewrite the workspace allowlist when the caller
-	// either flipped to "specific workspaces" mode or supplied an explicit
-	// workspace_ids list. When the capability is now applies-to-all, clear the
-	// allowlist to keep the join table tidy and avoid stale entries silently
-	// re-applying if the bool flips back.
-	if capability.AppliesToAllWorkspaces {
-		if err := h.repo.SetCapabilityWorkspaces(capability.ID, nil); err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-	} else if req.WorkspaceIDs != nil {
-		if err := h.repo.SetCapabilityWorkspaces(capability.ID, *req.WorkspaceIDs); err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
 	}
 
 	updated, err := h.repo.GetCapabilityByID(capability.ID)
@@ -1096,44 +500,58 @@ func (h *ActionsHandler) ListWorkspaceCapabilities(w http.ResponseWriter, r *htt
 	respondJSONOK(w, sanitizeCapabilitiesForWorkspace(caps))
 }
 
-// sanitizeCapabilitiesForWorkspace strips potentially sensitive material from
-// http_client capability configs before exposing them via the workspace
-// listing endpoint. Specifically:
-//   - default_headers loses any key matching IsSensitiveHeaderName so a
-//     legacy inline Authorization token never reaches a workspace-admin view;
-//   - secret_header_refs maps every entry to a 1 sentinel so the workspace
-//     side learns which header names are present without seeing the
-//     credential IDs (which would let a hostile workspace admin probe
-//     other workspaces' credentials).
-//
-// The admin endpoint (ListCapabilities / GetCapability) returns the
-// unsanitized config; system admins legitimately need to see the refs to
-// manage them.
+// sanitizeCapabilitiesForWorkspace redacts environment values, sensitive
+// headers, and credential IDs from workspace views. System-admin endpoints
+// retain the full configuration for credential management.
 func sanitizeCapabilitiesForWorkspace(caps []*models.ActionCapability) []*models.ActionCapability {
 	if len(caps) == 0 {
 		return caps
 	}
 	out := make([]*models.ActionCapability, 0, len(caps))
 	for _, c := range caps {
+		if c.CapabilityType == models.CapabilityDockerEnvironment {
+			var cfg models.DockerEnvironmentConfig
+			if err := json.Unmarshal([]byte(c.Config), &cfg); err != nil {
+				cp := *c
+				cp.Config = "{}"
+				out = append(out, &cp)
+				continue
+			}
+			for key := range cfg.EnvVars {
+				cfg.EnvVars[key] = "[REDACTED]"
+			}
+			newBytes, err := json.Marshal(cfg)
+			if err != nil {
+				cp := *c
+				cp.Config = "{}"
+				out = append(out, &cp)
+				continue
+			}
+			cp := *c
+			cp.Config = string(newBytes)
+			out = append(out, &cp)
+			continue
+		}
 		if c.CapabilityType != models.CapabilityHTTPClient {
 			out = append(out, c)
 			continue
 		}
 		var cfg models.HTTPClientConfig
 		if err := json.Unmarshal([]byte(c.Config), &cfg); err != nil {
-			// Malformed config — return as-is so the editor can show an
-			// actionable error. (Default headers in an unparsable blob can't
-			// be selectively stripped without parsing.)
-			out = append(out, c)
+			// A malformed config cannot be safely scrubbed.
+			cp := *c
+			cp.Config = "{}"
+			out = append(out, &cp)
 			continue
 		}
 		if len(cfg.DefaultHeaders) > 0 {
 			cleaned := make(map[string]string, len(cfg.DefaultHeaders))
-			for k, v := range cfg.DefaultHeaders {
+			for k := range cfg.DefaultHeaders {
 				if models.IsSensitiveHeaderName(k) {
 					continue
 				}
-				cleaned[k] = v
+				// Expose header names but never their literal values.
+				cleaned[k] = "[REDACTED]"
 			}
 			cfg.DefaultHeaders = cleaned
 		}
@@ -1152,12 +570,14 @@ func sanitizeCapabilitiesForWorkspace(caps []*models.ActionCapability) []*models
 				CredentialID: 0,
 				Placement:    cfg.Auth.Placement,
 				HeaderName:   cfg.Auth.HeaderName,
-				Scheme:       cfg.Auth.Scheme,
+				Scheme:       "",
 			}
 		}
 		newBytes, err := json.Marshal(cfg)
 		if err != nil {
-			out = append(out, c)
+			cp := *c
+			cp.Config = "{}"
+			out = append(out, &cp)
 			continue
 		}
 		cp := *c
@@ -1165,6 +585,22 @@ func sanitizeCapabilitiesForWorkspace(caps []*models.ActionCapability) []*models
 		out = append(out, &cp)
 	}
 	return out
+}
+
+func normalizeCapabilityWorkspaceIDs(ids []int) ([]int, error) {
+	seen := make(map[int]struct{}, len(ids))
+	out := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			return nil, fmt.Errorf("workspace_ids must contain positive workspace IDs")
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out, nil
 }
 
 // DeleteCapability deletes a capability
@@ -1199,7 +635,7 @@ func (h *ActionsHandler) auditCapability(r *http.Request, user *models.User, act
 	if user == nil || capability == nil {
 		return
 	}
-	h.auditor.LogWithDetails(r, user, action, logger.ResourceAutomationCapability, &capability.ID, capability.Name, map[string]interface{}{
+	h.auditor.LogWithDetails(r, user, action, logger.ResourceAutomationCapability, &capability.ID, capability.Name, map[string]any{
 		"capability_type":           capability.CapabilityType,
 		"is_enabled":                capability.IsEnabled,
 		"applies_to_all_workspaces": capability.AppliesToAllWorkspaces,

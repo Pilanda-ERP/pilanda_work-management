@@ -61,6 +61,9 @@ type updateCommentOut struct {
 func init() {
 	Register(Default, Tool[listCommentsArgs]{
 		Name:        "list_comments",
+		Group:       CapabilityReadComment,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "List all comments on a work item. Identifies the item by numeric ID or key (e.g. PROJ-42).",
 		Scopes:      []string{auth.ScopeItemsRead},
 		Run: func(_ context.Context, env *Env, args listCommentsArgs) (any, error) {
@@ -85,6 +88,9 @@ func init() {
 
 	Register(Default, Tool[addCommentArgs]{
 		Name:        "add_comment",
+		Group:       CapabilityReadComment,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Add a comment to a work item. Identifies the item by numeric ID or key (e.g. PROJ-42).",
 		Scopes:      []string{auth.ScopeItemsWrite},
 		Run: func(_ context.Context, env *Env, args addCommentArgs) (any, error) {
@@ -110,10 +116,11 @@ func init() {
 				return map[string]string{"error": "permission denied"}, nil
 			}
 			result, err := env.CommentService.Create(services.CreateCommentParams{
-				ItemID:      itemID,
-				AuthorID:    env.UserID,
-				Content:     args.Content,
-				ActorUserID: env.UserID,
+				ItemID:        itemID,
+				AuthorID:      env.UserID,
+				Content:       args.Content,
+				ActorUserID:   env.UserID,
+				EventMetadata: env.eventMetadata(),
 			})
 			if err != nil {
 				return nil, err
@@ -125,6 +132,9 @@ func init() {
 
 	Register(Default, Tool[updateCommentArgs]{
 		Name:        "update_comment",
+		Group:       CapabilityCommentEditing,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Scopes:      []string{auth.ScopeItemsWrite},
 		Description: "Update the content of an existing comment. Only the comment's author can edit it, unless the caller holds the edit-others-comments permission in the item's workspace.",
 		Run: func(_ context.Context, env *Env, args updateCommentArgs) (any, error) {
@@ -151,6 +161,9 @@ func init() {
 
 	Register(Default, Tool[deleteCommentArgs]{
 		Name:        "delete_comment",
+		Group:       CapabilityCommentEditing,
+		Access:      AccessDestructive,
+		Risk:        RiskHigh,
 		Scopes:      []string{auth.ScopeItemsDelete},
 		Description: "Delete a comment. Only the comment's author can delete it, unless the caller holds the edit-others-comments permission in the item's workspace.",
 		Run: func(_ context.Context, env *Env, args deleteCommentArgs) (any, error) {

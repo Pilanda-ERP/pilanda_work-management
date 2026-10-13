@@ -1,8 +1,15 @@
 <script>
-  import { X, Table2, ChevronLeft, ChevronRight, Loader2, AlertCircle, Package } from '@lucide/svelte';
+import { X, Table2, ChevronLeft, ChevronRight, AlertCircle, Package } from '@lucide/svelte';
+import EmptyState from '../components/EmptyState.svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
-  import { portalStore, iconMap } from '../stores/portal.svelte.js';
+  import { portalCustomizationStore as portalStore } from '../stores/portal.svelte.js';
+  import { iconMap } from '../stores/portalPresentation.js';
   import { t } from '../stores/i18n.svelte.js';
+  import Input from '../components/Input.svelte';
+  import CustomFieldRenderer from '../features/items/CustomFieldRenderer.svelte';
+  import { buildRowActionHref } from './rowActions.js';
+  import { toExternal } from '../runtime/contextPath.js';
 
   let {
     report,
@@ -20,6 +27,8 @@
   let pageSize = $state(10);
   let totalCount = $state(0);
   let totalPages = $state(0);
+  let customFieldDefinitions = $state([]);
+  let definitionLoadToken = 0;
 
   // Form-mode state. For run_mode='form' reports the user submits values that
   // get substituted into the report's CQL before the query runs. Until they
@@ -39,6 +48,10 @@
   let displayColumns = $derived(
     report?.column_config?.length ? report.column_config : ['title', 'asset_tag', 'status']
   );
+
+  // Per-row action links configured on the report. The backend already drops
+  // actions whose target request type is not visible to this visitor.
+  let rowActions = $derived(report?.config?.row_actions ?? []);
 
   // Load assets from execute endpoint
   async function loadAssets() {
@@ -103,6 +116,25 @@
     }
   }
 
+  async function loadCustomFieldDefinitions() {
+    if (!slug) {
+      customFieldDefinitions = [];
+      return;
+    }
+    const myToken = ++definitionLoadToken;
+    try {
+      const definitions = await api.portal.getCustomFields(slug);
+      if (myToken === definitionLoadToken) {
+        customFieldDefinitions = definitions || [];
+      }
+    } catch (err) {
+      if (myToken === definitionLoadToken) {
+        console.error('Failed to load custom field definitions:', err);
+        customFieldDefinitions = [];
+      }
+    }
+  }
+
   function submitForm(event) {
     event?.preventDefault?.();
     formSubmitted = true;
@@ -131,6 +163,11 @@
     loadAssets();
   });
 
+  $effect(() => {
+    slug;
+    loadCustomFieldDefinitions();
+  });
+
   function nextPage() {
     if (page < totalPages) {
       page++;
@@ -154,11 +191,27 @@
       category: t('common.category'),
       type: t('common.type')
     };
-    // Check for custom fields (cf_ prefix)
     if (col.startsWith('cf_')) {
-      return col.replace('cf_', '').replace(/_/g, ' ');
+      return getCustomFieldDefinition(col)?.name || col.slice(3).replace(/_/g, ' ');
     }
     return labels[col] || col;
+  }
+
+  function getCustomFieldDefinition(col) {
+    if (!col.startsWith('cf_')) return null;
+    const fieldID = Number.parseInt(col.slice(3), 10);
+    if (!Number.isFinite(fieldID)) return null;
+    return customFieldDefinitions.find((field) => field.id === fieldID) || null;
+  }
+
+  function getCustomFieldValue(asset, col) {
+    if (!col.startsWith('cf_')) return null;
+    return asset.custom_field_values?.[col.slice(3)] ?? null;
+  }
+
+  function hasCustomFieldValue(value) {
+    if (value === null || value === '') return false;
+    return !Array.isArray(value) || value.length > 0;
   }
 
   // Get cell value for a column. Logical column names ("status", "type",
@@ -173,14 +226,6 @@
     }
     if (col === 'type') {
       return asset.asset_type_name ?? '-';
-    }
-    // Custom fields: cf_<id> reads custom_field_values[id]. The backend stores
-    // values keyed by custom field id (string-encoded in the JSON column).
-    if (col.startsWith('cf_')) {
-      const key = col.slice(3);
-      const cfValue = asset.custom_field_values?.[key];
-      if (cfValue === null || cfValue === undefined) return '-';
-      return String(cfValue);
     }
     return asset[col] ?? '-';
   }
@@ -205,7 +250,7 @@
       <div>
         <h3 class="font-medium flex items-center gap-2" style="color: var(--ds-text);">
           {report.name}
-          {#if !report.is_active}
+          {#if report.is_active === false}
             <span
               class="px-1.5 py-0.5 text-[10px] font-medium rounded"
               style="background-color: {portalStore.isDarkMode ? 'rgba(156, 163, 175, 0.2)' : '#f3f4f6'}; color: {portalStore.isDarkMode ? '#9ca3af' : '#6b7280'};"
@@ -225,7 +270,7 @@
     {#if isEditing}
       <button
         onclick={() => onRemove(report.id)}
-        class="p-2 rounded transition-opacity opacity-0 group-hover:opacity-100"
+        class="p-2 rounded transition-opacity opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
         style="background-color: var(--ds-danger-subtle); color: var(--ds-text-danger);"
         title={t('portal.removeFromSection')}
       >
@@ -240,13 +285,11 @@
          results render via the table branch below. -->
     <div class="p-4">
       {#if formLoading}
-        <div class="flex items-center justify-center py-8">
-          <Loader2 class="w-6 h-6 animate-spin" style="color: var(--ds-text-subtle);" />
-        </div>
+        <StateDisplay type="loading" />
       {:else if error}
         <div class="flex items-center gap-2 py-4">
-          <AlertCircle class="w-5 h-5 text-red-500" />
-          <span class="text-sm text-red-500">{error}</span>
+          <AlertCircle class="w-5 h-5 text-ds-icon-danger" />
+          <span class="text-sm text-ds-text-danger">{error}</span>
         </div>
       {:else if formFields.length === 0}
         <p class="text-sm text-center py-6" style="color: var(--ds-text-subtle);">
@@ -262,15 +305,14 @@
                 style="color: var(--ds-text);"
               >
                 {field.field_label || field.field_name || field.field_identifier}
-                {#if field.is_required}<span class="text-red-500">*</span>{/if}
+                {#if field.is_required}<span class="text-ds-text-danger">*</span>{/if}
               </label>
-              <input
+              <Input
                 id={`ar-field-${field.id}`}
                 type="text"
                 bind:value={formValues[field.field_identifier]}
                 required={field.is_required}
-                class="w-full px-3 py-2 rounded border text-sm"
-                style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+                size="small"
               />
               {#if field.description}
                 <p class="text-xs mt-1" style="color: var(--ds-text-subtle);">{field.description}</p>
@@ -308,20 +350,14 @@
   <!-- Table Content -->
   <div class="overflow-x-auto">
     {#if loading}
-      <div class="flex items-center justify-center py-12">
-        <Loader2 class="w-6 h-6 animate-spin" style="color: var(--ds-text-subtle);" />
-        <span class="ml-2 text-sm" style="color: var(--ds-text-subtle);">{t('common.loading')}</span>
-      </div>
+      <StateDisplay type="loading" />
     {:else if error}
       <div class="flex items-center justify-center py-12 gap-2">
-        <AlertCircle class="w-5 h-5 text-red-500" />
-        <span class="text-sm text-red-500">{error}</span>
+        <AlertCircle class="w-5 h-5 text-ds-icon-danger" />
+        <span class="text-sm text-ds-text-danger">{error}</span>
       </div>
     {:else if assets.length === 0}
-      <div class="flex flex-col items-center justify-center py-12">
-        <Package class="w-8 h-8 mb-2" style="color: var(--ds-text-subtle);" />
-        <p class="text-sm" style="color: var(--ds-text-subtle);">{t('portal.noAssetsFound')}</p>
-      </div>
+      <EmptyState icon={Package} title={t('portal.noAssetsFound')} />
     {:else}
       <table class="w-full">
         <thead>
@@ -330,8 +366,18 @@
               <th
                 class="text-left px-4 py-3 text-sm font-medium capitalize"
                 style="color: var(--ds-text-subtle);"
+                data-testid={`asset-report-column-${col}`}
               >
                 {getColumnLabel(col)}
+              </th>
+            {/each}
+            {#each rowActions as action (action.id)}
+              <th
+                class="text-left px-4 py-3 text-sm font-medium"
+                style="color: var(--ds-text-subtle);"
+                data-testid={`asset-report-action-column-${action.id}`}
+              >
+                {action.label}
               </th>
             {/each}
           </tr>
@@ -340,8 +386,42 @@
           {#each assets as asset}
             <tr class="border-b last:border-b-0 hover:bg-black/5" style="border-color: var(--ds-border);">
               {#each displayColumns as col}
-                <td class="px-4 py-3 text-sm" style="color: var(--ds-text);">
-                  {getCellValue(asset, col)}
+                {@const customFieldDefinition = getCustomFieldDefinition(col)}
+                {@const customFieldValue = getCustomFieldValue(asset, col)}
+                <td
+                  class="px-4 py-3 text-sm"
+                  style="color: var(--ds-text);"
+                  data-testid={`asset-report-cell-${asset.id}-${col}`}
+                >
+                  {#if col.startsWith('cf_')}
+                    {#if customFieldDefinition && hasCustomFieldValue(customFieldValue)}
+                      <CustomFieldRenderer
+                        field={customFieldDefinition}
+                        value={customFieldValue}
+                        readonly={true}
+                        noPadding={true}
+                      />
+                    {:else}
+                      -
+                    {/if}
+                  {:else}
+                    {getCellValue(asset, col)}
+                  {/if}
+                </td>
+              {/each}
+              {#each rowActions as action (action.id)}
+                <td
+                  class="px-4 py-3 text-sm"
+                  data-testid={`asset-report-action-cell-${asset.id}-${action.id}`}
+                >
+                  <a
+                    href={toExternal(buildRowActionHref(slug, action, asset))}
+                    class="font-medium hover:underline"
+                    style="color: var(--ds-text-link);"
+                    data-testid={`asset-report-action-${asset.id}-${action.id}`}
+                  >
+                    {action.label}
+                  </a>
                 </td>
               {/each}
             </tr>

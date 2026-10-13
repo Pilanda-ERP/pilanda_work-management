@@ -1,5 +1,6 @@
 <script>
   import { onMount, onDestroy, untrack } from 'svelte';
+  import { copyToClipboard } from '../../utils/clipboard.js';
   import { useEventListener } from 'runed';
   import { api } from '../../api.js';
   import { navigate, currentRoute } from '../../router.js';
@@ -7,15 +8,12 @@
   import { workspacePermissions, itemDetailStore } from '../../stores';
   import { t } from '../../stores/i18n.svelte.js';
   import { getShortcut, matchesShortcut, isTypingInField } from '../../utils/keyboardShortcuts.js';
-  import { Trash2, X, Copy, BookOpen, Search, GitBranch, Repeat } from '@lucide/svelte';
+  import { Trash2, X, Copy, BookOpen, Search, GitBranch, GitMerge, Repeat, FolderInput } from '@lucide/svelte';
   import { Bookmark, BookmarkCheck, ExternalLink } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../../utils/icons.js';
-  import { addToast, successToast, errorToast } from '../../stores/toasts.svelte.js';
+  import { addToast, successToast, errorToast, infoToast } from '../../stores/toasts.svelte.js';
   import { timerStore } from '../../stores/timerStore.svelte.js';
   import { useItemAttachments } from '../../composables/useItemAttachments.svelte.js';
-  import { useWorkItemPoller } from '../../composables/useWorkItemPoller.svelte.js';
   import { useItemEventStream } from '../../composables/useItemEventStream.svelte.js';
-  import { itemLiveUpdates } from '../../stores/itemLiveUpdates.svelte.js';
   import { notificationActions } from '../../stores/notifications.js';
   import { agentRuns } from '../../stores/agentRuns.svelte.js';
   import {
@@ -32,6 +30,9 @@ import AIViewModal from '../../dialogs/AIViewModal.svelte';
 import AIConfirmModal from '../../dialogs/AIConfirmModal.svelte';
 import CatchMeUpBriefing from './CatchMeUpBriefing.svelte';
 import FindSimilarResults from './FindSimilarResults.svelte';
+import ItemMoveWorkspaceDialog from './ItemMoveWorkspaceDialog.svelte';
+import ItemMergeDialog from './ItemMergeDialog.svelte';
+import ItemSplitDialog from './ItemSplitDialog.svelte';
 
   // Import the shared content component
   import ItemDetailContent from '../items/ItemDetailContent.svelte';
@@ -39,9 +40,7 @@ import TimeLogModal from '../../dialogs/TimeLogModal.svelte';
 import TestCaseViewModal from '../../dialogs/TestCaseViewModal.svelte';
 import RecurrenceEditor from '../../editors/RecurrenceEditor.svelte';
 import Button from '../../components/Button.svelte';
-
-  // Use centralized icon map for work item types
-  const iconMap = itemTypeIconMap;
+import NativeSelect from '../../components/NativeSelect.svelte';
 
   let {
     workspaceId = null,
@@ -68,34 +67,41 @@ import Button from '../../components/Button.svelte';
   let item = $derived(itemDetailStore.item);
   let workspace = $derived(itemDetailStore.workspace);
 
-  // Keep the open issue detail in sync with agent/background changes. While the
-  // SSE stream is healthy the poller is demoted (it resumes automatically if the
-  // stream drops or is unsupported).
-  useWorkItemPoller(() => itemDetailStore.refreshCurrentItem(), {
-    enabled: () => !itemLiveUpdates.isLive(itemId),
+  // A reconcile request that arrives while the detail is loading must not be
+  // dropped: queue it and run once the in-flight load settles.
+  let reconcilePending = $state(false);
+
+  function runFullReconcile() {
+    if (itemDetailStore.loading) {
+      reconcilePending = true;
+      return Promise.resolve();
+    }
+    reconcilePending = false;
+    itemDetailStore.transitioning = true;
+    return loadData()
+      .then((loaded) => {
+        if (loaded) populateDropdownItems();
+      })
+      .finally(() => {
+        itemDetailStore.transitioning = false;
+      });
+  }
+
+  $effect(() => {
+    if (reconcilePending && !itemDetailStore.loading) {
+      void runFullReconcile().catch((err) => console.error('SSE reconcile failed:', err));
+    }
   });
 
-  // Live updates (WI-484): push changes instead of waiting for the 30s poll.
-  // Maps each event kind to a targeted reload; connect/reconnect/stale run a
-  // full loadData() so every section reconciles (including ones with no granular
-  // event: attachments, diagrams, worklogs, SCM links).
-  useItemEventStream(() => itemId, {
-    // Full reconcile (connect/reconnect/stale): reload the item AND the comments
-    // — Comments is a separate component, so loadData() alone would leave it
-    // stale and miss anything that arrived before the stream connected.
+  // Live updates (WI-484): the stream is coarse, so any change pushes a full
+  // reconcile instead of waiting for a poll. Comments, SCM links, and Zammad
+  // links are separate components, so the reconcile also nudges them.
+  const liveStream = useItemEventStream(() => itemId, {
     onReconcile: () => {
-      loadData().catch((err) => console.error('SSE reconcile failed:', err));
       window.dispatchEvent(new CustomEvent('item-comments-changed', { detail: { itemId } }));
       window.dispatchEvent(new CustomEvent('item-scm-links-changed', { detail: { itemId } }));
-    },
-    onItem: () => itemDetailStore.refreshCurrentItem().catch((err) => console.error('SSE item refresh failed:', err)),
-    onChildren: () => itemDetailStore.loadChildItems().catch((err) => console.error('SSE children refresh failed:', err)),
-    onComment: () => window.dispatchEvent(new CustomEvent('item-comments-changed', { detail: { itemId } })),
-    // `link` covers both the generic linked-items section (reloaded by loadData)
-    // and the separate SCM-links section (ItemSCMLinks listens for this event).
-    onLinks: () => {
-      loadData().catch((err) => console.error('SSE links refresh failed:', err));
-      window.dispatchEvent(new CustomEvent('item-scm-links-changed', { detail: { itemId } }));
+      window.dispatchEvent(new CustomEvent('item-zammad-links-changed', { detail: { itemId } }));
+      return runFullReconcile();
     },
     // The viewed item was deleted (its own topic published `deleted`). This is
     // authoritative — mark it gone so the view closes instead of refetching
@@ -103,18 +109,48 @@ import Button from '../../components/Button.svelte';
     onDeleted: () => itemDetailStore.markDeleted(),
   });
 
-  // Close the detail when the open item is deleted elsewhere (SSE `deleted`, or
-  // a 404 discovered by the poll fallback). Force hasChanges=false so a deleted
-  // item never triggers an unsaved-changes prompt.
+  // Abort requests during a real unload, but keep the loaded detail when the
+  // browser suspends this page for back-forward navigation.
+  useEventListener(() => window, 'pagehide', (event) => {
+    if (!event.persisted) itemDetailStore.reset();
+  });
+
+  // Close the detail when the open item is deleted. Consume the shared flag
+  // before closing so the next detail does not inherit the deletion state.
   $effect(() => {
     if (!itemDetailStore.notFound) return;
-    errorToast('This item was deleted.');
+    itemDetailStore.notFound = false;
+    showDeletionFeedback();
     if (isModal && onclose) {
-      onclose({ hasChanges: false });
+      onclose();
     } else if (!isModal) {
       closeModal();
     }
   });
+
+  // Whether the open ticket is a merged duplicate comes straight from the
+  // detail summary via the store; no extra request.
+  let mergedInto = $derived(itemDetailStore.mergedIntoItemId);
+
+  function openMergeDialog(duplicate = null) {
+    mergePreselected = duplicate;
+    showMergeDialog = true;
+  }
+
+  function handleMerged() {
+    successToast(t('items.mergeSuccess'));
+    // The moved comments land on this ticket; the comments tab listens for
+    // this event and refreshes without waiting for its poll cadence.
+    window.dispatchEvent(new CustomEvent('reload-item-detail', { detail: { itemId: item?.id } }));
+  }
+
+  function handleSplit(result) {
+    successToast(t('items.splitSuccess'));
+    window.dispatchEvent(new CustomEvent('reload-item-detail', { detail: { itemId: item?.id } }));
+    if (result?.split_item_id && workspaceId) {
+      navigate(`/workspaces/${workspaceId}/items/${result.split_item_id}`);
+    }
+  }
 
   // Instant refresh after the AI chat agent completes a run — don't make
   // the user wait up to 30s for the next poll tick to see the agent's effects.
@@ -133,6 +169,16 @@ import Button from '../../components/Button.svelte';
   let recurrenceEditorRef = $state(null);
   let recurrenceSaving = $state(false);
 
+  // Cross-workspace move state
+  let showWorkspaceMoveDialog = $state(false);
+
+  // Ticket lifecycle (merge/split) state
+  let showMergeDialog = $state(false);
+  let showSplitDialog = $state(false);
+  // Candidate passed in when the merge dialog is opened from the duplicates
+  // panel; null when opened from the actions menu.
+  let mergePreselected = $state(null);
+
   // Item type change state
   let showTypeChangeModal = $state(false);
   let typeChangeAnalysis = $state(null);
@@ -143,9 +189,27 @@ import Button from '../../components/Button.svelte';
 
   let availableSubIssueTypes = $derived(itemDetailStore.availableSubIssueTypes);
 
+  // Identity of a key-addressed route (workspace key + item number), or null
+  // for numeric/global routes.
+  function lookupIdentity(key, number) {
+    return key ? `${key}\u0000${number}` : null;
+  }
+
   // Track itemId changes for reactivity
   // svelte-ignore state_referenced_locally
   let previousItemId = $state(itemId);
+
+  // The requested key-route identity. Item numbers repeat across workspaces, so
+  // itemId alone cannot tell a same-number destination in another workspace
+  // apart from a re-render of the current one.
+  // svelte-ignore state_referenced_locally
+  let previousLookupKey = lookupIdentity(workspaceKey, itemNumber);
+
+  // Guards asynchronous load continuations. Every navigation and unmount bumps
+  // the generation, so a superseded load cannot rewrite route identity or
+  // canonicalize the URL after the user has moved on.
+  let loadGeneration = 0;
+  let destroyed = false;
 
   // Timer guard flag to prevent duplicate timer starts
   let isStartingTimer = $state(false);
@@ -153,7 +217,7 @@ import Button from '../../components/Button.svelte';
   // Modal control functions
   function closeModal() {
     if (isModal && onclose) {
-      onclose({ hasChanges: itemDetailStore.hasChanges });
+      onclose();
     } else if (!isModal) {
       const collectionId = $currentRoute.params?.collectionId;
       const url = collectionId
@@ -303,13 +367,10 @@ import Button from '../../components/Button.svelte';
   }
 
   async function handleCopyKey() {
-    try {
-      const key = `${item.workspace_key || workspace?.key || 'WORK'}-${item.workspace_item_number}`;
-      await navigator.clipboard.writeText(key);
-      showCopySuccess(key);
-    } catch (error) {
-      console.error('[handleCopyKey] Failed to copy key to clipboard:', error);
-    }
+    const key = `${item.workspace_key || workspace?.key || 'WORK'}-${item.workspace_item_number}`;
+    const ok = await copyToClipboard(key);
+    if (!ok) console.error('[handleCopyKey] Failed to copy key to clipboard');
+    else showCopySuccess(key);
   }
 
   function showCopySuccess(key) {
@@ -317,8 +378,8 @@ import Button from '../../components/Button.svelte';
   }
   
   async function handleSaveField(detail) {
-    const { field, value, assigneeName, iterationName } = detail;
-    await saveField(field, value, assigneeName, iterationName);
+    const { field, value, assigneeName, iterationName, teamName } = detail;
+    await saveField(field, value, assigneeName, iterationName, teamName);
   }
 
   function handleCancelEdit(detail) {
@@ -326,9 +387,9 @@ import Button from '../../components/Button.svelte';
     cancelEdit(field);
   }
 
-  async function saveField(field, directValue = null, assigneeName = null, iterationName = null) {
+  async function saveField(field, directValue = null, assigneeName = null, iterationName = null, teamName = null) {
     try {
-      await itemDetailStore.saveField(field, directValue, assigneeName, iterationName);
+      await itemDetailStore.saveField(field, directValue, assigneeName, iterationName, teamName);
     } catch (err) {
       console.error('Failed to update item:', err);
       showError('Failed to update item', err.message || String(err));
@@ -356,6 +417,15 @@ import Button from '../../components/Button.svelte';
   
   function handleSwitchTab(detail) {
     tab = detail.tab;
+    if (tab === 'time') {
+      itemDetailStore.loadWorklogs().catch((error) => {
+        console.error('Failed to load time entries:', error);
+      });
+    }
+    // The modal is mounted on top of a board/list route; navigating to the item
+    // route here would replace it with the full-page view. Only the full-page
+    // detail needs to mirror the active tab into the URL.
+    if (isModal) return;
     const url = `/workspaces/${workspaceId}/items/${itemId}${tab !== 'comments' ? `?tab=${tab}` : ''}`;
     navigate(url);
   }
@@ -383,14 +453,20 @@ import Button from '../../components/Button.svelte';
   }
 
   function handleViewTestCase(detail) {
-    const { testCaseId } = detail || {};
+    const { testCaseId, workspaceId: testCaseWorkspaceId } = detail || {};
     if (!testCaseId) return;
     const normalizedId = Number(testCaseId);
     if (!Number.isFinite(normalizedId)) {
       console.warn('Received invalid test case ID from link:', testCaseId);
       return;
     }
-    itemDetailStore.openTestCaseModal(normalizedId);
+    const normalizedWorkspaceId = Number(testCaseWorkspaceId);
+    itemDetailStore.openTestCaseModal(
+      normalizedId,
+      Number.isFinite(normalizedWorkspaceId) && normalizedWorkspaceId > 0
+        ? normalizedWorkspaceId
+        : null
+    );
   }
 
   function handleCloseTestCaseModal() {
@@ -521,11 +597,13 @@ import Button from '../../components/Button.svelte';
     }
   }
 
-  function handleLogTime() {
+  async function handleLogTime() {
+    await itemDetailStore.loadTimeModalData();
     itemDetailStore.openTimeLogModal();
   }
 
-  function handleEditWorklog(detail) {
+  async function handleEditWorklog(detail) {
+    await itemDetailStore.loadTimeModalData();
     itemDetailStore.openTimeLogModal(detail);
   }
 
@@ -648,6 +726,16 @@ import Button from '../../components/Button.svelte';
     }
   }
 
+  // A linked or child item's status changed from the detail view; refresh
+  // only the list that row came from.
+  async function handleRelatedStatusChanged({ kind }) {
+    if (kind === 'child-item') {
+      await itemDetailStore.loadChildItems();
+    } else {
+      await itemDetailStore.loadLinks();
+    }
+  }
+
   async function handleParentChanged() {
     // Reload the item data to get updated parent hierarchy
     try {
@@ -693,13 +781,12 @@ import Button from '../../components/Button.svelte';
         ...(targetStatusId ? { target_status_id: targetStatusId } : {})
       });
       itemDetailStore.item = { ...itemDetailStore.item, ...updated };
-      itemDetailStore.hasChanges = true;
       showTypeChangeModal = false;
       typeChangeAnalysis = null;
       typeChangeTarget = null;
       selectedTypeChangeStatusId = null;
       await itemDetailStore.loadItem(workspaceId, item.id);
-      successToast('Item type changed');
+      successToast(t('items.itemTypeChanged'));
     } catch (error) {
       console.error('Failed to change item type:', error);
       typeChangeError = error.message || String(error);
@@ -724,7 +811,34 @@ import Button from '../../components/Button.svelte';
     itemDetailStore.openDeleteDialog();
   }
 
+  function handleWorkspaceMoved(result) {
+    const moved = result?.item;
+    if (!moved) return;
+    successToast(t('items.moveWorkspaceSuccess', { key: result.new_key }));
+    navigate(`/workspaces/${moved.workspace_id}/items/${moved.id}`);
+  }
+
+  let deletionFeedbackItemId = null;
+
+  function showDeletionFeedback() {
+    const deletedId = String(itemId);
+    if (deletionFeedbackItemId === deletedId) return;
+    deletionFeedbackItemId = deletedId;
+    infoToast(t('items.deleted'));
+  }
+
   function handleDeleteComplete(result) {
+    showDeletionFeedback();
+    // Do not let the next detail briefly render the deleted shared-store item.
+    itemDetailStore.reset();
+    // Reparent navigation can reuse this component; allow its next item load.
+    itemDetailStore.loading = false;
+    // In a modal, close in place instead of navigating away; the host view
+    // reconciles the deletion through its own event stream.
+    if (isModal && onclose) {
+      onclose();
+      return;
+    }
     const collectionId = $currentRoute.params?.collectionId;
     // Navigate based on deletion result
     if (result?.mode === 'reparent' && result?.newParentId) {
@@ -770,6 +884,7 @@ import Button from '../../components/Button.svelte';
       },
       {
         id: 'watch',
+        testid: 'item-watch-toggle',
         type: 'regular',
         icon: itemDetailStore.isWatching ? BookmarkCheck : Bookmark,
         title: itemDetailStore.isWatching ? t('items.unwatchWorkItem') : t('items.watchWorkItem'),
@@ -777,14 +892,47 @@ import Button from '../../components/Button.svelte';
       }
     ];
 
-    if (!recurrenceRule) {
+    // Use untrack to prevent creating reactive dependency that could cause infinite loops
+    const canEdit = untrack(() => workspacePermissions.canEdit(workspaceId));
+
+    if (!recurrenceRule && canEdit) {
       items.push({
         id: 'add-recurrence',
         type: 'regular',
         icon: Repeat,
+        testid: 'item-recurrence-add',
         title: t('recurrence.addRecurrence'),
         onClick: handleSetupRecurrence
       });
+    }
+
+    if (canEdit) {
+      items.push({
+        id: 'move-workspace',
+        type: 'regular',
+        icon: FolderInput,
+        testid: 'item-move-workspace-open',
+        title: t('items.moveWorkspaceMenu'),
+        onClick: () => { showWorkspaceMoveDialog = true; }
+      });
+      items.push(
+        {
+          id: 'merge-duplicate',
+          type: 'regular',
+          icon: GitMerge,
+          testid: 'item-merge-open',
+          title: t('items.mergeMenu'),
+          onClick: () => openMergeDialog()
+        },
+        {
+          id: 'split-subticket',
+          type: 'regular',
+          icon: GitBranch,
+          testid: 'item-split-open',
+          title: t('items.splitMenu'),
+          onClick: () => { showSplitDialog = true; }
+        }
+      );
     }
 
     // Only show delete option if user has permission
@@ -800,6 +948,7 @@ import Button from '../../components/Button.svelte';
           id: 'delete',
           type: 'regular',
           icon: Trash2,
+          testid: 'item-delete-open',
           title: t('items.deleteWorkItem'),
           color: 'var(--ds-text-danger)',
           hoverClass: 'hover-danger',
@@ -815,12 +964,20 @@ import Button from '../../components/Button.svelte';
   // Stale-while-revalidate: keep the previous item rendered while the new one
   // loads so the swap is atomic instead of skeleton-flashing.
   $effect(() => {
-    if (itemId !== previousItemId && !itemDetailStore.loading) {
+    const lookupKey = lookupIdentity(workspaceKey, itemNumber);
+    const lookupChanged = lookupKey != null && lookupKey !== previousLookupKey;
+    if (
+      (String(itemId) !== String(previousItemId) || lookupChanged) &&
+      !itemDetailStore.loading
+    ) {
       previousItemId = itemId;
+      previousLookupKey = lookupKey;
       itemDetailStore.transitioning = true;
 
       loadData()
-        .then(() => populateDropdownItems())
+        .then((loaded) => {
+          if (loaded) populateDropdownItems();
+        })
         .catch((error) => console.error('Failed to load item data after navigation:', error))
         .finally(() => { itemDetailStore.transitioning = false; });
     }
@@ -838,7 +995,9 @@ import Button from '../../components/Button.svelte';
     if (currentId == null || String(id) !== String(currentId)) return;
     itemDetailStore.transitioning = true;
     loadData()
-      .then(() => populateDropdownItems())
+      .then((loaded) => {
+        if (loaded) populateDropdownItems();
+      })
       .catch((error) => console.error('Failed to reload open item detail:', error))
       .finally(() => { itemDetailStore.transitioning = false; });
   });
@@ -885,7 +1044,7 @@ import Button from '../../components/Button.svelte';
     try {
       const childTypeId = availableSubIssueTypes[0]?.id;
       if (!childTypeId) {
-        errorToast('No child item type available');
+        errorToast(t('items.noChildItemType'));
         return;
       }
       for (const task of selectedTasks) {
@@ -897,13 +1056,13 @@ import Button from '../../components/Button.svelte';
           item_type_id: childTypeId,
         });
       }
-      successToast(`Created ${selectedTasks.length} sub-task${selectedTasks.length > 1 ? 's' : ''}`);
+      successToast(t('items.subtasksCreated', { count: selectedTasks.length }));
       closeAIModal();
       // Reload child items
       await itemDetailStore.loadChildItems();
     } catch (err) {
       console.error('Failed to create sub-tasks:', err);
-      errorToast(err.message || 'Failed to create sub-tasks');
+      errorToast(err.message || t('items.subtasksCreateFailed'));
     } finally {
       aiCreating = false;
     }
@@ -923,13 +1082,10 @@ import Button from '../../components/Button.svelte';
 
   // Handle diagram saved event - reload diagrams
   async function handleDiagramSaved() {
-    await itemDetailStore.loadDiagrams();
+    await itemDetailStore.loadDiagrams({ force: true });
   }
 
   onMount(async () => {
-    // Initialize timer state from server
-    await timerStore.initialize();
-
     await loadData();
 
     // Register context-sensitive commands for this item
@@ -1021,13 +1177,9 @@ import Button from '../../components/Button.svelte';
       keywords: ['copy', 'link', 'share', 'url'],
       action: async () => {
         const url = `${publicBaseURL()}/workspaces/${workspaceId}/items/${itemId}`;
-        try {
-          await navigator.clipboard.writeText(url);
-          successToast(t('items.itemLinkCopied'));
-        } catch (error) {
-          console.error('Failed to copy to clipboard:', error);
-          errorToast(t('items.failedToCopyToClipboard'));
-        }
+        const ok = await copyToClipboard(url);
+        if (ok) successToast(t('items.itemLinkCopied'));
+        else errorToast(t('items.failedToCopyToClipboard'));
       },
       priority: COMMAND_PRIORITIES.NORMAL,
       category: 'action'
@@ -1084,27 +1236,44 @@ import Button from '../../components/Button.svelte';
   });
 
   onDestroy(() => {
+    destroyed = true;
+    loadGeneration += 1;
     // Unregister context commands when component is destroyed
     unregisterContextCommands('item-detail');
-    // Cleanup timer intervals
-    timerStore.cleanup();
   });
 
   // Load data using the store
   async function loadData() {
+    const generation = ++loadGeneration;
     const lookupWorkspaceKey = workspaceKey || (workspaceId && !/^\d+$/.test(String(workspaceId)) ? workspaceId : null);
     const lookupItemNumber = itemNumber || (lookupWorkspaceKey ? itemId : null);
 
-    await itemDetailStore.loadItem(workspaceId, itemId, {
+    const result = await itemDetailStore.loadItem(workspaceId, itemId, {
       workspaceKey: lookupWorkspaceKey,
       itemNumber: lookupItemNumber,
     });
 
+    // A newer navigation or unmount owns the view now. Drop this continuation
+    // before it can rewrite route identity or canonicalize the URL.
+    if (destroyed || generation !== loadGeneration) return false;
+    if (result?.status !== 'success') return false;
+
+    const resolvedItem = result.item;
+
+    // Diagrams are non-blocking detail data, but they should appear without a
+    // separate "Show Diagram" control.
+    void itemDetailStore.loadDiagrams();
+
+    if (tab === 'time') {
+      await itemDetailStore.loadWorklogs();
+      if (destroyed || generation !== loadGeneration) return false;
+    }
+
     // Backfill route props from the resolved item when the URL used a stable
     // key form (/workspace/WI/item/123 or /workspaces/WI/items/123).
-    if (itemDetailStore.item?.id) {
-      workspaceId = itemDetailStore.workspaceId;
-      itemId = itemDetailStore.item.id;
+    if (resolvedItem?.id) {
+      workspaceId = resolvedItem.workspace_id ?? itemDetailStore.workspaceId;
+      itemId = resolvedItem.id;
       previousItemId = itemId;
 
       // Clear notifications pointing at this item: viewing an item should
@@ -1115,66 +1284,68 @@ import Button from '../../components/Button.svelte';
       workspaceId = itemDetailStore.workspaceId;
     }
 
-    if (canonicalizeKeyRoute && !isModal && itemDetailStore.item?.id && itemDetailStore.workspaceId) {
+    if (canonicalizeKeyRoute && !isModal && resolvedItem?.id && resolvedItem.workspace_id) {
       const suffix = tab !== 'comments' ? `?tab=${tab}` : '';
-      navigate(`/workspaces/${itemDetailStore.workspaceId}/items/${itemDetailStore.item.id}${suffix}`, { replace: true });
+      navigate(`/workspaces/${resolvedItem.workspace_id}/items/${resolvedItem.id}${suffix}`, { replace: true });
     }
 
     // Load attachment settings and attachments (still using composable)
     await attachmentManager.loadSettings();
+    if (destroyed || generation !== loadGeneration) return false;
     if (attachmentManager.isEnabled()) {
       await attachmentManager.load();
+      if (destroyed || generation !== loadGeneration) return false;
     }
 
     // Load recurrence rule
     loadRecurrence();
+    return true;
   }
 
-  // Sub-issue creation function
   function startCreateSubIssue() {
     if (itemDetailStore.availableSubIssueTypes.length === 0) {
       showError(t('items.noSubIssueTypes'), t('items.cannotCreateChildItems'));
       return;
     }
 
-    // Set up for sub-issue creation and open the global create modal
-
-    // First, trigger loading the CreateModal component
-    window.dispatchEvent(new CustomEvent('show-create-modal'));
-
-    // Small delay to let the modal load, then configure it
-    setTimeout(() => {
-      // Set the type first
-      window.dispatchEvent(new CustomEvent('set-create-type', {
-        detail: { type: 'work-item' }
-      }));
-
-      // Set the parent
-      window.dispatchEvent(new CustomEvent('set-create-parent', {
-        detail: {
-          parentId: itemDetailStore.item.id,
-          parentTitle: itemDetailStore.item.title,
-          availableItemTypes: itemDetailStore.availableSubIssueTypes
-        }
-      }));
-
-      // Open the modal (this will load workspaces)
-      window.dispatchEvent(new CustomEvent('open-create-modal'));
-
-      // After modal is open and workspaces are loaded, set the workspace
-      setTimeout(() => {
-        window.dispatchEvent(new CustomEvent('set-create-workspace', {
-          detail: {
-            workspaceId: workspaceId,
-            workspaceName: itemDetailStore.workspace?.name
-          }
-        }));
-      }, 200);
-    }, 150);
+    window.dispatchEvent(new CustomEvent('show-create-modal', {
+      detail: {
+        type: 'work-item',
+        workspaceId,
+        parentContext: {
+          parent: { id: itemDetailStore.item.id, title: itemDetailStore.item.title },
+          allowedItemTypes: itemDetailStore.availableSubIssueTypes,
+        },
+      },
+    }));
   }
+
 </script>
 
 {#snippet contentSnippet()}
+  {#if mergedInto != null && mergedInto !== item?.id}
+    <div
+      class="flex items-center gap-2 px-4 py-2.5 rounded-lg border mx-4 mt-4 text-sm"
+      style="border-color: var(--ds-border); background: var(--ds-surface-warning, rgba(234, 88, 12, 0.08));"
+      data-testid="item-merged-banner"
+    >
+      <GitMerge class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-warning, var(--ds-text));" />
+      <span style="color: var(--ds-text);">
+        {t('items.mergedBanner')}
+      </span>
+      {#if workspaceId}
+        <button
+          type="button"
+          class="font-medium underline"
+          style="color: var(--ds-interactive);"
+          onclick={() => navigate(`/workspaces/${workspaceId}/items/${mergedInto}`)}
+          data-testid="item-merged-banner-link"
+        >
+          {t('items.mergedBannerOpen')}
+        </button>
+      {/if}
+    </div>
+  {/if}
   <ItemDetailContent
     loading={itemDetailStore.loading}
     error={itemDetailStore.error}
@@ -1184,7 +1355,6 @@ import Button from '../../components/Button.svelte';
     parentHierarchy={itemDetailStore.parentHierarchy}
     currentItemType={itemDetailStore.currentItemType}
     currentHierarchyLevel={itemDetailStore.currentHierarchyLevel}
-    {iconMap}
     {workspaceId}
     editingTitle={itemDetailStore.editing.title.active}
     editTitle={itemDetailStore.editing.title.value}
@@ -1200,6 +1370,7 @@ import Button from '../../components/Button.svelte';
     loadingLinks={itemDetailStore.loadingLinks}
     availableSubIssueTypes={itemDetailStore.availableSubIssueTypes}
     childItems={itemDetailStore.childItems}
+    storyPointsRollup={itemDetailStore.storyPointsRollup}
     loadingChildItems={itemDetailStore.loadingChildItems}
     itemTypes={itemDetailStore.itemTypes}
     {tab}
@@ -1230,9 +1401,9 @@ import Button from '../../components/Button.svelte';
     attachments={attachmentManager.attachments || []}
     attachmentPagination={attachmentManager.pagination}
     diagrams={itemDetailStore.diagrams}
-    loadingDiagrams={itemDetailStore.loadingDiagrams}
     manualActions={itemDetailStore.manualActions}
     canCreate={untrack(() => workspacePermissions.canCreate(workspaceId))}
+    canEdit={untrack(() => workspacePermissions.canEdit(workspaceId))}
     onaiAction={handleAIAction}
     onnavigate={handleNavigate}
     ongoBack={handleGoBack}
@@ -1261,6 +1432,7 @@ import Button from '../../components/Button.svelte';
     ondeleteWorklog={handleDeleteWorklog}
     onparentChanged={handleParentChanged}
     onitemtypechange={handleItemTypeChange}
+    onrequestmerge={openMergeDialog}
     onattachmentUpload={attachmentManager.handleUpload}
     onattachmentUploadFiles={attachmentManager.uploadFiles}
     onattachmentDelete={attachmentManager.handleDelete}
@@ -1269,6 +1441,7 @@ import Button from '../../components/Button.svelte';
     ondiagramSaved={handleDiagramSaved}
     onexecuteAction={handleExecuteAction}
     onreorderChildren={handleReorderChildren}
+    onrelatedStatusChanged={handleRelatedStatusChanged}
     onclose={closeModal}
     {recurrenceRule}
     onsetupRecurrence={handleSetupRecurrence}
@@ -1281,11 +1454,14 @@ import Button from '../../components/Button.svelte';
     isOpen={true}
     maxWidth={'max-w-6xl'}
     autoFocus={false}
+    dataTestid="item-detail-modal"
     onclose={closeModal}
     onKeydown={handleItemDetailShortcuts}
   >
     <div
       bind:this={modalElement}
+      data-testid="item-detail"
+      data-live-updates={liveStream.connected ? 'connected' : 'disconnected'}
       class="flex flex-col relative w-full h-[85vh]"
     >
       {#if itemDetailStore.showTestCaseModal}
@@ -1293,6 +1469,7 @@ import Button from '../../components/Button.svelte';
           embedded={true}
           isOpen={itemDetailStore.showTestCaseModal}
           testCaseId={itemDetailStore.selectedTestCaseId}
+          workspaceId={itemDetailStore.selectedTestCaseWorkspaceId ?? itemDetailStore.workspaceId}
           onclose={handleCloseTestCaseModal}
         />
       {:else}
@@ -1317,10 +1494,7 @@ import Button from '../../components/Button.svelte';
               </button>
               <button
                 onclick={closeModal}
-                class="p-2 rounded transition-colors"
-                style="color: var(--ds-text-subtle);"
-                onmouseenter={(e) => { e.currentTarget.style.color = 'var(--ds-text)'; e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'; }}
-                onmouseleave={(e) => { e.currentTarget.style.color = 'var(--ds-text-subtle)'; e.currentTarget.style.backgroundColor = ''; }}
+                class="modal-close p-2 rounded transition-colors"
                 title="Close"
               >
                 <X class="w-5 h-5" />
@@ -1333,15 +1507,17 @@ import Button from '../../components/Button.svelte';
         <!-- Re-key on the displayed item id (not the incoming prop) so the
              subtree only swaps once new data has landed, producing an atomic
              transition instead of a mid-load tear-down. -->
-        {#key itemDetailStore.item?.id ?? itemId}
-          <div
-            class="transition-opacity duration-200 ease-in-out flex flex-col flex-1 min-h-0 overflow-hidden"
-            class:opacity-90={itemDetailStore.transitioning}
-            class:opacity-100={!itemDetailStore.transitioning}
-          >
-            {@render contentSnippet()}
-          </div>
-        {/key}
+        {#if !itemDetailStore.notFound}
+          {#key itemDetailStore.item?.id ?? itemId}
+            <div
+              class="transition-opacity duration-200 ease-in-out flex flex-col flex-1 min-h-0 overflow-hidden"
+              class:opacity-90={itemDetailStore.transitioning}
+              class:opacity-100={!itemDetailStore.transitioning}
+            >
+              {@render contentSnippet()}
+            </div>
+          {/key}
+        {/if}
       {/if}
     </div>
   </Modal>
@@ -1349,30 +1525,37 @@ import Button from '../../components/Button.svelte';
 <!-- Full Page Container -->
 <div
   bind:this={modalElement}
+  data-testid="item-detail"
+  data-live-updates={liveStream.connected ? 'connected' : 'disconnected'}
   class="flex flex-col w-full h-full relative"
   style="background-color: var(--ds-surface-raised);"
 >
   <!-- Shared Content Component for Full Page -->
-  {#key itemDetailStore.item?.id ?? itemId}
-    <div
-      class="transition-opacity duration-200 ease-in-out"
-      class:opacity-90={itemDetailStore.transitioning}
-      class:opacity-100={!itemDetailStore.transitioning}
-    >
-      {@render contentSnippet()}
-    </div>
-  {/key}
+  {#if !itemDetailStore.notFound}
+    {#key itemDetailStore.item?.id ?? itemId}
+      <div
+        class="transition-opacity duration-200 ease-in-out"
+        class:opacity-90={itemDetailStore.transitioning}
+        class:opacity-100={!itemDetailStore.transitioning}
+      >
+        {@render contentSnippet()}
+      </div>
+    {/key}
+  {/if}
 </div>
 
 {#if !isModal}
   <TestCaseViewModal
     isOpen={itemDetailStore.showTestCaseModal}
     testCaseId={itemDetailStore.selectedTestCaseId}
+    workspaceId={itemDetailStore.selectedTestCaseWorkspaceId ?? itemDetailStore.workspaceId}
     onclose={handleCloseTestCaseModal}
   />
 {/if}
+{/if}
 
-<!-- Time Log Modal -->
+<!-- Time Log Modal: rendered outside the isModal branch so logging time
+     works from both the item detail modal and the full-page view. -->
 {#if itemDetailStore.showTimeLogModal}
   <TimeLogModal
     defaultProjectId={getDefaultProjectForTimeLogging()}
@@ -1388,7 +1571,26 @@ import Button from '../../components/Button.svelte';
     oncancel={handleModalCancel}
   />
 {/if}
-{/if}
+
+<ItemMoveWorkspaceDialog
+  bind:isOpen={showWorkspaceMoveDialog}
+  item={itemDetailStore.item}
+  onMoved={handleWorkspaceMoved}
+/>
+
+<ItemMergeDialog
+  bind:isOpen={showMergeDialog}
+  item={itemDetailStore.item}
+  preselected={mergePreselected}
+  onMerged={handleMerged}
+/>
+
+<ItemSplitDialog
+  bind:isOpen={showSplitDialog}
+  item={itemDetailStore.item}
+  itemTypes={itemDetailStore.availableSubIssueTypes}
+  onSplit={handleSplit}
+/>
 
 {#if showTypeChangeModal && typeChangeAnalysis}
   <Modal isOpen={showTypeChangeModal} maxWidth="max-w-lg" onclose={closeTypeChangeModal}>
@@ -1411,17 +1613,13 @@ import Button from '../../components/Button.svelte';
           Current status: <span class="font-medium" style="color: var(--ds-text);">{typeChangeAnalysis.current_status_name || 'None'}</span>
         </div>
         <label class="block text-sm font-medium mb-1" for="type-change-status">Target status</label>
-        <select
+        <NativeSelect
           id="type-change-status"
           bind:value={selectedTypeChangeStatusId}
-          class="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-        >
-          <option value={null}>Select target status…</option>
-          {#each typeChangeAnalysis.available_statuses || [] as status (status.id)}
-            <option value={status.id}>{status.name}</option>
-          {/each}
-        </select>
+          options={(typeChangeAnalysis.available_statuses || []).map((status) => ({ value: status.id, label: status.name }))}
+          placeholder="Select target status…"
+          size="small"
+        />
         <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
           The change is blocked if the selected status would bypass a condition-gated transition or an approval-bound status.
         </p>
@@ -1526,3 +1724,14 @@ import Button from '../../components/Button.svelte';
     />
   </FormModal>
 {/if}
+
+<style>
+  .modal-close {
+    color: var(--ds-text-subtle);
+  }
+
+  .modal-close:hover {
+    color: var(--ds-text);
+    background-color: var(--ds-background-neutral-hovered);
+  }
+</style>

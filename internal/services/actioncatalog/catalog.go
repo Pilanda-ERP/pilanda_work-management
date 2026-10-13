@@ -1,23 +1,6 @@
-// Package actioncatalog is the single source of truth for what kinds of
-// triggers and nodes a workspace-scoped Action can contain. The metadata
-// (label, description, category, iterator flag, output handles) plus a
-// JSON Schema for the node-config struct are registered here and consumed
-// by three different surfaces:
-//
-//   - the v1 REST catalog endpoint (/rest/api/v1/workspaces/{id}/action-catalog),
-//     which agents and external tooling hit to discover what they can build;
-//   - the four MCP / in-app tools in internal/aitools/actions.go, which give
-//     the LLM the same discovery + validate + create flow without going
-//     through HTTP;
-//   - the frontend palette in ActionFlowEditor.svelte, which renders the
-//     server-driven labels and uses the schemas to bootstrap default config
-//     when a node is dropped onto the canvas.
-//
-// The runtime executor (internal/services/action_service.go) still routes
-// on the string node-type, so adding a new node type means (a) defining its
-// constant + config struct in internal/models, (b) registering it here, and
-// (c) wiring its executor branch. The TestNodeTypeCatalogCoverage drift
-// detector in catalog_test.go fails CI when (a) and (b) disagree.
+// Package actioncatalog registers action triggers and nodes for REST, MCP,
+// and the frontend palette. New node types need a model, a registration, and
+// an executor; TestNodeTypeCatalogCoverage detects model/catalog drift.
 package actioncatalog
 
 import (
@@ -29,9 +12,7 @@ import (
 	"windshift/internal/models"
 )
 
-// NodeCategory groups node types into coarse buckets the UI uses to
-// section the palette. The categories are stable strings the frontend can
-// switch on; they're not enums to keep new categories ergonomic to add.
+// NodeCategory groups palette entries.
 const (
 	CategoryFlow        = "flow"        // trigger
 	CategoryMutation    = "mutation"    // set_field, set_status, transition_item, add_comment
@@ -52,14 +33,9 @@ type NodeTypeMetadata struct {
 	Label       string                `json:"label"`
 	Description string                `json:"description"`
 	Category    string                `json:"category"`
-	// ConfigSchema is the JSON Schema document for this node's NodeConfig
-	// JSON blob. Always non-nil — node types whose config is the empty
-	// object get a permissive `{"type":"object"}` schema so clients still
-	// see the shape uniformly.
+	// ConfigSchema is always non-nil, including empty node configs.
 	ConfigSchema *jsonschema.Schema `json:"config_schema"`
-	// IsIterator mirrors ActionNodeType.IsIterator so the frontend can
-	// render iterator-body affordances (drop zones, body containment) off
-	// a single field instead of switching on the type string.
+	// IsIterator enables iterator-body UI affordances.
 	IsIterator bool `json:"is_iterator"`
 	// Outputs lists the edge-source handle names a node emits. For most
 	// nodes this is ["default"]; condition nodes emit ["true", "false"];
@@ -151,6 +127,20 @@ func Build() (*Catalog, error) {
 		return nil, err
 	}
 	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
+		Type:        models.ActionTriggerSLABreached,
+		Label:       "SLA: breached",
+		Description: "Fires when an SLA cycle misses its goal. The {{sla.metric}} variable carries the metric name.",
+	}); err != nil {
+		return nil, err
+	}
+	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
+		Type:        models.ActionTriggerSLAWarning,
+		Label:       "SLA: warning",
+		Description: "Fires when an SLA cycle reaches a configured percent-of-goal warning threshold.",
+	}); err != nil {
+		return nil, err
+	}
+	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
 		Type:        models.ActionTriggerManual,
 		Label:       "Manual",
 		Description: "Action does not auto-fire — it must be invoked explicitly via the execute endpoint. Useful for human-in-the-loop or scripted automations.",
@@ -160,28 +150,42 @@ func Build() (*Catalog, error) {
 	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
 		Type:        models.ActionTriggerSCMTagCreated,
 		Label:       "SCM: tag created",
-		Description: "Fires when a synced source-control repository discovers a new tag/release ref.",
+		Description: "Fires when a synced source-control repository discovers a new tag/release ref. SCM triggers have no authenticated actor, so the action must set an actor_user_id override.",
 	}); err != nil {
 		return nil, err
 	}
 	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
 		Type:        models.ActionTriggerSCMReleaseBranchCreated,
 		Label:       "SCM: release branch created",
-		Description: "Fires when a synced source-control repository discovers a new release branch ref.",
+		Description: "Fires when a synced source-control repository discovers a new release branch ref. SCM triggers have no authenticated actor, so the action must set an actor_user_id override.",
 	}); err != nil {
 		return nil, err
 	}
 	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
 		Type:        models.ActionTriggerSCMPRLinked,
 		Label:       "SCM: pull request linked",
-		Description: "Fires when a synced repository discovers a new pull request linked to a work item. SCM triggers have no authenticated actor, so the action must set an actor_user_id override to perform item mutations.",
+		Description: "Fires when a synced repository discovers a new pull request linked to a work item. SCM triggers have no authenticated actor, so the action must set an actor_user_id override.",
 	}); err != nil {
 		return nil, err
 	}
 	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
 		Type:        models.ActionTriggerSCMPRMerged,
 		Label:       "SCM: pull request merged",
-		Description: "Fires when a linked pull request transitions to merged. SCM triggers have no authenticated actor, so the action must set an actor_user_id override to perform item mutations.",
+		Description: "Fires when a linked pull request transitions to merged. SCM triggers have no authenticated actor, so the action must set an actor_user_id override.",
+	}); err != nil {
+		return nil, err
+	}
+	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
+		Type:        models.ActionTriggerCommentCreated,
+		Label:       "Comment created",
+		Description: "Fires when a comment is added to an item. Use from_customer to react only to customer replies (portal customer or email-intake sender) or only to agent comments.",
+	}); err != nil {
+		return nil, err
+	}
+	if err := registerTrigger[models.ActionTriggerConfig](c, triggerSpec{
+		Type:        models.ActionTriggerItemInactive,
+		Label:       "Item inactive",
+		Description: "Fires when an open item has had no comment or update for the configured number of hours (inactive_hours). The trigger re-arms after new activity.",
 	}); err != nil {
 		return nil, err
 	}
@@ -225,7 +229,7 @@ func Build() (*Catalog, error) {
 	if err := registerNode[models.AddCommentNodeConfig](c, nodeSpec{
 		Type:        models.ActionNodeAddComment,
 		Label:       "Add comment",
-		Description: "Post a comment on the current item. Content supports {{variable}} template interpolation; mark is_private for restricted visibility.",
+		Description: "Post a comment on the current item. Content supports {{variable}} template interpolation; mark is_private for restricted visibility. Comments triggered by a private comment are posted as internal notes.",
 		Category:    CategoryMutation,
 	}); err != nil {
 		return nil, err
@@ -315,6 +319,30 @@ func Build() (*Catalog, error) {
 		Type:        models.ActionNodeCreateMilestone,
 		Label:       "Create milestone",
 		Description: "Upsert a workspace milestone from SCM branch/tag events, optionally promoting status and attaching release information.",
+		Category:    CategoryMutation,
+	}); err != nil {
+		return nil, err
+	}
+	if err := registerNode[models.InsertCannedResponseNodeConfig](c, nodeSpec{
+		Type:        models.ActionNodeInsertCannedResponse,
+		Label:       "Insert canned response",
+		Description: "Render a workspace canned response with the execution variables and post it as a comment on the current item. Private snippets, and any insert triggered by a private comment, are posted as private comments.",
+		Category:    CategoryMutation,
+	}); err != nil {
+		return nil, err
+	}
+	if err := registerNode[models.NotifyCustomerNodeConfig](c, nodeSpec{
+		Type:        models.ActionNodeNotifyCustomer,
+		Label:       "Notify customer",
+		Description: "Email the portal customer who created the item through the threaded reply transport. Skips safely when the item has no customer with an email address, or when the triggering comment is private.",
+		Category:    CategoryMutation,
+	}); err != nil {
+		return nil, err
+	}
+	if err := registerNode[models.AdjustLabelsNodeConfig](c, nodeSpec{
+		Type:        models.ActionNodeAdjustLabels,
+		Label:       "Adjust labels",
+		Description: "Add or remove labels on the current item.",
 		Category:    CategoryMutation,
 	}); err != nil {
 		return nil, err

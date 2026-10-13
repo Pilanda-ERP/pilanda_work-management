@@ -1,13 +1,16 @@
 <script>
   import { api } from '../api.js';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import Button from '../components/Button.svelte';
+  import Checkbox from '../components/Checkbox.svelte';
+  import Input from '../components/Input.svelte';
   import Textarea from '../components/Textarea.svelte';
   import AlertBox from '../components/AlertBox.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import Label from '../components/Label.svelte';
   import PortalModal from './PortalModal.svelte';
   import BasePicker from '../pickers/BasePicker.svelte';
   import CustomFieldRenderer from '../features/items/CustomFieldRenderer.svelte';
+  import { isBooleanCustomFieldType } from '../utils/customFieldTypes.js';
   import { t } from '../stores/i18n.svelte.js';
 
   let {
@@ -72,7 +75,11 @@
 
       const initial = {};
       for (const f of fields) {
-        if (f.field_type === 'virtual' && f.virtual_field_type === 'checkbox') {
+        const definition = f.field_type === 'custom' ? getCustomFieldDefinition(f.field_identifier) : null;
+        if (
+          (f.field_type === 'virtual' && f.virtual_field_type === 'checkbox') ||
+          isBooleanCustomFieldType(definition?.field_type)
+        ) {
           initial[f.field_identifier] = false;
         } else {
           initial[f.field_identifier] = '';
@@ -109,6 +116,7 @@
       if (!f.is_required) continue;
       const v = values[f.field_identifier];
       if (f.field_type === 'virtual' && f.virtual_field_type === 'checkbox') continue;
+      if (f.field_type === 'custom' && isBooleanCustomFieldType(getCustomFieldDefinition(f.field_identifier)?.field_type)) continue;
       if (v === '' || v === null || v === undefined || (Array.isArray(v) && v.length === 0)) {
         return t('portal.fieldRequired', { field: getFieldLabel(f) });
       }
@@ -164,6 +172,7 @@
 
 {#if isOpen && report}
   <PortalModal
+    id="portal-asset-report-form"
     isOpen={isOpen}
     isDarkMode={isDarkMode}
     maxWidth="max-w-3xl"
@@ -173,9 +182,7 @@
     bodyClass="px-6 py-4 max-h-[75vh] overflow-y-auto"
   >
     {#if loading}
-      <div class="flex items-center justify-center py-12">
-        <Spinner size="lg" />
-      </div>
+      <StateDisplay type="loading" size="lg" />
     {:else}
       {#if error}
         <AlertBox variant="error" message={error} class="mb-4" />
@@ -186,7 +193,7 @@
           <AlertBox variant="info" message={t('portal.noFieldsConfigured')} class="mb-4" />
           <div class="flex justify-end gap-2">
             <Button variant="default" onclick={close}>{t('common.cancel')}</Button>
-            <Button variant="primary" onclick={handleSubmit} disabled={submitting}>
+            <Button variant="primary" onclick={handleSubmit} disabled={submitting} dataTestid="portal-asset-report-form-submit">
               {submitting ? t('common.submitting') : submitLabel}
             </Button>
           </div>
@@ -205,12 +212,11 @@
                     placeholder={getFieldLabel(field)}
                   />
                 {:else}
-                  <input
+                  <Input
                     type="text"
                     bind:value={values[field.field_identifier]}
-                    class="w-full px-4 py-3 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
                     placeholder={getFieldLabel(field)}
+                    size="medium"
                   />
                 {/if}
                 {#if field.description}
@@ -286,31 +292,16 @@
                     getLabel={(option) => option.label}
                   />
                 {:else if field.virtual_field_type === 'checkbox'}
-                  <label class="flex items-center gap-3 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      bind:checked={values[field.field_identifier]}
-                      class="h-5 w-5 rounded border-gray-300 focus:ring-2 focus:ring-blue-500"
-                    />
-                    <span class="text-sm" style="color: {isDarkMode ? '#e2e8f0' : '#374151'};">
-                      {getFieldLabel(field)}
-                    </span>
-                  </label>
-                {:else if field.virtual_field_type === 'number'}
-                  <input
-                    type="number"
-                    bind:value={values[field.field_identifier]}
-                    class="w-full px-4 py-3 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
-                    placeholder={getFieldLabel(field)}
+                  <Checkbox
+                    bind:checked={values[field.field_identifier]}
+                    label={getFieldLabel(field)}
                   />
                 {:else}
-                  <input
+                  <Input
                     type="text"
                     bind:value={values[field.field_identifier]}
-                    class="w-full px-4 py-3 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
                     placeholder={getFieldLabel(field)}
+                    size="medium"
                   />
                 {/if}
               </div>
@@ -319,7 +310,7 @@
 
           <div class="flex justify-end gap-2 mt-6">
             <Button variant="default" onclick={close}>{t('common.cancel')}</Button>
-            <Button variant="primary" onclick={handleSubmit} disabled={submitting}>
+            <Button variant="primary" onclick={handleSubmit} disabled={submitting} dataTestid="portal-asset-report-form-submit">
               {submitting ? t('common.submitting') : submitLabel}
             </Button>
           </div>

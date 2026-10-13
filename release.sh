@@ -32,6 +32,7 @@ PLATFORMS=(
     "linux/amd64"
     "linux/arm64"
     "windows/amd64"
+    "windows/arm64"
     "darwin/amd64"
     "darwin/arm64"
 )
@@ -77,6 +78,37 @@ dry_run_or_exec() {
     else
         "$@"
     fi
+}
+
+ensure_node_runtime() {
+    local version_file="$SCRIPT_DIR/.nvmrc"
+    [ -f "$version_file" ] || return 0
+
+    local required_version current_version
+    required_version=$(tr -d '[:space:]' < "$version_file")
+    [ -n "$required_version" ] || die "Node version file is empty: $version_file"
+
+    current_version=""
+    if command -v node >/dev/null 2>&1; then
+        current_version=$(node --version 2>/dev/null || true)
+        current_version="${current_version#v}"
+    fi
+
+    if [ "$current_version" = "$required_version" ]; then
+        return 0
+    fi
+
+    if [ "${WINDSHIFT_RELEASE_NODE_BOOTSTRAPPED:-}" = "$required_version" ]; then
+        die "mise failed to activate Node $required_version (active: ${current_version:-unavailable})"
+    fi
+
+    if ! command -v mise >/dev/null 2>&1; then
+        die "Node $required_version is required (active: ${current_version:-unavailable}). Install mise or activate the version from .nvmrc."
+    fi
+
+    log_info "Active Node is ${current_version:-unavailable}; restarting with Node $required_version via mise..."
+    exec env WINDSHIFT_RELEASE_NODE_BOOTSTRAPPED="$required_version" \
+        mise x "node@$required_version" -- "$SCRIPT_DIR/release.sh" "$@"
 }
 
 # =============================================================================
@@ -142,13 +174,22 @@ create_git_tag() {
     fi
 
     if [ "$DRY_RUN" = true ]; then
-        log_info "[DRY-RUN] Would create git tag: $tag"
+        log_info "[DRY-RUN] Would create signed git tag: $tag"
         log_info "[DRY-RUN] Would push tag to remote"
         return 0
     fi
 
-    git tag -a "$tag" -m "Release $tag"
-    log_success "Created git tag: $tag"
+    if [ -n "${RELEASE_GPG_KEY:-}" ]; then
+        git -c gpg.format=openpgp -c user.signingkey="$RELEASE_GPG_KEY" \
+            tag -s "$tag" -m "Release $tag"
+    else
+        local ssh_key
+        ssh_key=$(release_ssh_signing_key) ||
+            die "Release signing requires RELEASE_GPG_KEY or RELEASE_SSH_KEY (or an SSH user.signingkey in Git config)"
+        git -c gpg.format=ssh -c user.signingkey="$ssh_key" \
+            tag -s "$tag" -m "Release $tag"
+    fi
+    log_success "Created signed git tag: $tag"
     git push origin "$tag"
     log_success "Pushed tag to remote"
     TAG_CREATED=true
@@ -208,6 +249,175 @@ check_gh_cli() {
     if ! gh auth status &>/dev/null; then
         die "GitHub CLI not authenticated - run 'gh auth login' first"
     fi
+}
+
+# =============================================================================
+# Preflight credential checks
+#
+# Credential failures used to surface only at the step that consumed them: an
+# expired 1Password session after a full multi-platform build, or a GHCR push
+# denial after every Docker layer had already been built. Both cost a complete
+# rebuild. Everything credential-shaped is therefore verified — and, for
+# 1Password, refreshed — before the first build step runs.
+# =============================================================================
+
+# The DMG build is the only consumer of the 1Password-backed APPLE_PASSWORD.
+desktop_build_is_active() {
+    [ "$SKIP_DESKTOP" != true ] && [ "$(uname)" = "Darwin" ]
+}
+
+preflight_1password() {
+    # $1: whether this command builds the DMG at all (push does not).
+    [ "$1" = true ] || return 0
+    desktop_build_is_active || return 0
+
+    # Only the op-backed path needs a session: an inline APPLE_PASSWORD, or a
+    # config without APPLE_PASSWORD_OP_REF, never touches 1Password.
+    if [ -n "${APPLE_PASSWORD:-}" ] || [ -z "${APPLE_PASSWORD_OP_REF:-}" ]; then
+        return 0
+    fi
+
+    command -v op >/dev/null 2>&1 \
+        || die "APPLE_PASSWORD_OP_REF is set but 1Password CLI (op) is not installed."
+
+    if ! op whoami >/dev/null 2>&1; then
+        log_warn "1Password session expired or not signed in."
+        [ -t 0 ] || die "No TTY available to run 'op signin'. Sign in first, or export APPLE_PASSWORD directly."
+
+        log_info "Running 'op signin'..."
+        local signin_env
+        signin_env=$(op signin) \
+            || die "1Password sign-in failed — run 'op signin' manually and retry."
+        eval "$signin_env"
+    fi
+
+    # Resolve the secret now instead of at notarization time, so a wrong or
+    # renamed item ID also fails here rather than after the build.
+    APPLE_PASSWORD=$(op item get "$APPLE_PASSWORD_OP_REF" --fields label=password --reveal) \
+        || die "Failed to read APPLE_PASSWORD from 1Password (item: $APPLE_PASSWORD_OP_REF)."
+    [ -n "$APPLE_PASSWORD" ] \
+        || die "1Password returned an empty password for item: $APPLE_PASSWORD_OP_REF"
+    export APPLE_PASSWORD
+
+    log_success "1Password session OK (APPLE_PASSWORD resolved)"
+}
+
+# Emits the ghcr.io username and secret on two lines, straight from the store
+# `docker push` itself reads, so the probe tests the real credential rather
+# than assuming it was seeded from `gh auth token`.
+read_ghcr_credential() {
+    local config="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+    [ -f "$config" ] || return 1
+
+    local helper
+    helper=$(jq -r '.credHelpers["ghcr.io"] // .credsStore // empty' "$config") || return 1
+
+    if [ -n "$helper" ]; then
+        command -v "docker-credential-$helper" >/dev/null 2>&1 || return 1
+        local out
+        out=$(echo "ghcr.io" | "docker-credential-$helper" get 2>/dev/null) || return 1
+        jq -r '.Username // empty, .Secret // empty' <<<"$out"
+        return 0
+    fi
+
+    # No helper: credentials sit inline as base64("user:token").
+    local b64 decoded
+    b64=$(jq -r '.auths["ghcr.io"].auth // empty' "$config") || return 1
+    [ -n "$b64" ] || return 1
+    decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null) || return 1
+    printf '%s\n%s\n' "${decoded%%:*}" "${decoded#*:}"
+}
+
+# 0 = push allowed, 1 = authenticated but not authorized, 2 = indeterminate.
+# Opens a blob upload session and immediately cancels it; nothing is published.
+ghcr_push_probe() {
+    local repo="$1" user="$2" secret="$3"
+
+    local token
+    token=$(curl -s -u "$user:$secret" \
+        "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull,push" \
+        | jq -r '.token // empty') || return 2
+    [ -n "$token" ] || return 2
+
+    local headers location
+    headers=$(curl -s -D - -o /dev/null -X POST \
+        -H "Authorization: Bearer $token" \
+        "https://ghcr.io/v2/${repo}/blobs/uploads/") || return 2
+
+    location=$(printf '%s' "$headers" | grep -i '^location:' | tr -d '\r' | cut -d' ' -f2-)
+    [ -n "$location" ] || return 1
+
+    # Release the session we just opened. GHCR expires abandoned uploads anyway,
+    # so a failure here must not fail the release.
+    curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $token" "$location" || true
+    return 0
+}
+
+# Fallback when the registry cannot be probed: inspect the gh token's scopes.
+# Only conclusive when the Docker login was seeded from `gh auth token`, so
+# this warns rather than aborts.
+preflight_ghcr_scope_fallback() {
+    if ! command -v gh >/dev/null 2>&1; then
+        log_warn "Cannot verify GHCR push access (need jq, curl or gh) — continuing."
+        return 0
+    fi
+
+    if gh auth status 2>&1 | grep -q "write:packages"; then
+        log_success "GitHub token lists the write:packages scope"
+        return 0
+    fi
+
+    log_warn "GitHub token does not list the 'write:packages' scope."
+    log_warn "  If the ghcr.io Docker login was seeded from 'gh auth token', the push WILL fail."
+    log_warn "  Fix: gh auth refresh -h github.com -s write:packages"
+    log_warn "       gh auth token | docker login ghcr.io -u <github-username> --password-stdin"
+}
+
+preflight_ghcr() {
+    local repo="${GHCR_REGISTRY#ghcr.io/}"
+
+    if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        preflight_ghcr_scope_fallback
+        return 0
+    fi
+
+    local creds
+    if ! creds=$(read_ghcr_credential); then
+        die "No ghcr.io credential found in Docker's credential store. Log in with:
+    gh auth refresh -h github.com -s write:packages
+    gh auth token | docker login ghcr.io -u <github-username> --password-stdin"
+    fi
+
+    local user secret
+    { read -r user; read -r secret; } <<<"$creds"
+    if [ -z "$user" ] || [ -z "$secret" ]; then
+        preflight_ghcr_scope_fallback
+        return 0
+    fi
+
+    local rc=0
+    ghcr_push_probe "$repo" "$user" "$secret" || rc=$?
+    case "$rc" in
+        0) log_success "GHCR push access OK (as $user)" ;;
+        1) die "GHCR denied push to ${GHCR_REGISTRY} for user '$user'.
+   The credential is valid but is missing the 'write:packages' scope. Fix with:
+     gh auth refresh -h github.com -s write:packages
+     gh auth token | docker login ghcr.io -u $user --password-stdin" ;;
+        *) log_warn "Could not reach the GHCR token API to verify push access — continuing." ;;
+    esac
+}
+
+# need_ghcr:    whether this command pushes Docker images.
+# need_desktop: whether this command builds (and notarizes) the DMG.
+preflight_auth() {
+    local need_ghcr="$1" need_desktop="$2"
+
+    log_step "0/9" "Preflight: verifying credentials..."
+    preflight_1password "$need_desktop"
+    if [ "$need_ghcr" = true ]; then
+        preflight_ghcr
+    fi
+    log_success "Preflight checks passed"
 }
 
 run_frontend_supply_chain_checks() {
@@ -277,7 +487,7 @@ build_frontend() {
         cd frontend
         export VITE_APP_VERSION_CODE="$VERSION"
         export VITE_APP_VERSION_NAME="$RELEASE_NAME"
-        npm ci --silent
+        npm ci
         run_frontend_supply_chain_checks
         npm run build
     )
@@ -430,7 +640,7 @@ PORT=8080
 
 # Database - Choose one:
 # SQLite (default)
-DATABASE_PATH=windshift.db
+DB_PATH=windshift.db
 
 # PostgreSQL (uncomment to use)
 # POSTGRES_CONNECTION_STRING=postgresql://user:password@localhost:5432/windshift?sslmode=disable
@@ -516,7 +726,9 @@ build_desktop_mac() {
     check_desktop_dependencies
 
     # Resolve Apple app-specific password from 1Password if configured.
-    # APPLE_PASSWORD_OP_REF is the 1Password item ID.
+    # APPLE_PASSWORD_OP_REF is the 1Password item ID. preflight_1password
+    # normally resolves and exports this before any build runs; this stays as a
+    # fallback for callers that reach this step without preflight.
     if [ -z "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_PASSWORD_OP_REF:-}" ]; then
         if ! command -v op >/dev/null 2>&1; then
             die "APPLE_PASSWORD_OP_REF is set but 1Password CLI (op) is not installed."
@@ -672,7 +884,7 @@ write_release_provenance() {
             echo ""
             echo "Resolved base image digests at build time"
             echo "-----------------------------------------"
-            for image in node:25-alpine golang:1.26.3-alpine golang:1.26-bookworm node:lts-slim; do
+            for image in node:24.18.0-alpine golang:1.27.2-alpine golang:1.27.2-bookworm node:lts-slim; do
                 docker buildx imagetools inspect "$image" 2>/dev/null | grep -E 'Name:|Digest:' || true
             done
         fi
@@ -681,27 +893,107 @@ write_release_provenance() {
     log_success "Wrote PROVENANCE.txt"
 }
 
-sign_checksums_if_possible() {
+release_ssh_signing_key() {
+    if [ -n "${RELEASE_SSH_KEY:-}" ]; then
+        printf '%s\n' "$RELEASE_SSH_KEY"
+        return 0
+    fi
+
+    [ "$(git config --get gpg.format 2>/dev/null || true)" = "ssh" ] || return 1
+    git config --get user.signingkey 2>/dev/null
+}
+
+release_signing_identity() {
+    if [ -n "${RELEASE_SIGNING_IDENTITY:-}" ]; then
+        printf '%s\n' "$RELEASE_SIGNING_IDENTITY"
+        return 0
+    fi
+
+    git config --get user.email 2>/dev/null
+}
+
+preflight_release_signing() {
     if [ "$DRY_RUN" = true ]; then
-        log_info "[DRY-RUN] Would sign SHA256SUMS.txt if gpg is available"
+        log_info "[DRY-RUN] Would verify the release signing key"
         return 0
     fi
 
-    [ -f dist/releases/SHA256SUMS.txt ] || return 0
-
-    if [ -z "${RELEASE_GPG_KEY:-}" ]; then
-        log_warn "RELEASE_GPG_KEY not set; SHA256SUMS.txt will not be signed"
+    if [ -n "${RELEASE_GPG_KEY:-}" ]; then
+        command -v gpg >/dev/null 2>&1 ||
+            die "gpg is required when RELEASE_GPG_KEY is set"
+        gpg --batch --list-secret-keys "$RELEASE_GPG_KEY" >/dev/null 2>&1 ||
+            die "No GPG secret key found for RELEASE_GPG_KEY=$RELEASE_GPG_KEY"
+        log_success "GPG release signing key is available"
         return 0
     fi
 
-    if ! command -v gpg >/dev/null 2>&1; then
-        log_warn "gpg not found; SHA256SUMS.txt will not be signed"
+    local ssh_key identity
+    ssh_key=$(release_ssh_signing_key) ||
+        die "Release signing requires RELEASE_GPG_KEY or RELEASE_SSH_KEY (or an SSH user.signingkey in Git config)"
+    identity=$(release_signing_identity) ||
+        die "SSH release signing requires RELEASE_SIGNING_IDENTITY or user.email in Git config"
+    [ -n "$identity" ] ||
+        die "SSH release signing requires RELEASE_SIGNING_IDENTITY or user.email in Git config"
+    [ -f "$ssh_key" ] ||
+        die "SSH release signing key not found: $ssh_key"
+    command -v ssh-keygen >/dev/null 2>&1 ||
+        die "ssh-keygen is required for SSH release signing"
+    log_success "SSH release signing key is available"
+}
+
+sign_release_checksums() {
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Would sign and verify SHA256SUMS.txt"
         return 0
     fi
 
-    gpg --batch --yes --armor --detach-sign --local-user "$RELEASE_GPG_KEY" \
-        -o dist/releases/SHA256SUMS.txt.asc dist/releases/SHA256SUMS.txt
-    log_success "Signed SHA256SUMS.txt -> SHA256SUMS.txt.asc"
+    local checksums="dist/releases/SHA256SUMS.txt"
+    [ -s "$checksums" ] || die "Missing or empty $checksums"
+
+    if [ -n "${RELEASE_GPG_KEY:-}" ]; then
+        local gpg_signature="${checksums}.asc"
+        gpg --batch --yes --armor --detach-sign --local-user "$RELEASE_GPG_KEY" \
+            -o "$gpg_signature" "$checksums" ||
+            die "Failed to sign SHA256SUMS.txt with GPG"
+        [ -s "$gpg_signature" ] || die "GPG did not create $gpg_signature"
+        gpg --batch --verify "$gpg_signature" "$checksums" >/dev/null 2>&1 ||
+            die "Generated GPG release signature could not be verified"
+        log_success "Signed and verified SHA256SUMS.txt -> SHA256SUMS.txt.asc"
+        return 0
+    fi
+
+    local ssh_key identity ssh_signature public_key allowed_signers
+    ssh_key=$(release_ssh_signing_key) ||
+        die "Release signing requires RELEASE_GPG_KEY or RELEASE_SSH_KEY (or an SSH user.signingkey in Git config)"
+    identity=$(release_signing_identity) ||
+        die "SSH release signing requires RELEASE_SIGNING_IDENTITY or user.email in Git config"
+    ssh_signature="${checksums}.sig"
+
+    ssh-keygen -Y sign -f "$ssh_key" -n windshift-release "$checksums" >/dev/null ||
+        die "Failed to sign SHA256SUMS.txt with SSH"
+    [ -s "$ssh_signature" ] || die "SSH signing did not create $ssh_signature"
+
+    if [[ "$ssh_key" == *.pub ]]; then
+        public_key=$(awk 'NR == 1 { print $1 " " $2 }' "$ssh_key")
+    else
+        public_key=$(ssh-keygen -y -f "$ssh_key") ||
+            die "Could not derive the public key for release signature verification"
+    fi
+    [ -n "$public_key" ] || die "Could not derive the public release signing key"
+
+    allowed_signers="dist/releases/.allowed_signers.tmp"
+    printf '%s %s\n' "$identity" "$public_key" > "$allowed_signers"
+    if ! ssh-keygen -Y verify \
+        -f "$allowed_signers" \
+        -I "$identity" \
+        -n windshift-release \
+        -s "$ssh_signature" \
+        < "$checksums" >/dev/null 2>&1; then
+        rm -f "$allowed_signers"
+        die "Generated SSH release signature could not be verified"
+    fi
+    rm -f "$allowed_signers"
+    log_success "Signed and verified SHA256SUMS.txt -> SHA256SUMS.txt.sig"
 }
 
 ensure_buildx() {
@@ -816,6 +1108,18 @@ create_github_release() {
 
     check_gh_cli
 
+    if [ "$DRY_RUN" = false ]; then
+        local signature_found=false
+        for signature in dist/releases/SHA256SUMS.txt.asc dist/releases/SHA256SUMS.txt.sig; do
+            if [ -s "$signature" ]; then
+                signature_found=true
+                break
+            fi
+        done
+        [ "$signature_found" = true ] ||
+            die "Refusing to publish a release without a SHA256SUMS.txt signature"
+    fi
+
     # Create git tag if needed
     local current_tag=$(get_git_tag)
     if [ -z "$current_tag" ]; then
@@ -830,7 +1134,7 @@ create_github_release() {
 
     # Collect assets
     local assets=()
-    for file in dist/releases/*.tar.gz dist/releases/*.zip dist/releases/*.dmg dist/releases/SHA256SUMS.txt dist/releases/SHA256SUMS.txt.asc dist/releases/PROVENANCE.txt; do
+    for file in dist/releases/*.tar.gz dist/releases/*.zip dist/releases/*.dmg dist/releases/SHA256SUMS.txt dist/releases/SHA256SUMS.txt.asc dist/releases/SHA256SUMS.txt.sig dist/releases/PROVENANCE.txt; do
         [ -f "$file" ] && assets+=("$file")
     done
 
@@ -855,6 +1159,7 @@ create_github_release() {
 cmd_build() {
     check_dependencies
     determine_version
+    preflight_auth false true
 
     rm -rf dist/
 
@@ -894,6 +1199,8 @@ cmd_push() {
         [[ $REPLY =~ ^[Yy]$ ]] || exit 1
     fi
 
+    preflight_auth true false
+
     rm -rf dist/
 
     run_go_vulnerability_check
@@ -927,6 +1234,7 @@ cmd_release() {
     determine_version
 
     REQUIRE_SIGNED_DMG=true
+    preflight_release_signing
 
     if [ "$CONFIRM" = true ] && [ "$DRY_RUN" = false ]; then
         echo ""
@@ -951,6 +1259,8 @@ cmd_release() {
         [[ $REPLY =~ ^[Yy]$ ]] || exit 1
     fi
 
+    preflight_auth true true
+
     rm -rf dist/
 
     run_go_vulnerability_check
@@ -962,7 +1272,7 @@ cmd_release() {
     build_desktop_mac
     write_release_provenance
     generate_checksums
-    sign_checksums_if_possible
+    sign_release_checksums
     build_docker
     create_github_release
 
@@ -1004,13 +1314,26 @@ Options:
   -y, --yes               Skip confirmation prompts
   -h, --help              Show this help
 
-Desktop signing (optional, only consulted when running on macOS):
+Every command runs a credential preflight (step 0/9) before the first build:
+GHCR push access is probed for 'push' and 'release', and an expired 1Password
+session is refreshed via 'op signin' whenever the DMG will be built. Bad
+credentials therefore fail in seconds rather than after a full build.
+
+Desktop signing (required for an official macOS release):
   APPLE_SIGNING_IDENTITY  Developer ID Application cert name in your keychain
   APPLE_ID                Apple ID email (for notarization)
   APPLE_PASSWORD          App-specific password (for notarization)
   APPLE_PASSWORD_OP_REF   1Password item ID — alternative to APPLE_PASSWORD
   APPLE_TEAM_ID           Apple Developer team ID (for notarization)
-  RELEASE_GPG_KEY         Optional GPG key id/email used to sign SHA256SUMS.txt
+
+Release signing (required for 'release'):
+  RELEASE_GPG_KEY         GPG key id/email used to create SHA256SUMS.txt.asc
+  RELEASE_SSH_KEY         SSH private/public key path used to create SHA256SUMS.txt.sig
+                          Defaults to Git's SSH user.signingkey when configured.
+  RELEASE_SIGNING_IDENTITY
+                          SSH signer identity; defaults to Git's user.email.
+
+Desktop behavior:
   For 'build' and 'push': when unset, the DMG is produced unsigned and
   unnotarized — Gatekeeper will block double-click on download, users must
   right-click → Open.
@@ -1040,6 +1363,11 @@ Release Notes:
 
     ## Bug Fixes
     - Fixed issue #123
+
+Node Runtime:
+  The script reads .nvmrc and automatically restarts through mise when the
+  active Node version differs. Install mise if the required version is not
+  already active.
 EOF
 }
 
@@ -1105,6 +1433,10 @@ main() {
     fi
 
     case "$COMMAND" in
+        build|push|release) ensure_node_runtime "$@" ;;
+    esac
+
+    case "$COMMAND" in
         build)   cmd_build ;;
         push)    cmd_push ;;
         release) cmd_release ;;
@@ -1113,4 +1445,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

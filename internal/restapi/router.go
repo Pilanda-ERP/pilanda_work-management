@@ -5,6 +5,7 @@ import (
 
 	"windshift/internal/auth"
 	"windshift/internal/database"
+	"windshift/internal/objecttranslation"
 	"windshift/internal/services"
 )
 
@@ -41,6 +42,23 @@ type Deps struct {
 	// a bare service when nil so embedders that haven't wired this yet still
 	// persist comments, but those comments won't fire notifications.
 	CommentService *services.CommentService
+	// ItemCreationService is the fully wired user-facing creation pipeline.
+	// Sharing it with the cookie handler keeps normalization, validation,
+	// persistence, and committed-item side effects identical across surfaces.
+	ItemCreationService *services.ItemCreationService
+	// ItemUpdateApplicationService is the fully wired user-facing update
+	// pipeline. Sharing it keeps activity tracking, cache invalidation,
+	// committed-item events, and mention processing identical across surfaces.
+	ItemUpdateApplicationService *services.ItemUpdateApplicationService
+	// ItemDeletionApplicationService is the fully wired destructive pipeline.
+	// It owns the exact item.delete permission, cascade result, cache
+	// invalidation, and committed delete event shared by REST v1 and MCP.
+	ItemDeletionApplicationService *services.ItemDeletionApplicationService
+	// PageApplicationService is the permission-aware mutation/audit pipeline
+	// shared by cookie, REST v1, and MCP page operations.
+	PageApplicationService *services.PageApplicationService
+	// PageDiagramService owns Page-scoped diagram attachment mutations.
+	PageDiagramService *services.PageDiagramService
 	// AssetPermissionService gates the v1 asset surface against the
 	// per-set role model. Shared with the cookie-auth handler so both
 	// surfaces consult one role-check pipeline. The v1 router constructs
@@ -55,6 +73,37 @@ type Deps struct {
 	// path produces orphaned audit rows (no automation hook); production
 	// should always pass the cookie-auth handler's shared instance.
 	AssetService *services.AssetService
+	// ObjectTranslationService is shared with the cookie-auth admin surface so
+	// writes invalidate the same translation cache for every transport.
+	ObjectTranslationService *objecttranslation.Service
+	// AuthorizationCacheInvalidator is the shared post-commit invalidation
+	// boundary used by every authorization-affecting mutation surface.
+	AuthorizationCacheInvalidator *services.AuthorizationCacheInvalidator
+	// PackProvisioner provisions built-in packs during workspace creation from
+	// a template pack. Optional: nil disables template_pack on the v1 surface.
+	PackProvisioner services.WorkspacePackProvisioner
+	// AI is the AI-tier surface (agentic chat, daily briefing) shared with
+	// the cookie-auth /api mount. Typed as a narrow interface because
+	// internal/handlers imports this package — the concrete
+	// *handlers.AIHandler satisfies it implicitly. Nil disables the v1 AI
+	// surface.
+	AI AIHandler
+	// AIRateLimiter bounds expensive AI calls, user-keyed. Satisfied by
+	// *middleware.RateLimiter (same import-cycle reasoning as AI). Optional:
+	// nil falls back to the group rate limiter alone.
+	AIRateLimiter Limiter
+}
+
+// AIHandler is the subset of the AI tier the bearer surface exposes.
+type AIHandler interface {
+	Chat(w http.ResponseWriter, r *http.Request)
+	GetDailyBriefing(w http.ResponseWriter, r *http.Request)
+}
+
+// Limiter wraps a request with a rate limit. Satisfied by the core
+// *middleware.RateLimiter.
+type Limiter interface {
+	Limit(next http.Handler) http.Handler
 }
 
 // SetupRoutesFunc is a function type for setting up v1 routes

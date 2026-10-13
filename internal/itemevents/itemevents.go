@@ -1,0 +1,741 @@
+// Package itemevents defines and records canonical work-item domain facts.
+package itemevents
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"windshift/internal/database"
+	"windshift/internal/events"
+	"windshift/internal/models"
+)
+
+const (
+	Created        = "item.created"
+	Updated        = "item.updated"
+	StatusChanged  = "item.status_changed"
+	Deleted        = "item.deleted"
+	CommentCreated = "item.comment_created"
+	Linked         = "item.linked"
+	Unlinked       = "item.unlinked"
+	Merged         = "item.merged"
+	Split          = "item.split"
+
+	PayloadVersion = 1
+)
+
+// Metadata preserves the principal, entry path, and causal chain of a fact.
+type Metadata struct {
+	OccurredAt        time.Time
+	ActorKind         string
+	ActorRef          string
+	SourceKind        string
+	SourceRef         string
+	CorrelationID     string
+	CausationEventKey string
+	Automation        *AutomationContext
+	// AgentRunID is the agent_runs row that produced this write, when an agent
+	// made it. It is the only precise link from an agent's effect back to the
+	// turn that caused it — a history row stamped with just "an agent did this"
+	// cannot say which turn, and therefore cannot report that turn's model or
+	// cost without guessing from timestamps. Adapters set it; the item-history
+	// feed persists it. newEvent surfaces it as SourceRef so the durable event
+	// store carries the same link.
+	AgentRunID int
+}
+
+// AutomationContext preserves action cascade information across restarts.
+type AutomationContext struct {
+	TriggeredByAction bool   `json:"triggered_by_action"`
+	ExecutionChainID  string `json:"execution_chain_id,omitempty"`
+	CascadeDepth      int    `json:"cascade_depth"`
+	SourceApplication string `json:"source_application,omitempty"`
+}
+
+// User records an internal user as the actor.
+func User(userID int, sourceKind string) Metadata {
+	return Metadata{ActorKind: "user", ActorRef: strconv.Itoa(userID), SourceKind: sourceKind}
+}
+
+// PortalCustomer records an unlinked portal customer as the actor.
+func PortalCustomer(customerID int, sourceKind string) Metadata {
+	return Metadata{ActorKind: "portal_customer", ActorRef: strconv.Itoa(customerID), SourceKind: sourceKind}
+}
+
+// Integration records a named external system as the actor.
+func Integration(ref, sourceKind string) Metadata {
+	return Metadata{ActorKind: "integration", ActorRef: ref, SourceKind: sourceKind}
+}
+
+// Agent records an autonomous agent as the actor.
+func Agent(ref, sourceKind string) Metadata {
+	return Metadata{ActorKind: "agent", ActorRef: ref, SourceKind: sourceKind}
+}
+
+// Import records an import job as the actor.
+func Import(ref string) Metadata {
+	return Metadata{ActorKind: "import", ActorRef: ref, SourceKind: "import"}
+}
+
+// System records a system-owned mutation.
+func System(sourceKind string) Metadata {
+	return Metadata{ActorKind: "system", SourceKind: sourceKind}
+}
+
+// ItemSnapshot is the stable item state carried by version-one events.
+type ItemSnapshot struct {
+	ID                      int            `json:"id"`
+	WorkspaceID             int            `json:"workspace_id"`
+	WorkspaceItemNumber     int            `json:"workspace_item_number"`
+	ItemTypeID              *int           `json:"item_type_id,omitempty"`
+	Title                   string         `json:"title"`
+	Description             string         `json:"description"`
+	StatusID                *int           `json:"status_id,omitempty"`
+	PriorityID              *int           `json:"priority_id,omitempty"`
+	AssigneeID              *int           `json:"assignee_id,omitempty"`
+	CreatorID               *int           `json:"creator_id,omitempty"`
+	CreatorPortalCustomerID *int           `json:"creator_portal_customer_id,omitempty"`
+	ParentID                *int           `json:"parent_id,omitempty"`
+	IterationID             *int           `json:"iteration_id,omitempty"`
+	ProjectID               *int           `json:"project_id,omitempty"`
+	TimeProjectID           *int           `json:"time_project_id,omitempty"`
+	DueDate                 *time.Time     `json:"due_date,omitempty"`
+	StartDate               *time.Time     `json:"start_date,omitempty"`
+	EndDate                 *time.Time     `json:"end_date,omitempty"`
+	IsTask                  bool           `json:"is_task"`
+	InheritProject          bool           `json:"inherit_project"`
+	ReporterID              *int           `json:"reporter_id,omitempty"`
+	ChannelID               *int           `json:"channel_id,omitempty"`
+	RequestTypeID           *int           `json:"request_type_id,omitempty"`
+	RelatedWorkItemID       *int           `json:"related_work_item_id,omitempty"`
+	StoryPoints             *float64       `json:"story_points,omitempty"`
+	EstimateMinutes         *int           `json:"estimate_minutes,omitempty"`
+	FracIndex               *string        `json:"frac_index,omitempty"`
+	CustomFieldValues       map[string]any `json:"custom_field_values,omitempty"`
+	VirtualFieldData        map[string]any `json:"virtual_field_data,omitempty"`
+}
+
+// Snapshot copies the canonical fields consumers may need after later writes.
+func Snapshot(item *models.Item) ItemSnapshot {
+	return ItemSnapshot{
+		ID:                      item.ID,
+		WorkspaceID:             item.WorkspaceID,
+		WorkspaceItemNumber:     item.WorkspaceItemNumber,
+		ItemTypeID:              item.ItemTypeID,
+		Title:                   item.Title,
+		Description:             item.Description,
+		StatusID:                item.StatusID,
+		PriorityID:              item.PriorityID,
+		AssigneeID:              item.AssigneeID,
+		CreatorID:               item.CreatorID,
+		CreatorPortalCustomerID: item.CreatorPortalCustomerID,
+		ParentID:                item.ParentID,
+		IterationID:             item.IterationID,
+		ProjectID:               item.ProjectID,
+		TimeProjectID:           item.TimeProjectID,
+		DueDate:                 item.DueDate,
+		StartDate:               item.StartDate,
+		EndDate:                 item.EndDate,
+		IsTask:                  item.IsTask,
+		InheritProject:          item.InheritProject,
+		ReporterID:              item.ReporterID,
+		ChannelID:               item.ChannelID,
+		RequestTypeID:           item.RequestTypeID,
+		RelatedWorkItemID:       item.RelatedWorkItemID,
+		StoryPoints:             item.StoryPoints,
+		EstimateMinutes:         item.EstimateMinutes,
+		FracIndex:               item.FracIndex,
+		CustomFieldValues:       item.CustomFieldValues,
+		VirtualFieldData:        item.VirtualFieldData,
+	}
+}
+
+type CreatedV1 struct {
+	Item         ItemSnapshot       `json:"item"`
+	MilestoneIDs []int              `json:"milestone_ids,omitempty"`
+	Automation   *AutomationContext `json:"automation,omitempty"`
+}
+
+type FieldChange struct {
+	Field    string `json:"field"`
+	OldValue any    `json:"old_value"`
+	NewValue any    `json:"new_value"`
+}
+
+// Changes returns stable, typed before-and-after facts for canonical item
+// fields. Joined display fields are intentionally excluded.
+func Changes(before, after *models.Item) []FieldChange {
+	changes := make([]FieldChange, 0)
+	add := func(field string, oldValue, newValue any) {
+		if !reflect.DeepEqual(oldValue, newValue) {
+			changes = append(changes, FieldChange{Field: field, OldValue: oldValue, NewValue: newValue})
+		}
+	}
+	add("workspace_id", before.WorkspaceID, after.WorkspaceID)
+	add("workspace_item_number", before.WorkspaceItemNumber, after.WorkspaceItemNumber)
+	add("item_type_id", pointerValue(before.ItemTypeID), pointerValue(after.ItemTypeID))
+	add("title", before.Title, after.Title)
+	add("description", before.Description, after.Description)
+	add("status_id", pointerValue(before.StatusID), pointerValue(after.StatusID))
+	add("priority_id", pointerValue(before.PriorityID), pointerValue(after.PriorityID))
+	add("assignee_id", pointerValue(before.AssigneeID), pointerValue(after.AssigneeID))
+	add("creator_id", pointerValue(before.CreatorID), pointerValue(after.CreatorID))
+	add("creator_portal_customer_id", pointerValue(before.CreatorPortalCustomerID), pointerValue(after.CreatorPortalCustomerID))
+	add("reporter_id", pointerValue(before.ReporterID), pointerValue(after.ReporterID))
+	add("channel_id", pointerValue(before.ChannelID), pointerValue(after.ChannelID))
+	add("request_type_id", pointerValue(before.RequestTypeID), pointerValue(after.RequestTypeID))
+	add("parent_id", pointerValue(before.ParentID), pointerValue(after.ParentID))
+	add("iteration_id", pointerValue(before.IterationID), pointerValue(after.IterationID))
+	add("project_id", pointerValue(before.ProjectID), pointerValue(after.ProjectID))
+	add("inherit_project", before.InheritProject, after.InheritProject)
+	add("time_project_id", pointerValue(before.TimeProjectID), pointerValue(after.TimeProjectID))
+	add("related_work_item_id", pointerValue(before.RelatedWorkItemID), pointerValue(after.RelatedWorkItemID))
+	add("due_date", pointerValue(before.DueDate), pointerValue(after.DueDate))
+	add("start_date", pointerValue(before.StartDate), pointerValue(after.StartDate))
+	add("end_date", pointerValue(before.EndDate), pointerValue(after.EndDate))
+	add("is_task", before.IsTask, after.IsTask)
+	add("story_points", pointerValue(before.StoryPoints), pointerValue(after.StoryPoints))
+	add("estimate_minutes", pointerValue(before.EstimateMinutes), pointerValue(after.EstimateMinutes))
+	add("frac_index", pointerValue(before.FracIndex), pointerValue(after.FracIndex))
+	addMapChanges(&changes, "cf_", before.CustomFieldValues, after.CustomFieldValues)
+	addMapChanges(&changes, "virtual_", before.VirtualFieldData, after.VirtualFieldData)
+	return changes
+}
+
+func pointerValue[T any](value *T) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func addMapChanges(changes *[]FieldChange, prefix string, before, after map[string]any) {
+	keys := make(map[string]struct{}, len(before)+len(after))
+	for key := range before {
+		keys[key] = struct{}{}
+	}
+	for key := range after {
+		keys[key] = struct{}{}
+	}
+	ordered := make([]string, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Strings(ordered)
+	for _, key := range ordered {
+		oldValue, oldPresent := before[key]
+		newValue, newPresent := after[key]
+		if !oldPresent {
+			oldValue = nil
+		}
+		if !newPresent {
+			newValue = nil
+		}
+		if !reflect.DeepEqual(oldValue, newValue) {
+			*changes = append(*changes, FieldChange{Field: prefix + key, OldValue: oldValue, NewValue: newValue})
+		}
+	}
+}
+
+type UpdatedV1 struct {
+	Item       ItemSnapshot       `json:"item"`
+	Changes    []FieldChange      `json:"changes"`
+	Automation *AutomationContext `json:"automation,omitempty"`
+}
+
+type StatusChangedV1 struct {
+	Item        ItemSnapshot       `json:"item"`
+	OldStatusID *int               `json:"old_status_id,omitempty"`
+	NewStatusID *int               `json:"new_status_id,omitempty"`
+	Changes     []FieldChange      `json:"changes"`
+	Automation  *AutomationContext `json:"automation,omitempty"`
+}
+
+type DeletedV1 struct {
+	Item            ItemSnapshot       `json:"item"`
+	DescendantCount int                `json:"descendant_count"`
+	Automation      *AutomationContext `json:"automation,omitempty"`
+}
+
+type CommentCreatedV1 struct {
+	ItemID              int                `json:"item_id"`
+	CommentID           int64              `json:"comment_id"`
+	AuthorID            *int               `json:"author_id,omitempty"`
+	PortalCustomerID    *int               `json:"portal_customer_id,omitempty"`
+	IsPrivate           bool               `json:"is_private"`
+	SuppressSideEffects bool               `json:"suppress_side_effects,omitempty"`
+	Automation          *AutomationContext `json:"automation,omitempty"`
+}
+
+type LinkChangedV1 struct {
+	ItemID     int                `json:"item_id"`
+	LinkID     int                `json:"link_id"`
+	LinkTypeID int                `json:"link_type_id"`
+	Direction  string             `json:"direction"`
+	OtherType  string             `json:"other_type"`
+	OtherID    int                `json:"other_id"`
+	SourceType string             `json:"source_type"`
+	SourceID   int                `json:"source_id"`
+	TargetType string             `json:"target_type"`
+	TargetID   int                `json:"target_id"`
+	Automation *AutomationContext `json:"automation,omitempty"`
+}
+
+// MergedV1 records one duplicate folded into a canonical ticket. Counts are
+// informational; the durable redirect is items.merged_into_item_id.
+type MergedV1 struct {
+	SourceItemID     int                `json:"source_item_id"`
+	TargetItemID     int                `json:"target_item_id"`
+	MovedComments    int                `json:"moved_comments"`
+	MovedAttachments int                `json:"moved_attachments"`
+	MovedLinks       int                `json:"moved_links"`
+	CommentsPrivate  bool               `json:"comments_private"`
+	Automation       *AutomationContext `json:"automation,omitempty"`
+}
+
+// SplitV1 records a subticket carved out of a source ticket.
+type SplitV1 struct {
+	SourceItemID     int                `json:"source_item_id"`
+	SplitItemID      int                `json:"split_item_id"`
+	MovedComments    int                `json:"moved_comments"`
+	MovedAttachments int                `json:"moved_attachments"`
+	AssigneeID       *int               `json:"assignee_id,omitempty"`
+	PortalCustomerID *int               `json:"portal_customer_id,omitempty"`
+	Automation       *AutomationContext `json:"automation,omitempty"`
+}
+
+// UpdateRecord describes one item update in a set-based source transaction.
+type UpdateRecord struct {
+	Item          *models.Item
+	Changes       []FieldChange
+	OldStatusID   *int
+	NewStatusID   *int
+	StatusChanged bool
+	Metadata      Metadata
+}
+
+// CreateRecord describes one item created by a set-based source transaction.
+type CreateRecord struct {
+	Item         *models.Item
+	MilestoneIDs []int
+	Metadata     Metadata
+}
+
+// FactObserver runs inside the source transaction after facts are appended.
+// An implementation must never keep the item write from committing: on error
+// it isolates itself and enqueues its own durable repair work.
+type FactObserver interface {
+	ObserveItemFacts(ctx context.Context, tx database.Tx, facts []RecordedFact) error
+}
+
+// RecordedFact is the canonical description of one appended item fact, shaped
+// for in-transaction observers such as the SLA evaluator.
+type RecordedFact struct {
+	Type              string
+	EventKey          string
+	ItemID            int
+	WorkspaceID       int
+	Changes           []FieldChange
+	OldStatusID       *int
+	NewStatusID       *int
+	CommentAuthorKind string
+	Snapshot          ItemSnapshot
+	Metadata          Metadata
+}
+
+var (
+	factObserverMu sync.RWMutex
+	factObserver   FactObserver
+)
+
+// RegisterFactObserver installs the process-wide in-transaction observer. It
+// is called once at startup; later calls replace the observer.
+func RegisterFactObserver(observer FactObserver) {
+	factObserverMu.Lock()
+	defer factObserverMu.Unlock()
+	factObserver = observer
+}
+
+// ClearFactObserver removes the process-wide observer. Tests use it to restore
+// global state.
+func ClearFactObserver() {
+	RegisterFactObserver(nil)
+}
+
+// Recorder appends item facts through the shared durable event store.
+type Recorder struct {
+	store *events.Store
+}
+
+func NewRecorder(db database.Database) *Recorder {
+	return &Recorder{store: events.NewStore(db)}
+}
+
+func (r *Recorder) observe(ctx context.Context, tx database.Tx, facts []RecordedFact) error {
+	if len(facts) == 0 {
+		return nil
+	}
+	factObserverMu.RLock()
+	observer := factObserver
+	factObserverMu.RUnlock()
+	if observer == nil {
+		return nil
+	}
+	return observer.ObserveItemFacts(ctx, tx, facts)
+}
+
+func (r *Recorder) Created(ctx context.Context, tx database.Tx, item *models.Item, milestoneIDs []int, metadata Metadata) (*events.Event, error) {
+	return r.append(ctx, tx, Created, item.WorkspaceID, item.ID, metadata, CreatedV1{
+		Item: Snapshot(item), MilestoneIDs: milestoneIDs, Automation: metadata.Automation,
+	})
+}
+
+// CreatedBatch appends one created fact for each distinct item.
+func (r *Recorder) CreatedBatch(ctx context.Context, tx database.Tx, records []CreateRecord) ([]*events.Event, error) {
+	inputs := make([]events.NewEvent, len(records))
+	for i, record := range records {
+		if record.Item == nil {
+			return nil, fmt.Errorf("item create record %d has no item", i)
+		}
+		input, err := newEvent(Created, record.Item.WorkspaceID, record.Item.ID, record.Metadata, CreatedV1{
+			Item: Snapshot(record.Item), MilestoneIDs: record.MilestoneIDs, Automation: record.Metadata.Automation,
+		})
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = input
+	}
+	appended, err := r.store.AppendBatch(ctx, tx, inputs)
+	if err != nil {
+		return nil, err
+	}
+	facts := make([]RecordedFact, len(records))
+	for i, record := range records {
+		facts[i] = RecordedFact{
+			Type: Created, ItemID: record.Item.ID, WorkspaceID: record.Item.WorkspaceID,
+			Snapshot: Snapshot(record.Item), Metadata: record.Metadata,
+		}
+		if i < len(appended) {
+			facts[i].EventKey = appended[i].Key
+		}
+	}
+	if err := r.observe(ctx, tx, facts); err != nil {
+		return nil, err
+	}
+	return appended, nil
+}
+
+func (r *Recorder) Updated(ctx context.Context, tx database.Tx, item *models.Item, changes []FieldChange, metadata Metadata) (*events.Event, error) {
+	return r.append(ctx, tx, Updated, item.WorkspaceID, item.ID, metadata, UpdatedV1{
+		Item: Snapshot(item), Changes: changes, Automation: metadata.Automation,
+	})
+}
+
+// UpdatedBatch appends one update fact for each distinct item in two
+// set-based event-store statements.
+func (r *Recorder) UpdatedBatch(ctx context.Context, tx database.Tx, records []UpdateRecord) ([]*events.Event, error) {
+	inputs := make([]events.NewEvent, len(records))
+	for i, record := range records {
+		if record.Item == nil {
+			return nil, fmt.Errorf("item update record %d has no item", i)
+		}
+		eventType := Updated
+		payload := any(UpdatedV1{
+			Item: Snapshot(record.Item), Changes: record.Changes, Automation: record.Metadata.Automation,
+		})
+		if record.StatusChanged {
+			eventType = StatusChanged
+			payload = StatusChangedV1{
+				Item: Snapshot(record.Item), OldStatusID: record.OldStatusID,
+				NewStatusID: record.NewStatusID, Changes: record.Changes,
+				Automation: record.Metadata.Automation,
+			}
+		}
+		input, err := newEvent(eventType, record.Item.WorkspaceID, record.Item.ID, record.Metadata, payload)
+		if err != nil {
+			return nil, err
+		}
+		inputs[i] = input
+	}
+	appended, err := r.store.AppendBatch(ctx, tx, inputs)
+	if err != nil {
+		return nil, err
+	}
+	facts := make([]RecordedFact, len(records))
+	for i, record := range records {
+		fact := RecordedFact{
+			Type: Updated, ItemID: record.Item.ID, WorkspaceID: record.Item.WorkspaceID,
+			Snapshot: Snapshot(record.Item), Changes: record.Changes, Metadata: record.Metadata,
+		}
+		if record.StatusChanged {
+			fact.Type = StatusChanged
+			fact.OldStatusID = record.OldStatusID
+			fact.NewStatusID = record.NewStatusID
+		}
+		if i < len(appended) {
+			fact.EventKey = appended[i].Key
+		}
+		facts[i] = fact
+	}
+	if err := r.observe(ctx, tx, facts); err != nil {
+		return nil, err
+	}
+	return appended, nil
+}
+
+func (r *Recorder) StatusChanged(ctx context.Context, tx database.Tx, item *models.Item, oldStatusID, newStatusID *int, changes []FieldChange, metadata Metadata) (*events.Event, error) {
+	return r.append(ctx, tx, StatusChanged, item.WorkspaceID, item.ID, metadata, StatusChangedV1{
+		Item: Snapshot(item), OldStatusID: oldStatusID, NewStatusID: newStatusID, Changes: changes, Automation: metadata.Automation,
+	})
+}
+
+func (r *Recorder) Deleted(ctx context.Context, tx database.Tx, item *models.Item, descendantCount int, metadata Metadata) (*events.Event, error) {
+	return r.append(ctx, tx, Deleted, item.WorkspaceID, item.ID, metadata, DeletedV1{
+		Item: Snapshot(item), DescendantCount: descendantCount, Automation: metadata.Automation,
+	})
+}
+
+// Merged appends the merge fact to both aggregates so each item's stream
+// records its side of the fold.
+func (r *Recorder) Merged(ctx context.Context, tx database.Tx, workspaceID int, payload MergedV1, metadata Metadata) ([]*events.Event, error) {
+	payload.Automation = metadata.Automation
+	source, err := r.appendNoObserve(ctx, tx, Merged, workspaceID, payload.SourceItemID, metadata, payload)
+	if err != nil {
+		return nil, err
+	}
+	target, err := r.appendNoObserve(ctx, tx, Merged, workspaceID, payload.TargetItemID, metadata, payload)
+	if err != nil {
+		return nil, err
+	}
+	facts := []RecordedFact{
+		{Type: Merged, EventKey: source.Key, ItemID: payload.SourceItemID, WorkspaceID: workspaceID, Metadata: metadata},
+		{Type: Merged, EventKey: target.Key, ItemID: payload.TargetItemID, WorkspaceID: workspaceID, Metadata: metadata},
+	}
+	if err := r.observe(ctx, tx, facts); err != nil {
+		return nil, err
+	}
+	return []*events.Event{source, target}, nil
+}
+
+// Split appends the split fact to both aggregates: the source records what
+// was carved out, the new subticket records where it came from.
+func (r *Recorder) Split(ctx context.Context, tx database.Tx, workspaceID int, payload SplitV1, metadata Metadata) ([]*events.Event, error) {
+	payload.Automation = metadata.Automation
+	source, err := r.appendNoObserve(ctx, tx, Split, workspaceID, payload.SourceItemID, metadata, payload)
+	if err != nil {
+		return nil, err
+	}
+	split, err := r.appendNoObserve(ctx, tx, Split, workspaceID, payload.SplitItemID, metadata, payload)
+	if err != nil {
+		return nil, err
+	}
+	facts := []RecordedFact{
+		{Type: Split, EventKey: source.Key, ItemID: payload.SourceItemID, WorkspaceID: workspaceID, Metadata: metadata},
+		{Type: Split, EventKey: split.Key, ItemID: payload.SplitItemID, WorkspaceID: workspaceID, Metadata: metadata},
+	}
+	if err := r.observe(ctx, tx, facts); err != nil {
+		return nil, err
+	}
+	return []*events.Event{source, split}, nil
+}
+
+func (r *Recorder) CommentCreated(ctx context.Context, tx database.Tx, workspaceID int, payload CommentCreatedV1, metadata Metadata) (*events.Event, error) {
+	payload.Automation = metadata.Automation
+	return r.append(ctx, tx, CommentCreated, workspaceID, payload.ItemID, metadata, payload)
+}
+
+// LinkChanged appends one fact to every item aggregate touched by the link.
+func (r *Recorder) LinkChanged(ctx context.Context, tx database.Tx, eventType string, link models.ItemLink, metadata Metadata) ([]*events.Event, error) {
+	return r.linkChanged(ctx, tx, eventType, link, metadata, false)
+}
+
+func (r *Recorder) linkChanged(ctx context.Context, tx database.Tx, eventType string, link models.ItemLink, metadata Metadata, skipMissingItems bool) ([]*events.Event, error) {
+	if eventType != Linked && eventType != Unlinked {
+		return nil, fmt.Errorf("unsupported item link event type %q", eventType)
+	}
+	type endpoint struct {
+		itemID, otherID      int
+		direction, otherType string
+	}
+	var endpoints []endpoint
+	if link.SourceType == "item" {
+		endpoints = append(endpoints, endpoint{link.SourceID, link.TargetID, "outgoing", link.TargetType})
+	}
+	if link.TargetType == "item" {
+		endpoints = append(endpoints, endpoint{link.TargetID, link.SourceID, "incoming", link.SourceType})
+	}
+	eventsOut := make([]*events.Event, 0, len(endpoints))
+	linkFacts := make([]RecordedFact, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		var workspaceID int
+		if err := tx.QueryRowContext(ctx, "SELECT workspace_id FROM items WHERE id = ?", endpoint.itemID).Scan(&workspaceID); err != nil {
+			if skipMissingItems && errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil, fmt.Errorf("load linked item %d workspace: %w", endpoint.itemID, err)
+		}
+		event, err := r.appendNoObserve(ctx, tx, eventType, workspaceID, endpoint.itemID, metadata, LinkChangedV1{
+			ItemID: endpoint.itemID, LinkID: link.ID, LinkTypeID: link.LinkTypeID,
+			Direction: endpoint.direction, OtherType: endpoint.otherType, OtherID: endpoint.otherID,
+			SourceType: link.SourceType, SourceID: link.SourceID,
+			TargetType: link.TargetType, TargetID: link.TargetID,
+			Automation: metadata.Automation,
+		})
+		if err != nil {
+			return nil, err
+		}
+		eventsOut = append(eventsOut, event)
+		linkFacts = append(linkFacts, RecordedFact{
+			Type: eventType, EventKey: event.Key, ItemID: endpoint.itemID,
+			WorkspaceID: workspaceID, Metadata: metadata,
+		})
+	}
+	if err := r.observe(ctx, tx, linkFacts); err != nil {
+		return nil, err
+	}
+	return eventsOut, nil
+}
+
+// RemovedLinks records item.unlinked facts for every link touching the
+// supplied polymorphic entity IDs. Call it before deleting the links or their
+// endpoints in the same transaction.
+func (r *Recorder) RemovedLinks(ctx context.Context, tx database.Tx, entityType string, entityIDs []int, metadata Metadata) error {
+	if len(entityIDs) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(entityIDs)), ",")
+	args := make([]any, 0, len(entityIDs)*2+2)
+	args = append(args, entityType)
+	for _, id := range entityIDs {
+		args = append(args, id)
+	}
+	args = append(args, entityType)
+	for _, id := range entityIDs {
+		args = append(args, id)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, link_type_id, source_type, source_id, target_type, target_id
+		FROM item_links
+		WHERE (source_type = ? AND source_id IN (`+placeholders+`))
+		   OR (target_type = ? AND target_id IN (`+placeholders+`))
+		ORDER BY id
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("load removed %s links: %w", entityType, err)
+	}
+	var links []models.ItemLink
+	for rows.Next() {
+		var link models.ItemLink
+		if err := rows.Scan(&link.ID, &link.LinkTypeID, &link.SourceType, &link.SourceID, &link.TargetType, &link.TargetID); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan removed %s link: %w", entityType, err)
+		}
+		links = append(links, link)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close removed %s links: %w", entityType, err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate removed %s links: %w", entityType, err)
+	}
+	for _, link := range links {
+		if _, err := r.linkChanged(ctx, tx, Unlinked, link, metadata, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Recorder) append(ctx context.Context, tx database.Tx, eventType string, workspaceID, itemID int, metadata Metadata, payload any) (*events.Event, error) {
+	event, err := r.appendNoObserve(ctx, tx, eventType, workspaceID, itemID, metadata, payload)
+	if err != nil {
+		return nil, err
+	}
+	fact := RecordedFact{Type: eventType, EventKey: event.Key, ItemID: itemID, WorkspaceID: workspaceID, Metadata: metadata}
+	enrichFactFromPayload(&fact, payload)
+	if err := r.observe(ctx, tx, []RecordedFact{fact}); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+func (r *Recorder) appendNoObserve(ctx context.Context, tx database.Tx, eventType string, workspaceID, itemID int, metadata Metadata, payload any) (*events.Event, error) {
+	input, err := newEvent(eventType, workspaceID, itemID, metadata, payload)
+	if err != nil {
+		return nil, err
+	}
+	event, err := r.store.Append(ctx, tx, input)
+	if err != nil {
+		return nil, fmt.Errorf("append %s for item %d: %w", eventType, itemID, err)
+	}
+	return event, nil
+}
+
+// enrichFactFromPayload copies the payload fields an in-transaction observer
+// needs without forcing every call site to construct a RecordedFact by hand.
+func enrichFactFromPayload(fact *RecordedFact, payload any) {
+	switch typed := payload.(type) {
+	case CreatedV1:
+		fact.Snapshot = typed.Item
+	case UpdatedV1:
+		fact.Snapshot = typed.Item
+		fact.Changes = typed.Changes
+	case StatusChangedV1:
+		fact.Snapshot = typed.Item
+		fact.Changes = typed.Changes
+		fact.OldStatusID = typed.OldStatusID
+		fact.NewStatusID = typed.NewStatusID
+	case DeletedV1:
+		fact.Snapshot = typed.Item
+	case CommentCreatedV1:
+		fact.CommentAuthorKind = fact.Metadata.ActorKind
+	case LinkChangedV1:
+		fact.ItemID = typed.ItemID
+	}
+}
+
+func newEvent(eventType string, workspaceID, itemID int, metadata Metadata, payload any) (events.NewEvent, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return events.NewEvent{}, fmt.Errorf("encode %s payload: %w", eventType, err)
+	}
+	if metadata.ActorKind == "" {
+		metadata.ActorKind = "system"
+	}
+	if metadata.SourceKind == "" {
+		metadata.SourceKind = "application"
+	}
+	// Surface the agent run as the event's source reference so the durable
+	// stream carries the same turn-level link the history feed persists. An
+	// automation's own SourceRef (the triggering application) wins: it
+	// describes *why* the write happened, which is the more specific fact.
+	sourceRef := metadata.SourceRef
+	if sourceRef == "" && metadata.AgentRunID > 0 {
+		sourceRef = "agent_run:" + strconv.Itoa(metadata.AgentRunID)
+	}
+	workspace := workspaceID
+	return events.NewEvent{
+		WorkspaceID:       &workspace,
+		AggregateType:     "item",
+		AggregateID:       strconv.Itoa(itemID),
+		Type:              eventType,
+		PayloadVersion:    PayloadVersion,
+		OccurredAt:        metadata.OccurredAt,
+		ActorKind:         metadata.ActorKind,
+		ActorRef:          metadata.ActorRef,
+		SourceKind:        metadata.SourceKind,
+		SourceRef:         sourceRef,
+		CorrelationID:     metadata.CorrelationID,
+		CausationEventKey: metadata.CausationEventKey,
+		Payload:           encoded,
+	}, nil
+}

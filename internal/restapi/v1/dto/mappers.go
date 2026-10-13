@@ -3,12 +3,22 @@ package dto
 import (
 	"fmt"
 
+	"windshift/internal/markdown"
 	"windshift/internal/models"
 	"windshift/internal/services"
 )
 
 // MapItemToResponse converts a models.Item to an ItemResponse DTO
 func MapItemToResponse(item *models.Item, baseURL string) *ItemResponse {
+	resp := mapItemToResponse(item, baseURL)
+	if resp == nil {
+		return nil
+	}
+	resp.DescriptionHTML, _ = markdown.Render(item.Description)
+	return resp
+}
+
+func mapItemToResponse(item *models.Item, baseURL string) *ItemResponse {
 	if item == nil {
 		return nil
 	}
@@ -31,11 +41,11 @@ func MapItemToResponse(item *models.Item, baseURL string) *ItemResponse {
 		UpdatedAt:           item.UpdatedAt,
 		CompletedAt:         item.CompletedAt,
 	}
-
 	// Map status
 	if item.StatusID != nil {
 		resp.Status = &StatusSummary{
 			ID:            *item.StatusID,
+			BuiltinKey:    item.StatusBuiltinKey,
 			Name:          item.StatusName,
 			CategoryColor: "", // Would need to be populated from expanded data
 		}
@@ -44,18 +54,20 @@ func MapItemToResponse(item *models.Item, baseURL string) *ItemResponse {
 	// Map priority
 	if item.PriorityID != nil {
 		resp.Priority = &PrioritySummary{
-			ID:    *item.PriorityID,
-			Name:  item.PriorityName,
-			Icon:  item.PriorityIcon,
-			Color: item.PriorityColor,
+			ID:         *item.PriorityID,
+			BuiltinKey: item.PriorityBuiltinKey,
+			Name:       item.PriorityName,
+			Icon:       item.PriorityIcon,
+			Color:      item.PriorityColor,
 		}
 	}
 
 	// Map item type
 	if item.ItemTypeID != nil {
 		resp.ItemType = &ItemTypeSummary{
-			ID:   *item.ItemTypeID,
-			Name: item.ItemTypeName,
+			ID:         *item.ItemTypeID,
+			BuiltinKey: item.ItemTypeBuiltinKey,
+			Name:       item.ItemTypeName,
 		}
 	}
 
@@ -131,11 +143,11 @@ func MapItemToResponse(item *models.Item, baseURL string) *ItemResponse {
 	return resp
 }
 
-// MapItemsToResponse converts a slice of models.Item to ItemResponse DTOs
+// MapItemsToResponse converts items without detail-only rendered fields.
 func MapItemsToResponse(items []models.Item, baseURL string) []ItemResponse {
 	result := make([]ItemResponse, len(items))
 	for i := range items {
-		result[i] = *MapItemToResponse(&items[i], baseURL)
+		result[i] = *mapItemToResponse(&items[i], baseURL)
 	}
 	return result
 }
@@ -153,6 +165,7 @@ func MapCommentToResponse(comment *models.Comment) *CommentResponse {
 		CreatedAt: comment.CreatedAt,
 		UpdatedAt: comment.UpdatedAt,
 	}
+	resp.ContentHTML, _ = markdown.Render(comment.Content)
 
 	if comment.AuthorID != nil {
 		resp.Author = &UserSummary{
@@ -202,6 +215,16 @@ func MapHistoryToResponse(history *models.ItemHistory) *HistoryResponse {
 			ID:       history.UserID,
 			FullName: history.UserName,
 			Email:    history.UserEmail,
+		}
+	}
+	if history.ActorKind != "" {
+		resp.ActorKind = history.ActorKind
+	}
+	if history.PortalCustomerID != nil {
+		resp.PortalCustomer = &PortalCustomerSummary{
+			ID:    *history.PortalCustomerID,
+			Name:  history.PortalCustomerName,
+			Email: history.PortalCustomerEmail,
 		}
 	}
 
@@ -266,21 +289,26 @@ func MapServiceTransitionsToResponse(transitions []services.WorkflowTransitionRe
 	result := make([]TransitionResponse, len(transitions))
 	for i, t := range transitions {
 		resp := TransitionResponse{
-			ID:           t.ID,
-			FromStatusID: t.FromStatusID,
-			ToStatusID:   t.ToStatusID,
+			ID:              t.ID,
+			FromStatusID:    t.FromStatusID,
+			FromAllStatuses: t.FromAllStatuses,
+			ToStatusID:      t.ToStatusID,
 		}
 
 		if t.FromStatusID != nil {
 			resp.FromStatus = &StatusSummary{
-				ID:   *t.FromStatusID,
-				Name: t.FromStatusName,
+				ID:                 *t.FromStatusID,
+				BuiltinKey:         t.FromStatusBuiltinKey,
+				Name:               t.FromStatusName,
+				CategoryBuiltinKey: t.FromCategoryBuiltinKey,
 			}
 		}
 
 		resp.ToStatus = &StatusSummary{
-			ID:   t.ToStatusID,
-			Name: t.ToStatusName,
+			ID:                 t.ToStatusID,
+			BuiltinKey:         t.ToStatusBuiltinKey,
+			Name:               t.ToStatusName,
+			CategoryBuiltinKey: t.ToCategoryBuiltinKey,
 		}
 
 		result[i] = resp

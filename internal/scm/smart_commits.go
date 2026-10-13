@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strconv"
 
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/services"
 )
@@ -155,10 +156,11 @@ func (s *SyncService) applySmartCommitAction(
 			return false
 		}
 		_, err := s.commentService.Create(services.CreateCommentParams{
-			ItemID:      itemID,
-			AuthorID:    userID,
-			ActorUserID: userID,
-			Content:     action.Payload,
+			ItemID:        itemID,
+			AuthorID:      userID,
+			ActorUserID:   userID,
+			Content:       action.Payload,
+			EventMetadata: itemevents.User(userID, "scm"),
 		})
 		if err != nil {
 			slog.Warn("smart commit: failed to create comment",
@@ -200,10 +202,11 @@ func (s *SyncService) applyTransitionSlug(
 	_, err = s.workflowService.PerformTransition(
 		ctx,
 		services.PerformTransitionRequest{
-			ItemID:      itemID,
-			ToStatusID:  int(toStatusID),
-			ActorUserID: userID,
-			Modes:       []string{"validator", "condition"},
+			ItemID:        itemID,
+			ToStatusID:    int(toStatusID),
+			ActorUserID:   userID,
+			EventMetadata: itemevents.User(userID, "scm"),
+			Modes:         []string{"validator", "condition"},
 		},
 		s.itemRepo,
 		s.conditionService,
@@ -219,9 +222,8 @@ func (s *SyncService) applyTransitionSlug(
 }
 
 // resolveActingUser maps a committer email to an internal user ID, but only
-// when that user has item-edit permission in the workspace. This mirrors
-// Jira's smart-commit rule that the committer email must match a user with
-// the permission to perform the action.
+// when that user has item-edit permission in the workspace. The committer
+// email must match a user who can perform the action.
 func (s *SyncService) resolveActingUser(workspaceID int, email string) (int, bool) {
 	if email == "" {
 		return 0, false

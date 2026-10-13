@@ -193,6 +193,16 @@ func (s *ConfigSetExportService) Export(ctx context.Context, configSetID int, ex
 	tpl.Payload.Links.EditScreenName = cs.EditScreenName
 	tpl.Payload.Links.ViewScreenName = cs.ViewScreenName
 
+	// Link types: the mutable part of the instance-global registry. Nothing
+	// on the configuration set references link types, so export carries every
+	// active non-system definition to keep the bundle self-contained; system
+	// rows exist on every instance by seed and are never carried.
+	linkTypes, err := s.exportLinkTypes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("export link types: %w", err)
+	}
+	tpl.Payload.LinkTypes = linkTypes
+
 	// Custom fields collected through workflow/condition/approval/screen
 	// traversal — emit their full definitions.
 	if len(customFieldNames) > 0 {
@@ -269,7 +279,7 @@ func (s *ConfigSetExportService) exportWorkflow(ctx context.Context, workflowID 
 	wf.Description = description.String
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT wt.id, wt.from_status_id, wt.to_status_id, wt.display_order,
+		SELECT wt.id, wt.from_status_id, wt.to_status_id, wt.from_all_statuses, wt.display_order,
 		       COALESCE(wt.source_handle, ''), COALESCE(wt.target_handle, ''),
 		       fs.name AS from_status_name, ts.name AS to_status_name
 		FROM workflow_transitions wt
@@ -287,28 +297,30 @@ func (s *ConfigSetExportService) exportWorkflow(ctx context.Context, workflowID 
 		var transitionID int
 		var fromID sql.NullInt64
 		var toID int
+		var fromAll bool
 		var displayOrder int
 		var sourceHandle, targetHandle string
 		var fromName sql.NullString
 		var toName string
-		if scanErr := rows.Scan(&transitionID, &fromID, &toID, &displayOrder, &sourceHandle, &targetHandle, &fromName, &toName); scanErr != nil {
+		if scanErr := rows.Scan(&transitionID, &fromID, &toID, &fromAll, &displayOrder, &sourceHandle, &targetHandle, &fromName, &toName); scanErr != nil {
 			return nil, scanErr
 		}
 
 		t := ConfigSetTplWorkflowTransition{
-			ToStatusName: toName,
-			DisplayOrder: displayOrder,
-			SourceHandle: sourceHandle,
-			TargetHandle: targetHandle,
+			ToStatusName:    toName,
+			FromAllStatuses: fromAll,
+			DisplayOrder:    displayOrder,
+			SourceHandle:    sourceHandle,
+			TargetHandle:    targetHandle,
 		}
-		if fromName.Valid {
+		if fromName.Valid && !fromAll {
 			f := fromName.String
 			t.FromStatusName = &f
 			statusNames[int(fromID.Int64)] = f
 		}
 		statusNames[toID] = toName
 
-		ref := ConfigSetTplTransitionRef{ToStatusName: toName}
+		ref := ConfigSetTplTransitionRef{ToStatusName: toName, FromAllStatuses: fromAll}
 		if t.FromStatusName != nil {
 			ref.FromStatusName = t.FromStatusName
 		}
@@ -372,9 +384,10 @@ func (s *ConfigSetExportService) exportConditionSet(ctx context.Context, conditi
 			continue
 		}
 		tc := ConfigSetTplTransitionCondition{
-			FromStatusName: ref.FromStatusName,
-			ToStatusName:   ref.ToStatusName,
-			LogicMode:      r.LogicMode,
+			FromStatusName:  ref.FromStatusName,
+			ToStatusName:    ref.ToStatusName,
+			FromAllStatuses: ref.FromAllStatuses,
+			LogicMode:       r.LogicMode,
 		}
 
 		condRows, err := s.db.QueryContext(ctx, `
@@ -393,7 +406,7 @@ func (s *ConfigSetExportService) exportConditionSet(ctx context.Context, conditi
 				_ = condRows.Close()
 				return nil, scanErr
 			}
-			cfg := map[string]interface{}{}
+			cfg := map[string]any{}
 			if configRaw != "" {
 				if err := json.Unmarshal([]byte(configRaw), &cfg); err != nil {
 					_ = condRows.Close()
@@ -420,7 +433,7 @@ func (s *ConfigSetExportService) exportConditionSet(ctx context.Context, conditi
 // rewriteConditionConfigForExport replaces ID-based references with names so
 // the bundle is portable. role_id → role_name; group_id → group_name; for
 // custom_field references, field_id → custom_field_name.
-func (s *ConfigSetExportService) rewriteConditionConfigForExport(ctx context.Context, condType string, cfg map[string]interface{}, customFieldNames map[int]string) error {
+func (s *ConfigSetExportService) rewriteConditionConfigForExport(ctx context.Context, condType string, cfg map[string]any, customFieldNames map[int]string) error {
 	switch condType {
 	case models.ConditionTypeUserInRole:
 		if rawID, ok := cfg["role_id"]; ok {
@@ -450,15 +463,15 @@ func (s *ConfigSetExportService) rewriteConditionConfigForExport(ctx context.Con
 		// field_identifier may be either a numeric custom-field id or a
 		// regular column name; only rewrite if it parses as an integer that
 		// matches a custom field row.
-		if rawID, ok := cfg["field_id"]; ok {
-			if id, ok := parseIntish(rawID); ok && id > 0 {
+		if rawIdent, ok := cfg["field_identifier"]; ok {
+			if id, ok := parseIntish(rawIdent); ok && id > 0 {
 				name, err := s.lookupCustomFieldName(ctx, id)
 				if err != nil {
 					return err
 				}
 				cfg["custom_field_name"] = name
 				customFieldNames[id] = name
-				delete(cfg, "field_id")
+				delete(cfg, "field_identifier")
 			}
 		}
 	case models.ConditionTypeScript:
@@ -469,7 +482,7 @@ func (s *ConfigSetExportService) rewriteConditionConfigForExport(ctx context.Con
 
 // rewriteFieldRef handles the embedded FieldRef inside user_in_role / user_in_group
 // configs (when source=='custom_field', it carries a field_id).
-func (s *ConfigSetExportService) rewriteFieldRef(cfg map[string]interface{}, customFieldNames map[int]string, ctx context.Context) {
+func (s *ConfigSetExportService) rewriteFieldRef(cfg map[string]any, customFieldNames map[int]string, ctx context.Context) {
 	source, _ := cfg["source"].(string)
 	if source != "custom_field" {
 		return
@@ -687,7 +700,7 @@ func (s *ConfigSetExportService) exportItemTypesByName(ctx context.Context, name
 		       COALESCE(hierarchy_level, 0), COALESCE(sort_order, 0)
 		FROM item_types
 		WHERE name IN (%s)
-		ORDER BY hierarchy_level, sort_order, name
+		ORDER BY CASE WHEN hierarchy_level = -1 THEN 1 ELSE 0 END, hierarchy_level, sort_order, name
 	`, placeholders)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -858,6 +871,36 @@ func (s *ConfigSetExportService) exportCustomFields(ctx context.Context, names [
 	return out, rows.Err()
 }
 
+// exportLinkTypes emits every active non-system link type's portable
+// definition, ordered by name for stable bundles.
+func (s *ConfigSetExportService) exportLinkTypes(ctx context.Context) ([]ConfigSetTplLinkType, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, COALESCE(description, ''), forward_label, reverse_label, COALESCE(color, ''), allowed_entity_types
+		FROM link_types
+		WHERE is_system = false AND active = true
+		ORDER BY name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ConfigSetTplLinkType
+	for rows.Next() {
+		var lt ConfigSetTplLinkType
+		var aetRaw sql.NullString
+		if err := rows.Scan(&lt.Name, &lt.Description, &lt.ForwardLabel, &lt.ReverseLabel, &lt.Color, &aetRaw); err != nil {
+			return nil, err
+		}
+		// A nil/invalid JSON column means "all entity types allowed", matching
+		// the live registry reader.
+		if aetRaw.Valid && aetRaw.String != "" {
+			_ = json.Unmarshal([]byte(aetRaw.String), &lt.AllowedEntityTypes)
+		}
+		out = append(out, lt)
+	}
+	return out, rows.Err()
+}
+
 func (s *ConfigSetExportService) exportStatuses(ctx context.Context, names []string) ([]ConfigSetTplStatus, error) {
 	if len(names) == 0 {
 		return nil, nil
@@ -958,8 +1001,8 @@ func mapValues(m map[int]string) []string {
 	return out
 }
 
-func inArgs(names []string) (placeholders string, args []interface{}) {
-	args = make([]interface{}, 0, len(names))
+func inArgs(names []string) (placeholders string, args []any) {
+	args = make([]any, 0, len(names))
 	for i, n := range names {
 		if i > 0 {
 			placeholders += ","
@@ -970,8 +1013,8 @@ func inArgs(names []string) (placeholders string, args []interface{}) {
 	return placeholders, args
 }
 
-func inArgsInt(ids []int) (placeholders string, args []interface{}) {
-	args = make([]interface{}, 0, len(ids))
+func inArgsInt(ids []int) (placeholders string, args []any) {
+	args = make([]any, 0, len(ids))
 	for i, id := range ids {
 		if i > 0 {
 			placeholders += ","
@@ -986,7 +1029,7 @@ func inArgsInt(ids []int) (placeholders string, args []interface{}) {
 // string) into an int. Numbers come back as float64 from json.Unmarshal;
 // SQLite TEXT columns scan as string. Returns false when no sensible int
 // is extractable so callers can leave the original identifier alone.
-func parseIntish(v interface{}) (int, bool) {
+func parseIntish(v any) (int, bool) {
 	switch x := v.(type) {
 	case int:
 		return x, true

@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"net/http"
 	"sort"
@@ -11,32 +11,44 @@ import (
 	"windshift/internal/services"
 )
 
-// Portal-side approval endpoints. Portal customers and internal users can
-// decide on approvals where they're in the active pool. Authentication is
-// handled upstream by RequirePortalAuth; these handlers pull the active actor
-// via getAuthFromContext.
-//
-// The active-pool snapshot is the gate (just like /api/approvals/{id}/decide
-// after slice 4 loosened item.view): if the actor isn't in the pool,
-// ApprovalService returns "actor is not an active approver" → 4xx.
+var errPortalApprovalActorUnauthorized = errors.New("portal approval actor is not authenticated")
 
-// GetMyApprovals lists pending approvals where the authenticated portal actor
-// is in the active pool.
-//
-// GET /portal/{slug}/approvals/mine
-func (h *PortalHandler) GetMyApprovals(w http.ResponseWriter, r *http.Request) {
+// Portal approval access is limited to active approver pools.
+
+// beginPortalApprovalAction resolves the portal and the linked approval
+// actor shared by every portal approval endpoint. It writes the
+// 401/403/503/404 responses itself; callers defer the returned cancel.
+func (h *PortalHandler) beginPortalApprovalAction(w http.ResponseWriter, r *http.Request) (context.Context, context.CancelFunc, models.Channel, portalApprovalActor, bool) {
 	if h.approvalService == nil {
 		respondServiceUnavailable(w, r, "approvals not configured")
-		return
+		return nil, func() {}, models.Channel{}, portalApprovalActor{}, false
 	}
 
-	actor, ok := h.requirePortalApprovalActor(w, r)
+	ctx, cancel, channel, _, ok := h.resolvePortalBySlug(w, r)
+	if !ok {
+		return nil, cancel, models.Channel{}, portalApprovalActor{}, false
+	}
+
+	// The actor lookup reads the request context, so rebind the bounded
+	// context onto the request before resolving linked identities.
+	actor, ok := h.requirePortalApprovalActor(w, r.WithContext(ctx))
+	if !ok {
+		cancel()
+		return nil, cancel, models.Channel{}, portalApprovalActor{}, false
+	}
+	return ctx, cancel, channel, actor, true
+}
+
+// GetMyApprovals lists an actor's pending portal approvals.
+func (h *PortalHandler) GetMyApprovals(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel, channel, actor, ok := h.beginPortalApprovalAction(w, r)
 	if !ok {
 		return
 	}
+	defer cancel()
 
 	status := r.URL.Query().Get("status")
-	requests, err := h.getApprovalsForPortalActor(actor, status)
+	requests, err := h.getApprovalsForPortalActor(ctx, actor, status, channel.ID)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
@@ -47,33 +59,42 @@ func (h *PortalHandler) GetMyApprovals(w http.ResponseWriter, r *http.Request) {
 	respondJSONOK(w, requests)
 }
 
-// GetApproval returns a single approval request for the authenticated portal
-// actor. Visibility gate: the actor must be in the snapshot pool of any step on
-// the request.
-//
-// GET /portal/{slug}/approvals/{id}
-func (h *PortalHandler) GetApproval(w http.ResponseWriter, r *http.Request) {
-	if h.approvalService == nil {
-		respondServiceUnavailable(w, r, "approvals not configured")
-		return
-	}
-
-	actor, ok := h.requirePortalApprovalActor(w, r)
-	if !ok {
-		return
-	}
+// resolvePortalApprovalRequest loads an approval request scoped to the
+// portal's channel and visible to the actor. Writes a 404 when the request
+// does not exist in this channel, the actor cannot view it, or its workspace
+// was removed from the portal's served scope.
+func (h *PortalHandler) resolvePortalApprovalRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, channelID int, actor portalApprovalActor) (*models.ApprovalRequest, int, bool) {
 	requestID, ok := requireIDParam(w, r, "id")
 	if !ok {
-		return
+		return nil, 0, false
 	}
-
-	req, err := h.approvalService.GetRequest(requestID)
+	req, err := h.approvalService.GetRequestInChannel(ctx, requestID, channelID)
+	if err != nil || !portalActorCanViewRequest(actor, req) {
+		respondNotFound(w, r, "Approval request")
+		return nil, 0, false
+	}
+	served, err := h.portalService.PortalServesWorkspace(ctx, channelID, req.WorkspaceID)
 	if err != nil {
+		respondInternalError(w, r, err)
+		return nil, 0, false
+	}
+	if !served {
 		respondNotFound(w, r, "Approval request")
+		return nil, 0, false
+	}
+	return req, requestID, true
+}
+
+// GetApproval returns an approval visible to the portal actor.
+func (h *PortalHandler) GetApproval(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel, channel, actor, ok := h.beginPortalApprovalAction(w, r)
+	if !ok {
 		return
 	}
-	if !portalActorCanViewRequest(actor, req) {
-		respondNotFound(w, r, "Approval request")
+	defer cancel()
+
+	req, _, ok := h.resolvePortalApprovalRequest(ctx, w, r, channel.ID, actor)
+	if !ok {
 		return
 	}
 	respondJSONOK(w, req)
@@ -85,31 +106,24 @@ type portalDecideRequest struct {
 	Comment  string `json:"comment,omitempty"`
 }
 
-// DecideAsPortalCustomer records a decision from a portal actor.
-//
-// POST /portal/{slug}/approvals/{id}/decide
+// DecideAsPortalCustomer records a portal actor's decision.
 func (h *PortalHandler) DecideAsPortalCustomer(w http.ResponseWriter, r *http.Request) {
-	if h.approvalService == nil {
-		respondServiceUnavailable(w, r, "approvals not configured")
-		return
-	}
-
-	actor, ok := h.requirePortalApprovalActor(w, r)
+	ctx, cancel, channel, actor, ok := h.beginPortalApprovalAction(w, r)
 	if !ok {
 		return
 	}
-	requestID, ok := requireIDParam(w, r, "id")
+	defer cancel()
+
+	scopedRequest, requestID, ok := h.resolvePortalApprovalRequest(ctx, w, r, channel.ID, actor)
 	if !ok {
 		return
 	}
 
 	var body portalDecideRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		respondValidationError(w, r, "Invalid request body")
+	if !decodeChannelRequest(w, r, &body, false) {
 		return
 	}
-	// Portal decision comments surface on the same approval timeline as
-	// the internal Decide path. Mirror the policy.
+	// Portal comments share the internal approval-timeline policy.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: &body.Comment, Policy: sanitize.RichText, Label: "Comment"},
 	)
@@ -125,13 +139,14 @@ func (h *PortalHandler) DecideAsPortalCustomer(w http.ResponseWriter, r *http.Re
 		req      *models.ApprovalRequest
 		err      error
 	)
+	decideOptions := services.DecideOptions{ChannelID: &channel.ID}
 	switch {
-	case actor.userID != nil && portalActorCanActAsUser(actor, h.approvalService, requestID):
-		decision, req, err = h.approvalService.Decide(r.Context(), requestID, *actor.userID, body.Decision, body.Comment, services.DecideOptions{})
+	case actor.userID != nil && portalActorCanActAsUser(actor, scopedRequest):
+		decision, req, err = h.approvalService.Decide(ctx, requestID, *actor.userID, body.Decision, body.Comment, decideOptions)
 	case actor.customerID != nil:
-		decision, req, err = h.approvalService.DecideAsCustomer(r.Context(), requestID, *actor.customerID, body.Decision, body.Comment, services.DecideOptions{})
+		decision, req, err = h.approvalService.DecideAsCustomer(ctx, requestID, *actor.customerID, body.Decision, body.Comment, decideOptions)
 	case actor.userID != nil:
-		decision, req, err = h.approvalService.Decide(r.Context(), requestID, *actor.userID, body.Decision, body.Comment, services.DecideOptions{})
+		decision, req, err = h.approvalService.Decide(ctx, requestID, *actor.userID, body.Decision, body.Comment, decideOptions)
 	}
 	if err != nil {
 		respondValidationError(w, r, err.Error())
@@ -153,11 +168,22 @@ type portalApprovalActor struct {
 	customerID *int
 }
 
-// requirePortalApprovalActor resolves every approval identity available to the
-// active portal request. Internal users are valid portal approval actors on
-// their own; if they also have a linked portal-customer row, both identities are
-// kept so pooled approvals addressed to either row appear in the portal view.
+// requirePortalApprovalActor retains linked user and customer identities so
+// approvals addressed to either active-pool entry remain visible.
 func (h *PortalHandler) requirePortalApprovalActor(w http.ResponseWriter, r *http.Request) (portalApprovalActor, bool) {
+	actor, err := h.portalApprovalActorFromRequest(r)
+	if errors.Is(err, errPortalApprovalActorUnauthorized) {
+		respondUnauthorized(w, r)
+		return portalApprovalActor{}, false
+	}
+	if err != nil {
+		respondInternalError(w, r, err)
+		return portalApprovalActor{}, false
+	}
+	return actor, true
+}
+
+func (h *PortalHandler) portalApprovalActorFromRequest(r *http.Request) (portalApprovalActor, error) {
 	internalUserID, customerID := h.getAuthFromContext(r)
 	actor := portalApprovalActor{userID: internalUserID, customerID: customerID}
 	if internalUserID != nil && customerID == nil {
@@ -165,36 +191,44 @@ func (h *PortalHandler) requirePortalApprovalActor(w http.ResponseWriter, r *htt
 		if err == nil && cid > 0 {
 			actor.customerID = &cid
 		} else if err != nil && !errors.Is(err, services.ErrPortalCustomerNotFound) {
-			respondInternalError(w, r, err)
-			return portalApprovalActor{}, false
+			return portalApprovalActor{}, err
 		}
 	}
 	if actor.userID == nil && actor.customerID == nil {
-		respondUnauthorized(w, r)
-		return portalApprovalActor{}, false
+		return portalApprovalActor{}, errPortalApprovalActorUnauthorized
 	}
-	return actor, true
+	return actor, nil
 }
 
-func (h *PortalHandler) getApprovalsForPortalActor(actor portalApprovalActor, status string) ([]*models.ApprovalRequest, error) {
+func (h *PortalHandler) getApprovalsForPortalActor(ctx context.Context, actor portalApprovalActor, status string, channelID int) ([]*models.ApprovalRequest, error) {
+	// Resolve the portal's served-workspace scope once and drop requests whose
+	// workspace was removed. The approval list is an alternate read path to the
+	// same items, so it must honor the same restriction as request access.
+	served, err := h.portalService.PortalServedWorkspaceIDs(ctx, channelID)
+	if err != nil {
+		return nil, err
+	}
 	byID := map[int]*models.ApprovalRequest{}
-	if actor.customerID != nil {
-		requests, err := h.approvalService.GetForPortalCustomer(*actor.customerID, status)
-		if err != nil {
-			return nil, err
-		}
+	add := func(requests []*models.ApprovalRequest) {
 		for _, req := range requests {
-			byID[req.ID] = req
+			if portalServedWorkspace(served, req.WorkspaceID) {
+				byID[req.ID] = req
+			}
 		}
 	}
-	if actor.userID != nil {
-		requests, err := h.approvalService.GetForUser(*actor.userID, status)
+	if actor.customerID != nil {
+		requests, err := h.approvalService.GetForPortalCustomerInChannel(ctx, *actor.customerID, status, channelID)
 		if err != nil {
 			return nil, err
 		}
-		for _, req := range requests {
-			byID[req.ID] = req
+		add(requests)
+	}
+	if actor.userID != nil {
+		requests, err := h.approvalService.GetForUserInChannel(ctx, *actor.userID, status, channelID)
+		if err != nil {
+			return nil, err
 		}
+		add(requests)
 	}
 	out := make([]*models.ApprovalRequest, 0, len(byID))
 	for _, req := range byID {
@@ -206,12 +240,31 @@ func (h *PortalHandler) getApprovalsForPortalActor(actor portalApprovalActor, st
 	return out, nil
 }
 
-// portalActorCanViewRequest returns true if either actor identity is in any
-// step's approver pool — same gate as the internal userCanViewRequest helper.
+// portalServedWorkspace applies the portal's served-workspace scope. An empty
+// list means the restriction is disabled (legacy config).
+func portalServedWorkspace(served []int, workspaceID int) bool {
+	if len(served) == 0 {
+		return true
+	}
+	for _, id := range served {
+		if id == workspaceID {
+			return true
+		}
+	}
+	return false
+}
+
+// portalActorCanViewRequest checks the approver pool. While a request is
+// pending only the active pool may read it; after it resolves, prior approvers
+// retain read access to the history.
 func portalActorCanViewRequest(actor portalApprovalActor, req *models.ApprovalRequest) bool {
+	requireActive := req.Status == models.ApprovalRequestStatusPending
 	for _, si := range req.StepInstances {
 		for _, app := range si.Approvers {
-			if portalActorMatchesApprover(actor, app) {
+			if !portalActorMatchesApprover(actor, app) {
+				continue
+			}
+			if !requireActive || app.IsActive {
 				return true
 			}
 		}
@@ -219,12 +272,8 @@ func portalActorCanViewRequest(actor portalApprovalActor, req *models.ApprovalRe
 	return false
 }
 
-func portalActorCanActAsUser(actor portalApprovalActor, svc *services.ApprovalService, requestID int) bool {
+func portalActorCanActAsUser(actor portalApprovalActor, req *models.ApprovalRequest) bool {
 	if actor.userID == nil {
-		return false
-	}
-	req, err := svc.GetRequest(requestID)
-	if err != nil {
 		return false
 	}
 	for _, si := range req.StepInstances {

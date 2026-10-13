@@ -1,12 +1,12 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { User, Users, X, Plus, Shield } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
   import AssigneePicker from '../pickers/AssigneePicker.svelte';
   import { confirm } from '../composables/useConfirm.js';
   import { api } from '../api.js';
-  import { formatDateTimeLocale } from '../utils/dateFormatter.js';
-  import Spinner from '../components/Spinner.svelte';
+  import { formatAuthenticatedDateTime as formatDateTimeLocale } from '../utils/authenticatedDateFormatter.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast } from '../stores/toasts.svelte.js';
   import DescriptionText from '../components/DescriptionText.svelte';
@@ -91,7 +91,7 @@
       <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
         {#if isDefault}
           <span class="flex items-center gap-2">
-            <Shield class="w-4 h-4 text-amber-500" />
+            <Shield class="w-4 h-4 text-ds-icon-warning" />
             {t('settings.channelManagers.systemChannelNote')}
           </span>
         {:else}
@@ -137,9 +137,7 @@
   <!-- Managers List -->
   <div class="space-y-2">
     {#if loading}
-      <div class="flex items-center justify-center py-12">
-        <Spinner />
-      </div>
+      <StateDisplay type="loading" />
     {:else if managers.length === 0}
       <div
         class="text-center py-12 rounded border-2 border-dashed"
@@ -228,4 +226,3 @@
     </div>
   {/if}
 </div>
-

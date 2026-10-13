@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import ColorDot from '../../components/ColorDot.svelte';
   import { api, fetchAPI } from '../../api.js';
   import { Sparkles, CalendarPlus, RotateCcw, CheckCircle, AlertCircle } from '@lucide/svelte';
   import { authStore } from '../../stores';
@@ -9,6 +10,7 @@
   import Button from '../../components/Button.svelte';
   import Select from '../../components/Select.svelte';
   import DescriptionText from '../../components/DescriptionText.svelte';
+  import ItemKey from '../../components/ItemKey.svelte';
 
   let loading = $state(false);
   let scheduling = $state(false);
@@ -21,7 +23,8 @@
 
   onMount(async () => {
     try {
-      connections = await api.llmProviders.getEnabled();
+      const enabledConnections = await api.llmProviders.getEnabled();
+      connections = Array.isArray(enabledConnections) ? enabledConnections : [];
       const def = connections.find(c => c.is_default);
       if (def) selectedConnectionId = def.id;
     } catch (e) { /* silent — fallback still works */ }
@@ -106,7 +109,11 @@
   }
 </script>
 
-<div class="p-6" style="background-color: var(--ds-surface); min-height: 100vh;">
+<div
+  class="p-6"
+  style="background-color: var(--ds-surface); min-height: 100vh;"
+  data-testid="plan-my-day-view"
+>
   <PageHeader
     icon={Sparkles}
     title="Plan My Day"
@@ -135,7 +142,7 @@
               />
             </div>
           {/if}
-          <Button variant="primary" onclick={generate}>
+          <Button variant="primary" onclick={generate} dataTestid="plan-my-day-generate">
             Generate Plan
           </Button>
         </div>
@@ -156,7 +163,7 @@
       <Card variant="outlined" padding="default">
         <div class="flex items-start gap-2">
           <AlertCircle size={16} style="color: var(--ds-text-danger); flex-shrink: 0; margin-top: 2px;" />
-          <p class="text-sm" style="color: var(--ds-text-danger);">{error}</p>
+          <p class="text-sm" style="color: var(--ds-text-danger);" data-testid="plan-my-day-error">{error}</p>
         </div>
       </Card>
     {/if}
@@ -184,7 +191,10 @@
         <div class="space-y-2">
           {#each plan.activities as activity, i}
             <Card variant="raised" padding="default">
-              <div class="flex items-start gap-4">
+              <div
+                class="flex items-start gap-4"
+                data-testid={`plan-my-day-activity-${activity.item_id}`}
+              >
                 <!-- Time badge -->
                 <div class="flex flex-col items-center flex-shrink-0 pt-0.5" style="min-width: 56px;">
                   <span class="text-sm font-mono font-semibold" style="color: var(--ds-text);">{activity.time}</span>
@@ -193,7 +203,7 @@
 
                 <!-- Divider line -->
                 <div class="flex flex-col items-center flex-shrink-0 pt-1">
-                  <div class="w-2.5 h-2.5 rounded-full" style="background-color: var(--ds-icon-accent);"></div>
+                  <ColorDot size="md" color="var(--ds-icon-accent)" />
                   {#if i < plan.activities.length - 1}
                     <div class="w-px flex-1 mt-1" style="background-color: var(--ds-border); min-height: 24px;"></div>
                   {/if}
@@ -202,7 +212,7 @@
                 <!-- Content -->
                 <div class="flex-1 min-w-0 pb-1">
                   <div class="flex items-center gap-2 flex-wrap">
-                    <span class="text-xs font-mono px-1.5 py-0.5 rounded" style="background-color: var(--ds-surface-sunken); color: var(--ds-text-subtle);">{activity.item_key}</span>
+                    <ItemKey itemKey={activity.item_key} variant="badge" />
                     <span class="text-sm font-medium truncate" style="color: var(--ds-text);">{activity.title}</span>
                   </div>
                   {#if activity.reason}
@@ -216,7 +226,15 @@
 
         <!-- Action buttons -->
         <div class="flex items-center gap-3">
-          <Button variant="primary" onclick={addToCalendar} loading={scheduling} icon={CalendarPlus}>
+          <Button
+            variant="primary"
+            onclick={addToCalendar}
+            loading={scheduling}
+            icon={CalendarPlus}
+            dataTestid="plan-my-day-add-calendar"
+            keyboardHint="A"
+            hotkeyConfig={{ key: 'a', guard: () => !scheduling && !!plan && !scheduled }}
+          >
             {#if scheduling}
               Adding to Calendar...
             {:else}
@@ -240,7 +258,7 @@
     {#if scheduled}
       <!-- Success state -->
       <Card variant="raised" padding="default">
-        <div class="flex flex-col items-center py-6 gap-3">
+        <div class="flex flex-col items-center py-6 gap-3" data-testid="plan-my-day-success">
           <div class="rounded-full p-3" style="background-color: color-mix(in srgb, var(--ds-icon-success) 15%, transparent);">
             <CheckCircle size={28} style="color: var(--ds-icon-success);" />
           </div>
@@ -250,7 +268,12 @@
               : 'All items have been added to your calendar'}
           </p>
           <div class="flex items-center gap-3">
-            <Button variant="primary" onclick={() => navigate('/personal/calendar')} icon={CalendarPlus}>
+            <Button
+              variant="primary"
+              onclick={() => navigate('/personal/calendar')}
+              icon={CalendarPlus}
+              dataTestid="plan-my-day-view-calendar"
+            >
               View Calendar
             </Button>
             <Button variant="secondary" onclick={generate} icon={RotateCcw}>

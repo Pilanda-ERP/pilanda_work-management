@@ -3,8 +3,10 @@
  * Centralized date formatting functions to avoid duplication across components
  */
 
-import { i18n } from '../stores/i18n.svelte.js';
+import { i18n, t } from '../stores/i18n.svelte.js';
 import { serverNow } from './serverClock.js';
+
+export const DEFAULT_TIMEZONE = 'UTC';
 
 /**
  * Get the app's current locale for date formatting.
@@ -13,6 +15,158 @@ import { serverNow } from './serverClock.js';
  */
 function getAppLocale() {
   return i18n.locale || 'en';
+}
+
+/**
+ * Validate an IANA timezone and fall back to UTC for missing or legacy values.
+ * Request and schedule validation remains a backend responsibility.
+ * @param {string|null|undefined} timezone
+ * @returns {string}
+ */
+export function resolveTimezone(timezone) {
+  const candidate = typeof timezone === 'string' ? timezone.trim() : '';
+  if (!candidate) return DEFAULT_TIMEZONE;
+  if (candidate === 'Local' || /^[+-]\d{2}(?::?\d{2})?$/.test(candidate)) {
+    return DEFAULT_TIMEZONE;
+  }
+
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format();
+    return candidate;
+  } catch (_error) {
+    return DEFAULT_TIMEZONE;
+  }
+}
+
+/**
+ * Format an instant in an explicit, validated timezone.
+ * @param {string|number|Date} value
+ * @param {string} timezone
+ * @param {Intl.DateTimeFormatOptions} options
+ * @returns {string}
+ */
+export function formatInstant(value, timezone = DEFAULT_TIMEZONE, options = {}) {
+  if (value === null || value === undefined || value === '') return '';
+
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+
+  try {
+    return new Intl.DateTimeFormat(getAppLocale(), {
+      ...options,
+      timeZone: resolveTimezone(timezone),
+    }).format(date);
+  } catch (_error) {
+    return '';
+  }
+}
+
+/**
+ * Format a calendar date without applying a user or browser timezone.
+ * @param {string|Date} value
+ * @param {Intl.DateTimeFormatOptions} options
+ * @returns {string}
+ */
+export function formatDateOnly(value, options = {}) {
+  if (!value) return '';
+
+  let ymd;
+  if (typeof value === 'string') {
+    ymd = value.slice(0, 10);
+  } else if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    ymd = value.toISOString().slice(0, 10);
+  } else {
+    return '';
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return '';
+
+  const [year, month, day] = ymd.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== ymd) return '';
+
+  try {
+    /** @type {Intl.DateTimeFormatOptions} */
+    const displayOptions =
+      Object.keys(options).length > 0
+        ? options
+        : { year: 'numeric', month: 'short', day: 'numeric' };
+    return new Intl.DateTimeFormat(getAppLocale(), {
+      ...displayOptions,
+      timeZone: DEFAULT_TIMEZONE,
+    }).format(date);
+  } catch (_error) {
+    return '';
+  }
+}
+
+/**
+ * Return the stored calendar key without applying a timezone.
+ * @param {string|Date} value
+ * @returns {string}
+ */
+export function dateOnlyKey(value) {
+  if (typeof value === 'string') {
+    const key = value.slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(key) ? key : '';
+  }
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  return '';
+}
+
+/**
+ * Decode a persisted UTC-midnight worklog date key.
+ * @param {number} epochSeconds
+ * @returns {string}
+ */
+export function worklogDateKey(epochSeconds) {
+  if (!Number.isFinite(epochSeconds)) return '';
+  return new Date(epochSeconds * 1000).toISOString().slice(0, 10);
+}
+
+function civilDayNumber(value) {
+  const key = dateOnlyKey(value);
+  if (!key) return null;
+  const [year, month, day] = key.split('-').map(Number);
+  return Date.UTC(year, month - 1, day) / 86400000;
+}
+
+function dueDayOffset(dueDate) {
+  const due = civilDayNumber(dueDate);
+  const today = civilDayNumber(formatDate(serverNow()));
+  return due === null || today === null ? null : due - today;
+}
+
+/**
+ * Bind a validated display timezone for repeated formatting.
+ * @param {string|null|undefined} timezone
+ */
+export function createTemporalFormatter(timezone) {
+  const resolvedTimezone = resolveTimezone(timezone);
+  return {
+    timezone: resolvedTimezone,
+    formatInstant: (value, options = {}) => formatInstant(value, resolvedTimezone, options),
+    formatDateOnly,
+  };
+}
+
+/**
+ * Convert an HTML date input value to the UTC timestamp expected by timestamp APIs.
+ * @param {string|null|undefined} value - Date in YYYY-MM-DD format
+ * @returns {string|null} RFC 3339 timestamp at midnight UTC, or null when empty
+ */
+export function dateInputToISOString(value) {
+  if (!value) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new RangeError('Date input must use YYYY-MM-DD format');
+  }
+
+  const date = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
+    throw new RangeError('Date input must be a valid calendar date');
+  }
+  return date.toISOString();
 }
 
 /**
@@ -79,31 +233,17 @@ export function formatDateShort(dateString) {
  * @returns {string}
  */
 export function formatCustomFieldDate(dateString) {
-  if (!dateString) return '';
-  try {
-    const ymd = typeof dateString === 'string' ? dateString.slice(0, 10) : formatDate(dateString);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return '';
-    const [y, m, d] = ymd.split('-').map(Number);
-    const date = new Date(Date.UTC(y, m - 1, d));
-    return date.toLocaleDateString(getAppLocale(), {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      timeZone: 'UTC',
-    });
-  } catch (error) {
-    console.error('Error formatting custom field date:', error);
-    return '';
-  }
+  return formatDateOnly(dateString);
 }
 
 /**
  * Format a date string to include time in locale format
  * @param {string|Date} dateString - Date string or Date object to format
+ * @param {string} timezone - Validated user or explicit public timezone
  * @returns {string} Formatted date with time, or empty string if invalid
  */
-export function formatDateTimeLocale(dateString) {
-  return formatDateLocale(dateString, {
+export function formatDateTimeLocale(dateString, timezone = DEFAULT_TIMEZONE) {
+  return formatInstant(dateString, timezone, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -121,46 +261,24 @@ export function formatRelativeTime(dateString) {
   if (!dateString) return '';
   try {
     const date = new Date(dateString);
+    if (Number.isNaN(date.getTime())) return '';
     const now = serverNow();
-    const diffMs = now.getTime() - date.getTime();
-    const diffSecs = Math.floor(diffMs / 1000);
-    const diffMins = Math.floor(diffSecs / 60);
-    const diffHours = Math.floor(diffMins / 60);
-    const diffDays = Math.floor(diffHours / 24);
+    const diffMs = date.getTime() - now.getTime();
+    const absoluteMs = Math.abs(diffMs);
+    const formatter = new Intl.RelativeTimeFormat(getAppLocale(), { numeric: 'always' });
+    const immediateFormatter = new Intl.RelativeTimeFormat(getAppLocale(), { numeric: 'auto' });
+    const valueFor = (unitMs) => Math.sign(diffMs) * Math.floor(absoluteMs / unitMs);
 
-    if (diffSecs < 60) return 'just now';
-    if (diffMins < 60) return `${diffMins} minute${diffMins !== 1 ? 's' : ''} ago`;
-    if (diffHours < 24) return `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
-    if (diffDays < 7) return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
-    if (diffDays < 30) {
-      const weeks = Math.floor(diffDays / 7);
-      return `${weeks} week${weeks !== 1 ? 's' : ''} ago`;
-    }
-    if (diffDays < 365) {
-      const months = Math.floor(diffDays / 30);
-      return `${months} month${months !== 1 ? 's' : ''} ago`;
-    }
-    const years = Math.floor(diffDays / 365);
-    return `${years} year${years !== 1 ? 's' : ''} ago`;
+    if (absoluteMs < 60_000) return immediateFormatter.format(0, 'second');
+    if (absoluteMs < 3_600_000) return formatter.format(valueFor(60_000), 'minute');
+    if (absoluteMs < 86_400_000) return formatter.format(valueFor(3_600_000), 'hour');
+    if (absoluteMs < 604_800_000) return formatter.format(valueFor(86_400_000), 'day');
+    if (absoluteMs < 2_592_000_000) return formatter.format(valueFor(604_800_000), 'week');
+    if (absoluteMs < 31_536_000_000) return formatter.format(valueFor(2_592_000_000), 'month');
+    return formatter.format(valueFor(31_536_000_000), 'year');
   } catch (error) {
     console.error('Error formatting relative time:', error);
     return '';
-  }
-}
-
-/**
- * Check if a date is today
- * @param {string|Date} dateString - Date string or Date object
- * @returns {boolean} True if the date is today
- */
-export function isToday(dateString) {
-  if (!dateString) return false;
-  try {
-    const date = new Date(dateString);
-    const today = serverNow();
-    return date.toDateString() === today.toDateString();
-  } catch (_error) {
-    return false;
   }
 }
 
@@ -171,22 +289,23 @@ export function isToday(dateString) {
  * @param {string} timezone - IANA timezone string or 'UTC'
  * @returns {string} Formatted timestamp with timezone abbreviation
  */
-export function formatHistoryTimestamp(dateString, timezone = 'UTC') {
+export function formatHistoryTimestamp(dateString, timezone = DEFAULT_TIMEZONE) {
   if (!dateString) return '';
   try {
     const date = new Date(dateString);
+    const resolvedTimezone = resolveTimezone(timezone);
 
     // Format date and time
     const dateOptions = {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
-      timeZone: timezone,
+      timeZone: resolvedTimezone,
     };
     const timeOptions = {
       hour: 'numeric',
       minute: '2-digit',
-      timeZone: timezone,
+      timeZone: resolvedTimezone,
     };
 
     const datePart = date.toLocaleDateString(getAppLocale(), /** @type {any} */ (dateOptions));
@@ -194,7 +313,7 @@ export function formatHistoryTimestamp(dateString, timezone = 'UTC') {
 
     // Get timezone abbreviation
     const formatter = new Intl.DateTimeFormat(getAppLocale(), {
-      timeZone: timezone,
+      timeZone: resolvedTimezone,
       timeZoneName: 'short',
     });
     const parts = formatter.formatToParts(date);
@@ -210,28 +329,12 @@ export function formatHistoryTimestamp(dateString, timezone = 'UTC') {
 
 /**
  * Get the user's configured timezone from the current user object
- * Falls back to browser timezone, then UTC
+ * Falls back to UTC for missing or invalid stored values.
  * @param {object} currentUser - Current user object with timezone property
  * @returns {string} IANA timezone string
  */
 export function getUserTimezone(currentUser) {
-  // Use user's configured timezone if available
-  if (currentUser?.timezone) {
-    return currentUser.timezone;
-  }
-
-  // Fall back to browser timezone
-  try {
-    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    if (browserTimezone) {
-      return browserTimezone;
-    }
-  } catch (error) {
-    console.warn('Could not determine browser timezone:', error);
-  }
-
-  // Final fallback to UTC
-  return 'UTC';
+  return resolveTimezone(currentUser?.timezone);
 }
 
 /**
@@ -289,36 +392,70 @@ export function formatStatusAge(since) {
  * @returns {string} Formatted due date text (e.g., "Due today", "Overdue by 3 days")
  */
 export function formatDueDate(dueDate) {
-  if (!dueDate) return 'No due date';
+  if (!dueDate) return t('dueDate.noDueDate');
 
-  const d = dueDate instanceof Date ? dueDate : new Date(dueDate);
-  const now = serverNow();
-  const diffMs = d.getTime() - now.getTime();
-  const days = Math.round(diffMs / 86400000);
+  const days = dueDayOffset(dueDate);
+  if (days === null) return '';
 
-  if (days > 7) return d.toLocaleDateString(getAppLocale(), { month: 'short', day: 'numeric' });
-  if (days > 1) return `Due in ${days} days`;
-  if (days === 1) return 'Due tomorrow';
-  if (days === 0) return 'Due today';
-  if (days === -1) return 'Due yesterday';
-  return `Overdue by ${Math.abs(days)} days`;
+  if (days > 7) return formatDateOnly(dueDate, { month: 'short', day: 'numeric' });
+  if (days > 1) return t('dueDate.dueInDays', { days });
+  if (days === 1) return t('dueDate.dueTomorrow');
+  if (days === 0) return t('dueDate.dueToday');
+  if (days === -1) return t('dueDate.dueYesterday');
+  return t('dueDate.overdueByDays', { days: Math.abs(days) });
 }
 
 /**
- * Get CSS class for due date badge based on urgency
+ * Compact due-date label carrying only the triage order (e.g. "68d", "3w").
  * @param {Date|string} dueDate - Due date
- * @returns {string} Tailwind CSS classes for the badge
+ * @returns {string} Compact day/week count
  */
-export function getDueBadgeClass(dueDate) {
-  if (!dueDate) return 'bg-gray-100 text-gray-600';
+export function formatDueCompact(dueDate) {
+  const offset = dueDayOffset(dueDate);
+  if (offset === null) return '';
+  const days = Math.abs(offset);
+  if (days < 14) return `${days}d`;
+  return `${Math.floor(days / 7)}w`;
+}
 
-  const d = dueDate instanceof Date ? dueDate : new Date(dueDate);
-  const now = serverNow();
-  const diff = d.getTime() - now.getTime();
+/**
+ * Severity bucket for a due date: drives icon and Badge variant.
+ * @param {Date|string} dueDate - Due date
+ * @returns {'overdue'|'soon'|'later'|null}
+ */
+export function getDueSeverity(dueDate) {
+  if (!dueDate) return null;
 
-  if (diff < 0) return 'bg-rose-100 text-rose-700';
-  if (diff <= 2 * 86400000) return 'bg-amber-100 text-amber-700';
-  return 'bg-blue-50 text-blue-700';
+  const diff = dueDayOffset(dueDate);
+  if (diff === null) return null;
+
+  if (diff < 0) return 'overdue';
+  if (diff <= 2) return 'soon';
+  return 'later';
+}
+
+/**
+ * Full-sentence due tooltip text (e.g. "Overdue by 68 days — was due 20 May 2026").
+ * @param {Date|string} dueDate - Due date
+ * @returns {string} Localised tooltip sentence
+ */
+export function formatDueTooltip(dueDate) {
+  const date = formatDateOnly(dueDate, {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+  const severity = getDueSeverity(dueDate);
+
+  if (severity === 'overdue') {
+    const days = Math.abs(dueDayOffset(dueDate));
+    return t('dueDate.overdueTooltip', { days, date });
+  }
+  if (severity === 'soon') {
+    const days = dueDayOffset(dueDate);
+    return t('dueDate.dueSoonTooltip', { days, date });
+  }
+  return t('dueDate.dueLaterTooltip', { date });
 }
 
 /**
@@ -382,9 +519,6 @@ export function daysUntil(targetDate, labels) {
  */
 export function getDaysOverdue(dueDate) {
   if (!dueDate) return 0;
-
-  const d = dueDate instanceof Date ? dueDate : new Date(dueDate);
-  const now = serverNow();
-  const diffMs = now.getTime() - d.getTime();
-  return Math.floor(diffMs / 86400000);
+  const offset = dueDayOffset(dueDate);
+  return offset === null || offset === 0 ? 0 : -offset;
 }

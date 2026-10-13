@@ -5,17 +5,14 @@
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast, warningToast } from '../../stores/toasts.svelte.js';
   import { IconFilter as Filter, IconSearch as Search } from '@tabler/icons-svelte-runes';
-  import Button from '../../components/Button.svelte';
   import Card from '../../components/Card.svelte';
-  import DataTable from '../../components/DataTable.svelte';
   import Pagination from '../../components/Pagination.svelte';
   import CollectionsSidebar from './CollectionsSidebar.svelte';
   import CollectionsBreadcrumbs from './CollectionsBreadcrumbs.svelte';
+  import { buildCollectionAssociationUpdate } from './collectionService.js';
   import QlQueryBar from '../shared/QlQueryBar.svelte';
-  import { getStatusColor as getStatusColorUtil, getStatusStyle } from '../../utils/statusColors.js';
   import { createWorkItemSearchStore } from '../../stores/searchStore.svelte.js';
   import { createWorkItemSearchHandlers } from '../../composables/useWorkItemSearch.svelte.js';
-  import { buildWorkItemColumns, createdAtColumn } from '../../utils/workItemColumns.js';
   import {
     decorateWorkItems,
     createDeleteItemHandler,
@@ -25,13 +22,20 @@
   import Modal from '../../dialogs/Modal.svelte';
   import WorkspacePicker from '../../pickers/WorkspacePicker.svelte';
   import { collectionCategoriesStore } from '../../stores/collectionCategories.js';
-  import { permissionStore, isSystemAdmin, authStore } from '../../stores';
+  import { permissionStore, isSystemAdmin, authStore, workspaceDataStore } from '../../stores';
+  import ColumnSelector from './ColumnSelector.svelte';
+  import WorkItemListTable from './WorkItemListTable.svelte';
+  import {
+    buildListColumnConfiguration,
+    DEFAULT_LIST_COLUMNS,
+    listColumnsFromConfig,
+  } from '../../utils/workItemListColumns.js';
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
 
   let { collectionId = null } = $props();
 
   // Each Collections instance owns a fresh search store — no cross-page leakage.
-  const store = createWorkItemSearchStore();
+  const store = createWorkItemSearchStore({ allowEmptyQuery: true });
   /** @type {Record<string, any>} */
   let storeState = $state({});
   const unsubscribeStore = store.subscribe((value) => (storeState = value));
@@ -60,6 +64,22 @@
   let currentPage = $state(1);
   let itemsPerPage = $state(/** @type {number} */ (50));
   let sidebarCollapsed = $state(false);
+  let boardConfig = $state(null);
+  let listColumns = $state([...DEFAULT_LIST_COLUMNS]);
+
+  let itemTypes = $derived(workspaceDataStore.itemTypes);
+  let listStatuses = $derived(workspaceDataStore.statuses);
+  let listStatusCategories = $derived(workspaceDataStore.statusCategories);
+  let listPriorities = $derived(workspaceDataStore.priorities);
+  let customFieldDefinitions = $derived(workspaceDataStore.customFieldDefinitions);
+  let canManageCollection = $derived(
+    Boolean(
+      currentCollection &&
+        authStore.currentUser?.id != null &&
+        String(currentCollection.created_by) === String(authStore.currentUser.id),
+    ),
+  );
+  let canConfigureColumns = $derived(canManageCollection);
 
   // Workspace / sharing modals
   let returnWorkspaceId = $state(null);
@@ -72,10 +92,22 @@
   let workspaceAssociationSaving = $state(false);
 
   onMount(async () => {
-    await store.loadReferenceData();
-    await collectionCategoriesStore.init();
+    await Promise.all([
+      store.loadReferenceData(),
+      collectionCategoriesStore.init(),
+      workspaceDataStore.initializeGlobal(),
+    ]);
 
     const urlParams = new URLSearchParams(window.location.search);
+    const hasURLQuery = [
+      'raw',
+      'ql',
+      'workspaces',
+      'statuses',
+      'priorities',
+      'search',
+      'dynamicFilters',
+    ].some((key) => urlParams.has(key));
     const wsParam = urlParams.get('workspace');
     if (wsParam) returnWorkspaceId = wsParam;
 
@@ -87,8 +119,10 @@
     }
 
     if (loadCollectionId) {
-      await loadCollectionById(loadCollectionId);
+      await loadCollectionById(loadCollectionId, hasURLQuery);
     } else {
+      boardConfig = null;
+      listColumns = [...DEFAULT_LIST_COLUMNS];
       store.restoreFromURL();
       if (storeState.hasFilters) {
         await store.executeSearch({ page: currentPage, limit: itemsPerPage });
@@ -98,13 +132,18 @@
     loading = false;
   });
 
-  async function loadCollectionById(id) {
+  async function loadCollectionById(id, restoreURLQuery = false) {
     try {
       const collection = await api.collections.get(id);
       if (!collection) return;
       currentCollection = collection;
       slugSaved = !!(collection.is_public && collection.public_slug);
-      await hydrateFromCollection(collection);
+      await loadBoardConfiguration(collection.id);
+      if (restoreURLQuery) {
+        store.restoreFromURL();
+      } else {
+        await hydrateFromCollection(collection);
+      }
       await store.executeSearch({ page: 1, limit: itemsPerPage });
 
       const url = new URL(window.location.href);
@@ -113,6 +152,49 @@
     } catch (error) {
       console.error('Failed to load collection:', error);
     }
+  }
+
+  async function loadBoardConfiguration(id) {
+    try {
+      const bootstrap = await api.collections.getBoardConfigurationBootstrap(id);
+      const config = bootstrap?.board_configuration ?? null;
+      boardConfig = config;
+      listColumns = listColumnsFromConfig(config);
+    } catch (error) {
+      boardConfig = null;
+      listColumns = [...DEFAULT_LIST_COLUMNS];
+      if (error?.status !== 404) {
+        console.error('Failed to load list column configuration:', error);
+      }
+    }
+  }
+
+  async function saveBoardConfiguration(newColumns) {
+    if (!currentCollection) return;
+
+    try {
+      const configData = buildListColumnConfiguration(boardConfig, newColumns);
+      const savedConfig = boardConfig?.id
+        ? await api.collections.updateBoardConfiguration(
+            currentCollection.id,
+            boardConfig.id,
+            configData,
+          )
+        : await api.collections.createBoardConfiguration(
+            currentCollection.id,
+            null,
+            configData,
+          );
+      boardConfig = savedConfig;
+      listColumns = listColumnsFromConfig(savedConfig);
+    } catch (error) {
+      console.error('Failed to save list column configuration:', error);
+      errorToast(t('dialogs.alerts.failedToSave', { error: error.message || error }));
+    }
+  }
+
+  function handleColumnChange({ columns }) {
+    void saveBoardConfiguration(columns);
   }
 
   async function hydrateFromCollection(collection) {
@@ -182,15 +264,6 @@
 
   // ===== Table data =====
 
-  let workItemColumns = $derived(
-    buildWorkItemColumns({
-      itemUrl: (item) => `/workspaces/${item.workspace_id}/items/${item.id}`,
-      lastColumn: createdAtColumn(),
-      allStatuses,
-      statusCategories,
-    })
-  );
-
   let tableData = $derived(decorateWorkItems(workItems, workspaces));
 
   function viewItem(item) {
@@ -211,47 +284,53 @@
 
   // ===== Public sharing =====
 
-  async function handlePublicToggle() {
+  function buildCollectionUpdate(overrides = {}) {
+    return {
+      name: currentCollection.name,
+      description: currentCollection.description || null,
+      ql_query: qlQuery,
+      filter_state: rawMode ? null : serializeFilterState(),
+      workspace_id: currentCollection.workspace_id ?? null,
+      category_id: currentCollection.category_id ?? null,
+      is_private: currentCollection.is_private ?? false,
+      ...overrides,
+    };
+  }
+
+  async function handlePrivacyToggle() {
     if (!currentCollection) return;
-    const newIsPublic = !currentCollection.is_public;
-    if (!newIsPublic) {
-      savingPublicSharing = true;
-      try {
-        await api.collections.updatePublicSharing(currentCollection.id, {
-          is_public: false,
-          public_slug: currentCollection.public_slug || null,
-        });
-        currentCollection = { ...currentCollection, is_public: false };
-        slugSaved = false;
-      } catch (error) {
-        console.error('Failed to disable public sharing:', error);
-      } finally {
-        savingPublicSharing = false;
-      }
-    } else {
-      currentCollection = { ...currentCollection, is_public: true };
-      slugSaved = false;
+    const next = !currentCollection.is_private;
+    try {
+      await api.collections.update(currentCollection.id, buildCollectionUpdate({ is_private: next }));
+      currentCollection = { ...currentCollection, is_private: next };
+    } catch (error) {
+      console.error('Failed to update collection privacy:', error);
+      errorToast(t('dialogs.alerts.failedToUpdate', { error: error.message || error }));
     }
   }
 
-  function handleSlugChange(value) {
-    if (!currentCollection) return;
-    currentCollection = { ...currentCollection, public_slug: value };
-    slugSaved = false;
-  }
-
-  async function handleSlugSave() {
-    if (!currentCollection || !currentCollection.public_slug) return;
+  async function handlePublicSharingSave({ isPublic, publicSlug }) {
+    if (!currentCollection) return { ok: false, error: 'Collection not found.' };
     savingPublicSharing = true;
     try {
-      await api.collections.updatePublicSharing(currentCollection.id, {
-        is_public: currentCollection.is_public,
-        public_slug: currentCollection.public_slug,
+      const update = buildCollectionUpdate({
+        is_public: isPublic,
+        public_slug: publicSlug,
       });
-      slugSaved = true;
+      await api.collections.update(currentCollection.id, update);
+      currentCollection = {
+        ...currentCollection,
+        ql_query: update.ql_query,
+        filter_state: update.filter_state,
+        is_public: isPublic,
+        public_slug: publicSlug,
+      };
+      slugSaved = Boolean(isPublic && publicSlug);
+      return { ok: true };
     } catch (error) {
       console.error('Failed to save public sharing:', error);
       errorToast(error.message || 'Failed to save public sharing settings');
+      return { ok: false, error: error.message || 'Failed to save public sharing settings.' };
     } finally {
       savingPublicSharing = false;
     }
@@ -266,14 +345,7 @@
       return;
     }
     try {
-      await api.collections.update(currentCollection.id, {
-        name: currentCollection.name,
-        description: currentCollection.description || null,
-        ql_query: qlQuery,
-        filter_state: rawMode ? null : serializeFilterState(),
-        workspace_id: currentCollection.workspace_id ?? null,
-        category_id: currentCollection.category_id ?? null,
-      });
+      await api.collections.update(currentCollection.id, buildCollectionUpdate());
       navigate(returnPath || '/collections');
     } catch (error) {
       console.error('Failed to update collection:', error);
@@ -298,18 +370,29 @@
     workspaceAssociationSaving = true;
     const workspaceId =
       workspaceAssociationSelection.length === 1 ? workspaceAssociationSelection[0] : null;
+    const clearedCategory = workspaceId != null && currentCollection.category_id != null;
 
     try {
-      await api.collections.update(currentCollection.id, {
-        name: currentCollection.name,
-        description: currentCollection.description || null,
-        ql_query: qlQuery,
-        filter_state: rawMode ? null : serializeFilterState(),
-        is_public: currentCollection.is_public,
+      // Association is not a publishing operation: omit public-sharing fields so
+      // an ordinary owner without public_board.manage can move the collection.
+      await api.collections.update(
+        currentCollection.id,
+        buildCollectionAssociationUpdate({
+          collection: currentCollection,
+          qlQuery,
+          filterState: rawMode ? null : serializeFilterState(),
+          workspaceId,
+        })
+      );
+      currentCollection = {
+        ...currentCollection,
         workspace_id: workspaceId,
-      });
-      currentCollection = { ...currentCollection, workspace_id: workspaceId };
+        category_id: workspaceId ? null : currentCollection.category_id,
+      };
       showWorkspaceAssociationModal = false;
+      if (clearedCategory) {
+        warningToast(t('collections.categoryClearedOnAssociation'));
+      }
     } catch (error) {
       console.error('Failed to associate workspace:', error);
       workspaceAssociationError = error.message || 'Failed to associate workspace. Please try again.';
@@ -320,16 +403,18 @@
 
   let trimmedCollectionName = $derived((currentCollection?.name || '').trim());
   let trimmedQlQuery = $derived(qlQuery.trim());
-  let canSubmitCollection = $derived(Boolean(currentCollection && trimmedCollectionName && trimmedQlQuery));
-  // Public-board sharing is gated on the global public_board.manage permission
-  // AND ownership of this collection (system admins may manage any). Mirrors the
-  // backend: publishing requires the permission, and editing a collection's
-  // public state requires being its creator (requireCollectionOwner).
+  let canSubmitCollection = $derived(
+    Boolean(currentCollection && canManageCollection && trimmedCollectionName && trimmedQlQuery)
+  );
+  // Public-board sharing requires owning the collection (the backend enforces
+  // requireOwner without a system-admin exception) plus the global
+  // public_board.manage permission or system administration.
   let canManagePublicBoard = $derived(
-    Boolean(currentCollection) &&
-      ($isSystemAdmin ||
-        (($permissionStore.userPermissionKeys?.has('public_board.manage') ?? false) &&
-          currentCollection.created_by === authStore.currentUser?.id))
+    Boolean(
+      canManageCollection &&
+        ($isSystemAdmin ||
+          ($permissionStore.userPermissionKeys?.has('public_board.manage') ?? false)),
+    )
   );
   let associatedWorkspace = $derived(
     currentCollection?.workspace_id ? workspaces.find((w) => w.id === currentCollection.workspace_id) : null
@@ -355,6 +440,7 @@
     {selectedPriorities}
     {searchQuery}
     {dynamicFilters}
+    {loading}
     disabled={rawMode}
     onupdateworkspaces={handleUpdateWorkspaces}
     onupdatestatuses={handleUpdateStatuses}
@@ -369,6 +455,7 @@
       collection={currentCollection}
       workspace={associatedWorkspace}
       isEditing={!!currentCollection}
+      canEdit={canManageCollection}
       canSave={canSubmitCollection}
       categories={$collectionCategoriesStore}
       {returnPath}
@@ -388,9 +475,10 @@
       publicSlug={currentCollection?.public_slug || null}
       {slugSaved}
       saving={savingPublicSharing}
-      onpublictoggle={handlePublicToggle}
-      onslugchange={handleSlugChange}
-      onslugsave={handleSlugSave}
+      onpublicsave={handlePublicSharingSave}
+      isPrivate={currentCollection?.is_private || false}
+      showPrivacyToggle={canManageCollection}
+      onprivacytoggle={handlePrivacyToggle}
     />
 
     <QlQueryBar
@@ -418,23 +506,44 @@
         <div class="animate-pulse" style="color: var(--ds-text-subtle);">{t('collections.loadingWorkItems')}</div>
       </Card>
     {:else}
-      <DataTable
+      {#if currentCollection}
+        <div class="flex justify-end mb-4">
+          <ColumnSelector
+            columns={listColumns}
+            {customFieldDefinitions}
+            canConfigure={canConfigureColumns}
+            testId="collection-column-selector-trigger"
+            onchange={handleColumnChange}
+          />
+        </div>
+      {/if}
+
+      <WorkItemListTable
         data={tableData}
-        columns={workItemColumns}
-        keyField="id"
+        columns={listColumns}
+        {workspaces}
+        {customFieldDefinitions}
+        {itemTypes}
+        includeWorkspace={true}
+        statuses={listStatuses.length > 0 ? listStatuses : allStatuses}
+        statusCategories={listStatusCategories.length > 0 ? listStatusCategories : statusCategories}
+        priorities={listPriorities.length > 0 ? listPriorities : allPriorities}
+        canEdit={false}
+        testId="collection-search-results-table"
         emptyMessage={t('collections.noWorkItemsFound')}
         emptyDescription={t('collections.tryAdjustingFilters')}
         emptyIcon={Search}
         actionItems={buildItemActions}
         onRowClick={viewItem}
+        rowAttrs={(item) => ({ 'data-testid': `collection-result-${item.id}` })}
       />
 
-      {#if itemsPagination && itemsPagination.total > 0}
+      {#if itemsPagination && itemsPagination.total_items > 0}
         <div class="mt-6">
           <Pagination
             currentPage={itemsPagination.page}
-            totalItems={itemsPagination.total}
-            itemsPerPage={itemsPagination.limit}
+            totalItems={itemsPagination.total_items}
+            itemsPerPage={itemsPagination.page_size}
             maxItems={10000}
             onpageChange={handlePageChange}
             onpageSizeChange={handlePageSizeChange}
@@ -468,6 +577,11 @@
       {#if workspaceAssociationError}
         <div class="text-sm" style="color: var(--ds-text-danger);">{workspaceAssociationError}</div>
       {/if}
+      {#if currentCollection?.category_id && workspaceAssociationSelection.length === 1}
+        <p class="text-xs" style="color: var(--ds-text-warning);" data-testid="category-cleared-note">
+          {t('collections.categoryClearedOnAssociation')}
+        </p>
+      {/if}
       <p class="text-xs" style="color: var(--ds-text-subtle);">
         {t('collections.workspaceAssociationNote')}
       </p>
@@ -481,4 +595,3 @@
     />
   </div>
 </Modal>
-

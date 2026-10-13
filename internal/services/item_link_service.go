@@ -1,12 +1,15 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
+	"windshift/internal/models"
 )
 
 // ItemLinkService owns the link-management business logic shared by every
@@ -28,7 +31,7 @@ type ItemLinkService struct {
 	// Optional dependencies — set via the With* methods. Nil-friendly:
 	// when missing, callers that need them get a fail-closed permission
 	// response. The bare CreateLink path does not touch any of these.
-	perm          *PermissionService
+	perm          WorkspacePermissionChecker
 	pagePerm      PagePermissionChecker
 	assetPerm     AssetPermissionChecker
 	notifications ItemLinkNotificationEmitter
@@ -53,6 +56,11 @@ type CreateItemLinkParams struct {
 	CustomFieldID *int
 }
 
+type itemLinkQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 // ErrInvalidLinkTypeForEntities is returned when the requested link type
 // does not allow the given source/target entity types. Centralizing this
 // in the service ensures both the public REST handler and the AI
@@ -63,6 +71,38 @@ var ErrInvalidLinkTypeForEntities = errors.New("link type does not allow these e
 // CreateLink validates and inserts a new item link.
 // Returns the new link ID, or 0 if the link was a duplicate (INSERT OR IGNORE).
 func (s *ItemLinkService) CreateLink(params CreateItemLinkParams) (int64, error) {
+	return createItemLink(s.db, params)
+}
+
+// CreateLinkWithMetadata validates and inserts a link with its canonical fact
+// in one transaction. It is the internal path for imports and integrations
+// that perform authorization outside this service.
+func (s *ItemLinkService) CreateLinkWithMetadata(params CreateItemLinkParams, metadata itemevents.Metadata) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	id, err := createItemLink(tx, params)
+	if err != nil || id == 0 {
+		return id, err
+	}
+	link := models.ItemLink{
+		ID: int(id), LinkTypeID: params.LinkTypeID,
+		SourceType: params.SourceType, SourceID: params.SourceID,
+		TargetType: params.TargetType, TargetID: params.TargetID,
+		CreatedBy: params.CreatedBy, CustomFieldID: params.CustomFieldID,
+	}
+	if _, err := itemevents.NewRecorder(s.db).LinkChanged(context.Background(), tx, itemevents.Linked, link, metadata); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func createItemLink(db itemLinkQuerier, params CreateItemLinkParams) (int64, error) {
 	// Verify the link type exists and is active, and pull its
 	// allowed_entity_types constraint in the same query so we can gate
 	// pairs that the link type's schema disallows.
@@ -70,7 +110,7 @@ func (s *ItemLinkService) CreateLink(params CreateItemLinkParams) (int64, error)
 		active             bool
 		allowedEntityTypes sql.NullString
 	)
-	err := s.db.QueryRow(
+	err := db.QueryRow(
 		"SELECT active, allowed_entity_types FROM link_types WHERE id = ?",
 		params.LinkTypeID,
 	).Scan(&active, &allowedEntityTypes)
@@ -114,7 +154,7 @@ func (s *ItemLinkService) CreateLink(params CreateItemLinkParams) (int64, error)
 
 	// Insert with ON CONFLICT DO NOTHING to handle duplicates gracefully
 	var linkID int64
-	err = s.db.QueryRow(`
+	err = db.QueryRow(`
 		INSERT INTO item_links (link_type_id, source_type, source_id, target_type, target_id, created_by, custom_field_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT DO NOTHING

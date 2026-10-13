@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"windshift/internal/models"
+	"windshift/internal/repository/actionutil"
 )
 
 //go:embed templates/*.yaml
@@ -63,7 +64,6 @@ var (
 	loadOnce  sync.Once
 	loaded    []Template
 	loadByKey map[string]Template
-	loadErr   error
 )
 
 // Registry returns all embedded templates, parsed and validated. Cached
@@ -81,18 +81,10 @@ func Get(key string) (Template, bool) {
 	return t, ok
 }
 
-// LoadError returns the first parse/validation error encountered (if any).
-// Used by tests and the startup self-check; the API returns whatever
-// templates parsed successfully and skips the rest.
-//
-// deadcode-keep: called by core-tests/internal/services/actiontemplates/registry_test.go
-func LoadError() error { return loadErr }
-
 func load() {
 	loadOnce.Do(func() {
 		entries, err := templateFS.ReadDir("templates")
 		if err != nil {
-			loadErr = fmt.Errorf("read embedded template dir: %w", err)
 			return
 		}
 
@@ -104,20 +96,16 @@ func load() {
 			}
 			raw, err := templateFS.ReadFile(path.Join("templates", name))
 			if err != nil {
-				loadErr = fmt.Errorf("read %s: %w", name, err)
 				continue
 			}
 			var t Template
 			if err := yaml.Unmarshal(raw, &t); err != nil {
-				loadErr = fmt.Errorf("parse %s: %w", name, err)
 				continue
 			}
 			if err := validate(&t); err != nil {
-				loadErr = fmt.Errorf("validate %s: %w", name, err)
 				continue
 			}
 			if _, dup := loadByKey[t.Key]; dup {
-				loadErr = fmt.Errorf("duplicate template key %q (in %s)", t.Key, name)
 				continue
 			}
 			loadByKey[t.Key] = t
@@ -169,7 +157,9 @@ func validate(t *Template) error {
 		if !nodeType.IsIterator() {
 			continue
 		}
-		body := bodyClosure(n.ID, t.Edges)
+		body := actionutil.Descendants(n.ID, t.Edges, func(edge TemplateEdge) (string, string) {
+			return edge.SourceNodeID, edge.TargetNodeID
+		})
 		for _, e := range t.Edges {
 			if !body[e.TargetNodeID] {
 				continue
@@ -186,28 +176,4 @@ func validate(t *Template) error {
 	}
 
 	return nil
-}
-
-// bodyClosure mirrors action_engine_iterator.iteratorBodyNodes but operates
-// on the YAML graph (string IDs) so we can validate before persisting.
-func bodyClosure(iteratorID string, edges []TemplateEdge) map[string]bool {
-	body := map[string]bool{}
-	queue := []string{}
-	for _, e := range edges {
-		if e.SourceNodeID == iteratorID && !body[e.TargetNodeID] {
-			body[e.TargetNodeID] = true
-			queue = append(queue, e.TargetNodeID)
-		}
-	}
-	for len(queue) > 0 {
-		next := queue[0]
-		queue = queue[1:]
-		for _, e := range edges {
-			if e.SourceNodeID == next && !body[e.TargetNodeID] {
-				body[e.TargetNodeID] = true
-				queue = append(queue, e.TargetNodeID)
-			}
-		}
-	}
-	return body
 }

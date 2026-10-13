@@ -26,6 +26,23 @@ func NewPermissionRepository(db database.Database) *PermissionRepository {
 
 const permissionColumns = "id, permission_key, permission_name, description, scope, is_system, created_at, updated_at"
 
+// SystemAdminGrantQuery matches a user's system.admin global permission,
+// either granted directly or via an active group. Used by the permission
+// cache and authz probes; keep aligned with handlers/auth_policy.go.
+const SystemAdminGrantQuery = `
+	SELECT EXISTS(
+		SELECT 1 FROM user_global_permissions ugp
+		JOIN permissions p ON ugp.permission_id = p.id
+		WHERE ugp.user_id = ? AND p.permission_key = 'system.admin'
+		UNION
+		SELECT 1 FROM group_members gm
+		JOIN groups g ON g.id = gm.group_id
+		JOIN group_global_permissions ggp ON ggp.group_id = gm.group_id
+		JOIN permissions p ON p.id = ggp.permission_id
+		WHERE gm.user_id = ? AND p.permission_key = 'system.admin' AND g.is_active = true
+	)
+`
+
 // GroupGlobalGrant is one row of the group_global_permissions table as
 // surfaced by the admin "all group permissions" listing.
 type GroupGlobalGrant struct {
@@ -33,6 +50,14 @@ type GroupGlobalGrant struct {
 	PermissionID int    `json:"permission_id"`
 	GrantedBy    *int   `json:"granted_by"`
 	GrantedAt    string `json:"granted_at"`
+}
+
+// UserEffectiveGlobalGrant is the compact effective-global-permission shape
+// consumed by the permission manager. Direct and active-group grants are
+// deduplicated by (user_id, permission_id).
+type UserEffectiveGlobalGrant struct {
+	UserID       int `json:"user_id"`
+	PermissionID int `json:"permission_id"`
 }
 
 // ListAll returns every permission ordered by scope then name.
@@ -257,6 +282,42 @@ func (r *PermissionRepository) ListGroupGlobalGrants() ([]GroupGlobalGrant, erro
 	return grants, nil
 }
 
+// ListEffectiveUserGlobalGrants returns every user's effective global grants
+// in one query. This intentionally excludes workspace permissions: the admin
+// permission matrix only renders global assignments.
+func (r *PermissionRepository) ListEffectiveUserGlobalGrants() ([]UserEffectiveGlobalGrant, error) {
+	rows, err := r.db.Query(`
+		SELECT grants.user_id, grants.permission_id
+		FROM (
+			SELECT ugp.user_id, ugp.permission_id
+			FROM user_global_permissions ugp
+			UNION
+			SELECT gm.user_id, ggp.permission_id
+			FROM group_members gm
+			JOIN groups g ON g.id = gm.group_id AND g.is_active = true
+			JOIN group_global_permissions ggp ON ggp.group_id = gm.group_id
+		) grants
+		ORDER BY grants.user_id, grants.permission_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list effective user global grants: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	grants := make([]UserEffectiveGlobalGrant, 0)
+	for rows.Next() {
+		var grant UserEffectiveGlobalGrant
+		if scanErr := rows.Scan(&grant.UserID, &grant.PermissionID); scanErr != nil {
+			return nil, fmt.Errorf("scan effective user global grant: %w", scanErr)
+		}
+		grants = append(grants, grant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate effective user global grants: %w", err)
+	}
+	return grants, nil
+}
+
 // GetUserBasic returns the basic user fields needed by the permission
 // summary view.
 func (r *PermissionRepository) GetUserBasic(userID int) (*models.User, error) {
@@ -348,13 +409,16 @@ func (r *PermissionRepository) ListUserGroupGlobalGrants(userID int) ([]models.U
 
 // ListUserWorkspaceRoleGrants returns the workspace permissions a user
 // holds through explicit workspace role assignments, with Permission and
-// Workspace populated. Rows that fail to scan are skipped.
+// Workspace populated. Aligns with the permission cache by ignoring roles
+// with permissions_enabled = false (label-only custom roles); rows that
+// fail to scan are skipped.
 func (r *PermissionRepository) ListUserWorkspaceRoleGrants(userID int) ([]models.UserWorkspacePermission, error) {
 	rows, err := r.db.Query(`
 		SELECT uwr.workspace_id, uwr.role_id, uwr.granted_by, uwr.granted_at,
 		       p.id, p.permission_key, p.permission_name, p.description, p.scope, p.is_system, p.created_at, p.updated_at,
 		       w.id, w.name, w.description, w.key
 		FROM user_workspace_roles uwr
+		JOIN workspace_roles wr ON wr.id = uwr.role_id AND wr.permissions_enabled = true
 		JOIN role_permissions rp ON uwr.role_id = rp.role_id
 		JOIN permissions p ON rp.permission_id = p.id
 		JOIN workspaces w ON uwr.workspace_id = w.id
@@ -389,6 +453,39 @@ func (r *PermissionRepository) ListUserWorkspaceRoleGrants(userID int) ([]models
 		return nil, err
 	}
 	return grants, nil
+}
+
+// ListUserWorkspacePermissionKeys returns the permission keys granted to a
+// user per workspace through explicit permission-enabled role assignments,
+// deduplicated into map[workspaceID]set-of-keys. It carries no display
+// fields — the compact shape the permission profile serves.
+func (r *PermissionRepository) ListUserWorkspacePermissionKeys(userID int) (map[int]map[string]bool, error) {
+	rows, err := r.db.Query(`
+		SELECT uwr.workspace_id, p.permission_key
+		FROM user_workspace_roles uwr
+		JOIN workspace_roles wr ON wr.id = uwr.role_id AND wr.permissions_enabled = true
+		JOIN role_permissions rp ON uwr.role_id = rp.role_id
+		JOIN permissions p ON rp.permission_id = p.id
+		WHERE uwr.user_id = ?
+	`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workspace permission keys: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	result := make(map[int]map[string]bool)
+	for rows.Next() {
+		var workspaceID int
+		var key string
+		if scanErr := rows.Scan(&workspaceID, &key); scanErr != nil {
+			continue
+		}
+		if result[workspaceID] == nil {
+			result[workspaceID] = make(map[string]bool)
+		}
+		result[workspaceID][key] = true
+	}
+	return result, rows.Err()
 }
 
 // PermissionsByKey returns the full permission catalog keyed by

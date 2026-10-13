@@ -26,19 +26,19 @@ func NewTimeProjectHandler(base BaseHandler, timePerm *services.TimePermissionSe
 }
 
 type timeProjectResponse struct {
-	ID            int                    `json:"id"`
-	CustomerID    *int                   `json:"customer_id,omitempty"`
-	CategoryID    *int                   `json:"category_id,omitempty"`
-	Name          string                 `json:"name"`
-	Description   string                 `json:"description"`
-	Status        string                 `json:"status"`
-	Color         string                 `json:"color,omitempty"`
-	HourlyRate    float64                `json:"hourly_rate"`
-	Settings      map[string]interface{} `json:"settings,omitempty"`
-	CustomerName  string                 `json:"customer_name,omitempty"`
-	CategoryName  string                 `json:"category_name,omitempty"`
-	CategoryColor string                 `json:"category_color,omitempty"`
-	TotalHours    *float64               `json:"total_hours,omitempty"`
+	ID            int            `json:"id"`
+	CustomerID    *int           `json:"customer_id,omitempty"`
+	CategoryID    *int           `json:"category_id,omitempty"`
+	Name          string         `json:"name"`
+	Description   string         `json:"description"`
+	Status        string         `json:"status"`
+	Color         string         `json:"color,omitempty"`
+	HourlyRate    float64        `json:"hourly_rate"`
+	Settings      map[string]any `json:"settings,omitempty"`
+	CustomerName  string         `json:"customer_name,omitempty"`
+	CategoryName  string         `json:"category_name,omitempty"`
+	CategoryColor string         `json:"category_color,omitempty"`
+	TotalHours    *float64       `json:"total_hours,omitempty"`
 }
 
 func mapTimeProjectToResponse(p repository.TimeProjectDetail) timeProjectResponse {
@@ -59,7 +59,18 @@ func mapTimeProjectToResponse(p repository.TimeProjectDetail) timeProjectRespons
 	}
 }
 
-// List returns time projects accessible to the authenticated user.
+// List handles GET /rest/api/v1/time/projects
+//
+// @Summary      List time projects
+// @Description  Returns the time projects the authenticated user may book time on, optionally filtered by status.
+// @Tags         time-tracking
+// @Produce      json
+// @Security     BearerAuth
+// @Param        status  query     string  false  "Filter by project status (e.g. Active)"
+// @Success      200     {array}   handlers.timeProjectResponse
+// @Failure      401     {object}  handlers.ErrorResponse
+// @Failure      500     {object}  handlers.ErrorResponse
+// @Router       /time/projects [get]
 func (h *TimeProjectHandler) List(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.RequireAuth(w, r)
 	if !ok {
@@ -90,7 +101,19 @@ func (h *TimeProjectHandler) List(w http.ResponseWriter, r *http.Request) {
 	h.RespondOK(w, out)
 }
 
-// Get returns a single time project by ID if the user can access it.
+// Get handles GET /rest/api/v1/time/projects/{id}
+//
+// @Summary      Get a time project
+// @Description  Returns a single time project. Responds 404 (not 403) when the project exists but the caller cannot view it.
+// @Tags         time-tracking
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      int  true  "Time project ID"
+// @Success      200  {object}  handlers.timeProjectResponse
+// @Failure      400  {object}  handlers.ErrorResponse
+// @Failure      401  {object}  handlers.ErrorResponse
+// @Failure      404  {object}  handlers.ErrorResponse
+// @Router       /time/projects/{id} [get]
 func (h *TimeProjectHandler) Get(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.RequireAuth(w, r)
 	if !ok {

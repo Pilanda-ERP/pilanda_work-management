@@ -1,20 +1,22 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
   import { authStore } from '../stores/auth.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast } from '../stores/toasts.svelte.js';
+  import { currentWorkspace } from '../stores';
+  import { navigate } from '../router.js';
   import { confirm } from '../composables/useConfirm.js';
   import {
     Bell, Plus, Edit, Trash2, Save, X, Check,
-    AlertCircle, Settings
+    AlertCircle, Settings, ArrowRight
   } from '@lucide/svelte';
   import DataTable from '../components/DataTable.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import Button from '../components/Button.svelte';
   import Modal from '../dialogs/Modal.svelte';
   import ModalHeader from '../dialogs/ModalHeader.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import Textarea from '../components/Textarea.svelte';
   import BasePicker from '../pickers/BasePicker.svelte';
   import Label from '../components/Label.svelte';
@@ -24,6 +26,9 @@
   import DescriptionText from '../components/DescriptionText.svelte';
   import EmptyState from '../components/EmptyState.svelte';
   import AlertBox from '../components/AlertBox.svelte';
+  import LocalizedObjectFields from './LocalizedObjectFields.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let notificationSettings = $state([]);
   let availableEvents = $state([]);
@@ -32,6 +37,7 @@
   let showCreateModal = $state(false);
   let showEditModal = $state(false);
   let editingSetting = $state(null);
+  let translationEditor = $state(null);
 
   // Form state
   let formData = $state({
@@ -114,7 +120,7 @@
     formData = {
       name: setting.name,
       description: setting.description || '',
-      is_active: true,
+      is_active: setting.is_active,
       event_rules: [...(setting.event_rules || [])],
       created_by: setting.created_by
     };
@@ -144,7 +150,9 @@
 
     try {
       if (editingSetting) {
+        translationEditor?.validate();
         await api.notificationSettings.update(editingSetting.id, formData);
+        await translationEditor?.save();
       } else {
         // Add created_by from current user
         formData.created_by = /** @type {any} */ (authStore.currentUser)?.id;
@@ -288,9 +296,7 @@
   </PageHeader>
 
   {#if loading}
-    <div class="flex justify-center py-12">
-      <Spinner />
-    </div>
+    <StateDisplay type="loading" />
   {:else if error}
     <AlertBox variant="error" message={error} />
   {:else}
@@ -318,31 +324,46 @@
     <form onsubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
       <div class="space-y-6">
         <!-- Basic Information -->
+        {#if editingSetting}
+          {#key editingSetting.id}
+            <LocalizedObjectFields
+              bind:this={translationEditor}
+              objectType="notification_setting"
+              objectId={editingSetting.id}
+              bind:canonicalName={formData.name}
+              bind:canonicalDescription={formData.description}
+              displayName={editingSetting.display_name || editingSetting.name}
+              displayDescription={editingSetting.display_description || editingSetting.description}
+            />
+          {/key}
+        {:else}
         <div class="grid grid-cols-1 gap-4">
           <div>
-            <Label for="name" color="default" required class="mb-1">{t('settings.notifications.name')}</Label>
-            <input
+            <TextField
+              label={t('settings.notifications.name')}
               id="name"
-              type="text"
-              bind:value={formData.name}
-              placeholder={t('settings.notifications.namePlaceholder')}
-              class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
               required
+              labelColor="default"
+              type="text"
+              placeholder={t('settings.notifications.namePlaceholder')}
+              size="small"
+              bind:value={formData.name}
             />
           </div>
 
           <div>
-            <Label for="description" color="default" class="mb-1">{t('settings.notifications.description')}</Label>
-            <Textarea
+            <TextareaField
+              label={t('settings.notifications.description')}
               id="description"
-              bind:value={formData.description}
+              labelColor="default"
               placeholder={t('settings.notifications.descriptionPlaceholder')}
               rows={3}
+              bind:value={formData.description}
             />
           </div>
 
         </div>
+        {/if}
 
         <!-- Event Rules -->
         <div>
@@ -392,11 +413,24 @@
                     <button
                       type="button"
                       onclick={() => removeEventRule(index)}
-                      class="text-red-600 hover:text-red-800 transition-colors pb-1.5"
+                      class="text-ds-text-danger hover:opacity-80 transition-colors pb-1.5"
                     >
                       <Trash2 class="w-4 h-4" />
                     </button>
                   </div>
+
+                  {#if rule.event_type === 'sla.warning' && $currentWorkspace}
+                    <button
+                      type="button"
+                      class="mt-1 inline-flex items-center gap-1 text-xs"
+                      style="color: var(--ds-text-link);"
+                      data-testid="sla-warning-thresholds-link-{index}"
+                      onclick={() => navigate(`/workspaces/${$currentWorkspace.id}/settings/service-levels?subtab=warnings`)}
+                    >
+                      {t('settings.notifications.configureSlaWarningThresholds')}
+                      <ArrowRight class="w-3 h-3" />
+                    </button>
+                  {/if}
 
                   <!-- Notification Recipients (multiselect) -->
                   <div class="mt-3">

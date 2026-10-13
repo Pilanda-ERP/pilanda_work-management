@@ -18,7 +18,16 @@ import time from './time.js';
 import ui from './ui.js';
 import workflows from './workflows.js';
 import workspace from './workspace.js';
+import teams from './teams.js';
 import pages from './pages.js';
+import supplemental from './supplemental.js';
+import quality from './quality.js';
+import review from './review.js';
+import adminOperations from './adminOperations.js';
+import dashboard from './dashboard.js';
+import zammad from './zammad.js';
+import mobile from './mobile.js';
+import backfill from './backfill.js';
 
 export default createLocale({
   admin,
@@ -36,4 +45,13 @@ export default createLocale({
   logbook,
   analytics,
   pages,
+  teams,
+  supplemental,
+  quality,
+  review,
+  adminOperations,
+  dashboard,
+  zammad,
+  mobile,
+  backfill,
 });

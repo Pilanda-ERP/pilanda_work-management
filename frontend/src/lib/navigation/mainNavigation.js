@@ -4,7 +4,7 @@ import {
   IconClock,
   IconFlag,
   IconFolderSearch,
-  IconLifebuoy,
+  IconMessage2Plus,
   IconPackage,
   IconPhoneCheck,
   IconSettings,
@@ -69,7 +69,7 @@ export const mainNavItems = [
   },
   {
     id: 'portal-hub',
-    icon: IconLifebuoy,
+    icon: IconMessage2Plus,
     labelKey: 'nav.portalHub',
     href: '/channels',
     activeViews: ['hub', 'hub-inbox', 'channels'],

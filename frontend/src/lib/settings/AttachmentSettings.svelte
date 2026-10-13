@@ -1,13 +1,16 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
   import { AlertCircle, CheckCircle, X, Plus, Paperclip } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
+  import TextField from '../components/TextField.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import Lozenge from '../components/Lozenge.svelte';
   import Label from '../components/Label.svelte';
   import { successToast } from '../stores/toasts.svelte.js';
+  import { attachmentStatus } from '../stores/attachmentStatus.svelte.js';
   import Toggle from '../components/Toggle.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import DescriptionText from '../components/DescriptionText.svelte';
@@ -97,10 +100,12 @@
   async function loadStatus() {
     try {
       status = await api.attachmentSettings.getStatus();
+      attachmentStatus.hydrate(status);
     } catch (err) {
       if (err.status === 404) {
         // Attachment status endpoint doesn't exist when attachments are not configured
         status = null;
+        attachmentStatus.hydrate({ enabled: false, writable: false });
       } else {
         console.error('Failed to load attachment status:', err);
       }
@@ -124,8 +129,9 @@
 
       successToast(t('settings.attachments.settingsSavedSuccess'));
 
-      // Reload settings to get updated values
-      await loadSettings();
+      // Keep both the form and the shared attachment capability snapshot in
+      // sync so attachment consumers update without a browser reload.
+      await Promise.all([loadSettings(), loadStatus()]);
 
     } catch (err) {
       console.error('Failed to save settings:', err);
@@ -142,6 +148,11 @@
       // Auto-save after adding MIME type
       if (!initialLoad) saveSettings();
     }
+  }
+
+  // Stable, selector-safe testid for a MIME type ("image/png" → "image-png").
+  function mimeTypeTestId(mimeType) {
+    return mimeType.replace(/[^a-zA-Z0-9]+/g, '-').toLowerCase();
   }
   
   function removeMimeType(index) {
@@ -209,9 +220,7 @@
   subtitle={t('settings.attachments.subtitle')}
 />
     {#if loading}
-      <div class="flex items-center justify-center py-12">
-        <Spinner />
-      </div>
+      <StateDisplay type="loading" />
     {:else}
       <!-- Status Section -->
       {#if status}
@@ -286,20 +295,22 @@
                 </span>
                 <p class="text-xs" style="color: var(--ds-text-subtle);">{t('settings.attachments.enableAttachmentsDesc')}</p>
               </div>
-<Toggle bind:checked={enabled} disabled={!status || !status.attachment_path} />
+<Toggle bind:checked={enabled} disabled={!status || !status.attachment_path} dataTestid="attachment-enabled-toggle" />
             </div>
 
             <!-- Max File Size -->
             <div>
-              <Label for="max-file-size" color="default" class="mb-1">{t('settings.attachments.maxFileSize')}</Label>
-              <input
+              <TextField
+                label={t('settings.attachments.maxFileSize')}
+                labelColor="default"
+                labelClass="mb-1"
                 type="number"
                 id="max-file-size"
                 bind:value={maxFileSizeMB}
                 min="1"
                 max="1024"
-                class="w-32 px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+                inputClass="w-32"
+                size="small"
               />
               <DescriptionText>
                 {t('settings.attachments.current')}: {formatFileSize(maxFileSizeMB * 1048576)}
@@ -335,7 +346,7 @@
                   size="small"
                   onclick={clearAllMimeTypes}
                   disabled={saving}
-                  class="text-red-600 hover:text-red-700"
+                  class="text-ds-text-danger hover:opacity-80"
                 >
                   {t('settings.attachments.clearAll')}
                 </Button>
@@ -347,20 +358,22 @@
           <div class="mb-4">
             <Label for="add-mime-type" color="default" class="mb-1">{t('settings.attachments.addMimeType')}</Label>
             <div class="flex gap-2">
-              <input
+              <Input
                 type="text"
                 id="add-mime-type"
                 bind:value={newMimeType}
                 onkeydown={handleKeydown}
                 placeholder={t('settings.attachments.mimeTypePlaceholder')}
-                class="flex-1 px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+                class="flex-1"
+                size="small"
               />
+              <!-- shortcut-guard-exempt: inline chip add, not a modal-opening create affordance -->
               <Button
                 variant="default"
                 icon={Plus}
                 onclick={addMimeType}
                 disabled={!newMimeType.trim() || saving}
+                dataTestid="attachment-add-mime-button"
               >
                 {t('common.add')}
               </Button>
@@ -369,7 +382,7 @@
 
           <!-- Current MIME Types -->
           {#if allowedMimeTypes.length > 0}
-            <div>
+            <div data-testid="attachment-mime-types">
               <span class="block font-medium text-sm mb-2" style="color: var(--ds-text);">{t('settings.attachments.allowedMimeTypes')} ({allowedMimeTypes.length}):</span>
               <div class="flex flex-wrap gap-2 max-h-48 overflow-y-auto p-1">
                 {#each allowedMimeTypes as mimeType, index}
@@ -384,6 +397,7 @@
                       disabled={saving}
                       class="ml-1 hover:opacity-70 transition-opacity disabled:opacity-50"
                       aria-label="Remove {mimeType}"
+                      data-testid={`attachment-remove-mime-${mimeTypeTestId(mimeType)}`}
                     >
                       <X class="w-3 h-3" />
                     </button>
@@ -400,7 +414,7 @@
 
         <!-- Error Messages -->
         {#if error}
-          <div class="flex items-center gap-2 text-red-600">
+          <div class="flex items-center gap-2 text-ds-text-danger">
             <AlertCircle class="w-4 h-4" />
             <span class="text-sm">{error}</span>
             <Button variant="ghost" icon={X} size="small" onclick={clearError} title="Dismiss" />

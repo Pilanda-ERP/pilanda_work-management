@@ -1,16 +1,17 @@
 <script>
   import { IconCheck } from '@tabler/icons-svelte-runes';
   import { t } from '../../stores/i18n.svelte.js';
+  import { errorToast } from '../../stores/toasts.svelte.js';
   import { api } from '../../api.js';
-  import Input from '../../components/Input.svelte';
-  import Select from '../../components/Select.svelte';
   import Button from '../../components/Button.svelte';
   import Label from '../../components/Label.svelte';
-  import Checkbox from '../../components/Checkbox.svelte';
-  import WorkspaceSelector from '../../workspaces/WorkspaceSelector.svelte';
   import DescriptionText from '../../components/DescriptionText.svelte';
+  import ChannelIntakesSection from './ChannelIntakesSection.svelte';
   import Toggle from '../../components/Toggle.svelte';
   import { publicBaseURL } from '../../runtime/contextPath.js';
+  import { isSystemAdmin } from '../../stores/permissions.svelte.js';
+	import TextField from '../../components/TextField.svelte';
+	import SelectField from '../../components/SelectField.svelte';
 
   let {
     channelId,
@@ -22,6 +23,9 @@
       oauth_tenant_id: 'common',
       oauth_connected: false,
       oauth_email: '',
+      connected_oauth_provider_type: '',
+      connected_oauth_client_id: '',
+      connected_oauth_tenant_id: '',
       imap_host: '',
       imap_port: 993,
       imap_encryption: 'ssl',
@@ -30,34 +34,63 @@
       workspace_id: null,
       item_type_id: null,
       mailbox: 'INBOX',
-      mark_as_read: true,
-      delete_after_process: false,
+      processing_disposition: 'mark_read',
+      rate_limit_per_hour: null,
       enabled: false
     }),
     workspaces = [],
-    itemTypes = [],
+    portals = [],
     loading = $bindable(false),
-    onLoadItemTypes = () => {},
-    onToast = () => {}
+    onSaveBeforeOAuth = async () => {},
+    onOAuthStartFailed = async () => {}
   } = $props();
 
+  // Older callers (and stored configs) carry the two legacy booleans instead of
+  // the single disposition. Derive it once so the select always has a value.
+  if (formData.processing_disposition === undefined) {
+    formData.processing_disposition = formData.delete_after_process
+      ? 'delete'
+      : formData.mark_as_read === false
+        ? 'leave'
+        : 'mark_read';
+  }
+
+  let oauthIdentityChanged = $derived(
+    formData.oauth_connected && (
+      formData.oauth_provider_type !== formData.connected_oauth_provider_type ||
+      formData.oauth_client_id.trim() !== formData.connected_oauth_client_id.trim() ||
+      (formData.oauth_provider_type === 'microsoft' &&
+        formData.oauth_tenant_id.trim() !== formData.connected_oauth_tenant_id.trim())
+    )
+  );
+  let oauthIsConnected = $derived(formData.oauth_connected && !oauthIdentityChanged);
+
   async function startOAuthFlow() {
-    if (!channelId) return;
+    if (!$isSystemAdmin || !channelId) return;
 
     if (!formData.oauth_client_id) {
-      onToast('Please enter OAuth client ID');
+      errorToast('Please enter OAuth client ID');
       return;
     }
 
+    let restoreEnabled = false;
     try {
       loading = true;
-      const result = await api.channels.startEmailOAuth(channelId);
+      restoreEnabled = await onSaveBeforeOAuth();
+      const result = await api.channels.startEmailOAuth(channelId, restoreEnabled);
       if (result.auth_url) {
         window.location.href = result.auth_url;
+      } else {
+        throw new Error('OAuth start did not return an authorization URL');
       }
     } catch (error) {
+      try {
+        await onOAuthStartFailed(restoreEnabled);
+      } catch (restoreError) {
+        console.error('Failed to restore email channel after OAuth start failure:', restoreError);
+      }
       console.error('Failed to start OAuth:', error);
-      onToast('Failed to start OAuth: ' + (error.message || error));
+      errorToast('Failed to start OAuth: ' + (error.message || error));
     } finally {
       loading = false;
     }
@@ -75,38 +108,30 @@
       if (!formData.oauth_client_id?.trim()) {
         return { valid: false, message: t('channel.clientIdRequired') };
       }
-      if (!formData.oauth_connected && !formData.oauth_client_secret?.trim()) {
+      if (!oauthIsConnected && !formData.oauth_client_secret?.trim()) {
         return { valid: false, message: t('channel.clientSecretRequired') };
       }
-    }
-
-    if (!formData.workspace_id) {
-      return { valid: false, message: t('channel.targetWorkspaceRequired') };
-    }
-    if (!formData.item_type_id) {
-      return { valid: false, message: t('channel.itemTypeRequired') };
     }
 
     return { valid: true };
   }
 
   export function getConfig() {
+    // The channel config carries the connection plus the mailbox-level
+    // post-processing default. Routing (folder, target, request/item type, rate
+    // limit) and per-intake disposition overrides live on intakes.
     const baseConfig = {
       email_auth_method: formData.auth_method,
-      email_workspace_id: formData.workspace_id,
-      email_item_type_id: formData.item_type_id,
-      email_mailbox: formData.mailbox,
-      email_mark_as_read: formData.mark_as_read,
-      email_delete_after_process: formData.delete_after_process
+      email_processing_disposition: formData.processing_disposition || 'mark_read'
     };
 
     if (formData.auth_method === 'oauth') {
       return {
         ...baseConfig,
         email_oauth_provider_type: formData.oauth_provider_type,
-        email_oauth_client_id: formData.oauth_client_id,
+        email_oauth_client_id: formData.oauth_client_id.trim(),
         email_oauth_client_secret: formData.oauth_client_secret || undefined,
-        email_oauth_tenant_id: formData.oauth_provider_type === 'microsoft' ? formData.oauth_tenant_id : undefined
+        email_oauth_tenant_id: formData.oauth_provider_type === 'microsoft' ? formData.oauth_tenant_id.trim() : undefined
       };
     } else {
       return {
@@ -198,23 +223,34 @@
         <!-- OAuth Credentials -->
         <div class="grid grid-cols-2 gap-4">
           <div>
-            <Label color="default" required class="mb-2">{t('channel.clientId')}</Label>
-            <Input bind:value={formData.oauth_client_id} placeholder="Application (client) ID" />
+            <TextField
+              label={t('channel.clientId')}
+              required
+              labelColor="default"
+              placeholder="Application (client) ID"
+              bind:value={formData.oauth_client_id}
+            />
           </div>
           <div>
-            <Label color="default" required class="mb-2">{t('channel.clientSecret')}</Label>
-            <Input
+            <TextField
+              label={t('channel.clientSecret')}
+              required
+              labelColor="default"
               type="password"
+              placeholder={oauthIsConnected ? t('channel.leaveBlankToKeep') : 'Client secret value'}
               bind:value={formData.oauth_client_secret}
-              placeholder={formData.oauth_connected ? t('channel.leaveBlankToKeep') : 'Client secret value'}
             />
           </div>
         </div>
 
         {#if formData.oauth_provider_type === 'microsoft'}
           <div>
-            <Label color="default" class="mb-2">{t('channel.tenantId')}</Label>
-            <Input bind:value={formData.oauth_tenant_id} placeholder="common (multi-tenant) or specific tenant ID" />
+            <TextField
+              label={t('channel.tenantId')}
+              labelColor="default"
+              placeholder="common (multi-tenant) or specific tenant ID"
+              bind:value={formData.oauth_tenant_id}
+            />
             <DescriptionText>
               {t('channel.tenantIdHelp')}
             </DescriptionText>
@@ -222,7 +258,7 @@
         {/if}
 
         <!-- Connection Status -->
-        {#if formData.oauth_connected}
+        {#if oauthIsConnected}
           <div class="p-4 rounded-lg border" style="background: var(--ds-background-success-subtle); border-color: var(--ds-border-success);">
             <div class="flex items-center gap-3">
               <IconCheck class="w-5 h-5" style="color: var(--ds-icon-success);" />
@@ -232,12 +268,14 @@
                   {formData.oauth_email}
                 </div>
               </div>
-              <Button variant="ghost" size="small" onclick={startOAuthFlow} disabled={loading}>
-                {t('channel.reconnect')}
-              </Button>
+              {#if $isSystemAdmin}
+                <Button variant="ghost" size="small" onclick={startOAuthFlow} disabled={loading}>
+                  {t('channel.reconnect')}
+                </Button>
+              {/if}
             </div>
           </div>
-        {:else if formData.oauth_client_id}
+        {:else if formData.oauth_client_id && $isSystemAdmin}
           <div class="p-4 rounded-lg border" style="background: var(--ds-surface-raised); border-color: var(--ds-border);">
             <div class="flex items-center justify-between">
               <div>
@@ -268,92 +306,79 @@
 
         <div class="grid grid-cols-2 gap-4">
           <div>
-            <Label color="default" required class="mb-2">{t('channel.imapHost')}</Label>
-            <Input bind:value={formData.imap_host} placeholder="imap.example.com" />
+            <TextField
+              label={t('channel.imapHost')}
+              required
+              labelColor="default"
+              placeholder="imap.example.com"
+              bind:value={formData.imap_host}
+            />
           </div>
           <div class="grid grid-cols-2 gap-4">
             <div>
-              <Label color="default" class="mb-2">{t('channel.port')}</Label>
-              <Input type="number" bind:value={formData.imap_port} placeholder="993" />
+              <TextField
+                label={t('channel.port')}
+                labelColor="default"
+                type="number"
+                placeholder="993"
+                bind:value={formData.imap_port}
+              />
             </div>
             <div>
-              <Label color="default" class="mb-2">{t('channel.encryption')}</Label>
-              <Select bind:value={formData.imap_encryption} options={[{ value: 'ssl', label: 'SSL/TLS (implicit)' }, { value: 'starttls', label: 'STARTTLS' }]} />
+              <SelectField
+                label={t('channel.encryption')}
+                labelColor="default"
+                options={[{ value: 'ssl', label: 'SSL/TLS (implicit)' }, { value: 'starttls', label: 'STARTTLS' }]}
+                bind:value={formData.imap_encryption}
+              />
             </div>
           </div>
         </div>
 
         <div class="grid grid-cols-2 gap-4">
           <div>
-            <Label color="default" required class="mb-2">{t('channel.username')}</Label>
-            <Input bind:value={formData.imap_username} placeholder="user@example.com" />
+            <TextField
+              label={t('channel.username')}
+              required
+              labelColor="default"
+              placeholder="user@example.com"
+              bind:value={formData.imap_username}
+            />
           </div>
           <div>
-            <Label color="default" required class="mb-2">{t('channel.password')}</Label>
-            <Input type="password" bind:value={formData.imap_password} placeholder="Enter password to update" />
+            <TextField
+              label={t('channel.password')}
+              required
+              labelColor="default"
+              type="password"
+              placeholder="Enter password to update"
+              bind:value={formData.imap_password}
+            />
             <DescriptionText>{t('channel.leaveBlankPassword')}</DescriptionText>
           </div>
         </div>
       </div>
     {/if}
 
-    <!-- Item Creation -->
-    <div class="pt-4 border-t space-y-4" style="border-color: var(--ds-border);">
-      <h5 class="text-sm font-medium" style="color: var(--ds-text);">{t('channel.itemCreation')}</h5>
-
-      <div class="grid grid-cols-2 gap-4">
-        <div>
-          <Label color="default" required class="mb-2">{t('channel.targetWorkspace')}</Label>
-          <WorkspaceSelector
-            bind:value={formData.workspace_id}
-            {workspaces}
-            placeholder={t('channel.selectWorkspace')}
-            onSelect={(workspace) => {
-              formData.item_type_id = null;
-              onLoadItemTypes(formData.workspace_id);
-            }}
-          />
-        </div>
-        <div>
-          <Label color="default" required class="mb-2">{t('channel.itemType')}</Label>
-          <Select bind:value={formData.item_type_id} disabled={!formData.workspace_id} options={[{ value: null, label: t('channel.selectItemType') }, ...itemTypes.map(type => ({ value: type.id, label: type.name }))]} />
-          {#if !formData.workspace_id}
-            <DescriptionText>{t('channel.selectWorkspaceFirst')}</DescriptionText>
-          {/if}
-        </div>
-      </div>
+    <!-- Mailbox-level post-processing default; an intake may override it. -->
+    <div class="pt-4 border-t" style="border-color: var(--ds-border);">
+      <SelectField
+        label={t('channel.processingDisposition')}
+        labelColor="default"
+        id="email-processing-disposition"
+        options={[
+          { value: 'leave', label: t('channel.dispositionLeave') },
+          { value: 'mark_read', label: t('channel.dispositionMarkRead') },
+          { value: 'delete', label: t('channel.dispositionDelete') }
+        ]}
+        bind:value={formData.processing_disposition}
+      />
+      <DescriptionText>{t('channel.dispositionHelp')}</DescriptionText>
     </div>
 
-    <!-- Processing Options -->
-    <div class="pt-4 border-t space-y-4" style="border-color: var(--ds-border);">
-      <h5 class="text-sm font-medium" style="color: var(--ds-text);">{t('channel.processingOptions')}</h5>
-
-      <div>
-        <Label color="default" class="mb-2">{t('channel.mailbox')}</Label>
-        <Input bind:value={formData.mailbox} placeholder="INBOX" />
-        <DescriptionText>{t('channel.mailboxHelp')}</DescriptionText>
-      </div>
-
-      <div class="space-y-3">
-        <div class="p-3 rounded" style="background-color: var(--ds-surface-raised);">
-          <Checkbox
-            bind:checked={formData.mark_as_read}
-            label={t('channel.markAsRead')}
-            hint={t('channel.markAsReadHelp')}
-            size="small"
-          />
-        </div>
-
-        <div class="p-3 rounded" style="background-color: var(--ds-surface-raised);">
-          <Checkbox
-            bind:checked={formData.delete_after_process}
-            label={t('channel.deleteAfterProcess')}
-            hint={t('channel.deleteAfterProcessHelp')}
-            size="small"
-          />
-        </div>
-      </div>
-    </div>
+    <!-- Intakes: routing is separate from the connection. One mailbox can feed
+         several intakes via distinct folders. -->
+    <ChannelIntakesSection {channelId} {workspaces} {portals} />
 
     <div class="flex items-center justify-between">
       <div>
@@ -366,7 +391,7 @@
             : t('channel.emailIsInactive', 'Email channel is currently disabled')}
         </div>
       </div>
-      <Toggle bind:checked={formData.enabled} />
+      <Toggle bind:checked={formData.enabled} dataTestid="channel-email-enable" />
     </div>
   </div>
 </div>

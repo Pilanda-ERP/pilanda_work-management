@@ -81,14 +81,29 @@ func requirePortalCustomer(w http.ResponseWriter, r *http.Request) (int, bool) {
 
 // ----- registration -----
 
+// requireCredentialName sanitizes and validates the passkey credential name
+// shared by registration start and complete. Writes the error response itself.
+func requireCredentialName(w http.ResponseWriter, r *http.Request, raw string) (string, bool) {
+	name := strings.TrimSpace(sanitize.PlainTextField.Sanitize(raw))
+	if name == "" {
+		respondValidationError(w, r, "Credential name is required")
+		return "", false
+	}
+	if utf8.RuneCountInString(name) > maxPortalCredentialNameLen {
+		respondValidationError(w, r, "Credential name is too long")
+		return "", false
+	}
+	return name, true
+}
+
 type portalRegistrationStartRequest struct {
 	CredentialName string `json:"credential_name"`
 }
 
 type portalRegistrationCompleteRequest struct {
-	SessionID      string      `json:"sessionId"`
-	CredentialName string      `json:"credentialName"`
-	Response       interface{} `json:"response"`
+	SessionID      string `json:"sessionId"`
+	CredentialName string `json:"credentialName"`
+	Response       any    `json:"response"`
 }
 
 // StartPortalRegistration begins enrolment of a new passkey for the
@@ -98,18 +113,13 @@ func (h *PortalWebAuthnHandler) StartPortalRegistration(w http.ResponseWriter, r
 	if !ok {
 		return
 	}
-	req, ok := decodeJSON[portalRegistrationStartRequest](w, r)
+	req, ok := decodeChannelJSON[portalRegistrationStartRequest](w, r)
 	if !ok {
 		return
 	}
-	sanitize.Apply(&req.CredentialName, sanitize.PlainTextField)
-	name := strings.TrimSpace(req.CredentialName)
-	if name == "" {
-		respondValidationError(w, r, "Credential name is required")
-		return
-	}
-	if utf8.RuneCountInString(name) > maxPortalCredentialNameLen {
-		respondValidationError(w, r, "Credential name is too long")
+	// Validate the name up front so the flow fails before the ceremony;
+	// it is stored when the registration is completed.
+	if _, ok := requireCredentialName(w, r, req.CredentialName); !ok {
 		return
 	}
 
@@ -146,7 +156,7 @@ func (h *PortalWebAuthnHandler) StartPortalRegistration(w http.ResponseWriter, r
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"publicKey": options.Response,
 		"sessionId": sessionID,
 	})
@@ -159,18 +169,12 @@ func (h *PortalWebAuthnHandler) CompletePortalRegistration(w http.ResponseWriter
 	if !ok {
 		return
 	}
-	req, ok := decodeJSON[portalRegistrationCompleteRequest](w, r)
+	req, ok := decodeChannelJSON[portalRegistrationCompleteRequest](w, r)
 	if !ok {
 		return
 	}
-	sanitize.Apply(&req.CredentialName, sanitize.PlainTextField)
-	name := strings.TrimSpace(req.CredentialName)
-	if name == "" {
-		respondValidationError(w, r, "Credential name is required")
-		return
-	}
-	if utf8.RuneCountInString(name) > maxPortalCredentialNameLen {
-		respondValidationError(w, r, "Credential name is too long")
+	name, ok := requireCredentialName(w, r, req.CredentialName)
+	if !ok {
 		return
 	}
 
@@ -215,10 +219,10 @@ func (h *PortalWebAuthnHandler) CompletePortalRegistration(w http.ResponseWriter
 		return
 	}
 
-	respondJSONCreated(w, map[string]interface{}{
+	respondJSONCreated(w, map[string]any{
 		"status":  "success",
 		"message": "Passkey registered successfully",
-		"credential": map[string]interface{}{
+		"credential": map[string]any{
 			"id":              credential.ID,
 			"name":            name,
 			"attestationType": credential.AttestationType,
@@ -230,8 +234,8 @@ func (h *PortalWebAuthnHandler) CompletePortalRegistration(w http.ResponseWriter
 // ----- discoverable login -----
 
 type portalLoginCompleteRequest struct {
-	SessionID string      `json:"sessionId"`
-	Response  interface{} `json:"response"`
+	SessionID string `json:"sessionId"`
+	Response  any    `json:"response"`
 }
 
 // StartPortalLogin issues a discoverable-login challenge. The slug must
@@ -258,7 +262,7 @@ func (h *PortalWebAuthnHandler) StartPortalLogin(w http.ResponseWriter, r *http.
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"publicKey": options.Response,
 		"sessionId": sessionID,
 	})
@@ -277,7 +281,7 @@ func (h *PortalWebAuthnHandler) CompletePortalLogin(w http.ResponseWriter, r *ht
 		return
 	}
 
-	req, ok := decodeJSON[portalLoginCompleteRequest](w, r)
+	req, ok := decodeChannelJSON[portalLoginCompleteRequest](w, r)
 	if !ok {
 		return
 	}
@@ -314,6 +318,11 @@ func (h *PortalWebAuthnHandler) CompletePortalLogin(w http.ResponseWriter, r *ht
 		customer, err := h.lookupStore.GetCustomer(customerID)
 		if err != nil {
 			return nil, fmt.Errorf("customer not found: %w", err)
+		}
+		// Deactivated customers cannot authenticate (WI-1554): failing the
+		// resolution produces the same generic 401 as any other failed login.
+		if customer.DeactivatedAt != nil {
+			return nil, fmt.Errorf("customer is deactivated")
 		}
 		hasAccess, err := h.lookupStore.CustomerHasChannelAccess(customerID, channel.ID)
 		if err != nil {
@@ -380,10 +389,10 @@ func (h *PortalWebAuthnHandler) CompletePortalLogin(w http.ResponseWriter, r *ht
 		slog.Int("portal_customer_id", resolvedCustomer.ID),
 		slog.String("portal", slug))
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"message": "Successfully signed in",
-		"customer": map[string]interface{}{
+		"customer": map[string]any{
 			"id":    resolvedCustomer.ID,
 			"email": resolvedCustomer.Email,
 			"name":  resolvedCustomer.Name,

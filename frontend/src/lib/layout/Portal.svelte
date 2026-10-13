@@ -10,7 +10,6 @@
   import Spinner from '../components/Spinner.svelte';
   import EmptyState from '../components/EmptyState.svelte';
   import Button from '../components/Button.svelte';
-  import GlassButton from '../components/GlassButton.svelte';
   import PortalHeader from '../portal/PortalHeader.svelte';
   import PortalHero from '../portal/PortalHero.svelte';
   import PortalFooter from '../portal/PortalFooter.svelte';
@@ -18,6 +17,8 @@
   import PortalMyApprovals from '../portal/PortalMyApprovals.svelte';
   import PortalMyDrafts from '../portal/PortalMyDrafts.svelte';
   import PortalSections from '../portal/PortalSections.svelte';
+  import PortalKBBrowse from '../portal/PortalKBBrowse.svelte';
+  import PortalKBArticle from '../portal/PortalKBArticle.svelte';
   import PortalCustomizePanel from '../portal/PortalCustomizePanel.svelte';
 
   // Modals
@@ -30,16 +31,24 @@
   import RequestTypeModal from '../dialogs/RequestTypeModal.svelte';
   import AssetReportModal from '../dialogs/AssetReportModal.svelte';
   import AssetReportFormModal from '../dialogs/AssetReportFormModal.svelte';
+  import GlobalConfirmDialog from '../dialogs/GlobalConfirmDialog.svelte';
 
   /** @type {any} */
   const AlertCircleIcon = AlertCircle;
 
   // Store
-  import { portalStore, gradients } from '../stores/portal.svelte.js';
+  import {
+    portalCatalogStore,
+    portalCustomizationStore as portalStore,
+  } from '../stores/portal.svelte.js';
+  import {
+    portalApprovalsStore,
+    portalDraftsStore,
+    portalRequestsStore,
+  } from '../stores/portalActivity.svelte.js';
   import { portalAuthStore } from '../stores/portalAuth.svelte.js';
   import { api } from '../api.js';
   import { navigate } from '../router.js';
-  import { safeCssUrl } from '../utils/sanitize';
 
   // Modal states (kept local since they are component-specific)
   // Request-type fields editing has moved inline into PortalCustomizePanel —
@@ -58,38 +67,23 @@
   let showAssetReportForm = $state(false);
   let selectedAssetReportForForm = $state(null);
 
-  // Compute background style - image takes priority over gradient (same as PortalHero).
-  // backgroundImageUrl is admin-controlled, so it's validated via safeCssUrl
-  // to prevent CSS injection via quote/paren breakouts in the inline style.
-  const backgroundStyle = $derived(() => {
-    const safeUrl = safeCssUrl(portalStore.backgroundImageUrl);
-    if (safeUrl) {
-      return `background: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4)), url("${safeUrl}") center/cover no-repeat;`;
-    }
-    const gradientValue = gradients[portalStore.selectedGradient]?.value;
-    if (gradientValue) {
-      return `background: ${gradientValue};`;
-    }
-    return `background: ${gradients[1].value};`;
-  });
-
   // Magic link token: prefer URL fragment (#token=...), which never reaches the
   // server and isn't sent in Referer headers, falling back to the legacy
   // ?token=... query string for in-flight emails sent before the fragment
   // switch. Approval-requested emails additionally carry a `next=` segment in
-  // the fragment that points at the specific approval; both are captured at
-  // mount and immediately stripped so they don't linger in browser history.
+  // the fragment that points at the specific approval. Capture and strip the
+  // fragment on mount and on hash navigation so a fresh link opened in the
+  // same tab after recovery is handled as another real login attempt.
   let hashToken = $state(/** @type {string|null} */ (null));
   let hashNext = $state(/** @type {string|null} */ (null));
-  if (typeof window !== 'undefined') {
+
+  function captureMagicLinkHash() {
+    if (typeof window === 'undefined') return;
+
     const tokenMatch = window.location.hash.match(/(?:^#|&)token=([^&]*)/);
-    if (tokenMatch && tokenMatch[1]) {
-      hashToken = decodeURIComponent(tokenMatch[1]);
-    }
+    hashToken = tokenMatch?.[1] ? decodeURIComponent(tokenMatch[1]) : null;
     const nextMatch = window.location.hash.match(/(?:^#|&)next=([^&]*)/);
-    if (nextMatch && nextMatch[1]) {
-      hashNext = decodeURIComponent(nextMatch[1]);
-    }
+    hashNext = nextMatch?.[1] ? decodeURIComponent(nextMatch[1]) : null;
     // svelte-ignore state_referenced_locally
     if (hashToken || hashNext) {
       const cleaned = window.location.hash
@@ -102,6 +96,8 @@
       );
     }
   }
+
+  captureMagicLinkHash();
   let verifyToken = $derived(hashToken || $currentRoute.query?.token);
 
   // Validate a `next` URL before redirecting to it: must be a same-origin
@@ -118,6 +114,22 @@
   let requestIdParam = $derived($currentRoute.query?.id);
   let approvalIdParam = $derived($currentRoute.query?.id);
   let requestTypeParam = $derived($currentRoute.query?.['request-type']);
+
+  // Prefill values for a route-bound request form, keyed by field_identifier.
+  let requestPrefill = $state({});
+
+  // Parse ?prefill.<field_identifier>=<value> from the current URL. The
+  // optional .label suffix carries display text only and is never a value.
+  function parsePrefill(query) {
+    const prefill = {};
+    for (const [key, value] of Object.entries(query || {})) {
+      if (!key.startsWith('prefill.')) continue;
+      const field = key.slice('prefill.'.length);
+      if (!field || field.endsWith('.label')) continue;
+      prefill[field] = value;
+    }
+    return prefill;
+  }
 
   // Track auth check completion to prevent flash of unauthenticated content
   let authCheckComplete = $state(false);
@@ -139,29 +151,40 @@
     typeof $currentRoute?.path === 'string' && $currentRoute.path.endsWith('/profile')
   );
 
+  // Knowledge-base routes share the 'portal' view too: /kb lists the
+  // published articles, /kb/{pageId} shows one. Discriminated on path the
+  // same way as /profile; the article id comes from the route params.
+  let isKBBrowseRoute = $derived(/\/kb\/?$/.test($currentRoute?.path ?? ''));
+  let isKBArticleRoute = $derived(/\/kb\/\d+$/.test($currentRoute?.path ?? ''));
+
+  // Request-type routes mirror the KB routes: /request/{requestTypeId} opens
+  // that form, optionally with prefill.* query params.
+  let isRequestRoute = $derived(/\/request\/\d+$/.test($currentRoute?.path ?? ''));
+  let requestTypeIdFromRoute = $derived(
+    isRequestRoute ? Number($currentRoute.params?.requestTypeId) : null
+  );
+  let kbPageId = $derived(
+    isKBArticleRoute ? Number($currentRoute.params?.pageId) : null
+  );
+
   onMount(async () => {
-    // Initialize auth (non-blocking for portal)
-    authStore.init().catch(() => {});
+    window.addEventListener('hashchange', captureMagicLinkHash);
 
-    // Load portal data
     const slug = $currentRoute.params?.slug;
-    await portalStore.loadPortal(slug);
-
-    // Check portal customer auth (magic link session) - await to prevent flash
-    await portalAuthStore.checkAuth(slug);
+    const [, userBootstrap] = await Promise.all([
+      portalStore.loadPortal(slug),
+      portalAuthStore.checkAuth(slug),
+    ]);
+    portalStore.hydrateUserBootstrap(userBootstrap);
+    previousAuthState = userBootstrap?.authenticated === true;
     authCheckComplete = true;
-
-    // Load my requests + approvals for badge counts if authenticated
-    if (($authStore.isAuthenticated || $portalAuthStore.isAuthenticated) && portalStore.currentSlug) {
-      portalStore.loadMyRequests();
-      portalStore.loadMyApprovals();
-    }
 
     // Apply theme CSS variables
     applyThemeStyles();
   });
 
   onDestroy(() => {
+    window.removeEventListener('hashchange', captureMagicLinkHash);
     portalStore.reset();
     portalAuthStore.reset();
   });
@@ -175,67 +198,70 @@
 
     if (viewParam === 'requests') {
       // Set showMyRequests directly (don't toggle, which would navigate again)
-      portalStore.setShowMyRequests(true);
+      portalRequestsStore.setVisible(true);
 
       // If a specific request ID is in URL, load and view it
       if (requestIdParam) {
-        portalStore.loadAndViewRequest(requestIdParam);
+        portalRequestsStore.loadAndView(requestIdParam);
       }
     } else if (viewParam === 'approvals') {
-      portalStore.setShowMyApprovals(true);
+      portalApprovalsStore.setVisible(true);
 
       // Deep-link to a specific approval (magic-link `&next=` lands here).
       if (approvalIdParam) {
-        portalStore.loadAndViewApproval(approvalIdParam);
+        portalApprovalsStore.loadAndView(approvalIdParam);
       }
     } else {
-      portalStore.setShowMyRequests(false);
-      portalStore.setShowMyApprovals(false);
+      portalRequestsStore.setVisible(false);
+      portalApprovalsStore.setVisible(false);
 
-      // Check for request-type param to auto-open form
+      // The legacy ?request-type= deep link is now an alias for the real
+      // request route.
       if (requestTypeParam) {
         const requestTypeId = parseInt(requestTypeParam, 10);
         if (!isNaN(requestTypeId)) {
-          // Wait for request types to load, then open the form
-          const checkAndOpenForm = () => {
-            const rt = portalStore.requestTypes.find(t => t.id === requestTypeId);
-            if (rt) {
-              openRequestForm(rt);
-              // Clear the query param from URL without reload
-              const slug = $currentRoute.params?.slug;
-              window.history.replaceState({}, '', `/portal/${slug}`);
-            }
-          };
-          // If request types already loaded, open immediately; otherwise wait
-          if (portalStore.requestTypes.length > 0) {
-            checkAndOpenForm();
-          } else {
-            // Poll briefly for request types to load
-            const interval = setInterval(() => {
-              if (portalStore.requestTypes.length > 0) {
-                clearInterval(interval);
-                checkAndOpenForm();
-              }
-            }, 100);
-            // Clear interval after 5 seconds to prevent infinite polling
-            setTimeout(() => clearInterval(interval), 5000);
-          }
+          navigate(`/portal/${$currentRoute.params?.slug}/request/${requestTypeId}`, {
+            replace: true,
+          });
         }
       }
     }
   });
 
-  // Watch for auth state changes to reload request types after login
+  // Open the request form for a /request/{id} route once request types are
+  // loaded, applying any prefill.* values. The URL stays authoritative so
+  // refresh/back/forward reopen the same form. Signed-out visitors get the
+  // login dialog and the URL is preserved for after login.
+  $effect(() => {
+    if (!authCheckComplete || !isRequestRoute || !requestTypeIdFromRoute) return;
+    if (!isUserAuthenticated) {
+      portalStore.showLoginDialog = true;
+      return;
+    }
+    // Already showing this form (e.g. from a card click) — don't reopen.
+    if (showRequestFormModal && selectedRequestTypeForForm?.id === requestTypeIdFromRoute) return;
+
+    const rt = portalCatalogStore.requestTypes.find((t) => t.id === requestTypeIdFromRoute);
+    if (!rt) return;
+    selectedRequestTypeForForm = rt;
+    requestPrefill = parsePrefill($currentRoute.query);
+    showRequestFormModal = true;
+  });
+
+  // Replace the anonymous sign-in shell with the protected portal after login,
+  // and clear protected portal state again after logout or access revocation.
   $effect(() => {
     const currentAuth = $authStore.isAuthenticated || $portalAuthStore.isAuthenticated;
 
-    // Only reload when auth state changes from false to true (login)
-    if (authCheckComplete && currentAuth && !previousAuthState && portalStore.currentSlug) {
-      portalStore.loadRequestTypes();
-      // Always load My Requests on login (needed for badge count)
-      portalStore.loadMyRequests();
-      // Refresh approvals for the badge count too.
-      portalStore.loadMyApprovals();
+    if (authCheckComplete && currentAuth !== previousAuthState && portalStore.currentSlug) {
+      if (currentAuth) {
+        if (portalAuthStore.userBootstrap?.authenticated) {
+          portalStore.hydrateUserBootstrap(portalAuthStore.userBootstrap);
+        }
+      } else {
+        portalStore.hydrateUserBootstrap(null);
+      }
+      void portalStore.loadPortal(portalStore.currentSlug);
     }
 
     previousAuthState = currentAuth;
@@ -282,7 +308,7 @@
     showRequestTypeModal = false;
     selectedRequestTypeForModal = null;
     await tick();
-    portalStore.loadRequestTypes();
+    portalCatalogStore.loadRequestTypes();
   }
 
   async function openAssetReportModal(mode, assetReport = null) {
@@ -296,7 +322,7 @@
     showAssetReportModal = false;
     selectedAssetReportForModal = null;
     await tick();
-    portalStore.loadAssetReports();
+    portalCatalogStore.loadAssetReports();
   }
 
   function openAssetReportFieldsModal(report) {
@@ -305,7 +331,7 @@
   }
 
   function handleAssetReportFieldsSaved() {
-    portalStore.loadAssetReports();
+    portalCatalogStore.loadAssetReports();
   }
 
   function openAssetReportForm(report) {
@@ -331,14 +357,25 @@
       return;
     }
 
+    requestPrefill = {};
     selectedRequestTypeForForm = requestType;
     showRequestFormModal = true;
   }
 
+  // Closing a route-bound form returns to the portal home so the URL does not
+  // keep pointing at a form that is no longer open.
+  function handleRequestFormClose() {
+    showRequestFormModal = false;
+    requestPrefill = {};
+    if (isRequestRoute) {
+      navigate(`/portal/${$currentRoute.params?.slug}`, { replace: true });
+    }
+  }
+
   function handleRequestSubmitted(itemId) {
     if (itemId) {
-      portalStore.setShowMyRequests(true);
-      portalStore.loadAndViewRequest(itemId);
+      portalRequestsStore.setVisible(true);
+      portalRequestsStore.loadAndView(itemId);
       navigate(`/portal/${portalStore.currentSlug}?view=requests&id=${itemId}`);
     }
   }
@@ -349,7 +386,7 @@
   // to the saved step automatically — no extra plumbing required here.
   function handleResumeDraft({ requestType }) {
     if (!requestType) return;
-    portalStore.showMyDrafts = false;
+    portalDraftsStore.visible = false;
     selectedRequestTypeForForm = requestType;
     showRequestFormModal = true;
     navigate(`/portal/${portalStore.currentSlug}`);
@@ -363,8 +400,8 @@
       selectedRequestTypeForForm = portalStore.pendingRequestType;
       portalStore.pendingRequestType = null;
       showRequestFormModal = true;
-    } else if (portalStore.showMyRequests) {
-      portalStore.loadMyRequests();
+    } else if (portalRequestsStore.visible) {
+      portalRequestsStore.load();
     }
   }
 
@@ -396,16 +433,10 @@
 
     navigate(next || `/portal/${slug}`, { replace: true });
 
-    // Force re-check auth to ensure UI reflects authenticated state
-    await portalAuthStore.checkAuth(slug);
-
-    // Refresh request types after auth change to ensure they're visible
-    await portalStore.loadRequestTypes();
-
-    // Reload my requests if that view is showing
-    if (portalStore.showMyRequests) {
-      portalStore.loadMyRequests();
-    }
+    // Re-check auth. The auth-state effect reuses its badge snapshot and
+    // replaces the anonymous shell with the protected portal bootstrap.
+    const userBootstrap = await portalAuthStore.checkAuth(slug);
+    portalStore.hydrateUserBootstrap(userBootstrap);
   }
 
   function handleVerifyError(message, code, hintEmail) {
@@ -445,7 +476,12 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <!-- Portal Page - Standalone, no Windshift navigation -->
-<div class="min-h-screen flex flex-col" style="background-color: var(--ds-surface, #ffffff);">
+<div
+  class="min-h-screen flex flex-col"
+  style="background-color: var(--ds-surface, #ffffff);"
+  data-testid="portal-page"
+  data-ready={!!portalStore.portalData && authCheckComplete && !portalStore.loading}
+>
   {#if portalStore.loading}
     <!-- Loading State -->
     <div class="flex-1 flex items-center justify-center">
@@ -475,45 +511,45 @@
     {:else if isUserAuthenticated}
       <!-- AUTHENTICATED: Show full portal -->
       <div class="flex-1 flex flex-col">
-        <!-- Header (settings + profile) -->
-        <PortalHeader />
-
         <!-- Edit Mode Top Bar -->
         {#if portalStore.isEditing}
-          <div class="fixed top-0 left-0 right-0 z-[60] h-10" style="background-color: #fefce8; border-bottom: 1px solid #fde68a;">
-            <div class="max-w-7xl mx-auto px-6 flex items-center justify-between h-full">
-              <span class="text-base font-semibold" style="color: #92400e;">Editing</span>
+          <div
+            class="relative z-[60] h-10"
+            style="background-color: #fefce8; border-bottom: 1px solid #fde68a;"
+            data-testid="portal-editing-bar"
+          >
+            <div class="max-w-6xl mx-auto px-4 sm:px-6 flex items-center justify-between h-full">
+              <span class="text-sm font-semibold" style="color: #92400e;">Editing portal</span>
               <Button variant="primary" size="small" icon={Check} onclick={() => portalStore.toggleEditing()}>
                 Done
               </Button>
             </div>
           </div>
-          <!-- Spacer to push flow content down -->
-          <div class="h-10"></div>
         {/if}
 
-        <!-- Hero Section (shown in normal portal view) -->
-        {#if !portalStore.showMyRequests && !portalStore.showMyApprovals && !portalStore.showMyDrafts && !isProfileRoute}
-          <div>
-            <PortalHero />
-          </div>
-        {:else}
-          <!-- Gradient backdrop for fixed header in list views -->
-          <div class="hero-gradient {portalStore.isDarkMode ? 'dark-mode' : ''} {portalStore.backgroundImageUrl ? 'has-image' : ''}" style="{backgroundStyle()}; min-height: 80px;"></div>
+        <!-- Stable portal navigation -->
+        <PortalHeader />
+
+        <!-- Branded search hero on the portal home. Hidden on the
+             knowledge-base routes, which are full sections of their own. -->
+        {#if !portalRequestsStore.visible && !portalApprovalsStore.visible && !portalDraftsStore.visible && !isProfileRoute && !isKBBrowseRoute && !isKBArticleRoute}
+          <PortalHero />
         {/if}
 
-        <!-- Content Area Below Hero -->
-        <div class="flex-1" style="background-color: var(--ds-surface-raised);">
-          <div class="max-w-7xl mx-auto px-6 py-16">
+        <!-- Portal work area -->
+        <main class="flex-1" style="background-color: var(--ds-surface);">
+          <div class="max-w-6xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
             {#if isProfileRoute}
               <PortalProfile />
-            {:else if portalStore.showMyApprovals}
+            {:else if isKBArticleRoute}
+              <PortalKBArticle pageId={kbPageId} />
+            {:else if isKBBrowseRoute}
+              <PortalKBBrowse />
+            {:else if portalApprovalsStore.visible}
               <PortalMyApprovals />
-            {:else if portalStore.showMyDrafts}
-              <PortalPasskeyBanner />
+            {:else if portalDraftsStore.visible}
               <PortalMyDrafts onresume={handleResumeDraft} />
-            {:else if portalStore.showMyRequests}
-              <PortalPasskeyBanner />
+            {:else if portalRequestsStore.visible}
               <PortalMyRequests />
             {:else}
               <PortalPasskeyBanner />
@@ -523,7 +559,7 @@
               />
             {/if}
           </div>
-        </div>
+        </main>
 
         <!-- Footer -->
         <PortalFooter />
@@ -545,8 +581,9 @@
           requestType={selectedRequestTypeForForm}
           portalSlug={portalStore.portalData.slug}
           isDarkMode={portalStore.isDarkMode}
+          prefill={requestPrefill}
           onsubmitted={handleRequestSubmitted}
-          onclose={() => showRequestFormModal = false}
+          onclose={handleRequestFormClose}
         />
       {/if}
 
@@ -607,29 +644,74 @@
         />
       {/if}
     {:else}
-      <!-- NOT AUTHENTICATED: Show login prompt only -->
+      <!-- NOT AUTHENTICATED: a focused portal entry, not a marketing hero. -->
       <div class="flex-1 flex flex-col">
         <PortalHeader />
-        <div class="hero-gradient {portalStore.isDarkMode ? 'dark-mode' : ''} {portalStore.backgroundImageUrl ? 'has-image' : ''}" style="{backgroundStyle()}">
-          <div class="hero-content max-w-7xl mx-auto px-6 py-20 text-center">
-            <h1 class="text-6xl font-bold mb-6 text-white">
-              {portalStore.editableTitle}
-            </h1>
-            {#if portalStore.editableDescription}
-              <p class="text-2xl text-white/90 mb-12 max-w-3xl mx-auto">
-                {portalStore.editableDescription}
-              </p>
-            {/if}
-            <!-- Login prompt -->
-            <div class="max-w-md mx-auto">
-              <p class="text-white/80 mb-6">{t('portal.signInToAccess')}</p>
-              <GlassButton variant="cta" onclick={() => portalStore.showLoginDialog = true}>
-                {t('auth.signIn')}
-              </GlassButton>
+        <main class="flex-1 flex items-center" style="background-color: var(--ds-surface);">
+          <div class="w-full max-w-6xl mx-auto px-4 sm:px-6 py-16 sm:py-24">
+            <div class="grid lg:grid-cols-[minmax(0,1fr)_24rem] gap-10 lg:gap-20 items-center">
+              <div
+                class="max-w-2xl {(portalStore.hasBackgroundImage || portalStore.hasGradient)
+                  ? 'rounded-xl p-7 sm:p-10'
+                  : ''}"
+                style={(portalStore.hasBackgroundImage || portalStore.hasGradient)
+                  ? portalStore.headerBackgroundStyle
+                  : ''}
+              >
+                <div
+                  class="text-xs font-semibold uppercase tracking-[0.16em] mb-4"
+                  style="color: {(portalStore.hasBackgroundImage || portalStore.hasGradient)
+                    ? 'rgba(255,255,255,0.78)'
+                    : 'var(--ds-text-subtle)'};"
+                >
+                  Customer portal
+                </div>
+                <h1
+                  class="text-4xl sm:text-5xl font-semibold tracking-tight mb-5"
+                  style="color: {(portalStore.hasBackgroundImage || portalStore.hasGradient)
+                    ? '#ffffff'
+                    : 'var(--ds-text)'};"
+                >
+                  {portalStore.editableTitle}
+                </h1>
+                {#if portalStore.editableDescription}
+                  <p
+                    class="text-lg sm:text-xl leading-relaxed max-w-xl"
+                    style="color: {(portalStore.hasBackgroundImage || portalStore.hasGradient)
+                      ? 'rgba(255,255,255,0.88)'
+                      : 'var(--ds-text-subtle)'};"
+                  >
+                    {portalStore.editableDescription}
+                  </p>
+                {/if}
+              </div>
+
+              <div
+                class="border rounded-lg p-6 sm:p-8"
+                style="background-color: var(--ds-surface-card); border-color: var(--ds-border);"
+              >
+                <h2 class="text-lg font-semibold mb-2" style="color: var(--ds-text);">
+                  Access your requests
+                </h2>
+                <p class="text-sm leading-relaxed mb-6" style="color: var(--ds-text-subtle);">
+                  {t('portal.signInToAccess')}
+                </p>
+                <button
+                  id="portal-sign-in"
+                  type="button"
+                  onclick={() => (portalStore.showLoginDialog = true)}
+                  class="w-full h-10 rounded-md px-4 text-sm font-semibold text-white transition-opacity hover:opacity-90"
+                  style="background-color: var(--ds-interactive, #2563eb);"
+                >
+                  {t('auth.signIn')}
+                </button>
+                <p class="text-xs mt-4" style="color: var(--ds-text-subtle);">
+                  No password required for customer access.
+                </p>
+              </div>
             </div>
           </div>
-        </div>
-        <div class="flex-1" style="background-color: var(--ds-surface-raised);"></div>
+        </main>
         <PortalFooter />
       </div>
     {/if}
@@ -637,14 +719,12 @@
     <!-- Portal Login Modal (Magic Link) - always accessible -->
     <PortalLoginModal onloginsuccess={handleLoginSuccess} />
 
-    <!-- Magic Link Verification - always accessible.
-         closeOnEscape lets the user bail out if the verify request hangs;
-         closeOnClick stays false to avoid accidental dismissal mid-verify.
-         onclose strips the token from the URL via replaceState so the modal
-         actually closes (show is bound to !!verifyToken) and the token isn't
-         left in browser history. -->
+    <!-- Wait for the initial auth check before redeeming the link so its
+         response cannot overwrite the verified session. Verification
+         redirects programmatically, so close without an outro. Escape still
+         lets the user leave a hung request; outside clicks stay disabled. -->
     <ModalBackdrop
-      show={!!verifyToken}
+      show={authCheckComplete && !!verifyToken}
       blur={4}
       closeOnClick={false}
       closeOnEscape={true}
@@ -655,7 +735,7 @@
       }}
     >
       <div
-        class="relative w-full max-w-md rounded-xl shadow-2xl overflow-hidden"
+        class="relative w-full max-w-md rounded-lg shadow-2xl overflow-hidden"
         style="background-color: var(--ds-surface-card);"
       >
         <PortalVerifyLink
@@ -667,44 +747,9 @@
       </div>
     </ModalBackdrop>
   {/if}
+
+  <!-- Shared confirm() composable target — the portal does not mount the
+       main app overlays, so the dialog must live here too. Mounted outside
+       the portal-state branches so confirm() works in every state. -->
+  <GlobalConfirmDialog />
 </div>
-
-<style>
-  /* Hero gradient background */
-  .hero-gradient {
-    width: 100%;
-    position: relative;
-  }
-
-  /* Add subtle pattern overlay for depth (only for gradients, not images) */
-  .hero-gradient:not(.has-image)::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-image:
-      radial-gradient(circle at 20% 50%, rgba(255, 255, 255, 0.1) 0%, transparent 50%),
-      radial-gradient(circle at 80% 80%, rgba(255, 255, 255, 0.1) 0%, transparent 50%);
-    pointer-events: none;
-  }
-
-  /* Dark mode overlay - dims the gradient (not needed for images as they have built-in overlay) */
-  .hero-gradient.dark-mode:not(.has-image)::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-color: rgba(0, 0, 0, 0.4);
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  .hero-content {
-    position: relative;
-    z-index: 1;
-  }
-</style>

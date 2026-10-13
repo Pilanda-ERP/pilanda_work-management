@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -20,7 +21,10 @@ import (
 //
 // Resolution policy:
 //   - Statuses, item types, priorities, custom fields, status categories,
-//     screens: match by name (case-insensitive) and create if missing.
+//     screens, link types: match by name (case-insensitive) and create if
+//     missing. Link types additionally refuse same-named rows whose
+//     definition differs (ErrLinkTypeDefinitionConflict) — the registry is
+//     global and import never overwrites it.
 //   - Workflow, condition set, approval set, configuration set: always
 //     created fresh with the bundle's names (DB does not enforce uniqueness
 //     on these except screens, where reuse-by-name is intentional).
@@ -53,6 +57,13 @@ func (s *ConfigSetImportService) Import(ctx context.Context, tpl *ConfigSetTempl
 	}
 
 	if err := s.validateReferences(ctx, tpl); err != nil {
+		return 0, nil, err
+	}
+
+	// Link type definition conflicts are also a pre-write structural
+	// rejection: the registry stays untouched and the admin gets both
+	// definitions back to decide which side to rename.
+	if err := s.validateLinkTypeDefinitions(ctx, tpl); err != nil {
 		return 0, nil, err
 	}
 
@@ -326,6 +337,19 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 		priorityNameToID[lowerStr(p.Name)] = id
 	}
 
+	// 5b. Link types — matched by name (case-insensitive); the global registry
+	//     stays global. Identical definitions were verified pre-transaction,
+	//     so reuse is safe; missing types are created active and non-system.
+	for _, lt := range tpl.Payload.LinkTypes {
+		created, err := s.findOrCreateLinkType(ctx, tx, lt, now)
+		if err != nil {
+			return 0, nil, fmt.Errorf("link_type %q: %w", lt.Name, err)
+		}
+		if !created {
+			warnings = append(warnings, fmt.Sprintf("link type %q already exists; reusing existing definition", lt.Name))
+		}
+	}
+
 	// 6. Screens — match by name (DB has UNIQUE(name)). Reuse if found;
 	//    otherwise create with rewritten custom-field identifiers.
 	screenNameToID := map[string]int{}
@@ -344,7 +368,8 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 	//    → transition_id map for later condition/approval references.
 	type transitionKey struct {
 		workflowName string
-		fromName     string // empty for initial transitions
+		fromName     string // empty for initial and from-all transitions
+		fromAll      bool
 		toName       string
 	}
 	workflowNameToID := map[string]int{}
@@ -362,7 +387,9 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 			}
 			var fromID *int
 			fromName := ""
-			if t.FromStatusName != nil {
+			if t.FromAllStatuses {
+				t.FromStatusName = nil
+			} else if t.FromStatusName != nil {
 				fid, ok := statusNameToID[lowerStr(*t.FromStatusName)]
 				if !ok {
 					return 0, nil, fmt.Errorf("workflow %q: transition references unknown from_status %q", wf.Name, *t.FromStatusName)
@@ -374,7 +401,7 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 			if err != nil {
 				return 0, nil, fmt.Errorf("workflow %q: insert transition: %w", wf.Name, err)
 			}
-			transitionKeyToID[transitionKey{lowerStr(wf.Name), lowerStr(fromName), lowerStr(t.ToStatusName)}] = tID
+			transitionKeyToID[transitionKey{lowerStr(wf.Name), lowerStr(fromName), t.FromAllStatuses, lowerStr(t.ToStatusName)}] = tID
 		}
 	}
 
@@ -393,7 +420,7 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 			if tc.FromStatusName != nil {
 				fromName = *tc.FromStatusName
 			}
-			tID, ok := transitionKeyToID[transitionKey{lowerStr(set.WorkflowName), lowerStr(fromName), lowerStr(tc.ToStatusName)}]
+			tID, ok := transitionKeyToID[transitionKey{lowerStr(set.WorkflowName), lowerStr(fromName), tc.FromAllStatuses, lowerStr(tc.ToStatusName)}]
 			if !ok {
 				return 0, nil, fmt.Errorf("condition_set %q: transition (%s → %s) not found in workflow %q", set.Name, displayFrom(tc.FromStatusName), tc.ToStatusName, set.WorkflowName)
 			}
@@ -403,6 +430,9 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 			}
 			for _, c := range tc.Conditions {
 				cfg := s.rewriteConditionConfigForImport(c.Type, c.Config, customFieldNameToID, ctx)
+				if err := validateConditionMap(c.Type, c.Mode, cfg); err != nil {
+					return 0, nil, fmt.Errorf("condition_set %q: %w", set.Name, err)
+				}
 				if err := s.createCondition(ctx, tx, cstID, c, cfg, now); err != nil {
 					return 0, nil, fmt.Errorf("condition_set %q: insert condition: %w", set.Name, err)
 				}
@@ -424,11 +454,11 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 			if !ok {
 				return 0, nil, fmt.Errorf("approval_set %q: unknown status %q", set.Name, ss.StatusName)
 			}
-			approveTID, ok := transitionKeyToID[transitionKey{lowerStr(set.WorkflowName), lowerStrPtr(ss.ApproveTransition.FromStatusName), lowerStr(ss.ApproveTransition.ToStatusName)}]
+			approveTID, ok := transitionKeyToID[transitionKey{lowerStr(set.WorkflowName), lowerStrPtr(ss.ApproveTransition.FromStatusName), ss.ApproveTransition.FromAllStatuses, lowerStr(ss.ApproveTransition.ToStatusName)}]
 			if !ok {
 				return 0, nil, fmt.Errorf("approval_set %q: approve_transition not found", set.Name)
 			}
-			denyTID, ok := transitionKeyToID[transitionKey{lowerStr(set.WorkflowName), lowerStrPtr(ss.DenyTransition.FromStatusName), lowerStr(ss.DenyTransition.ToStatusName)}]
+			denyTID, ok := transitionKeyToID[transitionKey{lowerStr(set.WorkflowName), lowerStrPtr(ss.DenyTransition.FromStatusName), ss.DenyTransition.FromAllStatuses, lowerStr(ss.DenyTransition.ToStatusName)}]
 			if !ok {
 				return 0, nil, fmt.Errorf("approval_set %q: deny_transition not found", set.Name)
 			}
@@ -516,6 +546,7 @@ func (s *ConfigSetImportService) apply(ctx context.Context, tx database.Tx, tpl 
 // ---- find-or-create helpers ----------------------------------------------
 
 func (s *ConfigSetImportService) findOrCreateCustomField(ctx context.Context, tx database.Tx, cf ConfigSetTplCustomField, now time.Time) (int, error) {
+	cf.FieldType = models.CanonicalCustomFieldType(cf.FieldType)
 	var id int
 	err := tx.QueryRowContext(ctx, `SELECT id FROM custom_field_definitions WHERE LOWER(name) = LOWER(?)`, cf.Name).Scan(&id)
 	if err == nil {
@@ -608,6 +639,135 @@ func (s *ConfigSetImportService) findOrCreatePriority(ctx context.Context, tx da
 // findOrCreateScreen reuses a screen by name if one exists (DB enforces
 // UNIQUE(name)); otherwise creates the screen, screen_fields, and
 // screen_system_fields rows.
+// findOrCreateLinkType reuses a link type by name (its definition was
+// verified identical before the transaction); otherwise inserts a new
+// active, non-system row. Returns whether a row was created.
+func (s *ConfigSetImportService) findOrCreateLinkType(ctx context.Context, tx database.Tx, lt ConfigSetTplLinkType, now time.Time) (created bool, err error) {
+	var id int
+	err = tx.QueryRowContext(ctx, `SELECT id FROM link_types WHERE LOWER(name) = LOWER(?)`, lt.Name).Scan(&id)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	normalized := normalizeTplLinkType(lt)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO link_types (name, description, forward_label, reverse_label, color, is_system, active, allowed_entity_types, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, false, true, ?, ?, ?)
+	`, lt.Name, lt.Description, lt.ForwardLabel, lt.ReverseLabel, normalized.Color,
+		encodeTplEntityTypes(normalized.AllowedEntityTypes), now, now)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// validateLinkTypeDefinitions compares every template link type against the
+// target registry and returns ErrLinkTypeDefinitionConflict when a same-named
+// row carries a different definition. No writes.
+func (s *ConfigSetImportService) validateLinkTypeDefinitions(ctx context.Context, tpl *ConfigSetTemplate) error {
+	var conflicts []LinkTypeConflict
+	for i := range tpl.Payload.LinkTypes {
+		tplLt := normalizeTplLinkType(tpl.Payload.LinkTypes[i])
+		existing, err := s.findLinkTypeDefinition(ctx, tplLt.Name)
+		if err != nil {
+			return err
+		}
+		if existing == nil || linkTypeDefinitionsEqual(tplLt, *existing) {
+			continue
+		}
+		conflicts = append(conflicts, LinkTypeConflict{
+			Name:     tplLt.Name,
+			Template: tplLt,
+			Existing: *existing,
+		})
+	}
+	if len(conflicts) == 0 {
+		return nil
+	}
+	return &ErrLinkTypeDefinitionConflict{Conflicts: conflicts}
+}
+
+// findLinkTypeDefinition loads one registry row by case-insensitive name as
+// a portable definition. Returns nil when no row matches.
+func (s *ConfigSetImportService) findLinkTypeDefinition(ctx context.Context, name string) (*ConfigSetTplLinkType, error) {
+	var lt ConfigSetTplLinkType
+	var aetRaw sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT name, COALESCE(description, ''), forward_label, reverse_label, COALESCE(color, ''), allowed_entity_types
+		FROM link_types WHERE LOWER(name) = LOWER(?)
+	`, name).Scan(&lt.Name, &lt.Description, &lt.ForwardLabel, &lt.ReverseLabel, &lt.Color, &aetRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Invalid JSON decodes as "all entity types allowed", matching the live
+	// registry reader.
+	if aetRaw.Valid && aetRaw.String != "" {
+		_ = json.Unmarshal([]byte(aetRaw.String), &lt.AllowedEntityTypes)
+	}
+	return &lt, nil
+}
+
+// normalizeTplLinkType applies the import-time normal forms so that a
+// template and an existing row compare semantically: empty color falls back
+// to the registry default, and a nil/empty entity-type list means "all".
+func normalizeTplLinkType(lt ConfigSetTplLinkType) ConfigSetTplLinkType {
+	if lt.Color == "" {
+		lt.Color = "#6b7280"
+	}
+	if len(lt.AllowedEntityTypes) == 0 {
+		lt.AllowedEntityTypes = nil
+	} else {
+		seen := map[string]struct{}{}
+		deduped := make([]string, 0, len(lt.AllowedEntityTypes))
+		for _, t := range lt.AllowedEntityTypes {
+			if _, dup := seen[t]; dup {
+				continue
+			}
+			seen[t] = struct{}{}
+			deduped = append(deduped, t)
+		}
+		sort.Strings(deduped)
+		lt.AllowedEntityTypes = deduped
+	}
+	return lt
+}
+
+// linkTypeDefinitionsEqual compares two already-normalized definitions.
+// Entity types compare as sets: nil and empty both mean "all allowed".
+func linkTypeDefinitionsEqual(a, b ConfigSetTplLinkType) bool {
+	if a.Description != b.Description || a.ForwardLabel != b.ForwardLabel ||
+		a.ReverseLabel != b.ReverseLabel || a.Color != b.Color {
+		return false
+	}
+	if len(a.AllowedEntityTypes) != len(b.AllowedEntityTypes) {
+		return false
+	}
+	for i := range a.AllowedEntityTypes {
+		if a.AllowedEntityTypes[i] != b.AllowedEntityTypes[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// encodeTplEntityTypes returns the JSON-encoded form for the nullable
+// allowed_entity_types column, or nil when empty ("all allowed").
+func encodeTplEntityTypes(types []string) any {
+	if len(types) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(types)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+
 func (s *ConfigSetImportService) findOrCreateScreen(ctx context.Context, tx database.Tx, sc ConfigSetTplScreen, customFieldNameToID map[string]int, now time.Time) (id int, reused bool, err error) {
 	err = tx.QueryRowContext(ctx, `SELECT id FROM screens WHERE LOWER(name) = LOWER(?)`, sc.Name).Scan(&id)
 	if err == nil {
@@ -663,9 +823,9 @@ func (s *ConfigSetImportService) createWorkflow(ctx context.Context, tx database
 func (s *ConfigSetImportService) createWorkflowTransition(ctx context.Context, tx database.Tx, workflowID int, fromStatusID *int, toStatusID int, t ConfigSetTplWorkflowTransition, now time.Time) (int, error) {
 	var id int
 	err := tx.QueryRowContext(ctx, `
-		INSERT INTO workflow_transitions (workflow_id, from_status_id, to_status_id, display_order, source_handle, target_handle, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
-	`, workflowID, fromStatusID, toStatusID, t.DisplayOrder, t.SourceHandle, t.TargetHandle, now).Scan(&id)
+		INSERT INTO workflow_transitions (workflow_id, from_status_id, to_status_id, from_all_statuses, display_order, source_handle, target_handle, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+	`, workflowID, fromStatusID, toStatusID, t.FromAllStatuses, t.DisplayOrder, t.SourceHandle, t.TargetHandle, now).Scan(&id)
 	return id, err
 }
 
@@ -695,7 +855,7 @@ func (s *ConfigSetImportService) createConditionSetTransition(ctx context.Contex
 	return id, err
 }
 
-func (s *ConfigSetImportService) createCondition(ctx context.Context, tx database.Tx, transitionID int, c ConfigSetTplCondition, cfg map[string]interface{}, now time.Time) error {
+func (s *ConfigSetImportService) createCondition(ctx context.Context, tx database.Tx, transitionID int, c ConfigSetTplCondition, cfg map[string]any, now time.Time) error {
 	cfgBytes, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal condition config: %w", err)
@@ -704,7 +864,7 @@ func (s *ConfigSetImportService) createCondition(ctx context.Context, tx databas
 	if mode == "" {
 		mode = models.ConditionModeCondition
 	}
-	var errMsg interface{}
+	var errMsg any
 	if c.ErrorMessage != "" {
 		errMsg = c.ErrorMessage
 	}
@@ -717,8 +877,8 @@ func (s *ConfigSetImportService) createCondition(ctx context.Context, tx databas
 
 // rewriteConditionConfigForImport reverses the export rewrites: name fields
 // → integer IDs. Returns a fresh map (does not mutate the input).
-func (s *ConfigSetImportService) rewriteConditionConfigForImport(condType string, cfg map[string]interface{}, customFieldNameToID map[string]int, ctx context.Context) map[string]interface{} {
-	out := make(map[string]interface{}, len(cfg))
+func (s *ConfigSetImportService) rewriteConditionConfigForImport(condType string, cfg map[string]any, customFieldNameToID map[string]int, ctx context.Context) map[string]any {
+	out := make(map[string]any, len(cfg))
 	for k, v := range cfg {
 		out[k] = v
 	}
@@ -742,7 +902,7 @@ func (s *ConfigSetImportService) rewriteConditionConfigForImport(condType string
 	case models.ConditionTypeFieldValue:
 		if name, ok := out["custom_field_name"].(string); ok && name != "" {
 			if id, ok := customFieldNameToID[lowerStr(name)]; ok {
-				out["field_id"] = id
+				out["field_identifier"] = strconv.Itoa(id)
 			}
 			delete(out, "custom_field_name")
 		}
@@ -750,7 +910,7 @@ func (s *ConfigSetImportService) rewriteConditionConfigForImport(condType string
 	return out
 }
 
-func (s *ConfigSetImportService) rewriteFieldRefForImport(cfg map[string]interface{}, customFieldNameToID map[string]int) {
+func (s *ConfigSetImportService) rewriteFieldRefForImport(cfg map[string]any, customFieldNameToID map[string]int) {
 	source, _ := cfg["source"].(string)
 	if source != "custom_field" {
 		return
@@ -962,7 +1122,7 @@ func resolveCustomFieldID(name string, m map[string]int) *int {
 // repository — duplicated rather than exported because the repo package keeps
 // it private. Empty strings need to scan/insert as SQL NULL on these columns,
 // not as the empty literal.
-func nullStringIfEmptyImport(s string) interface{} {
+func nullStringIfEmptyImport(s string) any {
 	if s == "" {
 		return nil
 	}

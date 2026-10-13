@@ -83,7 +83,7 @@ const (
 	PermissionTestManage  = "test.manage"  // Create, edit, delete test cases, sets, and folders
 
 	// Action management permissions
-	PermissionActionManage           = "action.manage"            // Create, edit, delete, and execute workspace actions
+	PermissionActionManage           = "action.manage"            // Create, edit, delete, and administratively test workspace actions
 	PermissionActionCredentialManage = "action.credential.manage" // Create, rotate, delete workspace-scoped action credentials
 
 	// Team management permissions
@@ -106,15 +106,23 @@ const (
 	RoleEditor        = "Editor"
 	RoleAdministrator = "Administrator"
 	RoleTester        = "Tester"
+
+	RoleBuiltinViewer        = "viewer"
+	RoleBuiltinEditor        = "editor"
+	RoleBuiltinAdministrator = "administrator"
+	RoleBuiltinTester        = "tester"
 )
 
-// UserPermissionSummary provides a complete overview of a user's permissions
+// UserPermissionSummary is the compact permission profile served to the SPA
+// boot path: permission keys only, grouped by workspace, with no joined
+// display objects. At a 10k-workspace tenant the Everyone fallback produces
+// one entry per workspace; verbose per-grant objects there multi-MB payload.
 type UserPermissionSummary struct {
-	UserID               int                       `json:"user_id"`
-	User                 *User                     `json:"user,omitempty"`
-	GlobalPermissions    []UserGlobalPermission    `json:"global_permissions"`
-	WorkspacePermissions []UserWorkspacePermission `json:"workspace_permissions"`
-	HasSystemAdmin       bool                      `json:"has_system_admin"`
+	UserID            int      `json:"user_id"`
+	HasSystemAdmin    bool     `json:"has_system_admin"`
+	GlobalPermissions []string `json:"global_permissions"`
+	// Map encoded as JSON object keyed by stringified workspace ID.
+	WorkspacePermissions map[int][]string `json:"workspace_permissions"`
 }
 
 // PermissionRequest for granting/revoking permissions
@@ -190,8 +198,11 @@ type PermissionSetPermission struct {
 // future toggle can flip it; v1 forces it false at create time.
 type WorkspaceRole struct {
 	ID                 int       `json:"id" db:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty" db:"builtin_key"`
 	Name               string    `json:"name" db:"name"`
+	DisplayName        string    `json:"display_name"`
 	Description        string    `json:"description" db:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
 	IsSystem           bool      `json:"is_system" db:"is_system"`
 	PermissionsEnabled bool      `json:"permissions_enabled" db:"permissions_enabled"`
 	DisplayOrder       int       `json:"display_order" db:"display_order"`

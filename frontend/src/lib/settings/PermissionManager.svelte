@@ -1,17 +1,25 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
+  import { authStore } from '../stores/auth.svelte.js';
+  import { permissionStore } from '../stores/permissions.svelte.js';
   import { Shield, Users as UsersIcon, Plus, X, User, Crown } from '@lucide/svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import AssigneePicker from '../pickers/AssigneePicker.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import Lozenge from '../components/Lozenge.svelte';
   import DataTable from '../components/DataTable.svelte';
   import Button from '../components/Button.svelte';
   import Modal from '../dialogs/Modal.svelte';
   import ModalHeader from '../dialogs/ModalHeader.svelte';
+  import {
+    buildPermissionAssignmentMap,
+    loadPermissionManagerData,
+    selectGlobalPermissions,
+  } from './permissionManagerData.js';
+  import { systemPermissionDescription, systemPermissionName } from '../utils/systemLabels.js';
 
   let permissions = $state([]);
   let users = $state([]);
@@ -38,16 +46,15 @@
     error = '';
 
     try {
-      // Load permissions, users, and groups in parallel
-      await Promise.all([
-        loadPermissions(),
-        loadUsers(),
-        loadGroups()
-      ]);
-
-      // Load user and group permissions after data is loaded
-      await loadAllUserPermissions();
-      await loadAllGroupPermissions();
+      await permissionStore.loadAllPermissions(authStore.currentUser);
+      const data = await loadPermissionManagerData(api, {
+        permissions: $permissionStore.permissions,
+      });
+      permissions = data.permissions;
+      users = data.users;
+      groups = data.groups;
+      userPermissions = data.userPermissions;
+      groupPermissions = data.groupPermissions;
     } catch (err) {
       error = t('settings.permissions.failedToLoadData') + err.message;
     } finally {
@@ -55,36 +62,13 @@
     }
   }
 
-  async function loadPermissions() {
-    permissions = await api.permissions.getAll();
-  }
-
-  async function loadUsers() {
-    users = await api.getUsers();
-  }
-
-  async function loadGroups() {
-    groups = await api.groups.getAll();
-  }
-
   async function loadAllUserPermissions() {
-    userPermissions = new Map();
-
-    // Load permissions for each user
-    for (const user of users) {
-      try {
-        const userPerms = await api.permissions.getUserPermissions(user.id);
-        const globalPermissionIds = new Set(
-          (userPerms.global_permissions || []).map(p => p.permission_id)
-        );
-        userPermissions.set(user.id, globalPermissionIds);
-      } catch (err) {
-        console.warn(`Failed to load permissions for user ${user.id}:`, err);
-        userPermissions.set(user.id, new Set());
-      }
+    try {
+      const allUserPerms = await api.permissions.getAllUserGlobalPermissions();
+      userPermissions = buildPermissionAssignmentMap(allUserPerms, 'user_id');
+    } catch (err) {
+      console.warn('Failed to load user permissions:', err);
     }
-    // Trigger reactivity
-    userPermissions = userPermissions;
   }
 
   async function loadAllGroupPermissions() {
@@ -100,26 +84,10 @@
         return;
       }
 
-      // Build map of groupId -> Set of permissionIds
-      for (const gp of allGroupPerms) {
-        if (!groupPermissions.has(gp.group_id)) {
-          groupPermissions.set(gp.group_id, new Set());
-        }
-        groupPermissions.get(gp.group_id).add(gp.permission_id);
-      }
-
-      // Trigger reactivity
-      groupPermissions = groupPermissions;
+      groupPermissions = buildPermissionAssignmentMap(allGroupPerms, 'group_id');
     } catch (err) {
       console.warn('Failed to load group permissions:', err);
     }
-  }
-
-  function getGlobalPermissions() {
-    // Hide user.list - any authenticated user can list users (needed for mentions/assignments)
-    // The permission is kept in backend but hidden from management UI
-    const hiddenPermissions = ['user.list'];
-    return permissions.filter(p => p.scope === 'global' && !hiddenPermissions.includes(p.permission_key));
   }
 
   function getUsersWithPermission(permissionId) {
@@ -250,18 +218,22 @@
     return group.name;
   }
 
-  const globalPermissions = $derived(getGlobalPermissions());
+  const globalPermissions = $derived(selectGlobalPermissions(permissions));
 
   const columns = [
     { key: 'permission_name', label: t('settings.permissions.permission'), slot: 'permission' },
-    { key: 'description', label: t('common.description') },
+    { key: 'description', label: t('common.description'), slot: 'description' },
     { key: 'users', label: t('settings.permissions.assignedUsers'), slot: 'users' },
     { key: 'groups', label: t('settings.permissions.assignedGroups'), slot: 'groups' },
     { key: 'actions', label: t('common.actions'), slot: 'actions', width: 'w-32' }
   ];
 </script>
 
-<div>
+<div
+  data-testid="permission-manager"
+  data-ready={!loading}
+  data-user-count={users.length}
+>
   <PageHeader
     icon={Shield}
     title={t('settings.permissions.title')}
@@ -281,10 +253,7 @@
   {/if}
 
   {#if loading}
-    <div class="flex items-center justify-center py-12">
-      <Spinner size="lg" />
-      <span class="ml-3" style="color: var(--ds-text-subtle);">{t('settings.permissions.loadingPermissions')}</span>
-    </div>
+    <StateDisplay type="loading" size="lg" message={t('settings.permissions.loadingPermissions')} />
   {:else}
     <!-- Global Permissions Table -->
     <h2 class="text-xl font-semibold mb-4" style="color: var(--ds-text);">{t('settings.permissions.globalPermissions')}</h2>
@@ -296,12 +265,16 @@
     >
       {#snippet permission(item)}
         <div class="text-sm font-medium flex items-center gap-2" style="color: var(--ds-text);">
-          {item.permission_name}
+          {systemPermissionName(item)}
           {#if item.is_system}
             <Crown class="w-4 h-4" style="color: var(--ds-text-warning);" title={t('settings.permissions.systemPermission')} />
           {/if}
         </div>
         <div class="text-xs" style="color: var(--ds-text-subtle);">{item.permission_key}</div>
+      {/snippet}
+
+      {#snippet description(item)}
+        {systemPermissionDescription(item)}
       {/snippet}
 
       {#snippet users(item)}
@@ -360,7 +333,7 @@
 <Modal bind:isOpen={assignModalOpen} onclose={closeAssignModal} maxWidth="max-w-2xl">
   {#if assignTarget}
     <ModalHeader
-      title={t('settings.permissions.assignPermission', { permission: assignTarget.permission_name })}
+      title={t('settings.permissions.assignPermission', { permission: systemPermissionName(assignTarget) })}
       onClose={closeAssignModal}
     />
     <div class="px-6 py-4">

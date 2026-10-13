@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -98,6 +97,60 @@ func (h *SCMWorkspaceHandler) GetWorkspaceSCMConnections(w http.ResponseWriter, 
 		return
 	}
 
+	if strings.EqualFold(r.URL.Query().Get("include_repositories"), "true") {
+		repositories, err := h.repo.ListLinkedRepositoriesForWorkspace(workspaceID)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		connectionIndexes := make(map[int]int, len(connections))
+		for i := range connections {
+			connectionIndexes[connections[i].ID] = i
+			connections[i].Repositories = []repository.SCMLinkedRepository{}
+		}
+		for _, linkedRepository := range repositories {
+			if index, exists := connectionIndexes[linkedRepository.WorkspaceSCMConnectionID]; exists {
+				connections[index].Repositories = append(connections[index].Repositories, linkedRepository)
+			}
+		}
+	}
+
+	if strings.EqualFold(r.URL.Query().Get("include_auth_status"), "true") {
+		user, ok := RequireAuth(w, r)
+		if !ok {
+			return
+		}
+		authStatuses, err := h.repo.ListConnectionAuthStatusesForWorkspace(workspaceID, user.ID)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		for i := range connections {
+			connections[i].AuthStatus = authStatuses[connections[i].ID]
+		}
+	}
+
+	respondJSONOK(w, connections)
+}
+
+// GetAccessibleSCMConnections returns connections across every workspace the
+// caller can view. It supports global release pickers without a workspace-list
+// request followed by one connection request per workspace.
+func (h *SCMWorkspaceHandler) GetAccessibleSCMConnections(w http.ResponseWriter, r *http.Request) {
+	user, ok := RequireAuth(w, r)
+	if !ok {
+		return
+	}
+	workspaceIDs, err := h.permissionService.AccessibleWorkspaceIDs(user.ID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	connections, err := h.repo.ListConnectionsForWorkspaces(workspaceIDs)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
 	respondJSONOK(w, connections)
 }
 
@@ -114,9 +167,7 @@ func (h *SCMWorkspaceHandler) CreateWorkspaceSCMConnection(w http.ResponseWriter
 	if !ok {
 		return
 	}
-	// Branch / item-key patterns are short identifier-shaped strings
-	// (templates like "feature/{{key}}-{{title}}" — placeholders survive
-	// PlainText / ShortIdentifier; only HTML markers get stripped).
+	// Sanitize identifier-shaped patterns while preserving supported placeholders.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: &req.DefaultBranchPattern, Policy: sanitize.ShortIdentifier, Label: "Default branch pattern"},
 		sanitize.Pair{Target: &req.ItemKeyPattern, Policy: sanitize.ShortIdentifier, Label: "Item key pattern"},
@@ -127,7 +178,6 @@ func (h *SCMWorkspaceHandler) CreateWorkspaceSCMConnection(w http.ResponseWriter
 		return
 	}
 
-	// Verify the provider exists and is enabled
 	providerEnabled, err := h.repo.GetProviderEnabled(req.SCMProviderID)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -143,7 +193,6 @@ func (h *SCMWorkspaceHandler) CreateWorkspaceSCMConnection(w http.ResponseWriter
 		return
 	}
 
-	// Check if workspace is allowed to use this provider
 	if h.providerHandler != nil {
 		var allowed bool
 		allowed, err = h.providerHandler.IsWorkspaceAllowedForProvider(req.SCMProviderID, workspaceID)
@@ -157,13 +206,11 @@ func (h *SCMWorkspaceHandler) CreateWorkspaceSCMConnection(w http.ResponseWriter
 		}
 	}
 
-	// Get user ID from context
 	var createdBy *int
 	if userID, ok := r.Context().Value("user_id").(int); ok {
 		createdBy = &userID
 	}
 
-	// Insert the connection
 	id, err := h.repo.CreateConnection(workspaceID, req.SCMProviderID, req.DefaultBranchPattern, req.ItemKeyPattern, createdBy)
 	if err != nil {
 		slog.Error("failed to create connection", slog.String("component", "scm"), slog.Any("error", err))
@@ -171,7 +218,6 @@ func (h *SCMWorkspaceHandler) CreateWorkspaceSCMConnection(w http.ResponseWriter
 		return
 	}
 
-	// Get the created connection
 	conn, err := h.repo.GetConnectionByID(id)
 	if err != nil {
 		respondInternalError(w, r, err)
@@ -205,7 +251,6 @@ func (h *SCMWorkspaceHandler) GetWorkspaceSCMConnection(w http.ResponseWriter, r
 		return
 	}
 
-	// Verify connection belongs to this workspace
 	if conn.WorkspaceID != workspaceID {
 		respondNotFound(w, r, "connection")
 		return
@@ -231,15 +276,12 @@ func (h *SCMWorkspaceHandler) UpdateWorkspaceSCMConnection(w http.ResponseWriter
 	if !ok {
 		return
 	}
-	// Pointer fields: sanitize the underlying string if it's set (nil
-	// means "leave unchanged" — sanitize.Apply on a nil pointer is a
-	// no-op).
+	// Sanitize only supplied pointer fields; nil means leave unchanged.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: req.DefaultBranchPattern, Policy: sanitize.ShortIdentifier, Label: "Default branch pattern"},
 		sanitize.Pair{Target: req.ItemKeyPattern, Policy: sanitize.ShortIdentifier, Label: "Item key pattern"},
 	)
 
-	// Verify connection exists and belongs to this workspace
 	conn, err := h.repo.GetConnectionByID(connID)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -255,7 +297,6 @@ func (h *SCMWorkspaceHandler) UpdateWorkspaceSCMConnection(w http.ResponseWriter
 		return
 	}
 
-	// Build update
 	enabled := conn.Enabled
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -279,7 +320,6 @@ func (h *SCMWorkspaceHandler) UpdateWorkspaceSCMConnection(w http.ResponseWriter
 		return
 	}
 
-	// Get updated connection
 	conn, err = h.repo.GetConnectionByID(connID)
 	if err != nil {
 		respondInternalError(w, r, err)
@@ -328,6 +368,40 @@ func (h *SCMWorkspaceHandler) DeleteWorkspaceSCMConnection(w http.ResponseWriter
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// validateWorkspaceConnectionAccess verifies that a connection belongs to the
+// requested workspace and that the workspace may use its provider. It writes
+// the endpoint's existing error response when validation fails.
+func (h *SCMWorkspaceHandler) validateWorkspaceConnectionAccess(w http.ResponseWriter, r *http.Request, workspaceID, connID int) bool {
+	connWorkspaceID, providerID, err := h.repo.GetConnectionWorkspaceAndProvider(connID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respondNotFound(w, r, "connection")
+		} else {
+			respondInternalError(w, r, err)
+		}
+		return false
+	}
+
+	if connWorkspaceID != workspaceID {
+		respondNotFound(w, r, "connection")
+		return false
+	}
+
+	if h.providerHandler != nil {
+		allowed, err := h.providerHandler.IsWorkspaceAllowedForProvider(providerID, workspaceID)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return false
+		}
+		if !allowed {
+			respondForbidden(w, r)
+			return false
+		}
+	}
+
+	return true
+}
+
 // ListAvailableRepositories lists repositories from the SCM provider
 func (h *SCMWorkspaceHandler) ListAvailableRepositories(w http.ResponseWriter, r *http.Request) {
 	workspaceID, ok := requireIDParam(w, r, "id")
@@ -339,37 +413,10 @@ func (h *SCMWorkspaceHandler) ListAvailableRepositories(w http.ResponseWriter, r
 		return
 	}
 
-	// Get connection and verify ownership
-	connWorkspaceID, providerID, err := h.repo.GetConnectionWorkspaceAndProvider(connID)
-	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
-			respondNotFound(w, r, "connection")
-		} else {
-			respondInternalError(w, r, err)
-		}
+	if !h.validateWorkspaceConnectionAccess(w, r, workspaceID, connID) {
 		return
 	}
 
-	if connWorkspaceID != workspaceID {
-		respondNotFound(w, r, "connection")
-		return
-	}
-
-	// Strict enforcement: check if workspace is still allowed to use this provider
-	if h.providerHandler != nil {
-		var allowed bool
-		allowed, err = h.providerHandler.IsWorkspaceAllowedForProvider(providerID, workspaceID)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-		if !allowed {
-			respondForbidden(w, r)
-			return
-		}
-	}
-
-	// Get provider with user-level credentials (falls back to workspace/provider for PAT/GitHub App)
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
@@ -380,10 +427,10 @@ func (h *SCMWorkspaceHandler) ListAvailableRepositories(w http.ResponseWriter, r
 	provider, err := h.credentialResolver.GetProviderForUser(r.Context(), connID, user.ID)
 	if err != nil {
 		if errors.Is(err, scm.ErrUserSCMNotConnected) {
-			respondJSONOK(w, map[string]interface{}{
+			respondJSONOK(w, map[string]any{
 				"error":        "Please connect your SCM account first",
 				"error_code":   "user_scm_not_connected",
-				"repositories": []interface{}{},
+				"repositories": []any{},
 			})
 			return
 		}
@@ -392,14 +439,13 @@ func (h *SCMWorkspaceHandler) ListAvailableRepositories(w http.ResponseWriter, r
 			return
 		}
 		slog.Error("failed to get provider", slog.String("component", "scm"), slog.Any("error", err))
-		respondJSONOK(w, map[string]interface{}{
+		respondJSONOK(w, map[string]any{
 			"error":        err.Error(),
-			"repositories": []interface{}{},
+			"repositories": []any{},
 		})
 		return
 	}
 
-	// Parse query params
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -408,10 +454,17 @@ func (h *SCMWorkspaceHandler) ListAvailableRepositories(w http.ResponseWriter, r
 	if perPage < 1 || perPage > 100 {
 		perPage = 30
 	}
+	// Optional server-side search (honored by the GitLab provider; other
+	// providers ignore it and return the unfiltered page).
+	search := strings.TrimSpace(r.URL.Query().Get("search"))
+	if len(search) > 200 {
+		search = search[:200]
+	}
 
 	opts := scm.ListRepositoriesOptions{
 		Page:    page,
 		PerPage: perPage,
+		Search:  search,
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -420,18 +473,15 @@ func (h *SCMWorkspaceHandler) ListAvailableRepositories(w http.ResponseWriter, r
 	repos, err := provider.ListRepositories(ctx, opts)
 	if err != nil {
 		slog.Error("failed to list repositories", slog.String("component", "scm"), slog.Any("error", err))
-		respondJSONOK(w, map[string]interface{}{
+		respondJSONOK(w, map[string]any{
 			"error":        err.Error(),
-			"repositories": []interface{}{},
+			"repositories": []any{},
 		})
 		return
 	}
 
-	// Get already linked repos to mark them (best-effort: an error leaves
-	// the linked set empty).
 	linkedMap, _ := h.repo.LinkedRepositoryExternalIDs(connID)
 
-	// Build response with linked status
 	type RepoWithStatus struct {
 		scm.Repository
 		IsLinked bool `json:"is_linked"`
@@ -445,7 +495,7 @@ func (h *SCMWorkspaceHandler) ListAvailableRepositories(w http.ResponseWriter, r
 		})
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"repositories": result,
 		"page":         page,
 		"per_page":     perPage,
@@ -519,34 +569,8 @@ func (h *SCMWorkspaceHandler) LinkRepository(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Verify connection belongs to workspace
-	connWorkspaceID, providerID, err := h.repo.GetConnectionWorkspaceAndProvider(connID)
-	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
-			respondNotFound(w, r, "connection")
-		} else {
-			respondInternalError(w, r, err)
-		}
+	if !h.validateWorkspaceConnectionAccess(w, r, workspaceID, connID) {
 		return
-	}
-
-	if connWorkspaceID != workspaceID {
-		respondNotFound(w, r, "connection")
-		return
-	}
-
-	// Strict enforcement: check if workspace is still allowed to use this provider
-	if h.providerHandler != nil {
-		var allowed bool
-		allowed, err = h.providerHandler.IsWorkspaceAllowedForProvider(providerID, workspaceID)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-		if !allowed {
-			respondForbidden(w, r)
-			return
-		}
 	}
 
 	defaultBranch := req.DefaultBranch
@@ -796,6 +820,23 @@ func (h *SCMWorkspaceHandler) StartWorkspaceOAuth(w http.ResponseWriter, r *http
 			url.QueryEscape(scopes),
 			state,
 		)
+	case models.SCMProviderTypeGitLab:
+		gitlabBaseURL := "https://gitlab.com"
+		if strings.TrimSpace(oauthCfg.BaseURL) != "" {
+			gitlabBaseURL = strings.TrimSuffix(strings.TrimSuffix(oauthCfg.BaseURL, "/"), "/api/v4")
+		}
+		scopes := "api"
+		if oauthCfg.Scopes != "" {
+			scopes = oauthCfg.Scopes
+		}
+		authURL = fmt.Sprintf(
+			"%s/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s",
+			gitlabBaseURL,
+			oauthCfg.ClientID,
+			url.QueryEscape(redirectURI),
+			url.QueryEscape(scopes),
+			state,
+		)
 	default:
 		respondBadRequest(w, r, "OAuth not supported for this provider type")
 		return
@@ -821,7 +862,7 @@ func (h *SCMWorkspaceHandler) SetWorkspacePAT(w http.ResponseWriter, r *http.Req
 	var req struct {
 		PersonalAccessToken string `json:"personal_access_token"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "Invalid request body")
 		return
 	}
@@ -954,7 +995,7 @@ func (h *SCMWorkspaceHandler) GetWorkspaceConnectionAuthStatus(w http.ResponseWr
 		return
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"auth_method":      providerInfo.AuthMethod,
 		"is_authenticated": false,
 		"provider_slug":    providerInfo.Slug,

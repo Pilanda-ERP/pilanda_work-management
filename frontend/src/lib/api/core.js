@@ -1,3 +1,4 @@
+import { toLogical } from '../runtime/contextPath.js';
 import {
   getClockOffset,
   getSampleCount,
@@ -7,9 +8,92 @@ import {
 
 // Use relative path for API calls - Vite proxy will handle dev, production uses same origin
 export const API_BASE = '/api';
+export const API_V2_BASE = '/api/v2';
+export const ADMIN_UI_MUTATION_EVENT = 'windshift:admin-ui-mutation';
 
 // Ensure the clock-drift warning toast fires at most once per session
 let driftWarningShown = false;
+
+// Chromium does not consistently report fetches cancelled by a document
+// navigation as AbortError. Track the page lifecycle explicitly so callers do
+// not mistake unload cancellation for a connectivity failure. `pageshow`
+// restores the flag when a document returns from the back-forward cache.
+let documentUnloading = false;
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    documentUnloading = true;
+  });
+  window.addEventListener('pageshow', () => {
+    documentUnloading = false;
+  });
+}
+
+function requestLocale() {
+  if (typeof document !== 'undefined' && document.documentElement.lang) {
+    return document.documentElement.lang;
+  }
+  if (typeof localStorage !== 'undefined') {
+    const saved = localStorage.getItem('windshift-locale');
+    if (saved) return saved;
+  }
+  return typeof navigator !== 'undefined' ? navigator.language : 'en';
+}
+
+// In-flight GET ownership is scoped to the authenticated browser session.
+// Settled responses are never retained here: this removes duplicate concurrent
+// network work without turning live endpoints into a cache.
+let apiRequestSessionKey = null;
+const inFlightGetRequests = new Map();
+
+function normalizeGETEndpoint(endpoint) {
+  try {
+    const url = new URL(endpoint, 'https://windshift.invalid');
+    url.searchParams.sort();
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return endpoint;
+  }
+}
+
+function inFlightGETKey(base, endpoint, options) {
+  if (!apiRequestSessionKey) return null;
+  const method = String(options?.method || 'GET').toUpperCase();
+  if (method !== 'GET') return null;
+
+  // Caller-specific request controls cannot safely share one underlying
+  // fetch: aborting or timing out one consumer must not cancel another.
+  const optionKeys = Object.keys(options || {});
+  if (optionKeys.some((key) => key !== 'method')) return null;
+
+  return `${apiRequestSessionKey}|${requestLocale()}|${base}|${normalizeGETEndpoint(endpoint)}`;
+}
+
+function isAdminUIPath() {
+  if (typeof window === 'undefined') return false;
+  const pathname = toLogical(window.location.pathname);
+  return pathname === '/admin' || pathname.startsWith('/admin/');
+}
+
+function notifyAdminUIMutation(endpoint, method) {
+  if (!isAdminUIPath()) return;
+  window.dispatchEvent(
+    new CustomEvent(ADMIN_UI_MUTATION_EVENT, {
+      detail: { endpoint, method },
+    })
+  );
+}
+
+/** Replace the in-flight ownership scope after authentication changes. */
+export function setAPIRequestSessionKey(sessionKey) {
+  const nextKey = sessionKey == null ? null : String(sessionKey);
+  if (nextKey === apiRequestSessionKey) return;
+  apiRequestSessionKey = nextKey;
+  inFlightGetRequests.clear();
+}
+
+export function clearAPIRequestSessionKey() {
+  setAPIRequestSessionKey(null);
+}
 
 /**
  * Create an enhanced error object from an API response
@@ -27,12 +111,22 @@ function createApiError(response, responseText) {
   // Try to parse structured error from response
   try {
     const parsed = JSON.parse(responseText);
-    /** @type {any} */ (error).code = parsed.code;
-    /** @type {any} */ (error).errorCode = parsed.code; // Alias for compatibility
-    /** @type {any} */ (error).details = parsed.details || {};
+    const payload =
+      typeof parsed.error === 'object' && parsed.error !== null ? parsed.error : parsed;
+    /** @type {any} */ (error).code = payload.code;
+    /** @type {any} */ (error).errorCode = payload.code; // Alias for compatibility
+    /** @type {any} */ (error).details = payload.details || {};
     /** @type {any} */ (error).requestId = parsed.request_id;
     /** @type {any} */ (error).body = parsed;
-    error.message = parsed.error || parsed.message || error.message;
+    // Authentication policy responses carry flow-control fields alongside the
+    // normal error envelope. Mirror the explicit fields callers need while
+    // retaining the complete body for diagnostics.
+    /** @type {any} */ (error).passkey_required = parsed.passkey_required === true;
+    /** @type {any} */ (error).enrollment_required = parsed.enrollment_required === true;
+    /** @type {any} */ (error).sso_required = parsed.sso_required === true;
+    /** @type {any} */ (error).policy_message = parsed.policy_message;
+    error.message =
+      (typeof parsed.error === 'string' ? parsed.error : payload.message) || error.message;
   } catch {
     // Response is not JSON, keep original message
   }
@@ -44,89 +138,241 @@ function createApiError(response, responseText) {
   return error;
 }
 
-export async function fetchAPI(endpoint, options = {}) {
-  const headers = {
-    'Content-Type': 'application/json',
-    ...options.headers,
+/**
+ * @param {string} base
+ * @param {string} endpoint
+ * @param {RequestInit & { timeout?: number; text?: boolean }} [options]
+ */
+async function performFetchAPI(base, endpoint, options = {}) {
+  const {
+    timeout: requestedTimeout = 0,
+    signal: callerSignal,
+    // Return the raw response body as text instead of parsing JSON —
+    // used by endpoints that serve non-JSON documents (e.g. Gherkin).
+    text: asText = false,
+    ...fetchOptions
+  } = options;
+  const isFormData = typeof FormData !== 'undefined' && fetchOptions.body instanceof FormData;
+  const headers = isFormData
+    ? { 'Accept-Language': requestLocale(), ...fetchOptions.headers }
+    : {
+        'Content-Type': 'application/json',
+        'Accept-Language': requestLocale(),
+        ...fetchOptions.headers,
+      };
+
+  const timeoutMs = Number(requestedTimeout);
+  const hasTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
+  const controller = hasTimeout ? new AbortController() : null;
+  let timedOut = false;
+  let timeoutId;
+  let removeCallerAbortListener = () => {};
+
+  if (controller && callerSignal) {
+    const abortFromCaller = () => controller.abort();
+    if (callerSignal.aborted) abortFromCaller();
+    else {
+      callerSignal.addEventListener('abort', abortFromCaller, { once: true });
+      removeCallerAbortListener = () => callerSignal.removeEventListener('abort', abortFromCaller);
+    }
+  }
+  if (controller) {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+
+  const cleanup = () => {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    removeCallerAbortListener();
+  };
+
+  const timeoutError = () => {
+    const error = new Error(
+      'The server took too long to respond. Check your connection and try again.'
+    );
+    /** @type {any} */ (error).status = 0;
+    /** @type {any} */ (error).code = 'REQUEST_TIMEOUT';
+    return error;
   };
 
   let response;
   try {
-    response = await fetch(`${API_BASE}${endpoint}`, {
-      ...options,
+    response = await fetch(`${base}${endpoint}`, {
+      ...fetchOptions,
       credentials: 'same-origin', // Include cookies for session auth
       headers,
+      signal: controller?.signal ?? callerSignal,
     });
-  } catch (_err) {
-    // Network errors (including CORS blocks) surface as TypeError
-    const corsError = new Error(
-      "Unable to connect to the server. This may be a CORS configuration issue — check that the server's BASE_URL matches the URL you're accessing it from."
+  } catch (err) {
+    cleanup();
+    if (timedOut) throw timeoutError();
+    // Caller-driven cancellation is control flow, not a connectivity failure.
+    // Preserve AbortError so route/store loaders can silently discard superseded
+    // work while the browser tears down the underlying HTTP request.
+    if (err?.name === 'AbortError') throw err;
+    // Chromium can surface fetches cancelled by a document navigation as a
+    // TypeError instead of AbortError. Only an actual unload may claim that:
+    // a hidden but live tab must still report offline/DNS/TLS failures as
+    // connectivity errors so recovery handling is not bypassed.
+    if (err instanceof TypeError && documentUnloading) {
+      throw new DOMException('The document was unloaded', 'AbortError');
+    }
+    // Network errors (including offline, DNS, TLS, and CORS failures) surface
+    // identically through fetch. Keep the user-facing copy actionable without
+    // incorrectly diagnosing an ordinary mobile connectivity loss as CORS.
+    const networkError = new Error(
+      'Unable to connect to the server. Check your connection and try again.'
     );
-    /** @type {any} */ (corsError).status = 0;
-    /** @type {any} */ (corsError).code = 'NETWORK_ERROR';
-    throw corsError;
+    /** @type {any} */ (networkError).status = 0;
+    /** @type {any} */ (networkError).code = 'NETWORK_ERROR';
+    throw networkError;
   }
 
-  // Track server-vs-client clock offset from the Date header
-  updateOffset(response.headers.get('Date'));
+  try {
+    // Track server-vs-client clock offset from the Date header
+    updateOffset(response.headers.get('Date'));
 
-  // After enough samples, warn admins once if drift is significant
-  if (!driftWarningShown && getSampleCount() >= 3 && isClockDriftSignificant()) {
-    driftWarningShown = true;
-    // Dynamic import avoids circular deps (stores → api → stores)
-    Promise.all([
-      import('../stores'),
-      import('../stores/toasts.svelte.js'),
-      import('../stores/i18n.svelte.js'),
-      import('../router.js'),
-    ]).then(([{ authStore }, { addToast }, { t }, { navigate }]) => {
-      let user;
-      authStore.subscribe((s) => (user = s.currentUser))();
-      if (/** @type {any} */ (user)?.is_system_admin) {
-        const offsetSec = Math.round(getClockOffset() / 1000);
-        const absMin = Math.floor(Math.abs(offsetSec) / 60);
-        const absSec = Math.abs(offsetSec) % 60;
-        const direction = offsetSec > 0 ? 'ahead' : 'behind';
-        const amount =
-          absMin > 0 ? `${absMin}m ${absSec}s ${direction}` : `${absSec}s ${direction}`;
-        addToast({
-          message: `Server clock appears to be ${amount}. Click for details.`,
-          title: t('toast.warning'),
-          variant: 'warning',
-          clickable: true,
-          onClick: () => navigate('/admin/diagnostics?subtab=clock'),
-        });
+    // After enough samples, warn admins once if drift is significant
+    if (!driftWarningShown && getSampleCount() >= 3 && isClockDriftSignificant()) {
+      driftWarningShown = true;
+      // Dynamic import avoids circular deps (stores → api → stores)
+      Promise.all([
+        import('../stores'),
+        import('../stores/toasts.svelte.js'),
+        import('../stores/i18n.svelte.js'),
+        import('../router.js'),
+      ]).then(([{ authStore }, { addToast }, { t }, { navigate }]) => {
+        let user;
+        authStore.subscribe((s) => (user = s.currentUser))();
+        if (/** @type {any} */ (user)?.is_system_admin) {
+          const offsetSec = Math.round(getClockOffset() / 1000);
+          const absMin = Math.floor(Math.abs(offsetSec) / 60);
+          const absSec = Math.abs(offsetSec) % 60;
+          const direction = offsetSec > 0 ? 'ahead' : 'behind';
+          const amount =
+            absMin > 0 ? `${absMin}m ${absSec}s ${direction}` : `${absSec}s ${direction}`;
+          addToast({
+            message: `Server clock appears to be ${amount}. Click for details.`,
+            title: t('toast.warning'),
+            variant: 'warning',
+            clickable: true,
+            onClick: () => navigate('/admin/diagnostics?subtab=clock'),
+          });
+        }
+      });
+    }
+
+    if (!response.ok) {
+      // Read and parse the response before deciding whether a 401 represents an
+      // expired login. Pending-auth sessions must survive while the user
+      // completes enrollment or second-factor verification.
+      let errorData = '';
+      try {
+        errorData = await response.text();
+      } catch (_e) {
+        // If we can't read the error body, use the status text
       }
-    });
-  }
-
-  if (!response.ok) {
-    // Handle authentication errors
-    if (response.status === 401) {
-      // Import auth store dynamically to avoid circular dependencies
-      const { authStore } = await import('../stores');
-      authStore.clearAuth();
+      const apiError = createApiError(response, errorData);
+      if (
+        response.status === 401 &&
+        /** @type {any} */ (apiError).code !== 'AUTHENTICATION_PENDING'
+      ) {
+        // Import auth store dynamically to avoid circular dependencies
+        const { authStore } = await import('../stores');
+        authStore.clearAuth();
+      }
+      throw apiError;
     }
-    // Try to get a more descriptive error message from the response body
-    let errorData = '';
-    try {
-      errorData = await response.text();
-    } catch (_e) {
-      // If we can't read the error body, use the status text
+
+    let result = null;
+    if (response.status !== 204) {
+      const contentType = response.headers.get('content-type');
+      if (asText) {
+        result = await response.text();
+      } else if (contentType?.includes('application/json')) {
+        result = await response.json();
+      }
     }
-    throw createApiError(response, errorData);
-  }
 
-  if (response.status === 204) {
-    return null;
-  }
+    const method = String(fetchOptions.method || 'GET').toUpperCase();
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+      notifyAdminUIMutation(endpoint, method);
+    }
 
-  const contentType = response.headers.get('content-type');
-  if (contentType?.includes('application/json')) {
-    return response.json();
+    return result;
+  } catch (error) {
+    if (timedOut) throw timeoutError();
+    throw error;
+  } finally {
+    cleanup();
   }
+}
 
-  return null;
+export function fetchAPI(endpoint, options = {}) {
+  return fetchFromAPI(API_BASE, endpoint, options);
+}
+
+export function fetchAPIV2(endpoint, options = {}) {
+  return fetchFromAPI(API_V2_BASE, endpoint, options);
+}
+
+export async function fetchV2Data(endpoint, options = {}) {
+  const document = await fetchAPIV2(endpoint, options);
+  return document?.data;
+}
+
+/** Fetch a v2 endpoint that responds with a plain text document. */
+export async function fetchV2Text(endpoint, options = {}) {
+  return fetchAPIV2(endpoint, { ...options, text: true });
+}
+
+export async function fetchAllV2Pages(endpoint, options = {}) {
+  // Fat payloads can raise pageSize per call to cut round trips; the v2 API
+  // caps page_size at 1000.
+  const { pageSize = 100, ...fetchOptions } = options;
+  const url = new URL(endpoint, 'https://windshift.invalid');
+  url.searchParams.set('page_size', String(pageSize));
+  const items = [];
+  const seenIds = new Set();
+  let page = 1;
+  let totalPages = 1;
+  do {
+    url.searchParams.set('page', String(page));
+    const document = await fetchAPIV2(`${url.pathname}${url.search}`, fetchOptions);
+    for (const item of document?.data ?? []) {
+      // Offset pagination drifts when rows shift between page fetches, so the
+      // same row can appear on two consecutive pages. Keep the first copy.
+      const key = item?.id ?? item?.key;
+      if (key !== undefined && key !== null) {
+        const dedupeKey = String(key);
+        if (seenIds.has(dedupeKey)) continue;
+        seenIds.add(dedupeKey);
+      }
+      items.push(item);
+    }
+    totalPages = document?.pagination?.total_pages ?? 0;
+    page += 1;
+  } while (page <= totalPages);
+  return items;
+}
+
+function fetchFromAPI(base, endpoint, options) {
+  const key = inFlightGETKey(base, endpoint, options);
+  if (!key) return performFetchAPI(base, endpoint, options);
+
+  const existing = inFlightGetRequests.get(key);
+  if (existing) return existing;
+
+  let trackedRequest;
+  trackedRequest = performFetchAPI(base, endpoint, options).finally(() => {
+    if (inFlightGetRequests.get(key) === trackedRequest) {
+      inFlightGetRequests.delete(key);
+    }
+  });
+  inFlightGetRequests.set(key, trackedRequest);
+  return trackedRequest;
 }
 
 // Generic HTTP methods

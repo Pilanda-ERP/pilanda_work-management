@@ -19,6 +19,7 @@ export default {
     steps: {
       connect: 'الاتصال',
       projects: 'المشاريع',
+      xray: 'Xray',
       mapping: 'التعيين',
       preview: 'المعاينة',
       import: 'الاستيراد',
@@ -35,10 +36,10 @@ export default {
       email: 'عنوان البريد الإلكتروني',
       username: 'اسم المستخدم',
       apiToken: 'رمز API',
-      password: 'كلمة المرور أو رمز الوصول الشخصي',
+      personalAccessToken: 'رمز الوصول الشخصي',
       generateToken: 'إنشاء رمز',
       tokenHelpCloud: 'من إعدادات حسابك في Atlassian',
-      tokenHelpDatacenter: 'استخدم كلمة المرور أو رمز الوصول الشخصي من إعدادات ملفك الشخصي في Jira',
+      tokenHelpDatacenter: 'أنشئ رمز وصول شخصي في إعدادات ملفك الشخصي في Jira',
     },
     buttons: {
       connect: 'اتصال',
@@ -60,7 +61,7 @@ export default {
       credentialsHelpCloud:
         'أدخل بيانات اعتماد Jira Cloud الخاصة بك. يمكنك إنشاء رمز API من إعدادات حسابك في Atlassian.',
       credentialsHelpDatacenter:
-        'أدخل بيانات اعتماد Jira Data Center الخاصة بك. استخدم اسم المستخدم وكلمة المرور أو رمز الوصول الشخصي.',
+        'أدخل رمز وصول شخصي من إعدادات ملفك الشخصي في Jira Data Center.',
       reviewSummary:
         'راجع ملخص الاستيراد قبل المتابعة. قد تستغرق هذه العملية عدة دقائق للمشاريع الكبيرة.',
       noAttachments: 'لن يتم استيراد المرفقات',
@@ -105,6 +106,7 @@ export default {
       importing: 'جاري الاستيراد...',
       starting: 'جاري بدء الاستيراد...',
       complete: 'اكتمل الاستيراد!',
+      completeWithErrors: 'اكتمل الاستيراد مع وجود أخطاء',
       success: 'تم استيراد {count} عنصر بنجاح.',
       failed: 'فشل استيراد {count} عنصر.',
       ready: 'جاهز للاستيراد',
@@ -147,6 +149,7 @@ export default {
     createField: 'إنشاء حقل',
     editField: 'تعديل الحقل',
     deleteField: 'حذف الحقل',
+    returnToBoard: 'العودة إلى حقول اللوحة',
     fieldName: 'اسم الحقل',
     fieldType: 'نوع الحقل',
     fieldDescription: 'الوصف',
@@ -682,6 +685,9 @@ export default {
   },
 
   setup: {
+    chooseLanguage: 'اختر لغتك',
+    chooseLanguageDesc: 'اختر اللغة التي ستُستخدم أثناء الإعداد وفي التطبيق.',
+    language: 'اللغة',
     welcomeTo: 'مرحباً بك في {appName}',
     setupMessage: 'لنقم بإعداد نظام إدارة العمل الخاص بك',
     setupProgress: 'تقدم الإعداد',
@@ -739,6 +745,13 @@ export default {
     workspaceName: 'اسم {type}',
     workspaceKeyPlaceholder: 'مفتاح مساحة العمل (مثال: PROJ، TEAM)',
     addDescription: 'إضافة وصف...',
+    workspaceTemplate: 'قالب',
+    workspaceTemplateBlank: 'مساحة عمل فارغة',
+    workspaceTemplateLoading: 'جارٍ تحميل القوالب...',
+    workspaceTemplateError: 'فشل تحميل قوالب مساحات العمل',
+    workspaceRestrict: 'تقييد الرؤية',
+    workspaceRestrictHint: 'أنت والأشخاص المعيّنون فقط يمكنهم رؤية مساحة العمل هذه',
+    workspaceTemplateMeta: '{templates} قوالب · {items} عناصر',
     // Field labels
     type: 'النوع',
     priority: 'الأولوية',

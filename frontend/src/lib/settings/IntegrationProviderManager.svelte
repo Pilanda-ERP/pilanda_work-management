@@ -1,12 +1,15 @@
 <script>
 	import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
 	import { api } from '../api.js';
-	import { Plus, Edit2, Trash2, Loader2 } from '@lucide/svelte';
+ import { Plus, Edit2, Trash2 } from '@lucide/svelte';
 	import Button from '../components/Button.svelte';
 	import CopyButton from '../components/CopyButton.svelte';
 	import Modal from '../dialogs/Modal.svelte';
 	import ModalHeader from '../dialogs/ModalHeader.svelte';
 	import Input from '../components/Input.svelte';
+	import Checkbox from '../components/Checkbox.svelte';
+	import NativeSelect from '../components/NativeSelect.svelte';
 	import FormField from '../components/FormField.svelte';
 	import AlertBox from '../components/AlertBox.svelte';
 	import EmptyState from '../components/EmptyState.svelte';
@@ -55,7 +58,7 @@
 			providers = await api.integrationProviders.getAll() || [];
 		} catch (err) {
 			console.error('Failed to load providers:', err);
-			error = 'Failed to load integration providers';
+			error = t('integrations.providers.loadFailed');
 		} finally {
 			loading = false;
 		}
@@ -102,17 +105,17 @@
 
 			if (editingProvider) {
 				await api.integrationProviders.update(editingProvider.id, data);
-				successToast('Provider updated');
+				successToast(t('integrations.providers.updated'));
 			} else {
 				await api.integrationProviders.create(data);
-				successToast('Provider created');
+				successToast(t('integrations.providers.created'));
 			}
 
 			showModal = false;
 			await loadProviders();
 		} catch (err) {
 			console.error('Failed to save provider:', err);
-			errorToast(err.message || 'Failed to save provider');
+			errorToast(err.message || t('integrations.providers.saveFailed'));
 		} finally {
 			saving = false;
 		}
@@ -120,18 +123,18 @@
 
 	async function deleteProvider(provider) {
 		const confirmed = await confirm(
-			`Delete "${provider.name}"?`,
-			'This will remove the integration provider and disconnect all users.'
+			t('integrations.providers.deleteTitle', { name: provider.name }),
+			t('integrations.providers.deleteMessage')
 		);
 		if (!confirmed) return;
 
 		try {
 			await api.integrationProviders.delete(provider.id);
-			successToast('Provider deleted');
+			successToast(t('integrations.providers.deleted'));
 			await loadProviders();
 		} catch (err) {
 			console.error('Failed to delete provider:', err);
-			errorToast('Failed to delete provider');
+			errorToast(t('integrations.providers.deleteFailed'));
 		}
 	}
 
@@ -167,9 +170,7 @@
 	{/if}
 
 	{#if loading}
-		<div class="flex items-center justify-center py-12">
-			<Loader2 class="w-6 h-6 animate-spin" style="color: var(--ds-text-subtle);" />
-		</div>
+		<StateDisplay type="loading" />
 	{:else if providers.length === 0}
 		<EmptyState title={t('integrations.noProviders')} />
 	{:else}
@@ -183,14 +184,14 @@
 						<div class="flex items-center gap-2">
 							<h3 class="text-sm font-medium" style="color: var(--ds-text);">{provider.name}</h3>
 							<Lozenge appearance={provider.enabled ? 'success' : 'default'}>
-								{provider.enabled ? 'Enabled' : 'Disabled'}
+				{provider.enabled ? t('common.enabled') : t('common.disabled')}
 							</Lozenge>
 							<Lozenge appearance="info">{getProviderLabel(provider.provider_type)}</Lozenge>
 						</div>
 						<p class="text-xs mt-1" style="color: var(--ds-text-subtle);">
 							{provider.slug}
 							{#if provider.has_oauth_client_secret}
-								&middot; OAuth configured
+				&middot; {t('integrations.providers.oauthConfigured')}
 							{/if}
 						</p>
 					</div>
@@ -210,35 +211,31 @@
 		<ModalHeader title={editingProvider ? t('integrations.editProvider') : t('integrations.addProvider')} onclose={() => showModal = false} />
 
 		<form onsubmit={(e) => { e.preventDefault(); save(); }} class="p-4 space-y-4">
-			<FormField label="Name" required>
-				<Input bind:value={formData.name} placeholder="My Notion Integration" />
+			<FormField label={t('common.name')} required>
+				<Input bind:value={formData.name} placeholder={t('integrations.providers.namePlaceholder')} />
 			</FormField>
 
-			<FormField label="Slug" required>
+			<FormField label={t('integrations.providers.slug')} required>
 				<Input bind:value={formData.slug} placeholder="notion-main" />
 			</FormField>
 
 			<FormField label={t('integrations.providerType')} required>
-				<select
+				<NativeSelect
 					bind:value={formData.provider_type}
-					class="w-full h-9 px-3 text-sm border rounded-md"
-					style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text);"
-				>
-					{#each providerTypes as pt}
-						<option value={pt.value}>{pt.label}</option>
-					{/each}
-				</select>
+					options={providerTypes}
+					size="small"
+				/>
 			</FormField>
 
 			<FormField label={t('integrations.oauthClientId')}>
-				<Input bind:value={formData.oauth_client_id} placeholder="OAuth Client ID" />
+				<Input bind:value={formData.oauth_client_id} placeholder={t('integrations.oauthClientId')} />
 			</FormField>
 
 			<FormField label={t('integrations.oauthClientSecret')}>
 				<Input
 					bind:value={formData.oauth_client_secret}
 					type="password"
-					placeholder={editingProvider?.has_oauth_client_secret ? '••••••••' : 'OAuth Client Secret'}
+					placeholder={editingProvider?.has_oauth_client_secret ? '••••••••' : t('integrations.oauthClientSecret')}
 				/>
 			</FormField>
 
@@ -257,18 +254,12 @@
 				</FormField>
 			{/if}
 
-			<div class="flex items-center gap-2">
-				<input type="checkbox" id="int-enabled" bind:checked={formData.enabled} />
-				<label for="int-enabled" class="text-sm" style="color: var(--ds-text);">Enabled</label>
-			</div>
+			<Checkbox id="int-enabled" bind:checked={formData.enabled} label={t('common.enabled')} size="small" />
 
 			<div class="flex justify-end gap-2 pt-2">
-				<Button variant="ghost" onclick={() => showModal = false}>Cancel</Button>
-				<Button variant="primary" type="submit" disabled={saving || !formData.slug || !formData.name}>
-					{#if saving}
-						<Loader2 class="w-4 h-4 animate-spin mr-1" />
-					{/if}
-					{editingProvider ? 'Update' : 'Create'}
+				<Button variant="ghost" onclick={() => showModal = false}>{t('common.cancel')}</Button>
+				<Button variant="primary" type="submit" loading={saving} disabled={!formData.slug || !formData.name}>
+					{editingProvider ? t('common.update') : t('common.create')}
 				</Button>
 			</div>
 		</form>

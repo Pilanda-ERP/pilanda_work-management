@@ -10,15 +10,20 @@
   import { Box, Globe, Building2, Calendar, User, Target, Link2, Mail, ExternalLink, CheckSquare } from '@lucide/svelte';
   import ColorDot from '../../components/ColorDot.svelte';
   import Checkbox from '../../components/Checkbox.svelte';
-  import { api } from '../../api.js';
+  import Input from '../../components/Input.svelte';
+  import Textarea from '../../components/Textarea.svelte';
+  import { onDestroy } from 'svelte';
+  import { referenceDisplayCache } from '../../stores/referenceDisplayCache.svelte.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { formatCustomFieldDate } from '../../utils/dateFormatter.js';
-  import { parseFieldOptions, resolveOptionLabel, resolveOptionLabels } from '../../utils/optionUtils.js';
+  import { fieldOptionsObject, parseFieldOptions, resolveOptionLabel, resolveOptionLabels } from '../../utils/optionUtils.js';
   import { safeHref } from '../../utils/sanitize';
+  import { booleanCustomFieldChecked, isBooleanCustomFieldType } from '../../utils/customFieldTypes.js';
   import {
     milestonePickerConfig as milestoneConfig,
     iterationPickerConfig as iterationConfig,
   } from '../../pickers/pickerConfigs.js';
+  import { clickOutside } from '../../actions/clickOutside.js';
 
   // Helper to parse field options into [{id, label}] items
   function parseOptions(optionsStr) {
@@ -26,47 +31,32 @@
     return items;
   }
 
-  let users = $state([]);
-  let usersLoading = $state(false);
-  let usersLoaded = $state(false);
-
   async function loadUsers() {
-    if (usersLoading || usersLoaded) return;
-    usersLoading = true;
-    try {
-      users = await api.getUsers() || [];
-      usersLoaded = true;
-    } catch (e) {
-      console.error('Failed to load users:', e);
-      users = [];
-    } finally {
-      usersLoading = false;
-    }
-  }
-
-  // Click outside action
-  function clickOutside(node) {
-    const handleClick = (event) => {
-      if (!node.contains(event.target)) {
-        node.dispatchEvent(new CustomEvent('clickOutside'));
-      }
-    };
-
-    document.addEventListener('click', handleClick, true);
-
-    return {
-      destroy() {
-        document.removeEventListener('click', handleClick, true);
-      }
-    };
+    if (providedUsers !== null) return;
+    await referenceDisplayCache.loadUsers();
   }
 
   let {
-    field, value = $bindable(''), onChange = () => {}, milestones = [], iterations = [],
+    field, value = $bindable(''), onChange = () => {}, onCommit = null, milestones = [], iterations = [],
     isDarkMode = false, required = false, readonly = true, disabled = false,
     onStartEdit = null, onCancel = null, showSelectedInTrigger = true, autoOpenPickers = true,
-    noPadding = false, itemId = null
+    noPadding = false, itemId = null, users: providedUsers = null, fieldLinks = null,
+    onFieldLinksChanged = null,
+    optionData = {}, optionLoading = {}, onRequestOptions = null, loadAssetOptions = null,
+    displayAlignment = 'start', truncateDisplay = false, displayTestId = undefined,
+    // Bare display hands layout to the caller: no padding, hover, or rounding.
+    // Used by sidebar rows that own the row chrome.
+    bare = false,
+    // Self-editing mode: the component owns the display→editor toggle, the
+    // way list cells need it. Callers that drive editing externally (item
+    // detail sidebar) keep using onStartEdit + readonly and leave this off.
+    selfEditing = false
   } = $props();
+
+  const users = $derived(providedUsers ?? referenceDisplayCache.users);
+  const usersLoading = $derived(providedUsers === null && referenceDisplayCache.usersLoading);
+  const displayHydration = new AbortController();
+  onDestroy(() => displayHydration.abort());
 
   const isRequired = $derived(required || field.required || field.is_required);
 
@@ -86,27 +76,13 @@
     return inputValue || '';
   }
 
-  function coerceCheckboxValue(raw) {
-    if (typeof raw === 'boolean') return raw;
-    if (typeof raw === 'number') return raw !== 0;
-    if (typeof raw === 'string') {
-      const normalized = raw.trim().toLowerCase();
-      if (['false', '0', 'no', 'off'].includes(normalized)) return false;
-      if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
-    }
-    return Boolean(raw);
-  }
-
   function parseAssetConfig() {
-    try { return field.options ? JSON.parse(field.options) : {}; }
+    try { return fieldOptionsObject(field.options); }
     catch { return {}; }
   }
 
   const assetConfig = $derived(parseAssetConfig());
   const isMultiAssetField = $derived(field.field_type === 'asset' && assetConfig.multi === true);
-  let assetLookup = $state({});
-  const assetLookupInFlight = new Set();
-
   function assetID(asset) {
     if (!asset) return null;
     const raw = asset && typeof asset === 'object' ? asset.id : asset;
@@ -126,28 +102,14 @@
   }
 
   async function loadAssetDisplayValues() {
-    const ids = [...new Set(assetIDsForLookup())].filter(
-      (id) => assetLookup[id] === undefined && !assetLookupInFlight.has(id)
-    );
-    if (ids.length === 0) return;
-
-    ids.forEach((id) => assetLookupInFlight.add(id));
-    await Promise.all(ids.map(async (id) => {
-      try {
-        const asset = await api.assets.get(id);
-        assetLookup = { ...assetLookup, [id]: asset || null };
-      } catch (e) {
-        console.error('Failed to load asset custom-field value:', e);
-        assetLookup = { ...assetLookup, [id]: null };
-      } finally {
-        assetLookupInFlight.delete(id);
-      }
-    }));
+    await referenceDisplayCache.loadAssets(assetIDsForLookup(), {
+      signal: displayHydration.signal,
+    });
   }
 
   function assetDisplayName(asset) {
     const id = assetID(asset);
-    const resolved = id ? assetLookup[id] : null;
+    const resolved = id ? referenceDisplayCache.getAsset(id) : null;
     const displayAsset = resolved || asset;
     if (displayAsset && typeof displayAsset === 'object') {
       if (displayAsset.title) return displayAsset.asset_tag ? `${displayAsset.asset_tag} - ${displayAsset.title}` : displayAsset.title;
@@ -203,23 +165,29 @@
         if (typeof v === 'object' && v.name) {
           return v.name;
         }
-        return `Customer #${v}`;
+		return `Customer #${typeof v === 'object' ? v.id : v}`;
       case 'customerorganisation':
         if (typeof v === 'object' && v.name) {
           return v.name;
         }
-        return `Organisation #${v}`;
+		return `Organisation #${typeof v === 'object' ? v.id : v}`;
       case 'select':
       case 'multiselect':
         if (field.options) {
           if (field.field_type === 'multiselect') {
-            return resolveOptionLabels(field.options, Array.isArray(v) ? v : []).join(', ');
+			const values = Array.isArray(v)
+			  ? v
+			  : typeof v === 'string' && v.includes(',')
+				? v.split(',').map(item => item.trim()).filter(Boolean)
+				: [v];
+			return resolveOptionLabels(field.options, values).join(', ');
           }
           return resolveOptionLabel(field.options, v);
         }
         return v;
+      case 'boolean':
       case 'checkbox':
-        return coerceCheckboxValue(v) ? t('common.yes') : t('common.no');
+        return booleanCustomFieldChecked(v) ? t('common.yes') : t('common.no');
       case 'number':
         const num = parseFloat(v);
         return isNaN(num) ? v : num.toString();
@@ -230,22 +198,26 @@
     }
   }
 
+	function hasDisplayValue() {
+	  if (value === null || value === undefined || value === '') return false;
+	  return !(field.field_type === 'multiselect' && Array.isArray(value) && value.length === 0);
+	}
+
   // Handle keydown for text/number inputs
   function handleKeydown(event) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      // Trigger save by calling onChange with current value
+      commitFromInput(/** @type {HTMLInputElement} */ (event.currentTarget).value);
     } else if (event.key === 'Escape') {
       event.preventDefault();
-      onCancel?.();
+      handleEditorCancel();
     }
   }
 
-  // Handle click on read mode to start editing
-  function handleClick() {
-    if (!disabled && onStartEdit) {
-      onStartEdit();
-    }
+  // Free-form inputs keep focus while typing; commit once focus leaves so a
+  // partially typed value is never saved.
+  function handleCommitBlur(event) {
+    commitFromInput(/** @type {HTMLInputElement | HTMLTextAreaElement} */ (event.currentTarget).value);
   }
 
   // Get iteration data for icon rendering
@@ -336,6 +308,154 @@
     return milestone || null;
   })());
 
+  // --- Self-editing plumbing ------------------------------------------------
+  // In self-editing mode the component starts in display form and swaps to
+  // the editor on click, commit-on-change for single-value types and commit
+  // on Enter/blur for free-form inputs, Escape or outside click to cancel.
+  let editorOpen = $state(false);
+  let lastExitAt = 0;
+  // Free-form inputs stage keystrokes in a draft so self-editing surfaces
+  // commit once (Enter/blur) instead of on every character.
+  let draftValue = $state(null);
+
+  const isSelfEditing = $derived(selfEditing && !disabled && readonly);
+  // Booleans edit in place — render the checkbox directly instead of routing
+  // through a display→editor swap.
+  const renderLiveEditor = $derived(isSelfEditing && isBooleanCustomFieldType(field.field_type));
+  // Opening the editor means the user already clicked the cell, so menus open
+  // immediately instead of needing a second click on the picker trigger.
+  const pickerAutoOpen = $derived(autoOpenPickers || editorOpen);
+  const editorValue = $derived(draftValue !== null ? draftValue : value);
+
+  function enterEdit() {
+    // The blur-commit that exits the editor re-renders the display under the
+    // pointer; swallow that stray click so the cell does not re-open.
+    if (Date.now() - lastExitAt < 200) return;
+    draftValue = null;
+    editorOpen = true;
+  }
+
+  function exitEditing() {
+    if (!editorOpen && draftValue === null) return;
+    lastExitAt = Date.now();
+    editorOpen = false;
+    draftValue = null;
+  }
+
+  function handleActivate() {
+    if (disabled) return;
+    if (onStartEdit) {
+      onStartEdit();
+      return;
+    }
+    if (isSelfEditing) enterEdit();
+  }
+
+  function handleEditorChange(newValue) {
+    onChange(newValue);
+    // Multi-value editors stay open so several entries can be picked in a
+    // row; everything else returns to display right after the commit.
+    const multiValue = ['multi_user', 'multiselect', 'combobox'].includes(field.field_type)
+      || (field.field_type === 'asset' && isMultiAssetField);
+    if (!multiValue) exitEditing();
+  }
+
+  function handleEditorCancel() {
+    onCancel?.();
+    exitEditing();
+  }
+
+  function commitFromInput(rawValue) {
+    if (isSelfEditing) {
+      // Blur fires even when nothing changed — only commit real edits. Both
+      // sides stringify first: inputs hand back strings while stored number
+      // or boolean values keep their type, and 5 !== "5" would commit on
+      // every untouched blur.
+      if (stringifyValue(rawValue) !== stringifyValue(value)) onChange(rawValue);
+      exitEditing();
+      return;
+    }
+    onCommit?.(rawValue);
+  }
+
+  function stringifyValue(v) {
+    if (v === null || v === undefined) return '';
+    return String(v);
+  }
+
+  // Edit-input keystrokes: free-form fields stage a draft in self-editing
+  // mode and keep the live onChange behavior everywhere else.
+  function handleEditorInput(newValue) {
+    if (!isSelfEditing) {
+      onChange(newValue);
+      return;
+    }
+    if (field.field_type === 'date') {
+      // A date is committed as a whole — there is no useful partial state.
+      handleEditorChange(newValue);
+      return;
+    }
+    draftValue = newValue;
+  }
+
+  // Labels a selected value that is missing from a picker's option list.
+  // Options load lazily in list cells, so the stored value object or the
+  // shared display cache is the only reliable source for the label.
+  const storedObjectByID = $derived.by(() => {
+    const byID = new Map();
+    const raw = /** @type {any} */ (value);
+    if (!raw) return byID;
+    const entries = Array.isArray(raw) ? raw : [raw];
+    entries.forEach((entry) => {
+      if (entry && typeof entry === 'object' && entry.id != null) byID.set(String(entry.id), entry);
+    });
+    return byID;
+  });
+
+  function resolveMissingLabel(missingValue) {
+    if (missingValue == null || missingValue === '') return '';
+    switch (field.field_type) {
+      case 'asset': {
+        const id = assetID(missingValue);
+        const stored = id ? storedObjectByID.get(String(id)) : null;
+        if (stored) return assetDisplayName(stored);
+        const cached = id ? referenceDisplayCache.getAsset(id) : null;
+        if (cached) return assetDisplayName(cached);
+        return `Asset #${id ?? missingValue}`;
+      }
+      case 'portalcustomer':
+      case 'customerorganisation': {
+        if (typeof missingValue === 'object') return missingValue.name || '';
+        const stored = storedObjectByID.get(String(missingValue));
+        if (stored?.name) return stored.name;
+        const noun = field.field_type === 'portalcustomer' ? 'Customer' : 'Organisation';
+        return `${noun} #${missingValue}`;
+      }
+      case 'user': {
+        const user = users.find((u) => u.id === parseInt(missingValue));
+        return user ? `${user.first_name || ''} ${user.last_name || ''}`.trim() || user.username : '';
+      }
+      case 'milestone':
+        return milestoneData?.name || '';
+      case 'iteration': {
+        const iteration = iterations?.find((i) => i.id === parseInt(missingValue));
+        return iteration ? iteration.name : '';
+      }
+      case 'select':
+        return field.options ? resolveOptionLabel(field.options, missingValue) : '';
+      case 'multiselect': {
+        if (!field.options) return '';
+        const values = Array.isArray(missingValue) ? missingValue : [missingValue];
+        return values.map((entry) => resolveOptionLabel(field.options, entry)).filter(Boolean).join(', ');
+      }
+      case 'combobox':
+        return typeof missingValue === 'string' ? missingValue.split(',').map((entry) => entry.trim()).filter(Boolean).join(', ') : '';
+      default:
+        return '';
+    }
+  }
+  // --------------------------------------------------------------------------
+
   // Get combobox labels array
   function getComboboxLabels(val) {
     if (!val) return [];
@@ -343,203 +463,151 @@
   }
 </script>
 
-{#if readonly}
-  <!-- Read-only display mode -->
-  <div>
-    {#if onStartEdit && !disabled}
-      <button
-        type="button"
-        class="w-full flex items-center gap-2 justify-start {noPadding ? '' : 'px-3'} py-2 text-sm hover:bg-gray-50 transition-colors text-left rounded"
-        onclick={handleClick}
-      >
-        {#if value !== null && value !== undefined && value !== ''}
-          {#if field.field_type === 'user'}
-            <!-- Display user with avatar -->
-            {#if userData}
-              <div class="w-4 h-4 rounded-full bg-blue-500 flex items-center justify-center text-white text-[9px] font-medium flex-shrink-0">
-                {userData.name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2)}
-              </div>
-              <span style="color: var(--ds-text);">{userData.name}</span>
-            {:else if usersLoading}
-              <span style="color: var(--ds-text-subtle);">{t('common.loading')}</span>
-            {:else}
-              <span style="color: var(--ds-text-subtle);">{t('common.unknownUser')}</span>
-            {/if}
-          {:else if field.field_type === 'milestone'}
-            <!-- Display milestone with color dot -->
-            {#if milestoneData}
-              <ColorDot color={milestoneData.category_color || '#9CA3AF'} />
-              <span style="color: var(--ds-text);">{milestoneData.name}</span>
-            {:else}
-              <Target class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-              <span style="color: var(--ds-text-subtle);">{t('items.setField', { field: field.name.toLowerCase() })}</span>
-            {/if}
-          {:else if field.field_type === 'iteration'}
-            <!-- Display iteration with icon -->
-            {#if iterationData}
-              {#if iterationData.is_global}
-                <Globe class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-              {:else}
-                <Building2 class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-              {/if}
-            {:else}
-              <Calendar class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-            {/if}
-            <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {:else if field.field_type === 'asset'}
-            <!-- Display asset with icon -->
-            <Box class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-            <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {:else if field.field_type === 'portalcustomer'}
-            <!-- Display portal customer with icon -->
-            <User class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-            <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {:else if field.field_type === 'customerorganisation'}
-            <!-- Display customer organisation with icon -->
-            <Building2 class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-            <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {:else if field.field_type === 'combobox'}
-            <!-- Display labels as chips/tags -->
-            <div class="flex items-center gap-1 flex-wrap">
-              {#each getComboboxLabels(value) as labelName}
-                <span class="inline-flex items-center px-2 py-0.5 bg-blue-100 text-blue-800 text-xs rounded-full">
-                  {labelName}
-                </span>
-              {/each}
-            </div>
-          {:else if field.field_type === 'checkbox'}
-            <CheckSquare class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-            <span style="color: var(--ds-text);">{coerceCheckboxValue(value) ? t('common.yes') : t('common.no')}</span>
-          {:else if field.field_type === 'email'}
-            <Mail class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-            <span style="color: var(--ds-text);">{value}</span>
-          {:else if field.field_type === 'url'}
-            <ExternalLink class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-            <span style="color: var(--ds-text);" class="truncate">{value}</span>
-          {:else if field.field_type === 'number'}
-            <span class="tabular-nums" style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {:else}
-            <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {/if}
-        {:else}
-          {#if field.field_type === 'user'}
-            <User class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {:else if field.field_type === 'milestone'}
-            <Target class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {:else if field.field_type === 'asset'}
-            <Box class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {:else if field.field_type === 'portalcustomer'}
-            <User class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {:else if field.field_type === 'customerorganisation'}
-            <Building2 class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {:else if field.field_type === 'checkbox'}
-            <CheckSquare class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {:else if field.field_type === 'email'}
-            <Mail class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {:else if field.field_type === 'url'}
-            <ExternalLink class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
-          {/if}
+{#snippet readOnlyContent(interactive)}
+  {#if hasDisplayValue()}
+    {#if field.field_type === 'user'}
+      {#if userData}
+        <div class="flex min-w-0 items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+          <div class="w-4 h-4 rounded-full bg-ds-accent-blue flex items-center justify-center text-ds-text-inverse text-[9px] font-medium flex-shrink-0">
+            {userData.name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2)}
+          </div>
+          <span class={truncateDisplay ? 'min-w-0 truncate' : ''} style="color: var(--ds-text);">{userData.name}</span>
+        </div>
+      {:else if usersLoading}
+        <span style="color: var(--ds-text-subtle);">{t('common.loading')}</span>
+      {:else}
+        <span style="color: var(--ds-text-subtle);">{t('common.unknownUser')}</span>
+      {/if}
+    {:else if field.field_type === 'milestone'}
+      <div class="flex items-center gap-2">
+        {#if milestoneData}
+          <ColorDot color={milestoneData.category_color || '#9CA3AF'} />
+          <span style="color: var(--ds-text);">{milestoneData.name}</span>
+        {:else if interactive}
+          <Target class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
           <span style="color: var(--ds-text-subtle);">{t('items.setField', { field: field.name.toLowerCase() })}</span>
-        {/if}
-      </button>
-    {:else}
-      <!-- Static display (no click handler or disabled) -->
-      <div class="{noPadding ? '' : 'px-3'} py-2 text-sm {disabled ? 'opacity-50' : ''}">
-        {#if value !== null && value !== undefined && value !== ''}
-          {#if field.field_type === 'user'}
-            {#if userData}
-              <div class="flex items-center gap-2">
-                <div class="w-4 h-4 rounded-full bg-blue-500 flex items-center justify-center text-white text-[9px] font-medium flex-shrink-0">
-                  {userData.name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2)}
-                </div>
-                <span style="color: var(--ds-text);">{userData.name}</span>
-              </div>
-            {:else if usersLoading}
-              <span style="color: var(--ds-text-subtle);">{t('common.loading')}</span>
-            {:else}
-              <span style="color: var(--ds-text-subtle);">{t('common.unknownUser')}</span>
-            {/if}
-          {:else if field.field_type === 'milestone'}
-            <div class="flex items-center gap-2">
-              {#if milestoneData}
-                <ColorDot color={milestoneData.category_color || '#9CA3AF'} />
-                <span style="color: var(--ds-text);">{milestoneData.name}</span>
-              {:else}
-                <span style="color: var(--ds-text-subtle);">{t('items.notSet')}</span>
-              {/if}
-            </div>
-          {:else if field.field_type === 'iteration'}
-            <div class="flex items-center gap-2">
-              {#if iterationData}
-                {#if iterationData.is_global}
-                  <Globe class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-                {:else}
-                  <Building2 class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-                {/if}
-              {:else}
-                <Calendar class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              {/if}
-              <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-            </div>
-          {:else if field.field_type === 'asset'}
-            <div class="flex items-center gap-2">
-              <Box class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-            </div>
-          {:else if field.field_type === 'portalcustomer'}
-            <div class="flex items-center gap-2">
-              <User class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-            </div>
-          {:else if field.field_type === 'customerorganisation'}
-            <div class="flex items-center gap-2">
-              <Building2 class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-            </div>
-          {:else if field.field_type === 'linking'}
-            <div class="flex items-center gap-1">
-              <Link2 class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              <span style="color: var(--ds-text);">
-                {#if Array.isArray(value) && value.length > 0}
-                  {value.length} linked
-                {:else if !Array.isArray(value) && value && typeof value === 'object'}
-                  1 linked
-                {:else}
-                  —
-                {/if}
-              </span>
-            </div>
-          {:else if field.field_type === 'combobox'}
-            <div class="flex items-center gap-1 flex-wrap">
-              {#each getComboboxLabels(value) as labelName}
-                <span class="inline-flex items-center px-2 py-0.5 bg-blue-100 text-blue-800 text-xs rounded-full">
-                  {labelName}
-                </span>
-              {/each}
-            </div>
-          {:else if field.field_type === 'checkbox'}
-            <div class="flex items-center gap-2">
-              <CheckSquare class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              <span style="color: var(--ds-text);">{coerceCheckboxValue(value) ? t('common.yes') : t('common.no')}</span>
-            </div>
-          {:else if field.field_type === 'email'}
-            <div class="flex items-center gap-2">
-              <Mail class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              <a href={`mailto:${value}`} class="hover:underline" style="color: var(--ds-text);">{value}</a>
-            </div>
-          {:else if field.field_type === 'url'}
-            <div class="flex items-center gap-2">
-              <ExternalLink class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              <a href={safeHref(value)} target="_blank" rel="noopener noreferrer" class="hover:underline truncate" style="color: var(--ds-text);">{value}</a>
-            </div>
-          {:else if field.field_type === 'number'}
-            <span class="tabular-nums" style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {:else}
-            <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
-          {/if}
         {:else}
           <span style="color: var(--ds-text-subtle);">{t('items.notSet')}</span>
         {/if}
+      </div>
+    {:else if field.field_type === 'iteration'}
+      <div class="flex items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        {#if iterationData}
+          {#if iterationData.is_global}
+            <Globe class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+          {:else}
+            <Building2 class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+          {/if}
+        {:else}
+          <Calendar class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        {/if}
+        <span class={truncateDisplay ? 'min-w-0 truncate' : ''} style="color: var(--ds-text);">{renderDisplayValue()}</span>
+      </div>
+    {:else if field.field_type === 'asset'}
+      <div class="flex min-w-0 items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        <Box class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        <span class={truncateDisplay ? 'min-w-0 truncate' : ''} style="color: var(--ds-text);">{renderDisplayValue()}</span>
+      </div>
+    {:else if field.field_type === 'portalcustomer'}
+      <div class="flex items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        <User class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
+      </div>
+    {:else if field.field_type === 'customerorganisation'}
+      <div class="flex items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        <Building2 class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        <span style="color: var(--ds-text);">{renderDisplayValue()}</span>
+      </div>
+    {:else if field.field_type === 'linking'}
+      <div class="flex items-center gap-1 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        <Link2 class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        <span style="color: var(--ds-text);">
+          {#if Array.isArray(value) && value.length > 0}
+            {value.length} linked
+          {:else if !Array.isArray(value) && value && typeof value === 'object'}
+            1 linked
+          {:else}
+            —
+          {/if}
+        </span>
+      </div>
+    {:else if field.field_type === 'combobox'}
+      <div class="flex items-center gap-1 flex-wrap {displayAlignment === 'end' ? 'justify-end' : ''}">
+        {#each getComboboxLabels(value) as labelName}
+          <span class="inline-flex items-center px-2 py-0.5 bg-ds-accent-blue-subtle text-ds-text-accent-blue text-xs rounded-full">
+            {labelName}
+          </span>
+        {/each}
+      </div>
+    {:else if isBooleanCustomFieldType(field.field_type)}
+      <div class="flex items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        <CheckSquare class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        <span style="color: var(--ds-text);">{booleanCustomFieldChecked(value) ? t('common.yes') : t('common.no')}</span>
+      </div>
+    {:else if field.field_type === 'email'}
+      <div class="flex items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        <Mail class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        {#if interactive}
+          <span style="color: var(--ds-text);">{value}</span>
+        {:else}
+          <a href={`mailto:${value}`} class="hover:underline" style="color: var(--ds-text);">{value}</a>
+        {/if}
+      </div>
+    {:else if field.field_type === 'url'}
+      <div class="flex min-w-0 items-center gap-2 {displayAlignment === 'end' ? 'justify-end' : ''}">
+        <ExternalLink class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+        {#if interactive}
+          <span style="color: var(--ds-text);" class="truncate">{value}</span>
+        {:else}
+          <a href={safeHref(value)} target="_blank" rel="noopener noreferrer" class="hover:underline truncate" style="color: var(--ds-text);">{value}</a>
+        {/if}
+      </div>
+    {:else if field.field_type === 'number'}
+      <span class="tabular-nums" style="color: var(--ds-text);">{renderDisplayValue()}</span>
+    {:else}
+      <span class={truncateDisplay ? 'block min-w-0 truncate' : ''} style="color: var(--ds-text);">{renderDisplayValue()}</span>
+    {/if}
+  {:else if interactive}
+    {#if field.field_type === 'user'}
+      <User class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {:else if field.field_type === 'milestone'}
+      <Target class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {:else if field.field_type === 'asset'}
+      <Box class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {:else if field.field_type === 'portalcustomer'}
+      <User class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {:else if field.field_type === 'customerorganisation'}
+      <Building2 class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {:else if isBooleanCustomFieldType(field.field_type)}
+      <CheckSquare class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {:else if field.field_type === 'email'}
+      <Mail class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {:else if field.field_type === 'url'}
+      <ExternalLink class="w-4 h-4 flex-shrink-0" style="color: var(--ds-text-subtle);" />
+    {/if}
+    <span class={truncateDisplay ? 'min-w-0 truncate' : ''} style="color: var(--ds-text-subtle);">{t('items.setField', { field: field.name.toLowerCase() })}</span>
+  {:else}
+    <span class={truncateDisplay ? 'block min-w-0 truncate' : ''} style="color: var(--ds-text-subtle);">{t('items.notSet')}</span>
+  {/if}
+{/snippet}
+
+{#if readonly && !editorOpen && !renderLiveEditor}
+  <div>
+    {#if (onStartEdit || isSelfEditing) && !disabled}
+      <button
+        type="button"
+        class="flex w-full min-w-0 items-center gap-2 {displayAlignment === 'end' ? 'justify-end text-right' : 'justify-start text-left'} {truncateDisplay ? 'whitespace-nowrap overflow-hidden' : ''} {bare || noPadding ? '' : 'px-3'} {bare ? '' : 'py-2'} text-sm {bare ? '' : 'hover:bg-ds-background-neutral-hovered transition-colors rounded'}"
+        onclick={handleActivate}
+        data-testid={displayTestId}
+      >
+        {@render readOnlyContent(true)}
+      </button>
+    {:else}
+      <div
+        class="min-w-0 {displayAlignment === 'end' ? 'text-right' : ''} {truncateDisplay ? 'whitespace-nowrap overflow-hidden' : ''} {bare || noPadding ? '' : 'px-3'} {bare ? '' : 'py-2'} text-sm {disabled ? 'opacity-50' : ''}"
+        data-testid={displayTestId}
+      >
+        {@render readOnlyContent(false)}
       </div>
     {/if}
   </div>
@@ -554,11 +622,12 @@
         placeholder={t('pickers.selectMilestone')}
         showUnassigned={true}
         unassignedLabel={t('pickers.noMilestone')}
-        autoOpen={autoOpenPickers}
+        autoOpen={pickerAutoOpen}
         class="w-full"
         {disabled}
-        onSelect={(item) => onChange(item?.id || null)}
-        onCancel={() => onCancel?.()}
+        {resolveMissingLabel}
+        onSelect={(item) => handleEditorChange(item?.id || null)}
+        onCancel={handleEditorCancel}
       />
     {:else if field.field_type === 'user'}
       {@const userValue = value && typeof value === 'object' ? /** @type {any} */ (value).id : (value ?? null)}
@@ -569,13 +638,18 @@
         {showSelectedInTrigger}
         class="w-full"
         {disabled}
+        users={providedUsers === null ? (users.length ? users : null) : providedUsers}
+        loading={optionLoading.users ?? false}
+        autoOpen={pickerAutoOpen}
+        {resolveMissingLabel}
+        onOpen={() => onRequestOptions?.('users')}
         onSelect={(selectedUser) => {
-          onChange(selectedUser ? {
+          handleEditorChange(selectedUser ? {
             id: selectedUser.id,
             name: `${selectedUser.first_name} ${selectedUser.last_name}`.trim() || selectedUser.username
           } : null);
         }}
-        onCancel={() => onCancel?.()}
+        onCancel={handleEditorCancel}
       />
     {:else if field.field_type === 'multi_user'}
       <div class="space-y-2">
@@ -596,8 +670,12 @@
           showSelectedInTrigger={false}
           class="w-full"
           {disabled}
+          users={providedUsers === null ? (users.length ? users : null) : providedUsers}
+          loading={optionLoading.users ?? false}
+          autoOpen={pickerAutoOpen}
+          onOpen={() => onRequestOptions?.('users')}
           onSelect={addMultiUser}
-          onCancel={() => onCancel?.()}
+          onCancel={handleEditorCancel}
         />
       </div>
     {:else if field.field_type === 'iteration'}
@@ -608,11 +686,12 @@
         placeholder={t('items.selectIteration')}
         showUnassigned={true}
         unassignedLabel={t('items.noIteration')}
-        autoOpen={autoOpenPickers}
+        autoOpen={pickerAutoOpen}
         class="w-full"
         {disabled}
-        onSelect={(item) => onChange(item?.id || null)}
-        onCancel={() => onCancel?.()}
+        {resolveMissingLabel}
+        onSelect={(item) => handleEditorChange(item?.id || null)}
+        onCancel={handleEditorCancel}
       />
     {:else if field.field_type === 'asset'}
       {@const assetValue = isMultiAssetField ? normalizedAssetIDs() : (value && typeof value === 'object' ? /** @type {any} */ (value).id : (value ?? null))}
@@ -622,19 +701,27 @@
         cqlQuery={assetConfig.cql_query || assetConfig.ql_query}
         placeholder={t('pickers.selectAsset')}
         showUnassigned={!isMultiAssetField}
-        autoOpen={autoOpenPickers}
+        autoOpen={pickerAutoOpen}
         multiple={isMultiAssetField}
         class="w-full"
         {disabled}
+        {resolveMissingLabel}
+        optionLoader={loadAssetOptions
+          ? (search) => loadAssetOptions(
+              assetConfig.asset_set_id,
+              assetConfig.cql_query || assetConfig.ql_query || '',
+              search,
+            )
+          : null}
         onSelect={(asset) => {
-          onChange(asset ? {
+          handleEditorChange(asset ? {
             id: asset.id,
             title: asset.title,
             asset_tag: asset.asset_tag || ''
           } : null);
         }}
-        onChange={(assets) => onChange(assets)}
-        onCancel={() => onCancel?.()}
+        onChange={(assets) => handleEditorChange(assets)}
+        onCancel={handleEditorCancel}
       />
     {:else if field.field_type === 'portalcustomer'}
       {@const customerValue = value && typeof value === 'object' ? /** @type {any} */ (value).id : (value ?? null)}
@@ -644,14 +731,19 @@
         showUnassigned={true}
         class="w-full"
         {disabled}
+        autoOpen={pickerAutoOpen}
+        {resolveMissingLabel}
+        customers={optionData.portalCustomers ?? null}
+        loading={optionLoading.portalCustomers ?? false}
+        onOpen={() => onRequestOptions?.('portalCustomers')}
         onSelect={(customer) => {
-          onChange(customer ? {
+          handleEditorChange(customer ? {
             id: customer.id,
             name: customer.name,
             email: customer.email
           } : null);
         }}
-        onCancel={() => onCancel?.()}
+        onCancel={handleEditorCancel}
       />
     {:else if field.field_type === 'customerorganisation'}
       {@const orgValue = value && typeof value === 'object' ? /** @type {any} */ (value).id : (value ?? null)}
@@ -661,21 +753,28 @@
         showUnassigned={true}
         class="w-full"
         {disabled}
+        autoOpen={pickerAutoOpen}
+        {resolveMissingLabel}
+        organisations={optionData.customerOrganisations ?? null}
+        loading={optionLoading.customerOrganisations ?? false}
+        onOpen={() => onRequestOptions?.('customerOrganisations')}
         onSelect={(org) => {
-          onChange(org ? {
+          handleEditorChange(org ? {
             id: org.id,
             name: org.name
           } : null);
         }}
-        onCancel={() => onCancel?.()}
+        onCancel={handleEditorCancel}
       />
     {:else if field.field_type === 'linking'}
       <LinkingFieldPicker
         fieldId={field.id}
         {itemId}
         fieldOptions={field.options}
-        {readonly}
+        readonly={false}
         {disabled}
+        links={fieldLinks}
+        onChanged={(change) => onFieldLinksChanged?.(change)}
       />
     {:else if field.field_type === 'combobox'}
       <PersonalLabelCombobox
@@ -684,11 +783,14 @@
         class="w-full"
         userId={null}
         {disabled}
+        labels={optionData.personalLabels ?? null}
+        loading={optionLoading.personalLabels ?? false}
+        onOpen={() => onRequestOptions?.('personalLabels')}
         onSelect={(result) => {
           const labelArray = result.value || [];
-          onChange(labelArray.join(','));
+          handleEditorChange(labelArray.join(','));
         }}
-        onCancel={() => onCancel?.()}
+        onCancel={handleEditorCancel}
       />
     {:else if field.field_type === 'select'}
       <BasePicker
@@ -699,8 +801,10 @@
         unassignedLabel={t('items.selectField', { field: field.name.toLowerCase() })}
         getValue={(item) => item.id}
         getLabel={(item) => item.label}
+        autoOpen={pickerAutoOpen}
         {disabled}
-        onSelect={(item) => onChange(item ? item.id : null)}
+        {resolveMissingLabel}
+        onSelect={(item) => handleEditorChange(item ? item.id : null)}
       />
     {:else if field.field_type === 'multiselect'}
       <BasePicker
@@ -710,17 +814,20 @@
         getValue={(item) => item.id}
         getLabel={(item) => item.label}
         multiple={true}
+        autoOpen={pickerAutoOpen}
         {disabled}
-        onChange={(selected) => onChange(selected)}
+        {resolveMissingLabel}
+        onChange={(selected) => handleEditorChange(selected)}
       />
     {:else if field.field_type === 'date'}
-      <div use:clickOutside onclickOutside={() => onCancel?.()}>
+      <div use:clickOutside onclickOutside={handleEditorCancel}>
         <!-- svelte-ignore a11y_autofocus -->
-        <input
+        <Input
           type="date"
-          value={formatDateForInput(value)}
-          oninput={(e) => onChange(formatDateFromInput(/** @type {HTMLInputElement} */ (e.target).value))}
-          class="w-full px-3 py-2 text-sm hover:bg-gray-50 focus:outline-none transition-colors bg-transparent border rounded"
+          value={formatDateForInput(editorValue)}
+          dataTestid={`custom-field-input-${field.id}`}
+          oninput={(e) => handleEditorInput(formatDateFromInput(/** @type {HTMLInputElement} */ (e.target).value))}
+          class="w-full px-3 py-2 text-sm hover:bg-ds-background-neutral-hovered focus:outline-none transition-colors bg-transparent border rounded"
           style="background-color: {isDarkMode ? '#1e293b' : 'var(--ds-background-input)'}; border-color: {isDarkMode ? '#475569' : 'var(--ds-border)'}; color: {isDarkMode ? '#e2e8f0' : 'var(--ds-text)'};"
           onkeydown={handleKeydown}
           {disabled}
@@ -729,72 +836,86 @@
         />
       </div>
     {:else if field.field_type === 'textarea'}
-      <div use:clickOutside onclickOutside={() => onCancel?.()}>
+      <div use:clickOutside onclickOutside={handleEditorCancel}>
         <!-- svelte-ignore a11y_autofocus -->
-        <textarea
-          {value}
-          oninput={(e) => onChange(/** @type {HTMLTextAreaElement} */ (e.target).value)}
-          class="w-full px-3 py-2 text-sm hover:bg-gray-50 focus:outline-none transition-colors bg-transparent border rounded"
+        <Textarea
+          value={editorValue}
+          data-testid={`custom-field-input-${field.id}`}
+          oninput={(e) => handleEditorInput(/** @type {HTMLTextAreaElement} */ (e.target).value)}
+          class="w-full px-3 py-2 text-sm hover:bg-ds-background-neutral-hovered focus:outline-none transition-colors bg-transparent border rounded"
           style="background-color: {isDarkMode ? '#1e293b' : 'var(--ds-background-input)'}; border-color: {isDarkMode ? '#475569' : 'var(--ds-border)'}; color: {isDarkMode ? '#e2e8f0' : 'var(--ds-text)'};"
           placeholder={t('items.enterField', { field: field.name.toLowerCase() })}
-          rows="3"
+          rows={3}
           {disabled}
           required={isRequired}
           autofocus
-        ></textarea>
+          size="small"
+          onblur={handleCommitBlur}
+        />
       </div>
     {:else if field.field_type === 'number'}
-      <div use:clickOutside onclickOutside={() => onCancel?.()}>
+      <div use:clickOutside onclickOutside={handleEditorCancel}>
         <!-- svelte-ignore a11y_autofocus -->
-        <input
+        <Input
           type="number"
           step="any"
-          {value}
-          oninput={(e) => onChange(/** @type {HTMLInputElement} */ (e.target).value)}
-          class="w-full px-3 py-2 text-sm hover:bg-gray-50 focus:outline-none transition-colors bg-transparent border rounded tabular-nums"
+          value={editorValue}
+          dataTestid={`custom-field-input-${field.id}`}
+          oninput={(e) => handleEditorInput(/** @type {HTMLInputElement} */ (e.target).value)}
+          class="w-full px-3 py-2 text-sm hover:bg-ds-background-neutral-hovered focus:outline-none transition-colors bg-transparent border rounded tabular-nums"
           style="background-color: {isDarkMode ? '#1e293b' : 'var(--ds-background-input)'}; border-color: {isDarkMode ? '#475569' : 'var(--ds-border)'}; color: {isDarkMode ? '#e2e8f0' : 'var(--ds-text)'};"
           placeholder={t('items.enterField', { field: field.name.toLowerCase() })}
           onkeydown={handleKeydown}
+          onblur={handleCommitBlur}
           {disabled}
           required={isRequired}
           autofocus
         />
       </div>
-    {:else if field.field_type === 'checkbox'}
-      <div use:clickOutside onclickOutside={() => onCancel?.()} class="px-3 py-2">
+    {:else if isBooleanCustomFieldType(field.field_type)}
+      <div
+        use:clickOutside
+        onclickOutside={handleEditorCancel}
+        class="px-3 py-2"
+        data-testid={`custom-field-input-${field.id}`}
+      >
         <Checkbox
-          checked={coerceCheckboxValue(value)}
+          checked={booleanCustomFieldChecked(value)}
           {disabled}
           onchange={(checked) => onChange(checked)}
         />
       </div>
     {:else if field.field_type === 'email'}
-      <div use:clickOutside onclickOutside={() => onCancel?.()}>
+      <div use:clickOutside onclickOutside={handleEditorCancel}>
         <!-- svelte-ignore a11y_autofocus -->
-        <input
+        <Input
           type="email"
-          {value}
-          oninput={(e) => onChange(/** @type {HTMLInputElement} */ (e.target).value)}
-          class="w-full px-3 py-2 text-sm hover:bg-gray-50 focus:outline-none transition-colors bg-transparent border rounded"
+          value={editorValue}
+          dataTestid={`custom-field-input-${field.id}`}
+          oninput={(e) => handleEditorInput(/** @type {HTMLInputElement} */ (e.target).value)}
+          class="w-full px-3 py-2 text-sm hover:bg-ds-background-neutral-hovered focus:outline-none transition-colors bg-transparent border rounded"
           style="background-color: {isDarkMode ? '#1e293b' : 'var(--ds-background-input)'}; border-color: {isDarkMode ? '#475569' : 'var(--ds-border)'}; color: {isDarkMode ? '#e2e8f0' : 'var(--ds-text)'};"
           placeholder={t('items.enterField', { field: field.name.toLowerCase() })}
           onkeydown={handleKeydown}
+          onblur={handleCommitBlur}
           {disabled}
           required={isRequired}
           autofocus
         />
       </div>
     {:else if field.field_type === 'url'}
-      <div use:clickOutside onclickOutside={() => onCancel?.()}>
+      <div use:clickOutside onclickOutside={handleEditorCancel}>
         <!-- svelte-ignore a11y_autofocus -->
-        <input
+        <Input
           type="url"
-          {value}
-          oninput={(e) => onChange(/** @type {HTMLInputElement} */ (e.target).value)}
-          class="w-full px-3 py-2 text-sm hover:bg-gray-50 focus:outline-none transition-colors bg-transparent border rounded"
+          value={editorValue}
+          dataTestid={`custom-field-input-${field.id}`}
+          oninput={(e) => handleEditorInput(/** @type {HTMLInputElement} */ (e.target).value)}
+          class="w-full px-3 py-2 text-sm hover:bg-ds-background-neutral-hovered focus:outline-none transition-colors bg-transparent border rounded"
           style="background-color: {isDarkMode ? '#1e293b' : 'var(--ds-background-input)'}; border-color: {isDarkMode ? '#475569' : 'var(--ds-border)'}; color: {isDarkMode ? '#e2e8f0' : 'var(--ds-text)'};"
           placeholder={t('items.enterField', { field: field.name.toLowerCase() })}
           onkeydown={handleKeydown}
+          onblur={handleCommitBlur}
           {disabled}
           required={isRequired}
           autofocus
@@ -802,16 +923,18 @@
       </div>
     {:else}
       <!-- Default: text input -->
-      <div use:clickOutside onclickOutside={() => onCancel?.()}>
+      <div use:clickOutside onclickOutside={handleEditorCancel}>
         <!-- svelte-ignore a11y_autofocus -->
-        <input
+        <Input
           type="text"
-          {value}
-          oninput={(e) => onChange(/** @type {HTMLInputElement} */ (e.target).value)}
-          class="w-full px-3 py-2 text-sm hover:bg-gray-50 focus:outline-none transition-colors bg-transparent border rounded"
+          value={editorValue}
+          dataTestid={`custom-field-input-${field.id}`}
+          oninput={(e) => handleEditorInput(/** @type {HTMLInputElement} */ (e.target).value)}
+          class="w-full px-3 py-2 text-sm hover:bg-ds-background-neutral-hovered focus:outline-none transition-colors bg-transparent border rounded"
           style="background-color: {isDarkMode ? '#1e293b' : 'var(--ds-background-input)'}; border-color: {isDarkMode ? '#475569' : 'var(--ds-border)'}; color: {isDarkMode ? '#e2e8f0' : 'var(--ds-text)'};"
           placeholder={t('items.enterField', { field: field.name.toLowerCase() })}
           onkeydown={handleKeydown}
+          onblur={handleCommitBlur}
           {disabled}
           required={isRequired}
           autofocus

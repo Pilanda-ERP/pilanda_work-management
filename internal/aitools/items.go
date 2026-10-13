@@ -2,6 +2,7 @@ package aitools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -107,9 +108,12 @@ type listItemsOut struct {
 func init() {
 	Register(Default, Tool[listItemsArgs]{
 		Name:        "list_items",
-		Description: "List work items in one or all accessible workspaces, with optional filters and CQL.",
+		Group:       CapabilityReadComment,
+		Access:      AccessRead,
+		Risk:        RiskLow,
+		Description: "List work items in one or all accessible workspaces. Filter by status, milestone, iteration, assignee, priority, labels, and more with CQL.",
 		Scopes:      []string{auth.ScopeItemsRead},
-		Run: func(_ context.Context, env *Env, args listItemsArgs) (any, error) {
+		Run: func(ctx context.Context, env *Env, args listItemsArgs) (any, error) {
 			var wsIDs []int
 			if args.WorkspaceID != nil && *args.WorkspaceID > 0 {
 				if !env.HasWorkspaceAccess(*args.WorkspaceID) {
@@ -144,7 +148,7 @@ func init() {
 			}
 
 			var qlParts []string
-			var qlArgs []interface{}
+			var qlArgs []any
 			if args.Status != "" {
 				qlParts = append(qlParts, "st.name = ?")
 				qlArgs = append(qlArgs, args.Status)
@@ -181,6 +185,9 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			if err := repository.NewMilestoneAttachRepository(env.DB).LoadForItemsContext(ctx, items); err != nil {
+				return nil, err
+			}
 
 			out := listItemsOut{Items: make([]itemSummaryDTO, 0, len(items)), Total: total}
 			for _, item := range items {
@@ -195,6 +202,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[getItemArgs]{
 		Name:        "get_item",
+		Group:       CapabilityReadComment,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "Get details of a single work item by numeric ID or key (e.g. PROJ-42). Long descriptions are truncated to 500 characters with an explicit marker unless full_description=true.",
 		Scopes:      []string{auth.ScopeItemsRead},
 		Run: func(_ context.Context, env *Env, args getItemArgs) (any, error) {
@@ -242,9 +252,12 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[searchItemsArgs]{
 		Name:        "search_items",
+		Group:       CapabilityReadComment,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "Full-text search for work items by title or description across accessible workspaces.",
 		Scopes:      []string{auth.ScopeItemsRead},
-		Run: func(_ context.Context, env *Env, args searchItemsArgs) (any, error) {
+		Run: func(ctx context.Context, env *Env, args searchItemsArgs) (any, error) {
 			if strings.TrimSpace(args.Query) == "" {
 				return map[string]string{"error": "query is required"}, nil
 			}
@@ -274,6 +287,9 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			if err := repository.NewMilestoneAttachRepository(env.DB).LoadForItemsContext(ctx, items); err != nil {
+				return nil, err
+			}
 			out := listItemsOut{Items: make([]itemSummaryDTO, 0, len(items)), Total: total}
 			for _, item := range items {
 				if !env.HasWorkspaceAccess(item.WorkspaceID) {
@@ -290,6 +306,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[createItemArgs]{
 		Name:        "create_item",
+		Group:       CapabilityIssueManagement,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Create a new work item in a workspace.",
 		Scopes:      []string{auth.ScopeItemsWrite},
 		Run: func(_ context.Context, env *Env, args createItemArgs) (any, error) {
@@ -299,7 +318,9 @@ func init() {
 			if !env.HasWorkspaceAccess(args.WorkspaceID) {
 				return map[string]string{"error": "workspace not found"}, nil
 			}
-			ok, err := env.PermService.HasWorkspacePermission(env.UserID, args.WorkspaceID, models.PermissionItemEdit)
+			// item.create, not item.edit — Testers hold item.create so they
+			// can file defects without broad editing rights.
+			ok, err := env.PermService.HasWorkspacePermission(env.UserID, args.WorkspaceID, models.PermissionItemCreate)
 			if err != nil {
 				return nil, err
 			}
@@ -308,8 +329,8 @@ func init() {
 			}
 			title := sanitize.PlainTextField.Sanitize(args.Title)
 			desc := sanitize.Comment.Sanitize(args.Description)
-			// Centralized creation validation (parent hierarchy, cross-workspace
-			// parent visibility, status rules) — mirrors the cookie-auth and v1
+			// Centralized creation validation (parent hierarchy and cross-workspace
+			// parent visibility) mirrors the cookie-auth and v1
 			// create paths. Permission-shaped parent failures surface as "Parent
 			// item not found" so existence isn't leaked.
 			validationResult := services.ValidateItemCreation(env.DB, services.ItemValidationParams{
@@ -317,7 +338,6 @@ func init() {
 				Title:       title,
 				ItemTypeID:  args.ItemTypeID,
 				ParentID:    args.ParentID,
-				StatusID:    args.StatusID,
 				UserID:      env.UserID,
 				PermService: env.PermService,
 			})
@@ -336,6 +356,7 @@ func init() {
 				CreatorID:        &env.UserID,
 				ValidatingUserID: env.UserID,
 				PermService:      env.PermService,
+				EventMetadata:    env.eventMetadata(),
 			})
 			if err != nil {
 				return map[string]string{"error": fmt.Sprintf("create failed: %s", err.Error())}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
@@ -354,6 +375,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[updateItemArgs]{
 		Name:        "update_item",
+		Group:       CapabilityIssueManagement,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Update fields on an existing work item. Identifies the item by numeric ID or key. Use transition_item to change status (workflow + condition rules apply).",
 		Scopes:      []string{auth.ScopeItemsWrite},
 		Run: func(_ context.Context, env *Env, args updateItemArgs) (any, error) {
@@ -386,9 +410,10 @@ func init() {
 			result, err := services.NewItemUpdateService(env.DB).
 				WithPermissionService(env.PermService).
 				UpdateItem(services.UpdateItemRequest{
-					ItemID:     itemID,
-					UpdateData: updateData,
-					UserID:     env.UserID,
+					ItemID:        itemID,
+					UpdateData:    updateData,
+					UserID:        env.UserID,
+					EventMetadata: env.eventMetadata(),
 				})
 			if err != nil {
 				return map[string]string{"error": fmt.Sprintf("update failed: %s", err.Error())}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
@@ -407,6 +432,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[deleteItemArgs]{
 		Name:        "delete_item",
+		Group:       CapabilityIssueManagement,
+		Access:      AccessDestructive,
+		Risk:        RiskHigh,
 		Description: "Delete a work item and all its descendants. Identifies the item by numeric ID or key (e.g. PROJ-42).",
 		Scopes:      []string{auth.ScopeItemsDelete},
 		Run: func(_ context.Context, env *Env, args deleteItemArgs) (any, error) {
@@ -414,26 +442,32 @@ func init() {
 			if err != nil {
 				return map[string]string{"error": err.Error()}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
 			}
-			crudSvc := services.NewItemCRUDService(env.DB)
-			item, err := crudSvc.GetByID(itemID)
-			if err != nil {
-				return map[string]string{"error": "item not found"}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
+			deletionService := env.ItemDeletionService
+			if deletionService == nil {
+				deletionService = services.NewItemDeletionApplicationService(env.DB, env.PermService)
 			}
-			if !env.HasWorkspaceAccess(item.WorkspaceID) {
-				return map[string]string{"error": "item not found"}, nil
-			}
-			ok, err := env.PermService.HasWorkspacePermission(env.UserID, item.WorkspaceID, models.PermissionItemDelete)
+			result, err := deletionService.Delete(services.ItemDeletionRequest{
+				ItemID:        itemID,
+				ActorUserID:   env.UserID,
+				ActorUsername: env.Username,
+				Mode:          services.ItemDeletionCascade,
+				CanAccessWorkspace: func(workspaceID int) (bool, error) {
+					return env.HasWorkspaceAccess(workspaceID), nil
+				},
+			})
 			if err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return map[string]string{"error": "item not found"}, nil
+				}
+				if errors.Is(err, services.ErrItemDeletionForbidden) {
+					return map[string]string{"error": "permission denied"}, nil
+				}
+				if errors.Is(err, services.ErrItemHasProtectedIntegrationLinks) {
+					return map[string]string{"error": "remove all protected integration links from the item or its descendants before deleting them"}, nil
+				}
 				return nil, err
 			}
-			if !ok {
-				return map[string]string{"error": "permission denied"}, nil
-			}
-			result, err := crudSvc.Delete(itemID)
-			if err != nil {
-				return nil, err
-			}
-			env.AuditWrite(logger.ResourceItem, itemID, "delete_item", item.Title)
+			env.AuditWrite(logger.ResourceItem, itemID, "delete_item", result.Item.Title)
 			return map[string]any{"deleted": true, "deleted_count": result.DeletedCount}, nil
 		},
 	})
@@ -443,6 +477,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[getItemChildrenArgs]{
 		Name:        "get_item_children",
+		Group:       CapabilityReadComment,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "Get the direct children of a work item. Identifies the parent by numeric ID or key (e.g. PROJ-42).",
 		Scopes:      []string{auth.ScopeItemsRead},
 		Run: func(_ context.Context, env *Env, args getItemChildrenArgs) (any, error) {
@@ -462,8 +499,13 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			// Cross-workspace children exist by design; drop any child whose
+			// workspace the caller cannot view rather than disclosing it.
 			out := make([]itemSummaryDTO, 0, len(children))
 			for _, c := range children {
+				if !env.HasWorkspaceAccess(c.WorkspaceID) {
+					continue
+				}
 				out = append(out, itemToSummary(c))
 			}
 			return map[string]any{"children": out}, nil
@@ -475,6 +517,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[transitionItemArgs]{
 		Name:        "transition_item",
+		Group:       CapabilityIssueManagement,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Perform a workflow status transition on an item. Identifies the item by ID or key, and the target status by ID or name. Workflow + condition rules are enforced.",
 		Scopes:      []string{auth.ScopeItemsWrite},
 		Run: func(ctx context.Context, env *Env, args transitionItemArgs) (any, error) {
@@ -512,12 +557,13 @@ func init() {
 			}
 			workflowSvc := services.NewWorkflowService(env.DB)
 			conditionSvc := services.NewConditionService(env.DB, env.PermService, services.NewScriptEngine())
-			approvalSvc := services.NewApprovalService(env.DB, env.PermService, repository.NewLeaveRepository(env.DB), workflowSvc)
+			approvalSvc := services.NewApprovalService(env.DB, repository.NewLeaveRepository(env.DB), workflowSvc)
 			result, err := workflowSvc.PerformTransition(ctx, services.PerformTransitionRequest{
-				ItemID:      itemID,
-				ToStatusID:  toStatusID,
-				ActorUserID: env.UserID,
-				Modes:       []string{"validator", "condition"},
+				ItemID:        itemID,
+				ToStatusID:    toStatusID,
+				ActorUserID:   env.UserID,
+				EventMetadata: env.eventMetadata(),
+				Modes:         []string{"validator", "condition"},
 			}, repository.NewItemRepository(env.DB), conditionSvc, approvalSvc)
 			if err != nil {
 				if rej := services.IsTransitionRejection(err); rej != nil {
@@ -566,22 +612,22 @@ type createItemArgs struct {
 }
 
 type updateItemArgs struct {
-	ItemID            int                    `json:"item_id,omitempty" jsonschema:"Item ID"`
-	ItemKey           string                 `json:"item_key,omitempty" jsonschema:"Item key like PROJ-42"`
-	Title             *string                `json:"title,omitempty" jsonschema:"New title"`
-	Description       *string                `json:"description,omitempty" jsonschema:"New description"`
-	PriorityID        *int                   `json:"priority_id,omitempty" jsonschema:"New priority ID"`
-	PriorityName      *string                `json:"priority_name,omitempty" jsonschema:"New priority name (alternative to ID)"`
-	AssigneeID        *int                   `json:"assignee_id,omitempty" jsonschema:"New assignee user ID (0 to unassign)"`
-	AssigneeName      *string                `json:"assignee_name,omitempty" jsonschema:"New assignee full name (alternative to ID)"`
-	DueDate           *string                `json:"due_date,omitempty" jsonschema:"Due date YYYY-MM-DD (empty string to clear)"`
-	MilestoneID       *int                   `json:"milestone_id,omitempty" jsonschema:"Milestone ID"`
-	MilestoneName     *string                `json:"milestone_name,omitempty" jsonschema:"Milestone name (alternative to ID)"`
-	IterationID       *int                   `json:"iteration_id,omitempty" jsonschema:"Iteration ID"`
-	IterationName     *string                `json:"iteration_name,omitempty" jsonschema:"Iteration name (alternative to ID)"`
-	ProjectID         *int                   `json:"project_id,omitempty" jsonschema:"Project ID"`
-	ParentID          *int                   `json:"parent_id,omitempty" jsonschema:"Parent item ID"`
-	CustomFieldValues map[string]interface{} `json:"custom_field_values,omitempty" jsonschema:"Custom field values map"`
+	ItemID            int            `json:"item_id,omitempty" jsonschema:"Item ID"`
+	ItemKey           string         `json:"item_key,omitempty" jsonschema:"Item key like PROJ-42"`
+	Title             *string        `json:"title,omitempty" jsonschema:"New title"`
+	Description       *string        `json:"description,omitempty" jsonschema:"New description"`
+	PriorityID        *int           `json:"priority_id,omitempty" jsonschema:"New priority ID"`
+	PriorityName      *string        `json:"priority_name,omitempty" jsonschema:"New priority name (alternative to ID)"`
+	AssigneeID        *int           `json:"assignee_id,omitempty" jsonschema:"New assignee user ID (0 to unassign)"`
+	AssigneeName      *string        `json:"assignee_name,omitempty" jsonschema:"New assignee full name (alternative to ID)"`
+	DueDate           *string        `json:"due_date,omitempty" jsonschema:"Due date YYYY-MM-DD (empty string to clear)"`
+	MilestoneID       *int           `json:"milestone_id,omitempty" jsonschema:"Milestone ID"`
+	MilestoneName     *string        `json:"milestone_name,omitempty" jsonschema:"Milestone name (alternative to ID)"`
+	IterationID       *int           `json:"iteration_id,omitempty" jsonschema:"Iteration ID"`
+	IterationName     *string        `json:"iteration_name,omitempty" jsonschema:"Iteration name (alternative to ID)"`
+	ProjectID         *int           `json:"project_id,omitempty" jsonschema:"Project ID"`
+	ParentID          *int           `json:"parent_id,omitempty" jsonschema:"Parent item ID"`
+	CustomFieldValues map[string]any `json:"custom_field_values,omitempty" jsonschema:"Custom field values map"`
 }
 
 type deleteItemArgs struct {
@@ -609,8 +655,8 @@ type transitionItemArgs struct {
 // services.UpdateItemRequest, resolving names to IDs where applicable.
 // Returns the update map, the list of changed field names, and any
 // resolution error.
-func buildUpdateData(env *Env, args updateItemArgs, wsID int) (data map[string]interface{}, changed []string, err error) {
-	data = map[string]interface{}{}
+func buildUpdateData(env *Env, args updateItemArgs, wsID int) (data map[string]any, changed []string, err error) {
+	data = map[string]any{}
 	out := data
 
 	if args.Title != nil {
@@ -626,11 +672,11 @@ func buildUpdateData(env *Env, args updateItemArgs, wsID int) (data map[string]i
 		out["priority_id"] = *args.PriorityID
 		changed = append(changed, "priority")
 	case args.PriorityName != nil:
-		id, err := resolvePriorityName(env.DB, *args.PriorityName)
+		id, err := services.NewIDResolverService(env.DB).ResolvePriorityIDByName(*args.PriorityName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("could not resolve priority name %q: %w", *args.PriorityName, err)
 		}
-		out["priority_id"] = id
+		out["priority_id"] = *id
 		changed = append(changed, "priority")
 	}
 	switch {
@@ -669,7 +715,7 @@ func buildUpdateData(env *Env, args updateItemArgs, wsID int) (data map[string]i
 		}
 		changed = append(changed, "milestone")
 	case args.MilestoneName != nil:
-		id, err := resolveMilestoneName(env.DB, *args.MilestoneName, wsID)
+		id, err := resolveMilestoneName(env, *args.MilestoneName, wsID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("could not resolve milestone name %q: %w", *args.MilestoneName, err)
 		}
@@ -685,7 +731,7 @@ func buildUpdateData(env *Env, args updateItemArgs, wsID int) (data map[string]i
 		}
 		changed = append(changed, "iteration")
 	case args.IterationName != nil:
-		id, err := resolveIterationName(env.DB, *args.IterationName, wsID)
+		id, err := resolveIterationName(env, *args.IterationName, wsID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("could not resolve iteration name %q: %w", *args.IterationName, err)
 		}
@@ -709,6 +755,8 @@ func buildUpdateData(env *Env, args updateItemArgs, wsID int) (data map[string]i
 		changed = append(changed, "parent")
 	}
 	if args.CustomFieldValues != nil {
+		// The update pipeline merges custom_field_values per field server-side,
+		// so the tool forwards exactly the caller's requested fields.
 		out["custom_field_values"] = args.CustomFieldValues
 		changed = append(changed, "custom_fields")
 	}
@@ -716,24 +764,9 @@ func buildUpdateData(env *Env, args updateItemArgs, wsID int) (data map[string]i
 }
 
 func workspaceLookupMap(db database.Database) map[string]int {
-	out := map[string]int{}
-	rows, err := db.Query("SELECT id, name, key FROM workspaces")
+	out, err := repository.NewWorkspaceRepository(db).ListNameKeyToIDMap()
 	if err != nil {
-		return out
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var id int
-		var name, key string
-		if err := rows.Scan(&id, &name, &key); err != nil {
-			continue
-		}
-		out[fmt.Sprintf("%d", id)] = id
-		out[strings.ToLower(name)] = id
-		out[strings.ToLower(key)] = id
-	}
-	if err := rows.Err(); err != nil {
-		return out
+		return map[string]int{}
 	}
 	return out
 }
@@ -776,15 +809,6 @@ func statusCandidateList(statuses []models.Status) string {
 	return strings.Join(parts, ", ")
 }
 
-func resolvePriorityName(db database.Database, name string) (int, error) {
-	var id int
-	err := db.QueryRow("SELECT id FROM priorities WHERE LOWER(name) = LOWER(?)", name).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("priority not found")
-	}
-	return id, nil
-}
-
 // resolveAssigneeName resolves a user's full name to an ID, restricted to
 // users visible in the item's workspace. Visibility reuses the canonical
 // gated-aware check the HTTP layer builds workspace access from (item.view
@@ -793,24 +817,13 @@ func resolvePriorityName(db database.Database, name string) (int, error) {
 // or out-of-workspace matches return an error listing candidates so the
 // caller can disambiguate (e.g. by passing assignee_id).
 func resolveAssigneeName(env *Env, name string, workspaceID int) (int, error) {
-	rows, err := env.DB.Query(
-		"SELECT id, first_name || ' ' || last_name FROM users WHERE LOWER(first_name || ' ' || last_name) = LOWER(?) ORDER BY id",
-		name,
-	)
+	rows, err := repository.NewUserRepository(env.DB).FindIDsByFullName(name)
 	if err != nil {
 		return 0, fmt.Errorf("failed to look up user: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-	var matches []userCandidate
-	for rows.Next() {
-		var c userCandidate
-		if err := rows.Scan(&c.id, &c.fullName); err != nil {
-			continue
-		}
-		matches = append(matches, c)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("failed to look up user: %w", err)
+	matches := make([]userCandidate, 0, len(rows))
+	for _, row := range rows {
+		matches = append(matches, userCandidate{id: row.ID, fullName: row.FullName})
 	}
 	if len(matches) == 0 {
 		return 0, fmt.Errorf("user not found")
@@ -852,26 +865,18 @@ func userCandidateList(users []userCandidate) string {
 	return strings.Join(parts, ", ")
 }
 
-func resolveMilestoneName(db database.Database, name string, workspaceID int) (int, error) {
-	var id int
-	err := db.QueryRow(
-		"SELECT id FROM milestones WHERE LOWER(name) = LOWER(?) AND (workspace_id = ? OR is_global = true) ORDER BY CASE WHEN workspace_id = ? THEN 0 ELSE 1 END LIMIT 1",
-		name, workspaceID, workspaceID,
-	).Scan(&id)
-	if err != nil {
+func resolveMilestoneName(env *Env, name string, workspaceID int) (int, error) {
+	id, err := services.NewPlanningService(env.DB).FindMilestoneIDByName(workspaceID, name)
+	if err != nil || id == nil {
 		return 0, fmt.Errorf("milestone not found")
 	}
-	return id, nil
+	return *id, nil
 }
 
-func resolveIterationName(db database.Database, name string, workspaceID int) (int, error) {
-	var id int
-	err := db.QueryRow(
-		"SELECT id FROM iterations WHERE LOWER(name) = LOWER(?) AND (workspace_id = ? OR is_global = true) ORDER BY CASE WHEN workspace_id = ? THEN 0 ELSE 1 END LIMIT 1",
-		name, workspaceID, workspaceID,
-	).Scan(&id)
-	if err != nil {
+func resolveIterationName(env *Env, name string, workspaceID int) (int, error) {
+	id, err := services.NewPlanningService(env.DB).FindIterationIDByName(workspaceID, name)
+	if err != nil || id == nil {
 		return 0, fmt.Errorf("iteration not found")
 	}
-	return id, nil
+	return *id, nil
 }

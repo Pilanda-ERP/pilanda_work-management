@@ -8,6 +8,7 @@ import (
 
 	"windshift/internal/authz"
 	"windshift/internal/database"
+	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/restapi"
 	"windshift/internal/restapi/v1/middleware"
@@ -19,6 +20,7 @@ type BaseHandler struct {
 	DB                database.Database
 	PermissionService *services.PermissionService
 	Perms             *authz.Authz
+	Auditor           *logger.Auditor
 }
 
 // NewBaseHandler creates a new base handler with shared dependencies.
@@ -27,7 +29,14 @@ func NewBaseHandler(db database.Database, permissionService *services.Permission
 		DB:                db,
 		PermissionService: permissionService,
 		Perms:             authz.New(db, permissionService),
+		Auditor:           logger.NewAuditor(db),
 	}
+}
+
+// AuditActor returns the transport-neutral actor metadata consumed by shared
+// application services. Bearer token attribution is preserved centrally.
+func (b *BaseHandler) AuditActor(r *http.Request, user *models.User) services.AuditActor {
+	return services.NewAuditActorFromRequest(r, user, middleware.GetAPIToken(r.Context()), "bearer")
 }
 
 // ParsePagination extracts pagination params from a request.
@@ -36,12 +45,16 @@ func (b *BaseHandler) ParsePagination(r *http.Request) restapi.PaginationParams 
 }
 
 // RespondOK writes a 200 OK response.
-func (b *BaseHandler) RespondOK(w http.ResponseWriter, data interface{}) {
+func (b *BaseHandler) RespondOK(w http.ResponseWriter, data any) {
 	restapi.RespondOK(w, data)
 }
 
+func (b *BaseHandler) RespondUnauthorized(w http.ResponseWriter, r *http.Request) {
+	restapi.RespondError(w, r, restapi.ErrUnauthorized)
+}
+
 // RespondCreated writes a 201 Created response.
-func (b *BaseHandler) RespondCreated(w http.ResponseWriter, data interface{}) {
+func (b *BaseHandler) RespondCreated(w http.ResponseWriter, data any) {
 	restapi.RespondCreated(w, data)
 }
 
@@ -51,7 +64,7 @@ func (b *BaseHandler) RespondNoContent(w http.ResponseWriter) {
 }
 
 // RespondPaginated writes a paginated response.
-func (b *BaseHandler) RespondPaginated(w http.ResponseWriter, data interface{}, pagination restapi.PaginationParams, total int) {
+func (b *BaseHandler) RespondPaginated(w http.ResponseWriter, data any, pagination restapi.PaginationParams, total int) {
 	restapi.RespondPaginated(w, data, restapi.NewPaginationMeta(pagination, total))
 }
 
@@ -92,13 +105,21 @@ func (b *BaseHandler) ParsePathID(w http.ResponseWriter, r *http.Request, param,
 	return id, true
 }
 
-// DecodeBodyOrRespond decodes JSON body or writes 400 on error.
-func (b *BaseHandler) DecodeBodyOrRespond(w http.ResponseWriter, r *http.Request, v interface{}) bool {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+// DecodeBodyOrRespond decodes JSON or writes the corresponding client error.
+func (b *BaseHandler) DecodeBodyOrRespond(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := restapi.DecodeJSONBody(w, r, v); err != nil {
+		if restapi.IsRequestBodyTooLarge(err) {
+			restapi.RespondError(w, r, restapi.NewAPIError(http.StatusRequestEntityTooLarge, restapi.ErrCodeRequestTooLarge, "Request body too large"))
+			return false
+		}
 		restapi.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body"))
 		return false
 	}
 	return true
+}
+
+func newJSONDecoder(w http.ResponseWriter, r *http.Request) *json.Decoder {
+	return restapi.NewJSONDecoder(w, r)
 }
 
 // RequireGlobalPermission checks global permission or writes 403.

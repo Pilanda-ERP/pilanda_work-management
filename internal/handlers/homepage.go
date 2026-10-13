@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"windshift/internal/models"
@@ -13,32 +15,40 @@ import (
 
 // HomepageHandler handles homepage-related HTTP requests
 type HomepageHandler struct {
-	workspaceRepo   *repository.WorkspaceRepository
-	itemRepo        *repository.ItemRepository
-	activityTracker *services.ActivityTracker
-	permService     *services.PermissionService
+	workspaceRepo      *repository.WorkspaceRepository
+	itemRepo           *repository.ItemRepository
+	itemCRUD           *services.ItemCRUDService
+	planningService    *services.PlanningService
+	activityTracker    *services.ActivityTracker
+	permService        *services.PermissionService
+	preferencesService *services.UserPreferencesService
 }
 
 // NewHomepageHandler creates a new homepage handler
-func NewHomepageHandler(workspaceRepo *repository.WorkspaceRepository, itemRepo *repository.ItemRepository, activityTracker *services.ActivityTracker, permService *services.PermissionService) *HomepageHandler {
+func NewHomepageHandler(workspaceRepo *repository.WorkspaceRepository, itemRepo *repository.ItemRepository, itemCRUD *services.ItemCRUDService, planningService *services.PlanningService, activityTracker *services.ActivityTracker, permService *services.PermissionService, preferencesService *services.UserPreferencesService) *HomepageHandler {
 	return &HomepageHandler{
-		workspaceRepo:   workspaceRepo,
-		itemRepo:        itemRepo,
-		activityTracker: activityTracker,
-		permService:     permService,
+		workspaceRepo:      workspaceRepo,
+		itemRepo:           itemRepo,
+		itemCRUD:           itemCRUD,
+		planningService:    planningService,
+		activityTracker:    activityTracker,
+		permService:        permService,
+		preferencesService: preferencesService,
 	}
 }
 
 // HomepageData represents the comprehensive data for the user's homepage
 type HomepageData struct {
-	RecentWorkspaces    []WorkspaceActivity `json:"recent_workspaces"`
-	TotalWorkspaceCount int                 `json:"total_workspace_count"`
-	TotalItemCount      int                 `json:"total_item_count"`
-	RecentlyViewed      []ItemActivity      `json:"recently_viewed"`
-	RecentlyEdited      []ItemActivity      `json:"recently_edited"`
-	RecentlyCommented   []ItemActivity      `json:"recently_commented"`
-	WatchedItems        []ItemActivity      `json:"watched_items"`
-	UpcomingMilestones  []MilestoneProgress `json:"upcoming_milestones"`
+	RecentWorkspaces    []WorkspaceActivity        `json:"recent_workspaces"`
+	TotalWorkspaceCount int                        `json:"total_workspace_count"`
+	TotalItemCount      int                        `json:"total_item_count"`
+	RecentlyViewed      []ItemActivity             `json:"recently_viewed"`
+	RecentlyEdited      []ItemActivity             `json:"recently_edited"`
+	RecentlyCommented   []ItemActivity             `json:"recently_commented"`
+	WatchedItems        []ItemActivity             `json:"watched_items"`
+	UpcomingMilestones  []MilestoneProgress        `json:"upcoming_milestones"`
+	Layout              models.UserDashboardLayout `json:"layout"`
+	LayoutRevision      string                     `json:"layout_revision"`
 }
 
 // WorkspaceActivity represents a workspace visit with metadata
@@ -61,11 +71,14 @@ type ItemActivity struct {
 	WorkspaceItemNumber int     `json:"workspace_item_number"`
 	Title               string  `json:"title"`
 	Status              string  `json:"status"`
+	StatusBuiltinKey    string  `json:"status_builtin_key,omitempty"`
 	StatusColor         *string `json:"status_color,omitempty"`
 	PriorityID          *int    `json:"priority_id,omitempty"`
 	PriorityName        *string `json:"priority_name,omitempty"`
+	PriorityBuiltinKey  string  `json:"priority_builtin_key,omitempty"`
 	PriorityColor       *string `json:"priority_color,omitempty"`
 	LastActivity        string  `json:"last_activity"`
+	LastActiveAt        string  `json:"last_active_at,omitempty"`
 	ActivityCount       int     `json:"activity_count"`
 }
 
@@ -101,6 +114,12 @@ func (h *HomepageHandler) GetHomepage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	accessibleWorkspaceIDs, err := GetAccessibleWorkspaceIDs(user, nil, h.permService)
+	if err != nil {
+		respondInternalError(w, r, fmt.Errorf("failed to resolve accessible workspaces: %w", err))
+		return
+	}
+
 	homepageData := HomepageData{
 		RecentWorkspaces:    []WorkspaceActivity{},
 		TotalWorkspaceCount: 0,
@@ -110,10 +129,28 @@ func (h *HomepageHandler) GetHomepage(w http.ResponseWriter, r *http.Request) {
 		RecentlyCommented:   []ItemActivity{},
 		WatchedItems:        []ItemActivity{},
 		UpcomingMilestones:  []MilestoneProgress{},
+		Layout: models.UserDashboardLayout{
+			Sections: []models.UserDashboardSection{},
+			Widgets:  []models.UserDashboardWidget{},
+		},
 	}
 
-	// Get total workspace count (excluding personal workspaces for onboarding purposes)
-	workspaceCount, err := h.workspaceRepo.CountNonPersonal()
+	// Dashboard layout is part of the route snapshot so homepage entry does not
+	// need a second request. A layout read failure is non-critical: the client
+	// can still render its default layout around the rest of the homepage data.
+	if h.preferencesService != nil {
+		layout, revision, layoutErr := h.preferencesService.GetDashboardLayoutSnapshot(user.ID)
+		if layoutErr != nil {
+			slog.Warn("error loading dashboard layout", slog.String("component", "homepage"), slog.Any("error", layoutErr))
+		} else {
+			homepageData.Layout = layout
+			homepageData.LayoutRevision = revision
+		}
+	}
+
+	// Homepage totals cover only the workspaces visible in this request's
+	// permission snapshot.
+	workspaceCount, err := h.workspaceRepo.CountNonPersonalByIDs(accessibleWorkspaceIDs)
 	if err != nil {
 		slog.Warn("error getting workspace count", slog.String("component", "homepage"), slog.Any("error", err))
 		// Continue even if count fails - not critical
@@ -121,8 +158,7 @@ func (h *HomepageHandler) GetHomepage(w http.ResponseWriter, r *http.Request) {
 		homepageData.TotalWorkspaceCount = workspaceCount
 	}
 
-	// Get total item count system-wide (for onboarding purposes)
-	itemCount, err := h.itemRepo.CountActiveNonPersonalItems()
+	itemCount, err := h.itemRepo.CountNonPersonalByWorkspaceIDs(accessibleWorkspaceIDs)
 	if err != nil {
 		slog.Warn("error getting item count", slog.String("component", "homepage"), slog.Any("error", err))
 		// Continue even if count fails - not critical
@@ -132,7 +168,7 @@ func (h *HomepageHandler) GetHomepage(w http.ResponseWriter, r *http.Request) {
 
 	// Batch load workspace details for recent visits
 	if len(userActivity.WorkspaceVisits) > 0 {
-		workspaceActivities, err := h.getWorkspaceActivitiesBatch(userActivity.WorkspaceVisits)
+		workspaceActivities, err := h.getWorkspaceActivitiesBatch(userActivity.WorkspaceVisits, accessibleWorkspaceIDs)
 		if err != nil {
 			slog.Warn("error loading workspace activities", slog.String("component", "homepage"), slog.Any("error", err))
 		} else {
@@ -171,12 +207,16 @@ func (h *HomepageHandler) GetHomepage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Batch load all item details
+	// Load all feed items through the same workspace-scoped list query used by
+	// the item collection surface. Revoked and deleted items are absent from the
+	// result map, so every feed below inherits the same visibility contract.
+	var authorizedItems []models.Item
 	if len(allItemActivities) > 0 {
-		itemDetails, err := h.getItemActivitiesBatch(allItemActivities)
+		itemDetails, items, err := h.getItemActivitiesBatch(r.Context(), allItemActivities, accessibleWorkspaceIDs)
 		if err != nil {
 			slog.Warn("error batch loading items", slog.String("component", "homepage"), slog.Any("error", err))
 		} else {
+			authorizedItems = items
 			// Distribute items to appropriate lists with correct timestamps
 			if viewedItems, ok := userActivity.ItemActivities[services.ActivityView]; ok {
 				for _, activity := range viewedItems {
@@ -211,48 +251,27 @@ func (h *HomepageHandler) GetHomepage(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// Watches are long-lived and survive workspace permission changes;
-			// re-authorize each item's workspace before surfacing the title /
-			// key / status, otherwise a revoked user sees the metadata of items
-			// they can no longer open.
-			workspaceVisible := make(map[int]bool)
 			for _, itemID := range userActivity.ItemWatches {
 				item, exists := itemDetails[itemID]
 				if !exists {
 					continue
 				}
-				visible, cached := workspaceVisible[item.WorkspaceID]
-				if !cached {
-					if h.permService == nil {
-						visible = true
-					} else {
-						ok, permErr := h.permService.HasWorkspacePermission(user.ID, item.WorkspaceID, models.PermissionItemView)
-						if permErr != nil {
-							slog.Warn("watch visibility check failed; hiding item",
-								slog.String("component", "homepage"),
-								slog.Int("user_id", user.ID),
-								slog.Int("item_id", item.ItemID),
-								slog.Int("workspace_id", item.WorkspaceID),
-								slog.Any("error", permErr))
-							visible = false
-						} else {
-							visible = ok
-						}
-					}
-					workspaceVisible[item.WorkspaceID] = visible
-				}
-				if !visible {
-					continue
-				}
 				homepageData.WatchedItems = append(homepageData.WatchedItems, item)
 			}
+			// The feed timestamp is the item's own recency, so watched items
+			// surface when any user updates them, not only the watcher.
+			sort.SliceStable(homepageData.WatchedItems, func(i, j int) bool {
+				left, _ := time.Parse(time.RFC3339, homepageData.WatchedItems[i].LastActiveAt)
+				right, _ := time.Parse(time.RFC3339, homepageData.WatchedItems[j].LastActiveAt)
+				return left.After(right)
+			})
 		}
 	}
 
 	// Load upcoming milestones based on user's recent activity - now uses batch approach
-	milestoneIDs := h.getUpcomingMilestonesBatch(allItemActivities)
+	milestoneIDs := getUpcomingMilestones(authorizedItems, 3)
 	if len(milestoneIDs) > 0 {
-		milestoneStats, err := h.getMilestoneStatsBatch(milestoneIDs)
+		milestoneStats, err := h.getMilestoneStatsBatch(milestoneIDs, accessibleWorkspaceIDs)
 		if err != nil {
 			slog.Warn("error loading milestone stats", slog.String("component", "homepage"), slog.Any("error", err))
 		} else {
@@ -263,18 +282,28 @@ func (h *HomepageHandler) GetHomepage(w http.ResponseWriter, r *http.Request) {
 	respondJSONOK(w, homepageData)
 }
 
-// getWorkspaceActivitiesBatch batch loads workspace details for multiple workspace visits
-func (h *HomepageHandler) getWorkspaceActivitiesBatch(visits []services.WorkspaceVisit) ([]WorkspaceActivity, error) {
-	if len(visits) == 0 {
+// getWorkspaceActivitiesBatch loads current metadata only for visible visits.
+func (h *HomepageHandler) getWorkspaceActivitiesBatch(visits []services.WorkspaceVisit, accessibleWorkspaceIDs []int) ([]WorkspaceActivity, error) {
+	if len(visits) == 0 || len(accessibleWorkspaceIDs) == 0 {
 		return []WorkspaceActivity{}, nil
 	}
 
-	// Build workspace ID list
-	workspaceIDs := make([]int, len(visits))
+	allowed := make(map[int]struct{}, len(accessibleWorkspaceIDs))
+	for _, workspaceID := range accessibleWorkspaceIDs {
+		allowed[workspaceID] = struct{}{}
+	}
+
+	workspaceIDs := make([]int, 0, len(visits))
 	visitMap := make(map[int]services.WorkspaceVisit)
-	for i, visit := range visits {
-		workspaceIDs[i] = visit.WorkspaceID
+	for _, visit := range visits {
+		if _, ok := allowed[visit.WorkspaceID]; !ok {
+			continue
+		}
+		workspaceIDs = append(workspaceIDs, visit.WorkspaceID)
 		visitMap[visit.WorkspaceID] = visit
+	}
+	if len(workspaceIDs) == 0 {
+		return []WorkspaceActivity{}, nil
 	}
 
 	basics, err := h.workspaceRepo.FindBasicsByIDs(workspaceIDs)
@@ -302,10 +331,13 @@ func (h *HomepageHandler) getWorkspaceActivitiesBatch(visits []services.Workspac
 	return activities, nil
 }
 
-// getItemActivitiesBatch batch loads item details for multiple items
-func (h *HomepageHandler) getItemActivitiesBatch(activities map[int]services.ItemActivity) (map[int]ItemActivity, error) {
+// getItemActivitiesBatch loads item details through the canonical item list.
+func (h *HomepageHandler) getItemActivitiesBatch(ctx context.Context, activities map[int]services.ItemActivity, workspaceIDs []int) (map[int]ItemActivity, []models.Item, error) {
 	if len(activities) == 0 {
-		return map[int]ItemActivity{}, nil
+		return map[int]ItemActivity{}, []models.Item{}, nil
+	}
+	if h.itemCRUD == nil {
+		return nil, nil, fmt.Errorf("item query service not available")
 	}
 
 	// Build item ID list
@@ -314,24 +346,40 @@ func (h *HomepageHandler) getItemActivitiesBatch(activities map[int]services.Ite
 		itemIDs = append(itemIDs, id)
 	}
 
-	summaries, err := h.itemRepo.ListHomepageItemSummaries(itemIDs)
+	items, err := h.itemCRUD.ListByIDsContext(ctx, itemIDs, workspaceIDs)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	result := make(map[int]ItemActivity, len(summaries))
-	for _, s := range summaries {
+	result := make(map[int]ItemActivity, len(items))
+	for _, item := range items {
 		itemActivity := ItemActivity{
-			ItemID:              s.ItemID,
-			WorkspaceID:         s.WorkspaceID,
-			WorkspaceItemNumber: s.WorkspaceItemNumber,
-			Title:               s.Title,
-			Status:              s.Status,
-			StatusColor:         s.StatusColor,
-			PriorityID:          s.PriorityID,
-			PriorityName:        s.PriorityName,
-			PriorityColor:       s.PriorityColor,
-			WorkspaceKey:        s.WorkspaceKey,
+			ItemID:              item.ID,
+			WorkspaceID:         item.WorkspaceID,
+			WorkspaceItemNumber: item.WorkspaceItemNumber,
+			Title:               item.Title,
+			Status:              item.StatusName,
+			StatusBuiltinKey:    item.StatusBuiltinKey,
+			PriorityID:          item.PriorityID,
+			PriorityBuiltinKey:  item.PriorityBuiltinKey,
+			WorkspaceKey:        item.WorkspaceKey,
+		}
+		if itemActivity.Status == "" {
+			itemActivity.Status = "Unknown"
+		}
+		itemActivity.StatusColor = optionalString(item.StatusColor)
+		itemActivity.PriorityName = optionalString(item.PriorityName)
+		itemActivity.PriorityColor = optionalString(item.PriorityColor)
+
+		// last_active_at is the item's global recency, so news feeds reflect
+		// updates from any user. last_activity stays the requesting user's own
+		// activity timestamp and is only used by the "your activity" feeds.
+		lastActive := item.LastActiveAt
+		if lastActive.IsZero() {
+			lastActive = item.UpdatedAt
+		}
+		if !lastActive.IsZero() {
+			itemActivity.LastActiveAt = lastActive.Format("2006-01-02T15:04:05Z07:00")
 		}
 
 		if activity, ok := activities[itemActivity.ItemID]; ok {
@@ -344,49 +392,66 @@ func (h *HomepageHandler) getItemActivitiesBatch(activities map[int]services.Ite
 		result[itemActivity.ItemID] = itemActivity
 	}
 
-	return result, nil
+	return result, items, nil
 }
 
-// getUpcomingMilestonesBatch identifies the top 3 most frequently occurring milestones
-// from the loaded item activities (avoids N+1 queries)
-func (h *HomepageHandler) getUpcomingMilestonesBatch(itemActivities map[int]services.ItemActivity) []int {
-	if len(itemActivities) == 0 {
+func optionalString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+// getUpcomingMilestones returns the most common milestones attached to the
+// authorized feed items, ordered deterministically.
+func getUpcomingMilestones(items []models.Item, limit int) []int {
+	if len(items) == 0 || limit <= 0 {
 		return []int{}
 	}
 
-	itemIDs := make([]int, 0, len(itemActivities))
-	for id := range itemActivities {
-		itemIDs = append(itemIDs, id)
+	frequencies := make(map[int]int)
+	for _, item := range items {
+		for _, milestone := range item.Milestones {
+			frequencies[milestone.ID]++
+		}
 	}
-
-	ids, err := h.itemRepo.TopMilestoneIDsForItems(itemIDs, 3)
-	if err != nil {
-		slog.Warn("error loading milestone frequencies", slog.String("component", "homepage"), slog.Any("error", err))
-		return []int{}
+	ids := make([]int, 0, len(frequencies))
+	for id := range frequencies {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		if frequencies[ids[i]] == frequencies[ids[j]] {
+			return ids[i] < ids[j]
+		}
+		return frequencies[ids[i]] > frequencies[ids[j]]
+	})
+	if len(ids) > limit {
+		ids = ids[:limit]
 	}
 	return ids
 }
 
-// getMilestoneStatsBatch batch calculates progress statistics for multiple milestones
-func (h *HomepageHandler) getMilestoneStatsBatch(milestoneIDs []int) ([]MilestoneProgress, error) {
-	stats, err := h.itemRepo.HomepageMilestoneProgressByIDs(milestoneIDs)
-	if err != nil {
-		return nil, err
+// getMilestoneStatsBatch reuses the workspace-scoped planning progress query.
+func (h *HomepageHandler) getMilestoneStatsBatch(milestoneIDs, workspaceIDs []int) ([]MilestoneProgress, error) {
+	if h.planningService == nil {
+		return nil, fmt.Errorf("planning service not available")
 	}
 
-	results := make([]MilestoneProgress, 0, len(stats))
-	for _, s := range stats {
-		progress := MilestoneProgress{
-			MilestoneID:   s.MilestoneID,
-			MilestoneName: s.MilestoneName,
-			TargetDate:    s.TargetDate,
-			CategoryColor: s.CategoryColor,
-			TotalItems:    s.TotalItems,
-			DoneItems:     s.DoneItems,
-			NotDoneItems:  s.TotalItems - s.DoneItems,
+	results := make([]MilestoneProgress, 0, len(milestoneIDs))
+	for _, milestoneID := range milestoneIDs {
+		report, err := h.planningService.GetMilestoneProgress(milestoneID, workspaceIDs)
+		if err != nil {
+			return nil, err
 		}
-		if progress.TotalItems > 0 {
-			progress.PercentComplete = float64(progress.DoneItems) / float64(progress.TotalItems) * 100.0
+		progress := MilestoneProgress{
+			MilestoneID:     report.MilestoneID,
+			MilestoneName:   report.MilestoneName,
+			TargetDate:      report.TargetDate,
+			CategoryColor:   report.CategoryColor,
+			TotalItems:      report.TotalItems,
+			DoneItems:       report.CompletedItems,
+			NotDoneItems:    report.TotalItems - report.CompletedItems,
+			PercentComplete: report.PercentComplete,
 		}
 		results = append(results, progress)
 	}

@@ -1,35 +1,30 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"windshift/internal/database"
 	"windshift/internal/emailutil"
+	"windshift/internal/models"
+	"windshift/internal/repository"
 )
 
-// hashMagicLinkToken returns the at-rest representation of a magic-link token.
-// The token is high-entropy (32 random bytes) and single-use, so a fast hash is
-// sufficient — its only job is to ensure a read-only DB compromise (leaked
-// backup, read replica, blind SQLi) yields no directly usable sign-in links.
-// The hash is deterministic, so the indexed equality lookup is preserved.
-func hashMagicLinkToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
 var (
-	ErrMagicLinkExpired          = errors.New("magic link has expired")
-	ErrMagicLinkInvalid          = errors.New("magic link is invalid")
-	ErrMagicLinkAlreadyUsed      = errors.New("magic link has already been used")
-	ErrMagicLinkChannelMismatch  = errors.New("magic link issued for a different portal")
+	ErrMagicLinkExpired         = errors.New("magic link has expired")
+	ErrMagicLinkInvalid         = errors.New("magic link is invalid")
+	ErrMagicLinkAlreadyUsed     = errors.New("magic link has already been used")
+	ErrMagicLinkChannelMismatch = errors.New("magic link issued for a different portal")
+	// ErrPortalCustomerDeactivated refuses link issuance for a deactivated
+	// customer; the session layer refuses them anyway (WI-1554).
+	ErrPortalCustomerDeactivated = errors.New("portal customer deactivated")
 	ErrPortalCustomerNotFound    = errors.New("portal customer not found")
 	ErrMagicLinkGenerationFailed = errors.New("failed to generate magic link token")
 )
@@ -88,6 +83,18 @@ func (s *MagicLinkService) GenerateApprovalMagicLink(portalCustomerID int, chann
 }
 
 func (s *MagicLinkService) generateMagicLink(portalCustomerID int, channelID *int, expiry time.Duration) (string, error) {
+	// Deactivated customers get no link — the auth paths all refuse them
+	// (WI-1554), so issuing a token would only invite a confusing dead end.
+	// Callers treat this like any other failure (generic success for sign-in
+	// requests, so enumeration is not aided).
+	var deactivatedAt sql.NullTime
+	if err := s.db.QueryRow(`SELECT deactivated_at FROM portal_customers WHERE id = ?`, portalCustomerID).Scan(&deactivatedAt); err != nil {
+		return "", fmt.Errorf("failed to load portal customer state: %w", err)
+	}
+	if deactivatedAt.Valid {
+		return "", ErrPortalCustomerDeactivated
+	}
+
 	tokenBytes := make([]byte, MagicLinkTokenLength)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return "", fmt.Errorf("%w: %w", ErrMagicLinkGenerationFailed, err)
@@ -102,7 +109,7 @@ func (s *MagicLinkService) generateMagicLink(portalCustomerID int, channelID *in
 		INSERT INTO portal_customer_magic_links (portal_customer_id, token, channel_id, expires_at, created_at)
 		VALUES (?, ?, ?, ?, ?)
 	`
-	_, err := s.db.ExecWrite(query, portalCustomerID, hashMagicLinkToken(token), channelID, expiresAt, time.Now())
+	_, err := s.db.ExecWrite(query, portalCustomerID, hashTokenAtRest(token), channelID, expiresAt, time.Now())
 	if err != nil {
 		return "", fmt.Errorf("failed to store magic link token: %w", err)
 	}
@@ -124,7 +131,8 @@ func (s *MagicLinkService) SendMagicLinkEmail(email, name, token, portalSlug str
 	return s.smtpSender.SendTransactional(email, emailutil.TemplateMagicLink, struct {
 		FirstName    string
 		MagicLinkURL string
-	}{name, url})
+		ExpiresIn    string
+	}{name, url, emailutil.HumanizeDuration(MagicLinkExpiry)})
 }
 
 // SendApprovalRequestEmail sends an "approval requested" email to a portal
@@ -144,7 +152,8 @@ func (s *MagicLinkService) SendApprovalRequestEmail(email, name, token, portalSl
 		ItemKey     string
 		ItemTitle   string
 		ApprovalURL string
-	}{name, itemKey, itemTitle, approvalURL})
+		ExpiresIn   string
+	}{name, itemKey, itemTitle, approvalURL, emailutil.HumanizeDuration(ApprovalMagicLinkExpiry)})
 }
 
 // ValidateMagicLink validates a magic link token presented at a specific
@@ -177,7 +186,7 @@ func (s *MagicLinkService) ValidateMagicLink(token string, expectedChannelID int
 	var usedAt sql.NullTime
 	var email, name string
 
-	err := s.db.QueryRow(query, hashMagicLinkToken(token)).Scan(
+	err := s.db.QueryRow(query, hashTokenAtRest(token)).Scan(
 		&linkID, &portalCustomerID, &channelID, &expiresAt, &usedAt,
 		&email, &name,
 	)
@@ -237,80 +246,32 @@ func (s *MagicLinkService) ValidateMagicLink(token string, expectedChannelID int
 	return hint, nil
 }
 
-// FindOrCreatePortalCustomer finds a portal customer by email or creates one if it doesn't exist
+// FindOrCreatePortalCustomer finds a portal customer by email or creates one
+// if it doesn't exist, then grants access to the channel.
 func (s *MagicLinkService) FindOrCreatePortalCustomer(email, name string, channelID int) (int, error) {
-	// First try to find existing customer
-	var customerID int
-	findQuery := `SELECT id FROM portal_customers WHERE email = ?`
-	err := s.db.QueryRow(findQuery, email).Scan(&customerID)
-
-	if err == nil {
-		// Customer exists, grant channel access if not already granted
-		s.grantChannelAccess(customerID, channelID)
-		return customerID, nil
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return 0, fmt.Errorf("email is required")
 	}
 
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("failed to find portal customer: %w", err)
-	}
-
-	// Customer doesn't exist, create new one
-	now := time.Now()
-	insertQuery := `
-		INSERT INTO portal_customers (name, email, created_at, updated_at)
-		VALUES (?, ?, ?, ?)
-		RETURNING id
-	`
-	err = s.db.QueryRow(insertQuery, name, email, now, now).Scan(&customerID)
+	repo := repository.NewPortalCustomerRepository(s.db)
+	customerID, created, err := repo.FindOrCreateByEmail(context.Background(), name, email, models.CustomerCreatedViaMagicLink)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create portal customer: %w", err)
+		return 0, err
+	}
+	if _, err := repo.EnsureChannelAccess(customerID, channelID); err != nil {
+		return 0, err
 	}
 
-	// Grant channel access
-	s.grantChannelAccess(customerID, channelID)
-
-	slog.Info("portal customer created", slog.String("component", "magic_link"), slog.Int("portal_customer_id", customerID), slog.String("email", email))
+	if created {
+		slog.Info("portal customer created", slog.String("component", "magic_link"), slog.Int("portal_customer_id", customerID), slog.String("email", email))
+	}
 	return customerID, nil
-}
-
-// grantChannelAccess grants a portal customer access to a channel if not already granted
-func (s *MagicLinkService) grantChannelAccess(portalCustomerID, channelID int) {
-	// Check if already has access
-	var accessID int
-	checkQuery := `SELECT id FROM portal_customer_channels WHERE portal_customer_id = ? AND channel_id = ?`
-	err := s.db.QueryRow(checkQuery, portalCustomerID, channelID).Scan(&accessID)
-	if err == nil {
-		// Already has access
-		return
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		slog.Error("failed to check existing portal channel access",
-			slog.String("component", "magic_link"),
-			slog.Int("portal_customer_id", portalCustomerID),
-			slog.Int("channel_id", channelID),
-			slog.Any("error", err),
-		)
-		return
-	}
-
-	// Grant access
-	insertQuery := `
-		INSERT INTO portal_customer_channels (portal_customer_id, channel_id, created_at)
-		VALUES (?, ?, ?)
-	`
-	if _, err := s.db.ExecWrite(insertQuery, portalCustomerID, channelID, time.Now()); err != nil {
-		slog.Error("failed to grant portal channel access",
-			slog.String("component", "magic_link"),
-			slog.Int("portal_customer_id", portalCustomerID),
-			slog.Int("channel_id", channelID),
-			slog.Any("error", err),
-		)
-	}
 }
 
 // GetPortalCustomerByEmail finds a portal customer by email
 func (s *MagicLinkService) GetPortalCustomerByEmail(email string) (customerID int, firstName string, err error) {
-	query := `SELECT id, name FROM portal_customers WHERE email = ?`
+	query := `SELECT id, name FROM portal_customers WHERE LOWER(email) = LOWER(?)`
 	err = s.db.QueryRow(query, email).Scan(&customerID, &firstName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

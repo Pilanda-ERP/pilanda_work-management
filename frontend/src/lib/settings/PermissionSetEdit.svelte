@@ -10,10 +10,10 @@
   import UserPicker from '../pickers/UserPicker.svelte';
   import RolePicker from '../pickers/RolePicker.svelte';
   import GroupPicker from '../pickers/GroupPicker.svelte';
-  import Textarea from '../components/Textarea.svelte';
-  import Label from '../components/Label.svelte';
   import Chip from '../components/Chip.svelte';
   import { confirm } from '../composables/useConfirm.js';
+	import TextareaField from '../components/TextareaField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let permissionSetId = $state(null);
   let permissionSet = $state(null);
@@ -299,22 +299,24 @@
         <h2 class="text-lg font-semibold mb-4" style="color: var(--ds-text);">{t('settings.permissionSets.basicInfo')}</h2>
         <div class="space-y-4">
           <div>
-            <Label color="default" required class="mb-1">{t('common.name')}</Label>
-            <input
+            <TextField
+              label={t('common.name')}
+              required
+              labelColor="default"
               type="text"
-              bind:value={formData.name}
-              class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
               placeholder={t('settings.permissionSets.namePlaceholder')}
+              size="small"
+              bind:value={formData.name}
             />
           </div>
 
           <div>
-            <Label color="default" class="mb-1">{t('common.description')}</Label>
-            <Textarea
-              bind:value={formData.description}
+            <TextareaField
+              label={t('common.description')}
+              labelColor="default"
               rows={3}
               placeholder={t('settings.permissionSets.descriptionPlaceholder')}
+              bind:value={formData.description}
             />
           </div>
 
@@ -363,7 +365,7 @@
 
                       <button
                       onclick={() => openAssignmentPicker(permission.id)}
-                      class="inline-flex items-center px-2.5 py-1 rounded-full text-xs border-2 border-dashed transition-colors hover:border-blue-400 hover:text-blue-600 hover:bg-blue-50"
+                      class="inline-flex items-center px-2.5 py-1 rounded-full text-xs border-2 border-dashed transition-colors hover:border-ds-accent-blue hover:text-ds-accent-blue hover:bg-ds-accent-blue-subtle"
                       style="border-color: var(--ds-border); color: var(--ds-text-subtle);"
                     >
                       <UserPlus class="w-3 h-3 mr-1" />

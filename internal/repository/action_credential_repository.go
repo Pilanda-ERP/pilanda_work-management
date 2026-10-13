@@ -104,7 +104,7 @@ func (r *ActionCredentialRepository) ListAllActionCredentials() ([]*models.Actio
 	)
 }
 
-func (r *ActionCredentialRepository) queryActionCredentials(errLabel, query string, args ...interface{}) ([]*models.ActionCredential, error) {
+func (r *ActionCredentialRepository) queryActionCredentials(errLabel, query string, args ...any) ([]*models.ActionCredential, error) {
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", errLabel, err)
@@ -133,7 +133,7 @@ func (r *ActionCredentialRepository) queryActionCredentials(errLabel, query stri
 // ActionRepository.populateWorkspaceIDs.
 func (r *ActionCredentialRepository) populateCredentialWorkspaceIDs(creds []*models.ActionCredential) error {
 	scopedByID := map[int]*models.ActionCredential{}
-	ids := []interface{}{}
+	ids := []any{}
 	for _, c := range creds {
 		if !c.AppliesToAllWorkspaces {
 			scopedByID[c.ID] = c
@@ -171,6 +171,10 @@ func (r *ActionCredentialRepository) populateCredentialWorkspaceIDs(creds []*mod
 // caller is responsible for encrypting the secret before calling, and for
 // calling SetCredentialWorkspaces afterward when AppliesToAllWorkspaces=false.
 func (r *ActionCredentialRepository) CreateActionCredential(c *models.ActionCredential) (int, error) {
+	return createActionCredential(r.db, c)
+}
+
+func createActionCredential(writer capabilityWriter, c *models.ActionCredential) (int, error) {
 	if strings.TrimSpace(c.EncryptedSecret) == "" {
 		return 0, errors.New("action credential: encrypted_secret is required")
 	}
@@ -178,7 +182,7 @@ func (r *ActionCredentialRepository) CreateActionCredential(c *models.ActionCred
 	c.CreatedAt = now
 	c.UpdatedAt = now
 	var id int64
-	err := r.db.QueryRow(`
+	err := writer.QueryRow(`
 		INSERT INTO action_credentials
 			(name, credential_type, applies_to_all_workspaces, created_by, encrypted_secret,
 			 secret_prefix, secret_metadata, is_enabled, created_at, updated_at)
@@ -196,12 +200,35 @@ func (r *ActionCredentialRepository) CreateActionCredential(c *models.ActionCred
 	return c.ID, nil
 }
 
+// CreateActionCredentialWithWorkspaces inserts the encrypted credential and
+// its scope rows atomically. If any workspace reference is stale, no orphaned
+// credential row is committed.
+func (r *ActionCredentialRepository) CreateActionCredentialWithWorkspaces(c *models.ActionCredential, workspaceIDs []int) (int, error) {
+	var id int
+	err := database.WithTx(r.db, func(tx database.Tx) error {
+		createdID, err := createActionCredential(tx, c)
+		if err != nil {
+			return err
+		}
+		id = createdID
+		return setCredentialWorkspaces(tx, id, workspaceIDs)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // UpdateActionCredentialMetadata updates non-secret fields including the
 // workspace-scope flag. Use RotateActionCredential to replace secret material,
 // and SetCredentialWorkspaces to change the workspace allowlist.
 func (r *ActionCredentialRepository) UpdateActionCredentialMetadata(c *models.ActionCredential) error {
+	return updateActionCredentialMetadata(r.db, c)
+}
+
+func updateActionCredentialMetadata(writer capabilityWriter, c *models.ActionCredential) error {
 	c.UpdatedAt = time.Now()
-	_, err := r.db.ExecWrite(`
+	_, err := writer.ExecWrite(`
 		UPDATE action_credentials
 		SET name = ?, secret_metadata = ?, is_enabled = ?, applies_to_all_workspaces = ?, updated_at = ?
 		WHERE id = ?
@@ -210,6 +237,53 @@ func (r *ActionCredentialRepository) UpdateActionCredentialMetadata(c *models.Ac
 		return fmt.Errorf("failed to update action credential: %w", err)
 	}
 	return nil
+}
+
+// UpdateActionCredentialMetadataWithWorkspaces updates metadata and scope in
+// one transaction so a failed allowlist replacement cannot widen, narrow, or
+// strand the credential independently of the returned error.
+func (r *ActionCredentialRepository) UpdateActionCredentialMetadataWithWorkspaces(c *models.ActionCredential, workspaceIDs []int) error {
+	return database.WithTx(r.db, func(tx database.Tx) error {
+		if err := updateActionCredentialMetadata(tx, c); err != nil {
+			return err
+		}
+		return setCredentialWorkspaces(tx, c.ID, workspaceIDs)
+	})
+}
+
+// UpdateManagedCredentialTx updates a provider-owned credential inside the
+// caller's transaction so provider policy and credential scope cannot diverge.
+func (r *ActionCredentialRepository) UpdateManagedCredentialTx(tx database.Tx, c *models.ActionCredential, workspaceIDs []int, encryptedSecret, prefix *string) error {
+	if err := updateActionCredentialMetadata(tx, c); err != nil {
+		return err
+	}
+	if err := setCredentialWorkspaces(tx, c.ID, workspaceIDs); err != nil {
+		return err
+	}
+	if encryptedSecret != nil && prefix != nil {
+		_, err := tx.ExecWrite(`UPDATE action_credentials
+			SET encrypted_secret = ?, secret_prefix = ?, updated_at = ? WHERE id = ?`,
+			*encryptedSecret, nullableString(*prefix), time.Now(), c.ID)
+		return err
+	}
+	return nil
+}
+
+// UpdateManagedCredentialSecretTx rotates only secret material. The metadata
+// predicate keeps the provider purpose/owner check valid at the write point,
+// while deliberately leaving name, enabled state, and workspace scope alone.
+func (r *ActionCredentialRepository) UpdateManagedCredentialSecretTx(tx database.Tx, id int, expectedMetadata, encryptedSecret, prefix string) (bool, error) {
+	if strings.TrimSpace(encryptedSecret) == "" {
+		return false, errors.New("managed action credential: encrypted_secret is required")
+	}
+	result, err := tx.ExecWrite(`UPDATE action_credentials
+		SET encrypted_secret = ?, secret_prefix = ?, updated_at = ?
+		WHERE id = ? AND secret_metadata = ?`, encryptedSecret, nullableString(prefix), time.Now(), id, expectedMetadata)
+	if err != nil {
+		return false, fmt.Errorf("failed to rotate managed action credential: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
 }
 
 // RotateActionCredential replaces the encrypted secret and prefix on an
@@ -288,18 +362,22 @@ func (r *ActionCredentialRepository) GetCredentialWorkspaceIDs(credentialID int)
 // Pass an empty slice to clear (only meaningful when AppliesToAllWorkspaces is
 // false; the caller is responsible for that invariant).
 func (r *ActionCredentialRepository) SetCredentialWorkspaces(credentialID int, workspaceIDs []int) error {
-	if _, err := r.db.ExecWrite(`DELETE FROM action_credential_workspaces WHERE credential_id = ?`, credentialID); err != nil {
+	return setCredentialWorkspaces(r.db, credentialID, workspaceIDs)
+}
+
+func setCredentialWorkspaces(writer capabilityWriter, credentialID int, workspaceIDs []int) error {
+	if _, err := writer.ExecWrite(`DELETE FROM action_credential_workspaces WHERE credential_id = ?`, credentialID); err != nil {
 		return fmt.Errorf("failed to clear credential workspace scope: %w", err)
 	}
 	for _, wsID := range workspaceIDs {
-		if _, err := r.db.ExecWrite(`INSERT INTO action_credential_workspaces (credential_id, workspace_id) VALUES (?, ?)`, credentialID, wsID); err != nil {
+		if _, err := writer.ExecWrite(`INSERT INTO action_credential_workspaces (credential_id, workspace_id) VALUES (?, ?)`, credentialID, wsID); err != nil {
 			return fmt.Errorf("failed to add credential workspace scope (ws %d): %w", wsID, err)
 		}
 	}
 	return nil
 }
 
-func nullableString(s string) interface{} {
+func nullableString(s string) any {
 	if s == "" {
 		return nil
 	}

@@ -2,17 +2,20 @@
   import { BasePicker } from '.';
   import { createAsyncLoader } from '../composables';
   import { api } from '../api.js';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { Shield } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
 
   let {
     value = $bindable(null),
+    id = undefined,
     placeholder = '',
     label = '',
     disabled = false,
+    multiple = false,
     class: className = '',
     onSelect = () => {},
+    onChange = () => {},
     onCancel = () => {}
   } = $props();
 
@@ -21,22 +24,27 @@
   const roles = createAsyncLoader(() => api.get('/workspace-roles'));
 
   onMount(() => roles.load());
+  onDestroy(() => roles.dispose());
 </script>
 
 <BasePicker
   bind:value
+  {id}
   items={roles.data}
   loading={roles.loading}
   error={roles.error}
   placeholder={resolvedPlaceholder}
   {label}
   {disabled}
+  {multiple}
   class={className}
   searchFields={['name', 'description']}
   getValue={(role) => role?.id}
   getLabel={(role) => role?.name ?? ''}
   onSelect={(item) => onSelect(item)}
+  onChange={(roleIDs) => onChange(roleIDs)}
   onCancel={() => onCancel()}
+  optionTestid={(option) => `role-picker-option-${option.value}`}
 >
   {#snippet itemSnippet({ item: role, isSelected })}
     <div class="flex items-center gap-3 flex-1 min-w-0">

@@ -5,25 +5,59 @@
   import {
     IconGripVertical, IconTrash, IconAsterisk, IconSearch, IconPlus, IconDeviceFloppy,
     IconSettings, IconArrowLeft, IconTextSize, IconForms, IconCheckbox, IconSelect, IconAlignBoxLeftTop,
-    IconPencil
+    IconPencil, IconEye, IconExternalLink
   } from '@tabler/icons-svelte-runes';
   import { t } from '../../stores/i18n.svelte.js';
+  import { api } from '../../api.js';
+  import { workspacesStore } from '../../stores/workspaces.svelte.js';
   import { formBuilderStore } from '../../stores/formBuilderStore.svelte.js';
   import { errorToast, successToast } from '../../stores/toasts.svelte.js';
   import { confirm } from '../../composables/useConfirm.js';
   import Button from '../../components/Button.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
   import Input from '../../components/Input.svelte';
+  import Checkbox from '../../components/Checkbox.svelte';
+  import Textarea from '../../components/Textarea.svelte';
   import Label from '../../components/Label.svelte';
   import Spinner from '../../components/Spinner.svelte';
+  import BasePicker from '../../pickers/BasePicker.svelte';
+  import IconSelector from '../../pickers/IconSelector.svelte';
+  import DescriptionText from '../../components/DescriptionText.svelte';
+  import CopyButton from '../../components/CopyButton.svelte';
+  import { publicBaseURL } from '../../runtime/contextPath.js';
   import FormFieldPalette from './FormFieldPalette.svelte';
+  import FormPreviewModal from './FormPreviewModal.svelte';
+	import TextField from '../../components/TextField.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
 
-  let { channelId, onBack = () => {}, onCreateForm = null, embedded = true } = $props();
+  let {
+    channelId,
+    channelSlug = '',
+    channelWorkspaceIds = [],
+    channelBrandColor = '#14b8a6',
+    onBack = () => {},
+    onCreateForm = null,
+    onOpenSettings = () => {},
+    embedded = true,
+  } = $props();
 
   let saving = $state(false);
+  let savingRouting = $state(false);
   let showSettings = $state(false);
+  let showPreview = $state(false);
   let setupCleanups = [];
   let expandedFields = $state(new Set());
+  let previewCustomFieldDefinitions = $state([]);
+  let directFormUrl = $derived(
+    formBuilderStore.editingForm && channelSlug
+      ? `${publicBaseURL()}/forms/${channelSlug}/${formBuilderStore.editingForm.id}`
+      : ''
+  );
+
+  // Routing-metadata editing (workspace / item type / identity).
+  let availableWorkspaces = $state([]);
+  let routingItemTypes = $state([]);
+  let configSets = [];
 
   function toggleFieldExpanded(fieldKey) {
     const next = new Set(expandedFields);
@@ -34,7 +68,84 @@
 
   onMount(async () => {
     await formBuilderStore.loadForms(channelId);
+    try {
+      const [allConfigSets, customFields] = await Promise.all([
+        api.configurationSets.getAll(),
+        api.customFields.getAll(),
+      ]);
+      const allWorkspaces = await workspacesStore.load();
+      configSets = allConfigSets?.configuration_sets || [];
+      previewCustomFieldDefinitions = customFields || [];
+      availableWorkspaces = (channelWorkspaceIds && channelWorkspaceIds.length > 0)
+        ? allWorkspaces.filter(ws => channelWorkspaceIds.includes(ws.id))
+        : allWorkspaces;
+    } catch (err) {
+      console.error('Failed to load workspaces for routing:', err);
+    }
   });
+
+  onMount(() => {
+    function warnBeforeUnload(event) {
+      if (!formBuilderStore.hasUnsavedChanges) return;
+      event.preventDefault();
+      event.returnValue = '';
+    }
+    window.addEventListener('beforeunload', warnBeforeUnload);
+    return () => window.removeEventListener('beforeunload', warnBeforeUnload);
+  });
+
+  // Reload selectable item types when the routing workspace changes, scoped to
+  // that workspace's configuration set (mirrors CreateFormModal). Only clears
+  // item_type_id when the current selection isn't valid in the new workspace,
+  // so editing an existing form doesn't wipe its item type on initial load.
+  $effect(() => {
+    const wsId = formBuilderStore.routingMeta.workspace_id;
+    if (!wsId) {
+      routingItemTypes = [];
+      return;
+    }
+    const ws = availableWorkspaces.find(w => w.id === wsId);
+    let configSetId = ws?.configuration_set_id;
+    if (!configSetId) {
+      const defaultCs = configSets.find(cs => cs.is_default);
+      if (defaultCs) configSetId = defaultCs.id;
+    }
+    const filters = configSetId ? { configuration_set_id: configSetId } : {};
+    const requestedWsId = wsId;
+    api.itemTypes.getAll(filters).then(types => {
+      if (formBuilderStore.routingMeta.workspace_id !== requestedWsId) return;
+      routingItemTypes = types;
+      const current = formBuilderStore.routingMeta.item_type_id;
+      if (current && !types.some(ty => ty.id === current)) {
+        formBuilderStore.routingMeta.item_type_id = null;
+      }
+    }).catch(err => {
+      if (formBuilderStore.routingMeta.workspace_id !== requestedWsId) return;
+      console.error('Failed to load item types for routing:', err);
+      routingItemTypes = [];
+    });
+  });
+
+  async function handleSaveRouting() {
+    const meta = formBuilderStore.routingMeta;
+    if (!meta.name.trim()) {
+      errorToast(t('forms.formNameRequired', 'Name is required'));
+      return;
+    }
+    if (!meta.workspace_id || !meta.item_type_id) {
+      errorToast(t('forms.selectItemType', 'Please select an item type'));
+      return;
+    }
+    try {
+      savingRouting = true;
+      await formBuilderStore.saveRoutingMetadata();
+      successToast(t('common.saved'));
+    } catch (err) {
+      errorToast(err.message || t('common.error'));
+    } finally {
+      savingRouting = false;
+    }
+  }
 
   onDestroy(() => {
     setupCleanups.forEach(fn => fn());
@@ -142,6 +253,9 @@
       saving = true;
       await formBuilderStore.saveFormFields();
       await formBuilderStore.saveFormConfig();
+      if (formBuilderStore.hasUnsavedRoutingChanges) {
+        await formBuilderStore.saveRoutingMetadata();
+      }
       successToast(t('common.saved'));
     } catch (err) {
       errorToast(err.message || t('common.error'));
@@ -150,8 +264,17 @@
     }
   }
 
-  function handleBack() {
+  async function handleBack() {
     if (formBuilderStore.showFieldEditor) {
+      if (formBuilderStore.hasUnsavedChanges) {
+        const discard = await confirm({
+          title: 'Discard unsaved form changes?',
+          message: 'Your field and per-form setting changes have not been saved.',
+          confirmText: 'Discard changes',
+          variant: 'danger',
+        });
+        if (!discard) return;
+      }
       formBuilderStore.cancelFieldEditor();
     } else {
       onBack();
@@ -251,15 +374,54 @@
             {t('forms.title')}
           {/if}
         </h3>
+        {#if formBuilderStore.showFieldEditor}
+          <p class="text-xs" style="color: {formBuilderStore.hasUnsavedChanges ? 'var(--ds-text-warning)' : 'var(--ds-text-subtle)'};">
+            {formBuilderStore.hasUnsavedChanges
+              ? 'Unsaved changes'
+              : 'All changes saved'}
+          </p>
+        {/if}
       </div>
     </div>
     {#if formBuilderStore.showFieldEditor}
       <div class="flex items-center gap-2">
         <Button
+          onclick={() => showPreview = true}
+          variant="default"
+          size="small"
+          icon={IconEye}
+          dataTestid="form-builder-preview-btn"
+        >
+          {t('common.preview')}
+        </Button>
+        {#if directFormUrl}
+          <CopyButton text={directFormUrl} size="sm" label="Copy link" />
+          <Button
+            onclick={() => window.open(directFormUrl, '_blank', 'noopener')}
+            variant="default"
+            size="small"
+            icon={IconExternalLink}
+            dataTestid="form-builder-open-btn"
+          >
+            {t('channel.openForm')}
+          </Button>
+        {:else}
+          <Button
+            onclick={onOpenSettings}
+            variant="default"
+            size="small"
+            icon={IconExternalLink}
+            dataTestid="form-builder-configure-slug-btn"
+          >
+            Set public URL
+          </Button>
+        {/if}
+        <Button
           onclick={() => showSettings = !showSettings}
           variant="default"
           size="small"
           icon={IconSettings}
+          dataTestid="form-builder-settings-btn"
         >
           {t('forms.settings.title')}
         </Button>
@@ -269,6 +431,7 @@
           size="small"
           icon={IconDeviceFloppy}
           disabled={saving}
+          dataTestid="form-builder-save-btn"
         >
           {saving ? t('common.saving') : t('common.save')}
         </Button>
@@ -289,26 +452,130 @@
         {#if showSettings}
           <!-- Per-form Settings -->
           <div class="max-w-xl mx-auto space-y-4">
+            <!-- Routing metadata: identity + where submissions are created -->
+            <h4 class="text-sm font-semibold" style="color: var(--ds-text);">{t('forms.routing.title')}</h4>
+            <DescriptionText>
+              Each response creates a work item in the selected target workspace using the selected item type.
+            </DescriptionText>
+
+            <div>
+              <TextField
+                label={t('forms.formName')}
+                id="form-routing-name"
+                required
+                labelColor="default"
+                placeholder={t('forms.formNamePlaceholder')}
+                bind:value={formBuilderStore.routingMeta.name}
+              />
+            </div>
+
+            <div>
+              <TextareaField
+                label={t('forms.formDescription')}
+                labelColor="default"
+                rows={2}
+                placeholder={t('forms.formDescriptionPlaceholder')}
+                bind:value={formBuilderStore.routingMeta.description}
+              />
+            </div>
+
+            <div>
+              <IconSelector
+                bind:selectedIcon={formBuilderStore.routingMeta.icon}
+                bind:selectedColor={formBuilderStore.routingMeta.color}
+                label={t('portal.iconAndColor')}
+                compact
+              />
+            </div>
+
+            <div>
+              <Label color="default" required class="mb-2">{t('channel.targetWorkspace')}</Label>
+              <BasePicker
+                id="form-routing-workspace"
+                bind:value={formBuilderStore.routingMeta.workspace_id}
+                items={availableWorkspaces}
+                placeholder={t('channel.selectWorkspace')}
+                getValue={(item) => item.id}
+                getLabel={(item) => item.name}
+                optionTestid={(opt) => `form-routing-ws-${opt.value}`}
+                disabled
+              />
+            </div>
+
+            <div>
+              <Label color="default" required class="mb-2">{t('forms.createsItemType')}</Label>
+              <BasePicker
+                id="form-routing-itemtype"
+                bind:value={formBuilderStore.routingMeta.item_type_id}
+                items={routingItemTypes}
+                placeholder={t('forms.selectItemType')}
+                getValue={(item) => item.id}
+                getLabel={(item) => item.name}
+                disabled
+                optionTestid={(opt) => `form-routing-it-${opt.value}`}
+              />
+              <DescriptionText>{t('portal.bindingLocked', 'Fixed after creation. Delete and recreate the request type to change it.')}</DescriptionText>
+            </div>
+
+            <Button
+              onclick={handleSaveRouting}
+              variant="primary"
+              size="small"
+              icon={IconDeviceFloppy}
+              dataTestid="form-routing-save-btn"
+              disabled={savingRouting || !formBuilderStore.routingMeta.name.trim() || !formBuilderStore.routingMeta.workspace_id || !formBuilderStore.routingMeta.item_type_id}
+            >
+              {savingRouting ? t('common.saving') : t('forms.routing.save', 'Save routing')}
+            </Button>
+
+            <hr style="border-color: var(--ds-border);" />
+
             <h4 class="text-sm font-semibold" style="color: var(--ds-text);">{t('forms.settings.title')}</h4>
+            <DescriptionText>
+              These settings apply only to this form. Branding and the public URL are channel settings.
+            </DescriptionText>
 
-            <div class="flex items-center gap-3">
-              <input type="checkbox" bind:checked={formBuilderStore.formConfig.require_auth} class="rounded" />
-              <Label color="default">{t('forms.settings.requireAuth')}</Label>
+            <Checkbox
+              id="form-require-auth"
+              bind:checked={formBuilderStore.formConfig.require_auth}
+              label={t('forms.settings.requireAuth')}
+              hint="Only signed-in Windshift users can submit this form."
+            />
+
+            <Checkbox
+              id="form-allow-attachments"
+              dataTestid="form-allow-attachments"
+              bind:checked={formBuilderStore.formConfig.allow_attachments}
+              label={t('forms.settings.allowAttachments')}
+            />
+
+            <div>
+              <TextField
+                label={t('forms.settings.submitButton')}
+                labelColor="default"
+                placeholder="Submit"
+                bind:value={formBuilderStore.formConfig.submit_button_text}
+              />
             </div>
 
             <div>
-              <Label color="default" class="mb-2">{t('forms.settings.submitButton')}</Label>
-              <Input bind:value={formBuilderStore.formConfig.submit_button_text} placeholder="Submit" />
+              <TextField
+                label={t('forms.settings.successMessage')}
+                labelColor="default"
+                placeholder={t('forms.settings.successMessagePlaceholder')}
+                bind:value={formBuilderStore.formConfig.success_message}
+              />
+              <DescriptionText>Shown after a response is accepted.</DescriptionText>
             </div>
 
             <div>
-              <Label color="default" class="mb-2">{t('forms.settings.successMessage')}</Label>
-              <Input bind:value={formBuilderStore.formConfig.success_message} placeholder={t('forms.settings.successMessagePlaceholder')} />
-            </div>
-
-            <div>
-              <Label color="default" class="mb-2">{t('forms.settings.redirectUrl')}</Label>
-              <Input bind:value={formBuilderStore.formConfig.redirect_url} placeholder="https://example.com/thank-you" />
+              <TextField
+                label={t('forms.settings.redirectUrl')}
+                labelColor="default"
+                placeholder="https://example.com/thank-you"
+                bind:value={formBuilderStore.formConfig.redirect_url}
+              />
+              <DescriptionText>Optional HTTPS destination opened after a successful response.</DescriptionText>
             </div>
 
             <Button onclick={() => showSettings = false} variant="default" size="small">
@@ -371,31 +638,37 @@
                     <!-- Edit toggle -->
                     <button
                       onclick={() => toggleFieldExpanded(fieldKey)}
-                      class="p-1 rounded transition-colors"
+                      data-testid={`form-field-edit-${index}`}
+                      class="flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors"
                       style="color: {isExpanded ? 'var(--ds-interactive)' : 'var(--ds-text-disabled)'};"
                       title="Edit label and help text"
                     >
                       <IconPencil class="w-4 h-4" />
+                      Edit
                     </button>
 
                     <!-- Required toggle -->
                     <button
                       onclick={() => formBuilderStore.toggleFieldRequired(index)}
-                      class="p-1 rounded transition-colors"
+                      data-testid={`form-field-required-${index}`}
+                      class="flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors"
                       style="color: {field.is_required ? 'var(--ds-text-danger)' : 'var(--ds-text-disabled)'};"
                       title={field.is_required ? t('forms.builder.required') : t('forms.builder.optional')}
                     >
                       <IconAsterisk class="w-4 h-4" />
+                      {field.is_required ? t('forms.builder.required') : t('forms.builder.optional')}
                     </button>
 
                     <!-- Remove button -->
                     <button
                       onclick={() => formBuilderStore.removeField(index)}
-                      class="p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity hover:bg-[var(--ds-background-danger-hovered)]"
+                      data-testid={`form-field-remove-${index}`}
+                      class="flex items-center gap-1 rounded px-2 py-1 text-xs hover:bg-[var(--ds-background-danger-hovered)]"
                       style="color: var(--ds-text-danger);"
                       title={t('common.remove')}
                     >
                       <IconTrash class="w-4 h-4" />
+                      {t('common.remove')}
                     </button>
                   </div>
 
@@ -405,25 +678,23 @@
                       {#if isExpanded}
                         <div>
                           <Label color="default" class="mb-1">Label</Label>
-                          <input
+                          <Input
                             type="text"
                             value={field.display_name ?? ''}
                             oninput={(e) => formBuilderStore.updateFieldProperty(index, 'display_name', e.currentTarget.value)}
                             placeholder={field.field_name || field.field_identifier}
-                            class="w-full px-2 py-1 text-sm rounded border"
-                            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+                            size="small"
                           />
                         </div>
                         <div>
                           <Label color="default" class="mb-1">Help text</Label>
-                          <textarea
+                          <Textarea
                             value={field.description ?? ''}
                             oninput={(e) => formBuilderStore.updateFieldProperty(index, 'description', e.currentTarget.value)}
-                            rows="2"
+                            rows={2}
                             placeholder="Optional instructions shown below the field"
-                            class="w-full px-2 py-1 text-sm rounded border"
-                            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-                          ></textarea>
+                            size="small"
+                          />
                         </div>
                       {/if}
 
@@ -431,21 +702,21 @@
                       <div class="text-xs font-semibold" style="color: var(--ds-text-subtle);">Options</div>
                       {#each options as opt, optIdx (optIdx)}
                         <div class="flex items-center gap-2">
-                          <input
+                          <Input
                             type="text"
                             value={opt.label ?? ''}
                             oninput={(e) => updateOptionLabel(index, optIdx, e.currentTarget.value)}
                             placeholder="Label"
-                            class="flex-1 px-2 py-1 text-sm rounded border"
-                            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+                            class="flex-1"
+                            size="small"
                           />
-                          <input
+                          <Input
                             type="text"
                             value={opt.value ?? ''}
                             oninput={(e) => updateOptionValue(index, optIdx, e.currentTarget.value)}
                             placeholder="value"
-                            class="w-32 px-2 py-1 text-sm rounded border"
-                            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+                            class="w-32"
+                            size="small"
                           />
                           <button
                             onclick={() => removeOption(index, optIdx)}
@@ -490,7 +761,8 @@
         >
           {#snippet action()}
             {#if onCreateForm}
-              <Button onclick={onCreateForm} variant="primary" size="small" icon={IconPlus}>
+              <!-- shortcut-guard-exempt: This is the page's single primary action. -->
+              <Button onclick={onCreateForm} variant="primary" size="small" icon={IconPlus} dataTestid="form-create-open">
                 {t('forms.createForm')}
               </Button>
             {/if}
@@ -500,7 +772,8 @@
         <div class="space-y-2 max-w-2xl mx-auto">
           {#if onCreateForm}
             <div class="flex justify-end mb-2">
-              <Button onclick={onCreateForm} variant="primary" size="small" icon={IconPlus}>
+              <!-- shortcut-guard-exempt: This is the page's single primary action. -->
+              <Button onclick={onCreateForm} variant="primary" size="small" icon={IconPlus} dataTestid="form-create-open">
                 {t('forms.createForm')}
               </Button>
             </div>
@@ -509,6 +782,7 @@
             <div
               role="button"
               tabindex="0"
+              data-testid={`form-row-${form.id}`}
               onclick={() => formBuilderStore.startEditFields(form)}
               onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); formBuilderStore.startEditFields(form); } }}
               class="group w-full flex items-center gap-4 p-4 rounded-lg border transition-colors hover:bg-[var(--ds-background-neutral-hovered)] cursor-pointer"
@@ -530,7 +804,7 @@
                 size="small"
                 icon={IconTrash}
                 title={t('forms.deleteForm')}
-                class="opacity-0 group-hover:opacity-100 !text-[var(--ds-text-danger)]"
+                class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 !text-[var(--ds-text-danger)]"
               />
             </div>
           {/each}
@@ -539,3 +813,13 @@
     </div>
   {/if}
 </div>
+
+<FormPreviewModal
+  bind:isOpen={showPreview}
+  form={formBuilderStore.editingForm}
+  fields={formBuilderStore.formFields}
+  customFieldDefinitions={previewCustomFieldDefinitions}
+  formConfig={formBuilderStore.formConfig}
+  brandColor={channelBrandColor}
+  onClose={() => showPreview = false}
+/>

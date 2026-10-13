@@ -3,7 +3,7 @@
   import { Building2 } from '@lucide/svelte';
   import { createAsyncLoader } from '../composables';
   import { api } from '../api.js';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   let {
     value = $bindable(null),
@@ -11,13 +11,22 @@
     showUnassigned = false,
     unassignedLabel = 'None',
     disabled = false,
+    organisations: providedOrganisations = null,
+    loading = false,
+    onOpen = null,
+    autoOpen = false,
+    // (value) => string | null. Labels a selected organisation id that is not
+    // in the loaded options (options load lazily on mount/open).
+    resolveMissingLabel = null,
     class: className = '',
     onSelect = () => {},
     onCancel = () => {}
   } = $props();
 
   const organisations = createAsyncLoader(() => api.customerOrganisations.getAll());
-  onMount(() => organisations.load());
+  onMount(() => { if (providedOrganisations === null) organisations.load(); });
+  onDestroy(() => organisations.dispose());
+  const organisationOptions = $derived(providedOrganisations ?? organisations.data ?? []);
 </script>
 
 {#snippet organisationRow({ item })}
@@ -32,18 +41,21 @@
 
 <BasePicker
   bind:value
-  items={organisations.data || []}
-  loading={organisations.loading}
+  items={organisationOptions}
+  loading={providedOrganisations === null ? organisations.loading : loading}
   {placeholder}
   {showUnassigned}
   {unassignedLabel}
   {disabled}
   allowClear={true}
+  {autoOpen}
   class={className}
   itemSnippet={organisationRow}
   searchFields={['name', 'email', 'description']}
   getValue={(item) => item?.id}
   getLabel={(item) => item?.name || ''}
+  {resolveMissingLabel}
+  onOpen={() => onOpen?.()}
   onSelect={(item) => onSelect(item)}
   onCancel={() => onCancel()}
 />

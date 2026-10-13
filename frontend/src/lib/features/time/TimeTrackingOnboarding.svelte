@@ -1,13 +1,16 @@
 <script>
   import { api } from '../../api.js';
+  import Progress from '../../components/Progress.svelte';
   import { Clock, Briefcase, User, X } from '@lucide/svelte';
   import Button from '../../components/Button.svelte';
+  import Input from '../../components/Input.svelte';
   import Modal from '../../dialogs/Modal.svelte';
-  import Textarea from '../../components/Textarea.svelte';
   import AlertBox from '../../components/AlertBox.svelte';
   import Label from '../../components/Label.svelte';
   import { t } from '../../stores/i18n.svelte.js';
   import DescriptionText from '../../components/DescriptionText.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
+	import TextField from '../../components/TextField.svelte';
 
   let { oncancel, oncompleted } = $props();
 
@@ -175,12 +178,7 @@
           <span class="text-sm font-medium" style="color: var(--ds-text-subtle);">{t('time.onboarding.setupProgress')}</span>
           <span class="text-sm" style="color: var(--ds-text-subtlest);">{t('time.onboarding.stepOf', { current: currentStep, total: totalSteps })}</span>
         </div>
-        <div class="w-full rounded-full h-2" style="background-color: var(--ds-background-neutral);">
-          <div
-            class="bg-blue-600 h-2 rounded-full transition-all duration-300"
-            style="width: {progressPercentage}%"
-          ></div>
-        </div>
+        <Progress value={progressPercentage} />
       </div>
 
       <!-- Error Message -->
@@ -203,39 +201,36 @@
 
           <div class="space-y-4">
             <div>
-              <Label for="customer_name" required class="mb-2">{t('time.organizations.name')}</Label>
-              <input
+              <TextField
+                label={t('time.organizations.name')}
                 id="customer_name"
-                type="text"
-                bind:value={customerData.name}
-                class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text);"
-                placeholder={t('time.onboarding.organizationNamePlaceholder')}
                 required
+                type="text"
+                size="small"
+                placeholder={t('time.onboarding.organizationNamePlaceholder')}
+                bind:value={customerData.name}
               />
             </div>
 
             <div>
-              <Label for="customer_email" class="mb-2">{t('time.organizations.emailOptional')}</Label>
-              <input
+              <TextField
+                label={t('time.organizations.emailOptional')}
                 id="customer_email"
                 type="email"
-                bind:value={customerData.email}
-                class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text);"
+                size="small"
                 placeholder={t('time.onboarding.emailPlaceholder')}
+                bind:value={customerData.email}
               />
             </div>
 
             <div>
-              <Label for="contact_person" class="mb-2">{t('time.organizations.contactPersonOptional')}</Label>
-              <input
+              <TextField
+                label={t('time.organizations.contactPersonOptional')}
                 id="contact_person"
                 type="text"
-                bind:value={customerData.contact_person}
-                class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text);"
+                size="small"
                 placeholder={t('time.onboarding.contactPersonPlaceholder')}
+                bind:value={customerData.contact_person}
               />
             </div>
           </div>
@@ -260,25 +255,24 @@
 
           <div class="space-y-4">
             <div>
-              <Label for="project_name" required class="mb-2">{t('time.projects.projectName')}</Label>
-              <input
+              <TextField
+                label={t('time.projects.projectName')}
                 id="project_name"
-                type="text"
-                bind:value={projectData.name}
-                class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text);"
-                placeholder={t('time.onboarding.projectNamePlaceholder')}
                 required
+                type="text"
+                size="small"
+                placeholder={t('time.onboarding.projectNamePlaceholder')}
+                bind:value={projectData.name}
               />
             </div>
 
             <div>
-              <Label for="project_description" class="mb-2">{t('time.projects.descriptionOptional')}</Label>
-              <Textarea
+              <TextareaField
+                label={t('time.projects.descriptionOptional')}
                 id="project_description"
-                bind:value={projectData.description}
                 rows={3}
                 placeholder={t('time.onboarding.projectDescriptionPlaceholder')}
+                bind:value={projectData.description}
               />
             </div>
 
@@ -286,14 +280,14 @@
               <Label for="hourly_rate" class="mb-2">{t('time.projects.hourlyRateOptional')}</Label>
               <div class="relative">
                 <span class="absolute left-3 top-1/2 transform -translate-y-1/2" style="color: var(--ds-text-subtle);">$</span>
-                <input
+                <Input
                   id="hourly_rate"
                   type="number"
                   bind:value={projectData.hourly_rate}
                   min="0"
                   step="0.01"
-                  class="w-full pl-8 pr-3 py-2 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                  style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text);"
+                  class="pl-8"
+                  size="small"
                   placeholder="0.00"
                 />
               </div>

@@ -9,7 +9,17 @@ CREATE TABLE IF NOT EXISTS notifications (
 	type TEXT NOT NULL DEFAULT 'info', -- info, warning, error, success, assignment, comment, status_change, reminder, milestone
 	timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	read BOOLEAN DEFAULT false,
+	-- seen_at marks "user looked at this in the tray" without acknowledging it.
+	-- Distinct from `read` so passive tray views do not suppress email batching.
+	-- migration: notifications_seen_at
+	seen_at TIMESTAMPTZ,
 	sent_at TIMESTAMPTZ, -- When notification was sent via email (NULL if not sent)
+	email_delivery_state TEXT NOT NULL DEFAULT 'pending',
+	email_claim_owner TEXT,
+	email_claim_token TEXT,
+	email_claim_expires_at TIMESTAMPTZ,
+	email_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+	email_last_error TEXT,
 	-- Set to TRUE only when the scheduler tried to roll back sent_at after an SMTP
 	-- failure and the rollback ITSELF failed. Without this flag the row is wedged:
 	-- sent_at is set so the next tick's `WHERE sent_at IS NULL` skips it, and the
@@ -18,6 +28,16 @@ CREATE TABLE IF NOT EXISTS notifications (
 	avatar TEXT, -- Initials or avatar identifier
 	action_url TEXT, -- URL to navigate to when clicked
 	metadata TEXT, -- JSON for additional data
+	authorization_scope TEXT NOT NULL DEFAULT 'legacy', -- legacy rows fail closed at delivery
+	workspace_id INTEGER,
+	item_id INTEGER,
+	source_type TEXT,
+	source_id INTEGER,
+	referenced_entity_type TEXT,
+	referenced_entity_id INTEGER,
+	referenced_workspace_id INTEGER,
+	referenced_workspace_permission TEXT,
+	delivery_key TEXT,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -27,7 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_timestamp ON notifications(timestamp);
 CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
 CREATE INDEX IF NOT EXISTS idx_notifications_sent_at ON notifications(sent_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_email_delivery ON notifications(email_delivery_state, email_claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
+CREATE INDEX IF NOT EXISTS idx_notifications_workspace_id ON notifications(workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_delivery_key ON notifications(delivery_key) WHERE delivery_key IS NOT NULL;
 
 -- Notification templates table is defined in base_tables_postgres.sql
 -- Default templates are inserted via initializePostgresDefaultData() to avoid semicolon parsing issues
@@ -35,6 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
 -- Notification settings system for configuration sets
 CREATE TABLE IF NOT EXISTS notification_settings (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL,
 	description TEXT,
 	is_active BOOLEAN DEFAULT true,
@@ -46,6 +70,7 @@ CREATE TABLE IF NOT EXISTS notification_settings (
 
 CREATE INDEX IF NOT EXISTS idx_notification_settings_active ON notification_settings(is_active);
 CREATE INDEX IF NOT EXISTS idx_notification_settings_created_by ON notification_settings(created_by);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notification_settings_builtin_key ON notification_settings(builtin_key) WHERE builtin_key IS NOT NULL;
 
 -- Notification event rules for each setting
 CREATE TABLE IF NOT EXISTS notification_event_rules (

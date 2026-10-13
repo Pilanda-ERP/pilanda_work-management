@@ -119,3 +119,115 @@ CREATE TABLE IF NOT EXISTS todoist_task_links (
 CREATE INDEX IF NOT EXISTS idx_todoist_task_links_user ON todoist_task_links(user_id);
 CREATE INDEX IF NOT EXISTS idx_todoist_task_links_item ON todoist_task_links(item_id);
 CREATE INDEX IF NOT EXISTS idx_todoist_task_links_todoist ON todoist_task_links(todoist_task_id);
+
+CREATE TABLE IF NOT EXISTS zammad_connections (
+	provider_id TEXT PRIMARY KEY REFERENCES integration_providers(id) ON DELETE CASCADE,
+	credential_id INTEGER NOT NULL REFERENCES action_credentials(id) ON DELETE RESTRICT,
+	auth_method TEXT NOT NULL DEFAULT 'api_token',
+	oauth_generation BIGINT NOT NULL DEFAULT 1,
+	config_revision BIGINT NOT NULL DEFAULT 1,
+	oauth_attempt_id TEXT,
+	base_url TEXT NOT NULL,
+	default_group_id INTEGER,
+	default_group_name TEXT DEFAULT '',
+	-- Legacy per-connection group-ID list; runtime reads allowed_groups.
+	-- migration: 20260829_zammad_integration
+	allowed_group_ids TEXT NOT NULL DEFAULT '[]',
+	allowed_groups TEXT NOT NULL DEFAULT '[]',
+	default_customer TEXT NOT NULL,
+	correlation_field TEXT NOT NULL DEFAULT 'windshift_item_key',
+	closed_state_ids TEXT NOT NULL DEFAULT '[]',
+	completion_status_id INTEGER REFERENCES statuses(id) ON DELETE SET NULL,
+	-- migration: 20260829_zammad_integration
+	applies_to_all_workspaces BOOLEAN NOT NULL DEFAULT false,
+	last_tested_at TIMESTAMPTZ,
+	last_test_error TEXT DEFAULT '',
+	created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+	created_at TIMESTAMPTZ DEFAULT NOW(),
+	updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_zammad_connections_credential ON zammad_connections(credential_id);
+
+-- Workspace membership scope for connection-scoped credentials.
+-- migration: 20260829_zammad_integration
+CREATE TABLE IF NOT EXISTS zammad_connection_workspaces (
+	provider_id TEXT NOT NULL REFERENCES zammad_connections(provider_id) ON DELETE CASCADE,
+	workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	PRIMARY KEY (provider_id, workspace_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_zammad_connection_workspaces_workspace ON zammad_connection_workspaces(workspace_id);
+
+CREATE TABLE IF NOT EXISTS zammad_oauth_tokens (
+	provider_id TEXT PRIMARY KEY REFERENCES zammad_connections(provider_id) ON DELETE CASCADE,
+	-- migration: 20260830_zammad_oauth_generation
+	oauth_generation BIGINT NOT NULL DEFAULT 1,
+	expires_at TIMESTAMPTZ NOT NULL,
+	reauthorization_required BOOLEAN NOT NULL DEFAULT false,
+	refresh_lock_until TIMESTAMPTZ,
+	refresh_claim_owner TEXT,
+	updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS zammad_oauth_state (
+	state TEXT PRIMARY KEY,
+	provider_id TEXT NOT NULL REFERENCES zammad_connections(provider_id) ON DELETE CASCADE,
+	initiated_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	-- migration: 20260830_zammad_oauth_generation
+	oauth_generation BIGINT NOT NULL DEFAULT 1,
+	expires_at TIMESTAMPTZ NOT NULL,
+	created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_zammad_oauth_state_expires ON zammad_oauth_state(expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_zammad_oauth_state_provider ON zammad_oauth_state(provider_id);
+
+CREATE TABLE IF NOT EXISTS zammad_ticket_links (
+	id TEXT PRIMARY KEY,
+	item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE RESTRICT,
+	provider_id TEXT NOT NULL REFERENCES zammad_connections(provider_id) ON DELETE CASCADE,
+	item_integration_link_id TEXT REFERENCES item_integration_links(id) ON DELETE SET NULL,
+	ticket_id INTEGER,
+	ticket_number TEXT DEFAULT '',
+	ticket_url TEXT DEFAULT '',
+	group_id INTEGER,
+	group_name TEXT DEFAULT '',
+	owner_id INTEGER,
+	owner_name TEXT DEFAULT '',
+	correlation_key TEXT NOT NULL,
+	sync_state TEXT NOT NULL DEFAULT 'pending',
+	creating_started_at TIMESTAMPTZ,
+	last_status_id INTEGER,
+	last_status_name TEXT DEFAULT '',
+	last_synced_at TIMESTAMPTZ,
+	last_attempt_at TIMESTAMPTZ,
+	next_attempt_at TIMESTAMPTZ,
+	last_error TEXT DEFAULT '',
+	completion_applied BOOLEAN NOT NULL DEFAULT false,
+	sync_lock_until TIMESTAMPTZ,
+	sync_lock_owner TEXT,
+	created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+	created_at TIMESTAMPTZ DEFAULT NOW(),
+	updated_at TIMESTAMPTZ DEFAULT NOW(),
+	UNIQUE(item_id, provider_id),
+	UNIQUE(provider_id, ticket_id),
+	UNIQUE(provider_id, correlation_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_zammad_ticket_links_item ON zammad_ticket_links(item_id);
+CREATE INDEX IF NOT EXISTS idx_zammad_ticket_links_sync ON zammad_ticket_links(sync_state, last_synced_at);
+
+CREATE TABLE IF NOT EXISTS zammad_ticket_changes (
+	id TEXT PRIMARY KEY,
+	ticket_link_id TEXT NOT NULL REFERENCES zammad_ticket_links(id) ON DELETE CASCADE,
+	field_name TEXT NOT NULL CHECK (field_name IN ('status', 'owner', 'group')),
+	old_value_id INTEGER,
+	old_value_name TEXT NOT NULL DEFAULT '',
+	new_value_id INTEGER,
+	new_value_name TEXT NOT NULL DEFAULT '',
+	observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_zammad_ticket_changes_link_observed ON zammad_ticket_changes(ticket_link_id, observed_at DESC);
+
+-- migration: 20260829_zammad_integration

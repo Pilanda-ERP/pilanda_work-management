@@ -1,5 +1,34 @@
 // Shared helpers for time parsing and synchronization between duration strings and HH:MM values.
 
+const FALLBACK_TIMEZONES = [
+  'UTC',
+  'Europe/Berlin',
+  'Europe/London',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+  'America/Sao_Paulo',
+  'Asia/Tokyo',
+  'Australia/Sydney',
+];
+
+/**
+ * Return the IANA timezone identifiers known to the runtime, so pickers can
+ * offer every zone (including South America) instead of a hardcoded subset.
+ * Falls back to a small curated set when Intl.supportedValuesOf is unavailable.
+ */
+export function listIanaTimezones() {
+  try {
+    if (typeof Intl !== 'undefined' && typeof Intl.supportedValuesOf === 'function') {
+      return Intl.supportedValuesOf('timeZone');
+    }
+  } catch {
+    // fall through to the curated list
+  }
+  return [...FALLBACK_TIMEZONES];
+}
+
 /**
  * Parse a duration string like "2h", "30m", "2h30m", "1d", or "3d 4h" (8 hours/day by default).
  * Returns total minutes.
@@ -73,7 +102,8 @@ export function durationToString(totalMinutes, options = {}) {
 }
 
 /**
- * Compute positive minutes between two HH:MM times; returns 0 if end <= start or inputs are invalid.
+ * Compute positive minutes between two HH:MM times; an end at or before the
+ * start wraps to the next day (overnight entry). Returns 0 for invalid input.
  */
 export function minutesBetweenTimes(startTime, endTime) {
   if (!startTime || !endTime) return 0;
@@ -82,9 +112,12 @@ export function minutesBetweenTimes(startTime, endTime) {
   const [endHours, endMins] = endTime.split(':').map(Number);
 
   const startTotal = startHours * 60 + startMins;
-  const endTotal = endHours * 60 + endMins;
+  let endTotal = endHours * 60 + endMins;
+  if (endTotal <= startTotal) {
+    endTotal += 24 * 60;
+  }
 
-  return endTotal > startTotal ? endTotal - startTotal : 0;
+  return endTotal - startTotal;
 }
 
 /**

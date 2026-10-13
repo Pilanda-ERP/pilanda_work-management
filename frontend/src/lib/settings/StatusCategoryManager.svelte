@@ -6,16 +6,24 @@
   import { confirm } from '../composables/useConfirm.js';
   import { Plus, Edit, Trash2, Palette, Folder } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
+  import ColorDot from '../components/ColorDot.svelte';
   import DataTable from '../components/DataTable.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import StatusCategoryModal from '../dialogs/StatusCategoryModal.svelte';
   import Lozenge from '../components/Lozenge.svelte';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+  import { objectDisplayValue } from '../utils/systemLabels.js';
 
   let statusCategories = $state([]);
   let loading = $state(true);
   let showModal = $state(false);
   let editingId = $state(null);
+  let editingObject = $state(null);
+  let translationEditor = $state(null);
+
+  function getCategoryDisplayValue(category, field) {
+    return objectDisplayValue(category, field);
+  }
 
   // Form state
   let formData = $state({
@@ -34,8 +42,8 @@
     try {
       loading = true;
       const [categories, statuses] = await Promise.all([
-        api.get('/status-categories') || [],
-        api.get('/statuses') || []
+        api.statusCategories.getAll() || [],
+        api.statuses.getAll() || []
       ]);
 
       // Add status count to each category
@@ -60,10 +68,12 @@
       is_completed: false
     };
     editingId = null;
+    editingObject = null;
     showModal = true;
   }
 
   function startEdit(category) {
+    editingObject = category;
     formData = {
       name: category.name || '',
       color: category.color || '#3b82f6',
@@ -78,6 +88,7 @@
   function cancelForm() {
     showModal = false;
     editingId = null;
+    editingObject = null;
     formData = {
       name: '',
       color: '#3b82f6',
@@ -95,12 +106,12 @@
       }
 
       if (editingId) {
-        const updated = await api.put(`/status-categories/${editingId}`, formData);
-        statusCategories = statusCategories.map(cat => 
-          cat.id === editingId ? { ...updated, statusCount: cat.statusCount } : cat
-        );
+        translationEditor?.validate();
+        await api.statusCategories.update(editingId, formData);
+        await translationEditor?.save();
+        await loadStatusCategories();
       } else {
-        const created = await api.post('/status-categories', formData);
+        const created = await api.statusCategories.create(formData);
         statusCategories = [...statusCategories, { ...created, statusCount: 0 }];
       }
       
@@ -108,14 +119,15 @@
       window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
     } catch (error) {
       console.error('Failed to save status category:', error);
-      errorToast(t('settings.statusCategories.failedToSave') + ' ' + (error.message || error));
+      errorToast(t('settings.statusCategories.failedToSave'));
     }
   }
 
   async function deleteCategory(category) {
+    const displayName = getCategoryDisplayValue(category, 'name');
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: `Are you sure you want to delete the status category "${category.name}"? This action cannot be undone.`,
+      message: t('settings.statusCategories.confirmDelete', { name: displayName }),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger'
@@ -123,16 +135,16 @@
     if (!confirmed) return;
 
     try {
-      await api.delete(`/status-categories/${category.id}`);
+      await api.statusCategories.delete(category.id);
       statusCategories = statusCategories.filter(cat => cat.id !== category.id);
       window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
     } catch (error) {
       console.error('Failed to delete status category:', error);
       
       if (error.status === 409) {
-        errorToast(t('settings.statusCategories.inUseByStatuses', { name: category.name }));
+        errorToast(t('settings.statusCategories.inUseByStatuses', { name: displayName }));
       } else {
-        errorToast(t('settings.statusCategories.failedToDelete') + ' ' + (error.message || error));
+        errorToast(t('settings.statusCategories.failedToDelete'));
       }
     }
   }
@@ -145,6 +157,7 @@
         icon: Edit,
         title: t('common.edit'),
         hoverClass: 'hover-bg',
+        testid: `status-category-edit-${category.id}`,
         onClick: () => startEdit(category)
       },
       {
@@ -154,6 +167,7 @@
         title: t('common.delete'),
         color: 'var(--ds-text-danger)',
         hoverClass: 'hover-danger',
+        testid: `status-category-delete-${category.id}`,
         onClick: () => deleteCategory(category),
         disabled: category.statusCount > 0
       }
@@ -175,13 +189,15 @@
     {
       key: 'description',
       label: t('settings.statusCategories.description'),
-      render: (category) => category.description || '—',
+      render: (category) => getCategoryDisplayValue(category, 'description') || '—',
       textColor: 'var(--ds-text-subtle)'
     },
     {
       key: 'status_count',
       label: t('statuses.title'),
-      render: (category) => `${category.statusCount || 0} status${category.statusCount === 1 ? '' : 'es'}`,
+      render: (category) => t('settings.statusCategories.statusCount', {
+        count: category.statusCount || 0
+      }),
       textColor: 'var(--ds-text-subtle)'
     },
     {
@@ -196,10 +212,10 @@
     icon={Folder}
     title={t('settings.statusCategories.title')}
     subtitle={t('settings.statusCategories.subtitle')}
-    count="{statusCategories.length} categories"
+    count={t('settings.statusCategories.count', { count: statusCategories.length })}
   >
     {#snippet actions()}
-      <Button variant="primary" icon={Plus} onclick={startCreate} keyboardHint="A" hotkeyConfig={{ key: toHotkeyString('statusCategories', 'addCategory'), guard: () => !showModal }}>
+      <Button variant="primary" icon={Plus} onclick={startCreate} keyboardHint="A" hotkeyConfig={{ key: toHotkeyString('statusCategories', 'addCategory'), guard: () => !showModal }} dataTestid="status-category-add">
         {t('settings.statusCategories.addStatusCategory')}
       </Button>
     {/snippet}
@@ -209,13 +225,15 @@
     columns={categoryColumns}
     data={statusCategories}
     keyField="id"
-    emptyMessage="No status categories found. Create your first status category to get started."
+    emptyMessage={t('settings.statusCategories.empty')}
     emptyIcon={Palette}
     actionItems={buildCategoryDropdownItems}
+    rowAttrs={(category) => ({ 'data-testid': `status-category-row-${category.id}` })}
+    actionTriggerTestid={(category) => `status-category-actions-${category.id}`}
   >
     {#snippet category(category)}
       <div class="flex items-center gap-3">
-        <h3 class="font-medium" style="color: var(--ds-text);">{category.name}</h3>
+        <h3 class="font-medium" style="color: var(--ds-text);">{getCategoryDisplayValue(category, 'name')}</h3>
         {#if category.is_default}
           <Lozenge color="blue" text={t('settings.statusCategories.default')} />
         {/if}
@@ -227,10 +245,7 @@
 
     {#snippet color(category)}
       <div class="flex items-center gap-2">
-        <div
-          class="w-4 h-4 rounded border border-gray-300"
-          style="background-color: {category.color};"
-        ></div>
+        <ColorDot color={category.color} class="w-4 h-4 border border-[var(--ds-border)]" />
         <span class="text-sm font-mono" style="color: var(--ds-text-subtle);">{category.color}</span>
       </div>
     {/snippet}
@@ -240,7 +255,11 @@
   <StatusCategoryModal
     isOpen={showModal}
     bind:formData
+    bind:translationEditor
     isEditing={!!editingId}
+    objectId={editingId}
+    displayName={editingObject?.display_name || editingObject?.name}
+    displayDescription={editingObject?.display_description || editingObject?.description}
     onsave={saveCategory}
     oncancel={cancelForm}
   />

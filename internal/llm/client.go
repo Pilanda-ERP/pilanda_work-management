@@ -2,9 +2,6 @@ package llm
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"net/http"
 	"strings"
 	"time"
 )
@@ -21,10 +18,10 @@ import (
 // and is intentionally independent of this value.
 const DefaultRequestTimeout = 5 * time.Minute
 
-// Client provides methods to interact with an OpenAI-compatible LLM API.
+// Client provides a provider-neutral interface to an LLM API.
 type Client interface {
-	// ChatCompletion sends a chat completion request and returns the response.
-	ChatCompletion(ctx context.Context, req ChatCompletionRequest) (*ChatCompletionResponse, error)
+	// Complete sends a normalized generation request and returns its result.
+	Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error)
 	// Health checks if the LLM service is healthy.
 	Health(ctx context.Context) error
 	// Available returns true if the LLM service is configured.
@@ -51,60 +48,7 @@ func NewClient(cfg Config) Client {
 		timeout = DefaultRequestTimeout
 	}
 
-	return &httpClient{
-		endpoint: endpoint,
-		apiKey:   cfg.APIKey,
-		http:     newAdminConfiguredHTTPClient(timeout),
-	}
-}
-
-// httpClient implements Client using HTTP requests to an OpenAI-compatible API.
-type httpClient struct {
-	endpoint string
-	apiKey   string
-	http     *http.Client
-}
-
-func (c *httpClient) ChatCompletion(ctx context.Context, req ChatCompletionRequest) (*ChatCompletionResponse, error) {
-	body := baseChatBody(req, req.Model)
-
-	// llama.cpp takes a GBNF grammar for structured output.
-	if req.StructuredOutput != nil && len(req.StructuredOutput.Schema) > 0 {
-		grammar, err := JSONSchemaToGBNF(req.StructuredOutput.Schema)
-		if err != nil {
-			slog.Warn("failed to generate GBNF grammar", slog.Any("error", err))
-		} else if grammar != "" {
-			slog.Debug("applying GBNF grammar", slog.Int("length", len(grammar)))
-			body["grammar"] = grammar
-		}
-	}
-
-	return postChatCompletion(ctx, c.http, c.endpoint+"/v1/chat/completions", c.apiKey, body)
-}
-
-func (c *httpClient) Health(ctx context.Context) error {
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", c.endpoint+"/health", http.NoBody)
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrConnectionFailed, err)
-	}
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.http.Do(httpReq) //nolint:gosec // G704: admin-configured LLM endpoint
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrConnectionFailed, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return ErrServiceNotReady
-	}
-	return nil
-}
-
-func (c *httpClient) Available() bool {
-	return true
+	return newDynamicFantasyClient(endpoint, cfg.APIKey, timeout)
 }
 
 // ConnectionConfig holds configuration for creating a provider-specific client.
@@ -129,10 +73,35 @@ func NewProviderClient(cfg ConnectionConfig) Client {
 		baseURL = provider.BaseURL
 	}
 
-	switch provider.APIFormat {
-	case "anthropic":
-		return newAnthropicClient(baseURL, cfg.Model, cfg.APIKey, cfg.ProviderConfig, cfg.Timeout)
+	switch ResolveGenerationProtocol(cfg.ProviderType, cfg.BaseURL, cfg.ProviderConfig) {
+	case APIContractAnthropic:
+		return newFantasyClient(baseURL, cfg.Model, cfg.APIKey, APIContractAnthropic, provider.ChatPath, cfg.ProviderConfig, cfg.Timeout)
+	case APIContractResponses:
+		return newFantasyClient(baseURL, cfg.Model, cfg.APIKey, APIContractResponses, provider.ChatPath, cfg.ProviderConfig, cfg.Timeout)
 	default:
-		return newOpenAIClient(baseURL, cfg.Model, cfg.APIKey, cfg.ProviderConfig, cfg.Timeout, provider.ChatPath)
+		return newFantasyClient(baseURL, cfg.Model, cfg.APIKey, APIContractChatCompletions, provider.ChatPath, cfg.ProviderConfig, cfg.Timeout)
 	}
+}
+
+// ResolveGenerationProtocol resolves the connection once into the protocol
+// its model client must speak. The coding-agent binding receives this value so
+// it uses the same dispatch decision as in-process callers without learning a
+// provider credential or upstream URL.
+func ResolveGenerationProtocol(providerType ProviderType, baseURL, providerConfig string) string {
+	provider := GetProvider(providerType)
+	if provider == nil {
+		return APIContractChatCompletions
+	}
+	if provider.APIFormat == "anthropic" {
+		return APIContractAnthropic
+	}
+	contract := ProviderConfigAPIContract(providerConfig)
+	if contract == APIContractResponses || contract == APIContractChatCompletions {
+		return contract
+	}
+	usesCatalogEndpoint := baseURL == "" || strings.TrimRight(baseURL, "/") == strings.TrimRight(provider.BaseURL, "/")
+	if provider.APIFormat == "openai-responses" && usesCatalogEndpoint {
+		return APIContractResponses
+	}
+	return APIContractChatCompletions
 }

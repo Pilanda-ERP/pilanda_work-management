@@ -1,33 +1,15 @@
 <script>
-  import { CheckSquare } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../../utils/icons.js';
+  import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
+  import ItemKey from '../../components/ItemKey.svelte';
   import { formatDateSimple } from '../../utils/dateFormatter.js';
   import ItemCard from './ItemCard.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
   import { getStatusCategory } from '../../utils/statusColors.js';
+  import { t } from '../../stores/i18n.svelte.js';
 
   /**
-   * WorkItemRow - A reusable component for displaying work items in list views
-   *
-   * @prop {Object} item - The work item object (id, title, workspace_id, workspace_key, workspace_item_number, item_type_id, status_id, priority_id)
-   * @prop {Object} workspace - Optional workspace object for key lookup (fallback if item.workspace_key is missing)
-   * @prop {Array} itemTypes - Array of item types for icon lookup (optional)
-   * @prop {Array} statuses - Array of statuses for status lookup (optional)
-   * @prop {Array} priorities - Array of priorities for priority lookup (optional)
-   * @prop {Array} statusCategories - Array of status categories for color lookup (optional)
-   * @prop {string} href - Optional link URL (defaults to /workspaces/{workspace_id}/items/{id})
-   * @prop {Function} onclick - Optional click handler (for modal pattern, disables href)
-   * @prop {boolean} showIcon - Show item type icon (default: true)
-   * @prop {boolean} showKey - Show item key (default: true)
-   * @prop {boolean} showWorkspace - Show workspace name (default: false)
-   * @prop {boolean} showTimestamp - Show timestamp (default: false)
-   * @prop {boolean} showStatus - Show status badge (default: false)
-   * @prop {boolean} showPriority - Show priority badge (default: false)
-   * @prop {string|Date} timestamp - The timestamp to display
-   * @prop {Function} formatTimestamp - Optional custom formatter for timestamp
-   * @prop {boolean} compact - Use compact styling (default: false)
-   * @prop {Snippet} leading - Content to render before icon (e.g., drag handle, checkbox)
-   * @prop {Snippet} trailing - Content to render after title (e.g., custom badges, actions)
+   * Reusable list-row props. Lookup arrays enrich the item; leading and trailing
+   * snippets add controls. `onclick` replaces navigation when supplied.
    */
   let {
     item,
@@ -47,15 +29,17 @@
     timestamp = null,
     formatTimestamp = null,
     compact = false,
+    dataTestid = undefined,
+    showStoryPoints = false,
+    storyPointsSaving = false,
+    onStoryPointsChange = null,
     leading = null,
     trailing = null,
   } = $props();
 
-  // Compute the display key - prefer item.workspace_key, fallback to workspace.key
-  const displayKey = $derived.by(() => {
-    const key = item.workspace_key || workspace?.key;
-    return key ? `${key}-${item.workspace_item_number}` : `ITEM-${item.workspace_item_number}`;
-  });
+  let editingStoryPoints = $state(false);
+  let storyPointsEditValue = $state('');
+  let storyPointsError = $state(false);
 
   // Look up the item type for icon and color
   const itemType = $derived(item.item_type_id ? itemTypes.find(t => t.id === item.item_type_id) : null);
@@ -110,36 +94,72 @@
   // Resolve the status badge color, preferring a pre-resolved color on the item
   // (e.g. status_color from the homepage activity API where statuses arrays aren't loaded)
   const statusColor = $derived(item.status_color || statusCategory?.color || '#6b7280');
+
+  function startEditingStoryPoints(event) {
+    event?.stopPropagation();
+    if (storyPointsSaving) return;
+    storyPointsEditValue = item.story_points == null ? '' : String(item.story_points);
+    storyPointsError = false;
+    editingStoryPoints = true;
+  }
+
+  function cancelStoryPointsEdit(event) {
+    event?.stopPropagation();
+    editingStoryPoints = false;
+    storyPointsError = false;
+  }
+
+  function saveStoryPoints(event) {
+    event?.stopPropagation();
+    const raw = String(storyPointsEditValue ?? '').trim();
+    const parsed = raw === '' ? null : Number(raw);
+    if (parsed !== null && (!Number.isFinite(parsed) || parsed < 0)) {
+      storyPointsError = true;
+      return;
+    }
+
+    if (parsed === (item.story_points ?? null)) {
+      editingStoryPoints = false;
+      storyPointsError = false;
+      return;
+    }
+
+    editingStoryPoints = false;
+    storyPointsError = false;
+    onStoryPointsChange?.(parsed);
+  }
+
+  function handleStoryPointsKeydown(event) {
+    event.stopPropagation();
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      saveStoryPoints(event);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      cancelStoryPointsEdit(event);
+    }
+  }
 </script>
 
-<ItemCard href={itemHref} {onclick} {compact}>
+<ItemCard href={itemHref} {onclick} {compact} {dataTestid}>
   {#snippet children()}
     <div class="flex items-center gap-3">
       {#if leading}{@render leading()}{/if}
 
       <!-- Item Type Icon -->
       {#if showIcon}
-        {#if itemType}
-          {@const RowTypeIcon = itemTypeIconMap[itemType.icon] || itemTypeIconMap.FileText}
-          <div
-            class="w-5 h-5 rounded flex items-center justify-center flex-shrink-0"
-            style="background-color: {itemType.color};"
-            title={itemType.name}
-          >
-            <RowTypeIcon class="w-3 h-3" style="color: white;" />
-          </div>
-        {:else}
-          <div class="w-5 h-5 rounded flex items-center justify-center flex-shrink-0" style="background-color: var(--ds-accent-blue);">
-            <CheckSquare class="w-3 h-3" style="color: white;" />
-          </div>
-        {/if}
+        <ItemTypeIcon
+          itemType={itemType}
+          icon={item.item_type_icon}
+          color={item.item_type_color}
+          title={item.item_type_name || undefined}
+          testId={`work-item-type-icon-${item.id}`}
+        />
       {/if}
 
       <!-- Item Key -->
       {#if showKey}
-        <span class="font-mono text-xs px-2 py-0.5 rounded flex-shrink-0" style="background-color: rgba(59, 130, 246, 0.1); color: var(--ds-text);">
-          {displayKey}
-        </span>
+        <ItemKey {item} {workspace} variant="badge" clickable={false} />
       {/if}
 
       <!-- Priority Badge -->
@@ -155,7 +175,7 @@
 
       <!-- Optional Workspace Name -->
       {#if showWorkspace && item.workspace_name}
-        <span class="text-xs flex-shrink-0" style="color: var(--ds-text-subtle);">{item.workspace_name}</span>
+        <span class="text-xs min-w-0 truncate" style="color: var(--ds-text-subtle);">{item.workspace_name}</span>
       {/if}
 
       <!-- Optional Timestamp -->
@@ -166,6 +186,51 @@
       <!-- Status Badge -->
       {#if showStatus && status}
         <Lozenge text={status.name.replace(/_/g, ' ')} customBg={statusColor} />
+      {/if}
+
+      {#if showStoryPoints}
+        <div
+          class="flex-shrink-0"
+          data-testid={`backlog-story-points-${item.id}`}
+        >
+          {#if editingStoryPoints}
+            <input
+              type="number"
+              min="0"
+              step="0.5"
+              aria-label={t('items.storyPoints')}
+              aria-invalid={storyPointsError}
+              aria-describedby={storyPointsError ? `backlog-story-points-error-${item.id}` : undefined}
+              data-testid={`backlog-story-points-input-${item.id}`}
+              class="w-16 rounded border px-2 py-1 text-xs tabular-nums outline-none"
+              style="background-color: var(--ds-surface-card); border-color: {storyPointsError ? 'var(--ds-text-danger)' : 'var(--ds-border-focused)'}; color: var(--ds-text);"
+              bind:value={storyPointsEditValue}
+              disabled={storyPointsSaving}
+              onclick={(event) => event.stopPropagation()}
+              onblur={saveStoryPoints}
+              onkeydown={handleStoryPointsKeydown}
+            />
+            {#if storyPointsError}
+              <span id={`backlog-story-points-error-${item.id}`} class="sr-only">
+                {t('items.enterField', { field: t('items.storyPoints') })}
+              </span>
+            {/if}
+          {:else}
+            <button
+              type="button"
+              class="inline-flex items-center gap-1 rounded px-2 py-1 text-xs tabular-nums transition-colors hover:bg-black/5 dark:hover:bg-white/10 disabled:cursor-wait disabled:opacity-60"
+              style="color: var(--ds-text-subtle);"
+              title={t('items.setField', { field: t('items.storyPoints') })}
+              aria-label={t('items.setField', { field: t('items.storyPoints') })}
+              data-testid={`backlog-story-points-button-${item.id}`}
+              disabled={storyPointsSaving}
+              onclick={startEditingStoryPoints}
+            >
+              <span style="color: var(--ds-text);">{item.story_points ?? t('items.notSet')}</span>
+              <span>SP</span>
+            </button>
+          {/if}
+        </div>
       {/if}
 
       {#if trailing}{@render trailing()}{/if}

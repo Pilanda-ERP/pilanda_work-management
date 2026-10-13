@@ -1,10 +1,8 @@
-/**
- * Store for managing Item Detail state.
- * Uses Svelte 5 class-based reactive state pattern.
- * Centralizes item data, editing states, modals, and related data loading.
- */
 import { api } from '../api.js';
-import { buildDetailScreenFieldConfig, resolveEffectiveScreenIds } from '../utils/screenFields.js';
+import { childItemTypesForParent } from '../utils/hierarchy.js';
+import { buildDetailScreenFieldConfig } from '../utils/screenFields.js';
+import { workspaceDataStore } from './workspaceDataStore.svelte.js';
+import { workspacesStore } from './workspaces.svelte.js';
 
 const FIELD_MAP = {
   title: 'title',
@@ -17,6 +15,7 @@ const FIELD_MAP = {
   milestone: 'milestones',
   iteration: 'iteration_id',
   assignee: 'assignee_id',
+  team: 'team_id',
   project: 'project_id',
 };
 
@@ -24,6 +23,21 @@ const STRING_FIELDS = new Set(['title', 'description']);
 
 function isNumericID(value) {
   return /^\d+$/.test(String(value ?? ''));
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError';
+}
+
+// Outcome of a loadItem call. A superseded or failed load must not be treated
+// as a successful item load: the shared store may already hold a different
+// item by the time the caller resumes.
+const LOAD_SUPERSEDED = Object.freeze({ status: 'superseded' });
+
+function hasSharedWorkspaceReferences(workspaceId) {
+  return (
+    workspaceDataStore.initialized && Number(workspaceDataStore.workspaceId) === Number(workspaceId)
+  );
 }
 
 function childItemListsMatch(current = [], next = []) {
@@ -57,6 +71,7 @@ const RELATED_ITEM_FIELDS = {
   priority: ['priority_id', 'priority_name', 'priority_color'],
   iteration: ['iteration_id', 'iteration_name', 'iteration_end_date'],
   assignee: ['assignee_id', 'assignee_name', 'assignee_email'],
+  team: ['team_id', 'team_name', 'team_color', 'team_avatar_url'],
   project: ['project_id', 'project_name', 'inherit_project'],
 };
 
@@ -72,6 +87,7 @@ const DEFAULT_EDITING_STATE = {
   iteration: { active: false, value: null },
   project: { active: false, value: null },
   assignee: { active: false, value: null },
+  team: { active: false, value: null },
   customFields: { active: {}, values: {} },
 };
 
@@ -79,6 +95,23 @@ class ItemDetailStore {
   // Monotonic counter for in-flight loadItem calls; lets us discard results
   // from superseded calls when the user clicks rapidly through items.
   #loadToken = 0;
+  #loadController = null;
+  #refreshToken = 0;
+  #refreshController = null;
+  #refreshInFlight = false;
+  #refreshPending = false;
+  #linksController = null;
+  #worklogsController = null;
+  #worklogsPromise = null;
+  #worklogsPromiseItemId = null;
+  #worklogsLoadedItemId = null;
+  #diagramsController = null;
+  #diagramsPromise = null;
+  #diagramsPromiseItemId = null;
+  #diagramsLoadedItemId = null;
+  #timeModalDataController = null;
+  #timeModalDataPromise = null;
+  #timeModalDataLoaded = false;
 
   // === Current Item ===
   item = $state(null);
@@ -87,9 +120,11 @@ class ItemDetailStore {
   loading = $state(true);
   error = $state(null);
   saving = $state(false);
-  // Set when the open item no longer exists (deleted elsewhere — discovered via
-  // the SSE `deleted` event or a 404 on refresh). The detail view watches this
-  // and closes/navigates away instead of showing stale data (WI-484).
+  // Latest requested save per field while another save is in flight; replayed
+  // on completion so rapid edits are not dropped.
+  #pendingSaves = new Map();
+  #drainingPendingSaves = false;
+  // The detail view closes when an SSE deletion or refresh 404 sets this.
   notFound = $state(false);
 
   // Workspace
@@ -112,15 +147,12 @@ class ItemDetailStore {
   currentHierarchyLevel = $state(null);
   availableSubIssueTypes = $state([]);
 
-  // Screen configuration (cached per workspace).
-  // workspaceScreenFields / workspaceScreenSystemFields hold the *visibility*
-  // union (edit ∪ view); editableScreenFieldIds / editableScreenSystemFields
-  // are the *editable* subset (edit-screen only). When both are null, all
-  // visible fields are editable (i.e., the legacy single-screen path is
-  // active and there's no view-vs-edit separation in play).
+  // Null editable fields preserve the legacy path: all visible fields are editable.
   customFieldDefinitions = $state([]);
   workspaceScreenFields = $state([]);
   workspaceScreenSystemFields = $state([]);
+  // Recursive descendant story-point rollup from the detail summary (GH #256).
+  storyPointsRollup = $state(null);
   // Virtual field metadata for the item's request type (read-only display only).
   requestTypeFields = $state([]);
   editableScreenFieldIds = $state(null);
@@ -138,17 +170,19 @@ class ItemDetailStore {
 
   // Watch
   isWatching = $state(false);
+  // Set when the open ticket is a merged duplicate pointing at its canonical.
+  mergedIntoItemId = $state(null);
   loadingWatchStatus = $state(false);
 
   // Time tracking
   timeProjects = $state([]);
   timeWorklogs = $state([]);
+  timeWorklogsLoading = $state(false);
+  timeModalDataLoading = $state(false);
   customers = $state([]);
   workItems = $state([]);
   workspaces = $state([]);
-  // Child-item rollup for the Time Tracking tab "Include child items" toggle.
-  // timeRollup is null until the user opts in; it caches the API response
-  // for the current item view so toggling on/off doesn't refetch.
+  // Cache the optional child-item rollup for the current item.
   includeChildItems = $state(false);
   timeRollup = $state(null);
   timeRollupLoading = $state(false);
@@ -156,21 +190,21 @@ class ItemDetailStore {
   // Diagrams & Actions
   diagrams = $state([]);
   loadingDiagrams = $state(false);
+  diagramsLoaded = $state(false);
   manualActions = $state([]);
 
   // Modals
   showDeleteDialog = $state(false);
   showLinkModal = $state(false);
-  // Preselect the link type when the add-link modal opens — set by callers
-  // that pre-select a type (e.g. the Pages section's Add button).
+  // Callers may preselect the link type before opening this modal.
   linkModalPreselectTypeId = $state(null);
   showTestCaseModal = $state(false);
   selectedTestCaseId = $state(null);
+  // Numeric workspace id for the selected test case. Links can cross
+  // workspaces, so this may differ from the item's workspace.
+  selectedTestCaseWorkspaceId = $state(null);
   showTimeLogModal = $state(false);
   editingWorklog = $state(null);
-
-  // Track changes
-  hasChanges = $state(false);
 
   // Animation state
   transitioning = $state(false);
@@ -180,24 +214,19 @@ class ItemDetailStore {
 
   // === Derived Values (getters) ===
 
-  /**
-   * Get status options based on loaded transitions.
-   */
   get statusOptions() {
     if (this.availableStatusTransitions.length > 0) {
       return this.availableStatusTransitions.map((transition) => ({
         id: transition.id,
         value: transition.value,
         label: transition.name,
+        builtin_key: transition.builtin_key,
         categoryColor: transition.category_color || null,
       }));
     }
     return this.loadingStatusTransitions ? [{ value: '', label: 'Loading...' }] : [];
   }
 
-  /**
-   * Get filtered link types (excluding test link type for item-to-item linking).
-   */
   get filteredLinkTypes() {
     return this.linkTypes;
   }
@@ -213,6 +242,18 @@ class ItemDetailStore {
    * race-safe by a monotonic load token; superseded results are discarded.
    */
   async loadItem(workspaceId, itemId, options = {}) {
+    this.#loadController?.abort();
+    this.#refreshController?.abort();
+    this.#linksController?.abort();
+    this.#worklogsController?.abort();
+    this.#diagramsController?.abort();
+    const controller = new AbortController();
+    this.#loadController = controller;
+    this.#refreshController = null;
+    this.#refreshToken += 1;
+    this.#refreshInFlight = false;
+    this.#refreshPending = false;
+    const requestOptions = { signal: controller.signal };
     const token = ++this.#loadToken;
     const isSwitch = this.item != null;
 
@@ -223,26 +264,52 @@ class ItemDetailStore {
     const lookupItemNumber = options.itemNumber || (lookupWorkspaceKey ? itemId : null);
 
     this.itemId = effectiveItemId;
+    this.timeWorklogs = [];
+    this.timeWorklogsLoading = false;
+    this.#worklogsLoadedItemId = null;
+    this.#worklogsPromise = null;
+    this.#worklogsPromiseItemId = null;
+    this.diagrams = [];
+    this.loadingDiagrams = false;
+    this.diagramsLoaded = false;
+    this.#diagramsPromise = null;
+    this.#diagramsPromiseItemId = null;
+    this.#diagramsLoadedItemId = null;
     this.error = null;
     this.notFound = false;
     if (!isSwitch) {
       this.loading = true;
       this.loadingLinks = true;
     }
+    this.loadingStatusTransitions = true;
+    this.loadingWatchStatus = true;
+    this.loadingChildItems = true;
 
     try {
-      if (lookupWorkspaceKey) {
-        const resolved = await api.items.getByKey(lookupWorkspaceKey, lookupItemNumber);
-        if (token !== this.#loadToken) return;
-        effectiveItemId = resolved.id;
-        effectiveWorkspaceId = resolved.workspace_id;
-        this.itemId = effectiveItemId;
-      }
+      let workspaceInitPromise = isNumericID(effectiveWorkspaceId)
+        ? workspaceDataStore.initialize(effectiveWorkspaceId)
+        : null;
+      const summary = lookupWorkspaceKey
+        ? await api.items.getDetailSummaryByKey(
+            lookupWorkspaceKey,
+            lookupItemNumber,
+            requestOptions
+          )
+        : await api.items.getDetailSummary(effectiveItemId, requestOptions);
+      if (token !== this.#loadToken) return LOAD_SUPERSEDED;
 
-      // Fetch item first to derive workspaceId if not provided
-      const itemData = await api.items.get(effectiveItemId);
-      if (token !== this.#loadToken) return;
-
+      const itemData = summary?.item;
+      if (!itemData) throw new Error('Item detail summary did not include an item');
+      effectiveItemId = itemData.id;
+      effectiveWorkspaceId = itemData.workspace_id;
+      this.itemId = effectiveItemId;
+      // Screen field state must never outlive the item that produced it: clear
+      // it synchronously with the item assignment; #hydrateScreenFields refills
+      // it from the summary or the workspace cache.
+      this.workspaceScreenFields = [];
+      this.workspaceScreenSystemFields = [];
+      this.editableScreenFieldIds = null;
+      this.editableScreenSystemFields = null;
       this.item = itemData;
       if (this.item.assignee_id === undefined) {
         this.item.assignee_id = null;
@@ -252,42 +319,21 @@ class ItemDetailStore {
       const wsId = effectiveWorkspaceId || itemData.workspace_id;
       this.workspaceId = wsId;
 
-      const [
-        workspaceData,
-        linkTypesData,
-        linksData,
-        customFieldsData,
-        milestonesData,
-        iterationsData,
-        projectsData,
-        worklogsData,
-        customersData,
-        workItemsData,
-        workspacesData,
-        requestTypeFieldsData,
-      ] = await Promise.all([
-        api.workspaces.get(wsId),
-        api.linkTypes.getAll(),
-        api.links.getForItem('items', effectiveItemId),
-        api.customFields.getAll(),
-        api.milestones.getAll({ workspace_id: wsId, include_global: true }),
-        api.iterations.getAll({ workspace_id: wsId, include_global: true }),
-        api.time.projects.getByWorkspace(wsId),
-        api.time.worklogs.getByItem(effectiveItemId),
-        api.customerOrganisations.getAll(),
-        api.items.getAll({ limit: 100 }),
-        api.workspaces.getAll(),
-        itemData.request_type_id
-          ? api.requestTypes.getFields(itemData.request_type_id).catch(() => [])
-          : Promise.resolve([]),
-      ]);
-      if (token !== this.#loadToken) return;
+      // Share MainApp's in-flight workspace bootstrap.
+      workspaceInitPromise ??= workspaceDataStore.initialize(wsId);
+      await workspaceInitPromise;
+      if (token !== this.#loadToken) return LOAD_SUPERSEDED;
+      const useSharedReferences = hasSharedWorkspaceReferences(wsId);
 
-      this.workspace = workspaceData;
-      this.customFieldDefinitions = customFieldsData?.data || [];
+      this.workspace = useSharedReferences
+        ? workspaceDataStore.workspace
+        : await api.workspaces.get(wsId, requestOptions);
+      this.customFieldDefinitions = useSharedReferences
+        ? workspaceDataStore.customFieldDefinitions
+        : [];
 
       // Filter milestones by workspace restrictions
-      let allMilestones = milestonesData || [];
+      const allMilestones = useSharedReferences ? workspaceDataStore.milestones : [];
       if (this.workspace?.milestone_categories?.length > 0) {
         const allowedCategoryIds = this.workspace.milestone_categories;
         this.milestones = allMilestones.filter((m) => allowedCategoryIds.includes(m.category_id));
@@ -295,98 +341,95 @@ class ItemDetailStore {
         this.milestones = allMilestones;
       }
 
-      this.iterations = iterationsData || [];
-      this.timeProjects = projectsData || [];
-      this.timeWorklogs = worklogsData || [];
-      this.customers = customersData || [];
-      this.workItems = workItemsData?.items || workItemsData || [];
-      this.workspaces = workspacesData || [];
-      this.requestTypeFields = requestTypeFieldsData || [];
+      this.iterations = useSharedReferences ? workspaceDataStore.iterations : [];
+      this.timeProjects = useSharedReferences ? workspaceDataStore.projects : [];
+      this.itemTypes = useSharedReferences ? workspaceDataStore.itemTypes : [];
+      this.priorities = [
+        ...(summary.priorities?.length
+          ? summary.priorities
+          : useSharedReferences
+            ? workspaceDataStore.priorities
+            : []),
+      ].sort((a, b) => a.sort_order - b.sort_order);
 
-      // Resolve the workspace's configuration set once. Priorities and screen-
-      // field resolution both need it; fetching it twice was a redundant round
-      // trip on every item open.
-      const configSet = this.workspace?.configuration_set_id
-        ? await api.configurationSets.get(this.workspace.configuration_set_id).catch((err) => {
-            console.warn('Failed to load configuration set:', err);
-            return null;
-          })
-        : null;
-      if (token !== this.#loadToken) return;
+      this.requestTypeFields = summary.request_type_fields || [];
+      this.linkTypes = summary.link_types || [];
+      this.#applyLinks(summary.links);
+      this.availableStatusTransitions = summary.transitions?.available_transitions || [];
+      this.pendingApproval = summary.transitions?.pending_approval || null;
+      this.isWatching = summary.watching || false;
+      this.mergedIntoItemId = summary.merged_into_item_id || null;
+      this.childItems = summary.children || [];
+      this.currentItemType = summary.current_item_type || null;
+      this.currentHierarchyLevel = summary.current_hierarchy_level || null;
+      this.availableSubIssueTypes = summary.available_sub_issue_types || [];
+      this.manualActions = summary.manual_actions || [];
 
-      // Load priorities based on workspace configuration
-      await this.#loadPriorities(configSet);
-      if (token !== this.#loadToken) return;
+      const fieldConfigPromise = this.#hydrateScreenFields(
+        summary.screen_context,
+        itemData.item_type_id ?? null,
+        token
+      );
 
-      // Load status transitions and watch status
-      this.#loadAvailableStatusTransitions();
-      this.#loadWatchStatus();
+      this.storyPointsRollup = summary.story_points_rollup || null;
 
-      this.linkTypes = linkTypesData;
+      this.parentHierarchy = (summary.ancestors || []).map((ancestor) => {
+        const itemType = this.itemTypes.find((type) => type.id === ancestor.item_type_id);
+        return itemType ? { ...ancestor, itemType } : ancestor;
+      });
 
-      // Process links data
-      const allLinks = [];
-      if (linksData.outgoing) allLinks.push(...linksData.outgoing);
-      if (linksData.incoming) allLinks.push(...linksData.incoming);
-      this.itemLinks = allLinks;
-
-      // Sync editing state from item
+      // Heavy optional panels such as diagrams, worklogs, history, SCM detail,
+      // and agent logs remain deferred behind their existing loaders.
       this.#syncEditingFromItem();
-
-      // Load item type / hierarchy data first so parent-hierarchy enrichment
-      // can reuse this.itemTypes instead of fetching the type list again.
-      await this.#loadItemTypeData();
-      if (token !== this.#loadToken) return;
-
-      // Load parent hierarchy if item has parents
-      if (this.item.parent_id) {
-        await this.#loadParentHierarchy();
-      } else {
-        this.parentHierarchy = [];
-      }
-      if (token !== this.#loadToken) return;
-
-      // Load child items
-      await this.loadChildItems();
-      if (token !== this.#loadToken) return;
-
-      // Load workspace screen configuration
-      await this.#loadWorkspaceScreenFields(configSet);
-      if (token !== this.#loadToken) return;
-
-      // Load diagrams
-      await this.loadDiagrams();
-      if (token !== this.#loadToken) return;
-
-      // Load manual actions
-      await this.#loadManualActions();
-      return this.item;
+      await fieldConfigPromise;
+      // Screen-field hydration can outlive this request; a newer load that
+      // started meanwhile owns the store now.
+      if (token !== this.#loadToken) return LOAD_SUPERSEDED;
+      return { status: 'success', item: this.item };
     } catch (err) {
-      if (token !== this.#loadToken) return;
+      if (token !== this.#loadToken || isAbortError(err)) return LOAD_SUPERSEDED;
       console.error('Failed to load item or workspace:', err);
       this.error = err.message || 'Failed to load data';
       this.item = null;
+      return { status: 'error', error: this.error };
     } finally {
       if (token === this.#loadToken) {
+        if (this.#loadController === controller) this.#loadController = null;
         this.loading = false;
         this.loadingLinks = false;
+        this.loadingStatusTransitions = false;
+        this.loadingWatchStatus = false;
+        this.loadingChildItems = false;
         this.transitioning = false;
+        this.#runPendingRefresh();
       }
     }
   }
 
-  /**
-   * Lightweight background refresh for an already-open item detail view.
-   * Unlike loadItem(), this only fetches the item record and merges it into
-   * current state so agent-driven status/comment-adjacent updates appear
-   * without clobbering any field the local user is actively editing.
-   */
+  // Refresh the item without overwriting fields being edited locally.
   async refreshCurrentItem() {
-    if (!this.itemId || this.loading || this.saving) return;
+    if (!this.itemId) return;
+    if (this.loading || this.saving || this.#refreshInFlight) {
+      this.#refreshPending = true;
+      return;
+    }
+
+    const itemId = this.itemId;
+    const controller = new AbortController();
+    const token = ++this.#refreshToken;
+    this.#refreshController = controller;
+    this.#refreshInFlight = true;
 
     try {
-      const nextItem = await api.items.get(this.itemId);
-      if (!nextItem || String(nextItem.id) !== String(this.itemId)) return;
+      // An SSE refresh must not share a pre-mutation GET that happens to still
+      // be in flight. Otherwise the event can be consumed while the UI is
+      // reconciled with the response captured before that mutation.
+      const nextItem = await api.items.get(itemId, {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      if (token !== this.#refreshToken || String(itemId) !== String(this.itemId)) return;
+      if (!nextItem || String(nextItem.id) !== String(itemId)) return;
 
       const previousStatusID = this.item?.status_id;
       const previousItemTypeID = this.item?.item_type_id;
@@ -400,7 +443,7 @@ class ItemDetailStore {
       }
       if (previousItemTypeID !== this.item.item_type_id) {
         await this.#loadItemTypeData();
-        await this.#loadWorkspaceScreenFields();
+        await this.#hydrateScreenFields(null, this.item.item_type_id ?? null, this.#loadToken);
       }
       if (previousParentID !== this.item.parent_id) {
         if (this.item.parent_id) {
@@ -410,45 +453,142 @@ class ItemDetailStore {
         }
       }
     } catch (err) {
-      // A 404 means the item was deleted out from under us. Surface it so the
-      // view can close instead of silently keeping stale data (WI-484).
+      if (token !== this.#refreshToken || isAbortError(err)) return;
+      // A deleted item must close rather than remain stale.
       if (err?.status === 404) {
         this.markDeleted();
         return;
       }
       console.warn('Failed to refresh item detail:', err);
+      // Let callers that own freshness (SSE handlers) observe the failure and
+      // resume the polling fallback instead of leaving the view stale.
+      throw err;
+    } finally {
+      if (token === this.#refreshToken) {
+        if (this.#refreshController === controller) this.#refreshController = null;
+        this.#refreshInFlight = false;
+        this.#runPendingRefresh();
+      }
     }
   }
 
-  /**
-   * Mark the open item as gone (deleted elsewhere). Idempotent; the detail view
-   * reacts to `notFound` by closing/navigating away.
-   */
+  #runPendingRefresh() {
+    if (!this.#refreshPending || this.loading || this.saving || this.#refreshInFlight) return;
+    this.#refreshPending = false;
+    queueMicrotask(() => {
+      this.refreshCurrentItem().catch(() => {
+        // refreshCurrentItem already logged the failure.
+      });
+    });
+  }
+
   markDeleted() {
+    // Tear down the rendered detail immediately so lazy panels abort their own
+    // requests before the deleted resource starts returning 404s.
+    this.#loadToken += 1;
+    this.#refreshToken += 1;
+    this.#loadController?.abort();
+    this.#refreshController?.abort();
+    this.#linksController?.abort();
+    this.#worklogsController?.abort();
+    this.#diagramsController?.abort();
+    this.#timeModalDataController?.abort();
+    this.item = null;
+    this.#refreshController = null;
+    this.#refreshInFlight = false;
+    this.#refreshPending = false;
     this.notFound = true;
   }
 
-  /**
-   * Reload worklogs (e.g., after timer stops).
-   */
-  async reloadWorklogs() {
+  // Single-flight per-item worklog loading prevents duplicate tab requests.
+  async loadWorklogs({ force = false } = {}) {
     if (!this.itemId) return;
-    try {
-      this.timeWorklogs = (await api.time.worklogs.getByItem(this.itemId)) || [];
-    } catch (err) {
-      console.error('Failed to reload worklogs:', err);
+    const itemId = this.itemId;
+    if (!force && this.#worklogsLoadedItemId === itemId) return this.timeWorklogs;
+    if (!force && this.#worklogsPromise && this.#worklogsPromiseItemId === itemId) {
+      return this.#worklogsPromise;
     }
-    // Logging time also changes the rollup totals; refresh in the background
-    // if the user has it visible.
-    if (this.includeChildItems) {
-      this.loadTimeRollup({ force: true });
-    }
+
+    this.#worklogsController?.abort();
+    const controller = new AbortController();
+    this.#worklogsController = controller;
+    this.#worklogsPromiseItemId = itemId;
+    this.timeWorklogsLoading = true;
+
+    const promise = api.time.worklogs
+      .getByItem(itemId, { signal: controller.signal })
+      .then((worklogs) => {
+        if (this.itemId === itemId) {
+          this.timeWorklogs = worklogs || [];
+          this.#worklogsLoadedItemId = itemId;
+        }
+        return this.timeWorklogs;
+      })
+      .catch((err) => {
+        if (isAbortError(err)) return this.timeWorklogs;
+        console.error('Failed to load worklogs:', err);
+        return this.timeWorklogs;
+      })
+      .finally(() => {
+        if (this.#worklogsController === controller) {
+          this.#worklogsController = null;
+          this.#worklogsPromise = null;
+          this.#worklogsPromiseItemId = null;
+          this.timeWorklogsLoading = false;
+        }
+      });
+    this.#worklogsPromise = promise;
+    return promise;
   }
 
-  /**
-   * Fetch the rolled-up estimate / logged minutes across the current item
-   * and its descendants. Cached; pass { force: true } to refetch.
-   */
+  // Load TimeLogModal-only picker data lazily and once.
+  async loadTimeModalData() {
+    if (this.#timeModalDataLoaded) return;
+    if (this.#timeModalDataPromise) return this.#timeModalDataPromise;
+
+    const controller = new AbortController();
+    this.#timeModalDataController = controller;
+    this.timeModalDataLoading = true;
+    const requestOptions = { signal: controller.signal };
+    const fallback = (promise, label) =>
+      promise.catch((err) => {
+        if (isAbortError(err)) throw err;
+        console.warn(`Failed to load ${label} for time logging:`, err);
+        return [];
+      });
+
+    const promise = Promise.all([
+      fallback(api.customerOrganisations.getAll({}, requestOptions), 'customers'),
+      fallback(api.items.getAll({ limit: 100 }, requestOptions), 'work items'),
+      fallback(workspacesStore.load(), 'workspaces'),
+    ])
+      .then(([customers, workItems, workspaces]) => {
+        this.customers = customers || [];
+        this.workItems = workItems?.data ?? [];
+        this.workspaces = workspaces || [];
+        this.#timeModalDataLoaded = true;
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error('Failed to load time-log modal data:', err);
+      })
+      .finally(() => {
+        if (this.#timeModalDataController === controller) {
+          this.#timeModalDataController = null;
+          this.#timeModalDataPromise = null;
+          this.timeModalDataLoading = false;
+        }
+      });
+    this.#timeModalDataPromise = promise;
+    return promise;
+  }
+
+  /** Reload worklogs after a timer or manual time-entry mutation. */
+  async reloadWorklogs() {
+    await this.loadWorklogs({ force: true });
+    if (this.includeChildItems) this.loadTimeRollup({ force: true });
+  }
+
+  // Fetch and cache the current item's descendant time rollup.
   async loadTimeRollup({ force = false } = {}) {
     if (!this.itemId) return;
     if (this.timeRollup && !force) return;
@@ -463,14 +603,11 @@ class ItemDetailStore {
     }
   }
 
-  /**
-   * Load child items.
-   */
-  async loadChildItems() {
+  async loadChildItems(requestOptions = {}) {
     if (!this.itemId) return;
     try {
       this.loadingChildItems = true;
-      const response = await api.items.getChildren(this.itemId);
+      const response = await api.items.getChildren(this.itemId, requestOptions);
       let nextChildItems = [];
       if (Array.isArray(response)) {
         nextChildItems = response;
@@ -484,103 +621,131 @@ class ItemDetailStore {
         this.childItems = nextChildItems;
       }
     } catch (err) {
+      if (isAbortError(err)) return;
       console.error('Failed to load child items:', err);
       this.childItems = [];
     } finally {
-      this.loadingChildItems = false;
+      if (!requestOptions.signal?.aborted) this.loadingChildItems = false;
     }
   }
 
-  /**
-   * Load diagrams for the item.
-   */
-  async loadDiagrams() {
-    if (!this.item?.id) return;
+  // Link mutations and SSE link events refresh only links, not the full view.
+  async loadLinks() {
+    if (!this.itemId) return;
+    this.#linksController?.abort();
+    const controller = new AbortController();
+    this.#linksController = controller;
+    const itemId = this.itemId;
     try {
-      this.loadingDiagrams = true;
-      this.diagrams = (await api.getDiagrams(this.item.id)) || [];
+      this.loadingLinks = true;
+      const links = await api.links.getForItem('items', itemId, {
+        signal: controller.signal,
+      });
+      if (this.itemId !== itemId) return;
+      this.#applyLinks(links);
     } catch (err) {
-      console.error('Failed to load diagrams:', err);
-      this.diagrams = [];
+      if (isAbortError(err)) return;
+      console.error('Failed to load item links:', err);
     } finally {
-      this.loadingDiagrams = false;
+      if (this.#linksController === controller) {
+        this.#linksController = null;
+        this.loadingLinks = false;
+      }
     }
+  }
+
+  async loadDiagrams({ force = false } = {}) {
+    const itemId = this.item?.id;
+    if (!itemId) return [];
+    if (!force && this.#diagramsLoadedItemId === itemId) return this.diagrams;
+    if (!force && this.#diagramsPromise && this.#diagramsPromiseItemId === itemId) {
+      return this.#diagramsPromise;
+    }
+
+    this.#diagramsController?.abort();
+    const controller = new AbortController();
+    this.#diagramsController = controller;
+    this.#diagramsPromiseItemId = itemId;
+    this.loadingDiagrams = true;
+
+    const promise = api
+      .getDiagrams(itemId, { signal: controller.signal })
+      .then((diagrams) => {
+        if (this.item?.id === itemId) {
+          this.diagrams = diagrams || [];
+          this.diagramsLoaded = true;
+          this.#diagramsLoadedItemId = itemId;
+        }
+        return this.diagrams;
+      })
+      .catch((err) => {
+        if (isAbortError(err) || controller.signal.aborted || this.item?.id !== itemId) {
+          return this.diagrams;
+        }
+        if (err?.status === 404) {
+          this.markDeleted();
+          return this.diagrams;
+        }
+        console.error('Failed to load diagrams:', err);
+        if (this.item?.id === itemId) this.diagrams = [];
+        return this.diagrams;
+      })
+      .finally(() => {
+        if (this.#diagramsController === controller) {
+          this.#diagramsController = null;
+          this.#diagramsPromise = null;
+          this.#diagramsPromiseItemId = null;
+          this.loadingDiagrams = false;
+        }
+      });
+
+    this.#diagramsPromise = promise;
+    return promise;
   }
 
   // === Private Data Loading Methods ===
 
-  /**
-   * @param {object|null} [configSet] Pre-resolved configuration set from the
-   *   caller (loadItem resolves it once and shares it). Pass `undefined` to let
-   *   this method fetch it itself; pass `null` to signal "configured but the
-   *   fetch failed" (yields no priorities, matching the old error path).
-   */
-  async #loadPriorities(configSet = undefined) {
-    if (!this.workspace) return;
-    try {
-      if (this.workspace.configuration_set_id) {
-        const cs =
-          configSet !== undefined
-            ? configSet
-            : await api.configurationSets.get(this.workspace.configuration_set_id);
-        this.priorities = cs?.priorities_detailed || [];
-      } else {
-        this.priorities = await api.priorities.getAll();
-      }
-      this.priorities = this.priorities.sort((a, b) => a.sort_order - b.sort_order);
-    } catch (err) {
-      console.error('Failed to load priorities:', err);
-      this.priorities = [];
-    }
+  #applyLinks(linksData) {
+    const links = [];
+    if (linksData?.outgoing) links.push(...linksData.outgoing);
+    if (linksData?.incoming) links.push(...linksData.incoming);
+    this.itemLinks = links;
   }
 
-  async #loadAvailableStatusTransitions() {
-    if (!this.item?.id || this.loadingStatusTransitions) return;
+  async #loadAvailableStatusTransitions(requestOptions = {}) {
+    if (!this.item?.id) return;
+    const itemId = this.item.id;
     try {
       this.loadingStatusTransitions = true;
-      const result = await api.items.getAvailableStatusTransitions(this.item.id);
+      const result = await api.items.getAvailableStatusTransitions(itemId, requestOptions);
+      if (this.item?.id !== itemId) return;
       this.availableStatusTransitions = result.available_transitions || [];
       this.pendingApproval = result.pending_approval || null;
     } catch (err) {
+      if (isAbortError(err)) return;
       console.error('Failed to load status transitions:', err);
       this.availableStatusTransitions = [];
       this.pendingApproval = null;
     } finally {
-      this.loadingStatusTransitions = false;
+      if (!requestOptions.signal?.aborted && this.item?.id === itemId) {
+        this.loadingStatusTransitions = false;
+      }
     }
   }
 
-  /**
-   * Re-fetch available transitions (and pending-approval state). Call after a
-   * decision finalizes so the picker reflects the new gating.
-   */
   async refreshAvailableTransitions() {
     await this.#loadAvailableStatusTransitions();
   }
 
-  async #loadWatchStatus() {
-    if (!this.item?.id || this.loadingWatchStatus) return;
+  async #loadParentHierarchy(requestOptions = {}) {
     try {
-      this.loadingWatchStatus = true;
-      const result = await api.items.getWatchStatus(this.item.id);
-      this.isWatching = result.watching || false;
-    } catch (err) {
-      console.error('Failed to load watch status:', err);
-      this.isWatching = false;
-    } finally {
-      this.loadingWatchStatus = false;
-    }
-  }
-
-  async #loadParentHierarchy() {
-    try {
-      const ancestors = await api.items.getAncestors(this.item.id);
+      const ancestors = await api.items.getAncestors(this.item.id, requestOptions);
       try {
         // Reuse the already-loaded type list (set by #loadItemTypeData, which
         // runs first); only fetch as a fallback if it isn't populated yet.
         const itemTypesData = this.itemTypes?.length
           ? this.itemTypes
-          : await api.itemTypes.getAll();
+          : await api.itemTypes.getAll({}, requestOptions);
         this.parentHierarchy = ancestors.map((ancestor) => {
           if (ancestor.item_type_id) {
             const itemType = itemTypesData.find((type) => type.id === ancestor.item_type_id);
@@ -589,20 +754,25 @@ class ItemDetailStore {
           return ancestor;
         });
       } catch (err) {
+        if (isAbortError(err)) throw err;
         console.warn('Failed to load item types for parent hierarchy:', err);
         this.parentHierarchy = ancestors;
       }
     } catch (err) {
+      if (isAbortError(err)) return;
       console.error('Failed to load ancestors:', err);
       this.parentHierarchy = [];
     }
   }
 
-  async #loadItemTypeData() {
+  async #loadItemTypeData(requestOptions = {}) {
     try {
+      const useSharedReferences = hasSharedWorkspaceReferences(this.workspaceId);
       const [itemTypesData, hierarchyLevels] = await Promise.all([
-        api.itemTypes.getAll(),
-        api.hierarchyLevels.getAll(),
+        useSharedReferences
+          ? Promise.resolve(workspaceDataStore.itemTypes)
+          : api.itemTypes.getAll({}, requestOptions),
+        api.hierarchyLevels.getAll({}, requestOptions),
       ]);
 
       this.itemTypes = itemTypesData || [];
@@ -616,16 +786,15 @@ class ItemDetailStore {
         }
       }
 
-      // Find available sub-issue types (next level down)
-      if (this.currentItemType && this.currentHierarchyLevel) {
-        const nextLevel = this.currentHierarchyLevel.level + 1;
-        this.availableSubIssueTypes = this.itemTypes.filter(
-          (type) => type.hierarchy_level === nextLevel
-        );
+      // Find available child types, including the level-independent generic
+      // sub-task sentinel beneath every regular hierarchy item.
+      if (this.currentItemType) {
+        this.availableSubIssueTypes = childItemTypesForParent(this.itemTypes, this.currentItemType);
       } else {
         this.availableSubIssueTypes = [];
       }
     } catch (err) {
+      if (isAbortError(err)) return;
       console.error('Failed to load item type data:', err);
       this.currentItemType = null;
       this.currentHierarchyLevel = null;
@@ -634,73 +803,44 @@ class ItemDetailStore {
   }
 
   /**
-   * @param {object|null} [configSet] Pre-resolved configuration set shared by
-   *   loadItem. Pass `undefined` to let this method fetch it itself (the
-   *   refresh path); `null` means "none configured / fetch failed".
+   * Resolve and apply the screen field configuration for the current item.
+   *
+   * Screen field state must never outlive the item that produced it, so the
+   * state is cleared synchronously here and hydrated either from the detail
+   * summary's screen context (same response as the item) or, when that section
+   * is unavailable, from the workspace-scoped effective-config cache.
+   *
+   * `loadToken` guards against applying a superseded load's resolution.
    */
-  async #loadWorkspaceScreenFields(configSet = undefined) {
-    try {
-      let editScreenId = null;
-      let viewScreenId = null;
+  async #hydrateScreenFields(screenContext, itemTypeId, loadToken) {
+    this.workspaceScreenFields = [];
+    this.workspaceScreenSystemFields = [];
+    this.editableScreenFieldIds = null;
+    this.editableScreenSystemFields = null;
 
-      let cs = configSet;
-      if (cs === undefined) {
-        cs = this.workspace?.configuration_set_id
-          ? await api.configurationSets.get(this.workspace.configuration_set_id)
-          : null;
+    let fieldConfig = null;
+    if (screenContext?.edit) {
+      fieldConfig = buildDetailScreenFieldConfig(screenContext.edit, screenContext.view);
+    } else {
+      try {
+        const config = await workspaceDataStore.screenConfig(itemTypeId ?? null);
+        if (config?.edit_screen) {
+          fieldConfig = buildDetailScreenFieldConfig(config.edit_screen, config.view_screen);
+        }
+      } catch (err) {
+        console.error('Failed to resolve effective screen configuration:', err);
       }
-      if (cs) {
-        const itemTypeId = this.item?.item_type_id;
-        const screenIds = resolveEffectiveScreenIds(cs, itemTypeId, 1);
-        editScreenId = screenIds.edit;
-        viewScreenId = screenIds.view;
-      }
-
-      // Hardcoded fallback (preserves legacy behavior when nothing is
-      // configured). resolveEffectiveScreenIds already chains through create as
-      // the universal fallback, so a null here means truly nothing is set.
-      if (!editScreenId) editScreenId = 1;
-
-      // If view screen is missing or matches edit, only fetch one — same
-      // behavior as before (every visible field is editable).
-      const sameScreen = !viewScreenId || viewScreenId === editScreenId;
-      const [editScreen, viewScreen] = await Promise.all([
-        api.screens.get(editScreenId),
-        sameScreen ? Promise.resolve(null) : api.screens.get(viewScreenId),
-      ]);
-
-      const fieldConfig = buildDetailScreenFieldConfig(editScreen, sameScreen ? null : viewScreen);
-      this.workspaceScreenFields = fieldConfig.visibleCustomFields;
-      this.workspaceScreenSystemFields = fieldConfig.visibleSystemFields;
-      this.editableScreenFieldIds = fieldConfig.editableCustomFieldIds;
-      this.editableScreenSystemFields = fieldConfig.editableSystemFields;
-    } catch (err) {
-      console.error('Failed to load workspace screen fields:', err);
-      this.workspaceScreenFields = [];
-      this.workspaceScreenSystemFields = [];
-      this.editableScreenFieldIds = null;
-      this.editableScreenSystemFields = null;
     }
-  }
 
-  async #loadManualActions() {
-    if (!this.workspaceId) return;
-    try {
-      const allActions = await api.actions.getAll(this.workspaceId);
-      this.manualActions = (allActions || []).filter(
-        (a) => a.trigger_type === 'manual' && a.is_enabled
-      );
-    } catch (err) {
-      console.error('Failed to load manual actions:', err);
-      this.manualActions = [];
-    }
+    if (!fieldConfig || loadToken !== this.#loadToken) return;
+    this.workspaceScreenFields = fieldConfig.visibleCustomFields;
+    this.workspaceScreenSystemFields = fieldConfig.visibleSystemFields;
+    this.editableScreenFieldIds = fieldConfig.editableCustomFieldIds;
+    this.editableScreenSystemFields = fieldConfig.editableSystemFields;
   }
 
   // === Editing Methods ===
 
-  /**
-   * Start editing a field.
-   */
   startEditing(field) {
     if (field.startsWith('custom_field_')) {
       const fieldId = field.replace('custom_field_', '');
@@ -719,9 +859,6 @@ class ItemDetailStore {
     }
   }
 
-  /**
-   * Cancel editing a field.
-   */
   cancelEditing(field) {
     if (field.startsWith('custom_field_')) {
       const fieldId = field.replace('custom_field_', '');
@@ -736,11 +873,24 @@ class ItemDetailStore {
     }
   }
 
-  /**
-   * Save a field value.
-   */
-  async saveField(field, directValue = null, assigneeName = null, iterationName = null) {
-    if (this.saving) return;
+  async saveField(
+    field,
+    directValue = null,
+    assigneeName = null,
+    iterationName = null,
+    teamName = null
+  ) {
+    if (this.saving) {
+      // A save is in flight; remember the latest requested value per field
+      // and replay it when that save finishes so rapid edits are not lost.
+      this.#pendingSaves.set(field, {
+        directValue: this.#resolveSaveValue(field, directValue),
+        assigneeName,
+        iterationName,
+        teamName,
+      });
+      return;
+    }
 
     try {
       this.saving = true;
@@ -766,13 +916,11 @@ class ItemDetailStore {
           this.cancelEditing('status');
           return;
         }
-        // Status changes must go through the transition endpoint so workflow
-        // rules (validators, conditions) are enforced. The item update endpoint
-        // rejects status_id.
+        // Status changes must use the transition endpoint for workflow validation.
         const updatedItem = await api.items.transition(this.item.id, newStatusId);
         this.item = { ...this.item, ...updatedItem };
-        this.hasChanges = true;
         this.cancelEditing('status');
+        await this.refreshAvailableTransitions();
         return;
       } else if (field === 'priority_id') {
         const newPriorityId = directValue !== null ? directValue : null;
@@ -879,6 +1027,18 @@ class ItemDetailStore {
           assignee_id: newAssignee,
           assignee_name: assigneeName !== undefined ? assigneeName : this.item.assignee_name,
         };
+      } else if (field === 'team') {
+        const newTeamId = directValue !== undefined ? directValue : this.editing.team.value;
+        if (newTeamId === this.item.team_id) {
+          this.cancelEditing('team');
+          return;
+        }
+        updateData.team_id = newTeamId;
+        this.item = {
+          ...this.item,
+          team_id: newTeamId,
+          team_name: teamName !== undefined ? teamName : this.item.team_name,
+        };
       } else if (field.startsWith('custom_field_')) {
         const fieldId = field.replace('custom_field_', '');
         let newValue =
@@ -905,8 +1065,8 @@ class ItemDetailStore {
           return;
         }
 
+        // Custom fields merge per field server-side; send only the edited field.
         updateData.custom_field_values = {
-          ...(this.item.custom_field_values || {}),
           [fieldId]: newValue,
         };
       }
@@ -923,13 +1083,47 @@ class ItemDetailStore {
         this.item = { ...this.item, iteration_name: iterationName };
       }
 
-      this.hasChanges = true;
       this.cancelEditing(field);
     } catch (err) {
       console.error('Failed to update item:', err);
       throw err;
     } finally {
       this.saving = false;
+      await this.#drainPendingSaves();
+      this.#runPendingRefresh();
+    }
+  }
+
+  // Resolve an editing-state value into a direct value so a queued save keeps
+  // writing the same content after the editor closes.
+  #resolveSaveValue(field, directValue) {
+    if (directValue !== null || !field.startsWith('custom_field_')) {
+      return directValue;
+    }
+    const fieldId = field.replace('custom_field_', '');
+    const value = this.editing.customFields.values[fieldId];
+    return value !== undefined ? value : null;
+  }
+
+  // Replay queued saves sequentially; the nested saveField call re-enters
+  // this drain in its own finally, so guard against double processing.
+  async #drainPendingSaves() {
+    if (this.#drainingPendingSaves) return;
+    this.#drainingPendingSaves = true;
+    try {
+      while (this.#pendingSaves.size > 0) {
+        const [field, pending] = this.#pendingSaves.entries().next().value;
+        this.#pendingSaves.delete(field);
+        await this.saveField(
+          field,
+          pending.directValue,
+          pending.assigneeName,
+          pending.iterationName,
+          pending.teamName
+        );
+      }
+    } finally {
+      this.#drainingPendingSaves = false;
     }
   }
 
@@ -1030,7 +1224,6 @@ class ItemDetailStore {
         await api.items.addWatch(this.item.id);
         this.isWatching = true;
       }
-      this.hasChanges = true;
     } catch (err) {
       console.error('Failed to toggle watch:', err);
       throw err;
@@ -1048,8 +1241,7 @@ class ItemDetailStore {
         target_id: parseInt(targetId, 10),
         link_type_id: parseInt(linkTypeId, 10),
       });
-      // Reload to refresh links
-      await this.loadItem(this.workspaceId, this.itemId);
+      await this.loadLinks();
     } catch (err) {
       console.error('Error creating link:', err);
       throw err;
@@ -1059,7 +1251,7 @@ class ItemDetailStore {
   async removeLink(linkId) {
     try {
       await api.links.delete(linkId);
-      await this.loadItem(this.workspaceId, this.itemId);
+      await this.loadLinks();
     } catch (err) {
       console.error('Error removing link:', err);
       throw err;
@@ -1109,14 +1301,16 @@ class ItemDetailStore {
     this.linkModalPreselectTypeId = null;
   }
 
-  openTestCaseModal(testCaseId) {
+  openTestCaseModal(testCaseId, workspaceId = null) {
     this.selectedTestCaseId = testCaseId;
+    this.selectedTestCaseWorkspaceId = workspaceId;
     this.showTestCaseModal = true;
   }
 
   closeTestCaseModal() {
     this.showTestCaseModal = false;
     this.selectedTestCaseId = null;
+    this.selectedTestCaseWorkspaceId = null;
   }
 
   openTimeLogModal(worklog = null) {
@@ -1140,10 +1334,33 @@ class ItemDetailStore {
 
   // === Reset ===
 
-  /**
-   * Full reset.
-   */
   reset() {
+    this.#loadToken += 1;
+    this.#refreshToken += 1;
+    this.#refreshPending = false;
+    this.#pendingSaves.clear();
+    this.#drainingPendingSaves = false;
+    this.#loadController?.abort();
+    this.#refreshController?.abort();
+    this.#linksController?.abort();
+    this.#worklogsController?.abort();
+    this.#diagramsController?.abort();
+    this.#timeModalDataController?.abort();
+    this.#loadController = null;
+    this.#refreshController = null;
+    this.#refreshInFlight = false;
+    this.#linksController = null;
+    this.#worklogsController = null;
+    this.#worklogsPromise = null;
+    this.#worklogsPromiseItemId = null;
+    this.#worklogsLoadedItemId = null;
+    this.#diagramsController = null;
+    this.#diagramsPromise = null;
+    this.#diagramsPromiseItemId = null;
+    this.#diagramsLoadedItemId = null;
+    this.#timeModalDataController = null;
+    this.#timeModalDataPromise = null;
+    this.#timeModalDataLoaded = false;
     this.item = null;
     this.itemId = null;
     this.workspaceId = null;
@@ -1157,6 +1374,7 @@ class ItemDetailStore {
 
     this.parentHierarchy = [];
     this.childItems = [];
+    this.storyPointsRollup = null;
     this.loadingChildItems = false;
     this.milestones = [];
     this.iterations = [];
@@ -1181,6 +1399,8 @@ class ItemDetailStore {
     this.loadingWatchStatus = false;
     this.timeProjects = [];
     this.timeWorklogs = [];
+    this.timeWorklogsLoading = false;
+    this.timeModalDataLoading = false;
     this.includeChildItems = false;
     this.timeRollup = null;
     this.timeRollupLoading = false;
@@ -1189,15 +1409,16 @@ class ItemDetailStore {
     this.workspaces = [];
     this.diagrams = [];
     this.loadingDiagrams = false;
+    this.diagramsLoaded = false;
     this.manualActions = [];
     this.showDeleteDialog = false;
     this.showLinkModal = false;
     this.linkModalPreselectTypeId = null;
     this.showTestCaseModal = false;
     this.selectedTestCaseId = null;
+    this.selectedTestCaseWorkspaceId = null;
     this.showTimeLogModal = false;
     this.editingWorklog = null;
-    this.hasChanges = false;
     this.transitioning = false;
     this.dropdownItems = [];
   }

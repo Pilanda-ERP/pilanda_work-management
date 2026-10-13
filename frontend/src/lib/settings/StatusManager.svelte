@@ -3,25 +3,20 @@
   import { api } from '../api.js';
   import { Plus, Edit, Trash2, Circle, GitBranch } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
+  import ColorDot from '../components/ColorDot.svelte';
   import DataTable from '../components/DataTable.svelte';
   import Panel from '../components/Panel.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import { getHexFromColorName } from '../utils/colors.js';
-  import Modal from '../dialogs/Modal.svelte';
-  import ModalHeader from '../dialogs/ModalHeader.svelte';
-  import Textarea from '../components/Textarea.svelte';
   import Lozenge from '../components/Lozenge.svelte';
-  import Toggle from '../components/Toggle.svelte';
-  import BasePicker from '../pickers/BasePicker.svelte';
-  import DialogFooter from '../dialogs/DialogFooter.svelte';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast } from '../stores/toasts.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
+  import { loadStatusManagerData } from './statusManagerData.js';
   import './settings-form.css';
-
-  // System-protected status IDs (cannot be deleted)
-  const PROTECTED_STATUS_IDS = [1, 6]; // Open and Closed
+  import { objectDisplayName, objectDisplayValue } from '../utils/systemLabels.js';
+  import StatusModal from '../dialogs/StatusModal.svelte';
 
   let statuses = $state([]);
   let statusCategories = $state([]);
@@ -30,6 +25,21 @@
   let loadingCategories = $state(true);
   let showCreateForm = $state(false);
   let editingId = $state(null);
+  let editingObject = $state(null);
+  let translationEditor = $state(null);
+  let saving = $state(false);
+
+  function getStatusDisplayValue(status, field) {
+    return objectDisplayValue(status, field);
+  }
+
+  function getStatusCategoryDisplayName(category) {
+    return objectDisplayName(category);
+  }
+
+  function isProtectedStatus(status) {
+    return status?.builtin_key === 'open' || status?.builtin_key === 'done';
+  }
 
   // Form state
   let formData = $state({
@@ -40,61 +50,27 @@
   });
 
   onMount(async () => {
-    await loadStatusCategories();
-    await loadStatuses();
-  });
-
-  async function loadStatusCategories() {
     try {
+      loading = true;
       loadingCategories = true;
-      statusCategories = await api.get('/status-categories') || [];
+      const data = await loadStatusManagerData(api);
+      statusCategories = data.statusCategories;
+      workflowTransitions = data.workflowTransitions;
+      statuses = data.statuses;
       // Set default category if none selected
       if (statusCategories.length > 0 && !formData.category_id) {
         formData.category_id = statusCategories[0].id;
       }
     } catch (error) {
-      console.error('Failed to load status categories:', error);
-      statusCategories = [];
-    } finally {
-      loadingCategories = false;
-    }
-  }
-
-  async function loadStatuses() {
-    try {
-      loading = true;
-      const [statusesResult, workflows] = await Promise.all([
-        api.get('/statuses') || [],
-        api.get('/workflows') || []
-      ]);
-      
-      // Get all transitions from all workflows
-      const allTransitions = [];
-      for (const workflow of workflows) {
-        try {
-          const transitions = await api.get(`/workflows/${workflow.id}/transitions`) || [];
-          allTransitions.push(...transitions);
-        } catch (error) {
-          console.error(`Failed to load transitions for workflow ${workflow.id}:`, error);
-        }
-      }
-      
-      workflowTransitions = allTransitions;
-      
-      // Add transition count to each status
-      statuses = statusesResult.map(status => ({
-        ...status,
-        transitionCount: allTransitions.filter(t => 
-          t.from_status_id === status.id || t.to_status_id === status.id
-        ).length
-      }));
-    } catch (error) {
       console.error('Failed to load statuses:', error);
+      statusCategories = [];
+      workflowTransitions = [];
       statuses = [];
     } finally {
       loading = false;
+      loadingCategories = false;
     }
-  }
+  });
 
   function startCreate() {
     formData = {
@@ -104,10 +80,12 @@
       is_default: false
     };
     editingId = null;
+    editingObject = null;
     showCreateForm = true;
   }
 
   function startEdit(status) {
+    editingObject = status;
     formData = {
       name: status.name || '',
       description: status.description || '',
@@ -121,6 +99,7 @@
   function cancelForm() {
     showCreateForm = false;
     editingId = null;
+    editingObject = null;
     formData = {
       name: '',
       description: '',
@@ -130,6 +109,8 @@
   }
 
   async function saveStatus() {
+    if (saving) return;
+    saving = true;
     try {
       if (!formData.name.trim()) {
         errorToast(t('dialogs.alerts.nameRequired'));
@@ -137,12 +118,15 @@
       }
 
       if (editingId) {
-        const updated = await api.put(`/statuses/${editingId}`, formData);
-        statuses = statuses.map(status => 
-          status.id === editingId ? { ...updated, transitionCount: status.transitionCount } : status
-        );
+        translationEditor?.validate();
+        await api.statuses.update(editingId, formData);
+        await translationEditor?.save();
+        const reloaded = await loadStatusManagerData(api);
+        statuses = reloaded.statuses;
+        statusCategories = reloaded.statusCategories;
+        workflowTransitions = reloaded.workflowTransitions;
       } else {
-        const created = await api.post('/statuses', formData);
+        const created = await api.statuses.create(formData);
         statuses = [...statuses, { ...created, transitionCount: 0 }];
       }
       
@@ -151,18 +135,20 @@
     } catch (error) {
       console.error('Failed to save status:', error);
       errorToast(t('dialogs.alerts.failedToSave', { error: error.message || error }));
+    } finally {
+      saving = false;
     }
   }
 
   async function deleteStatus(status) {
     // Protect system-critical statuses
-    if (PROTECTED_STATUS_IDS.includes(status.id)) {
+    if (isProtectedStatus(status)) {
       return; // Silently ignore - button should already be disabled
     }
 
     if (status.transitionCount > 0) {
       errorToast(t('dialogs.alerts.statusInUseByTransitions', {
-        name: status.name,
+        name: getStatusDisplayValue(status, 'name'),
         count: status.transitionCount
       }));
       return;
@@ -170,7 +156,9 @@
 
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: t('dialogs.confirmations.deleteItem', { name: status.name }),
+      message: t('dialogs.confirmations.deleteItem', {
+        name: getStatusDisplayValue(status, 'name')
+      }),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger'
@@ -178,7 +166,7 @@
     if (!confirmed) return;
 
     try {
-      await api.delete(`/statuses/${status.id}`);
+      await api.statuses.delete(status.id);
       statuses = statuses.filter(s => s.id !== status.id);
       window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
     } catch (error) {
@@ -197,11 +185,11 @@
 
   function getCategoryName(categoryId) {
     const category = statusCategories.find(cat => cat.id === categoryId);
-    return category ? category.name : 'Unknown';
+    return category ? getStatusCategoryDisplayName(category) : t('common.unknown');
   }
 
   function buildStatusDropdownItems(status) {
-    const isProtected = PROTECTED_STATUS_IDS.includes(status.id);
+    const isProtected = isProtectedStatus(status);
     const inUse = status.transitionCount > 0;
 
     const items = [
@@ -211,6 +199,7 @@
         icon: Edit,
         title: t('common.edit'),
         hoverClass: 'hover-bg',
+        testid: `status-edit-${status.id}`,
         onClick: () => startEdit(status)
       }
     ];
@@ -224,6 +213,7 @@
         title: t('common.delete'),
         color: 'var(--ds-text-danger)',
         hoverClass: 'hover-danger',
+        testid: `status-delete-${status.id}`,
         onClick: () => deleteStatus(status),
         disabled: inUse
       });
@@ -247,13 +237,15 @@
     {
       key: 'description',
       label: t('common.description'),
-      render: (status) => status.description || '—',
+      render: (status) => getStatusDisplayValue(status, 'description') || '—',
       textColor: 'var(--ds-text-subtle)'
     },
     {
       key: 'transitions',
       label: t('workflows.transitions'),
-      render: (status) => `${status.transitionCount || 0} transition${status.transitionCount === 1 ? '' : 's'}`,
+      render: (status) => t('statuses.transitionCount', {
+        count: status.transitionCount || 0
+      }),
       textColor: 'var(--ds-text-subtle)'
     },
     {
@@ -278,6 +270,7 @@
         disabled={statusCategories.length === 0}
         keyboardHint="A"
         hotkeyConfig={{ key: toHotkeyString('statuses', 'add'), guard: () => !showCreateForm }}
+        dataTestid="status-add"
       >
         {t('statuses.createStatus')}
       </Button>
@@ -286,9 +279,9 @@
 
   {#if statusCategories.length === 0 && !loadingCategories}
     <Panel padding="spacious" class="text-center">
-      <Circle class="w-12 h-12 text-gray-400 mx-auto mb-4" />
-      <h3 class="text-lg font-medium text-gray-900 mb-2">{t('categories.noCategories')}</h3>
-      <p class="text-gray-500 mb-6">{t('statuses.noStatuses')}</p>
+      <Circle class="w-12 h-12 text-ds-icon-subtle mx-auto mb-4" />
+      <h3 class="text-lg font-medium text-ds-text mb-2">{t('categories.noCategories')}</h3>
+      <p class="text-ds-text-subtle mb-6">{t('statuses.noStatuses')}</p>
       <Button href="/admin/status-categories" variant="primary">
         {t('categories.title')}
       </Button>
@@ -301,10 +294,12 @@
       emptyMessage={t('statuses.noStatuses')}
       emptyIcon={Circle}
       actionItems={buildStatusDropdownItems}
+      rowAttrs={(status) => ({ 'data-testid': `status-row-${status.id}` })}
+      actionTriggerTestid={(status) => `status-actions-${status.id}`}
     >
       {#snippet status(status)}
         <div class="flex items-center gap-3">
-          <h3 class="font-medium" style="color: var(--ds-text);">{status.name}</h3>
+          <h3 class="font-medium" style="color: var(--ds-text);">{getStatusDisplayValue(status, 'name')}</h3>
           {#if status.is_default}
             <Lozenge color="green" text={t('common.default')} />
           {/if}
@@ -313,76 +308,24 @@
 
       {#snippet category(status)}
         <div class="flex items-center gap-2">
-          <div
-            class="w-4 h-4 rounded border border-gray-300"
-            style="background-color: {getCategoryColor(status.category_id)};"
-          ></div>
+          <ColorDot color={getCategoryColor(status.category_id)} class="w-4 h-4 border border-[var(--ds-border)]" />
           <span class="font-medium" style="color: var(--ds-text);">{getCategoryName(status.category_id)}</span>
         </div>
       {/snippet}
     </DataTable>
   {/if}
 
-  <Modal isOpen={showCreateForm} onclose={cancelForm} maxWidth="max-w-lg" onSubmit={saveStatus}>
-    {#snippet children(submitHint)}
-    <!-- Modal header -->
-    <ModalHeader title={editingId ? t('statuses.editStatus') : t('statuses.createStatus')} showCloseButton={false} />
-
-    <!-- Modal content -->
-    <div class="px-6 py-4">
-      <form onsubmit={(e) => { e.preventDefault(); saveStatus(); }}>
-        <div class="form-group">
-          <label for="name">{t('common.name')} *</label>
-          <input
-            type="text"
-            id="name"
-            placeholder="e.g. Open, In Progress, Resolved"
-            bind:value={formData.name}
-            required
-          />
-        </div>
-
-        <div class="form-group">
-          <label for="category">{t('common.category')} *</label>
-          <BasePicker
-            bind:value={formData.category_id}
-            items={statusCategories}
-            placeholder={t('categories.selectCategory')}
-            getValue={(item) => item.id}
-            getLabel={(item) => item.name}
-          />
-        </div>
-
-        <div class="form-group">
-          <label for="description">{t('common.description')}</label>
-          <Textarea
-            id="description"
-            placeholder={t('placeholders.optionalDescription')}
-            bind:value={formData.description}
-            rows={2}
-          />
-        </div>
-
-        <div class="mb-6">
-          <Toggle
-            bind:checked={formData.is_default}
-            label={t('common.default')}
-            size="small"
-          />
-        </div>
-
-        <!-- Modal footer -->
-        <DialogFooter
-          onCancel={cancelForm}
-          onConfirm={saveStatus}
-          confirmLabel={editingId ? t('common.update') : t('common.create')}
-          showKeyboardHint={true}
-          confirmKeyboardHint={submitHint}
-          class="mx-[-1.5rem] mb-[-1rem] mt-0"
-        />
-      </form>
-    </div>
-    {/snippet}
-  </Modal>
+  <StatusModal
+    isOpen={showCreateForm}
+    bind:formData
+    categories={statusCategories}
+    isEditing={editingId !== null}
+    objectId={editingId}
+    displayName={editingObject?.display_name || editingObject?.name}
+    displayDescription={editingObject?.display_description || editingObject?.description}
+    bind:translationEditor
+    saving={saving}
+    onsave={saveStatus}
+    oncancel={cancelForm}
+  />
 </div>
-

@@ -2,6 +2,8 @@
   import { Clock, Edit, MessageSquare, Eye } from '@lucide/svelte';
   import { homepageStore } from '../../stores';
   import { navigate } from '../../router.js';
+  import DashboardItemRow from './DashboardItemRow.svelte';
+  import { t } from '../../stores/i18n.svelte.js';
 
   let activeTab = $derived(homepageStore.activeTab);
   let loading = $derived(homepageStore.loading);
@@ -13,13 +15,18 @@
   });
 
   const tabs = [
-    { id: 'viewed', label: 'Viewed', icon: Eye },
-    { id: 'edited', label: 'Edited', icon: Edit },
-    { id: 'commented', label: 'Commented', icon: MessageSquare },
+    { id: 'viewed', labelKey: 'dashboard.viewed', icon: Eye },
+    { id: 'edited', labelKey: 'dashboard.edited', icon: Edit },
+    { id: 'commented', labelKey: 'dashboard.commented', icon: MessageSquare },
   ];
 
   function open(item) {
     navigate(`/workspaces/${item.workspace_id}/items/${item.item_id}`);
+  }
+
+  function itemKey(item) {
+    if (item.workspace_key == null || item.workspace_item_number == null) return null;
+    return `${item.workspace_key}-${item.workspace_item_number}`;
   }
 </script>
 
@@ -36,7 +43,7 @@
         onclick={() => homepageStore.setActiveTab(tab.id)}
       >
         <TabIcon class="w-3.5 h-3.5" />
-        {tab.label}
+        {t(tab.labelKey)}
       </button>
     {/each}
   </div>
@@ -50,29 +57,27 @@
   {:else if items.length === 0}
     <div class="flex flex-col items-center text-center py-6" style="color: var(--ds-text-subtle);">
       <Clock class="w-6 h-6 mb-2 opacity-60" />
-      <p class="text-sm">No recent activity</p>
+      <p class="text-sm">{t('dashboard.noRecentActivity')}</p>
     </div>
   {:else}
-    <ul class="flex flex-col">
+    <ul class="flex flex-col gap-1.5">
       {#each items.slice(0, 6) as item (item.item_id)}
         <li>
-          <button
-            class="w-full text-left px-2 py-1.5 rounded flex items-start gap-2 transition-colors"
-            onmouseenter={(e) =>
-              (e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)')}
-            onmouseleave={(e) => (e.currentTarget.style.backgroundColor = '')}
+          <DashboardItemRow
+            title={item.title}
+            itemKey={itemKey(item)}
+            statusName={item.status}
+            statusBuiltinKey={item.status_builtin_key}
+            statusColor={item.status_color}
+            priorityName={item.priority_name}
+            priorityBuiltinKey={item.priority_builtin_key}
+            priorityColor={item.priority_color}
+            timestamp={item.last_activity
+              ? homepageStore.formatRelativeTime(item.last_activity)
+              : null}
+            dataTestid="your-activity-entry"
             onclick={() => open(item)}
-          >
-            <div class="min-w-0 flex-1">
-              <p class="text-sm truncate" style="color: var(--ds-text);">{item.title}</p>
-              <p class="text-[0.7rem] mt-0.5" style="color: var(--ds-text-subtle);">
-                {item.workspace_key}-{item.workspace_item_number}
-                {#if item.last_activity}
-                  · {homepageStore.formatRelativeTime(item.last_activity)}
-                {/if}
-              </p>
-            </div>
-          </button>
+          />
         </li>
       {/each}
     </ul>

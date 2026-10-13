@@ -1,26 +1,71 @@
 package services
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/gherkin"
 	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/sanitize"
 )
+
+// ErrTestRunItemNotFound identifies an item link that is missing or belongs to
+// a different workspace. Handlers use it to preserve resource-specific 404s.
+var ErrTestRunItemNotFound = errors.New("test run item not found")
+
+// ErrInvalidTestResultStatus identifies an unsupported case or step status.
+var ErrInvalidTestResultStatus = &TestManagementValidationError{Msg: "invalid status: must be passed, failed, blocked, skipped, or not_run"}
 
 // TestRunService handles test run business logic
 type TestRunService struct {
-	db   database.Database
-	repo *repository.TestRunRepository
+	db       database.Database
+	repo     *repository.TestRunRepository
+	itemRepo *repository.ItemRepository
+	bddRepo  *repository.TestCaseBDDRepository
 }
 
 // NewTestRunService creates a new test run service
 func NewTestRunService(db database.Database) *TestRunService {
 	return &TestRunService{
-		db:   db,
-		repo: repository.NewTestRunRepository(db),
+		db:       db,
+		repo:     repository.NewTestRunRepository(db),
+		itemRepo: repository.NewItemRepository(db),
+		bddRepo:  repository.NewTestCaseBDDRepository(db),
 	}
+}
+
+// TestRunResultWithCaseTitle is the shared test-result response shape.
+type TestRunResultWithCaseTitle struct {
+	models.TestResult
+	TestCaseTitle string `json:"test_case_title"`
+}
+
+// TestRunStepResult is the shared step-result response shape.
+type TestRunStepResult struct {
+	StepID       int        `json:"step_id"`
+	TestCaseID   int        `json:"test_case_id"`
+	Status       string     `json:"status"`
+	ActualResult string     `json:"actual_result"`
+	Notes        string     `json:"notes"`
+	ItemID       *int       `json:"item_id"`
+	ExecutedAt   *time.Time `json:"executed_at"`
+}
+
+// TestRunDetail is the complete read model shared by both HTTP surfaces.
+// BDDSnapshots carries the run-scoped specification of every BDD case in the
+// run; ExampleResults carries the per-example execution results.
+type TestRunDetail struct {
+	Run            *models.TestRun              `json:"run"`
+	TestCases      []models.TestCase            `json:"test_cases"`
+	Results        []TestRunResultWithCaseTitle `json:"results"`
+	StepResults    map[string]TestRunStepResult `json:"step_results"`
+	BDDSnapshots   []models.TestRunCaseSnapshot `json:"bdd_snapshots"`
+	ExampleResults []models.TestExampleResult   `json:"example_results"`
 }
 
 // TestRunListFilters contains filter parameters for listing test runs
@@ -43,9 +88,50 @@ func (s *TestRunService) List(workspaceID int, filters TestRunListFilters) ([]mo
 	})
 }
 
+// ListPage retrieves a repository-bounded page of test runs.
+func (s *TestRunService) ListPage(workspaceID int, filters TestRunListFilters, limit, offset int) ([]models.TestRun, int, error) {
+	return s.repo.FindPage(workspaceID, repository.TestRunFilters{
+		AssigneeID: filters.AssigneeID, Unassigned: filters.Unassigned,
+		TemplateID: filters.TemplateID, SetID: filters.SetID, IncludeEnded: filters.IncludeEnded,
+		Limit: limit, Offset: offset,
+	})
+}
+
 // GetByID retrieves a single test run
 func (s *TestRunService) GetByID(id, workspaceID int) (*models.TestRun, error) {
 	return s.repo.FindByID(id, workspaceID)
+}
+
+// GetDetail returns a complete test-run execution snapshot.
+func (s *TestRunService) GetDetail(id, workspaceID int) (*TestRunDetail, error) {
+	run, err := s.repo.FindByID(id, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	testCases, err := s.repo.FindCasesWithStepsForRun(id, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	results, err := s.ListResults(id, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	stepResults, err := s.ListStepResults(id, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	bddSnapshots, err := s.bddRepo.FindSnapshotsForRun(id)
+	if err != nil {
+		return nil, err
+	}
+	exampleResults, err := s.bddRepo.FindExampleResultsForRun(id, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	return &TestRunDetail{
+		Run: run, TestCases: testCases, Results: results, StepResults: stepResults,
+		BDDSnapshots: bddSnapshots, ExampleResults: exampleResults,
+	}, nil
 }
 
 // TestRunCreateRequest contains data for creating a test run
@@ -63,20 +149,27 @@ func (s *TestRunService) validateAssignee(assigneeID *int) error {
 	}
 	var count int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ? AND is_active = true`, *assigneeID).Scan(&count)
-	if err != nil || count == 0 {
-		return fmt.Errorf("assignee not found")
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return &TestManagementValidationError{Msg: "assignee not found"}
 	}
 	return nil
 }
 
 // Create creates a new test run and initializes results for all test cases in the set
 func (s *TestRunService) Create(workspaceID int, req TestRunCreateRequest) (*models.TestRun, error) {
+	req.Name = sanitize.PlainTextField.Sanitize(req.Name)
 	// Verify test set belongs to workspace
 	if req.SetID > 0 {
 		var count int
 		err := s.db.QueryRow("SELECT COUNT(*) FROM test_sets WHERE id = ? AND workspace_id = ?", req.SetID, workspaceID).Scan(&count)
-		if err != nil || count == 0 {
-			return nil, fmt.Errorf("test set not found in workspace")
+		if err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			return nil, &TestManagementValidationError{Msg: "test set not found in workspace"}
 		}
 	}
 
@@ -89,8 +182,11 @@ func (s *TestRunService) Create(workspaceID int, req TestRunCreateRequest) (*mod
 			"SELECT COUNT(*) FROM test_run_templates WHERE id = ? AND workspace_id = ?",
 			req.TemplateID, workspaceID,
 		).Scan(&count)
-		if err != nil || count == 0 {
-			return nil, fmt.Errorf("test run template not found in workspace")
+		if err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			return nil, &TestManagementValidationError{Msg: "test run template not found in workspace"}
 		}
 	}
 
@@ -118,9 +214,13 @@ func (s *TestRunService) Create(workspaceID int, req TestRunCreateRequest) (*mod
 			return nil, err
 		}
 
-		// Create results for all test cases in the set
+		// Create results for all test cases in the set, then freeze the
+		// BDD cases' specifications and example rows for this run.
 		if err := s.repo.CreateResultsFromSet(tx, runID, req.SetID); err != nil {
 			return nil, fmt.Errorf("failed to create test results: %w", err)
+		}
+		if err := s.bddRepo.SnapshotSet(tx, runID, req.SetID); err != nil {
+			return nil, fmt.Errorf("failed to snapshot BDD cases: %w", err)
 		}
 
 		run.ID = runID
@@ -147,7 +247,7 @@ func (s *TestRunService) Update(id, workspaceID int, req TestRunUpdateRequest) (
 		return nil, err
 	}
 
-	run.Name = req.Name
+	run.Name = sanitize.PlainTextField.Sanitize(req.Name)
 	run.AssigneeID = req.AssigneeID
 
 	return database.WithTxResult(s.db, func(tx database.Tx) (*models.TestRun, error) {
@@ -186,14 +286,45 @@ type TestResultUpdateRequest struct {
 	Notes        string
 }
 
+// TestStepResultUpdateRequest contains data for creating or updating a step result.
+type TestStepResultUpdateRequest struct {
+	Status       string
+	ActualResult string
+	Notes        string
+	ItemID       *int
+}
+
+// ListResults returns every per-case result for a workspace-scoped run.
+func (s *TestRunService) ListResults(runID, workspaceID int) ([]TestRunResultWithCaseTitle, error) {
+	if _, err := s.repo.FindByID(runID, workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.repo.FindResultsWithTestCase(runID, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]TestRunResultWithCaseTitle, 0, len(rows))
+	for _, row := range rows {
+		results = append(results, TestRunResultWithCaseTitle{
+			TestResult: row.TestResult, TestCaseTitle: row.TestCaseTitle,
+		})
+	}
+	return results, nil
+}
+
 // UpdateResult updates a test result. runID scopes the update — if the
 // result doesn't belong to that run, the repo returns ErrNotFound and the
 // handler renders 404.
-func (s *TestRunService) UpdateResult(runID, resultID int, req TestResultUpdateRequest) error {
+func (s *TestRunService) UpdateResult(workspaceID, runID, resultID int, req TestResultUpdateRequest) (*models.TestResult, error) {
+	if _, err := s.repo.FindByID(runID, workspaceID); err != nil {
+		return nil, err
+	}
 	// Validate status
 	if !isValidTestResultStatus(req.Status) {
-		return fmt.Errorf("invalid status: must be passed, failed, blocked, skipped, or not_run")
+		return nil, ErrInvalidTestResultStatus
 	}
+	req.ActualResult = sanitize.RichText.Sanitize(req.ActualResult)
+	req.Notes = sanitize.RichText.Sanitize(req.Notes)
 
 	now := time.Now()
 	result := &models.TestResult{
@@ -204,9 +335,148 @@ func (s *TestRunService) UpdateResult(runID, resultID int, req TestResultUpdateR
 		ExecutedAt:   &now,
 	}
 
-	return database.WithTx(s.db, func(tx database.Tx) error {
+	if err := database.WithTx(s.db, func(tx database.Tx) error {
 		return s.repo.UpdateResult(tx, runID, result)
-	})
+	}); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ListStepResults returns step results keyed by test-case and step ID.
+func (s *TestRunService) ListStepResults(runID, workspaceID int) (map[string]TestRunStepResult, error) {
+	if _, err := s.repo.FindByID(runID, workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.repo.FindStepResultsForRun(runID, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	results := make(map[string]TestRunStepResult, len(rows))
+	for _, row := range rows {
+		key := fmt.Sprintf("%d_%d", row.TestCaseID, row.StepID)
+		results[key] = TestRunStepResult{
+			StepID: row.StepID, TestCaseID: row.TestCaseID, Status: row.Status,
+			ActualResult: row.ActualResult, Notes: row.Notes, ItemID: row.ItemID,
+			ExecutedAt: row.ExecutedAt,
+		}
+	}
+	return results, nil
+}
+
+// UpdateStepResult upserts a step result and derives the parent case status.
+func (s *TestRunService) UpdateStepResult(workspaceID, runID, stepID int, req TestStepResultUpdateRequest) error {
+	if !isValidTestResultStatus(req.Status) {
+		return ErrInvalidTestResultStatus
+	}
+	if req.ItemID != nil {
+		itemWorkspaceID, err := s.itemRepo.GetWorkspaceID(*req.ItemID)
+		if err != nil || itemWorkspaceID != workspaceID {
+			return ErrTestRunItemNotFound
+		}
+	}
+	testResultID, err := s.repo.FindTestResultIDForStep(runID, stepID, workspaceID)
+	if err != nil {
+		return err
+	}
+	existingID, findErr := s.repo.FindStepResultID(testResultID, stepID)
+	input := repository.StepResultInput{
+		TestResultID: testResultID,
+		StepID:       stepID,
+		Status:       req.Status,
+		ActualResult: sanitize.RichText.Sanitize(req.ActualResult),
+		Notes:        sanitize.RichText.Sanitize(req.Notes),
+		ItemID:       req.ItemID,
+	}
+	switch {
+	case errors.Is(findErr, repository.ErrNotFound):
+		err = s.repo.CreateStepResult(input)
+	case findErr == nil:
+		err = s.repo.UpdateStepResult(existingID, input)
+	default:
+		err = findErr
+	}
+	if err != nil {
+		return err
+	}
+	if err := s.updateCaseStatusFromSteps(testResultID); err != nil {
+		slog.Warn("failed to update test case status", slog.Any("error", err), slog.Int("test_result_id", testResultID))
+	}
+	return nil
+}
+
+func (s *TestRunService) updateCaseStatusFromSteps(testResultID int) error {
+	statuses, err := s.repo.FindStepResultStatuses(testResultID)
+	if err != nil || len(statuses) == 0 {
+		return err
+	}
+
+	finalStatus := "not_run"
+	allPassed := true
+	hasFailed, hasBlocked, hasSkipped := false, false, false
+	for _, status := range statuses {
+		switch status {
+		case "failed":
+			hasFailed, allPassed = true, false
+		case "blocked":
+			hasBlocked, allPassed = true, false
+		case "skipped":
+			hasSkipped, allPassed = true, false
+		case "not_run":
+			allPassed = false
+		}
+	}
+	switch {
+	case hasFailed:
+		finalStatus = "failed"
+	case hasBlocked:
+		finalStatus = "blocked"
+	case hasSkipped:
+		finalStatus = "skipped"
+	case allPassed:
+		finalStatus = "passed"
+	}
+	return s.repo.SetTestResultStatus(testResultID, finalStatus)
+}
+
+// LinkResultItem links an item after enforcing workspace ownership on both records.
+func (s *TestRunService) LinkResultItem(workspaceID, resultID, itemID int) error {
+	itemWorkspaceID, err := s.itemRepo.GetWorkspaceID(itemID)
+	if err != nil || itemWorkspaceID != workspaceID {
+		return ErrTestRunItemNotFound
+	}
+	owned, err := s.repo.TestResultBelongsToWorkspace(resultID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return repository.ErrNotFound
+	}
+	return s.repo.LinkResultToItem(resultID, itemID)
+}
+
+// UnlinkResultItem removes an item link from a workspace-owned test result.
+func (s *TestRunService) UnlinkResultItem(workspaceID, resultID, itemID int) error {
+	owned, err := s.repo.TestResultBelongsToWorkspace(resultID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return repository.ErrNotFound
+	}
+	return s.repo.UnlinkResultFromItem(resultID, itemID)
+}
+
+// ListResultItems returns items linked to a workspace-owned test result.
+func (s *TestRunService) ListResultItems(workspaceID, resultID int) ([]models.Item, error) {
+	owned, err := s.repo.TestResultBelongsToWorkspace(resultID, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !owned {
+		return nil, repository.ErrNotFound
+	}
+	return s.itemRepo.ListItemsLinkedToTestResult(resultID, workspaceID)
 }
 
 // Helper functions
@@ -220,4 +490,176 @@ func isValidTestResultStatus(status string) bool {
 		"not_run": true,
 	}
 	return validStatuses[status]
+}
+
+// BDD example execution
+
+// TestExampleResultUpdateRequest records a direct result for one Examples row.
+type TestExampleResultUpdateRequest struct {
+	Status       string
+	ActualResult string
+	Notes        string
+}
+
+// TestExampleStepResultUpdateRequest records one step result within an
+// example execution.
+type TestExampleStepResultUpdateRequest struct {
+	Status       string
+	ActualResult string
+	Notes        string
+	ItemID       *int
+}
+
+// ListExampleResults returns the per-example execution results of a
+// workspace-scoped run.
+func (s *TestRunService) ListExampleResults(runID, workspaceID int) ([]models.TestExampleResult, error) {
+	if _, err := s.repo.FindByID(runID, workspaceID); err != nil {
+		return nil, err
+	}
+	results, err := s.bddRepo.FindExampleResultsForRun(runID, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range results {
+		steps, err := s.bddRepo.FindStepResultsForExample(results[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		results[i].StepResults = steps
+	}
+	return results, nil
+}
+
+// exampleContext bundles the validated state an example execution update
+// needs: the run's snapshot spec for the case and the example result row.
+type exampleContext struct {
+	spec   *gherkin.ScenarioSpec
+	result *models.TestExampleResult
+}
+
+// requireExampleContext validates that the run, case, snapshot, and example
+// index all line up, and returns the snapshot spec plus the eager example
+// result row.
+func (s *TestRunService) requireExampleContext(workspaceID, runID, testCaseID, exampleIndex int) (*exampleContext, error) {
+	if _, err := s.repo.FindByID(runID, workspaceID); err != nil {
+		return nil, err
+	}
+	// The case must belong to the run.
+	var exists int
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM test_results WHERE run_id = ? AND test_case_id = ?
+	`, runID, testCaseID).Scan(&exists); err != nil {
+		return nil, err
+	}
+	if exists == 0 {
+		return nil, repository.ErrNotFound
+	}
+
+	snapshots, err := s.bddRepo.FindSnapshotsForRun(runID)
+	if err != nil {
+		return nil, err
+	}
+	var snapshot *models.TestRunCaseSnapshot
+	for i := range snapshots {
+		if snapshots[i].TestCaseID == testCaseID {
+			snapshot = &snapshots[i]
+			break
+		}
+	}
+	if snapshot == nil {
+		return nil, &TestManagementValidationError{Msg: "test case is not a BDD case in this run"}
+	}
+	var spec gherkin.ScenarioSpec
+	if err := json.Unmarshal([]byte(snapshot.Spec), &spec); err != nil {
+		return nil, fmt.Errorf("run snapshot is unreadable: %w", err)
+	}
+
+	results, err := s.bddRepo.FindExampleResultsForRun(runID, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	var result *models.TestExampleResult
+	for i := range results {
+		if results[i].TestCaseID == testCaseID && results[i].ExampleIndex == exampleIndex {
+			result = &results[i]
+			break
+		}
+	}
+	if result == nil {
+		return nil, &TestManagementValidationError{Msg: "example index does not exist for this scenario outline"}
+	}
+	return &exampleContext{spec: &spec, result: result}, nil
+}
+
+// exampleRowBounds returns the valid step-number range for one example
+// execution: Background steps first, then the scenario's own steps.
+func exampleRowBounds(spec *gherkin.ScenarioSpec) (count int) {
+	return len(spec.Background) + len(spec.Steps)
+}
+
+// UpdateExampleResult records a direct (non-step) result for one Examples
+// row and recomputes the case-level aggregate.
+func (s *TestRunService) UpdateExampleResult(workspaceID, runID, testCaseID, exampleIndex int, req TestExampleResultUpdateRequest) (*models.TestExampleResult, error) {
+	ctxData, err := s.requireExampleContext(workspaceID, runID, testCaseID, exampleIndex)
+	if err != nil {
+		return nil, err
+	}
+	if !isValidTestResultStatus(req.Status) {
+		return nil, ErrInvalidTestResultStatus
+	}
+	req.ActualResult = sanitize.RichText.Sanitize(req.ActualResult)
+	req.Notes = sanitize.RichText.Sanitize(req.Notes)
+
+	result := ctxData.result
+	result.Status = req.Status
+	result.ActualResult = req.ActualResult
+	result.Notes = req.Notes
+
+	err = database.WithTx(s.db, func(tx database.Tx) error {
+		if _, err := s.bddRepo.UpdateExampleResult(tx, result); err != nil {
+			return err
+		}
+		return s.bddRepo.RecomputeCaseResult(tx, runID, testCaseID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// UpdateExampleStepResult records one step result within an example
+// execution, derives the example's status from its step results, and
+// recomputes the case-level aggregate.
+func (s *TestRunService) UpdateExampleStepResult(workspaceID, runID, testCaseID, exampleIndex, stepNumber int, req TestExampleStepResultUpdateRequest) error {
+	ctxData, err := s.requireExampleContext(workspaceID, runID, testCaseID, exampleIndex)
+	if err != nil {
+		return err
+	}
+	if !isValidTestResultStatus(req.Status) {
+		return ErrInvalidTestResultStatus
+	}
+	if stepNumber < 1 || stepNumber > exampleRowBounds(ctxData.spec) {
+		return &TestManagementValidationError{Msg: "step number is outside the scenario's steps"}
+	}
+	if req.ItemID != nil {
+		itemWorkspaceID, err := s.itemRepo.GetWorkspaceID(*req.ItemID)
+		if err != nil || itemWorkspaceID != workspaceID {
+			return ErrTestRunItemNotFound
+		}
+	}
+
+	step := &models.TestExampleStepResult{
+		ExampleResultID: ctxData.result.ID,
+		StepNumber:      stepNumber,
+		Status:          req.Status,
+		ActualResult:    sanitize.RichText.Sanitize(req.ActualResult),
+		Notes:           sanitize.RichText.Sanitize(req.Notes),
+		ItemID:          req.ItemID,
+	}
+	return database.WithTx(s.db, func(tx database.Tx) error {
+		if _, err := s.bddRepo.UpsertExampleStepResult(tx, step); err != nil {
+			return err
+		}
+		return s.bddRepo.RecomputeCaseResult(tx, runID, testCaseID)
+	})
 }

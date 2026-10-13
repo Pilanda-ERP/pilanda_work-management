@@ -2,7 +2,7 @@ import { fetchAPI } from './core.js';
 import { createCrudClient } from './createCrudClient.js';
 
 export const setup = {
-  getStatus: () => fetchAPI('/setup/status'),
+  getStatus: (options) => fetchAPI('/setup/status', options),
   complete: (data) =>
     fetchAPI('/setup/complete', {
       method: 'POST',
@@ -16,6 +16,10 @@ export const setup = {
     }),
 };
 
+export const shellBootstrap = {
+  get: (options) => fetchAPI('/shell-bootstrap', options),
+};
+
 export const system = {
   shutdown: () =>
     fetchAPI('/shutdown', {
@@ -25,7 +29,7 @@ export const system = {
 
 export const themes = {
   ...createCrudClient('/themes'),
-  getActive: () => fetchAPI('/themes/active'),
+  getActive: (options) => fetchAPI('/themes/active', options),
   activate: (id) =>
     fetchAPI(`/themes/${id}/activate`, {
       method: 'POST',
@@ -64,8 +68,14 @@ export const authPolicy = {
   // Get statistics for policy planning
   getStats: () => fetchAPI('/admin/auth-policy/stats'),
 
-  // Get list of users affected by current policy
-  getAffected: () => fetchAPI('/admin/auth-policy/affected'),
+  // Get a bounded page of users affected by current policy.
+  // Supports `limit` and `cursor` (the previous page's next_cursor); the
+  // response carries `users`, `total_count`, `has_more`, and `next_cursor`.
+  getAffected: ({ limit = 50, cursor = '' } = {}) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (cursor) params.set('cursor', cursor);
+    return fetchAPI(`/admin/auth-policy/affected?${params}`);
+  },
 
   // Get public policy status (no auth required - for login page)
   getPublicStatus: () => fetchAPI('/auth/policy-status'),
@@ -81,4 +91,12 @@ export const oauthClients = {
     fetchAPI(`/admin/oauth-clients/${id}/rotate-secret`, {
       method: 'POST',
     }),
+};
+
+// Agent template catalog (admin only). System-admin overrides for the Agent
+// Studio creation catalog (WI-922). `defaults` returns the embedded default
+// catalog so admins can seed an override that overwrites a built-in template.
+export const agentTemplates = {
+  ...createCrudClient('/admin/agent-templates'),
+  defaults: () => fetchAPI('/admin/agent-templates/defaults'),
 };

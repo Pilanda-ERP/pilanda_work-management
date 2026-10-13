@@ -16,6 +16,9 @@ import { clearStores, getStoreValue } from './storeUtils.js';
  */
 
 function createPortalAuthStore() {
+  // userBootstrap is a store so consumers can react to request_sharing changes
+  // (WI-1139) as well as read it through the combined store value.
+  const userBootstrap = writable(null);
   const customer = writable(null);
   const user = writable(null); // internal user
   const isAuthenticated = writable(false);
@@ -30,7 +33,17 @@ function createPortalAuthStore() {
 
   // Create a combined derived store for easy subscription
   const combined = derived(
-    [customer, user, isAuthenticated, isInternal, loading, error, emailSent, showPasskeyBanner],
+    [
+      customer,
+      user,
+      isAuthenticated,
+      isInternal,
+      loading,
+      error,
+      emailSent,
+      showPasskeyBanner,
+      userBootstrap,
+    ],
     ([
       $customer,
       $user,
@@ -40,6 +53,7 @@ function createPortalAuthStore() {
       $error,
       $emailSent,
       $showPasskeyBanner,
+      $userBootstrap,
     ]) => ({
       customer: $customer,
       user: $user,
@@ -49,6 +63,7 @@ function createPortalAuthStore() {
       error: $error,
       emailSent: $emailSent,
       showPasskeyBanner: $showPasskeyBanner,
+      userBootstrap: $userBootstrap,
     })
   );
 
@@ -97,6 +112,10 @@ function createPortalAuthStore() {
       return getStoreValue(showPasskeyBanner);
     },
 
+    get userBootstrap() {
+      return getStoreValue(userBootstrap);
+    },
+
     /**
      * Check current authentication status for a portal
      * @param {string} slug - Portal slug
@@ -106,7 +125,8 @@ function createPortalAuthStore() {
       error.set(null);
 
       try {
-        const response = await api.portalAuth.getCurrentCustomer(slug);
+        const response = await api.portal.getUserBootstrap(slug);
+        userBootstrap.set(response);
         if (response.authenticated) {
           if (response.is_internal) {
             // Internal user authenticated
@@ -129,6 +149,7 @@ function createPortalAuthStore() {
           isInternal.set(false);
           showPasskeyBanner.set(false);
         }
+        return response;
       } catch (_err) {
         // Not authenticated is not an error
         customer.set(null);
@@ -136,6 +157,8 @@ function createPortalAuthStore() {
         isAuthenticated.set(false);
         isInternal.set(false);
         showPasskeyBanner.set(false);
+        userBootstrap.set({ authenticated: false, my_requests: [], my_approvals: [] });
+        return getStoreValue(userBootstrap);
       } finally {
         loading.set(false);
       }
@@ -167,8 +190,8 @@ function createPortalAuthStore() {
         });
         if (completeResponse.success) {
           // Server set the session cookie; refresh state so UI reflects it.
-          await this.checkAuth(slug);
-          return { success: true };
+          const bootstrap = await this.checkAuth(slug);
+          return { success: true, userBootstrap: bootstrap };
         }
         const msg = completeResponse.message || 'Passkey sign-in failed';
         error.set(msg);
@@ -250,8 +273,9 @@ function createPortalAuthStore() {
       try {
         const response = await api.portalAuth.verifyMagicLink(slug, token);
         if (response.success) {
-          customer.set(response.customer);
-          isAuthenticated.set(true);
+          // The caller dismisses the one-time-token UI before checkAuth updates
+          // reactive auth state. Updating it here can remount the verifier and
+          // redeem the same token a second time.
           return { success: true, customer: response.customer };
         } else {
           error.set(response.message || 'Invalid or expired link');
@@ -298,6 +322,7 @@ function createPortalAuthStore() {
       isInternal.set(false);
       loading.set(false);
       emailSent.set(false);
+      userBootstrap.set(null);
     },
 
     /**
@@ -323,6 +348,7 @@ function createPortalAuthStore() {
       isInternal.set(false);
       loading.set(false);
       emailSent.set(false);
+      userBootstrap.set(null);
     },
   };
 }

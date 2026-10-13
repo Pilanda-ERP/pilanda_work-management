@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -10,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
+	"sync"
 	"time"
 
 	"windshift/internal/cacheutil"
@@ -27,313 +26,17 @@ const (
 	PrefixLength = 4  // Length of visible prefix for identification
 )
 
-// Granular resource:action scope constants
-const (
-	// Items (includes comments, attachments, history)
-	ScopeItemsRead   = "items:read"
-	ScopeItemsWrite  = "items:write"
-	ScopeItemsDelete = "items:delete"
+var ErrTokenNotFound = errors.New("token not found")
 
-	// Workspaces
-	ScopeWorkspacesRead   = "workspaces:read"
-	ScopeWorkspacesWrite  = "workspaces:write"
-	ScopeWorkspacesDelete = "workspaces:delete"
-
-	// Configuration resources (read-only via API)
-	ScopeStatusesRead     = "statuses:read"
-	ScopeWorkflowsRead    = "workflows:read"
-	ScopeItemTypesRead    = "item-types:read"
-	ScopePrioritiesRead   = "priorities:read"
-	ScopeCustomFieldsRead = "custom-fields:read"
-
-	// Users
-	ScopeUsersRead = "users:read"
-
-	// Milestones
-	ScopeMilestonesRead   = "milestones:read"
-	ScopeMilestonesWrite  = "milestones:write"
-	ScopeMilestonesDelete = "milestones:delete"
-
-	// Iterations
-	ScopeIterationsRead   = "iterations:read"
-	ScopeIterationsWrite  = "iterations:write"
-	ScopeIterationsDelete = "iterations:delete"
-
-	// Projects
-	ScopeProjectsRead   = "projects:read"
-	ScopeProjectsWrite  = "projects:write"
-	ScopeProjectsDelete = "projects:delete"
-
-	// MCP — single binary scope; the MCP server exposes both read and write
-	// tools so we don't split this into :read/:write.
-	ScopeMCPAccess = "mcp:access"
-
-	// Collections
-	ScopeCollectionsRead = "collections:read"
-
-	// Actions (automation graphs — node-catalog discovery, action CRUD).
-	// :write is required for create/update; :read covers catalog + list/get.
-	ScopeActionsRead  = "actions:read"
-	ScopeActionsWrite = "actions:write"
-
-	// Pages (workspace knowledge / wiki). :write covers create + edit + move;
-	// :delete is required for archive. Per-page ACLs still apply in-handler.
-	ScopePagesRead   = "pages:read"
-	ScopePagesWrite  = "pages:write"
-	ScopePagesDelete = "pages:delete"
-
-	// Test management (folders, cases, labels, sets, runs, run templates,
-	// reports, result↔item links). :write covers mutations; the per-workspace
-	// test.view / test.execute / test.manage role gates individual actions
-	// in-handler.
-	ScopeTestsRead  = "tests:read"
-	ScopeTestsWrite = "tests:write"
-
-	// Assets (sets, types, categories, statuses, asset entities). :write
-	// covers mutations to asset entities and CSV import; :delete is required
-	// for hard-delete. Mutating sets / types / categories / statuses / actions
-	// stays admin-UI-only. The per-set asset role (Viewer / Editor /
-	// Administrator, asset.view / edit / delete / admin keys) still gates
-	// individual actions in-handler via AssetPermissionService — token scope
-	// alone never grants access to a set the user can't see.
-	ScopeAssetsRead   = "assets:read"
-	ScopeAssetsWrite  = "assets:write"
-	ScopeAssetsDelete = "assets:delete"
-
-	// Time tracking (worklogs, timers, time projects). :write covers create/edit;
-	// :delete is required for worklog deletion. Per-project membership is enforced
-	// in-handler via TimePermService — token scope alone never grants access to a
-	// project the user isn't a member of.
-	ScopeTimeRead   = "time:read"
-	ScopeTimeWrite  = "time:write"
-	ScopeTimeDelete = "time:delete"
-
-	// Agent skills (WI-258): the per-workspace library of markdown knowledge
-	// packs a run's prompt indexes and the agent reads via `ws skill get`.
-	// Read-only by design on the token surface — authoring is a workspace-
-	// admin UI concern, not an API-token one.
-	ScopeAgentSkillsRead = "agent-skills:read"
-
-	// Work item templates (WI-438): workspace-defined reusable bodies that
-	// pre-fill a new item's description. :read covers list/get (agents discover
-	// the scaffold a type enforces); :write covers admin/programmatic CRUD.
-	ScopeItemTemplatesRead  = "item-templates:read"
-	ScopeItemTemplatesWrite = "item-templates:write"
-
-	// Admin scopes (require system admin role AND scope on token)
-	ScopeAdminUsersRead      = "admin:users:read"
-	ScopeAdminUsersWrite     = "admin:users:write"
-	ScopeAdminGroupsRead     = "admin:groups:read"
-	ScopeAdminGroupsWrite    = "admin:groups:write"
-	ScopeAdminAuditLogsRead  = "admin:audit-logs:read"
-	ScopeAdminAPITokensRead  = "admin:api-tokens:read"
-	ScopeAdminAPITokensWrite = "admin:api-tokens:write"
-)
-
-// DefaultAgentScopes is the scope set granted when a token is minted without
-// an explicit permissions list. Tuned for agent / `ws` CLI workflows: full
-// items + workspace + pages access, all non-admin planning reads, and MCP
-// access. Excludes admin scopes and write access to planning entities — mint
-// with an explicit permissions list when you need those.
-var DefaultAgentScopes = []string{
-	ScopeItemsRead, ScopeItemsWrite,
-	ScopeWorkspacesRead, ScopeWorkspacesWrite,
-	ScopeUsersRead,
-	ScopeItemTypesRead, ScopeWorkflowsRead,
-	ScopeStatusesRead, ScopePrioritiesRead, ScopeCustomFieldsRead,
-	ScopeItemTemplatesRead,
-	ScopeMilestonesRead, ScopeIterationsRead, ScopeProjectsRead,
-	ScopePagesRead, ScopePagesWrite, ScopePagesDelete,
-	ScopeTestsRead, ScopeTestsWrite,
-	ScopeTimeRead, ScopeTimeWrite,
-	// assets:read + assets:write are default-on; the per-set asset role
-	// model (Viewer / Editor / Administrator on each asset_management_set,
-	// enforced by services.AssetPermissionService) is the real guard, so
-	// the scope flag alone never grants access to a set the user can't
-	// already act on. assets:delete is opt-in only — matches items:delete
-	// posture and the original asset-api-v1-security-review-2026-06-03
-	// finding 1 concern that legacy 'write' shouldn't silently grant
-	// destructive ops.
-	ScopeAssetsRead, ScopeAssetsWrite,
-	ScopeAgentSkillsRead,
-	ScopeMCPAccess,
-}
-
-// DefaultCodingAgentRunScopes is the narrowed scope set granted to short-lived
-// per-run coding-agent tokens when a binding does not explicitly request
-// scopes. It is intentionally smaller than DefaultAgentScopes: no workspace
-// write, no pages delete/write, no assets write, and no tests write.
-var DefaultCodingAgentRunScopes = []string{
-	ScopeItemsRead, ScopeItemsWrite,
-	ScopeWorkspacesRead,
-	ScopeUsersRead,
-	ScopeItemTypesRead, ScopeWorkflowsRead,
-	ScopeStatusesRead, ScopePrioritiesRead, ScopeCustomFieldsRead,
-	ScopeItemTemplatesRead,
-	ScopeMilestonesRead, ScopeIterationsRead, ScopeProjectsRead,
-	ScopePagesRead,
-	ScopeTestsRead,
-	ScopeTimeRead, ScopeTimeWrite,
-	ScopeAgentSkillsRead,
-	// mcp:access is safe to grant since WI-351: the MCP server enforces
-	// each tool's required token scopes at dispatch, so this narrowed set
-	// holds on the MCP surface too — e.g. a run token (no pages:write,
-	// no items:delete, no actions:*) is refused page-writing, item-delete
-	// and automation tools there just like on the v1 REST surface.
-	ScopeMCPAccess,
-}
-
-// AllValidScopes is the complete set of valid scope strings for validation.
-var AllValidScopes = []string{
-	ScopeItemsRead, ScopeItemsWrite, ScopeItemsDelete,
-	ScopeWorkspacesRead, ScopeWorkspacesWrite, ScopeWorkspacesDelete,
-	ScopeStatusesRead, ScopeWorkflowsRead, ScopeItemTypesRead,
-	ScopePrioritiesRead, ScopeCustomFieldsRead,
-	ScopeUsersRead,
-	ScopeMilestonesRead, ScopeMilestonesWrite, ScopeMilestonesDelete,
-	ScopeIterationsRead, ScopeIterationsWrite, ScopeIterationsDelete,
-	ScopeProjectsRead, ScopeProjectsWrite, ScopeProjectsDelete,
-	ScopeMCPAccess,
-	ScopeCollectionsRead,
-	ScopeActionsRead, ScopeActionsWrite,
-	ScopePagesRead, ScopePagesWrite, ScopePagesDelete,
-	ScopeTestsRead, ScopeTestsWrite,
-	ScopeAssetsRead, ScopeAssetsWrite, ScopeAssetsDelete,
-	ScopeTimeRead, ScopeTimeWrite, ScopeTimeDelete,
-	ScopeAgentSkillsRead,
-	ScopeItemTemplatesRead, ScopeItemTemplatesWrite,
-	ScopeAdminUsersRead, ScopeAdminUsersWrite,
-	ScopeAdminGroupsRead, ScopeAdminGroupsWrite,
-	ScopeAdminAuditLogsRead,
-	ScopeAdminAPITokensRead, ScopeAdminAPITokensWrite,
-}
-
-// allNonAdminReadScopes is the set of non-admin :read scopes (for legacy "read" mapping).
-// assets:read is included: the per-set asset role model is the real guard,
-// so a legacy read-scoped token can never reach a set the user isn't
-// authorized on. (Legacy 'read' still can't reach assets:write or
-// assets:delete — those require an explicit upgrade.)
-var allNonAdminReadScopes = []string{
-	ScopeItemsRead, ScopeWorkspacesRead, ScopeStatusesRead,
-	ScopeWorkflowsRead, ScopeItemTypesRead, ScopePrioritiesRead,
-	ScopeCustomFieldsRead, ScopeUsersRead, ScopeMilestonesRead,
-	ScopeIterationsRead, ScopeProjectsRead, ScopeCollectionsRead,
-	ScopeActionsRead, ScopePagesRead, ScopeTestsRead,
-	ScopeAssetsRead, ScopeTimeRead, ScopeItemTemplatesRead,
-}
-
-// allNonAdminScopes is the set of all non-admin scopes (for legacy "write" mapping).
-// assets:read + assets:write are included (the per-set role guard applies).
-// assets:delete is deliberately excluded so legacy 'write' doesn't silently
-// grant destructive ops — matches the items posture and the spirit of
-// asset-api-v1-security-review-2026-06-03 finding 1 around destructive
-// auto-grants.
-var allNonAdminScopes = []string{
-	ScopeItemsRead, ScopeItemsWrite, ScopeItemsDelete,
-	ScopeWorkspacesRead, ScopeWorkspacesWrite, ScopeWorkspacesDelete,
-	ScopeStatusesRead, ScopeWorkflowsRead, ScopeItemTypesRead,
-	ScopePrioritiesRead, ScopeCustomFieldsRead,
-	ScopeUsersRead,
-	ScopeMilestonesRead, ScopeMilestonesWrite, ScopeMilestonesDelete,
-	ScopeIterationsRead, ScopeIterationsWrite, ScopeIterationsDelete,
-	ScopeProjectsRead, ScopeProjectsWrite, ScopeProjectsDelete,
-	ScopeMCPAccess,
-	ScopeCollectionsRead,
-	ScopeActionsRead, ScopeActionsWrite,
-	ScopePagesRead, ScopePagesWrite, ScopePagesDelete,
-	ScopeTestsRead, ScopeTestsWrite,
-	ScopeAssetsRead, ScopeAssetsWrite,
-	ScopeTimeRead, ScopeTimeWrite,
-	ScopeItemTemplatesRead, ScopeItemTemplatesWrite,
-}
-
-// AdminScopes returns the set of scopes that require system admin role.
-func AdminScopes() []string {
-	return []string{
-		ScopeAdminUsersRead, ScopeAdminUsersWrite,
-		ScopeAdminGroupsRead, ScopeAdminGroupsWrite,
-		ScopeAdminAuditLogsRead,
-		ScopeAdminAPITokensRead, ScopeAdminAPITokensWrite,
-	}
-}
-
-// IsAdminScope returns true if the scope is an admin scope.
-func IsAdminScope(scope string) bool {
-	return strings.HasPrefix(scope, "admin:")
-}
-
-// ValidateScopes checks that all provided scopes are valid.
-// Returns an error listing any invalid scopes.
-// last review: ser, 210426
-func ValidateScopes(scopes []string) error {
-	valid := make(map[string]bool, len(AllValidScopes))
-	// Also accept legacy scopes for backward compatibility
-	valid["read"] = true
-	valid["write"] = true
-	valid["admin"] = true
-	for _, s := range AllValidScopes {
-		valid[s] = true
-	}
-	var invalid []string
-	for _, s := range scopes {
-		if !valid[s] {
-			invalid = append(invalid, s)
-		}
-	}
-	if len(invalid) > 0 {
-		return fmt.Errorf("invalid scopes: %s", strings.Join(invalid, ", "))
-	}
-	return nil
-}
-
-// ValidateAgentScopes restricts coding-agent run tokens to the narrowed
-// DefaultCodingAgentRunScopes set: no admin:* scopes, no legacy
-// "read"/"write"/"admin" strings, no destructive scopes, and no broad
-// workspace writes. mcp:access is permitted since WI-351 because the MCP
-// server enforces per-tool token scopes, so it cannot widen the set. The
-// harness mints tokens that run inside an attacker-reachable container, so
-// the surface must stay narrow regardless of what the binding's workspace
-// admin requested.
-func ValidateAgentScopes(scopes []string) error {
-	allowed := make(map[string]bool, len(DefaultCodingAgentRunScopes))
-	for _, s := range DefaultCodingAgentRunScopes {
-		allowed[s] = true
-	}
-	var rejected []string
-	for _, s := range scopes {
-		if !allowed[s] {
-			rejected = append(rejected, s)
-		}
-	}
-	if len(rejected) > 0 {
-		return fmt.Errorf("scopes not permitted for coding-agent tokens: %s", strings.Join(rejected, ", "))
-	}
-	return nil
-}
-
-// expandLegacyScopes maps old-style permission strings to granular scopes.
-// Returns the original scopes unchanged if they are already in resource:action format.
-func expandLegacyScopes(scopes []string) []string {
-	for _, s := range scopes {
-		switch s {
-		case "admin":
-			// "admin" grants everything
-			return append(append([]string{}, allNonAdminScopes...), AdminScopes()...)
-		case "write":
-			return allNonAdminScopes
-		case "read":
-			return allNonAdminReadScopes
-		}
-	}
-	// No legacy scopes found — return as-is
-	return scopes
-}
+// Scope constants, the scope catalog, and scope validation live in scopes.go.
 
 // tokenCacheEntry is the value stored in the token validation cache.
 type tokenCacheEntry struct {
-	User      models.User     `json:"user"`
-	APIToken  models.APIToken `json:"api_token"`
-	ExpiresAt *time.Time      `json:"expires_at,omitempty"`
+	User          models.User     `json:"user"`
+	APIToken      models.APIToken `json:"api_token"`
+	OAuthClientID string          `json:"oauth_client_id,omitempty"`
+	OAuthResource string          `json:"oauth_resource,omitempty"`
+	ExpiresAt     *time.Time      `json:"expires_at,omitempty"`
 }
 
 // tokenCacheKey returns a SHA-256 hex digest of the raw token for use as a cache key.
@@ -355,19 +58,46 @@ type TokenManager struct {
 	db           database.Database
 	tokenTracker TokenUsageRecorder
 	cache        *bigcache.BigCache
+	closeOnce    sync.Once
+	closeErr     error
+}
+
+// Close stops the validation cache's background worker. It does not close the
+// shared database or token tracker, and may be called more than once.
+func (tm *TokenManager) Close() error {
+	tm.closeOnce.Do(func() {
+		if tm.cache != nil {
+			tm.closeErr = tm.cache.Close()
+		}
+	})
+	return tm.closeErr
 }
 
 // NewTokenManager creates a new token manager
-func NewTokenManager(db database.Database, tokenTracker TokenUsageRecorder) *TokenManager {
-	cacheConfig := cacheutil.NewBigCacheConfig(cacheutil.BigCacheOptions{
-		TTL:          30 * time.Second,
-		MaxCacheMB:   32,
-		MaxEntrySize: 2048,
-		Shards:       256,
-		CleanWindow:  10 * time.Second,
-	})
+func NewTokenManager(db database.Database, tokenTracker TokenUsageRecorder, cacheSizeMB ...int) *TokenManager {
+	maxCacheMB := 8
+	if len(cacheSizeMB) > 0 && cacheSizeMB[0] > 0 {
+		maxCacheMB = cacheSizeMB[0]
+	}
+	return newTokenManager(db, tokenTracker, "api_tokens", maxCacheMB)
+}
 
-	cache, err := bigcache.New(context.Background(), cacheConfig)
+// NewTokenManagerWithCacheBudget creates a token manager with an explicitly
+// named cache. The SSH server uses this so its share of the aggregate token
+// budget remains independently visible in diagnostics.
+func NewTokenManagerWithCacheBudget(db database.Database, tokenTracker TokenUsageRecorder, cacheName string, maxCacheMB int) *TokenManager {
+	return newTokenManager(db, tokenTracker, cacheName, maxCacheMB)
+}
+
+func newTokenManager(db database.Database, tokenTracker TokenUsageRecorder, cacheName string, maxCacheMB int) *TokenManager {
+	cache, err := cacheutil.New(cacheName, cacheutil.BigCacheOptions{
+		TTL:               30 * time.Second,
+		MaxCacheMB:        maxCacheMB,
+		MaxEntrySize:      2048,
+		Shards:            16,
+		InitialCapacityMB: 1,
+		CleanWindow:       10 * time.Second,
+	})
 	if err != nil {
 		slog.Warn("failed to create token validation cache, continuing without cache", "error", err)
 	}
@@ -381,14 +111,13 @@ func NewTokenManager(db database.Database, tokenTracker TokenUsageRecorder) *Tok
 
 // GenerateToken creates a cryptographically secure API token
 func (tm *TokenManager) GenerateToken() (string, error) {
-	// Generate random bytes for the token body
+	// Generate a random body and prefix it for indexed lookup.
 	tokenBytes := make([]byte, TokenLength-len(TokenPrefix))
 	_, err := rand.Read(tokenBytes)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate random token: %w", err)
 	}
 
-	// Convert to hex and add prefix
 	tokenBody := hex.EncodeToString(tokenBytes)
 	fullToken := TokenPrefix + tokenBody
 
@@ -414,21 +143,19 @@ func (tm *TokenManager) GetTokenPrefix(token string) string {
 
 // ValidateToken checks if a token is valid and returns the associated user
 func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APIToken, error) {
-	// Check token format
 	if err := checkTokenFormat(token, TokenPrefix, 20); err != nil {
 		return nil, nil, err
 	}
 
 	cacheKey := tokenCacheKey(token)
 
-	// Try cache first
+	// Cached entries avoid the database and bcrypt work; misses use the indexed prefix query below.
 	if tm.cache != nil {
 		if data, err := tm.cache.Get(cacheKey); err == nil {
 			var entry tokenCacheEntry
 			if err := json.Unmarshal(data, &entry); err == nil {
-				// Check expiry
 				switch {
-				case entry.ExpiresAt != nil && entry.ExpiresAt.Before(time.Now()):
+				case entry.ExpiresAt != nil && !time.Now().Before(*entry.ExpiresAt):
 					tm.cache.Delete(cacheKey) //nolint:errcheck // best-effort cache eviction
 				case !entry.User.IsActive:
 					tm.cache.Delete(cacheKey) //nolint:errcheck // best-effort cache eviction
@@ -436,21 +163,21 @@ func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APITo
 					go tm.updateLastUsed(entry.APIToken.ID)
 					user := entry.User
 					apiToken := entry.APIToken
+					apiToken.OAuthClientID = entry.OAuthClientID
+					apiToken.OAuthResource = entry.OAuthResource
 					return &user, &apiToken, nil
 				}
 			}
 		}
 	}
 
-	// Cache miss — full DB + bcrypt path
-	// Extract token prefix for efficient database lookup (matches stored format with "...")
 	tokenPrefix := tm.GetTokenPrefix(token)
 
-	// Query tokens matching prefix to avoid full table scan and excessive bcrypt comparisons
-	// Use CURRENT_TIMESTAMP which works in both SQLite and PostgreSQL
+	// Prefix filtering limits bcrypt comparisons; CURRENT_TIMESTAMP is portable across both databases.
 	rows, err := tm.db.Query(`
 		SELECT t.id, t.user_id, t.name, t.token_hash, t.token_prefix, t.permissions,
-		       t.is_temporary, t.expires_at, t.last_used_at, t.created_at, t.updated_at,
+		       t.is_temporary, t.oauth_client_id, t.oauth_resource,
+		       t.expires_at, t.last_used_at, t.created_at, t.updated_at,
 		       u.id, u.email, u.username, u.first_name, u.last_name, u.is_active
 		FROM api_tokens t
 		JOIN users u ON t.user_id = u.id
@@ -466,10 +193,12 @@ func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APITo
 		var apiToken models.APIToken
 		var user models.User
 		var expiresAt, lastUsedAt sql.NullTime
+		var oauthClientID, oauthResource sql.NullString
 
 		err := rows.Scan(
 			&apiToken.ID, &apiToken.UserID, &apiToken.Name, &apiToken.Token,
 			&apiToken.TokenPrefix, &apiToken.Permissions, &apiToken.IsTemporary,
+			&oauthClientID, &oauthResource,
 			&expiresAt, &lastUsedAt, &apiToken.CreatedAt, &apiToken.UpdatedAt,
 			&user.ID, &user.Email, &user.Username, &user.FirstName,
 			&user.LastName, &user.IsActive,
@@ -484,30 +213,30 @@ func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APITo
 			continue
 		}
 
-		// Check if token hash matches
 		if verifyTokenHash(apiToken.Token, token) != nil {
 			continue // Hash doesn't match, try next token
 		}
 
-		// Convert nullable times
 		if expiresAt.Valid {
 			apiToken.ExpiresAt = &expiresAt.Time
 		}
+		apiToken.OAuthClientID = oauthClientID.String
+		apiToken.OAuthResource = oauthResource.String
 		if lastUsedAt.Valid {
 			apiToken.LastUsedAt = &lastUsedAt.Time
 		}
 
-		// Check if user is active
 		if !user.IsActive {
 			return nil, nil, fmt.Errorf("user account is disabled")
 		}
 
-		// Populate cache
 		if tm.cache != nil {
 			entry := tokenCacheEntry{
-				User:      user,
-				APIToken:  apiToken,
-				ExpiresAt: apiToken.ExpiresAt,
+				User:          user,
+				APIToken:      apiToken,
+				OAuthClientID: apiToken.OAuthClientID,
+				OAuthResource: apiToken.OAuthResource,
+				ExpiresAt:     apiToken.ExpiresAt,
 			}
 			if data, err := json.Marshal(entry); err == nil {
 				tm.cache.Set(cacheKey, data)                                       //nolint:errcheck // best-effort cache population
@@ -515,7 +244,6 @@ func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APITo
 			}
 		}
 
-		// Update last used timestamp
 		go tm.updateLastUsed(apiToken.ID)
 
 		return &user, &apiToken, nil
@@ -533,8 +261,23 @@ func (tm *TokenManager) ValidateToken(token string) (*models.User, *models.APITo
 
 // CreateToken creates a new API token for a user
 func (tm *TokenManager) CreateToken(userID int, request models.APITokenCreate) (*models.APITokenResponse, error) {
+	return tm.createToken(tm.db, userID, request)
+}
+
+// CreateTokenInTx creates an API token inside an existing transaction. It is
+// used when issuing the token is only one part of a larger credential update
+// that must either commit in full or leave no usable credentials behind.
+func (tm *TokenManager) CreateTokenInTx(tx database.Tx, userID int, request models.APITokenCreate) (*models.APITokenResponse, error) {
+	return tm.createToken(tx, userID, request)
+}
+
+type tokenRowStore interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func (tm *TokenManager) createToken(store tokenRowStore, userID int, request models.APITokenCreate) (*models.APITokenResponse, error) {
 	var userActive bool
-	if err := tm.db.QueryRow(`SELECT COALESCE(is_active, false) FROM users WHERE id = ?`, userID).Scan(&userActive); err != nil {
+	if err := store.QueryRow(`SELECT COALESCE(is_active, false) FROM users WHERE id = ?`, userID).Scan(&userActive); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("user not found")
 		}
@@ -544,43 +287,45 @@ func (tm *TokenManager) CreateToken(userID int, request models.APITokenCreate) (
 		return nil, fmt.Errorf("cannot create token for inactive user")
 	}
 
-	// Generate token
+	// Generate and hash the token; only the response below exposes its plaintext.
 	token, err := tm.GenerateToken()
 	if err != nil {
 		return nil, err
 	}
 
-	// Hash token
 	tokenHash, err := tm.HashToken(token)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get token prefix for identification
 	tokenPrefix := tm.GetTokenPrefix(token)
 
-	// Convert permissions to JSON
 	permissionsJSON, err := json.Marshal(request.Permissions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal permissions: %w", err)
 	}
 
-	// Insert token into database using RETURNING clause (supported by both SQLite 3.35+ and PostgreSQL)
+	// RETURNING is supported by both SQLite 3.35+ and PostgreSQL.
 	var tokenID int64
-	err = tm.db.QueryRow(`
-		INSERT INTO api_tokens (user_id, name, token_hash, token_prefix, permissions, expires_at, is_temporary)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+	err = store.QueryRow(`
+		INSERT INTO api_tokens (
+			user_id, name, token_hash, token_prefix, permissions, expires_at,
+			is_temporary, oauth_client_id, oauth_resource
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id
-	`, userID, request.Name, tokenHash, tokenPrefix, string(permissionsJSON), request.ExpiresAt, request.IsTemporary).Scan(&tokenID)
+	`, userID, request.Name, tokenHash, tokenPrefix, string(permissionsJSON), request.ExpiresAt,
+		request.IsTemporary, nullIfEmpty(request.OAuthClientID), nullIfEmpty(request.OAuthResource)).Scan(&tokenID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token: %w", err)
 	}
 
-	// Get the created token details
-	apiToken, err := tm.GetTokenByID(int(tokenID))
+	apiToken, err := getTokenByID(store, int(tokenID))
 	if err != nil {
 		return nil, err
 	}
+	apiToken.OAuthClientID = request.OAuthClientID
+	apiToken.OAuthResource = request.OAuthResource
 
 	return &models.APITokenResponse{
 		Token:    token, // Only returned on creation
@@ -588,9 +333,20 @@ func (tm *TokenManager) CreateToken(userID int, request models.APITokenCreate) (
 	}, nil
 }
 
+func nullIfEmpty(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
 // GetTokenByID retrieves a token by ID (without the actual token value)
 func (tm *TokenManager) GetTokenByID(id int) (*models.APIToken, error) {
-	row := tm.db.QueryRow(`
+	return getTokenByID(tm.db, id)
+}
+
+func getTokenByID(store tokenRowStore, id int) (*models.APIToken, error) {
+	row := store.QueryRow(`
 		SELECT t.id, t.user_id, t.name, t.token_prefix, t.permissions, t.is_temporary,
 		       t.expires_at, t.last_used_at, t.created_at, t.updated_at,
 		       u.email, u.username
@@ -602,7 +358,7 @@ func (tm *TokenManager) GetTokenByID(id int) (*models.APIToken, error) {
 	token, err := scanAPITokenListRow(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("token not found")
+			return nil, ErrTokenNotFound
 		}
 		return nil, fmt.Errorf("failed to get token: %w", err)
 	}
@@ -658,7 +414,7 @@ func (tm *TokenManager) RevokeToken(tokenID, userID int) error {
 	}
 
 	if rowsAffected == 0 {
-		return fmt.Errorf("token not found or not owned by user")
+		return fmt.Errorf("%w or not owned by user", ErrTokenNotFound)
 	}
 
 	tm.invalidateTokenCache(tokenID)
@@ -696,9 +452,8 @@ func (tm *TokenManager) CleanupExpiredTokens() (int, error) {
 // ListAllTokens retrieves all non-temporary tokens across all users (admin endpoint).
 // Supports optional filtering by user_id and pagination.
 func (tm *TokenManager) ListAllTokens(userIDFilter *int, limit, offset int) ([]models.APIToken, int, error) {
-	// Count total
 	countQuery := `SELECT COUNT(*) FROM api_tokens t WHERE NOT t.is_temporary`
-	var countArgs []interface{}
+	var countArgs []any
 	if userIDFilter != nil {
 		countQuery += " AND t.user_id = ?"
 		countArgs = append(countArgs, *userIDFilter)
@@ -709,7 +464,6 @@ func (tm *TokenManager) ListAllTokens(userIDFilter *int, limit, offset int) ([]m
 		return nil, 0, fmt.Errorf("failed to count tokens: %w", err)
 	}
 
-	// Fetch page
 	query := `
 		SELECT t.id, t.user_id, t.name, t.token_prefix, t.permissions, t.is_temporary,
 		       t.expires_at, t.last_used_at, t.created_at, t.updated_at,
@@ -717,7 +471,7 @@ func (tm *TokenManager) ListAllTokens(userIDFilter *int, limit, offset int) ([]m
 		FROM api_tokens t
 		JOIN users u ON t.user_id = u.id
 		WHERE NOT t.is_temporary`
-	var args []interface{}
+	var args []any
 	if userIDFilter != nil {
 		query += " AND t.user_id = ?"
 		args = append(args, *userIDFilter)
@@ -760,7 +514,7 @@ func (tm *TokenManager) AdminRevokeToken(tokenID int) error {
 	}
 
 	if rowsAffected == 0 {
-		return fmt.Errorf("token not found")
+		return ErrTokenNotFound
 	}
 
 	tm.invalidateTokenCache(tokenID)
@@ -793,46 +547,17 @@ func (tm *TokenManager) invalidateTokenCache(tokenID int) {
 }
 
 // CheckTokenPermissions checks if a token has specific permissions.
-// Supports both legacy ("read", "write", "admin") and granular ("items:read") scopes.
+// Scopes are granular ("items:read") only. The legacy "read"/"write"/"admin"
+// strings were rewritten to their granular equivalents by the
+// 20260808_api_token_legacy_scopes migration and are no longer expanded here,
+// so a token still carrying one grants nothing.
 // last review: ser, 210426
 func (tm *TokenManager) CheckTokenPermissions(token *models.APIToken, requiredPermissions []string) bool {
-	var rawScopes []string
-	err := json.Unmarshal([]byte(token.Permissions), &rawScopes)
+	var scopes []string
+	err := json.Unmarshal([]byte(token.Permissions), &scopes)
 	if err != nil {
 		return false
 	}
 
-	// Expand legacy scopes into granular ones
-	expanded := expandLegacyScopes(rawScopes)
-
-	// Build lookup set
-	have := make(map[string]bool, len(expanded))
-	for _, s := range expanded {
-		have[s] = true
-	}
-
-	// Check each required permission
-	for _, required := range requiredPermissions {
-		if have[required] {
-			continue
-		}
-		// Hierarchy: write implies read for the same resource
-		// e.g. "items:write" satisfies "items:read"
-		if strings.HasSuffix(required, ":read") {
-			resource := strings.TrimSuffix(required, ":read")
-			if have[resource+":write"] {
-				continue
-			}
-		}
-		// admin:*:write implies admin:*:read
-		if strings.HasPrefix(required, "admin:") && strings.HasSuffix(required, ":read") {
-			resource := strings.TrimSuffix(required, ":read")
-			if have[resource+":write"] {
-				continue
-			}
-		}
-		return false
-	}
-
-	return true
+	return ScopesSatisfy(scopes, requiredPermissions)
 }

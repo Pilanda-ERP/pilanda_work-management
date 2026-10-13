@@ -43,9 +43,9 @@ func (s *PortalLookupStore) GetCustomer(id int) (*auth.PortalCustomer, error) {
 	var phone sql.NullString
 	var orgID sql.NullInt64
 	err := s.db.QueryRow(`
-		SELECT id, name, email, phone, customer_organisation_id, created_at, updated_at
+		SELECT id, name, email, phone, customer_organisation_id, deactivated_at, created_at, updated_at
 		FROM portal_customers WHERE id = ?
-	`, id).Scan(&c.ID, &c.Name, &c.Email, &phone, &orgID, &c.CreatedAt, &c.UpdatedAt)
+	`, id).Scan(&c.ID, &c.Name, &c.Email, &phone, &orgID, &c.DeactivatedAt, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrPortalCustomerNotFound
 	}
@@ -65,34 +65,24 @@ func (s *PortalLookupStore) GetCustomer(id int) (*auth.PortalCustomer, error) {
 // FindEnabledPortalChannelBySlug locates the channel backing a portal slug.
 // Mirrors the lookup in portal_auth.go so this store is independent.
 func (s *PortalLookupStore) FindEnabledPortalChannelBySlug(slug string) (*models.Channel, error) {
-	rows, err := s.db.Query(`
-		SELECT id, name, type, config, status
-		FROM channels WHERE type = 'portal' ORDER BY created_at DESC
-	`)
+	var ch models.Channel
+	err := s.db.QueryRow(`
+		SELECT id, name, type, COALESCE(config, '{}'), status
+		FROM channels
+		WHERE type = 'portal' AND direction = 'inbound' AND status = 'enabled'
+		  AND public_slug = ?
+	`, slug).Scan(&ch.ID, &ch.Name, &ch.Type, &ch.Config, &ch.Status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrPortalChannelNotFound
+	}
 	if err != nil {
-		return nil, fmt.Errorf("query portal channels: %w", err)
+		return nil, fmt.Errorf("query portal channel: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		var ch models.Channel
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Type, &ch.Config, &ch.Status); err != nil {
-			continue
-		}
-		var cfg models.ChannelConfig
-		if ch.Config != "" {
-			if err := json.Unmarshal([]byte(ch.Config), &cfg); err != nil {
-				continue
-			}
-		}
-		if cfg.PortalSlug == slug && ch.Status == "enabled" {
-			return &ch, nil
-		}
+	var cfg models.ChannelConfig
+	if err := json.Unmarshal([]byte(ch.Config), &cfg); err != nil || cfg.PortalSlug != slug {
+		return nil, ErrPortalChannelNotFound
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate portal channels: %w", err)
-	}
-	return nil, ErrPortalChannelNotFound
+	return &ch, nil
 }
 
 // CustomerHasChannelAccess reports whether the portal customer is allowed to

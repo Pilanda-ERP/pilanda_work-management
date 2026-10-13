@@ -2,6 +2,7 @@
   import { assetImportStore } from './AssetImportStore.svelte.js';
   import Select from '../../../components/Select.svelte';
   import Input from '../../../components/Input.svelte';
+  import FileInput from '../../../components/FileInput.svelte';
   import Checkbox from '../../../components/Checkbox.svelte';
   import Button from '../../../components/Button.svelte';
   import AlertBox from '../../../components/AlertBox.svelte';
@@ -59,10 +60,11 @@
 <div class="space-y-6">
   <!-- Asset Type Selection -->
   <div>
-    <div class="block text-sm font-medium mb-1.5" style="color: var(--ds-text);">Asset Type <span class="text-red-500">*</span></div>
+    <div class="block text-sm font-medium mb-1.5" style="color: var(--ds-text);">Asset Type <span class="text-ds-text-danger">*</span></div>
     <div class="flex items-center gap-2">
       <div class="flex-1">
         <Select
+          id="asset-import-type"
           value={target.assetTypeId || ''}
           onchange={(v) => handleTypeChange({ target: { value: v } })}
           size="small"
@@ -86,7 +88,7 @@
       <div class="flex items-center justify-between">
         <h4 class="text-sm font-semibold" style="color: var(--ds-text);">Create New Asset Type</h4>
         <button
-          class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
+          class="p-1 rounded hover:bg-ds-background-neutral-hovered"
           onclick={() => assetImportStore.toggleCreateType()}
         >
           <IconX class="w-4 h-4" style="color: var(--ds-text-subtle);" />
@@ -95,7 +97,7 @@
 
       <!-- Type Name -->
       <div>
-        <div class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">Type Name <span class="text-red-500">*</span></div>
+        <div class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">Type Name <span class="text-ds-text-danger">*</span></div>
         <Input
           size="small"
           placeholder="e.g. Laptop, Vehicle, License..."
@@ -135,7 +137,7 @@
                 </div>
                 <div class="flex-1 min-w-0 space-y-1">
                   <div class="flex items-center gap-2">
-                    <input
+                    <Input
                       type="text"
                       class="flex-1 px-2 py-1 text-sm rounded border"
                       style="background: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
@@ -191,7 +193,7 @@
   <!-- File Upload -->
   {#if !upload.uploadId}
     <div>
-      <div class="block text-sm font-medium mb-1.5" style="color: var(--ds-text);">CSV File <span class="text-red-500">*</span></div>
+      <div class="block text-sm font-medium mb-1.5" style="color: var(--ds-text);">CSV File <span class="text-ds-text-danger">*</span></div>
 
       <!-- Drop zone -->
       <button
@@ -217,9 +219,9 @@
         {/if}
       </button>
 
-      <input
-        bind:this={fileInput}
-        type="file"
+      <FileInput
+        id="asset-import-file"
+        bind:inputRef={fileInput}
         accept=".csv,.tsv,.txt"
         class="hidden"
         onchange={handleFileSelect}

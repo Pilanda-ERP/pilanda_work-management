@@ -19,7 +19,7 @@ func NewOutput() *Output {
 }
 
 // Print outputs data in the configured format
-func (o *Output) Print(data interface{}) {
+func (o *Output) Print(data any) {
 	switch o.format {
 	case "table":
 		o.printTable(data)
@@ -30,13 +30,16 @@ func (o *Output) Print(data interface{}) {
 	}
 }
 
-func (o *Output) printJSON(data interface{}) {
+func (o *Output) printJSON(data any) {
 	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	_ = encoder.Encode(data) //nolint:errcheck // output to stdout
 }
 
-func (o *Output) printTable(data interface{}) {
+func (o *Output) printTable(data any) {
+	if items, ok := data.(*PaginatedResponse[Item]); ok {
+		warnItemPagination(items)
+	}
 	w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 	defer func() { _ = w.Flush() }() //nolint:errcheck // output to stdout
 
@@ -57,6 +60,8 @@ func (o *Output) printTable(data interface{}) {
 		o.printWorkspaceDetailTable(w, v)
 	case []Status:
 		o.printStatusesTable(w, v)
+	case *StatusListResult:
+		o.printStatusListTable(w, v)
 	case []ItemType:
 		o.printItemTypesTable(w, v)
 	case []TestCase:
@@ -109,6 +114,10 @@ func (o *Output) printTable(data interface{}) {
 		o.printPagePermissionsTable(w, v)
 	case *PagePermission:
 		o.printPagePermissionDetailTable(w, v)
+	case []PageDiagram:
+		o.printPageDiagramsTable(w, v)
+	case *PageDiagram:
+		o.printPageDiagramDetailTable(w, v)
 	case []LinkType:
 		o.printLinkTypesTable(w, v)
 	case *ItemLink:
@@ -137,7 +146,10 @@ func (o *Output) printTable(data interface{}) {
 	}
 }
 
-func (o *Output) printCSV(data interface{}) {
+func (o *Output) printCSV(data any) {
+	if items, ok := data.(*PaginatedResponse[Item]); ok {
+		warnItemPagination(items)
+	}
 	w := csv.NewWriter(stdout)
 	defer w.Flush()
 
@@ -158,6 +170,8 @@ func (o *Output) printCSV(data interface{}) {
 		o.printWorkspaceCSV(w, v)
 	case []Status:
 		o.printStatusesCSV(w, v)
+	case *StatusListResult:
+		o.printStatusListCSV(w, v)
 	case []ItemType:
 		o.printItemTypesCSV(w, v)
 	case []TestCase:
@@ -206,6 +220,10 @@ func (o *Output) printCSV(data interface{}) {
 		o.printPagePermissionsCSV(w, v)
 	case *PagePermission:
 		o.printPagePermissionCSV(w, v)
+	case []PageDiagram:
+		o.printPageDiagramsCSV(w, v)
+	case *PageDiagram:
+		o.printPageDiagramCSV(w, v)
 	case []LinkType:
 		o.printLinkTypesCSV(w, v)
 	case *ItemLink:
@@ -233,10 +251,7 @@ func (o *Output) printItemsCSV(w *csv.Writer, items []Item) {
 
 func (o *Output) printItemCSV(w *csv.Writer, item *Item) {
 	key, status, assignee, itemType := itemDisplayFields(item)
-	priority := ""
-	if item.Priority != nil {
-		priority = item.Priority.Name
-	}
+	priority := item.PriorityName
 	_ = w.Write([]string{"KEY", "TITLE", "STATUS", "TYPE", "PRIORITY", "ASSIGNEE", "DESCRIPTION", "CREATED", "UPDATED"})
 	_ = w.Write([]string{key, item.Title, status, itemType, priority, assignee, item.Description, item.CreatedAt.Format(time.RFC3339), item.UpdatedAt.Format(time.RFC3339)})
 }
@@ -273,6 +288,35 @@ func (o *Output) printStatusesCSV(w *csv.Writer, statuses []Status) {
 			isCompleted = "yes"
 		}
 		_ = w.Write([]string{fmt.Sprintf("%d", s.ID), s.Name, s.CategoryName, isDefault, isCompleted})
+	}
+}
+
+func (o *Output) printStatusListCSV(w *csv.Writer, result *StatusListResult) {
+	workspaceKey, workspaceName := "", ""
+	if result.Workspace != nil {
+		workspaceKey = result.Workspace.Key
+		workspaceName = result.Workspace.Name
+	}
+	_ = w.Write([]string{"SCOPE", "WORKSPACE_KEY", "WORKSPACE_NAME", "ID", "NAME", "CATEGORY", "DEFAULT", "COMPLETED"})
+	for _, status := range result.Statuses {
+		isDefault := ""
+		if status.IsDefault {
+			isDefault = "yes"
+		}
+		isCompleted := ""
+		if status.IsCompleted {
+			isCompleted = "yes"
+		}
+		_ = w.Write([]string{
+			result.Scope,
+			workspaceKey,
+			workspaceName,
+			fmt.Sprintf("%d", status.ID),
+			status.Name,
+			status.CategoryName,
+			isDefault,
+			isCompleted,
+		})
 	}
 }
 
@@ -331,7 +375,7 @@ func (o *Output) printTestRunCSV(w *csv.Writer, run *TestRun) {
 		status = "completed"
 	}
 	_ = w.Write([]string{"ID", "NAME", "SET_ID", "ASSIGNEE", "STARTED", "ENDED", "STATUS"})
-	_ = w.Write([]string{fmt.Sprintf("%d", run.ID), run.Name, fmt.Sprintf("%d", run.SetID), assignee, started, ended, status})
+	_ = w.Write([]string{fmt.Sprintf("%d", run.ID), run.Name, fmt.Sprintf("%d", run.PlanID), assignee, started, ended, status})
 }
 
 func (o *Output) printTestResultsCSV(w *csv.Writer, results []TestResult) {
@@ -415,11 +459,11 @@ func (o *Output) printItemDetailTable(w *tabwriter.Writer, item *Item) {
 	key, _, _, _ := itemDisplayFields(item)
 	_, _ = fmt.Fprintf(w, "Key:\t%s\n", key)
 	_, _ = fmt.Fprintf(w, "Title:\t%s\n", item.Title)
-	if item.Status != nil {
-		_, _ = fmt.Fprintf(w, "Status:\t%s\n", item.Status.Name)
+	if item.StatusName != "" {
+		_, _ = fmt.Fprintf(w, "Status:\t%s\n", item.StatusName)
 	}
-	if item.ItemType != nil {
-		_, _ = fmt.Fprintf(w, "Type:\t%s\n", item.ItemType.Name)
+	if item.ItemTypeName != "" {
+		_, _ = fmt.Fprintf(w, "Type:\t%s\n", item.ItemTypeName)
 	}
 	if item.ParentID != nil {
 		_, _ = fmt.Fprintf(w, "Parent:\t%s\n", parentDisplay(item))
@@ -427,14 +471,14 @@ func (o *Output) printItemDetailTable(w *tabwriter.Writer, item *Item) {
 	if len(item.Children) > 0 {
 		_, _ = fmt.Fprintf(w, "Children:\t%s\n", childrenSummary(item.Children))
 	}
-	if item.Priority != nil {
-		_, _ = fmt.Fprintf(w, "Priority:\t%s\n", item.Priority.Name)
+	if item.PriorityName != "" {
+		_, _ = fmt.Fprintf(w, "Priority:\t%s\n", item.PriorityName)
 	}
-	if item.Assignee != nil {
-		_, _ = fmt.Fprintf(w, "Assignee:\t%s\n", item.Assignee.FullName)
+	if item.AssigneeName != "" {
+		_, _ = fmt.Fprintf(w, "Assignee:\t%s\n", item.AssigneeName)
 	}
-	if item.Creator != nil {
-		_, _ = fmt.Fprintf(w, "Creator:\t%s\n", item.Creator.FullName)
+	if item.CreatorName != "" {
+		_, _ = fmt.Fprintf(w, "Creator:\t%s\n", item.CreatorName)
 	}
 	if item.Description != "" {
 		_, _ = fmt.Fprintf(w, "Description:\t%s\n", truncateString(item.Description, 100))
@@ -525,6 +569,15 @@ func (o *Output) printStatusesTable(w *tabwriter.Writer, statuses []Status) {
 	}
 }
 
+func (o *Output) printStatusListTable(w *tabwriter.Writer, result *StatusListResult) {
+	_, _ = fmt.Fprintf(w, "Scope:\t%s\n", result.Scope)
+	if result.Workspace != nil {
+		_, _ = fmt.Fprintf(w, "Workspace:\t%s (%s)\n", result.Workspace.Name, result.Workspace.Key)
+	}
+	_, _ = fmt.Fprintln(w)
+	o.printStatusesTable(w, result.Statuses)
+}
+
 func (o *Output) printItemTypesTable(w *tabwriter.Writer, types []ItemType) {
 	_, _ = fmt.Fprintln(w, "ID\tNAME\tICON")
 	_, _ = fmt.Fprintln(w, "--\t----\t----")
@@ -583,7 +636,7 @@ func (o *Output) printTestRunsTable(w *tabwriter.Writer, runs []TestRun) {
 func (o *Output) printTestRunDetailTable(w *tabwriter.Writer, run *TestRun) {
 	_, _ = fmt.Fprintf(w, "ID:\t%d\n", run.ID)
 	_, _ = fmt.Fprintf(w, "Name:\t%s\n", run.Name)
-	_, _ = fmt.Fprintf(w, "Set ID:\t%d\n", run.SetID)
+	_, _ = fmt.Fprintf(w, "Plan ID:\t%d\n", run.PlanID)
 	if run.AssigneeName != "" {
 		_, _ = fmt.Fprintf(w, "Assignee:\t%s\n", run.AssigneeName)
 	}
@@ -1025,6 +1078,26 @@ func (o *Output) printPagePermissionDetailTable(w *tabwriter.Writer, p *PagePerm
 	}
 }
 
+func (o *Output) printPageDiagramsTable(w *tabwriter.Writer, diagrams []PageDiagram) {
+	_, _ = fmt.Fprintln(w, "ATTACHMENT\tPAGE\tNAME\tKIND\tCONTENT HASH")
+	_, _ = fmt.Fprintln(w, "----------\t----\t----\t----\t------------")
+	for i := range diagrams {
+		d := &diagrams[i]
+		_, _ = fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\n", d.AttachmentID, d.PageID, d.Name, d.Kind, d.ContentHash)
+	}
+}
+
+func (o *Output) printPageDiagramDetailTable(w *tabwriter.Writer, d *PageDiagram) {
+	_, _ = fmt.Fprintf(w, "Attachment:\t%d\n", d.AttachmentID)
+	_, _ = fmt.Fprintf(w, "Page:\t%d\n", d.PageID)
+	_, _ = fmt.Fprintf(w, "Name:\t%s\n", d.Name)
+	_, _ = fmt.Fprintf(w, "Kind:\t%s\n", d.Kind)
+	_, _ = fmt.Fprintf(w, "Content hash:\t%s\n", d.ContentHash)
+	if d.RevisionNumber > 0 {
+		_, _ = fmt.Fprintf(w, "Revision:\t%d\n", d.RevisionNumber)
+	}
+}
+
 func (o *Output) printPagesCSV(w *csv.Writer, pages []Page) {
 	_ = w.Write([]string{"ID", "TITLE", "SLUG", "DEPTH", "PARENT_ID", "UPDATED"})
 	for i := range pages {
@@ -1123,6 +1196,28 @@ func (o *Output) writePagePermissionCSVRow(w *csv.Writer, p *PagePermission) {
 		grantedBy = fmt.Sprintf("%d", *p.GrantedBy)
 	}
 	_ = w.Write([]string{fmt.Sprintf("%d", p.ID), fmt.Sprintf("%d", p.PageID), p.PrincipalType, fmt.Sprintf("%d", p.PrincipalID), p.PermissionLevel, grantedBy})
+}
+
+func (o *Output) printPageDiagramsCSV(w *csv.Writer, diagrams []PageDiagram) {
+	_ = w.Write([]string{"ATTACHMENT_ID", "PAGE_ID", "NAME", "KIND", "CONTENT_HASH"})
+	for i := range diagrams {
+		o.writePageDiagramCSVRow(w, &diagrams[i])
+	}
+}
+
+func (o *Output) printPageDiagramCSV(w *csv.Writer, d *PageDiagram) {
+	_ = w.Write([]string{"ATTACHMENT_ID", "PAGE_ID", "NAME", "KIND", "CONTENT_HASH"})
+	o.writePageDiagramCSVRow(w, d)
+}
+
+func (o *Output) writePageDiagramCSVRow(w *csv.Writer, d *PageDiagram) {
+	_ = w.Write([]string{
+		fmt.Sprintf("%d", d.AttachmentID),
+		fmt.Sprintf("%d", d.PageID),
+		d.Name,
+		d.Kind,
+		d.ContentHash,
+	})
 }
 
 // ============================================
@@ -1300,8 +1395,7 @@ func (o *Output) printAssetDetailTable(w *tabwriter.Writer, a *Asset) {
 		_, _ = fmt.Fprintf(w, "Category:\t%s\n", a.Category.Name)
 	}
 	if a.Creator != nil {
-		// v1 asset surface no longer exposes creator.email under
-		// assets:read; render the display name (id as fallback) instead.
+		// The asset surface does not expose creator.email under assets:read.
 		name := a.Creator.FullName
 		if name == "" {
 			name = fmt.Sprintf("#%d", a.Creator.ID)
@@ -1388,21 +1482,21 @@ func (o *Output) printAssetTypeDetailTable(w *tabwriter.Writer, t *AssetType) {
 }
 
 func (o *Output) printAssetImportJobTable(w *tabwriter.Writer, j *AssetImportJob) {
-	_, _ = fmt.Fprintf(w, "Job ID:\t%d\n", j.ID)
-	_, _ = fmt.Fprintf(w, "Set ID:\t%d\n", j.SetID)
-	if j.AssetTypeID > 0 {
-		_, _ = fmt.Fprintf(w, "Asset type ID:\t%d\n", j.AssetTypeID)
-	}
+	_, _ = fmt.Fprintf(w, "Job ID:\t%s\n", j.JobID)
 	_, _ = fmt.Fprintf(w, "Status:\t%s\n", j.Status)
-	_, _ = fmt.Fprintf(w, "Rows:\t%d total, %d processed, %d created, %d errors\n", j.TotalRows, j.ProcessedRows, j.CreatedRows, j.ErrorRows)
+	if j.Progress != nil {
+		_, _ = fmt.Fprintf(w, "Rows:\t%d total, %d imported, %d errors\n", j.Progress.TotalRows, j.Progress.ImportedCount, j.Progress.FailedCount)
+	}
 	if j.ErrorMessage != "" {
 		_, _ = fmt.Fprintf(w, "Error:\t%s\n", j.ErrorMessage)
 	}
-	_, _ = fmt.Fprintf(w, "Created:\t%s\n", j.CreatedAt)
+	if j.CreatedAt != nil {
+		_, _ = fmt.Fprintf(w, "Created:\t%s\n", j.CreatedAt.Format(time.RFC3339))
+	}
 	if j.StartedAt != nil {
-		_, _ = fmt.Fprintf(w, "Started:\t%s\n", *j.StartedAt)
+		_, _ = fmt.Fprintf(w, "Started:\t%s\n", j.StartedAt.Format(time.RFC3339))
 	}
 	if j.CompletedAt != nil {
-		_, _ = fmt.Fprintf(w, "Completed:\t%s\n", *j.CompletedAt)
+		_, _ = fmt.Fprintf(w, "Completed:\t%s\n", j.CompletedAt.Format(time.RFC3339))
 	}
 }

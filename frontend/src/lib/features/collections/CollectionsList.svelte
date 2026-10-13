@@ -14,7 +14,7 @@
   import { collectionCategoriesStore } from '../../stores/collectionCategories.js';
   import { formatDate } from '../../utils/dateFormatter.js';
   import { toHotkeyString } from '../../utils/keyboardShortcuts.js';
-  import { workspacesStore } from '../../stores';
+  import { workspacesStore, authStore } from '../../stores';
   import WorkspaceSelector from '../../workspaces/WorkspaceSelector.svelte';
   import ColorDot from '../../components/ColorDot.svelte';
   import Badge from '../../components/Badge.svelte';
@@ -189,17 +189,29 @@
     }
   }
 
+  let currentUserId = $derived(authStore.currentUser?.id ?? null);
+
+  function canManageCollection(collection) {
+    return collection.created_by != null && String(collection.created_by) === String(currentUserId);
+  }
+
   function buildCollectionActions(collection) {
-    return [
+    /** @type {Array<Record<string, any>>} */
+    const actions = [
       {
         id: 'view',
+        testid: 'collection-action-view',
         type: 'regular',
         icon: Eye,
         title: t('collections.viewCollection'),
         onClick: () => viewCollection(collection)
-      },
+      }
+    ];
+    if (!canManageCollection(collection)) return actions;
+    actions.push(
       {
         id: 'edit',
+        testid: 'collection-action-edit',
         type: 'regular',
         icon: Pencil,
         title: t('collections.editCollection'),
@@ -208,6 +220,7 @@
       { type: 'divider' },
       {
         id: 'delete',
+        testid: 'collection-action-delete',
         type: 'regular',
         icon: Trash2,
         title: t('common.delete'),
@@ -215,7 +228,8 @@
         hoverClass: 'hover-danger',
         onClick: () => deleteCollection(collection)
       }
-    ];
+    );
+    return actions;
   }
 
   // Category management functions
@@ -229,10 +243,10 @@
   }
 </script>
 
-<div class="flex min-h-screen" style="background-color: var(--ds-surface);">
+<div class="flex h-full min-h-0 overflow-hidden" style="background-color: var(--ds-surface);">
   <CollectionsNavigation />
 
-  <div class="flex-1">
+  <div class="flex-1 min-h-0 overflow-y-auto">
     <div class="p-6">
       <!-- Header -->
       <PageHeader
@@ -243,6 +257,7 @@
       >
         {#snippet actions()}
           <Button
+            dataTestid="collection-create"
             onclick={createNewCollection}
             variant="primary"
             icon={Plus}
@@ -283,7 +298,9 @@
         emptyDescription={t('collections.noCollectionsFound')}
         emptyIcon={FolderOpen}
         actionItems={buildCollectionActions}
+        actionTriggerTestid={(collection) => `collection-actions-${collection.id}`}
         onRowClick={(collection) => viewCollection(collection)}
+        rowAttrs={(collection) => ({ 'data-testid': `collection-row-${collection.id}` })}
       >
         {#snippet name(collection)}
           {@const href = collection.workspace_id
@@ -292,7 +309,9 @@
           <a href={href} class="block no-underline" style="color: inherit;">
             <div class="flex items-center gap-2">
               <div style="color: var(--ds-text);">{collection.name}</div>
-              {#if collection.is_public}
+              {#if collection.is_private}
+                <Badge variant="default">{t('collections.private')}</Badge>
+              {:else if collection.is_public}
                 <Badge variant="info">{t('collections.public')}</Badge>
               {/if}
             </div>
@@ -333,4 +352,3 @@
   onDelete={handleDeleteCategory}
   showColorPicker={true}
 />
-

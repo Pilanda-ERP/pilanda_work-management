@@ -135,6 +135,8 @@ export default {
 
     // Status indicators
     loading: 'Cargando...',
+    loadingSlow: 'Esto puede tardar un momento con una conexión lenta.',
+    skipToMainContent: 'Saltar al contenido principal',
     saving: 'Guardando...',
     deleting: 'Eliminando...',
     processing: 'Procesando...',
@@ -154,6 +156,7 @@ export default {
     loadingMore: 'Cargando más...',
     remaining: 'restantes',
     showingOfTotal: 'Mostrando {count} de {total}',
+    showingXofY: 'Mostrando {from}–{to} de {total}',
 
     // Results
     noResults: 'No se encontraron resultados',
@@ -222,6 +225,7 @@ export default {
     updated: 'Actualizado correctamente',
     copied: 'Copiado al portapapeles',
     failed: 'Operación fallida',
+    layoutSaveFailed: 'No se pudieron guardar los cambios del panel. Tus ediciones se perderán al recargar.',
   },
 
   // Backend error codes
@@ -312,5 +316,16 @@ export default {
     noRequirements: 'No hay requisitos configurados',
     configureFilter: 'Configure el filtro para ver elementos',
     createToStart: 'Cree {item} para comenzar',
+  },
+  dueDate: {
+    noDueDate: 'Sin fecha de vencimiento',
+    dueToday: 'Vence hoy',
+    dueTomorrow: 'Vence mañana',
+    dueYesterday: 'Venció ayer',
+    dueInDays: 'Vence en {days} días',
+    overdueByDays: 'Vencido hace {days} días',
+    overdueTooltip: 'Vencido hace {days} días — vencía el {date}',
+    dueSoonTooltip: 'Vence en {days} días — {date}',
+    dueLaterTooltip: 'Vence el {date}',
   },
 };

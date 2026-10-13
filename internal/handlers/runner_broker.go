@@ -3,8 +3,12 @@ package handlers
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -31,6 +35,16 @@ const (
 	// egressResponseHeaderTimeout bounds time-to-first-header for arbitrary
 	// HTTP/git egress, where a slow upstream is treated as a fault.
 	egressResponseHeaderTimeout = 30 * time.Second
+
+	// brokerProtocolVersion identifies the non-streaming inference contract the
+	// broker speaks. The coding-agent client must send this exact value in the
+	// X-Protocol-Version header on every /complete request; the broker rejects
+	// a missing or newer/mismatched version with 426 Upgrade Required so an
+	// out-of-step agent fails loudly and diagnostically instead of misparsing
+	// the response (WI-921). Bump it when CompletionRequest/CompletionResponse
+	// changes incompatibly.
+	brokerProtocolVersion = "1"
+	protocolVersionHeader = "X-Protocol-Version"
 	// llmResponseHeaderTimeout is intentionally generous: an OpenAI-compatible
 	// chat completion can spend minutes on prompt prefill (long context,
 	// reasoning) before committing the SSE response headers. A 30s bound aborts
@@ -79,7 +93,10 @@ func (h *RunnerBrokerHandler) SetUsageRepository(usage *repository.LLMUsageRepos
 // running. Returns the run's grants + workspace, or writes a 401/403/404 and
 // returns ok=false.
 func (h *RunnerBrokerHandler) runFromToken(w http.ResponseWriter, r *http.Request, runID int) (grants *models.RunGrants, workspaceID int, ok bool) {
-	token := bearerCredential(r)
+	return h.runFromPresentedToken(w, r, runID, bearerCredential(r))
+}
+
+func (h *RunnerBrokerHandler) runFromPresentedToken(w http.ResponseWriter, r *http.Request, runID int, token string) (grants *models.RunGrants, workspaceID int, ok bool) {
 	if token == "" {
 		respondUnauthorized(w, r)
 		return nil, 0, false
@@ -131,34 +148,22 @@ func (h *RunnerBrokerHandler) GetSecret(w http.ResponseWriter, r *http.Request) 
 		respondNotFound(w, r, "credential")
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	respondJSON(w, http.StatusOK, map[string]any{"value": plaintext})
 }
 
-// ProxyLLM reverse-proxies a running job's model API calls to the LLM
-// connection it is granted, injecting the real provider credential
-// server-side so the key never reaches the runner. /llm-proxy/{run}/{path...}.
-//
-// Token-quota metering (grants.LLM.QuotaTokens) is a follow-up; this slice
-// establishes key-injecting, run-scoped proxying. Only anthropic and
-// openai-compatible auth conventions are handled; other providers need an
-// added case.
-// unbindStreamDeadlines lifts the server's per-request read/write deadlines for
-// a long-lived proxied stream. The broker's http.Server sets ReadTimeout (15s)
-// and WriteTimeout (30s) as slow-loris protection for ordinary JSON endpoints,
-// but those are hard wall-clock deadlines that do NOT reset on streaming
-// activity: a 30s WriteTimeout severs any LLM SSE response — or a large git
-// transfer — the moment it runs past 30s, which the coding agent observes as an
-// HTTP/2 "INTERNAL_ERROR; received from peer" mid-stream. Streaming proxy
-// handlers opt out here; the upstream transport's ResponseHeaderTimeout and the
-// request context still bound the work. Best-effort: SetWriteDeadline returns
-// http.ErrNotSupported on a ResponseWriter that cannot carry a deadline, which
-// is harmless (the broker's writer can).
+// unbindStreamDeadlines removes server wall-clock deadlines for streaming.
+// Upstream timeouts and the request context still bound the work.
 func unbindStreamDeadlines(w http.ResponseWriter) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Time{})
 	_ = rc.SetWriteDeadline(time.Time{})
 }
 
+// ProxyLLM executes one provider-neutral inference operation for a running job.
+// Provider credentials, URLs, model selection, and wire protocols remain on
+// the server side; the run token can reach no provider API surface directly.
 func (h *RunnerBrokerHandler) ProxyLLM(w http.ResponseWriter, r *http.Request) {
 	if h.tokens == nil || h.runs == nil || h.llmConns == nil {
 		respondServiceUnavailable(w, r, "coding-agent harness is disabled on this server")
@@ -176,109 +181,88 @@ func (h *RunnerBrokerHandler) ProxyLLM(w http.ResponseWriter, r *http.Request) {
 		respondForbidden(w, r)
 		return
 	}
+	if v := r.Header.Get(protocolVersionHeader); v != brokerProtocolVersion {
+		w.Header().Set(protocolVersionHeader, brokerProtocolVersion)
+		respondUpgradeRequired(w, r)
+		return
+	}
 	cfg, err := h.llmConns.ConnectionRuntime(r.Context(), grants.LLM.ConnectionID)
 	if err != nil {
 		respondServiceUnavailable(w, r, "llm connection unavailable")
 		return
 	}
-	provider := llm.GetProvider(llm.ProviderType(cfg.ProviderType))
-	base := cfg.BaseURL
-	if base == "" && provider != nil {
-		base = provider.BaseURL
-	}
-	target, err := url.Parse(base)
-	if err != nil || target.Host == "" {
-		respondServiceUnavailable(w, r, "llm connection has no base url")
-		return
-	}
-	upstreamPath := r.PathValue("path")
-	providerType := strings.ToLower(cfg.ProviderType)
-	// The Go agent speaks OpenAI-compatible /v1/chat/completions. Until the
-	// broker implements OpenAI→Anthropic translation, reject Anthropic bindings
-	// clearly instead of forwarding an incompatible request shape.
-	if providerType == "anthropic" {
-		respondServiceUnavailable(w, r, "anthropic coding-agent bindings require broker translation that is not enabled")
-		return
-	}
-	// Restrict the run token to the exact inference API surface the Go agent
-	// needs. A leaked run token must not be usable to drive files, fine-tuning,
-	// batch, or arbitrary provider APIs through the injected key.
-	if !allowedLLMProxyEndpoint(r.Method, upstreamPath) {
-		respondForbidden(w, r)
-		return
-	}
-	// Bound the request body (WI-238 security Phase 7).
 	r.Body = http.MaxBytesReader(w, r.Body, maxLLMBrokerBody)
-	// Read the chat body once when we need to merge provider_config OR meter
-	// usage (image parts are priced from the request, not the SSE tail).
-	imageCount := 0
-	isChat := strings.TrimPrefix(upstreamPath, "/") == "v1/chat/completions"
-	hasProviderConfig := strings.TrimSpace(cfg.ProviderConfig) != ""
-	if isChat && (hasProviderConfig || h.usage != nil) {
-		body, readErr := io.ReadAll(r.Body)
-		if readErr != nil {
-			respondBadRequest(w, r, "invalid llm request body")
+	var request llm.CompletionRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&request); err != nil {
+		respondBadRequest(w, r, "invalid inference request body")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		respondBadRequest(w, r, "inference request must contain one JSON object")
+		return
+	}
+	request.Model = cfg.Model
+	binding := llmBindingFingerprint(grants.LLM.ConnectionID, cfg.ProviderType, cfg.Model)
+	for _, message := range request.Messages {
+		if len(message.ProviderState) > 0 && message.ProviderBinding != binding {
+			respondBadRequest(w, r, "provider continuation binding mismatch")
 			return
 		}
-		imageCount = countImageParts(body)
-		out := body
-		if hasProviderConfig {
-			merged, mergeErr := llm.MergeProviderConfigJSON(body, cfg.ProviderConfig)
-			if mergeErr != nil {
-				respondServiceUnavailable(w, r, services.RedactString(mergeErr.Error()))
-				return
-			}
-			out = merged
-		}
-		r.Body = io.NopCloser(bytes.NewReader(out))
-		r.ContentLength = int64(len(out))
-		r.Header.Set("Content-Length", fmt.Sprintf("%d", len(out)))
 	}
-	apiKey := cfg.APIKey
-	providerChatPath := "/v1/chat/completions"
-	if provider != nil && provider.ChatPath != "" {
-		providerChatPath = provider.ChatPath
+	if request.MaxTokens <= 0 || request.MaxTokens > cfg.MaxOutputTokens {
+		request.MaxTokens = cfg.MaxOutputTokens
 	}
-	proxy := &httputil.ReverseProxy{
-		// Match ProxyHTTP: refuse to dial private/loopback/link-local/metadata
-		// targets even if an LLM connection's base URL is misconfigured or
-		// rebinds between write-time validation and use (Phase 8 of the
-		// agent-runner security fix plan).
-		Transport: ssrfSafeTransport(llmResponseHeaderTimeout),
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = target.Host
-			outPath := upstreamPath
-			if strings.TrimPrefix(upstreamPath, "/") == "v1/chat/completions" {
-				outPath = strings.TrimPrefix(providerChatPath, "/")
-			}
-			req.URL.Path = singleJoiningSlash(target.Path, outPath)
-			req.URL.RawPath = ""
-			// Replace the run-token with the real provider credential.
-			req.Header.Del("Authorization")
-			req.Header.Del("X-Api-Key")
-			switch providerType {
-			case "anthropic":
-				req.Header.Set("x-api-key", apiKey)
-				if req.Header.Get("anthropic-version") == "" {
-					req.Header.Set("anthropic-version", "2023-06-01")
-				}
-			default: // openai-compatible
-				req.Header.Set("Authorization", "Bearer "+apiKey)
-			}
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			respondServiceUnavailable(w, r, services.RedactString(err.Error()))
-		},
-		// Meter token usage + cost from the SSE usage tail (WI-493). The agent is
-		// untrusted, so the broker is the trustworthy capture point.
-		ModifyResponse: h.meterLLMResponse(runID, cfg.Model, h.llmConns.ModelPricing(llm.ProviderType(cfg.ProviderType), cfg.Model), imageCount),
-	}
-	// The chat completion streams as SSE and routinely runs past the server's
-	// 30s WriteTimeout; lift the deadline so the stream is not severed mid-run.
+	request.CodingAgent = true
+	pricing := h.llmConns.ModelPricing(llm.ProviderType(cfg.ProviderType), cfg.Model)
+	request.EnablePromptCache = cfg.Protocol == llm.APIContractAnthropic && pricing != nil && pricing.HasCompleteCacheRates()
+	client := llm.NewProviderClient(llm.ConnectionConfig{
+		ProviderType: llm.ProviderType(cfg.ProviderType), Model: cfg.Model,
+		APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, ProviderConfig: cfg.ProviderConfig,
+		Timeout: llmResponseHeaderTimeout,
+	})
+
+	// Inference can outlive the server's ordinary 30s response deadline.
 	unbindStreamDeadlines(w)
-	proxy.ServeHTTP(w, r)
+	response, err := client.Complete(r.Context(), request)
+	if err != nil {
+		respondServiceUnavailable(w, r, services.RedactString(err.Error()))
+		return
+	}
+	for i := range response.Choices {
+		if len(response.Choices[i].Message.ProviderState) > 0 {
+			response.Choices[i].Message.ProviderBinding = binding
+		}
+	}
+	h.persistLLMUsage(r.Context(), runID, cfg, request, response.Usage)
+	w.Header().Set("Cache-Control", "no-store")
+	respondJSON(w, http.StatusOK, response)
+}
+
+func llmBindingFingerprint(connectionID int, providerType, model string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d\x00%s\x00%s", connectionID, providerType, model)))
+	return fmt.Sprintf("sha256:%x", sum[:])
+}
+
+func (h *RunnerBrokerHandler) persistLLMUsage(ctx context.Context, runID int, cfg *llm.ConnectionRuntimeConfig, request llm.CompletionRequest, usage llm.Usage) {
+	if h.usage == nil {
+		return
+	}
+	// The descriptor carries only non-secret identity plus catalog pricing; the
+	// client holding the decrypted key stays inside the manager.
+	descriptor := llm.ConnectionDescriptor{
+		ProviderType: llm.ProviderType(cfg.ProviderType),
+		Model:        cfg.Model,
+		Pricing:      h.llmConns.ModelPricing(llm.ProviderType(cfg.ProviderType), cfg.Model),
+	}
+	_, err := services.RecordLLMCall(ctx, h.usage, runID, descriptor, services.MeteredCall{
+		Usage:  usage,
+		Images: llm.CompletionRequestImageCount(request),
+		Calls:  1,
+	})
+	if err != nil {
+		slog.Warn("persist llm usage", slog.Int("run_id", runID), slog.Any("error", err))
+	}
 }
 
 // allowedGitProxyPath reports whether the {gitpath...} tail is one of the three
@@ -302,18 +286,6 @@ func gitProxyBaseURL(providerType, stored string) string {
 func allowedGitProxyPath(path string) bool {
 	switch strings.TrimPrefix(path, "/") {
 	case "info/refs", "git-upload-pack", "git-receive-pack":
-		return true
-	default:
-		return false
-	}
-}
-
-func allowedLLMProxyEndpoint(method, path string) bool {
-	path = strings.TrimPrefix(path, "/")
-	switch {
-	case method == http.MethodPost && path == "v1/chat/completions":
-		return true
-	case method == http.MethodGet && path == "v1/models":
 		return true
 	default:
 		return false
@@ -429,7 +401,12 @@ func (h *RunnerBrokerHandler) ProxyGit(w http.ResponseWriter, r *http.Request) {
 	}
 	upstreamPath := singleJoiningSlash(target.Path, owner+"/"+repo+"/"+gitPath)
 	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
+		// Resolve and reject non-public destinations at connection time. The
+		// transport intentionally ignores proxy environment variables so they
+		// cannot bypass the checked dialer.
+		Transport: ssrfSafeTransport(egressResponseHeaderTimeout),
+		Rewrite: func(proxyReq *httputil.ProxyRequest) {
+			req := proxyReq.Out
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
@@ -439,6 +416,9 @@ func (h *RunnerBrokerHandler) ProxyGit(w http.ResponseWriter, r *http.Request) {
 			// agnostic oauth2:<token> Basic form).
 			req.Header.Del("Authorization")
 			req.SetBasicAuth("oauth2", scmToken)
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			respondServiceUnavailable(w, r, services.RedactString(err.Error()))
 		},
 	}
 	// Git smart-HTTP clones/fetches of a large repo stream well past 30s in
@@ -488,8 +468,9 @@ func (h *RunnerBrokerHandler) ProxyHTTP(w http.ResponseWriter, r *http.Request) 
 		// metadata endpoint or internal services. The dialer re-resolves and
 		// re-checks at connect time, which also defends against DNS rebinding.
 		Transport: ssrfSafeTransport(egressResponseHeaderTimeout),
-		Director: func(req *http.Request) {
-			req.URL = tu
+		Rewrite: func(proxyReq *httputil.ProxyRequest) {
+			req := proxyReq.Out
+			*req.URL = *tu
 			req.Host = tu.Host
 			req.Header.Del("X-Windshift-Target")
 			req.Header.Del("Authorization") // strip the run-token
@@ -510,7 +491,7 @@ func (h *RunnerBrokerHandler) ProxyHTTP(w http.ResponseWriter, r *http.Request) 
 // plain IsPrivateIP check, which misses several localhost-reachable ranges.
 // Used by the HTTP egress broker.
 func ssrfSafeTransport(responseHeaderTimeout time.Duration) http.RoundTripper {
-	return &http.Transport{
+	return utils.ConfigureHTTPTransport(&http.Transport{
 		// No ProxyFromEnvironment (WI-238 security Phase 7): an env-configured
 		// HTTP(S)_PROXY would be dialed directly, bypassing the post-resolution
 		// blocklist below and reopening the SSRF hole the dialer closes. The
@@ -520,7 +501,7 @@ func ssrfSafeTransport(responseHeaderTimeout time.Duration) http.RoundTripper {
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		DialContext:           utils.SafeNetDialer(10 * time.Second).DialContext,
-	}
+	})
 }
 
 // authorizeGitPush parses the pushed ref-update commands from a

@@ -14,27 +14,39 @@ type UserSummary struct {
 	AvatarURL string `json:"avatar_url,omitempty"`
 }
 
+// PortalCustomerSummary provides a minimal portal-customer representation for
+// attribution fields (uploaders, history actors).
+type PortalCustomerSummary struct {
+	ID    int    `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
 // StatusSummary provides a minimal status representation
 type StatusSummary struct {
-	ID            int    `json:"id"`
-	Name          string `json:"name"`
-	CategoryID    int    `json:"category_id"`
-	CategoryName  string `json:"category_name,omitempty"`
-	CategoryColor string `json:"category_color,omitempty"`
-	IsCompleted   bool   `json:"is_completed,omitempty"`
+	ID                 int    `json:"id"`
+	BuiltinKey         string `json:"builtin_key,omitempty"`
+	Name               string `json:"name"`
+	CategoryID         int    `json:"category_id"`
+	CategoryBuiltinKey string `json:"category_builtin_key,omitempty"`
+	CategoryName       string `json:"category_name,omitempty"`
+	CategoryColor      string `json:"category_color,omitempty"`
+	IsCompleted        bool   `json:"is_completed,omitempty"`
 }
 
 // PrioritySummary provides a minimal priority representation
 type PrioritySummary struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	Icon  string `json:"icon,omitempty"`
-	Color string `json:"color,omitempty"`
+	ID         int    `json:"id"`
+	BuiltinKey string `json:"builtin_key,omitempty"`
+	Name       string `json:"name"`
+	Icon       string `json:"icon,omitempty"`
+	Color      string `json:"color,omitempty"`
 }
 
 // ItemTypeSummary provides a minimal item type representation
 type ItemTypeSummary struct {
 	ID             int    `json:"id"`
+	BuiltinKey     string `json:"builtin_key,omitempty"`
 	Name           string `json:"name"`
 	Icon           string `json:"icon,omitempty"`
 	Color          string `json:"color,omitempty"`

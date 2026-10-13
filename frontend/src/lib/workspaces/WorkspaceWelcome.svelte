@@ -6,21 +6,35 @@
   import {
     useGradientStyles,
     loadWorkspaceGradient,
+    hydrateWorkspaceGradientLayout,
     workspaceGradientIndex,
     applyToAllViews as applyToAllViewsStore,
     workspaceBackgroundImageUrl
   } from '../stores/workspaceGradient.svelte.js';
 
-  const shortDateFormat = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
   import { getCollection } from '../features/collections/collectionService.js';
   import { Edit3, Plus, X, LayoutGrid, Pencil, Trash2 } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import { formatDateOnly } from '../utils/dateFormatter.js';
   import { errorToast } from '../stores/toasts.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-  import { getDefaultWidth, getWidgetMetadata } from '../services/widgetRegistry.js';
+  import {
+    WORKSPACE_WIDGET_GRID_COLUMNS,
+    clampWidgetWidth,
+    getDefaultWidth,
+    getWidgetMetadata,
+    getWidgetMaxWidth,
+    getWidgetMinWidth
+  } from '../services/widgetRegistry.js';
+  import {
+    captureWorkspaceWidgetWidths,
+    normalizeWorkspaceWidgets,
+    restoreRejectedWorkspaceWidgetWidths
+  } from '../services/workspaceWidgetLayout.js';
   import Button from '../components/Button.svelte';
   import Card from '../components/Card.svelte';
+  import Input from '../components/Input.svelte';
   import ViewHeader from '../layout/ViewHeader.svelte';
   import StaticViewBackground from '../layout/StaticViewBackground.svelte';
 
@@ -36,6 +50,10 @@
   import UpcomingDeadlinesWidget from '../widgets/UpcomingDeadlinesWidget.svelte';
   import IterationTimelineWidget from '../widgets/IterationTimelineWidget.svelte';
   import TestCoverageWidget from '../widgets/TestCoverageWidget.svelte';
+  import ZammadSupportWidget from '../widgets/ZammadSupportWidget.svelte';
+  import SavedSearchWidget from '../widgets/dashboard/SavedSearchWidget.svelte';
+  import StoryPointsWidget from '../widgets/StoryPointsWidget.svelte';
+	import SupportMetricsWidget from '../widgets/SupportMetricsWidget.svelte';
 
   // Customization sidebar
   import WorkspaceCustomizationSidebar from './WorkspaceCustomizationSidebar.svelte';
@@ -65,6 +83,7 @@
   let customizationCategory = $state('built-in');
   let setupCleanups = [];
   let savePending = $state(false);
+  let savedWidgetWidths = new Map();
 
   // Drag state
   let draggedWidget = $state(null);
@@ -85,15 +104,17 @@
     return [
       {
         id: crypto.randomUUID(),
-        title: 'Overview',
-        subtitle: 'Key metrics and statistics',
+        title: t('workspaceDashboard.overview'),
+        subtitle: t('workspaceDashboard.overviewDescription'),
+        system_key: 'overview',
         display_order: 0,
         widget_ids: []
       },
       {
         id: crypto.randomUUID(),
-        title: 'Progress Tracking',
-        subtitle: 'Charts and timelines',
+        title: t('workspaceDashboard.progress'),
+        subtitle: t('workspaceDashboard.progressDescription'),
+        system_key: 'progress',
         display_order: 1,
         widget_ids: []
       }
@@ -247,9 +268,7 @@
       }
 
       const itemsResponse = await api.items.getAll(filters);
-      const items = Array.isArray(itemsResponse)
-        ? itemsResponse
-        : (itemsResponse?.items ?? []);
+      const items = itemsResponse?.data ?? [];
       const fetchedStatuses = await api.statuses.getAll();
       const statusList = Array.isArray(fetchedStatuses) ? fetchedStatuses : [];
       const localStatusById = new Map(
@@ -291,7 +310,9 @@
         completedByWeekData.push({
           date: new Date(weekStart),
           count: completedCount,
-          label: `Week of ${shortDateFormat.format(weekStart)}`
+          label: t('workspaceDashboard.weekOf', {
+            date: formatDateOnly(weekStart, { month: 'short', day: 'numeric' })
+          })
         });
       }
 
@@ -324,7 +345,7 @@
       const layout = await loadWorkspaceGradient(workspaceId);
       if (layout && layout.sections && layout.sections.length > 0) {
         sections = layout.sections.sort((a, b) => a.display_order - b.display_order);
-        widgets = layout.widgets || [];
+        widgets = normalizeWorkspaceWidgets(layout.widgets);
       } else {
         sections = getDefaultSections();
         widgets = getDefaultWidgets();
@@ -334,6 +355,7 @@
       sections = getDefaultSections();
       widgets = getDefaultWidgets();
     }
+    savedWidgetWidths = captureWorkspaceWidgetWidths(widgets);
   }
 
   async function saveHomepageLayout() {
@@ -342,9 +364,10 @@
       return;
     }
     savePending = true;
+    let attemptedLayout = null;
 
     try {
-      const layout = {
+      attemptedLayout = {
         sections: sections.map((s, idx) => ({
           ...s,
           display_order: idx
@@ -358,9 +381,18 @@
         backgroundImageUrl: get(workspaceBackgroundImageUrl) || ''
       };
 
-      await api.workspaces.updateHomepageLayout(workspaceId, layout);
+      await api.workspaces.updateHomepageLayout(workspaceId, attemptedLayout);
+      hydrateWorkspaceGradientLayout(workspaceId, attemptedLayout);
+      savedWidgetWidths = captureWorkspaceWidgetWidths(attemptedLayout.widgets);
     } catch (error) {
       console.error('Failed to save homepage layout:', error);
+      if (attemptedLayout) {
+        widgets = restoreRejectedWorkspaceWidgetWidths(
+          widgets,
+          attemptedLayout.widgets,
+          savedWidgetWidths
+        );
+      }
       errorToast(t('dialogs.alerts.failedToSaveLayout'));
     } finally {
       savePending = false;
@@ -406,7 +438,7 @@
   function addSection() {
     const newSection = {
       id: crypto.randomUUID(),
-      title: 'New Section',
+      title: t('dashboard.sections.new'),
       subtitle: '',
       display_order: sections.length,
       widget_ids: []
@@ -461,7 +493,7 @@
   async function deleteSection(sectionId) {
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: 'Delete this section? All widgets in this section will be removed.',
+      message: t('dashboard.sections.deleteMessage'),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger'
@@ -522,8 +554,21 @@
   }
 
   function updateWidgetWidth(widgetId, newWidth) {
+    const widget = widgets.find(w => w.id === widgetId);
+    if (!widget) return null;
+    const width = clampWidgetWidth(widget.type, newWidth);
     widgets = widgets.map(w =>
-      w.id === widgetId ? { ...w, width: newWidth } : w
+      w.id === widgetId ? { ...w, width } : w
+    );
+    debouncedSave();
+    return width;
+  }
+
+  function updateWidgetConfig(widgetId, configChanges) {
+    widgets = widgets.map((widget) =>
+      widget.id === widgetId
+        ? { ...widget, config: { ...(widget.config ?? {}), ...configChanges } }
+        : widget
     );
     debouncedSave();
   }
@@ -599,7 +644,20 @@
   });
 
   function getWidgetTitle(type) {
-    return getWidgetMetadata(type)?.name || type;
+    const widget = getWidgetMetadata(type);
+    return widget?.nameKey ? t(widget.nameKey) : widget?.name || type;
+  }
+
+  function getSectionTitle(section) {
+    if (section.system_key === 'overview' || section.title === 'Overview') return t('workspaceDashboard.overview');
+    if (section.system_key === 'progress' || section.title === 'Progress Tracking') return t('workspaceDashboard.progress');
+    return section.title;
+  }
+
+  function getSectionSubtitle(section) {
+    if (section.system_key === 'overview' || section.subtitle === 'Key metrics and statistics') return t('workspaceDashboard.overviewDescription');
+    if (section.system_key === 'progress' || section.subtitle === 'Charts and timelines') return t('workspaceDashboard.progressDescription');
+    return section.subtitle;
   }
 
   // Get widgets for a section
@@ -624,13 +682,13 @@
 >
     {#if loading}
       <div class="flex items-center justify-center h-64">
-        <p style={gradientStyles.emptyStateStyle}>Loading workspace data...</p>
+        <p style={gradientStyles.emptyStateStyle}>{t('workspaceDashboard.loading')}</p>
       </div>
     {:else}
     <!-- Header -->
     <ViewHeader
-      viewName={workspace?.name || 'Workspace'}
-      workspaceName="Homepage"
+      viewName={workspace?.name || t('common.workspace')}
+      workspaceName={t('workspaceDashboard.homepage')}
       collection={currentCollectionName !== 'Default' ? currentCollectionName : ''}
       hasGradient={gradientStyles.hasCustomBackground}
       textStyle={gradientStyles.textStyle}
@@ -644,7 +702,7 @@
             icon={isEditMode ? X : Edit3}
             onclick={toggleEditMode}
           >
-            {isEditMode ? 'Done Editing' : 'Edit'}
+            {isEditMode ? t('workspaceDashboard.doneEditing') : t('common.edit')}
           </Button>
 
           <!-- Customize button -->
@@ -653,7 +711,7 @@
             icon={isCustomizeMode ? X : LayoutGrid}
             onclick={toggleCustomizeMode}
           >
-            {isCustomizeMode ? 'Done' : 'Customize'}
+            {isCustomizeMode ? t('common.done') : t('workspaceDashboard.customize')}
           </Button>
         </div>
       {/snippet}
@@ -664,15 +722,16 @@
       <div class="mb-4 p-3 border rounded flex items-center justify-between" style="background-color: var(--ds-status-info-bg); border-color: var(--ds-status-info-border);">
         <div class="flex items-center gap-2 text-sm" style="color: var(--ds-status-info-text);">
           <Edit3 class="h-4 w-4" />
-          <span>Edit mode: Add, rename, or delete sections</span>
+          <span>{t('workspaceDashboard.editModeHint')}</span>
         </div>
+        <!-- shortcut-guard-exempt: section creation is available only inside dashboard edit mode -->
         <Button
           variant="primary"
           size="small"
           icon={Plus}
           onclick={addSection}
         >
-          Add Section
+          {t('layout.addSection')}
         </Button>
       </div>
     {/if}
@@ -687,60 +746,57 @@
             {#if editingSectionId === section.id}
               <!-- Editing mode -->
               <div class="flex-1 flex items-center gap-2">
-                <input
+                <Input
                   type="text"
                   bind:value={editingSectionTitle}
-                  class="px-3 py-2 border border-gray-300 rounded text-lg font-semibold"
-                  placeholder="Section title"
+                  class="text-lg font-semibold"
+                  placeholder={t('dashboard.sections.titlePlaceholder')}
                   onkeydown={handleSectionEditKeydown}
                 />
-                <input
+                <Input
                   type="text"
                   bind:value={editingSectionSubtitle}
-                  class="px-3 py-2 border border-gray-300 rounded text-sm"
-                  placeholder="Subtitle (optional)"
+                  placeholder={t('dashboard.sections.subtitlePlaceholder')}
                   onkeydown={handleSectionEditKeydown}
+                  size="small"
                 />
                 <Button
                   variant="primary"
                   size="small"
                   onclick={saveSection}
                 >
-                  Save <span class="ml-1 opacity-60">⏎</span>
+                  {t('common.save')} <span class="ml-1 opacity-60">⏎</span>
                 </Button>
                 <Button
                   variant="default"
                   size="small"
                   onclick={cancelEditingSection}
                 >
-                  Cancel <span class="ml-1 opacity-60">Esc</span>
+                  {t('common.cancel')} <span class="ml-1 opacity-60">Esc</span>
                 </Button>
               </div>
             {:else}
               <!-- Display mode -->
               <div>
-                <h2 class="text-xl font-semibold" style={gradientStyles.glassTextStyle}>{section.title}</h2>
+                <h2 class="text-xl font-semibold" style={gradientStyles.glassTextStyle}>{getSectionTitle(section)}</h2>
                 {#if section.subtitle}
-                  <p class="text-sm mt-1" style={gradientStyles.glassSubtleTextStyle}>{section.subtitle}</p>
+                  <p class="text-sm mt-1" style={gradientStyles.glassSubtleTextStyle}>{getSectionSubtitle(section)}</p>
                 {/if}
               </div>
 
               {#if isEditMode}
                 <div class="flex items-center gap-2">
                   <button
-                    class="p-2 rounded"
-                    style="color: var(--ds-text-subtle); transition: color 0.15s;"
-                    onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-interactive)'}
-                    onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
+                    class="section-edit p-2 rounded"
                     onclick={() => startEditingSection(section)}
-                    title="Rename section"
+                    title={t('dashboard.sections.rename')}
                   >
                     <Pencil class="h-4 w-4" />
                   </button>
                   <button
                     class="p-2 rounded hover-danger" style="color: var(--ds-text-subtle);"
                     onclick={() => deleteSection(section.id)}
-                    title="Delete section"
+                    title={t('layout.deleteSection')}
                   >
                     <Trash2 class="h-4 w-4" />
                   </button>
@@ -757,7 +813,7 @@
             style="{draggedWidget && isCustomizeMode
               ? `border-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-border-focused)' : (gradientStyles.hasCustomBackground ? 'rgba(255, 255, 255, 0.3)' : 'var(--ds-border)')};
                  ${dropZoneStates.get(section.id)?.isOver ? 'box-shadow: 0 0 0 2px var(--ds-border-focused);' : ''}
-                 background-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-surface-hover)' : 'transparent'};
+                 background-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-surface-hovered)' : 'transparent'};
                  padding: 0.5rem;`
               : ''}"
             data-section-drop-zone
@@ -769,10 +825,17 @@
                   <WidgetWrapper
                     title={getWidgetTitle(widget.type)}
                     widgetId={widget.id}
-                    bind:width={widget.width}
+                    widgetType={widget.type}
+                    width={widget.width}
+                    gridColumns={WORKSPACE_WIDGET_GRID_COLUMNS}
+                    resizeMinWidth={getWidgetMinWidth(widget.type)}
+                    resizeMaxWidth={getWidgetMaxWidth(widget.type)}
+                    resizeDefaultWidth={getDefaultWidth(widget.type)}
+                    config={widget.config ?? {}}
                     isEditing={isCustomizeMode}
                     onremove={() => removeWidget(widget.id)}
                     onwidthchange={(newWidth) => updateWidgetWidth(widget.id, newWidth)}
+                    onconfigchange={(changes) => updateWidgetConfig(widget.id, changes)}
                   >
                     {#if widget.type === 'stats'}
                       <StatsCardWidget {stats} {statusCategories} />
@@ -782,6 +845,14 @@
                       <CreatedChartWidget chartData={createdLast7DaysData} />
                     {:else if widget.type === 'milestone-progress'}
                       <MilestoneProgressWidget {milestones} />
+                    {:else if widget.type === 'story-points-by-assignee'}
+                      <StoryPointsWidget {workspaceId} />
+                    {:else if widget.type === 'support-metrics'}
+                      <SupportMetricsWidget
+                        {workspaceId}
+                        {collectionId}
+                        config={widget.config ?? {}}
+                      />
                     {:else if widget.type === 'recent-items'}
                       <RecentItemsWidget {workspaceId} {collectionFilter} />
                     {:else if widget.type === 'my-tasks'}
@@ -794,9 +865,17 @@
                       <IterationTimelineWidget {workspaceId} />
                     {:else if widget.type === 'test-coverage'}
                       <TestCoverageWidget {workspaceId} collectionId={collectionId} />
+                    {:else if widget.type === 'zammad-support-overview'}
+                      <ZammadSupportWidget {workspaceId} />
+                    {:else if widget.type === 'saved-search'}
+                      <SavedSearchWidget
+                        {workspaceId}
+                        config={widget.config ?? {}}
+                        onconfigchange={(changes) => updateWidgetConfig(widget.id, changes)}
+                      />
                     {:else}
                       <div class="text-center py-8 text-sm" style="color: var(--ds-text-subtle);">
-                        Unknown widget type: {widget.type}
+                        {t('dashboard.widgets.unknown', { type: widget.type })}
                       </div>
                     {/if}
                   </WidgetWrapper>
@@ -804,8 +883,8 @@
               </div>
             {:else}
               <div class="text-center py-12" style={gradientStyles.emptyStateStyle}>
-                <p class="text-sm">No widgets in this section yet</p>
-                <p class="text-xs mt-1">Click "Customize" to add widgets</p>
+                <p class="text-sm">{t('dashboard.sections.noWidgets')}</p>
+                <p class="text-xs mt-1">{t('dashboard.sections.addWidgetsHint')}</p>
               </div>
             {/if}
           </div>
@@ -816,8 +895,8 @@
     {#if sections.length === 0}
       <div class="flex flex-col items-center justify-center py-16" style={gradientStyles.emptyStateStyle}>
         <LayoutGrid class="h-16 w-16 mb-4 opacity-30" />
-        <p class="text-lg font-medium">No sections configured</p>
-        <p class="text-sm mt-2">Click "Edit" to add sections to your homepage</p>
+        <p class="text-lg font-medium">{t('dashboard.sections.none')}</p>
+        <p class="text-sm mt-2">{t('workspaceDashboard.noSectionsHint')}</p>
       </div>
     {/if}
     {/if}
@@ -829,8 +908,6 @@
     width: 100%;
     min-height: 100vh;
     position: relative;
-    background-size: 200% 200%;
-    animation: gradient-shift 15s ease infinite;
   }
 
   /* Add subtle pattern overlay for depth */
@@ -847,42 +924,22 @@
     pointer-events: none;
   }
 
-  /* Floating glow orbs for visual interest */
-  :global(.workspace-welcome-wrapper::after) {
-    content: '';
-    position: absolute;
-    top: 10%;
-    right: 10%;
-    width: 300px;
-    height: 300px;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(255, 255, 255, 0.15), transparent 70%);
-    filter: blur(60px);
-    pointer-events: none;
-    animation: glow-breathe 6s ease-in-out infinite;
-  }
-
   /* Ensure content appears above the gradient overlay */
   :global(.workspace-welcome) {
     position: relative;
     z-index: 1;
-    animation: fade-up var(--duration-slow, 300ms) var(--ease-smooth, ease) forwards;
   }
 
   .section-drop-zone {
     position: relative;
   }
 
-  /* Reduced motion support */
-  @media (prefers-reduced-motion: reduce) {
-    :global(.workspace-welcome-wrapper) {
-      animation: none;
-    }
-    :global(.workspace-welcome-wrapper::after) {
-      animation: none;
-    }
-    :global(.workspace-welcome) {
-      animation: none;
-    }
+  .section-edit {
+    color: var(--ds-text-subtle);
+    transition: color 0.15s;
+  }
+
+  .section-edit:hover {
+    color: var(--ds-interactive);
   }
 </style>

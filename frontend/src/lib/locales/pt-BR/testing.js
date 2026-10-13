@@ -25,6 +25,7 @@ export default {
     addTestPlan: 'Adicionar Plano de Teste',
     createFirstTestPlan: 'Crie seu primeiro plano de teste para organizar casos de teste',
     lastRun: 'Última Execução',
+    neverRun: 'Nunca executado',
     deleteFolder: 'Excluir Pasta',
     deleteStep: 'Excluir Etapa',
     steps: 'Etapas',
@@ -82,6 +83,7 @@ export default {
       'Tem certeza de que deseja excluir este caso de teste? Esta ação não pode ser desfeita.',
     noTestCasesFound: 'Nenhum caso de teste encontrado',
     noTestCasesWithLabel: 'Nenhum caso de teste encontrado com o filtro de rótulo selecionado.',
+    searchTestCases: 'Pesquisar casos de teste...',
     createFirstTestCase:
       "Clique em 'Adicionar Caso de Teste' para criar seu primeiro caso de teste nesta pasta.",
     allLabels: 'Todos os rótulos',
@@ -109,7 +111,7 @@ export default {
       'Descreva as condições que devem ser atendidas antes de executar este caso de teste...',
     testCaseStepsInfo:
       'Após criar este caso de teste, você poderá adicionar etapas individuais com ações específicas, dados e resultados esperados para uma execução de teste precisa.',
-    pressToOpenSteps: 'Pressione 1-9 para abrir etapas',
+    pressToOpenSteps: 'Pressione uma tecla destacada para abrir as etapas',
     // Gerenciamento de Rótulos
     manageLabels: 'Gerenciar Rótulos',
     clickLabelsToAssign: 'Clique nos rótulos para atribuir/remover deste caso de teste',
@@ -328,7 +330,10 @@ export default {
     duration: 'Duration',
     failedToLoadSummary: 'Failed to load test summary',
     noResultsForExport: 'No results available for export',
-    stepsNotExecuted: '{count} step(s) were not individually executed',
+    testRunSummary: 'Resumo da execução de teste',
+    printLoading: 'Preparando o resumo da execução de teste para impressão…',
+    backToRun: 'Voltar à execução de teste',
+    stepsNotExecuted: '{count} etapas não foram executadas individualmente',
   },
 
   testCase: {

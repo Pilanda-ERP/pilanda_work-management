@@ -13,15 +13,19 @@ CREATE TABLE IF NOT EXISTS attachments (
 	mime_type TEXT NOT NULL,
 	file_size INTEGER NOT NULL,
 	uploaded_by INTEGER,
+	uploaded_by_portal_customer_id INTEGER,
 	has_thumbnail BOOLEAN DEFAULT false,
 	thumbnail_path TEXT,
 	category TEXT DEFAULT '',
+	is_internal BOOLEAN NOT NULL DEFAULT false, -- hidden from portal customers (e.g. JSM internal-note files)
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-	FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
+	FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL,
+	FOREIGN KEY (uploaded_by_portal_customer_id) REFERENCES portal_customers(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_attachments_item_id ON attachments(item_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_uploaded_by ON attachments(uploaded_by);
+CREATE INDEX IF NOT EXISTS idx_attachments_uploaded_by_portal_customer ON attachments(uploaded_by_portal_customer_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_entity ON attachments(entity_type, item_id);
 
 CREATE TABLE IF NOT EXISTS attachment_settings (
@@ -74,6 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_item_diagrams_created_by ON item_diagrams(created
 -- Link management tables
 CREATE TABLE IF NOT EXISTS link_types (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL UNIQUE,
 	description TEXT,
 	forward_label TEXT NOT NULL,
@@ -85,6 +90,8 @@ CREATE TABLE IF NOT EXISTS link_types (
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_link_types_builtin_key ON link_types(builtin_key) WHERE builtin_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS item_links (
 	id SERIAL PRIMARY KEY,

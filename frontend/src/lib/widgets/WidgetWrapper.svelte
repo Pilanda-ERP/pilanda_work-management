@@ -1,7 +1,54 @@
 <script>
   import { t } from '../stores/i18n.svelte.js';
+  import { getDashboardWidgetMinWidth, getDashboardWidgetDefaultWidth } from '../services/dashboardWidgetRegistry.js';
+  import {
+    ROW_COUNT_OPTIONS,
+    resolveRowCount,
+    resolveDensity,
+    shouldShowRowControls,
+  } from './dashboard/taskWidgetState.js';
+  import DropdownMenu from '../layout/DropdownMenu.svelte';
+  import { useEventListener } from 'runed';
+  import { MoreHorizontal } from '@lucide/svelte';
 
-  let { title = "", widgetId = "", isEditing = false, width = $bindable(3), onremove = null, onwidthchange = null, children } = $props();
+  let {
+    title = '',
+    widgetId = '',
+    widgetType = '',
+    isEditing = false,
+    width = $bindable(getDashboardWidgetDefaultWidth(widgetType)),
+    config = $bindable({}),
+    gridColumns = 12,
+    resizeMinWidth = null,
+    resizeMaxWidth = null,
+    resizeDefaultWidth = null,
+    onremove = null,
+    onwidthchange = null,
+    onconfigchange = null,
+    children,
+  } = $props();
+
+  const totalColumns = $derived(
+    Number.isFinite(Number(gridColumns))
+      ? Math.max(1, Math.round(Number(gridColumns)))
+      : 12
+  );
+  const registryMinWidth = $derived(getDashboardWidgetMinWidth(widgetType) || 3);
+  const minWidth = $derived(
+    Math.min(totalColumns, Math.max(1, resizeMinWidth ?? registryMinWidth))
+  );
+  const maxWidth = $derived(
+    Math.max(minWidth, Math.min(totalColumns, resizeMaxWidth ?? totalColumns))
+  );
+  const defaultWidth = $derived(
+    Math.min(
+      maxWidth,
+      Math.max(
+        minWidth,
+        resizeDefaultWidth ?? getDashboardWidgetDefaultWidth(widgetType) ?? totalColumns
+      )
+    )
+  );
 
   function handleRemove(event) {
     event.stopPropagation();
@@ -10,22 +57,155 @@
   }
 
   function setWidth(newWidth) {
-    width = newWidth;
-    onwidthchange?.(newWidth);
+    const clamped = Math.min(maxWidth, Math.max(minWidth, newWidth));
+    const resolved = onwidthchange?.(clamped);
+    width = Number.isFinite(resolved) ? resolved : clamped;
   }
 
-  // Get grid column span class
-  const gridColClass = $derived(`col-span-${width}`);
+  // --- Resize presets (WI-831) ---
+  const presets = $derived([
+    { label: t('widgets.widthQuarter'), value: totalColumns / 4 },
+    { label: t('widgets.widthThird'), value: totalColumns / 3 },
+    { label: t('widgets.widthHalf'), value: totalColumns / 2 },
+    { label: t('widgets.widthTwoThirds'), value: (totalColumns * 2) / 3 },
+    { label: t('widgets.widthFull'), value: totalColumns },
+  ].filter((p) =>
+    Number.isInteger(p.value) && p.value >= minWidth && p.value <= maxWidth
+  ));
+
+  const presetItems = $derived(presets.map((p) => ({
+    title: p.label,
+    testid: `widget-width-preset-${p.value}`,
+    onClick: () => setWidth(p.value),
+    selected: width === p.value,
+  })));
+
+  const supportsRowCount = $derived(shouldShowRowControls(widgetType, config));
+  const currentRowCount = $derived(resolveRowCount(config, width));
+  const currentDensity = $derived(resolveDensity(config));
+
+  function setRowCount(value) {
+    config = { ...config, rowCount: value };
+    onconfigchange?.({ rowCount: value });
+  }
+
+  function setDensity(value) {
+    config = { ...config, density: value };
+    onconfigchange?.({ density: value });
+  }
+
+  const rowCountItems = $derived(ROW_COUNT_OPTIONS.map((n) => ({
+    title: n === 'all' ? t('widgets.rowCountAll') : t(`widgets.rowCount${n}`),
+    testid: `widget-row-count-${n}`,
+    onClick: () => setRowCount(n),
+    selected: currentRowCount === n,
+  })));
+
+  const densityItems = $derived([
+    {
+      title: t('widgets.densityComfortable'),
+      testid: 'widget-density-comfortable',
+      onClick: () => setDensity('comfortable'),
+      selected: currentDensity === 'comfortable',
+    },
+    {
+      title: t('widgets.densityCompact'),
+      testid: 'widget-density-compact',
+      onClick: () => setDensity('compact'),
+      selected: currentDensity === 'compact',
+    },
+  ]);
+
+  const menuItems = $derived([
+    ...presetItems,
+    ...(supportsRowCount ? [{ type: 'divider' }] : []),
+    ...(supportsRowCount ? rowCountItems : []),
+    ...(supportsRowCount ? [{ type: 'divider' }] : []),
+    ...(supportsRowCount ? densityItems : []),
+  ]);
+
+  // --- Pointer drag resize (WI-831), follows WorkspaceNavigation.svelte ---
+  let isResizing = $state(false);
+  let resizeStartX = $state(0);
+  let resizeStartWidth = $state(0);
+  let containerEl = $state(null);
+  let liveColumns = $state(null);
+
+  function onResizeStart(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    resizeStartX = e.clientX;
+    resizeStartWidth = width;
+    isResizing = true;
+  }
+
+  function handleResizeMove(e) {
+    if (!containerEl) return;
+    const grid = containerEl.parentElement;
+    if (!grid) return;
+    const colWidth = grid.getBoundingClientRect().width / totalColumns;
+    if (colWidth <= 0) return;
+    const deltaCols = Math.round((e.clientX - resizeStartX) / colWidth);
+    const next = Math.min(maxWidth, Math.max(minWidth, resizeStartWidth + deltaCols));
+    liveColumns = next;
+    if (next !== width) {
+      const resolved = onwidthchange?.(next);
+      width = Number.isFinite(resolved) ? resolved : next;
+    }
+  }
+
+  function handleResizeEnd() {
+    isResizing = false;
+    liveColumns = null;
+  }
+
+  function onResizeHandleDblClick() {
+    setWidth(defaultWidth);
+  }
+
+  useEventListener(() => (isResizing ? window : undefined), 'mousemove', handleResizeMove);
+  useEventListener(() => (isResizing ? window : undefined), 'mouseup', handleResizeEnd);
+
+  // --- Keyboard slider (WI-831) ---
+  function handleSliderKeydown(e) {
+    let next = width;
+    switch (e.key) {
+      case 'ArrowLeft':
+      case 'ArrowDown':
+        next = width - 1;
+        break;
+      case 'ArrowRight':
+      case 'ArrowUp':
+        next = width + 1;
+        break;
+      case 'Home':
+        next = minWidth;
+        break;
+      case 'End':
+        next = maxWidth;
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    setWidth(next);
+  }
+
+  const displayColumns = $derived(liveColumns ?? width);
 </script>
 
 <div
-  class="widget-container rounded shadow-sm border bg-ds-surface-raised border-ds-border {gridColClass}"
+  bind:this={containerEl}
+  class="widget-container rounded shadow-sm border bg-ds-surface-raised border-ds-border"
+  style="--widget-cols: {displayColumns};"
   data-widget-id={widgetId}
   data-widget-wrapper
+  data-widget-width={displayColumns}
+  data-testid={`widget-${widgetId}`}
 >
   <!-- Header with drag handle -->
   <div class="widget-header flex items-center justify-between px-4 py-3 border-b border-ds-border">
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 min-w-0">
       {#if isEditing}
         <button
           class="drag-handle cursor-grab hover:cursor-grabbing text-ds-text-subtlest"
@@ -49,50 +229,29 @@
           </svg>
         </button>
       {/if}
-      <h3 class="text-sm font-semibold text-ds-text">{title}</h3>
+      <h3 class="text-sm font-semibold text-ds-text truncate">{title}</h3>
     </div>
 
-    {#if isEditing}
-      <div class="flex items-center gap-1">
-        <!-- Width controls -->
-        <div class="flex items-center gap-1 mr-2 rounded border border-ds-border">
-          <button
-            class="px-2 py-1 text-xs"
-            class:bg-ds-surface-selected={width === 1}
-            class:text-ds-text={width === 1}
-            class:text-ds-text-subtle={width !== 1}
-            onclick={() => setWidth(1)}
-            title={t('widgets.narrowWidth')}
-          >
-            1
-          </button>
-          <button
-            class="px-2 py-1 text-xs"
-            class:bg-ds-surface-selected={width === 2}
-            class:text-ds-text={width === 2}
-            class:text-ds-text-subtle={width !== 2}
-            onclick={() => setWidth(2)}
-            title={t('widgets.mediumWidth')}
-          >
-            2
-          </button>
-          <button
-            class="px-2 py-1 text-xs"
-            class:bg-ds-surface-selected={width === 3}
-            class:text-ds-text={width === 3}
-            class:text-ds-text-subtle={width !== 3}
-            onclick={() => setWidth(3)}
-            title={t('widgets.fullWidth')}
-          >
-            3
-          </button>
-        </div>
+    <div class="flex items-center gap-1 flex-shrink-0">
+      <!-- Width presets menu (available outside edit mode too) -->
+      <DropdownMenu
+        triggerIcon={MoreHorizontal}
+        triggerIconBgColor="transparent"
+        iconOnly={true}
+        showChevron={false}
+        triggerLabel={t('widgets.resizeAriaLabel')}
+        triggerClass="!p-1 text-ds-text-subtle hover:text-ds-text hover:bg-ds-surface-hovered rounded"
+        triggerTestid="widget-width-menu"
+        placement="bottom-end"
+        items={menuItems}
+      />
 
-        <!-- Remove button -->
+      {#if isEditing}
         <button
-          class="hover:text-red-600 p-1 text-ds-text-subtlest"
+          class="hover:text-ds-text-danger p-1 text-ds-text-subtlest"
           onclick={handleRemove}
           title={t('widgets.removeWidget')}
+          aria-label={t('widgets.removeWidget')}
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -109,54 +268,133 @@
             <line x1="6" y1="6" x2="18" y2="18"></line>
           </svg>
         </button>
-      </div>
-    {/if}
+      {/if}
+    </div>
   </div>
 
   <!-- Widget content -->
   <div class="widget-content p-4">
     {@render children?.()}
   </div>
+
+  <!-- Resize handle (right edge). Available in every mode; the grip is
+       revealed on widget hover and stays visible while editing. -->
+  <button
+    class="widget-resize-handle"
+    class:widget-resize-handle--editing={isEditing}
+    class:widget-resize-handle--active={isResizing}
+    data-testid="widget-resize-handle"
+    role="slider"
+    tabindex={isEditing ? 0 : -1}
+    aria-label={t('widgets.resizeAriaLabel')}
+    aria-valuemin={minWidth}
+    aria-valuemax={maxWidth}
+    aria-valuenow={displayColumns}
+    aria-valuetext={t('widgets.resizeColumnsValue', { count: displayColumns, total: totalColumns })}
+    onmousedown={onResizeStart}
+    ondblclick={onResizeHandleDblClick}
+    onkeydown={handleSliderKeydown}
+  >
+    <span class="widget-resize-grip" data-testid="widget-resize-grip" aria-hidden="true"></span>
+  </button>
+
+  {#if isResizing}
+    <div class="widget-resize-guide" data-testid="widget-resize-guide">
+      {displayColumns}
+    </div>
+  {/if}
 </div>
 
 <style>
-  .col-span-1 {
-    grid-column: span 1 / span 1;
+  .widget-container {
+    position: relative;
+    grid-column: span var(--widget-cols, 12);
+    transition: box-shadow 0.2s;
   }
 
-  .col-span-2 {
-    grid-column: span 2 / span 2;
+  .widget-container:hover {
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
   }
 
-  .col-span-3 {
-    grid-column: span 3 / span 3;
-  }
-
-  @media (max-width: 1024px) {
-    /* On tablet, 2-column layout */
-    .col-span-3 {
-      grid-column: span 2 / span 2;
-    }
-  }
-
-  @media (max-width: 768px) {
-    /* On mobile, single column */
-    .col-span-1,
-    .col-span-2,
-    .col-span-3 {
-      grid-column: span 1 / span 1;
-    }
+  .widget-content {
+    container-type: inline-size;
+    container-name: widget;
   }
 
   .drag-handle:active {
     cursor: grabbing;
   }
 
-  .widget-container {
-    transition: box-shadow 0.2s;
+  .widget-resize-handle {
+    position: absolute;
+    top: 0;
+    right: -6px;
+    bottom: 0;
+    width: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: col-resize;
+    background-color: transparent;
+    border: none;
+    padding: 0;
+    z-index: 2;
+    touch-action: none;
   }
 
-  .widget-container:hover {
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  /* Revealed on widget hover and kept visible while editing, so the resize
+     affordance is discoverable without cluttering the resting page. */
+  .widget-resize-grip {
+    width: 3px;
+    height: 2.5rem;
+    border-radius: 9999px;
+    background-color: var(--ds-text-subtlest);
+    opacity: 0;
+    transition: background-color 140ms ease-in-out, opacity 140ms ease-in-out,
+      transform 140ms ease-in-out;
+  }
+
+  .widget-container:hover .widget-resize-grip,
+  .widget-resize-handle:focus-visible .widget-resize-grip,
+  .widget-resize-handle--active .widget-resize-grip,
+  .widget-resize-handle--editing .widget-resize-grip {
+    opacity: 1;
+  }
+
+  .widget-resize-handle:hover .widget-resize-grip,
+  .widget-resize-handle:focus-visible .widget-resize-grip,
+  .widget-resize-handle--active .widget-resize-grip {
+    background-color: var(--ds-border-focused, #3b82f6);
+    transform: scaleY(1.4);
+  }
+
+  .widget-resize-handle:focus-visible {
+    outline: 2px solid var(--ds-border-focused, #3b82f6);
+    outline-offset: -2px;
+    border-radius: 4px;
+  }
+
+  .widget-resize-guide {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    background-color: var(--ds-surface-raised, #fff);
+    color: var(--ds-text);
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-full, 9999px);
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    font-weight: var(--font-semibold, 600);
+    font-variant-numeric: tabular-nums;
+    box-shadow: var(--ds-shadow-raised, 0 1px 2px rgba(0, 0, 0, 0.1));
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  /* Small viewports collapse to full width until container queries take over. */
+  @media (max-width: 768px) {
+    .widget-container {
+      grid-column: 1 / -1;
+    }
   }
 </style>

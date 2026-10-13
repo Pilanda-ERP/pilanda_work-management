@@ -2,14 +2,15 @@
 package auth
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"windshift/internal/database"
@@ -21,6 +22,9 @@ const (
 	SessionTokenLength      = 32 // 256-bit session tokens
 	DefaultSessionDuration  = 24 * time.Hour
 	ExtendedSessionDuration = 30 * 24 * time.Hour // 30 days for "remember me"
+	// DefaultSessionValidationCacheTTL bounds how long another instance's
+	// session or user-state mutation can remain invisible to this process.
+	DefaultSessionValidationCacheTTL = 5 * time.Second
 )
 
 var (
@@ -31,6 +35,15 @@ var (
 
 const sessionTokenHashPrefix = "sha256:"
 
+const (
+	AuthPendingEnrollment = "passkey_enrollment"
+	// #nosec G101 -- authentication workflow state, not a credential.
+	AuthPendingPasskeyVerification = "passkey_verification"
+
+	pendingEnrollmentDuration   = 30 * time.Minute
+	pendingVerificationDuration = 5 * time.Minute
+)
+
 func hashSessionToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return sessionTokenHashPrefix + hex.EncodeToString(sum[:])
@@ -39,32 +52,87 @@ func hashSessionToken(token string) string {
 // SessionManager handles secure session management
 type SessionManager struct {
 	cookieManager
-	db database.Database
+	db                database.Database
+	opaqueKey         []byte
+	sessionValidation *sessionValidator
+	closeOnce         sync.Once
+	closeErr          error
+	// ipBinding is the resolved SESSION_IP_BINDING mode (config.SessionIPBinding*)
+	// that session validation applies to a client-IP change. An unknown or
+	// zero value is treated as strict so managers built without config.Load
+	// fail closed.
+	ipBinding string
+}
+
+// Close stops the session validation cache's background worker without closing
+// the shared database. It is safe with caching disabled and on repeated calls.
+func (sm *SessionManager) Close() error {
+	sm.closeOnce.Do(func() {
+		if sm.sessionValidation != nil && sm.sessionValidation.cache != nil {
+			sm.closeErr = sm.sessionValidation.cache.Close()
+		}
+	})
+	return sm.closeErr
 }
 
 // Session represents an active user session
 type Session struct {
-	ID        int          `json:"id"`
-	UserID    int          `json:"user_id"`
-	Token     string       `json:"-"`
-	ExpiresAt time.Time    `json:"expires_at"`
-	IPAddress string       `json:"ip_address"`
-	UserAgent string       `json:"user_agent"`
-	IsActive  bool         `json:"is_active"`
-	CreatedAt time.Time    `json:"created_at"`
-	User      *models.User `json:"user,omitempty"`
+	ID                 int          `json:"id"`
+	UserID             int          `json:"user_id"`
+	Token              string       `json:"-"`
+	ExpiresAt          time.Time    `json:"expires_at"`
+	IPAddress          string       `json:"ip_address"`
+	UserAgent          string       `json:"user_agent"`
+	IsActive           bool         `json:"is_active"`
+	EnrollmentRequired bool         `json:"enrollment_required"`
+	AuthPendingType    string       `json:"-"`
+	CreatedAt          time.Time    `json:"created_at"`
+	User               *models.User `json:"user,omitempty"`
 }
 
-// NewSessionManager creates a new session manager with secure cookie handling.
-// If cookieSecret is non-empty, deterministic cookie keys are derived from it
-// so that sessions survive process restarts with the same secret.
-// last review: ser, 210426
-func NewSessionManager(db database.Database, useSecureCookies, useProxy bool, additionalProxies []string, cookieSecret string) *SessionManager {
+// NewSessionManagerWithValidationCacheTTL creates a session manager with a
+// bounded local validation cache. A non-positive TTL disables retained cache
+// entries while preserving in-flight request coalescing.
+func NewSessionManagerWithValidationCacheTTL(db database.Database, useSecureCookies, useProxy bool, additionalProxies []string, cookieSecret, ipBinding string, validationCacheTTL time.Duration, cacheSizeMB ...int) *SessionManager {
+	return newSessionManagerWithValidationCache(
+		db,
+		useSecureCookies,
+		useProxy,
+		additionalProxies,
+		cookieSecret,
+		ipBinding,
+		validationCacheTTL,
+		"session_validation",
+		cacheSizeMB...,
+	)
+}
+
+func newSessionManagerWithValidationCache(db database.Database, useSecureCookies, useProxy bool, additionalProxies []string, cookieSecret, ipBinding string, validationCacheTTL time.Duration, cacheName string, cacheSizeMB ...int) *SessionManager {
+	var opaqueKey []byte
+	if cookieSecret != "" {
+		opaqueKey = deriveKey(cookieSecret, "windshift-auth-opaque-values", 32)
+	} else {
+		opaqueKey = generateSecureKey(32)
+	}
 	return &SessionManager{
 		cookieManager: newCookieManager(useSecureCookies, useProxy, additionalProxies, cookieSecret,
 			"windshift-cookie-hash", "windshift-cookie-block"),
-		db: db,
+		db:                db,
+		opaqueKey:         opaqueKey,
+		sessionValidation: newSessionValidator(validationCacheTTL, cacheName, cacheSizeMB...),
+		ipBinding:         ipBinding,
 	}
+}
+
+// DeriveOpaqueValue returns a stable, non-reversible 256-bit value scoped to a
+// purpose. It is used for public auth-flow decoys that must remain consistent
+// across requests without exposing whether they correspond to stored data.
+func (sm *SessionManager) DeriveOpaqueValue(purpose, value string) []byte {
+	mac := hmac.New(sha256.New, sm.opaqueKey)
+	_, _ = mac.Write([]byte(purpose))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(value))
+	return mac.Sum(nil)
 }
 
 // CreateSession creates a new session for a user
@@ -79,8 +147,6 @@ func (sm *SessionManager) CreateSession(userID int, ipAddress, userAgent string,
 		ipAddress = host
 	}
 
-	slog.Debug("creating session", slog.String("component", "sso"), slog.Int("user_id", userID), slog.String("ip_address", ipAddress))
-
 	token, err := generateSessionToken()
 	if err != nil {
 		return nil, err
@@ -91,6 +157,13 @@ func (sm *SessionManager) CreateSession(userID int, ipAddress, userAgent string,
 		duration = ExtendedSessionDuration
 	}
 	expiresAt := time.Now().Add(duration)
+	slog.Debug("creating session",
+		slog.String("component", "auth"),
+		slog.Int("user_id", userID),
+		slog.String("ip_address", ipAddress),
+		slog.Bool("remember_me", rememberMe),
+		slog.Duration("duration", duration),
+	)
 
 	// Insert session into database using RETURNING clause (supported by both SQLite 3.35+ and PostgreSQL).
 	// Store only a hash of the bearer token; the plaintext token is returned to
@@ -122,95 +195,6 @@ func (sm *SessionManager) CreateSession(userID int, ipAddress, userAgent string,
 	}, nil
 }
 
-// ValidateSession validates a session token and returns the session with user info
-func (sm *SessionManager) ValidateSession(token, ipAddress string) (*Session, error) {
-	if token == "" {
-		return nil, ErrInvalidSession
-	}
-
-	query := `
-		SELECT
-			s.id, s.user_id, s.session_token, s.expires_at, s.ip_address, s.user_agent, s.is_active, s.created_at,
-			u.email, u.username, u.first_name, u.last_name, u.is_active, u.avatar_url, u.requires_password_reset, u.timezone, u.language, u.email_verified, u.created_at, u.updated_at
-		FROM user_sessions s
-		JOIN users u ON s.user_id = u.id
-		WHERE s.session_token IN (?, ?) AND s.is_active = true
-	`
-
-	row := sm.db.QueryRow(query, hashSessionToken(token), token)
-
-	session := &Session{User: &models.User{}}
-	var avatarURL, timezone, language sql.NullString
-
-	err := row.Scan(
-		&session.ID, &session.UserID, &session.Token, &session.ExpiresAt, &session.IPAddress, &session.UserAgent, &session.IsActive, &session.CreatedAt,
-		&session.User.Email, &session.User.Username, &session.User.FirstName, &session.User.LastName, &session.User.IsActive, &avatarURL, &session.User.RequiresPasswordReset, &timezone, &language, &session.User.EmailVerified, &session.User.CreatedAt, &session.User.UpdatedAt,
-	)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrSessionNotFound
-		}
-		return nil, fmt.Errorf("failed to validate session: %w", err)
-	}
-
-	// Check if session is expired
-	if time.Now().After(session.ExpiresAt) {
-		// Clean up expired session
-		_ = sm.DeleteSession(token)
-		return nil, ErrSessionExpired
-	}
-
-	// Validate IP address for security. Sessions store the client IP at
-	// creation; subsequent validations must match.
-	//
-	// Failure modes:
-	//   - session.IPAddress empty: legacy session created before IP was
-	//     recorded, or a code path that didn't populate it. We can't bind
-	//     retroactively — log loudly and accept so existing logged-in users
-	//     don't get kicked out, but this is a signal the operator should
-	//     investigate.
-	//   - request ipAddress empty: proxy misconfig (X-Forwarded-For
-	//     stripping, untrusted proxy, missing RemoteAddr). Previously this
-	//     skipped the check; that turned a broken proxy into a stealth
-	//     downgrade of every session-bound user. Fail closed.
-	//   - mismatch: existing behavior — reject.
-	switch {
-	case session.IPAddress == "":
-		slog.Warn("session has no recorded IP, skipping bind check",
-			slog.Int("user_id", session.UserID),
-			slog.Int("session_id", session.ID))
-	case ipAddress == "":
-		slog.Warn("request has no client IP, rejecting IP-bound session",
-			slog.Int("user_id", session.UserID),
-			slog.String("session_ip", session.IPAddress))
-		return nil, ErrInvalidSession
-	case session.IPAddress != ipAddress:
-		slog.Warn("session IP mismatch",
-			slog.Int("user_id", session.UserID),
-			slog.String("session_ip", session.IPAddress),
-			slog.String("request_ip", ipAddress))
-		return nil, ErrInvalidSession
-	}
-
-	// Set user fields
-	session.User.ID = session.UserID
-	if avatarURL.Valid {
-		session.User.AvatarURL = avatarURL.String
-	}
-	if timezone.Valid {
-		session.User.Timezone = timezone.String
-	}
-	if language.Valid {
-		session.User.Language = language.String
-	} else {
-		session.User.Language = "en" // default
-	}
-	session.User.FullName = fmt.Sprintf("%s %s", session.User.FirstName, session.User.LastName)
-
-	return session, nil
-}
-
 // DeleteSession invalidates a session
 // last review: ser, 210426, NOTE: all the following still in use
 func (sm *SessionManager) DeleteSession(token string) error {
@@ -219,6 +203,7 @@ func (sm *SessionManager) DeleteSession(token string) error {
 	if err != nil {
 		return fmt.Errorf("failed to delete session: %w", err)
 	}
+	sm.invalidateSessionValidationToken(token)
 	return nil
 }
 
@@ -229,6 +214,7 @@ func (sm *SessionManager) DeleteAllUserSessions(userID int) error {
 	if err != nil {
 		return fmt.Errorf("failed to delete user sessions: %w", err)
 	}
+	sm.InvalidateUserSessionValidation(userID)
 	return nil
 }
 
@@ -249,12 +235,38 @@ func (sm *SessionManager) RefreshSession(token string, rememberMe bool) error {
 		duration = ExtendedSessionDuration
 	}
 
-	newExpiresAt := time.Now().Add(duration)
-	query := `UPDATE user_sessions SET expires_at = ? WHERE session_token IN (?, ?) AND is_active = true`
-	_, err := sm.db.ExecWrite(query, newExpiresAt, hashSessionToken(token), token)
+	now := time.Now()
+	newExpiresAt := now.Add(duration)
+	query := `UPDATE user_sessions SET expires_at = ? WHERE session_token IN (?, ?) AND is_active = true AND expires_at > ?`
+	result, err := sm.db.ExecWrite(query, newExpiresAt, hashSessionToken(token), token, now)
 	if err != nil {
 		return fmt.Errorf("failed to refresh session: %w", err)
 	}
+	sm.invalidateSessionValidationToken(token)
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to inspect refreshed session: %w", err)
+	}
+	if rowsAffected != 1 {
+		return ErrInvalidSession
+	}
+	return nil
+}
+
+// UpdateSessionIP rebinds a session to a new client IP. It is used by the log
+// SESSION_IP_BINDING mode, where a session that moves between networks is
+// followed rather than rejected. Sessions are stored as token digests with a
+// legacy plaintext fallback, so the predicate matches both forms — a
+// plaintext-only predicate would match zero rows for every current session.
+func (sm *SessionManager) UpdateSessionIP(token, ipAddress string) error {
+	query := `UPDATE user_sessions SET ip_address = ? WHERE session_token IN (?, ?) AND is_active = true`
+	_, err := sm.db.ExecWrite(query, ipAddress, hashSessionToken(token), token)
+	if err != nil {
+		return fmt.Errorf("failed to update session IP: %w", err)
+	}
+	// The cached snapshot still carries the previous IP; drop it so the next
+	// request revalidates against the rebound row instead of rebinding again.
+	sm.invalidateSessionValidationToken(token)
 	return nil
 }
 
@@ -292,19 +304,43 @@ func (sm *SessionManager) GetSessionFromRequest(r *http.Request) (string, error)
 	return sm.getSessionFromRequest(r, SessionCookieName)
 }
 
-// SetEnrollmentRequired marks a session as requiring passkey enrollment
-func (sm *SessionManager) SetEnrollmentRequired(sessionID int, required bool) error {
-	query := `UPDATE user_sessions SET enrollment_required = ? WHERE id = ?`
-	_, err := sm.db.ExecWrite(query, required, sessionID)
-	if err != nil {
-		return fmt.Errorf("failed to set enrollment required: %w", err)
+// SetAuthPending marks a password-verified session as narrowly scoped pending
+// authentication. Enrollment sessions may register a first passkey; verification
+// sessions may only complete an assertion with an already enrolled passkey.
+func (sm *SessionManager) SetAuthPending(sessionID int, pendingType string) error {
+	if pendingType != AuthPendingEnrollment && pendingType != AuthPendingPasskeyVerification {
+		return fmt.Errorf("invalid auth pending type %q", pendingType)
 	}
+	duration := pendingEnrollmentDuration
+	if pendingType == AuthPendingPasskeyVerification {
+		duration = pendingVerificationDuration
+	}
+	query := `UPDATE user_sessions SET enrollment_required = true, auth_pending_type = ?, expires_at = ? WHERE id = ?`
+	_, err := sm.db.ExecWrite(query, pendingType, time.Now().Add(duration), sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to set auth pending state: %w", err)
+	}
+	sm.invalidateSessionValidationID(sessionID)
 	return nil
 }
 
-// ClearEnrollmentRequired clears the enrollment required flag for a session
+// SetEnrollmentRequired is retained for callers creating enrollment-only sessions.
+func (sm *SessionManager) SetEnrollmentRequired(sessionID int, required bool) error {
+	if required {
+		return sm.SetAuthPending(sessionID, AuthPendingEnrollment)
+	}
+	return sm.ClearEnrollmentRequired(sessionID)
+}
+
+// ClearEnrollmentRequired elevates a pending session after its required WebAuthn ceremony.
 func (sm *SessionManager) ClearEnrollmentRequired(sessionID int) error {
-	return sm.SetEnrollmentRequired(sessionID, false)
+	query := `UPDATE user_sessions SET enrollment_required = false, auth_pending_type = NULL, expires_at = ? WHERE id = ?`
+	_, err := sm.db.ExecWrite(query, time.Now().Add(DefaultSessionDuration), sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to clear auth pending state: %w", err)
+	}
+	sm.invalidateSessionValidationID(sessionID)
+	return nil
 }
 
 // IsEnrollmentRequired checks if a session requires passkey enrollment
@@ -318,13 +354,19 @@ func (sm *SessionManager) IsEnrollmentRequired(sessionID int) (bool, error) {
 	return required, nil
 }
 
-// ClearEnrollmentRequiredByUserID clears enrollment required for all sessions of a user
-// Called after successful passkey enrollment
+// ClearEnrollmentRequiredByUserID elevates enrollment-only sessions after a
+// successful first-passkey registration. It deliberately does not elevate
+// password+passkey verification sessions, which still require an assertion.
 func (sm *SessionManager) ClearEnrollmentRequiredByUserID(userID int) error {
-	query := `UPDATE user_sessions SET enrollment_required = false WHERE user_id = ? AND is_active = true`
-	_, err := sm.db.ExecWrite(query, userID)
+	query := `
+		UPDATE user_sessions SET enrollment_required = false, auth_pending_type = NULL, expires_at = ?
+		WHERE user_id = ? AND is_active = true
+		AND (auth_pending_type = ? OR (auth_pending_type IS NULL AND enrollment_required = true))
+	`
+	_, err := sm.db.ExecWrite(query, time.Now().Add(DefaultSessionDuration), userID, AuthPendingEnrollment)
 	if err != nil {
 		return fmt.Errorf("failed to clear enrollment required: %w", err)
 	}
+	sm.InvalidateUserSessionValidation(userID)
 	return nil
 }

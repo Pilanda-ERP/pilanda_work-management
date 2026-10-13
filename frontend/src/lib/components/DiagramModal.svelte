@@ -1,6 +1,8 @@
 <script>
   import ExcalidrawEditor from './ExcalidrawEditor.svelte';
   import Button from './Button.svelte';
+  import Input from './Input.svelte';
+  import { convertMermaidToExcalidraw } from '../editors/mermaidConversion.js';
   import { api } from '../api.js';
   import { themeStore } from '../stores/theme.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
@@ -44,13 +46,9 @@
 
   async function seedFromMermaid(source) {
     try {
-      const [{ parseMermaidToExcalidraw }, { convertToExcalidrawElements }] = await Promise.all([
-        import('@excalidraw/mermaid-to-excalidraw'),
-        import('@excalidraw/excalidraw'),
-      ]);
-      const { elements: skeletons, files } = await parseMermaidToExcalidraw(source);
+      const { elements, files } = await convertMermaidToExcalidraw(source);
       initialData = {
-        elements: convertToExcalidrawElements(skeletons),
+        elements,
         appState: {},
         files: files || {},
         scrollToContent: true,
@@ -134,15 +132,15 @@
     <!-- Header -->
     <div class="flex items-center justify-between p-4 border-b" style="border-color: var(--ds-border);">
       <div class="flex items-center space-x-4 flex-1 min-w-0">
-        <input
+        <Input
           type="text"
           bind:value={diagramName}
           placeholder={t('components.diagram.namePlaceholder')}
-          class="px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 max-w-md"
-          style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text);"
+          class="max-w-md"
+          size="small"
         />
         {#if hasChanges}
-          <span class="text-sm text-orange-600">{t('components.diagram.unsavedChanges')}</span>
+          <span class="text-sm text-ds-text-warning">{t('components.diagram.unsavedChanges')}</span>
         {/if}
       </div>
       <div class="flex items-center space-x-2 shrink-0">
@@ -172,4 +170,3 @@
     </div>
   </div>
 </div>
-

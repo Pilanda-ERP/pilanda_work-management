@@ -11,22 +11,8 @@ import (
 	"windshift/internal/services"
 )
 
-// Link tools — the AI-agent surface over the polymorphic item_links table
-// (item ↔ item, item ↔ page, item ↔ test_case). All orchestration
-// (permission gating, cross-workspace page invariant, duplicate detection,
-// per-page ACL filtering) lives in services.ItemLinkService; this file is a
-// thin adapter that mirrors the HTTP handlers' behavior:
-//   - missing entity / no permission / cross-workspace page all collapse to
-//     a generic not-found JSON error (existence-leak policy),
-//   - listing drops links whose endpoints the caller cannot see,
-//   - creating requires edit on the source and view on the target (page
-//     endpoints additionally go through per-page ACLs),
-//   - deleting requires edit on the link's source entity.
-//
-// The link type is auto-picked per entity-type pair when omitted, matching
-// the ws CLI: Page for item↔page, Tests for item↔test_case, Relates To for
-// item↔item (override with Implements / Depends On / Links To / Duplicates /
-// Child Of). The server-side service re-validates pair legality regardless.
+// Link tools adapt ItemLinkService for agents. They preserve HTTP authorization,
+// ACL, and existence-hiding behavior; omitted link types receive pair defaults.
 
 // --- arg types ---
 
@@ -60,9 +46,7 @@ type linkTypeDTO struct {
 	Description  string `json:"description,omitempty"`
 	ForwardLabel string `json:"forward_label"`
 	ReverseLabel string `json:"reverse_label"`
-	// AllowedEntityTypes is the unordered multiset of entity-type slots the
-	// pair must fit into (e.g. ["item","page"] allows item↔page only).
-	// Empty means any pair of item/page/test_case is allowed.
+	// AllowedEntityTypes constrains endpoint pairs; empty permits all supported pairs.
 	AllowedEntityTypes []string `json:"allowed_entity_types,omitempty"`
 }
 
@@ -99,6 +83,9 @@ type listLinksOut struct {
 func init() {
 	Register(Default, Tool[listLinkTypesArgs]{
 		Name:   "list_link_types",
+		Group:  CapabilityPlanningActivity,
+		Access: AccessRead,
+		Risk:   RiskLow,
 		Scopes: []string{auth.ScopeItemsRead},
 		Description: "List the active link-type catalog with each type's entity-pair " +
 			"constraints. allowed_entity_types is a slot multiset: [item,page] permits " +
@@ -126,6 +113,9 @@ func init() {
 
 	Register(Default, Tool[listLinksArgs]{
 		Name:   "list_links",
+		Group:  CapabilityPlanningActivity,
+		Access: AccessRead,
+		Risk:   RiskLow,
 		Scopes: []string{auth.ScopeItemsRead},
 		Description: "List outgoing and incoming cross-entity links anchored on a work item, " +
 			"page, or test case. Identify the entity by entity_type + entity_id, or by " +
@@ -153,6 +143,9 @@ func init() {
 
 	Register(Default, Tool[addLinkArgs]{
 		Name:   "add_link",
+		Group:  CapabilityPlanningActivity,
+		Access: AccessWrite,
+		Risk:   RiskMedium,
 		Scopes: []string{auth.ScopeItemsWrite},
 		Description: "Create a cross-entity link (item-item, item-page, or item-test_case). " +
 			"Identify each side by type + id, or by source_item_key / target_item_key for work " +
@@ -200,6 +193,9 @@ func init() {
 
 	Register(Default, Tool[removeLinkArgs]{
 		Name:   "remove_link",
+		Group:  CapabilityPlanningActivity,
+		Access: AccessWrite,
+		Risk:   RiskMedium,
 		Scopes: []string{auth.ScopeItemsWrite},
 		Description: "Delete a cross-entity link by its numeric ID (from list_links output). " +
 			"Requires edit access on the link's source entity.",
@@ -215,12 +211,8 @@ func init() {
 
 // --- helpers ---
 
-// newLinkToolService builds the orchestration-grade ItemLinkService for one
-// tool call: workspace permissions + per-page ACLs are wired so create /
-// delete / list run the same checks as the HTTP handlers. The asset checker
-// stays nil (asset endpoints are out of scope for AI tools and fail closed),
-// and the notification emitter has no Env slot, so linked/unlinked
-// notifications are skipped — matching the orchestration's nil-safe design.
+// newLinkToolService wires the same workspace and page checks as HTTP handlers.
+// Asset links fail closed and this adapter has no notification emitter.
 func newLinkToolService(env *Env) *services.ItemLinkService {
 	svc := services.NewItemLinkService(env.DB).
 		WithPermissionService(env.PermService).
@@ -231,11 +223,8 @@ func newLinkToolService(env *Env) *services.ItemLinkService {
 	return svc
 }
 
-// resolveLinkEntity normalizes an (entity_type, entity_id, item_key) triple
-// into a canonical (entityType, entityID) pair and applies the Env-level
-// workspace gate. Returns a non-empty errMsg (for the JSON-value error
-// convention) when the reference is invalid or the entity is not accessible;
-// both "missing" and "no access" share the same generic message.
+// resolveLinkEntity normalizes a reference and applies the workspace gate.
+// Missing and inaccessible entities share one generic error.
 func resolveLinkEntity(env *Env, svc *services.ItemLinkService, entityType string, entityID int, itemKey string) (canonical string, status int, message string) {
 	canonical = "item"
 	if strings.TrimSpace(entityType) != "" {
@@ -291,11 +280,7 @@ func autoLinkTypeNameForPair(srcType, tgtType string) string {
 	}
 }
 
-// linkTypeAllowsPair mirrors the server-side budget check in
-// ItemLinkService.CreateLink: each endpoint consumes one slot from
-// allowed_entity_types; nil/empty means any combination. Kept here as a
-// client-side preflight so the tool can return a message that names the
-// allowed entity types — the service remains authoritative.
+// linkTypeAllowsPair preflights endpoint slots; ItemLinkService remains authoritative.
 func linkTypeAllowsPair(lt *models.LinkType, srcType, tgtType string) bool {
 	if len(lt.AllowedEntityTypes) == 0 {
 		return true
@@ -354,10 +339,7 @@ func resolveToolLinkType(svc *services.ItemLinkService, name, srcType, tgtType s
 	return nil, fmt.Sprintf("link type %q not found (see list_link_types)", name), nil
 }
 
-// linkServiceErrorResult maps ItemLinkService's typed errors onto the
-// aitools JSON-value error convention. Not-found, no-permission, and the
-// cross-workspace page invariant all collapse into one generic message —
-// the same existence-leak policy the HTTP handlers apply via 404.
+// linkServiceErrorResult preserves the shared existence-hiding error contract.
 func linkServiceErrorResult(err error) (any, error) {
 	switch {
 	case errors.Is(err, services.ErrLinkSelfReference),

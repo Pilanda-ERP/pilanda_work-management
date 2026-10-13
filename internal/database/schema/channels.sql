@@ -16,10 +16,11 @@ CREATE TABLE IF NOT EXISTS channels (
 	name TEXT NOT NULL,
 	type TEXT NOT NULL, -- smtp, webhook, portal, imap, etc.
 	direction TEXT NOT NULL, -- inbound, outbound
-	description TEXT,
+	description TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL DEFAULT 'disabled', -- enabled, disabled
-	is_default BOOLEAN DEFAULT false,
-	config TEXT, -- JSON configuration data specific to channel type
+	is_default BOOLEAN NOT NULL DEFAULT false,
+	config TEXT NOT NULL DEFAULT '{}', -- JSON configuration data specific to channel type
+	public_slug TEXT, -- normalized portal/form slug used for race-safe uniqueness
 	plugin_name TEXT, -- NULL for user-created, plugin name for plugin-managed
 	plugin_webhook_id TEXT, -- Plugin's internal webhook identifier
 	category_id INTEGER REFERENCES channel_categories(id) ON DELETE SET NULL,
@@ -32,8 +33,12 @@ CREATE INDEX IF NOT EXISTS idx_channels_type ON channels(type);
 CREATE INDEX IF NOT EXISTS idx_channels_direction ON channels(direction);
 CREATE INDEX IF NOT EXISTS idx_channels_status ON channels(status);
 CREATE INDEX IF NOT EXISTS idx_channels_is_default ON channels(is_default);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channels_default_route ON channels(type, direction) WHERE is_default = true;
 CREATE INDEX IF NOT EXISTS idx_channels_plugin_name ON channels(plugin_name);
 CREATE INDEX IF NOT EXISTS idx_channels_category_id ON channels(category_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channels_public_slug
+	ON channels(type, public_slug)
+	WHERE direction = 'inbound' AND public_slug IS NOT NULL;
 
 -- Channel managers table for access control
 CREATE TABLE IF NOT EXISTS channel_managers (
@@ -65,7 +70,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 	requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	response_status_code INTEGER,        -- NULL on connection error or plugin transport
 	response_time_ms INTEGER,            -- NULL on hard failure
-	success BOOLEAN NOT NULL DEFAULT 0,  -- denormalized for fast filtering
+	success BOOLEAN NOT NULL DEFAULT FALSE,  -- denormalized for fast filtering
 	error_message TEXT,
 	response_preview TEXT,               -- up to 4 KiB of non-2xx response body for diagnostics
 	FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
@@ -75,3 +80,5 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_channel_id ON webhook_deliveries(channel_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_requested_at ON webhook_deliveries(requested_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_success ON webhook_deliveries(success);
+
+-- migration: 0000_baseline
