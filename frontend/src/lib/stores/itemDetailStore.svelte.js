@@ -40,6 +40,32 @@ function hasSharedWorkspaceReferences(workspaceId) {
   );
 }
 
+const isConcurrencyLimitError = (err) =>
+  err?.status === 429 || /too many concurrent requests/i.test(String(err?.message ?? ''));
+
+// When the shared workspace store is not initialized for the item's workspace
+// (e.g. the item modal is opened from a cross-workspace collection board that
+// runs the store in global mode, or the store's bootstrap was rejected by the
+// per-user concurrency limiter), load the workspace reference data directly.
+// Without this, custom field definitions, milestones and iterations stay empty
+// and the sidebar renders an empty "Custom fields" section.
+async function loadWorkspaceReferences(workspaceId) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await api.workspaces.getBootstrap(workspaceId);
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      if (!isConcurrencyLimitError(err) || attempt === 2) {
+        console.warn('Failed to load workspace references for item detail:', err);
+        return null;
+      }
+      // The server answers 429 with Retry-After: 1
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+  return null;
+}
+
 function childItemListsMatch(current = [], next = []) {
   if (current === next) return true;
   if (!Array.isArray(current) || !Array.isArray(next) || current.length !== next.length) {
@@ -324,16 +350,20 @@ class ItemDetailStore {
       await workspaceInitPromise;
       if (token !== this.#loadToken) return LOAD_SUPERSEDED;
       const useSharedReferences = hasSharedWorkspaceReferences(wsId);
+      const fallbackReferences = useSharedReferences ? null : await loadWorkspaceReferences(wsId);
+      if (token !== this.#loadToken) return LOAD_SUPERSEDED;
 
       this.workspace = useSharedReferences
         ? workspaceDataStore.workspace
-        : await api.workspaces.get(wsId, requestOptions);
+        : (fallbackReferences?.workspace ?? (await api.workspaces.get(wsId, requestOptions)));
       this.customFieldDefinitions = useSharedReferences
         ? workspaceDataStore.customFieldDefinitions
-        : [];
+        : (fallbackReferences?.custom_field_definitions ?? []);
 
       // Filter milestones by workspace restrictions
-      const allMilestones = useSharedReferences ? workspaceDataStore.milestones : [];
+      const allMilestones = useSharedReferences
+        ? workspaceDataStore.milestones
+        : (fallbackReferences?.milestones ?? []);
       if (this.workspace?.milestone_categories?.length > 0) {
         const allowedCategoryIds = this.workspace.milestone_categories;
         this.milestones = allMilestones.filter((m) => allowedCategoryIds.includes(m.category_id));
@@ -341,9 +371,15 @@ class ItemDetailStore {
         this.milestones = allMilestones;
       }
 
-      this.iterations = useSharedReferences ? workspaceDataStore.iterations : [];
-      this.timeProjects = useSharedReferences ? workspaceDataStore.projects : [];
-      this.itemTypes = useSharedReferences ? workspaceDataStore.itemTypes : [];
+      this.iterations = useSharedReferences
+        ? workspaceDataStore.iterations
+        : (fallbackReferences?.iterations ?? []);
+      this.timeProjects = useSharedReferences
+        ? workspaceDataStore.projects
+        : (fallbackReferences?.projects ?? []);
+      this.itemTypes = useSharedReferences
+        ? workspaceDataStore.itemTypes
+        : (fallbackReferences?.item_types ?? []);
       this.priorities = [
         ...(summary.priorities?.length
           ? summary.priorities
