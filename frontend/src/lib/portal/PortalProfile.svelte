@@ -1,10 +1,11 @@
 <script>
   import { onMount } from 'svelte';
   import { ArrowLeft, KeyRound, Plus, Trash2, ShieldCheck, X } from '@lucide/svelte';
-  import { portalStore } from '../stores/portal.svelte.js';
+  import { portalCustomizationStore as portalStore } from '../stores/portal.svelte.js';
   import { portalAuthStore } from '../stores/portalAuth.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import { api } from '../api.js';
+  import { confirm } from '../composables/useConfirm.js';
   import { navigate } from '../router.js';
   import {
     isWebAuthnSupported,
@@ -13,8 +14,11 @@
     getWebAuthnErrorMessage,
   } from '../utils/webauthn-utils.js';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import ModalBackdrop from '../components/ModalBackdrop.svelte';
+  import PageHeader from '../layout/PageHeader.svelte';
+  import { formatInstant } from '../utils/dateFormatter.js';
 
   let credentials = $state([]);
   let loadingCredentials = $state(false);
@@ -104,9 +108,10 @@
   }
 
   async function handleRemove(credential) {
-    const ok = window.confirm(
-      `Remove passkey "${credential.credential_name}"? You won't be able to sign in with this device anymore.`
-    );
+    const ok = await confirm({
+      message: `Remove passkey "${credential.credential_name}"? You won't be able to sign in with this device anymore.`,
+      confirmText: 'Remove',
+    });
     if (!ok) return;
     removingId = credential.id;
     actionError = '';
@@ -121,12 +126,9 @@
   }
 
   function formatDate(value) {
-    if (!value) return '';
-    try {
-      return new Date(value).toLocaleString();
-    } catch (_err) {
-      return value;
-    }
+    return formatInstant(value, 'UTC', {
+      year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    });
   }
 
   function backToPortal() {
@@ -134,7 +136,7 @@
   }
 </script>
 
-<div class="max-w-3xl mx-auto px-4 py-8">
+<div class="max-w-4xl">
   <button
     onclick={backToPortal}
     class="flex items-center gap-2 text-sm mb-6 hover:underline"
@@ -144,17 +146,15 @@
     {t('portal.backToPortal') || 'Back to portal'}
   </button>
 
-  <h1 class="text-3xl font-bold mb-1" style="color: var(--ds-text);">
-    {t('portal.profileTitle') || 'Profile'}
-  </h1>
-  <p class="text-sm mb-8" style="color: var(--ds-text-subtle);">
-    {t('portal.profileSubtitle') || 'Manage how you sign in to this portal.'}
-  </p>
+  <PageHeader
+    title={t('portal.profileTitle') || 'Profile'}
+    subtitle={t('portal.profileSubtitle') || 'Manage how you sign in to this portal.'}
+  />
 
   <!-- Profile section -->
   <section
-    class="rounded-lg border p-6 mb-8"
-    style="background-color: var(--ds-surface-card); border-color: var(--ds-border);"
+    class="pt-7 mt-7 border-t"
+    style="border-color: var(--ds-border);"
   >
     <h2 class="text-lg font-semibold mb-4" style="color: var(--ds-text);">
       {t('portal.profileSection') || 'Account'}
@@ -179,10 +179,10 @@
 
   <!-- Security / passkeys section -->
   <section
-    class="rounded-lg border p-6"
-    style="background-color: var(--ds-surface-card); border-color: var(--ds-border);"
+    class="pt-8 mt-8 border-t"
+    style="border-color: var(--ds-border);"
   >
-    <div class="flex items-start justify-between gap-4 mb-1">
+    <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-4 mb-1">
       <div>
         <h2 class="text-lg font-semibold flex items-center gap-2" style="color: var(--ds-text);">
           <ShieldCheck class="w-5 h-5" />
@@ -227,11 +227,14 @@
         {t('common.loading') || 'Loading…'}
       </p>
     {:else if credentials.length === 0}
-      <div class="mt-6 py-8 text-center border-2 border-dashed rounded" style="border-color: var(--ds-border);">
-        <KeyRound class="w-8 h-8 mx-auto mb-2" style="color: var(--ds-text-subtle);" />
-        <p class="text-sm" style="color: var(--ds-text-subtle);">
-          {t('portal.noPasskeys') || 'No passkeys yet.'}
-        </p>
+      <div class="mt-6 py-5 flex items-start gap-3">
+        <KeyRound class="w-5 h-5 mt-0.5" style="color: var(--ds-text-subtle);" />
+        <div>
+          <h3 class="font-medium" style="color: var(--ds-text);">No passkeys yet</h3>
+          <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
+            Add a passkey to sign in without waiting for an email link.
+          </p>
+        </div>
       </div>
     {:else}
       <ul class="mt-4 divide-y" style="border-color: var(--ds-border);" data-testid="portal-passkey-list">
@@ -252,7 +255,7 @@
             </div>
             <button
               type="button"
-              class="p-2 rounded hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-50"
+              class="p-2 rounded hover:bg-ds-danger-subtle transition-colors disabled:opacity-50"
               style="color: var(--ds-text-danger, #b91c1c);"
               disabled={removingId === cred.id}
               onclick={() => handleRemove(cred)}
@@ -275,7 +278,7 @@
   onclose={closeAddModal}
 >
   <div
-    class="relative w-full max-w-md rounded-xl shadow-2xl overflow-hidden"
+    class="relative w-full max-w-md rounded-lg shadow-2xl overflow-hidden"
     style="background-color: var(--ds-surface-card);"
   >
     <button
@@ -303,16 +306,15 @@
       <label for="passkey-name" class="block text-sm font-medium mb-2" style="color: var(--ds-text);">
         {t('portal.passkeyName') || 'Passkey name'}
       </label>
-      <input
+      <Input
         id="passkey-name"
         type="text"
         bind:value={newCredentialName}
         placeholder="e.g. Personal MacBook"
-        maxlength="100"
+        maxlength={100}
         autocomplete="off"
         disabled={registering}
-        class="block w-full px-3 py-2 rounded border focus:outline-none focus:ring-2"
-        style="background-color: var(--ds-surface); color: var(--ds-text); border-color: var(--ds-border);"
+        size="small"
       />
 
       <div class="mt-6 flex items-center justify-end gap-2">

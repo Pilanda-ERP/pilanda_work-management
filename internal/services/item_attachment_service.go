@@ -1,20 +1,24 @@
 package services
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"time"
 
 	"windshift/internal/database"
 	"windshift/internal/fileserve"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 )
+
+type ItemAttachmentBinary struct {
+	File             *os.File
+	OriginalFilename string
+	MimeType         string
+	FileSize         int64
+}
 
 var (
 	// ErrItemAttachmentDisabled is returned when attachment storage is not
@@ -53,127 +57,292 @@ func NewItemAttachmentService(db database.Database, attachmentPath string, permi
 }
 
 // ItemAttachmentUploadInput contains the validated HTTP upload payload.
+// UploaderID is the internal user for authenticated uploads; portal and
+// public-form uploads leave it 0 and carry UploaderPortalCustomerID instead
+// (or neither for anonymous public-form submissions).
 type ItemAttachmentUploadInput struct {
-	ItemID           int
-	UploaderID       int
-	OriginalFilename string
-	FileData         []byte
-	FileSize         int64
+	ItemID                   int
+	UploaderID               int
+	UploaderPortalCustomerID *int
+	OriginalFilename         string
+	FileData                 []byte
+	FileSize                 int64
+}
+
+// ItemAttachmentUploadPolicy is the public-safe subset of attachment settings.
+// It intentionally omits the server filesystem path.
+type ItemAttachmentUploadPolicy struct {
+	Enabled          bool
+	MaxFileSize      int64
+	AllowedMimeTypes []string
+}
+
+// UploadPolicy returns the current public-safe upload limits.
+func (s *ItemAttachmentService) UploadPolicy() (ItemAttachmentUploadPolicy, error) {
+	if s.attachmentPath == "" {
+		return ItemAttachmentUploadPolicy{}, nil
+	}
+	settings, err := loadAttachmentSettings(s.db, s.attachmentPath)
+	if err != nil {
+		return ItemAttachmentUploadPolicy{}, err
+	}
+	policy := ItemAttachmentUploadPolicy{Enabled: settings.Enabled, MaxFileSize: settings.MaxFileSize}
+	if settings.AllowedMimeTypes != "" && json.Valid([]byte(settings.AllowedMimeTypes)) {
+		_ = json.Unmarshal([]byte(settings.AllowedMimeTypes), &policy.AllowedMimeTypes)
+	}
+	return policy, nil
+}
+
+func (s *ItemAttachmentService) ListItemAttachments(userID, itemID, limit, offset int) ([]models.Attachment, int, error) {
+	allowed, err := s.attachmentService.CanViewItemAttachment(userID, itemID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !allowed {
+		return nil, 0, ErrItemAttachmentNotFound
+	}
+	return repository.NewAttachmentRepository(s.db).ListItem(itemID, limit, offset)
+}
+
+func (s *ItemAttachmentService) GetItemAttachment(userID, attachmentID int) (*models.Attachment, error) {
+	attachment, err := repository.NewAttachmentRepository(s.db).GetItem(attachmentID)
+	if err != nil {
+		return nil, ErrItemAttachmentNotFound
+	}
+	if attachment.ItemID == nil {
+		return nil, ErrItemAttachmentNotFound
+	}
+	allowed, err := s.attachmentService.CanViewItemAttachment(userID, *attachment.ItemID)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, ErrItemAttachmentNotFound
+	}
+	return attachment, nil
+}
+
+func (s *ItemAttachmentService) OpenItemAttachment(userID, attachmentID int, thumbnail bool) (*ItemAttachmentBinary, error) {
+	if s.attachmentPath == "" {
+		return nil, ErrItemAttachmentDisabled
+	}
+	repo := repository.NewAttachmentRepository(s.db)
+	if thumbnail {
+		record, err := repo.GetItemThumbnailRecord(attachmentID)
+		if err != nil {
+			return nil, ErrItemAttachmentNotFound
+		}
+		allowed, err := s.attachmentService.permissionService.HasWorkspacePermission(userID, record.WorkspaceID, models.PermissionItemView)
+		if err != nil || !allowed {
+			return nil, ErrItemAttachmentNotFound
+		}
+		file, err := fileserve.OpenUnderRoot(s.attachmentPath, record.ThumbnailPath)
+		if err != nil {
+			return nil, ErrItemAttachmentNotFound
+		}
+		info, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		return &ItemAttachmentBinary{File: file, OriginalFilename: "thumbnail.jpg", MimeType: "image/jpeg", FileSize: info.Size()}, nil
+	}
+	record, err := repo.GetItemDownloadRecord(attachmentID)
+	if err != nil {
+		return nil, ErrItemAttachmentNotFound
+	}
+	allowed, err := s.attachmentService.permissionService.HasWorkspacePermission(userID, record.WorkspaceID, models.PermissionItemView)
+	if err != nil || !allowed {
+		return nil, ErrItemAttachmentNotFound
+	}
+	file, err := fileserve.OpenUnderRoot(s.attachmentPath, record.FilePath)
+	if err != nil {
+		return nil, ErrItemAttachmentNotFound
+	}
+	return &ItemAttachmentBinary{File: file, OriginalFilename: record.OriginalFilename, MimeType: record.MimeType, FileSize: record.FileSize}, nil
+}
+
+// ListPortalRequestAttachments returns the attachment page for one portal
+// request. Portal ownership was resolved by the caller, so no workspace
+// permission check runs here.
+func (s *ItemAttachmentService) ListPortalRequestAttachments(itemID, limit, offset int) ([]models.Attachment, int, error) {
+	return repository.NewAttachmentRepository(s.db).ListPortalItem(itemID, limit, offset)
+}
+
+// OpenPortalRequestAttachment opens an item attachment for a portal
+// participant. The caller has already established portal ownership of itemID;
+// this verifies the attachment is an item attachment bound to that request and
+// returns a root-confined file handle.
+func (s *ItemAttachmentService) OpenPortalRequestAttachment(attachmentID, itemID int) (*ItemAttachmentBinary, error) {
+	if s.attachmentPath == "" {
+		return nil, ErrItemAttachmentDisabled
+	}
+	record, err := repository.NewAttachmentRepository(s.db).GetPortalRequestAttachmentRecord(attachmentID, itemID)
+	if err != nil {
+		return nil, ErrItemAttachmentNotFound
+	}
+	file, err := fileserve.OpenUnderRoot(s.attachmentPath, record.FilePath)
+	if err != nil {
+		return nil, ErrItemAttachmentNotFound
+	}
+	return &ItemAttachmentBinary{File: file, OriginalFilename: record.OriginalFilename, MimeType: record.MimeType, FileSize: record.FileSize}, nil
+}
+
+// ValidatePublicFormAttachment performs every file-level check before a form
+// item is created. UploadPublicFormAttachment repeats these checks before
+// storage, keeping validation safe across the create/store boundary.
+func (s *ItemAttachmentService) ValidatePublicFormAttachment(in ItemAttachmentUploadInput) error {
+	return s.validateUpload(in)
 }
 
 // UploadItemAttachment stores a new attachment for an item and returns the
 // same response model the cookie-auth upload endpoint uses for regular
 // attachments, so bearer and cookie callers see identical shapes.
 func (s *ItemAttachmentService) UploadItemAttachment(in ItemAttachmentUploadInput) (models.AttachmentUploadResponse, error) {
-	if s.attachmentPath == "" {
-		return models.AttachmentUploadResponse{}, ErrItemAttachmentDisabled
-	}
+	return s.uploadItemAttachment(in, true)
+}
+
+// UploadPublicFormAttachment stores a file on an item that the public-form
+// handler has just created. It deliberately skips actor authorization because
+// the caller never accepts an item id from the browser; target ownership was
+// established by the channel/request-type validation and CreateItem call.
+func (s *ItemAttachmentService) UploadPublicFormAttachment(in ItemAttachmentUploadInput) (models.AttachmentUploadResponse, error) {
+	return s.uploadItemAttachment(in, false)
+}
+
+func (s *ItemAttachmentService) validateUpload(in ItemAttachmentUploadInput) error {
+	_, err := validateAttachmentUpload(s.db, s.attachmentPath, attachmentFileInput{
+		originalFilename: in.OriginalFilename,
+		data:             in.FileData,
+		validationSize:   int64(len(in.FileData)),
+	}, attachmentValidationErrors{disabled: ErrItemAttachmentDisabled, invalid: ErrItemAttachmentInvalid})
+	return err
+}
+
+func (s *ItemAttachmentService) uploadItemAttachment(in ItemAttachmentUploadInput, authorize bool) (models.AttachmentUploadResponse, error) {
 	if in.ItemID <= 0 {
 		return models.AttachmentUploadResponse{}, fmt.Errorf("%w: item_id is required", ErrItemAttachmentInvalid)
 	}
-	if strings.TrimSpace(in.OriginalFilename) == "" {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("%w: filename is required", ErrItemAttachmentInvalid)
+	if authorize {
+		if err := s.authorizeItemEdit(in.UploaderID, in.ItemID); err != nil {
+			return models.AttachmentUploadResponse{}, err
+		}
+	} else {
+		exists, err := repository.NewItemRepository(s.db).Exists(in.ItemID)
+		if err != nil {
+			return models.AttachmentUploadResponse{}, fmt.Errorf("check public form item: %w", err)
+		}
+		if !exists {
+			return models.AttachmentUploadResponse{}, ErrItemAttachmentNotFound
+		}
 	}
-	if len(in.FileData) == 0 {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("%w: file is empty", ErrItemAttachmentInvalid)
+	fileInput := attachmentFileInput{
+		originalFilename: in.OriginalFilename,
+		data:             in.FileData,
+		validationSize:   int64(len(in.FileData)),
 	}
-
-	if err := s.authorizeItemEdit(in.UploaderID, in.ItemID); err != nil {
+	detectedMimeType, err := validateAttachmentUpload(s.db, s.attachmentPath, fileInput, attachmentValidationErrors{
+		disabled: ErrItemAttachmentDisabled,
+		invalid:  ErrItemAttachmentInvalid,
+	})
+	if err != nil {
+		return models.AttachmentUploadResponse{}, err
+	}
+	stored, err := storeAttachmentFile(s.attachmentPath, "items", "item", in.ItemID, fileInput, detectedMimeType)
+	if err != nil {
 		return models.AttachmentUploadResponse{}, err
 	}
 
-	if err := validateAttachmentFileExtension(in.OriginalFilename); err != nil {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("%w: %s", ErrItemAttachmentInvalid, err.Error())
+	var uploaderID *int
+	if in.UploaderID > 0 {
+		uploaderID = &in.UploaderID
 	}
-	detectedMimeType, err := verifyAttachmentFileContent(in.FileData, in.OriginalFilename)
-	if err != nil {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("%w: File content validation failed: %s", ErrItemAttachmentInvalid, err.Error())
-	}
-
-	settings, err := loadAttachmentSettings(s.db, s.attachmentPath)
-	if err != nil {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("get attachment settings: %w", err)
-	}
-	if !settings.Enabled {
-		return models.AttachmentUploadResponse{}, ErrItemAttachmentDisabled
-	}
-	if in.FileSize > settings.MaxFileSize {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("%w: File too large. Maximum size: %d bytes", ErrItemAttachmentInvalid, settings.MaxFileSize)
-	}
-	// validateAllowedMimeType wraps its error with the page-upload sentinel;
-	// re-wrap under the item sentinel so the v1 handler maps it to a 400.
-	if err := validateAllowedMimeType(settings.AllowedMimeTypes, detectedMimeType); err != nil {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("%w: %s", ErrItemAttachmentInvalid, err.Error())
-	}
-
-	uniqueFilename, err := generateAttachmentFilename(in.OriginalFilename)
-	if err != nil {
-		return models.AttachmentUploadResponse{}, fmt.Errorf("generate filename: %w", err)
-	}
-
-	// Match the cookie-auth path layout (attachments/items/{itemID}/...) so
-	// downloads/thumbnails served by the existing v1 AttachmentHandler resolve
-	// the same files regardless of which surface wrote them.
-	itemDir := filepath.Join(s.attachmentPath, "items", strconv.Itoa(in.ItemID))
-	if err := os.MkdirAll(itemDir, 0o750); err != nil { //nolint:gosec // path built from configured root + numeric item id
-		return models.AttachmentUploadResponse{}, fmt.Errorf("create attachment directory: %w", err)
-	}
-	filePath := filepath.Join(itemDir, uniqueFilename)
-	if err := os.WriteFile(filePath, in.FileData, 0o600); err != nil { //nolint:gosec // path built from configured root + generated filename
-		return models.AttachmentUploadResponse{}, fmt.Errorf("save file: %w", err)
-	}
-
-	hasThumbnail := false
-	thumbnailPath := ""
-	if strings.HasPrefix(detectedMimeType, "image/") {
-		if path, err := generateAttachmentThumbnail(filePath, uniqueFilename); err == nil {
-			hasThumbnail = true
-			thumbnailPath = path
-		} else {
-			slog.Warn("failed to generate item attachment thumbnail", slog.String("component", "attachments"), slog.Any("error", err))
-		}
-	}
-
-	uploaderID := in.UploaderID
 	attachmentID, err := s.attachmentService.CreateRecord(CreateAttachmentParams{
-		ItemID:           in.ItemID,
-		EntityType:       "item",
-		Filename:         uniqueFilename,
-		OriginalFilename: in.OriginalFilename,
-		FilePath:         filePath,
-		MimeType:         detectedMimeType,
-		FileSize:         int64(len(in.FileData)),
-		UploadedBy:       &uploaderID,
-		HasThumbnail:     hasThumbnail,
-		ThumbnailPath:    thumbnailPath,
-		Category:         "",
+		ItemID:                     in.ItemID,
+		EntityType:                 "item",
+		Filename:                   stored.filename,
+		OriginalFilename:           in.OriginalFilename,
+		FilePath:                   stored.path,
+		MimeType:                   stored.mimeType,
+		FileSize:                   stored.size,
+		UploadedBy:                 uploaderID,
+		UploadedByPortalCustomerID: in.UploaderPortalCustomerID,
+		HasThumbnail:               stored.hasThumbnail,
+		ThumbnailPath:              stored.thumbnailPath,
+		Category:                   "",
 	})
 	if err != nil {
-		_ = os.Remove(filePath) //nolint:gosec // cleanup of path built above
+		removeStoredAttachmentFile(stored)
 		return models.AttachmentUploadResponse{}, fmt.Errorf("save attachment record: %w", err)
 	}
 
-	// Best-effort history row, mirroring the cookie-auth handler. A failure
-	// here must not fail an otherwise-successful upload.
-	if histErr := s.attachmentService.RecordItemHistory(in.ItemID, &uploaderID, "attachment_uploaded", nil, attachmentID, in.OriginalFilename); histErr != nil {
+	// Best-effort history row, mirroring the cookie-auth handler. The actor
+	// is the uploading user, the portal customer, or none (anonymous public
+	// form) — every upload must land in item history for audit purposes. A
+	// failure here must not fail an otherwise-successful upload.
+	if histErr := s.attachmentService.RecordItemHistory(in.ItemID, AttachmentHistoryActor{
+		UserID:           uploaderID,
+		PortalCustomerID: in.UploaderPortalCustomerID,
+	}, "attachment_uploaded", nil, attachmentID, in.OriginalFilename); histErr != nil {
 		slog.Warn("failed to record attachment upload history", slog.String("component", "attachments"), slog.Any("error", histErr))
 	}
 
-	itemID := in.ItemID
-	return models.AttachmentUploadResponse{
-		Success: true,
-		Message: "File uploaded successfully",
-		Attachment: models.Attachment{
-			ID:               int(attachmentID),
-			ItemID:           &itemID,
-			Filename:         uniqueFilename,
-			OriginalFilename: in.OriginalFilename,
-			MimeType:         detectedMimeType,
-			FileSize:         int64(len(in.FileData)),
-			UploadedBy:       &uploaderID,
-			CreatedAt:        time.Now(),
-		},
-	}, nil
+	response := newAttachmentUploadResponse(attachmentID, in.ItemID, in.OriginalFilename, uploaderID, stored)
+	response.Attachment.UploadedByPortalCustomerID = in.UploaderPortalCustomerID
+	return response, nil
+}
+
+// RollbackPublicFormItem removes attachment blobs and the just-created item
+// after any post-create upload failure. The item delete cascades attachment
+// rows; blob paths are removed explicitly because the database cannot own the
+// filesystem transaction.
+func (s *ItemAttachmentService) RollbackPublicFormItem(itemID int) error {
+	rows, err := s.db.Query(`
+		SELECT file_path, COALESCE(thumbnail_path, '')
+		FROM attachments
+		WHERE item_id = ? AND COALESCE(entity_type, 'item') = 'item'
+	`, itemID)
+	if err != nil {
+		return fmt.Errorf("list public form attachment rollback paths: %w", err)
+	}
+	var paths []string
+	for rows.Next() {
+		var filePath, thumbnailPath string
+		if err := rows.Scan(&filePath, &thumbnailPath); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan public form attachment rollback path: %w", err)
+		}
+		paths = append(paths, filePath)
+		if thumbnailPath != "" {
+			paths = append(paths, thumbnailPath)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate public form attachment rollback paths: %w", err)
+	}
+	_ = rows.Close()
+
+	itemRepo := repository.NewItemRepository(s.db)
+	workspaceID, _ := itemRepo.GetWorkspaceID(itemID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin public form item rollback: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := itemRepo.Delete(tx, itemID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit public form item rollback: %w", err)
+	}
+	repository.InvalidateItemListCountCache(s.db, workspaceID)
+	for _, path := range paths {
+		if err := fileserve.RemoveUnderRoot(s.attachmentPath, path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("failed to remove rolled-back public form attachment", slog.String("component", "attachments"), slog.String("file_path", path), slog.Any("error", err))
+		}
+	}
+	return nil
 }
 
 // DeleteItemAttachment deletes an item-scoped attachment record and removes
@@ -206,7 +375,7 @@ func (s *ItemAttachmentService) DeleteItemAttachment(attachmentID, deleterID int
 
 	// Record the deletion in item history before removing the row so the
 	// original filename survives for the `old_value` snapshot.
-	if histErr := s.attachmentService.RecordItemHistory(itemID, &deleterID, "attachment_deleted", &details.OriginalFilename, 0, details.OriginalFilename); histErr != nil {
+	if histErr := s.attachmentService.RecordItemHistory(itemID, AttachmentHistoryActor{UserID: &deleterID}, "attachment_deleted", &details.OriginalFilename, 0, details.OriginalFilename); histErr != nil {
 		slog.Warn("failed to record attachment deletion history", slog.String("component", "attachments"), slog.Any("error", histErr))
 	}
 

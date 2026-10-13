@@ -6,10 +6,10 @@ import (
 	"strconv"
 
 	"windshift/internal/database"
+	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/restapi"
-	"windshift/internal/sanitize"
 	"windshift/internal/services"
 )
 
@@ -20,16 +20,14 @@ import (
 // to avoid leaking template / workspace existence).
 type TemplateHandler struct {
 	BaseHandler
-	repo      *repository.TemplateRepository
-	itemTypes *repository.ItemTypeRepository
+	service *services.ItemTemplateService
 }
 
 // NewTemplateHandler constructs a v1 TemplateHandler.
 func NewTemplateHandler(db database.Database, permissionService *services.PermissionService) *TemplateHandler {
 	return &TemplateHandler{
 		BaseHandler: NewBaseHandler(db, permissionService),
-		repo:        repository.NewTemplateRepository(db),
-		itemTypes:   repository.NewItemTypeRepository(db),
+		service:     services.NewItemTemplateService(db),
 	}
 }
 
@@ -89,13 +87,13 @@ func (h *TemplateHandler) ListForWorkspace(w http.ResponseWriter, r *http.Reques
 			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid item_type_id"))
 			return
 		}
-		templates, err := h.repo.ListForType(wsID, typeID)
+		templates, err := h.service.List(wsID, &typeID)
 		if err != nil {
 			h.RespondInternalError(w, r)
 			return
 		}
 		resp := templateListResponse{Items: templates}
-		if mandatory, merr := h.repo.GetMandatoryForType(wsID, typeID); merr == nil {
+		if mandatory, merr := h.service.GetMandatory(wsID, typeID); merr == nil {
 			resp.MandatoryTemplateID = &mandatory.ID
 		} else if !errors.Is(merr, repository.ErrNotFound) {
 			h.RespondInternalError(w, r)
@@ -105,7 +103,7 @@ func (h *TemplateHandler) ListForWorkspace(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	templates, err := h.repo.ListByWorkspace(wsID)
+	templates, err := h.service.List(wsID, nil)
 	if err != nil {
 		h.RespondInternalError(w, r)
 		return
@@ -145,46 +143,15 @@ func (h *TemplateHandler) CreateInWorkspace(w http.ResponseWriter, r *http.Reque
 	if !h.DecodeBodyOrRespond(w, r, &req) {
 		return
 	}
-	name := sanitize.ShortIdentifier.Sanitize(req.Name)
-	if !h.ValidateRequiredString(w, r, name, "name") {
-		return
-	}
-	mode := req.Mode
-	if mode == "" {
-		mode = models.TemplateModeSelectable
-	}
-	isActive := true
-	if req.IsActive != nil {
-		isActive = *req.IsActive
-	}
-	if !h.itemTypeIDsValid(w, r, req.ItemTypeIDs) {
-		return
-	}
-
-	exists, err := h.repo.NameExistsInWorkspace(wsID, name, 0)
-	if err != nil {
-		h.RespondInternalError(w, r)
-		return
-	}
-	if exists {
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeValidationFailed, "a template with this name already exists in this workspace"))
-		return
-	}
-
-	created, err := h.repo.Create(&models.ItemTemplate{
-		WorkspaceID:     wsID,
-		Name:            name,
-		DescriptionBody: req.DescriptionBody,
-		Mode:            mode,
-		IsActive:        isActive,
-		ItemTypeIDs:     req.ItemTypeIDs,
-		CreatedBy:       &user.ID,
-		UpdatedBy:       &user.ID,
+	created, err := h.service.Create(wsID, user.ID, services.ItemTemplateInput{
+		Name: req.Name, DescriptionBody: req.DescriptionBody, Mode: req.Mode,
+		IsActive: req.IsActive, ItemTypeIDs: req.ItemTypeIDs,
 	})
 	if err != nil {
 		h.respondTemplateWriteError(w, r, err)
 		return
 	}
+	h.Auditor.Log(r, user, logger.ActionTemplateCreate, logger.ResourceItemTemplate, &created.ID, created.Name)
 	h.RespondCreated(w, created)
 }
 
@@ -208,7 +175,7 @@ func (h *TemplateHandler) GetInWorkspace(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	tmpl, err := h.repo.GetByID(templateID)
+	tmpl, err := h.service.Get(templateID)
 	if errors.Is(err, repository.ErrNotFound) || (err == nil && tmpl.WorkspaceID != wsID) {
 		h.RespondNotFound(w, r)
 		return
@@ -248,7 +215,7 @@ func (h *TemplateHandler) UpdateInWorkspace(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	existing, err := h.repo.GetByID(templateID)
+	existing, err := h.service.Get(templateID)
 	if errors.Is(err, repository.ErrNotFound) || (err == nil && existing.WorkspaceID != wsID) {
 		h.RespondNotFound(w, r)
 		return
@@ -263,53 +230,15 @@ func (h *TemplateHandler) UpdateInWorkspace(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	updated := *existing
-	if req.Name != nil {
-		name := sanitize.ShortIdentifier.Sanitize(*req.Name)
-		if name == "" {
-			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeMissingField, "name is required"))
-			return
-		}
-		updated.Name = name
-	}
-	if req.DescriptionBody != nil {
-		updated.DescriptionBody = *req.DescriptionBody
-	}
-	if req.Mode != nil {
-		updated.Mode = *req.Mode
-	}
-	if req.IsActive != nil {
-		updated.IsActive = *req.IsActive
-	}
-	if req.ItemTypeIDs != nil {
-		if !h.itemTypeIDsValid(w, r, *req.ItemTypeIDs) {
-			return
-		}
-		updated.ItemTypeIDs = *req.ItemTypeIDs
-	}
-	updated.UpdatedBy = &user.ID
-
-	if updated.Name != existing.Name {
-		exists, eerr := h.repo.NameExistsInWorkspace(wsID, updated.Name, templateID)
-		if eerr != nil {
-			h.RespondInternalError(w, r)
-			return
-		}
-		if exists {
-			h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeValidationFailed, "a template with this name already exists in this workspace"))
-			return
-		}
-	}
-
-	if err := h.repo.Update(&updated); err != nil {
+	result, err := h.service.Update(templateID, user.ID, services.ItemTemplatePatch{
+		Name: req.Name, DescriptionBody: req.DescriptionBody, Mode: req.Mode,
+		IsActive: req.IsActive, ItemTypeIDs: req.ItemTypeIDs,
+	})
+	if err != nil {
 		h.respondTemplateWriteError(w, r, err)
 		return
 	}
-	result, err := h.repo.GetByID(templateID)
-	if err != nil {
-		h.RespondInternalError(w, r)
-		return
-	}
+	h.Auditor.Log(r, user, logger.ActionTemplateUpdate, logger.ResourceItemTemplate, &templateID, result.Name)
 	h.RespondOK(w, result)
 }
 
@@ -328,11 +257,15 @@ func (h *TemplateHandler) UpdateInWorkspace(w http.ResponseWriter, r *http.Reque
 // @Failure      500  {object}  handlers.ErrorResponse
 // @Router       /workspaces/{id}/templates/{templateId} [delete]
 func (h *TemplateHandler) DeleteInWorkspace(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.RequireAuth(w, r)
+	if !ok {
+		return
+	}
 	wsID, templateID, ok := h.resolveWorkspaceTemplateAccess(w, r, h.Perms.CanAdminWorkspace)
 	if !ok {
 		return
 	}
-	existing, err := h.repo.GetByID(templateID)
+	existing, err := h.service.Get(templateID)
 	if errors.Is(err, repository.ErrNotFound) || (err == nil && existing.WorkspaceID != wsID) {
 		h.RespondNotFound(w, r)
 		return
@@ -341,10 +274,11 @@ func (h *TemplateHandler) DeleteInWorkspace(w http.ResponseWriter, r *http.Reque
 		h.RespondInternalError(w, r)
 		return
 	}
-	if err := h.repo.Delete(templateID); err != nil {
+	if _, err := h.service.Delete(templateID); err != nil {
 		h.RespondInternalError(w, r)
 		return
 	}
+	h.Auditor.Log(r, user, logger.ActionTemplateDelete, logger.ResourceItemTemplate, &templateID, existing.Name)
 	h.RespondNoContent(w)
 }
 
@@ -374,26 +308,13 @@ func (h *TemplateHandler) resolveWorkspaceTemplateAccess(w http.ResponseWriter, 
 	return workspaceID, templateID, true
 }
 
-// itemTypeIDsValid checks every supplied item type id exists. Unknown ids
-// surface as 400 rather than a foreign-key 500 from the repository.
-func (h *TemplateHandler) itemTypeIDsValid(w http.ResponseWriter, r *http.Request, ids []int) bool {
-	for _, id := range ids {
-		exists, err := h.itemTypes.Exists(id)
-		if err != nil {
-			h.RespondInternalError(w, r)
-			return false
-		}
-		if !exists {
-			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, "unknown item type id"))
-			return false
-		}
-	}
-	return true
-}
-
 // respondTemplateWriteError maps repository write errors to client responses.
 func (h *TemplateHandler) respondTemplateWriteError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, services.ErrItemTemplateNameRequired):
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeMissingField, "name is required"))
+	case errors.Is(err, services.ErrItemTemplateTypeNotFound):
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, "unknown item type id"))
 	case errors.Is(err, repository.ErrInvalidTemplateMode):
 		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, "mode must be 'selectable' or 'mandatory'"))
 	case errors.Is(err, repository.ErrMandatoryRequiresOneType):

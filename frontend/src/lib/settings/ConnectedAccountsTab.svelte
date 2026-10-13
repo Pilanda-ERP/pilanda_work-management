@@ -1,13 +1,16 @@
 <script>
 	import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import { setOAuthReturnURL } from '../utils/oauthReturn.js';
 	import { api } from '../api.js';
-	import { GitBranch, CheckCircle, XCircle, LogOut, Loader2, ExternalLink } from '@lucide/svelte';
+ import { GitBranch, CheckCircle, XCircle, LogOut, ExternalLink } from '@lucide/svelte';
 	import { IconBrandGithub as Github } from '@tabler/icons-svelte-runes';
 	import Button from '../components/Button.svelte';
 	import AlertBox from '../components/AlertBox.svelte';
 	import EmptyState from '../components/EmptyState.svelte';
 	import TodoistSyncSettings from './TodoistSyncSettings.svelte';
 	import { t } from '../stores/i18n.svelte.js';
+	import { successToast } from '../stores/toasts.svelte.js';
 	import { formatDateSimple } from '../utils/dateFormatter.js';
 
 	let loading = $state(true);
@@ -23,6 +26,16 @@
 	let intDisconnecting = $state(null);
 
 	onMount(() => {
+		// Landed back from the OAuth callback (via the app shell's return
+		// navigation): acknowledge the outcome and clean the URL.
+		const oauthParams = new URLSearchParams(window.location.search);
+		if (oauthParams.get('oauth') === 'success') {
+			successToast(t('settings.connectedAccounts.oauthConnected'));
+			window.history.replaceState({}, '', window.location.pathname);
+		} else if (oauthParams.get('oauth') === 'error') {
+			error = oauthParams.get('message') || t('settings.connectedAccounts.oauthFailedCallback');
+			window.history.replaceState({}, '', window.location.pathname);
+		}
 		loadProviders();
 		loadIntegrations();
 	});
@@ -61,7 +74,7 @@
 		api.scmProviders.startOAuth(provider.slug).then(result => {
 			if (result?.auth_url) {
 				// Store return URL so we come back here
-				sessionStorage.setItem('scm_oauth_return', window.location.href);
+				setOAuthReturnURL();
 				window.location.href = result.auth_url;
 			}
 		}).catch(err => {
@@ -152,9 +165,7 @@
 	{/if}
 
 	{#if loading}
-		<div class="flex items-center justify-center py-8">
-			<Loader2 class="w-6 h-6 animate-spin" style="color: var(--ds-text-subtle);" />
-		</div>
+		<StateDisplay type="loading" />
 	{:else if providers.length === 0}
 		<EmptyState
 			icon={GitBranch}
@@ -237,15 +248,10 @@
 								variant="danger"
 								size="small"
 								onclick={() => disconnect(provider.id)}
-								disabled={disconnecting === provider.id}
+								loading={disconnecting === provider.id}
+								icon={LogOut}
 							>
-								{#if disconnecting === provider.id}
-									<Loader2 class="w-4 h-4 animate-spin mr-1" />
-									{t('settings.connectedAccounts.disconnecting')}
-								{:else}
-									<LogOut class="w-4 h-4 mr-1" />
-									{t('settings.connectedAccounts.disconnect')}
-								{/if}
+								{disconnecting === provider.id ? t('settings.connectedAccounts.disconnecting') : t('settings.connectedAccounts.disconnect')}
 							</Button>
 						{:else}
 							<Button
@@ -358,13 +364,9 @@
 									variant="danger"
 									size="small"
 									onclick={() => disconnectIntegration(provider.id)}
-									disabled={intDisconnecting === provider.id}
+									loading={intDisconnecting === provider.id}
+									icon={LogOut}
 								>
-									{#if intDisconnecting === provider.id}
-										<Loader2 class="w-4 h-4 animate-spin mr-1" />
-									{:else}
-										<LogOut class="w-4 h-4 mr-1" />
-									{/if}
 									{t('integrations.disconnect')}
 								</Button>
 							{:else}

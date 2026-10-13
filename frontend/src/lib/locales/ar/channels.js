@@ -1,16 +1,3 @@
-/**
- * Arabic (ar) - Channels, Notifications, Portal, and Request Form translations
- * RTL language
- *
- * This module contains translations for:
- * - notifications: Notification UI and email verification
- * - channels: Channel management and integration settings
- * - channel: Channel configuration (portal, webhook, email)
- * - portal: Customer portal settings and request types
- * - requestForm: Portal request submission form
- * - requestTypeFields: Field configuration for request types
- */
-
 export default {
   notifications: {
     title: 'الإشعارات',
@@ -73,6 +60,18 @@ export default {
     channelDeleted: 'تم حذف القناة بنجاح',
     cannotDeleteDefault: 'لا يمكن حذف قناة الإشعارات الافتراضية',
     searchChannels: 'البحث في القنوات...',
+    manager: {
+      subtitle: 'إدارة القنوات التي تقع ضمن مسؤوليتك',
+      purpose: 'الغرض',
+      publishedAt: 'منشورة على {path}',
+      deliversTo: 'تسلّم الطلبات إلى {workspace}',
+      outboundNotifications: 'ترسل الإشعارات الصادرة',
+      outboundEvents: 'تسلّم الأحداث الصادرة',
+      operational: 'قناة تشغيلية',
+      noChannels: 'لا توجد قنوات مُدارة',
+      noChannelsDescription: 'ستظهر هنا القنوات المسندة إليك.',
+      loadFailed: 'تعذّر تحميل القنوات',
+    },
     testWebhook: 'اختبار Webhook',
     webhookSent: 'تم إرسال اختبار Webhook بنجاح!',
     webhookFailed: 'فشل اختبار Webhook',
@@ -257,6 +256,9 @@ export default {
     smtpFromName: 'اسم المرسل',
     smtpFromNamePlaceholder: 'الاسم المعروض للرسائل الصادرة',
     smtpEncryption: 'التشفير',
+    smtpSkipTlsVerify: 'تخطي التحقق من الشهادة',
+    smtpSkipTlsVerifyDescription: 'السماح بالشهادات الموقعة ذاتيًا أو غير الموثوقة لخادم SMTP هذا فقط. يؤدي ذلك إلى إضعاف أمان الاتصال.',
+    smtpNoEncryptionWarning: 'سيتم إرسال محتوى البريد الإلكتروني وبيانات التسليم الوصفية دون تشفير. استخدم هذا الخيار فقط مع مرحل SMTP محلي موثوق.',
     noEncryption: 'بدون تشفير (غير مستحسن)',
     authentication: 'المصادقة',
     senderSettings: 'إعدادات المرسل',
@@ -582,6 +584,7 @@ export default {
     settings: {
       title: 'Form Settings',
       requireAuth: 'Require authentication',
+      allowAttachments: 'السماح بالمرفقات',
       submitButton: 'Submit Button Text',
       successMessage: 'Success Message',
       successMessagePlaceholder: 'Thank you for your submission!',

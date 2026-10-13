@@ -16,23 +16,37 @@ import (
 	"windshift/internal/models"
 )
 
-// ItemRepository provides data access methods for items
 type ItemRepository struct {
 	db database.Database
 }
 
-// NewItemRepository creates a new item repository
 func NewItemRepository(db database.Database) *ItemRepository {
 	return &ItemRepository{db: db}
+}
+
+// GetDetailPanelAvailability reports whether the item detail surface has SCM
+// context or agent runs to show. Keeping this query in the repository preserves
+// the handler boundary while allowing both flags to share one database round trip.
+func (r *ItemRepository) GetDetailPanelAvailability(workspaceID, itemID int) (scmAvailable, hasAgentRuns bool, err error) {
+	err = r.db.QueryRow(`
+		SELECT
+			EXISTS(
+				SELECT 1 FROM workspace_repositories wr
+				JOIN workspace_scm_connections wsc ON wsc.id = wr.workspace_scm_connection_id
+				WHERE wsc.workspace_id = ? AND wr.is_active = true AND wsc.enabled = true
+			),
+			EXISTS(SELECT 1 FROM agent_runs WHERE item_id = ?)
+	`, workspaceID, itemID).Scan(&scmAvailable, &hasAgentRuns)
+	return scmAvailable, hasAgentRuns, err
 }
 
 const itemBaseColumns = `id, workspace_id, workspace_item_number, item_type_id, title, description, status_id,
        priority_id, due_date, start_date, end_date, is_task, iteration_id, project_id, inherit_project,
        time_project_id, assignee_id, creator_id, creator_portal_customer_id, custom_field_values, parent_id, related_work_item_id,
-       story_points, estimate_minutes, frac_index, created_at, updated_at`
+       story_points, estimate_minutes, frac_index, created_at, updated_at, channel_id`
 
 func scanItemBase(scanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }) (*models.Item, error) {
 	var item models.Item
 	var customFieldValuesJSON sql.NullString
@@ -42,12 +56,13 @@ func scanItemBase(scanner interface {
 	var storyPoints sql.NullFloat64
 	var estimateMinutes sql.NullInt64
 	var fracIndex sql.NullString
+	var channelID sql.NullInt64
 
 	err := scanner.Scan(
 		&item.ID, &item.WorkspaceID, &item.WorkspaceItemNumber, &itemTypeID, &item.Title, &item.Description,
 		&statusID, &priorityID, &dueDate, &startDate, &endDate, &item.IsTask, &iterationID,
 		&projectID, &item.InheritProject, &timeProjectID, &assigneeID, &creatorID, &creatorPortalCustomerID, &customFieldValuesJSON, &parentID,
-		&relatedWorkItemID, &storyPoints, &estimateMinutes, &fracIndex, &item.CreatedAt, &item.UpdatedAt,
+		&relatedWorkItemID, &storyPoints, &estimateMinutes, &fracIndex, &item.CreatedAt, &item.UpdatedAt, &channelID,
 	)
 	if err != nil {
 		return nil, err
@@ -64,6 +79,7 @@ func scanItemBase(scanner interface {
 	assignNullableInt(&item.CreatorID, creatorID)
 	assignNullableInt(&item.CreatorPortalCustomerID, creatorPortalCustomerID)
 	assignNullableInt(&item.RelatedWorkItemID, relatedWorkItemID)
+	assignNullableInt(&item.ChannelID, channelID)
 	assignNullableTime(&item.DueDate, dueDate)
 	assignNullableTime(&item.StartDate, startDate)
 	assignNullableTime(&item.EndDate, endDate)
@@ -82,11 +98,8 @@ func assignNullableStringPtr(dest **string, src sql.NullString) {
 	}
 }
 
-// mapItemErr normalizes a QueryRow/Scan error for the single-item accessors:
-// a missing row becomes ErrNotFound, any other error is wrapped as
-// "failed to <op>". Returns nil for a nil error. This is the shared error
-// contract behind the GetX(itemID) accessors so they don't each re-spell the
-// same ErrNoRows / wrap dance.
+// mapItemErr keeps single-item accessors consistent: missing rows become
+// ErrNotFound and other errors are wrapped with the operation name.
 func mapItemErr(err error, op string) error {
 	if err == nil {
 		return nil
@@ -97,27 +110,92 @@ func mapItemErr(err error, op string) error {
 	return fmt.Errorf("failed to %s: %w", op, err)
 }
 
-// scanItemColumn reads a single column for one item by id into dest, mapping a
-// missing row to ErrNotFound via mapItemErr. It is the common query function
-// behind the typed single-column accessors (GetWorkspaceID, GetTitle,
-// GetParentID, …) — each shrinks to one call instead of hand-rolling the query.
-// column / op are trusted literals supplied by the accessor, never caller input.
+// scanItemColumn reads one allowlisted item column and maps missing rows to
+// ErrNotFound. column and op come only from typed accessors.
 func (r *ItemRepository) scanItemColumn(itemID int, column, op string, dest any) error {
 	return mapItemErr(r.db.QueryRow("SELECT "+column+" FROM items WHERE id = ?", itemID).Scan(dest), op)
 }
 
-// FindByID loads an item by ID with all fields (no joins)
 func (r *ItemRepository) FindByID(id int) (*models.Item, error) {
-	item, err := scanItemBase(r.db.QueryRow(`SELECT `+itemBaseColumns+` FROM items WHERE id = ?`, id))
+	return r.FindByIDContext(context.Background(), id)
+}
+
+func (r *ItemRepository) FindByIDContext(ctx context.Context, id int) (*models.Item, error) {
+	item, err := scanItemBase(r.db.QueryRowContext(ctx, `SELECT `+itemBaseColumns+` FROM items WHERE id = ?`, id))
 	if err != nil {
 		return nil, mapItemErr(err, "find item")
 	}
 	return item, nil
 }
 
-// FindByIDForUpdate loads an item by ID inside a transaction. On Postgres it
-// appends FOR UPDATE so update workflows can lock the row while validating and
-// mutating it. SQLite ignores row-level locking and uses the plain select.
+// MergedIntoItemID returns the canonical item this one was merged into, or nil
+// when it is not a merged duplicate. Merged duplicates are read-only redirects
+// (WI-1528), so writes must consult this before mutating an item.
+func (r *ItemRepository) MergedIntoItemID(ctx context.Context, id int) (*int, error) {
+	var mergedInto *int
+	err := r.db.QueryRowContext(ctx, `SELECT merged_into_item_id FROM items WHERE id = ?`, id).Scan(&mergedInto)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load merge state for item %d: %w", id, err)
+	}
+	return mergedInto, nil
+}
+
+// ItemCaptureSnapshot is the stable item projection used by the Jira capture
+// export verifier.
+type ItemCaptureSnapshot struct {
+	Title, Description, StatusName, ItemTypeName, PriorityName string
+	AssigneeUsername, ReporterUsername, CreatorUsername        string
+	StoryPoints                                                *float64
+	DueDate, CreatedAt, UpdatedAt, CustomFieldValues           string
+}
+
+// GetCaptureSnapshot returns the item fields required by capture verification.
+func (r *ItemRepository) GetCaptureSnapshot(itemID int) (*ItemCaptureSnapshot, error) {
+	var out ItemCaptureSnapshot
+	var description, statusName, itemTypeName, priorityName sql.NullString
+	var assignee, reporter, creator, dueDate, createdAt, updatedAt, customFields sql.NullString
+	err := r.db.QueryRow(`
+		SELECT i.title, i.description, s.name, t.name, p.name,
+		       ua.username, ur.username, uc.username, i.story_points,
+		       CAST(i.due_date AS TEXT), CAST(i.created_at AS TEXT),
+		       CAST(i.updated_at AS TEXT), CAST(i.custom_field_values AS TEXT)
+		FROM items i
+		LEFT JOIN statuses s ON s.id = i.status_id
+		LEFT JOIN item_types t ON t.id = i.item_type_id
+		LEFT JOIN priorities p ON p.id = i.priority_id
+		LEFT JOIN users ua ON ua.id = i.assignee_id
+		LEFT JOIN users ur ON ur.id = i.reporter_id
+		LEFT JOIN users uc ON uc.id = i.creator_id
+		WHERE i.id = ?
+	`, itemID).Scan(
+		&out.Title, &description, &statusName, &itemTypeName, &priorityName,
+		&assignee, &reporter, &creator, &out.StoryPoints,
+		&dueDate, &createdAt, &updatedAt, &customFields,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get item capture snapshot: %w", err)
+	}
+	out.Description = description.String
+	out.StatusName = statusName.String
+	out.ItemTypeName = itemTypeName.String
+	out.PriorityName = priorityName.String
+	out.AssigneeUsername = assignee.String
+	out.ReporterUsername = reporter.String
+	out.CreatorUsername = creator.String
+	out.DueDate = dueDate.String
+	out.CreatedAt = createdAt.String
+	out.UpdatedAt = updatedAt.String
+	out.CustomFieldValues = customFields.String
+	return &out, nil
+}
+
+// FindByIDForUpdate locks the row on Postgres; SQLite uses a plain select.
 func (r *ItemRepository) FindByIDForUpdate(tx database.Tx, id int) (*models.Item, error) {
 	query := `SELECT ` + itemBaseColumns + ` FROM items WHERE id = ?`
 	if r.db.GetDriverName() == "postgres" {
@@ -130,28 +208,117 @@ func (r *ItemRepository) FindByIDForUpdate(tx database.Tx, id int) (*models.Item
 	return item, nil
 }
 
-// ItemWithWorkspaceStatus includes workspace active status for permission checks
+// FindByIDsForUpdateContext locks a bounded set in stable ID order. Missing
+// IDs are omitted so callers can fail the operation without exposing which one.
+func (r *ItemRepository) FindByIDsForUpdateContext(ctx context.Context, tx database.Tx, ids []int) ([]*models.Item, error) {
+	if len(ids) == 0 {
+		return []*models.Item{}, nil
+	}
+	placeholders, args := inPlaceholders(ids)
+	query := `SELECT ` + itemBaseColumns + ` FROM items WHERE id IN (` + placeholders + `) ORDER BY id`
+	if r.db.GetDriverName() == "postgres" {
+		query += " FOR UPDATE"
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("find items for bulk update: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	items := make([]*models.Item, 0, len(ids))
+	for rows.Next() {
+		item, scanErr := scanItemBase(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan item for bulk update: %w", scanErr)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate items for bulk update: %w", err)
+	}
+	return items, nil
+}
+
+// FindByIDsInWorkspace resolves the requested item ids that exist in the
+// given workspace, preserving the requested id order. Ids belonging to other
+// workspaces are silently dropped so batch reads stay workspace-scoped.
+func (r *ItemRepository) FindByIDsInWorkspace(ctx context.Context, workspaceID int, ids []int) ([]*models.Item, error) {
+	if len(ids) == 0 {
+		return []*models.Item{}, nil
+	}
+	placeholders, args := inPlaceholders(ids)
+	args = append([]any{workspaceID}, args...)
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT `+itemBaseColumns+` FROM items WHERE workspace_id = ? AND id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("find items in workspace: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	byID := make(map[int]*models.Item, len(ids))
+	for rows.Next() {
+		item, scanErr := scanItemBase(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan item: %w", scanErr)
+		}
+		byID[item.ID] = item
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate items: %w", err)
+	}
+	out := make([]*models.Item, 0, len(ids))
+	for _, id := range ids {
+		if item, ok := byID[id]; ok {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
+// LockWorkspaceItemsTx prevents new foreign-key references from being added to
+// the workspace's current items while a destructive workspace operation runs.
+// The caller must lock the workspace row first so concurrent item creation is
+// fenced as well.
+func (r *ItemRepository) LockWorkspaceItemsTx(tx database.Tx, workspaceID int) error {
+	query := "SELECT id FROM items WHERE workspace_id = ? ORDER BY id"
+	if r.db.GetDriverName() == "postgres" {
+		query += " FOR UPDATE"
+	}
+	rows, err := tx.Query(query, workspaceID)
+	if err != nil {
+		return fmt.Errorf("lock workspace items: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var itemID int
+		if err := rows.Scan(&itemID); err != nil {
+			return fmt.Errorf("scan locked workspace item: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate locked workspace items: %w", err)
+	}
+	return nil
+}
+
 type ItemWithWorkspaceStatus struct {
 	*models.Item
 	WorkspaceActive bool
 }
 
-// FindByIDWithDetails loads an item with all joined data
-// This is the consolidated method for the ~30 duplicate JOIN queries throughout items.go
 func (r *ItemRepository) FindByIDWithDetails(id int) (*models.Item, error) {
-	result, err := r.FindByIDWithWorkspaceStatus(id)
+	return r.FindByIDWithDetailsContext(context.Background(), id)
+}
+
+func (r *ItemRepository) FindByIDWithDetailsContext(ctx context.Context, id int) (*models.Item, error) {
+	result, err := r.FindByIDWithWorkspaceStatusContext(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	return result.Item, nil
 }
 
-// itemDetailsSelectBody is the SELECT + JOINs that hydrate a fully-joined item
-// (workspace, iteration, project, parent, assignee/creator, priority, status,
-// item type, related work item) plus the owning workspace's active flag. It is
-// shared by the single-item (FindByIDWithWorkspaceStatus) and batch
-// (FindByIDsWithDetails) loaders so both stay column-for-column identical. The
-// caller appends the WHERE clause and matches scanItemDetailsRow's order.
+// itemDetailsSelectBody is the shared joined projection for single and batch
+// loaders. Callers append the WHERE clause and use scanItemDetailsRow.
 const itemDetailsSelectBody = `
 	SELECT i.id, i.workspace_id, i.workspace_item_number, i.item_type_id, i.title, i.description,
 	       i.status_id, i.priority_id, i.due_date, i.start_date, i.end_date, i.is_task, i.iteration_id,
@@ -167,14 +334,19 @@ const itemDetailsSelectBody = `
 	       p.workspace_item_number as parent_workspace_item_number,
 	       assignee.first_name || ' ' || assignee.last_name as assignee_name, assignee.email as assignee_email, assignee.avatar_url as assignee_avatar,
 	       creator.first_name || ' ' || creator.last_name as creator_name, creator.email as creator_email,
-	       pri.name as priority_name, pri.icon as priority_icon, pri.color as priority_color,
-	       s.name as status_name,
-	       it.name as item_type_name,
+	       pri.name as priority_name, COALESCE(pri.builtin_key, '') as priority_builtin_key, pri.icon as priority_icon, pri.color as priority_color,
+	       s.name as status_name, COALESCE(s.builtin_key, '') as status_builtin_key,
+	       it.name as item_type_name, COALESCE(it.builtin_key, '') as item_type_builtin_key, COALESCE(it.icon, '') as item_type_icon, COALESCE(it.color, '') as item_type_color,
 	       i.related_work_item_id,
 	       rw.title as related_work_item_title,
 	       rw_ws.key as related_work_item_workspace_key,
 	       rw.workspace_id as related_work_item_workspace_id,
-	       rw.workspace_item_number as related_work_item_number
+	       rw.workspace_item_number as related_work_item_number,
+	       i.team_id, i.incident_id,
+	       t.name as team_name, t.color as team_color, t.avatar_url as team_avatar,
+	       pcc.name as creator_portal_customer_name, pcc.email as creator_portal_customer_email,
+	       pcc.customer_organisation_id as creator_customer_organisation_id,
+	       co.name as creator_customer_organisation_name
 	FROM items i
 	JOIN workspaces w ON i.workspace_id = w.id
 	LEFT JOIN iterations iter ON i.iteration_id = iter.id
@@ -187,12 +359,13 @@ const itemDetailsSelectBody = `
 	LEFT JOIN statuses s ON i.status_id = s.id
 	LEFT JOIN item_types it ON i.item_type_id = it.id
 	LEFT JOIN items rw ON i.related_work_item_id = rw.id
-	LEFT JOIN workspaces rw_ws ON rw.workspace_id = rw_ws.id`
+	LEFT JOIN workspaces rw_ws ON rw.workspace_id = rw_ws.id
+	LEFT JOIN teams t ON i.team_id = t.id
+	LEFT JOIN portal_customers pcc ON i.creator_portal_customer_id = pcc.id
+	LEFT JOIN customer_organisations co ON pcc.customer_organisation_id = co.id`
 
-// scanItemDetailsRow scans one row produced by itemDetailsSelectBody into a
-// fully-joined item plus the owning workspace's active flag. Milestones are NOT
-// attached here — the caller does that (per-item for the single loader, batched
-// for the set loader) to avoid a per-row round trip.
+// scanItemDetailsRow scans the shared projection. Milestones are attached by
+// the caller to avoid a per-row query.
 func scanItemDetailsRow(scanner rowScanner) (models.Item, bool, error) {
 	var item models.Item
 	var customFieldValuesJSON sql.NullString
@@ -202,19 +375,21 @@ func scanItemDetailsRow(scanner rowScanner) (models.Item, bool, error) {
 	var dueDate, startDate, endDate sql.NullTime
 	var workspaceActive bool
 
-	// Joined data
 	var projectName, iterationName, timeProjectName, parentTitle sql.NullString
 	var parentWorkspaceItemNumber sql.NullInt64
 	var assigneeName, assigneeEmail, assigneeAvatar, creatorName, creatorEmail sql.NullString
-	var priorityName, priorityIcon, priorityColor sql.NullString
-	var statusName sql.NullString
-	var itemTypeName sql.NullString
-	// Related work item data (for personal tasks)
+	var priorityName, priorityBuiltinKey, priorityIcon, priorityColor sql.NullString
+	var statusName, statusBuiltinKey sql.NullString
+	var itemTypeName, itemTypeBuiltinKey, itemTypeIcon, itemTypeColor sql.NullString
 	var relatedWorkItemID sql.NullInt64
 	var relatedWorkItemTitle, relatedWorkItemWorkspaceKey sql.NullString
 	var relatedWorkItemWorkspaceID, relatedWorkItemNumber sql.NullInt64
-	// Portal-specific fields
 	var creatorPortalCustomerID, channelID, requestTypeID sql.NullInt64
+	var teamID, incidentID sql.NullInt64
+	var teamName, teamColor, teamAvatar sql.NullString
+	var creatorPortalCustomerName, creatorPortalCustomerEmail sql.NullString
+	var creatorCustomerOrganisationID sql.NullInt64
+	var creatorCustomerOrganisationName sql.NullString
 
 	var storyPoints sql.NullFloat64
 	var estimateMinutes sql.NullInt64
@@ -229,20 +404,28 @@ func scanItemDetailsRow(scanner rowScanner) (models.Item, bool, error) {
 		&item.WorkspaceName, &item.WorkspaceKey, &workspaceActive,
 		&iterationName, &projectName, &timeProjectName, &parentTitle, &parentWorkspaceItemNumber,
 		&assigneeName, &assigneeEmail, &assigneeAvatar, &creatorName, &creatorEmail,
-		&priorityName, &priorityIcon, &priorityColor,
-		&statusName,
-		&itemTypeName,
+		&priorityName, &priorityBuiltinKey, &priorityIcon, &priorityColor,
+		&statusName, &statusBuiltinKey,
+		&itemTypeName, &itemTypeBuiltinKey, &itemTypeIcon, &itemTypeColor,
 		&relatedWorkItemID,
 		&relatedWorkItemTitle,
 		&relatedWorkItemWorkspaceKey,
 		&relatedWorkItemWorkspaceID,
 		&relatedWorkItemNumber,
+		&teamID,
+		&incidentID,
+		&teamName,
+		&teamColor,
+		&teamAvatar,
+		&creatorPortalCustomerName,
+		&creatorPortalCustomerEmail,
+		&creatorCustomerOrganisationID,
+		&creatorCustomerOrganisationName,
 	)
 	if err != nil {
 		return models.Item{}, false, err
 	}
 
-	// Handle nullable ID fields
 	assignNullableInt(&item.ItemTypeID, itemTypeID)
 	assignNullableInt(&item.ParentID, parentID)
 	assignNullableInt(&item.StatusID, statusID)
@@ -253,10 +436,11 @@ func scanItemDetailsRow(scanner rowScanner) (models.Item, bool, error) {
 	assignNullableInt(&item.AssigneeID, assigneeID)
 	assignNullableInt(&item.CreatorID, creatorID)
 
-	// Portal-specific fields
 	assignNullableInt(&item.CreatorPortalCustomerID, creatorPortalCustomerID)
 	assignNullableInt(&item.ChannelID, channelID)
 	assignNullableInt(&item.RequestTypeID, requestTypeID)
+	assignNullableInt(&item.TeamID, teamID)
+	assignNullableInt(&item.IncidentID, incidentID)
 
 	assignNullableTime(&item.DueDate, dueDate)
 	assignNullableTime(&item.StartDate, startDate)
@@ -264,7 +448,6 @@ func scanItemDetailsRow(scanner rowScanner) (models.Item, bool, error) {
 	assignNullableFloat64(&item.StoryPoints, storyPoints)
 	assignNullableInt(&item.EstimateMinutes, estimateMinutes)
 
-	// Handle nullable string fields from joins
 	assignNullableString(&item.IterationName, iterationName)
 	assignNullableString(&item.ProjectName, projectName)
 	assignNullableString(&item.TimeProjectName, timeProjectName)
@@ -276,12 +459,23 @@ func scanItemDetailsRow(scanner rowScanner) (models.Item, bool, error) {
 	assignNullableString(&item.CreatorName, creatorName)
 	assignNullableString(&item.CreatorEmail, creatorEmail)
 	assignNullableString(&item.PriorityName, priorityName)
+	assignNullableString(&item.PriorityBuiltinKey, priorityBuiltinKey)
 	assignNullableString(&item.PriorityIcon, priorityIcon)
 	assignNullableString(&item.PriorityColor, priorityColor)
 	assignNullableString(&item.StatusName, statusName)
+	assignNullableString(&item.StatusBuiltinKey, statusBuiltinKey)
 	assignNullableString(&item.ItemTypeName, itemTypeName)
+	assignNullableString(&item.ItemTypeBuiltinKey, itemTypeBuiltinKey)
+	assignNullableString(&item.ItemTypeIcon, itemTypeIcon)
+	assignNullableString(&item.ItemTypeColor, itemTypeColor)
+	assignNullableString(&item.TeamName, teamName)
+	assignNullableString(&item.TeamColor, teamColor)
+	assignNullableString(&item.TeamAvatarURL, teamAvatar)
+	assignNullableString(&item.CreatorPortalCustomerName, creatorPortalCustomerName)
+	assignNullableString(&item.CreatorPortalCustomerEmail, creatorPortalCustomerEmail)
+	assignNullableInt(&item.CreatorCustomerOrganisationID, creatorCustomerOrganisationID)
+	assignNullableString(&item.CreatorCustomerOrganisationName, creatorCustomerOrganisationName)
 
-	// Handle related work item fields (for personal tasks)
 	assignNullableInt(&item.RelatedWorkItemID, relatedWorkItemID)
 	assignNullableString(&item.RelatedWorkItemTitle, relatedWorkItemTitle)
 	assignNullableString(&item.RelatedWorkItemWorkspaceKey, relatedWorkItemWorkspaceKey)
@@ -298,9 +492,12 @@ func scanItemDetailsRow(scanner rowScanner) (models.Item, bool, error) {
 	return item, workspaceActive, nil
 }
 
-// FindByIDWithWorkspaceStatus loads an item with all joined data including workspace active status
 func (r *ItemRepository) FindByIDWithWorkspaceStatus(id int) (*ItemWithWorkspaceStatus, error) {
-	item, workspaceActive, err := scanItemDetailsRow(r.db.QueryRow(itemDetailsSelectBody+"\n\t\tWHERE i.id = ?", id))
+	return r.FindByIDWithWorkspaceStatusContext(context.Background(), id)
+}
+
+func (r *ItemRepository) FindByIDWithWorkspaceStatusContext(ctx context.Context, id int) (*ItemWithWorkspaceStatus, error) {
+	item, workspaceActive, err := scanItemDetailsRow(r.db.QueryRowContext(ctx, itemDetailsSelectBody+"\n\t\tWHERE i.id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -308,17 +505,17 @@ func (r *ItemRepository) FindByIDWithWorkspaceStatus(id int) (*ItemWithWorkspace
 		return nil, fmt.Errorf("failed to find item with details: %w", err)
 	}
 
-	// Eager-load milestones so callers (REST mappers, ai tools, etc.) don't
-	// each have to remember to attach them after the fact.
+	// Attach milestones once so callers receive complete item details.
 	holder := []models.Item{item}
-	if err := NewMilestoneAttachRepository(r.db).LoadForItems(holder); err == nil {
+	if err := NewMilestoneAttachRepository(r.db).LoadForItemsContext(ctx, holder); err == nil {
 		item = holder[0]
+	} else if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 
 	return &ItemWithWorkspaceStatus{Item: &item, WorkspaceActive: workspaceActive}, nil
 }
 
-// GetWorkspaceID returns just the workspace_id for an item (frequently needed for permission checks)
 func (r *ItemRepository) GetWorkspaceID(itemID int) (int, error) {
 	var workspaceID int
 	if err := r.scanItemColumn(itemID, "workspace_id", "get workspace id", &workspaceID); err != nil {
@@ -327,8 +524,6 @@ func (r *ItemRepository) GetWorkspaceID(itemID int) (int, error) {
 	return workspaceID, nil
 }
 
-// GetWorkspaceIDCtx is the context-aware variant of GetWorkspaceID. Used by
-// handlers that already hold a request-scoped context with timeouts.
 func (r *ItemRepository) GetWorkspaceIDCtx(ctx context.Context, itemID int) (int, error) {
 	var workspaceID int
 	err := r.db.QueryRowContext(ctx, "SELECT workspace_id FROM items WHERE id = ?", itemID).Scan(&workspaceID)
@@ -338,8 +533,61 @@ func (r *ItemRepository) GetWorkspaceIDCtx(ctx context.Context, itemID int) (int
 	return workspaceID, nil
 }
 
-// ListChildTitles returns the titles of items whose parent_id equals the given
-// id. Used for generating prompts that reference existing children.
+// ChildItemSummary is the projection used by item briefings. It carries
+// descriptions but not attachments, so a parent briefing can include children
+// without pulling in attachment data.
+type ChildItemSummary struct {
+	ID           int
+	ItemKey      string
+	Title        string
+	StatusName   string
+	AssigneeName string
+	ItemTypeName string
+	Description  string
+}
+
+// ListChildBriefings returns the direct children of parentID in the same
+// workspace, ordered by board position, capped at limit. It does not recurse.
+func (r *ItemRepository) ListChildBriefings(workspaceID, parentID, limit int) ([]ChildItemSummary, error) {
+	if limit <= 0 {
+		return []ChildItemSummary{}, nil
+	}
+	rows, err := r.db.Query(`
+		SELECT i.id,
+		       w.key || '-' || CAST(i.workspace_item_number AS TEXT) as item_key,
+		       i.title,
+		       COALESCE(s.name, '') as status_name,
+		       COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), '') as assignee_name,
+		       COALESCE(it.name, '') as item_type_name,
+		       COALESCE(i.description, '') as description
+		FROM items i
+		JOIN workspaces w ON i.workspace_id = w.id
+		LEFT JOIN statuses s ON i.status_id = s.id
+		LEFT JOIN users u ON i.assignee_id = u.id
+		LEFT JOIN item_types it ON i.item_type_id = it.id
+		WHERE i.workspace_id = ? AND i.parent_id = ?
+		ORDER BY i.frac_index, i.workspace_item_number
+		LIMIT ?
+	`, workspaceID, parentID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list child briefings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]ChildItemSummary, 0)
+	for rows.Next() {
+		var child ChildItemSummary
+		if err := rows.Scan(&child.ID, &child.ItemKey, &child.Title, &child.StatusName, &child.AssigneeName, &child.ItemTypeName, &child.Description); err != nil {
+			return nil, fmt.Errorf("scan child briefing: %w", err)
+		}
+		out = append(out, child)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate child briefings: %w", err)
+	}
+	return out, nil
+}
+
 func (r *ItemRepository) ListChildTitles(parentID int) ([]string, error) {
 	rows, err := r.db.Query(`SELECT title FROM items WHERE parent_id = ?`, parentID)
 	if err != nil {
@@ -361,10 +609,7 @@ func (r *ItemRepository) ListChildTitles(parentID int) ([]string, error) {
 	return titles, nil
 }
 
-// GetTitles returns a map of itemID → title for all IDs that exist. Missing
-// IDs are simply omitted from the result; there is no ErrNotFound signal for
-// a missing ID because callers are typically hydrating a mixed set of entity
-// IDs and expect lookups to fail silently.
+// GetTitles omits missing IDs because callers hydrate mixed entity sets.
 func (r *ItemRepository) GetTitles(itemIDs []int) (map[int]string, error) {
 	if len(itemIDs) == 0 {
 		return map[int]string{}, nil
@@ -390,20 +635,15 @@ func (r *ItemRepository) GetTitles(itemIDs []int) (map[int]string, error) {
 	return out, rows.Err()
 }
 
-// ItemRefByCustomField is one row from ListItemsReferencingAssetInCustomField
-// — a single item that references the given asset via its custom_field_values
-// JSON blob. Used by the asset-link custom-field reference walker.
+// ItemRefByCustomField identifies an item referencing an asset in custom fields.
 type ItemRefByCustomField struct {
 	ID          int
 	Title       string
 	WorkspaceID int
 }
 
-// ListItemsReferencingAssetInCustomField scans items whose
-// custom_field_values JSON contains the given asset ID, either as a plain int,
-// as an object with an `id` key, or inside a multi-asset array for the given
-// custom-field key. fieldKey and assetIDStr must already be stringified by the
-// caller.
+// ListItemsReferencingAssetInCustomField scans scalar, object, and array asset
+// references for a field key. Callers provide stringified values.
 func (r *ItemRepository) ListItemsReferencingAssetInCustomField(fieldKey, assetIDStr string) ([]ItemRefByCustomField, error) {
 	var query string
 	if r.db.GetDriverName() == "postgres" {
@@ -450,10 +690,7 @@ func (r *ItemRepository) ListItemsReferencingAssetInCustomField(fieldKey, assetI
 	return out, rows.Err()
 }
 
-// ItemGraphMetadata is the subset of item fields used to label a node in the
-// asset-link graph view — workspace key + item number for display, workspace
-// id for permission checks, and the current status name (empty string if
-// unset).
+// ItemGraphMetadata contains display, permission, and status data for a graph node.
 type ItemGraphMetadata struct {
 	WorkspaceKey        string
 	WorkspaceItemNumber int
@@ -461,8 +698,6 @@ type ItemGraphMetadata struct {
 	StatusName          string
 }
 
-// GetItemGraphMetadata returns the minimal per-item metadata the asset-link
-// graph view needs. Returns ErrNotFound if the item does not exist.
 func (r *ItemRepository) GetItemGraphMetadata(itemID int) (*ItemGraphMetadata, error) {
 	var meta ItemGraphMetadata
 	err := r.db.QueryRow(`
@@ -478,9 +713,6 @@ func (r *ItemRepository) GetItemGraphMetadata(itemID int) (*ItemGraphMetadata, e
 	return &meta, nil
 }
 
-// GetCustomFieldValuesRaw returns the raw JSON-encoded custom_field_values
-// payload for an item. Migration/analysis handlers consume this directly
-// without parsing into a map.
 func (r *ItemRepository) GetCustomFieldValuesRaw(itemID int) (sql.NullString, error) {
 	var data sql.NullString
 	if err := r.scanItemColumn(itemID, "custom_field_values", "get custom field values", &data); err != nil {
@@ -489,28 +721,27 @@ func (r *ItemRepository) GetCustomFieldValuesRaw(itemID int) (sql.NullString, er
 	return data, nil
 }
 
-// SetCustomFieldValuesRaw replaces an item's entire custom_field_values JSON
-// payload. Callers own marshaling; no history is recorded.
-func (r *ItemRepository) SetCustomFieldValuesRaw(ctx context.Context, itemID int, raw string) error {
-	// An emptied cfv comes through as "". Write NULL rather than the empty
-	// string: the column treats empty/NULL identically, but on Postgres the
-	// JSONB column rejects '' ("invalid input syntax for type json").
-	if raw == "" {
-		if _, err := r.db.ExecWriteContext(ctx, `UPDATE items SET custom_field_values = NULL WHERE id = ?`, itemID); err != nil {
-			return fmt.Errorf("set custom field values: %w", err)
-		}
-		return nil
+func (r *ItemRepository) GetCustomFieldValuesRawTx(ctx context.Context, tx database.Tx, itemID int) (sql.NullString, error) {
+	var data sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT custom_field_values FROM items WHERE id = ?`, itemID).Scan(&data); err != nil {
+		return sql.NullString{}, mapItemErr(err, "get custom field values")
 	}
-	if _, err := r.db.ExecWriteContext(ctx, `UPDATE items SET custom_field_values = ? WHERE id = ?`, raw, itemID); err != nil {
-		return fmt.Errorf("set custom field values: %w", err)
-	}
-	return nil
+	return data, nil
 }
 
-// SetVirtualFieldDataRaw replaces an item's virtual_field_data JSON payload.
-func (r *ItemRepository) SetVirtualFieldDataRaw(ctx context.Context, itemID int, raw string) error {
-	if _, err := r.db.ExecWriteContext(ctx, `UPDATE items SET virtual_field_data = ? WHERE id = ?`, raw, itemID); err != nil {
-		return fmt.Errorf("set virtual field data: %w", err)
+// UpdateDescription replaces only an item's description. Import workflows use
+// this after attachment mappings make rich-text media links resolvable.
+func (r *ItemRepository) UpdateDescription(itemID int, description string) error {
+	result, err := r.db.ExecWrite(
+		"UPDATE items SET description = ? WHERE id = ?",
+		description,
+		itemID,
+	)
+	if err != nil {
+		return fmt.Errorf("update item description: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -521,9 +752,6 @@ type ItemCFVRow struct {
 	CFV string
 }
 
-// ListCustomFieldValuesPageByKey returns up to limit items after afterID whose
-// custom_field_values JSON contains the given field key, ordered by id. Used
-// by the cleanup scheduler to iterate the table with bounded memory.
 func (r *ItemRepository) ListCustomFieldValuesPageByKey(afterID int, fieldKey string, limit int) ([]ItemCFVRow, error) {
 	// CAST(... AS TEXT) so the LIKE key prefilter works on both SQLite (TEXT
 	// column) and Postgres (JSONB column — a bare LIKE errors with "jsonb ~~").
@@ -554,18 +782,26 @@ func (r *ItemRepository) ListCustomFieldValuesPageByKey(afterID int, fieldKey st
 	return out, rows.Err()
 }
 
-// itemRemapColumns lists the reference columns that configuration-set
-// migration may bulk-remap across workspaces.
 var itemRemapColumns = map[string]bool{
 	"status_id":    true,
 	"priority_id":  true,
 	"item_type_id": true,
 }
 
-// RemapFieldForWorkspacesTx bulk-updates one reference column from one value
-// (nil meaning NULL) to another across the given workspaces, optionally
-// restricted to a single item type. Returns the number of rows updated.
+// RemapFieldForWorkspacesTx remaps one allowlisted reference column in a
+// transaction and optionally restricts by item type. The remap lands in item
+// history attributed to the system (no acting user).
 func (r *ItemRepository) RemapFieldForWorkspacesTx(tx database.Tx, column string, fromID *int, toID int, itemTypeID *int, workspaceIDs []int, now time.Time) (int, error) {
+	return r.remapFieldForWorkspacesTx(tx, column, fromID, toID, itemTypeID, workspaceIDs, now, 0)
+}
+
+// RemapFieldForWorkspacesTxAsUser behaves like RemapFieldForWorkspacesTx but
+// attributes the item-history rows to the acting admin user.
+func (r *ItemRepository) RemapFieldForWorkspacesTxAsUser(tx database.Tx, column string, fromID *int, toID int, itemTypeID *int, workspaceIDs []int, now time.Time, actorUserID int) (int, error) {
+	return r.remapFieldForWorkspacesTx(tx, column, fromID, toID, itemTypeID, workspaceIDs, now, actorUserID)
+}
+
+func (r *ItemRepository) remapFieldForWorkspacesTx(tx database.Tx, column string, fromID *int, toID int, itemTypeID *int, workspaceIDs []int, now time.Time, actorUserID int) (int, error) {
 	if !itemRemapColumns[column] {
 		return 0, fmt.Errorf("RemapFieldForWorkspacesTx: column %q is not in the allow-list", column)
 	}
@@ -574,32 +810,76 @@ func (r *ItemRepository) RemapFieldForWorkspacesTx(tx database.Tx, column string
 	}
 	// The column name is validated against the fixed allow-list above, so the
 	// fmt.Sprintf cannot splice attacker-controlled input.
-	query := fmt.Sprintf("UPDATE items SET %s = ?, updated_at = ?", column)
-	args := []interface{}{toID, now}
+	where := " WHERE " + column
+	args := []any{}
 	if fromID == nil {
-		query += fmt.Sprintf(" WHERE %s IS NULL", column)
+		where += " IS NULL"
 	} else {
-		query += fmt.Sprintf(" WHERE %s = ?", column)
+		where += " = ?"
 		args = append(args, *fromID)
 	}
 	if itemTypeID != nil {
-		query += " AND item_type_id = ?"
+		where += " AND item_type_id = ?"
 		args = append(args, *itemTypeID)
 	}
 	ph, wsArgs := inPlaceholders(workspaceIDs)
-	query += " AND workspace_id IN (" + ph + ")"
+	where += " AND workspace_id IN (" + ph + ")"
 	args = append(args, wsArgs...)
 
-	res, err := tx.Exec(query, args...)
+	// Capture the affected items before the update so each one gets an
+	// item-history row; the remap is otherwise invisible to audit trails.
+	idRows, err := tx.Query("SELECT id FROM items"+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("list %s remap targets: %w", column, err)
+	}
+	var itemIDs []int
+	for idRows.Next() {
+		var id int
+		if err := idRows.Scan(&id); err != nil {
+			_ = idRows.Close()
+			return 0, fmt.Errorf("scan %s remap target: %w", column, err)
+		}
+		itemIDs = append(itemIDs, id)
+	}
+	if err := idRows.Err(); err != nil {
+		_ = idRows.Close()
+		return 0, fmt.Errorf("iterate %s remap targets: %w", column, err)
+	}
+	_ = idRows.Close()
+
+	updateQuery := fmt.Sprintf("UPDATE items SET %s = ?, updated_at = ?", column) + where
+	updateArgs := make([]any, 0, 2+len(args))
+	updateArgs = append(updateArgs, toID, now)
+	updateArgs = append(updateArgs, args...)
+	res, err := tx.Exec(updateQuery, updateArgs...)
 	if err != nil {
 		return 0, fmt.Errorf("remap %s: %w", column, err)
 	}
 	rows, _ := res.RowsAffected()
+
+	// Record the remap per item, committed atomically with the update.
+	oldValue := ""
+	if fromID != nil {
+		oldValue = fmt.Sprintf("%d", *fromID)
+	}
+	for _, itemID := range itemIDs {
+		entry := HistoryEntry{
+			ItemID: itemID, FieldName: column,
+			OldValue: oldValue, NewValue: fmt.Sprintf("%d", toID), ChangedAt: now,
+		}
+		if actorUserID > 0 {
+			entry.ActorKind = HistoryActorUser
+			entry.UserID = actorUserID
+		} else {
+			entry.ActorKind = HistoryActorSystem
+		}
+		if err := r.RecordHistory(tx, entry); err != nil {
+			return 0, fmt.Errorf("record %s remap history: %w", column, err)
+		}
+	}
 	return int(rows), nil
 }
 
-// SetCustomFieldValuesRawTx replaces an item's custom_field_values JSON and
-// bumps updated_at inside the caller's transaction.
 func (r *ItemRepository) SetCustomFieldValuesRawTx(tx database.Tx, itemID int, raw string, now time.Time) error {
 	if _, err := tx.Exec(`UPDATE items SET custom_field_values = ?, updated_at = ? WHERE id = ?`, raw, now, itemID); err != nil {
 		return fmt.Errorf("set custom field values: %w", err)
@@ -607,8 +887,6 @@ func (r *ItemRepository) SetCustomFieldValuesRawTx(tx database.Tx, itemID int, r
 	return nil
 }
 
-// DeleteByWorkspaceTx deletes every item in the given workspace. Used by user
-// offboarding to tear down personal workspaces.
 func (r *ItemRepository) DeleteByWorkspaceTx(tx database.Tx, workspaceID int) error {
 	if _, err := tx.Exec(`DELETE FROM items WHERE workspace_id = ?`, workspaceID); err != nil {
 		return fmt.Errorf("delete items by workspace: %w", err)
@@ -616,8 +894,6 @@ func (r *ItemRepository) DeleteByWorkspaceTx(tx database.Tx, workspaceID int) er
 	return nil
 }
 
-// ClearAssigneeForUserTx unassigns the given user from every item. Used by
-// user offboarding; intentionally does not bump updated_at.
 func (r *ItemRepository) ClearAssigneeForUserTx(tx database.Tx, userID int) error {
 	if _, err := tx.Exec(`UPDATE items SET assignee_id = NULL WHERE assignee_id = ?`, userID); err != nil {
 		return fmt.Errorf("clear assignee for user: %w", err)
@@ -625,10 +901,6 @@ func (r *ItemRepository) ClearAssigneeForUserTx(tx database.Tx, userID int) erro
 	return nil
 }
 
-// ListCustomFieldValuesByWorkspace streams every (item_id, custom_field_values)
-// pair in a workspace. Used by the migration analyzer which has to inspect
-// every item's stored field payload. The returned RowsIterator mirrors
-// database/sql's Rows so callers can scan without re-implementing streaming.
 func (r *ItemRepository) ListCustomFieldValuesByWorkspace(workspaceID int) (*sql.Rows, error) {
 	rows, err := r.db.Query(
 		`SELECT id, custom_field_values FROM items WHERE workspace_id = ?`,
@@ -640,23 +912,10 @@ func (r *ItemRepository) ListCustomFieldValuesByWorkspace(workspaceID int) (*sql
 	return rows, nil
 }
 
-// itemNumberAdvisoryLockClass namespaces the transaction-scoped advisory lock
-// taken by GetNextWorkspaceItemNumber (Postgres). pg_advisory_xact_lock's first
-// argument is a lock class; pairing it with the workspace id confines the lock
-// to per-workspace number allocation and avoids clashing with any other
-// advisory-lock keyspace.
 const itemNumberAdvisoryLockClass = 0x4954 // 'IT'
 
-// GetNextWorkspaceItemNumber returns the next item number for a workspace.
-//
-// On Postgres, allocation is serialized per workspace with a transaction-scoped
-// advisory lock so concurrent allocators don't all read the same MAX and
-// collide on items_workspace_id_workspace_item_number_key. A prior FOR UPDATE
-// on the current-max row couldn't cover an empty workspace (no row to lock), so
-// the first batch of concurrent inserts exhausted the unique-violation retry
-// budget; the advisory lock holds even when no row exists yet. SQLite needs no
-// lock — its global writer lock already serializes writing transactions.
-// Mirrors GenerateFracIndexForNewItem.
+// GetNextWorkspaceItemNumber serializes Postgres allocation per workspace with
+// an advisory lock; SQLite's writer lock already provides the needed isolation.
 func (r *ItemRepository) GetNextWorkspaceItemNumber(tx database.Tx, workspaceID int) (int, error) {
 	// Serialize per-workspace number assignment on Postgres. MAX+1 alone races:
 	// `ORDER BY ... DESC LIMIT 1 FOR UPDATE` has no row to lock on a fresh
@@ -674,45 +933,89 @@ func (r *ItemRepository) GetNextWorkspaceItemNumber(tx database.Tx, workspaceID 
 			return 0, fmt.Errorf("failed to acquire item-number lock: %w", err)
 		}
 	}
-	q := `
-		SELECT workspace_item_number
-		FROM items
-		WHERE workspace_id = ?
-		ORDER BY workspace_item_number DESC
-		LIMIT 1`
-	var maxNumber sql.NullInt64
-	err := tx.QueryRow(q, workspaceID).Scan(&maxNumber)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("failed to get next item number: %w", err)
+	// Read each indexed maximum independently instead of materializing and
+	// sorting the union of every item and reservation in the workspace.
+	var maxItem, maxReservation sql.NullInt64
+	if err := tx.QueryRow(
+		`SELECT MAX(workspace_item_number) FROM items WHERE workspace_id = ?`,
+		workspaceID,
+	).Scan(&maxItem); err != nil {
+		return 0, fmt.Errorf("failed to get max item number: %w", err)
 	}
-	if !maxNumber.Valid {
-		return 1, nil
+	if err := tx.QueryRow(
+		`SELECT MAX(workspace_item_number) FROM item_key_reservations WHERE workspace_id = ?`,
+		workspaceID,
+	).Scan(&maxReservation); err != nil {
+		return 0, fmt.Errorf("failed to get max reserved item number: %w", err)
 	}
-	return int(maxNumber.Int64) + 1, nil
+	maxNumber := int64(0)
+	if maxItem.Valid && maxItem.Int64 > maxNumber {
+		maxNumber = maxItem.Int64
+	}
+	if maxReservation.Valid && maxReservation.Int64 > maxNumber {
+		maxNumber = maxReservation.Int64
+	}
+	return int(maxNumber + 1), nil
 }
 
-// Create inserts a new item and returns its ID
+// Create inserts an item in a caller-owned transaction. It is the single
+// items-row insert: every creation path (services.CreateItem, workspace clone,
+// and the CreateWithRetry wrapper) goes through it, so all callers write the
+// same columns. WorkspaceItemNumber, FracIndex, and the timestamps are honored
+// when set (imports backdate rows; clone pins numbers and ranks) and defaulted
+// otherwise.
 func (r *ItemRepository) Create(tx database.Tx, item *models.Item) (int, error) {
+	if err := acquireGlobalRankMutationLock(tx, r.db.GetDriverName()); err != nil {
+		return 0, err
+	}
 	customFieldValuesJSON, err := marshalCustomFields(item.CustomFieldValues)
 	if err != nil {
 		return 0, err
 	}
+	virtualFieldDataJSON, err := marshalCustomFields(item.VirtualFieldData)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal virtual field data: %w", err)
+	}
+	fracIndex := item.FracIndex
+	if fracIndex == nil || *fracIndex == "" {
+		generated, err := GenerateFracIndexForNewItem(tx, r.db.GetDriverName())
+		if err != nil {
+			return 0, fmt.Errorf("failed to generate frac_index: %w", err)
+		}
+		fracIndex = &generated
+	}
 
 	now := time.Now()
+	createdAt := item.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	updatedAt := item.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	lastActiveAt := item.LastActiveAt
+	if lastActiveAt.IsZero() {
+		lastActiveAt = updatedAt
+	}
+
 	var id int64
 	err = tx.QueryRow(`
 		INSERT INTO items (
-			workspace_id, workspace_item_number, item_type_id, title, description, status_id,
-			priority_id, due_date, start_date, end_date, is_task, iteration_id, project_id, inherit_project,
-			assignee_id, creator_id, custom_field_values, parent_id, related_work_item_id,
-			story_points, estimate_minutes, frac_index, created_at, updated_at, last_active_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+			workspace_id, workspace_item_number, item_type_id, title, description, status_id, priority_id, is_task,
+			iteration_id, project_id, inherit_project, time_project_id, assignee_id, team_id, reporter_id, creator_id, creator_portal_customer_id,
+			channel_id, request_type_id, intake_id, portal_org_shared, due_date, start_date, end_date, related_work_item_id,
+			story_points, estimate_minutes, custom_field_values, virtual_field_data, parent_id,
+			frac_index, created_at, updated_at, last_active_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
 	`,
 		item.WorkspaceID, item.WorkspaceItemNumber, item.ItemTypeID, item.Title, item.Description,
-		item.StatusID, item.PriorityID, item.DueDate, item.StartDate, item.EndDate, item.IsTask,
-		item.IterationID, item.ProjectID, item.InheritProject, item.AssigneeID, item.CreatorID,
-		customFieldValuesJSON, item.ParentID, item.RelatedWorkItemID,
-		item.StoryPoints, item.EstimateMinutes, item.FracIndex, now, now, now,
+		item.StatusID, item.PriorityID, item.IsTask, item.IterationID, item.ProjectID, item.InheritProject,
+		item.TimeProjectID, item.AssigneeID, item.TeamID, item.ReporterID, item.CreatorID, item.CreatorPortalCustomerID,
+		item.ChannelID, item.RequestTypeID, item.IntakeID, item.PortalOrgShared,
+		item.DueDate, item.StartDate, item.EndDate, item.RelatedWorkItemID,
+		item.StoryPoints, item.EstimateMinutes, customFieldValuesJSON, virtualFieldDataJSON, item.ParentID,
+		fracIndex, createdAt, updatedAt, lastActiveAt,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create item: %w", err)
@@ -721,7 +1024,6 @@ func (r *ItemRepository) Create(tx database.Tx, item *models.Item) (int, error) 
 	return int(id), nil
 }
 
-// Update updates an existing item
 func (r *ItemRepository) Update(tx database.Tx, item *models.Item) error {
 	customFieldValuesJSON, err := marshalCustomFields(item.CustomFieldValues)
 	if err != nil {
@@ -732,14 +1034,14 @@ func (r *ItemRepository) Update(tx database.Tx, item *models.Item) error {
 	_, err = tx.Exec(`
 		UPDATE items
 		SET workspace_id = ?, title = ?, description = ?, status_id = ?, priority_id = ?,
-		    due_date = ?, start_date = ?, end_date = ?, iteration_id = ?, project_id = ?, inherit_project = ?,
-		    time_project_id = ?, assignee_id = ?, creator_id = ?, custom_field_values = ?, parent_id = ?,
+		    due_date = ?, start_date = ?, end_date = ?, is_task = ?, iteration_id = ?, project_id = ?, inherit_project = ?,
+		    time_project_id = ?, assignee_id = ?, team_id = ?, creator_id = ?, custom_field_values = ?, parent_id = ?,
 		    related_work_item_id = ?, story_points = ?, estimate_minutes = ?, updated_at = ?, last_active_at = ?
 		WHERE id = ?
 	`,
 		item.WorkspaceID, item.Title, item.Description, item.StatusID, item.PriorityID,
-		item.DueDate, item.StartDate, item.EndDate, item.IterationID, item.ProjectID, item.InheritProject,
-		item.TimeProjectID, item.AssigneeID, item.CreatorID, customFieldValuesJSON, item.ParentID,
+		item.DueDate, item.StartDate, item.EndDate, item.IsTask, item.IterationID, item.ProjectID, item.InheritProject,
+		item.TimeProjectID, item.AssigneeID, item.TeamID, item.CreatorID, customFieldValuesJSON, item.ParentID,
 		item.RelatedWorkItemID, item.StoryPoints, item.EstimateMinutes, now, now, item.ID,
 	)
 
@@ -755,43 +1057,42 @@ var allowedItemColumns = map[string]bool{
 	"title": true, "description": true, "status_id": true, "priority_id": true,
 	"due_date": true, "start_date": true, "end_date": true,
 	"iteration_id": true, "project_id": true, "inherit_project": true,
-	"assignee_id": true, "creator_id": true, "custom_field_values": true,
+	"assignee_id": true, "team_id": true, "creator_id": true, "custom_field_values": true,
 	"parent_id": true, "related_work_item_id": true, "item_type_id": true,
 	"frac_index": true, "is_task": true, "time_project_id": true,
 	"story_points": true, "estimate_minutes": true,
 }
 
-// IsAllowedItemColumn reports whether col names a column on the items table
-// that is safe to interpolate into a query (used by callers that must build
-// dynamic SELECT/UPDATE statements, e.g., action nodes).
+// IsAllowedItemColumn reports whether col is safe for dynamic item queries.
 func IsAllowedItemColumn(col string) bool {
 	return allowedItemColumns[col]
 }
 
-// GetAllowedColumnValue returns one whitelisted items-table column value for
-// callers that need dynamic field access (for example action nodes). Keeping
-// the allowlist at the repository boundary prevents ad-hoc dynamic SELECTs
-// from spreading through services.
-func (r *ItemRepository) GetAllowedColumnValue(itemID int, col string) (interface{}, error) {
+// GetAllowedColumnValue reads one allowlisted item column.
+func (r *ItemRepository) GetAllowedColumnValue(itemID int, col string) (any, error) {
 	if !allowedItemColumns[col] {
 		return nil, fmt.Errorf("unknown item column: %s", col)
 	}
-	var val interface{}
+	var val any
 	if err := r.db.QueryRow(`SELECT `+col+` FROM items WHERE id = ?`, itemID).Scan(&val); err != nil {
 		return nil, fmt.Errorf("get item column %s: %w", col, err)
 	}
 	return val, nil
 }
 
-// UpdateFields updates only the specified columns of an item.
-// Keys must be valid item column names; unknown keys return an error.
-func (r *ItemRepository) UpdateFields(tx database.Tx, itemID int, fields map[string]interface{}) error {
+// UpdateFields updates only allowlisted item columns.
+func (r *ItemRepository) UpdateFields(tx database.Tx, itemID int, fields map[string]any) error {
 	if len(fields) == 0 {
 		return nil
 	}
+	if _, changesRank := fields["frac_index"]; changesRank {
+		if err := acquireGlobalRankMutationLock(tx, r.db.GetDriverName()); err != nil {
+			return err
+		}
+	}
 
 	setClauses := make([]string, 0, len(fields)+1)
-	args := make([]interface{}, 0, len(fields)+2)
+	args := make([]any, 0, len(fields)+2)
 
 	for col, val := range fields {
 		if !allowedItemColumns[col] {
@@ -818,16 +1119,11 @@ func (r *ItemRepository) UpdateFields(tx database.Tx, itemID int, fields map[str
 	return nil
 }
 
-// execer is the subset of database.Database / database.Tx that TouchActivity
-// needs, so callers can bump activity either inside a transaction or directly
-// on the pool (comment creation is non-transactional).
 type execer interface {
-	Exec(query string, args ...interface{}) (sql.Result, error)
+	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// TouchActivity bumps an item's last_active_at to mark recent activity (e.g. a
-// new comment) for the board's Bubble Mode sort. It deliberately leaves
-// updated_at untouched so "last edited"/change-log semantics stay distinct.
+// TouchActivity updates Bubble Mode recency without changing updated_at.
 func (r *ItemRepository) TouchActivity(exec execer, itemID int, now time.Time) error {
 	if _, err := exec.Exec("UPDATE items SET last_active_at = ? WHERE id = ?", now, itemID); err != nil {
 		return fmt.Errorf("failed to touch item activity: %w", err)
@@ -835,11 +1131,24 @@ func (r *ItemRepository) TouchActivity(exec execer, itemID int, now time.Time) e
 	return nil
 }
 
-// GetItemCustomFieldValue reads the current value for a single custom field
-// out of an item's custom_field_values JSON blob. Returns nil if the item has
-// no entry for that field. The value is returned as decoded from JSON
-// (string/float64/bool/map/slice).
-func (r *ItemRepository) GetItemCustomFieldValue(itemID, customFieldID int) (interface{}, error) {
+// TouchChanged marks a user-visible item change for delta sync and recency.
+func (r *ItemRepository) TouchChanged(exec execer, itemID int, now time.Time) error {
+	if _, err := exec.Exec(
+		"UPDATE items SET updated_at = ?, last_active_at = ? WHERE id = ?",
+		now, now, itemID,
+	); err != nil {
+		return fmt.Errorf("failed to touch changed item: %w", err)
+	}
+	return nil
+}
+
+// GetMilestoneIDs returns the IDs of the milestones attached to an item.
+func (r *ItemRepository) GetMilestoneIDs(itemID int) ([]int, error) {
+	return NewMilestoneAttachRepository(r.db).MilestoneIDsForItem(itemID)
+}
+
+// GetItemCustomFieldValue returns a decoded field value, or nil when absent.
+func (r *ItemRepository) GetItemCustomFieldValue(itemID, customFieldID int) (any, error) {
 	var raw sql.NullString
 	if err := r.db.QueryRow(`SELECT custom_field_values FROM items WHERE id = ?`, itemID).Scan(&raw); err != nil {
 		return nil, fmt.Errorf("load item custom_field_values: %w", err)
@@ -847,18 +1156,15 @@ func (r *ItemRepository) GetItemCustomFieldValue(itemID, customFieldID int) (int
 	if !raw.Valid || raw.String == "" {
 		return nil, nil
 	}
-	var values map[string]interface{}
+	var values map[string]any
 	if err := json.Unmarshal([]byte(raw.String), &values); err != nil {
 		return nil, nil //nolint:nilerr // treat malformed blob as "no value present"
 	}
 	return values[strconv.Itoa(customFieldID)], nil
 }
 
-// SetItemCustomFieldValue sets a single custom field entry inside an item's
-// custom_field_values JSON blob, preserving other entries. The caller is
-// responsible for validating that customFieldID refers to an existing field;
-// this method verifies existence to fail fast for obviously bogus IDs.
-func (r *ItemRepository) SetItemCustomFieldValue(tx database.Tx, itemID, customFieldID int, value interface{}) error {
+// SetItemCustomFieldValue updates one JSON field while preserving the others.
+func (r *ItemRepository) SetItemCustomFieldValue(tx database.Tx, itemID, customFieldID int, value any) error {
 	var exists int
 	if err := tx.QueryRow(`SELECT 1 FROM custom_field_definitions WHERE id = ?`, customFieldID).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -872,7 +1178,7 @@ func (r *ItemRepository) SetItemCustomFieldValue(tx database.Tx, itemID, customF
 		return fmt.Errorf("load item custom_field_values: %w", err)
 	}
 
-	values := make(map[string]interface{})
+	values := make(map[string]any)
 	if raw.Valid && raw.String != "" {
 		_ = json.Unmarshal([]byte(raw.String), &values)
 	}
@@ -889,7 +1195,6 @@ func (r *ItemRepository) SetItemCustomFieldValue(tx database.Tx, itemID, customF
 	return nil
 }
 
-// Delete removes an item by ID
 func (r *ItemRepository) Delete(tx database.Tx, id int) error {
 	_, err := tx.Exec("DELETE FROM items WHERE id = ?", id)
 	if err != nil {
@@ -898,7 +1203,6 @@ func (r *ItemRepository) Delete(tx database.Tx, id int) error {
 	return nil
 }
 
-// DeleteItemLinks removes all links where the item is source or target
 func (r *ItemRepository) DeleteItemLinks(tx database.Tx, itemID int) error {
 	_, err := tx.Exec(`
 		DELETE FROM item_links
@@ -910,7 +1214,6 @@ func (r *ItemRepository) DeleteItemLinks(tx database.Tx, itemID int) error {
 	return nil
 }
 
-// ClearWorklogItemReferences clears item references from worklogs
 func (r *ItemRepository) ClearWorklogItemReferences(tx database.Tx, itemID int) error {
 	_, err := tx.Exec("UPDATE time_worklogs SET item_id = NULL WHERE item_id = ?", itemID)
 	if err != nil {
@@ -919,7 +1222,6 @@ func (r *ItemRepository) ClearWorklogItemReferences(tx database.Tx, itemID int) 
 	return nil
 }
 
-// GetParentID returns the parent_id for an item
 func (r *ItemRepository) GetParentID(itemID int) (*int, error) {
 	var parentID sql.NullInt64
 	if err := r.scanItemColumn(itemID, "parent_id", "get parent id", &parentID); err != nil {
@@ -928,10 +1230,27 @@ func (r *ItemRepository) GetParentID(itemID int) (*int, error) {
 	return nullIntPtr(parentID), nil
 }
 
-// GetParentIDTx returns the parent_id for an item using the supplied
-// transaction, locking the row with FOR UPDATE on Postgres so a concurrent
-// writer cannot change the parent between the cycle check and the subsequent
-// update in the same transaction.
+// GetParentIDAndHierarchyLevel returns the stored parent and hierarchy level.
+func (r *ItemRepository) GetParentIDAndHierarchyLevel(itemID int) (parentID, hierarchyLevel *int, err error) {
+	var parent, level sql.NullInt64
+	err = r.db.QueryRow(`
+		SELECT i.parent_id, it.hierarchy_level
+		FROM items i
+		LEFT JOIN item_types it ON i.item_type_id = it.id
+		WHERE i.id = ?
+	`, itemID).Scan(&parent, &level)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("get parent and hierarchy level: %w", err)
+	}
+	assignNullableInt(&parentID, parent)
+	assignNullableInt(&hierarchyLevel, level)
+	return parentID, hierarchyLevel, nil
+}
+
+// GetParentIDTx locks and reads the parent inside the supplied transaction.
 func (r *ItemRepository) GetParentIDTx(tx database.Tx, itemID int) (*int, error) {
 	query := `SELECT parent_id FROM items WHERE id = ?`
 	if r.db.GetDriverName() == "postgres" {
@@ -944,7 +1263,6 @@ func (r *ItemRepository) GetParentIDTx(tx database.Tx, itemID int) (*int, error)
 	return nullIntPtr(parentID), nil
 }
 
-// Exists checks if an item exists
 func (r *ItemRepository) Exists(id int) (bool, error) {
 	var exists bool
 	err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM items WHERE id = ?)", id).Scan(&exists)
@@ -954,9 +1272,7 @@ func (r *ItemRepository) Exists(id int) (bool, error) {
 	return exists, nil
 }
 
-// GetCalendarData returns an item's calendar_data payload along with its workspace id,
-// which callers need to authorize the caller against the item's workspace.
-// A row with NULL calendar_data returns a non-valid sql.NullString.
+// GetCalendarData returns calendar data and its workspace for authorization.
 func (r *ItemRepository) GetCalendarData(itemID int) (sql.NullString, int, error) {
 	var data sql.NullString
 	var workspaceID int
@@ -970,7 +1286,6 @@ func (r *ItemRepository) GetCalendarData(itemID int) (sql.NullString, int, error
 	return data, workspaceID, nil
 }
 
-// UpdateCalendarData replaces an item's calendar_data payload.
 func (r *ItemRepository) UpdateCalendarData(itemID int, data string, updatedAt time.Time) error {
 	result, err := r.db.ExecWrite("UPDATE items SET calendar_data = ?, updated_at = ? WHERE id = ?", data, updatedAt, itemID)
 	if err != nil {
@@ -982,10 +1297,6 @@ func (r *ItemRepository) UpdateCalendarData(itemID int, data string, updatedAt t
 	return nil
 }
 
-// itemCountableColumns is the allow-list of columns the CountByField method
-// may filter on. This keeps the column name out of dynamic SQL construction
-// (structurally prevents injection) while covering the handful of "is this
-// still in use?" checks that handlers need before delete/demote.
 var itemCountableColumns = map[string]bool{
 	"status_id":       true,
 	"priority_id":     true,
@@ -997,10 +1308,8 @@ var itemCountableColumns = map[string]bool{
 	"workspace_id":    true,
 }
 
-// CountByField returns the number of items where the given column equals value.
-// The column name must be in itemCountableColumns — unknown columns produce an
-// error rather than a dynamic query, so SQL injection is structurally impossible.
-func (r *ItemRepository) CountByField(column string, value interface{}) (int, error) {
+// CountByField counts items matching an allowlisted column value.
+func (r *ItemRepository) CountByField(column string, value any) (int, error) {
 	if !itemCountableColumns[column] {
 		return 0, fmt.Errorf("CountByField: column %q is not in the allow-list", column)
 	}
@@ -1014,8 +1323,7 @@ func (r *ItemRepository) CountByField(column string, value interface{}) (int, er
 	return count, nil
 }
 
-// FindIDByKeyAndNumber resolves a "KEY-NUMBER" item reference (e.g. "TEST-42")
-// to an internal item ID. The workspace key comparison is case-insensitive.
+// FindIDByKeyAndNumber resolves a case-insensitive KEY-NUMBER reference.
 func (r *ItemRepository) FindIDByKeyAndNumber(workspaceKey string, itemNumber int) (int, error) {
 	var id int
 	err := r.db.QueryRow(
@@ -1028,8 +1336,7 @@ func (r *ItemRepository) FindIDByKeyAndNumber(workspaceKey string, itemNumber in
 	return id, nil
 }
 
-// GetItemKey returns the "KEY-NUMBER" display key for an item (e.g. "WI-42").
-// Returns ErrNotFound when the item does not exist.
+// GetItemKey returns an item's KEY-NUMBER display key.
 func (r *ItemRepository) GetItemKey(itemID int) (string, error) {
 	var workspaceKey string
 	var itemNumber int
@@ -1045,17 +1352,13 @@ func (r *ItemRepository) GetItemKey(itemID int) (string, error) {
 	return fmt.Sprintf("%s-%d", workspaceKey, itemNumber), nil
 }
 
-// itemUserRefColumns lists the read-only user-reference columns on items that
-// resolvers (e.g. approval steps) may select dynamically. Kept separate from
-// allowedItemColumns because that list also gates writes via UpdateFields.
 var itemUserRefColumns = map[string]bool{
 	"assignee_id": true,
 	"creator_id":  true,
 	"reporter_id": true,
 }
 
-// GetUserFieldTx returns the given user-reference column of an item inside a
-// transaction. Returns nil (without error) when the column is NULL.
+// GetUserFieldTx reads an allowlisted user-reference column inside a transaction.
 func (r *ItemRepository) GetUserFieldTx(ctx context.Context, tx database.Tx, itemID int, col string) (*int, error) {
 	if !itemUserRefColumns[col] {
 		return nil, fmt.Errorf("unknown item user column: %s", col)
@@ -1067,11 +1370,7 @@ func (r *ItemRepository) GetUserFieldTx(ctx context.Context, tx database.Tx, ite
 	return nullIntPtr(nid), nil
 }
 
-// FindIDByKeyAndNumberInWorkspace resolves an item by workspace key + number,
-// additionally constrained to the given workspace — the key must belong to
-// that workspace or the lookup returns ErrNotFound. Used by SCM sync, where
-// commit/PR references may only resolve inside the repository's bound
-// workspace.
+// FindIDByKeyAndNumberInWorkspace constrains KEY-NUMBER lookup to one workspace.
 func (r *ItemRepository) FindIDByKeyAndNumberInWorkspace(workspaceID int, workspaceKey string, itemNumber int) (int, error) {
 	var id int
 	err := r.db.QueryRow(
@@ -1084,9 +1383,7 @@ func (r *ItemRepository) FindIDByKeyAndNumberInWorkspace(workspaceID int, worksp
 	return id, nil
 }
 
-// GetFracIndex returns the fractional-index (used for drag-and-drop ordering)
-// of an item. Returns nil when the column is NULL; ErrNotFound when the item
-// doesn't exist.
+// GetFracIndex returns an item's ordering key, or nil when unset.
 func (r *ItemRepository) GetFracIndex(itemID int) (*string, error) {
 	var fracIndex sql.NullString
 	if err := r.scanItemColumn(itemID, "frac_index", "get frac_index", &fracIndex); err != nil {
@@ -1095,9 +1392,7 @@ func (r *ItemRepository) GetFracIndex(itemID int) (*string, error) {
 	return nullStrPtr(fracIndex), nil
 }
 
-// ListItemsLinkedToTestResult returns the items associated with a given test
-// result, ordered by most recently linked first. Scoped to the workspace via
-// the test run so a stale result ID from a different workspace can't leak.
+// ListItemsLinkedToTestResult scopes links through the test run's workspace.
 func (r *ItemRepository) ListItemsLinkedToTestResult(resultID, workspaceID int) ([]models.Item, error) {
 	rows, err := r.db.Query(`
 		SELECT i.id, i.workspace_item_number, i.title, i.item_type_id, i.status_id, i.created_at
@@ -1124,16 +1419,12 @@ func (r *ItemRepository) ListItemsLinkedToTestResult(resultID, workspaceID int) 
 	return items, rows.Err()
 }
 
-// ItemCustomFields is the projection returned by ListItemCustomFieldsTx —
-// each row is an item id with its raw JSON-encoded custom_field_values.
 type ItemCustomFields struct {
 	ID      int
 	CFVJSON string
 }
 
-// ListItemCustomFieldsTx streams (id, custom_field_values) rows for every item
-// in the given workspaces within the provided transaction. NULL payloads are
-// coerced to "{}" so callers can unmarshal without an extra branch.
+// ListItemCustomFieldsTx streams item custom-field JSON, coercing NULL to "{}".
 func (r *ItemRepository) ListItemCustomFieldsTx(tx database.Tx, workspaceIDs []int) ([]ItemCustomFields, error) {
 	if len(workspaceIDs) == 0 {
 		return []ItemCustomFields{}, nil
@@ -1162,20 +1453,15 @@ func (r *ItemRepository) ListItemCustomFieldsTx(tx database.Tx, workspaceIDs []i
 	return results, rows.Err()
 }
 
-// SearchLinkableItems returns a set of items whose title or description
-// matches the substring, scoped to the given workspaces and optionally
-// restricted to the given item types. Used by the link picker.
+// SearchLinkableItems searches linkable items within the given workspaces.
 func (r *ItemRepository) SearchLinkableItems(query string, workspaceIDs, itemTypeIDs []int, limit int) ([]models.LinkableItem, error) {
 	if len(workspaceIDs) == 0 {
 		return []models.LinkableItem{}, nil
 	}
-	wsPlaceholders := make([]string, len(workspaceIDs))
-	args := []interface{}{}
-	args = append(args, "%"+query+"%", "%"+query+"%")
-	for i, id := range workspaceIDs {
-		wsPlaceholders[i] = "?"
-		args = append(args, id)
-	}
+	whereClause, args := r.buildWhereClause(ItemListParams{
+		WorkspaceIDs: workspaceIDs,
+		Filters:      itemSearchFilters(query),
+	})
 
 	itemTypeFilter := ""
 	if len(itemTypeIDs) > 0 {
@@ -1195,20 +1481,23 @@ func (r *ItemRepository) SearchLinkableItems(query string, workspaceIDs, itemTyp
 			COALESCE(i.description, '') AS description,
 			i.workspace_id,
 			w.name AS workspace_name,
+			w.key AS workspace_key,
+			i.workspace_item_number,
 			COALESCE(s.name, '') AS status_name,
 			COALESCE(p.name, '') AS priority_name,
 			i.item_type_id,
-			COALESCE(it.name, '') AS item_type_name
+			COALESCE(it.name, '') AS item_type_name,
+			COALESCE(it.icon, '') AS item_type_icon,
+			COALESCE(it.color, '') AS item_type_color
 		FROM items i
 		LEFT JOIN workspaces w ON i.workspace_id = w.id
 		LEFT JOIN statuses s ON i.status_id = s.id
 		LEFT JOIN priorities p ON i.priority_id = p.id
 		LEFT JOIN item_types it ON i.item_type_id = it.id
-		WHERE (i.title LIKE ? OR i.description LIKE ?)
-		  AND i.workspace_id IN (%s)%s
+		%s%s
 		ORDER BY i.title
 		LIMIT ?
-	`, strings.Join(wsPlaceholders, ","), itemTypeFilter)
+	`, whereClause, itemTypeFilter)
 
 	rows, err := r.db.Query(sqlQuery, args...)
 	if err != nil {
@@ -1219,14 +1508,14 @@ func (r *ItemRepository) SearchLinkableItems(query string, workspaceIDs, itemTyp
 	items := []models.LinkableItem{}
 	for rows.Next() {
 		var item models.LinkableItem
-		var description, workspaceName, statusName, priorityName, itemTypeName sql.NullString
-		var workspaceID, itemTypeID sql.NullInt64
+		var description, workspaceName, workspaceKey, statusName, priorityName, itemTypeName, itemTypeIcon, itemTypeColor sql.NullString
+		var workspaceID, workspaceItemNumber, itemTypeID sql.NullInt64
 
 		if err := rows.Scan(
 			&item.ID, &item.Title, &description,
-			&workspaceID, &workspaceName,
+			&workspaceID, &workspaceName, &workspaceKey, &workspaceItemNumber,
 			&statusName, &priorityName,
-			&itemTypeID, &itemTypeName,
+			&itemTypeID, &itemTypeName, &itemTypeIcon, &itemTypeColor,
 		); err != nil {
 			return nil, err
 		}
@@ -1237,6 +1526,11 @@ func (r *ItemRepository) SearchLinkableItems(query string, workspaceIDs, itemTyp
 			item.WorkspaceID = &v
 		}
 		item.WorkspaceName = workspaceName.String
+		item.WorkspaceKey = workspaceKey.String
+		if workspaceItemNumber.Valid {
+			v := int(workspaceItemNumber.Int64)
+			item.WorkspaceItemNumber = &v
+		}
 		item.Status = statusName.String
 		item.Priority = priorityName.String
 		if itemTypeID.Valid {
@@ -1244,16 +1538,14 @@ func (r *ItemRepository) SearchLinkableItems(query string, workspaceIDs, itemTyp
 			item.ItemTypeID = &v
 		}
 		item.ItemTypeName = itemTypeName.String
+		item.ItemTypeIcon = itemTypeIcon.String
+		item.ItemTypeColor = itemTypeColor.String
 		item.Type = "item"
 		items = append(items, item)
 	}
 	return items, rows.Err()
 }
 
-// PublicItem is the projection returned by FindPublicItemByKeyAndNumber. It
-// carries the visual metadata (status category color, item-type icon/color)
-// the public board view needs but FindByIDWithDetails doesn't surface on the
-// regular Item model.
 type PublicItem struct {
 	ID             int
 	Title          string
@@ -1273,9 +1565,6 @@ type PublicItem struct {
 	CreatedAt      string
 }
 
-// FindPublicItemByKeyAndNumber returns the visual projection of an item
-// identified by (workspace_key, workspace_item_number). Used by the public
-// board view which has its own color/icon needs.
 func (r *ItemRepository) FindPublicItemByKeyAndNumber(workspaceKey string, itemNumber int) (*PublicItem, error) {
 	var p PublicItem
 	var statusName, statusColor sql.NullString
@@ -1330,16 +1619,12 @@ func (r *ItemRepository) FindPublicItemByKeyAndNumber(workspaceKey string, itemN
 	return &p, nil
 }
 
-// KeyReference maps an "ITEMKEY-NUMBER" string to its item id and workspace id.
 type KeyReference struct {
 	ItemKey     string
 	ItemID      int
 	WorkspaceID int
 }
 
-// ResolveItemKeyReferences resolves a set of "ITEMKEY-NUMBER" strings to the
-// underlying item ids and workspace ids. Unknown keys are silently omitted.
-// Returns an empty slice when keys is empty.
 func (r *ItemRepository) ResolveItemKeyReferences(keys []string) ([]KeyReference, error) {
 	if len(keys) == 0 {
 		return []KeyReference{}, nil
@@ -1366,8 +1651,35 @@ func (r *ItemRepository) ResolveItemKeyReferences(keys []string) ([]KeyReference
 	return results, rows.Err()
 }
 
-// CandidateItem is the projection returned by ListOpenCandidatesInWorkspace —
-// the fields the AI link-suggestion prompt needs to describe a candidate.
+func (r *ItemRepository) ResolveItemKeyReferencesInWorkspaces(keys []string, workspaceIDs []int) ([]KeyReference, error) {
+	if len(keys) == 0 || len(workspaceIDs) == 0 {
+		return []KeyReference{}, nil
+	}
+	keyPlaceholders, args := inPlaceholders(keys)
+	workspacePlaceholders, workspaceArgs := inPlaceholders(workspaceIDs)
+	args = append(args, workspaceArgs...)
+	query := `SELECT w.key || '-' || CAST(i.workspace_item_number AS TEXT) as item_key, i.id, i.workspace_id
+		FROM items i
+		JOIN workspaces w ON i.workspace_id = w.id
+		WHERE w.key || '-' || CAST(i.workspace_item_number AS TEXT) IN (` + keyPlaceholders + `)
+		  AND i.workspace_id IN (` + workspacePlaceholders + `)`
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve scoped item keys: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	results := []KeyReference{}
+	for rows.Next() {
+		var ref KeyReference
+		if err := rows.Scan(&ref.ItemKey, &ref.ItemID, &ref.WorkspaceID); err != nil {
+			return nil, fmt.Errorf("scan scoped key reference: %w", err)
+		}
+		results = append(results, ref)
+	}
+	return results, rows.Err()
+}
+
 type CandidateItem struct {
 	ID          int
 	ItemKey     string
@@ -1376,9 +1688,6 @@ type CandidateItem struct {
 	Description string
 }
 
-// ListOpenCandidatesInWorkspace returns up to `limit` non-completed items in
-// the given workspace, excluding excludeID. Ordered by creation time desc so
-// the most recently created items surface first.
 func (r *ItemRepository) ListOpenCandidatesInWorkspace(workspaceID, excludeID, limit int) ([]CandidateItem, error) {
 	rows, err := r.db.Query(
 		`SELECT i.id, w.key || '-' || CAST(i.workspace_item_number AS TEXT) as item_key, i.title,
@@ -1408,8 +1717,6 @@ func (r *ItemRepository) ListOpenCandidatesInWorkspace(workspaceID, excludeID, l
 	return results, rows.Err()
 }
 
-// IterationItemInfo is the projection returned by ListIterationItems — the
-// fields used by the AI dependency analyzer prompt.
 type IterationItemInfo struct {
 	ID            int
 	Key           string
@@ -1425,20 +1732,18 @@ type IterationItemInfo struct {
 	IterationID   int
 }
 
-// ListIterationItems returns up to 100 items that live in any of the given
-// iterations and workspaces, ordered for deterministic prompt generation.
 func (r *ItemRepository) ListIterationItems(iterationIDs, workspaceIDs []int) ([]IterationItemInfo, error) {
 	if len(iterationIDs) == 0 || len(workspaceIDs) == 0 {
 		return []IterationItemInfo{}, nil
 	}
 	iterPlaceholders := make([]string, len(iterationIDs))
-	iterArgs := make([]interface{}, len(iterationIDs))
+	iterArgs := make([]any, len(iterationIDs))
 	for i, id := range iterationIDs {
 		iterPlaceholders[i] = "?"
 		iterArgs[i] = id
 	}
 	wsPlaceholders := make([]string, len(workspaceIDs))
-	wsArgs := make([]interface{}, len(workspaceIDs))
+	wsArgs := make([]any, len(workspaceIDs))
 	for i, id := range workspaceIDs {
 		wsPlaceholders[i] = "?"
 		wsArgs[i] = id
@@ -1465,7 +1770,7 @@ func (r *ItemRepository) ListIterationItems(iterationIDs, workspaceIDs []int) ([
 		strings.Join(iterPlaceholders, ","),
 		strings.Join(wsPlaceholders, ","))
 
-	args := make([]interface{}, 0, len(iterArgs)+len(wsArgs))
+	args := make([]any, 0, len(iterArgs)+len(wsArgs))
 	args = append(args, iterArgs...)
 	args = append(args, wsArgs...)
 
@@ -1489,19 +1794,13 @@ func (r *ItemRepository) ListIterationItems(iterationIDs, workspaceIDs []int) ([
 	return results, rows.Err()
 }
 
-// ItemWithCalendar augments a bare Item with the parsed calendar schedule
-// entries and the owning workspace's is_personal flag — the shape needed by
-// the scheduled-items endpoint.
 type ItemWithCalendar struct {
 	Item            models.Item
 	CalendarEntries []models.CalendarScheduleEntry
 	IsPersonal      bool
 }
 
-// ListItemsWithCalendarData returns every item in the given workspaces whose
-// calendar_data column is populated, each with parsed entries and the
-// workspace's is_personal flag. Items with malformed calendar JSON are
-// skipped (logged by the caller, not at the repository boundary).
+// ListItemsWithCalendarData returns parsed schedules for populated calendar rows.
 func (r *ItemRepository) ListItemsWithCalendarData(workspaceIDs []int) ([]ItemWithCalendar, error) {
 	if len(workspaceIDs) == 0 {
 		return []ItemWithCalendar{}, nil
@@ -1565,11 +1864,8 @@ func (r *ItemRepository) ListItemsWithCalendarData(workspaceIDs []int) ([]ItemWi
 	return results, rows.Err()
 }
 
-// FindByIDsWithDetails returns items for a set of IDs, each populated the same
-// way FindByIDWithDetails populates a single item, in a single IN (...) query
-// plus one batched milestone attach. IDs not found are silently omitted. The
-// result order is not guaranteed — callers index by item ID. Returns an empty
-// slice (not nil) when ids is empty.
+// FindByIDsWithDetails loads joined items in one query plus a batched milestone
+// attach. Missing IDs are omitted and result order is unspecified.
 func (r *ItemRepository) FindByIDsWithDetails(ids []int) ([]*models.Item, error) {
 	if len(ids) == 0 {
 		return []*models.Item{}, nil
@@ -1581,8 +1877,7 @@ func (r *ItemRepository) FindByIDsWithDetails(ids []int) ([]*models.Item, error)
 	}
 	defer func() { _ = rows.Close() }()
 
-	// Materialize into a value slice so the batched milestone attach can mutate
-	// in place, then return pointers into it.
+	// Materialize values before the batched milestone attach populates pointers.
 	scanned := make([]models.Item, 0, len(ids))
 	for rows.Next() {
 		item, _, err := scanItemDetailsRow(rows)
@@ -1595,8 +1890,7 @@ func (r *ItemRepository) FindByIDsWithDetails(ids []int) ([]*models.Item, error)
 		return nil, fmt.Errorf("iterate items with details: %w", err)
 	}
 
-	// Batched milestone attach — one round trip for the whole set, mirroring
-	// the per-item eager-load in FindByIDWithWorkspaceStatus.
+	// Attach milestones in one round trip for the full result set.
 	if err := NewMilestoneAttachRepository(r.db).LoadForItems(scanned); err != nil {
 		slog.Warn("failed to attach milestones for batch items", slog.Any("error", err))
 	}
@@ -1608,168 +1902,27 @@ func (r *ItemRepository) FindByIDsWithDetails(ids []int) ([]*models.Item, error)
 	return items, nil
 }
 
-// --- Homepage aggregations --------------------------------------------------
+// Homepage aggregations.
 
-// CountActiveNonPersonalItems returns the number of items in active, non-
-// personal workspaces. Used by the homepage onboarding banner.
-func (r *ItemRepository) CountActiveNonPersonalItems() (int, error) {
+// CountNonPersonalByWorkspaceIDs returns the non-personal item count in the
+// given workspaces.
+func (r *ItemRepository) CountNonPersonalByWorkspaceIDs(workspaceIDs []int) (int, error) {
+	if len(workspaceIDs) == 0 {
+		return 0, nil
+	}
+	placeholders, args := inPlaceholders(workspaceIDs)
 	var count int
 	err := r.db.QueryRow(`
 		SELECT COUNT(*)
 		FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
-		WHERE (w.is_personal = false OR w.is_personal IS NULL)
-	`).Scan(&count)
+		JOIN workspaces w ON w.id = i.workspace_id
+		WHERE i.workspace_id IN (`+placeholders+`)
+		  AND (w.is_personal = false OR w.is_personal IS NULL)
+	`, args...).Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("count non-personal items: %w", err)
+		return 0, fmt.Errorf("count visible items: %w", err)
 	}
 	return count, nil
-}
-
-// HomepageItemSummary carries the subset of item metadata the homepage
-// activity widget needs. MilestoneIDs is the full set of milestones the item
-// belongs to, so the caller can aggregate by milestone without a second round
-// trip.
-type HomepageItemSummary struct {
-	ItemID              int
-	WorkspaceID         int
-	WorkspaceItemNumber int
-	Title               string
-	Status              string
-	StatusColor         *string
-	PriorityID          *int
-	PriorityName        *string
-	PriorityColor       *string
-	WorkspaceKey        string
-	MilestoneIDs        []int
-}
-
-// ListHomepageItemSummaries returns the homepage widget's item summaries for
-// the given item IDs. Missing IDs are silently omitted. The result order is
-// not guaranteed — callers index by ItemID.
-func (r *ItemRepository) ListHomepageItemSummaries(itemIDs []int) ([]HomepageItemSummary, error) {
-	if len(itemIDs) == 0 {
-		return []HomepageItemSummary{}, nil
-	}
-	placeholders, args := inPlaceholders(itemIDs)
-	query := `
-		SELECT i.id, i.workspace_id, i.workspace_item_number, i.title,
-		       COALESCE(s.name, 'Unknown') as status,
-		       sc.color as status_color,
-		       i.priority_id, p.name as priority_name, p.color as priority_color,
-		       w.key as workspace_key
-		FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
-		LEFT JOIN statuses s ON i.status_id = s.id
-		LEFT JOIN status_categories sc ON s.category_id = sc.id
-		LEFT JOIN priorities p ON i.priority_id = p.id
-		WHERE i.id IN (` + placeholders + `)`
-
-	rows, err := r.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list homepage items: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	results := []HomepageItemSummary{}
-	resultIdx := map[int]int{}
-	for rows.Next() {
-		var s HomepageItemSummary
-		var priorityID sql.NullInt64
-		var statusColor, priorityName, priorityColor sql.NullString
-		if err := rows.Scan(
-			&s.ItemID, &s.WorkspaceID, &s.WorkspaceItemNumber, &s.Title,
-			&s.Status, &statusColor,
-			&priorityID, &priorityName, &priorityColor,
-			&s.WorkspaceKey,
-		); err != nil {
-			return nil, fmt.Errorf("scan homepage item: %w", err)
-		}
-		s.StatusColor = nullStrPtr(statusColor)
-		s.PriorityID = nullIntPtr(priorityID)
-		s.PriorityName = nullStrPtr(priorityName)
-		s.PriorityColor = nullStrPtr(priorityColor)
-		resultIdx[s.ItemID] = len(results)
-		results = append(results, s)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	if len(results) > 0 {
-		msPlaceholders, msArgs := inPlaceholders(itemIDs)
-		msRows, err := r.db.Query(`
-			SELECT item_id, milestone_id
-			FROM item_milestones
-			WHERE item_id IN (`+msPlaceholders+`)
-			ORDER BY milestone_id
-		`, msArgs...)
-		if err != nil {
-			return nil, fmt.Errorf("list homepage item milestones: %w", err)
-		}
-		defer func() { _ = msRows.Close() }()
-		for msRows.Next() {
-			var itemID, mID int
-			if err := msRows.Scan(&itemID, &mID); err != nil {
-				return nil, fmt.Errorf("scan homepage item milestone: %w", err)
-			}
-			if idx, ok := resultIdx[itemID]; ok {
-				results[idx].MilestoneIDs = append(results[idx].MilestoneIDs, mID)
-			}
-		}
-		if err := msRows.Err(); err != nil {
-			return nil, err
-		}
-	}
-
-	return results, nil
-}
-
-// TopMilestoneIDsForItems returns the `limit` most frequently referenced
-// milestone_id values among the given item IDs, ordered by frequency desc,
-// then ascending milestone_id for stability. With multi-milestone, every
-// (item, milestone) row in item_milestones counts once.
-func (r *ItemRepository) TopMilestoneIDsForItems(itemIDs []int, limit int) ([]int, error) {
-	if len(itemIDs) == 0 || limit <= 0 {
-		return []int{}, nil
-	}
-	placeholders, args := inPlaceholders(itemIDs)
-	query := `
-		SELECT milestone_id, COUNT(*) as freq
-		FROM item_milestones
-		WHERE item_id IN (` + placeholders + `)
-		GROUP BY milestone_id
-		ORDER BY freq DESC, milestone_id ASC
-		LIMIT ?`
-	args = append(args, limit)
-	rows, err := r.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("top milestone frequencies: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var ids []int
-	for rows.Next() {
-		var id int
-		var freq int
-		if err := rows.Scan(&id, &freq); err != nil {
-			return nil, fmt.Errorf("scan milestone freq: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-// HomepageMilestoneProgress is the per-milestone progress row returned by
-// HomepageMilestoneProgressByIDs. TargetDate and CategoryColor may be empty
-// when the milestone lacks a target date or category.
-type HomepageMilestoneProgress struct {
-	MilestoneID   int
-	MilestoneName string
-	TargetDate    *string
-	CategoryColor string
-	TotalItems    int
-	DoneItems     int
 }
 
 // ClearRelatedWorkItem removes a personal task's related work item reference.
@@ -1789,15 +1942,30 @@ func (r *ItemRepository) ClearRelatedWorkItem(itemID int) error {
 }
 
 // GetHistoryWithApprovals returns item history plus approval decision events as a single chronological feed.
-func (r *ItemRepository) GetHistoryWithApprovals(itemID int) ([]models.ItemHistory, error) {
+// Portal-customer actors resolve to their customer name; system rows have no
+// user and display through the empty-name fallback the frontend applies.
+func (r *ItemRepository) GetHistoryWithApprovals(itemID int, includeAgentOwner bool) ([]models.ItemHistory, error) {
+	// The metered model/tokens/cost for an agent-written change are deliberately
+	// NOT joined here: aggregating llm_usage is not scoped to the item, so doing
+	// it inline would scan the whole metering table on every history load, which
+	// is a hot path. The response carries only agent_run_id; the client fetches
+	// that run's usage on demand from the indexed per-run endpoint.
 	query := `
 		SELECT
 			ih.id, ih.item_id, ih.user_id, ih.changed_at, ih.field_name, ih.old_value, ih.new_value,
-			COALESCE(u.first_name || ' ' || u.last_name, u.username, '') as user_name,
-			COALESCE(u.email, '') as user_email,
-			COALESCE(u.is_agent, FALSE) AS is_agent
+			COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username, '') AS user_name,
+			COALESCE(u.email, '') AS user_email,
+			COALESCE(u.is_agent, FALSE) AS is_agent,
+			COALESCE(NULLIF(TRIM(COALESCE(owner.first_name, '') || ' ' || COALESCE(owner.last_name, '')), ''), owner.username, '') AS agent_owner_name,
+			ih.actor_kind,
+			ih.actor_portal_customer_id,
+			COALESCE(NULLIF(TRIM(pc.name), ''), pc.email, '') AS portal_customer_name,
+			COALESCE(ih.source, '') AS source,
+			ih.agent_run_id
 		FROM item_history ih
 		LEFT JOIN users u ON ih.user_id = u.id
+		LEFT JOIN users owner ON owner.id = u.agent_owner_user_id
+		LEFT JOIN portal_customers pc ON ih.actor_portal_customer_id = pc.id
 		WHERE ih.item_id = ?
 		UNION ALL
 		SELECT
@@ -1808,12 +1976,20 @@ func (r *ItemRepository) GetHistoryWithApprovals(itemID int) ([]models.ItemHisto
 			'approval_' || d.decision AS field_name,
 			NULL AS old_value,
 			d.comment AS new_value,
-			COALESCE(u.first_name || ' ' || u.last_name, u.username, 'System') AS user_name,
+			COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.username, '') AS user_name,
 			COALESCE(u.email, '') AS user_email,
-			COALESCE(u.is_agent, FALSE) AS is_agent
+			COALESCE(u.is_agent, FALSE) AS is_agent,
+			COALESCE(NULLIF(TRIM(COALESCE(owner.first_name, '') || ' ' || COALESCE(owner.last_name, '')), ''), owner.username, '') AS agent_owner_name,
+			CASE WHEN d.actor_portal_customer_id IS NOT NULL THEN 'portal_customer' ELSE 'user' END AS actor_kind,
+			d.actor_portal_customer_id,
+			COALESCE(NULLIF(TRIM(pc.name), ''), pc.email, '') AS portal_customer_name,
+			'' AS source,
+			NULL AS agent_run_id
 		FROM approval_decisions d
 		JOIN approval_requests ar ON ar.id = d.approval_request_id
 		LEFT JOIN users u ON u.id = d.actor_user_id
+		LEFT JOIN users owner ON owner.id = u.agent_owner_user_id
+		LEFT JOIN portal_customers pc ON d.actor_portal_customer_id = pc.id
 		WHERE ar.item_id = ?
 		ORDER BY changed_at DESC
 	`
@@ -1827,71 +2003,29 @@ func (r *ItemRepository) GetHistoryWithApprovals(itemID int) ([]models.ItemHisto
 	history := []models.ItemHistory{}
 	for rows.Next() {
 		var entry models.ItemHistory
-		if err := rows.Scan(&entry.ID, &entry.ItemID, &entry.UserID, &entry.ChangedAt, &entry.FieldName, &entry.OldValue, &entry.NewValue, &entry.UserName, &entry.UserEmail, &entry.IsAgent); err != nil {
+		var userID, portalCustomerID, runID sql.NullInt64
+		var actorKind sql.NullString
+		if err := rows.Scan(&entry.ID, &entry.ItemID, &userID, &entry.ChangedAt, &entry.FieldName, &entry.OldValue, &entry.NewValue, &entry.UserName, &entry.UserEmail, &entry.IsAgent, &entry.AgentOwnerName, &actorKind, &portalCustomerID, &entry.PortalCustomerName, &entry.Source, &runID); err != nil {
 			return nil, err
+		}
+		if userID.Valid {
+			entry.UserID = int(userID.Int64)
+		}
+		entry.ActorKind = actorKind.String
+		if portalCustomerID.Valid {
+			id := int(portalCustomerID.Int64)
+			entry.PortalCustomerID = &id
+		}
+		if runID.Valid {
+			v := int(runID.Int64)
+			entry.AgentRunID = &v
+		}
+		if !includeAgentOwner {
+			entry.AgentOwnerName = ""
 		}
 		history = append(history, entry)
 	}
 	return history, rows.Err()
-}
-
-func (r *ItemRepository) HomepageMilestoneProgressByIDs(milestoneIDs []int) ([]HomepageMilestoneProgress, error) {
-	if len(milestoneIDs) == 0 {
-		return []HomepageMilestoneProgress{}, nil
-	}
-	placeholders, args := inPlaceholders(milestoneIDs)
-	query := `
-		SELECT
-			m.id,
-			m.name,
-			m.target_date,
-			mc.color,
-			COUNT(i.id) as total_items,
-			SUM(CASE WHEN COALESCE(sc.is_completed, FALSE) = TRUE THEN 1 ELSE 0 END) as done_items
-		FROM milestones m
-		LEFT JOIN milestone_categories mc ON m.category_id = mc.id
-		LEFT JOIN item_milestones im ON im.milestone_id = m.id
-		LEFT JOIN items i ON i.id = im.item_id
-		LEFT JOIN statuses s ON i.status_id = s.id
-		LEFT JOIN status_categories sc ON s.category_id = sc.id
-		WHERE m.id IN (` + placeholders + `)
-		GROUP BY m.id, m.name, m.target_date, mc.color
-		ORDER BY m.id`
-
-	rows, err := r.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query milestone progress: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	results := []HomepageMilestoneProgress{}
-	for rows.Next() {
-		var progress HomepageMilestoneProgress
-		var targetDate, categoryColor sql.NullString
-		var doneItems sql.NullInt64
-		if err := rows.Scan(
-			&progress.MilestoneID,
-			&progress.MilestoneName,
-			&targetDate,
-			&categoryColor,
-			&progress.TotalItems,
-			&doneItems,
-		); err != nil {
-			return nil, fmt.Errorf("scan milestone progress: %w", err)
-		}
-		if targetDate.Valid {
-			v := targetDate.String
-			progress.TargetDate = &v
-		}
-		if categoryColor.Valid {
-			progress.CategoryColor = categoryColor.String
-		}
-		if doneItems.Valid {
-			progress.DoneItems = int(doneItems.Int64)
-		}
-		results = append(results, progress)
-	}
-	return results, rows.Err()
 }
 
 // GetCQLCustomFieldMap returns a lowercase-name → {ID, Kind, ...} map of every
@@ -1901,7 +2035,12 @@ func (r *ItemRepository) HomepageMilestoneProgressByIDs(milestoneIDs []int) ([]H
 // to the numeric JSON key used in items.custom_field_values. For linking fields,
 // also reads options to detect mirror fields and target-type constraints.
 func (r *ItemRepository) GetCQLCustomFieldMap() (cql.CustomFieldMap, error) {
-	rows, err := r.db.Query(`SELECT id, LOWER(name), field_type, COALESCE(options, '') FROM custom_field_definitions`)
+	return r.GetCQLCustomFieldMapContext(context.Background())
+}
+
+// GetCQLCustomFieldMapContext is the request-aware form of GetCQLCustomFieldMap.
+func (r *ItemRepository) GetCQLCustomFieldMapContext(ctx context.Context) (cql.CustomFieldMap, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id, LOWER(name), field_type, COALESCE(options, '') FROM custom_field_definitions`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query item custom fields: %w", err)
 	}

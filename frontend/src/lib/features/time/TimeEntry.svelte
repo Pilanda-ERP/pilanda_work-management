@@ -155,6 +155,7 @@
       keyboardHint="A"
       hotkeyConfig={{ key: toHotkeyString('timeEntry', 'openLog'), guard: () => !showTimeLogModal }}
       title={t('time.entry.addTimeEntry')}
+      dataTestid="time-log-open"
     >
       {t('time.logTime')}
     </Button>
@@ -254,14 +255,14 @@
     {#snippet item(worklog)}
       {#if worklog.item_title && worklog.workspace_key && worklog.workspace_item_number}
         <button
-          class="font-medium text-blue-600 hover:text-blue-800 cursor-pointer text-left hover:underline text-sm"
+          class="font-medium text-ds-text-link hover:text-ds-text-link-hovered cursor-pointer text-left hover:underline text-sm"
           onclick={() => navigateToItem(worklog.workspace_id, worklog.item_id)}
           title={t('time.entry.clickToView', { key: worklog.workspace_key, number: worklog.workspace_item_number })}
         >
           {worklog.workspace_key}-{worklog.workspace_item_number}: {worklog.item_title}
         </button>
       {:else}
-        <span class="text-gray-400 text-xs">—</span>
+        <span class="text-ds-text-subtlest text-xs">—</span>
       {/if}
     {/snippet}
 

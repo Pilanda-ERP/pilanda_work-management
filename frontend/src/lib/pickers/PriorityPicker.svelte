@@ -5,6 +5,7 @@
   import { priorityIconMap } from '../utils/icons.js';
   import ItemPicker from './ItemPicker.svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import { workspaceDataStore } from '../stores/workspaceDataStore.svelte.js';
 
   // Props
   let {
@@ -58,17 +59,11 @@
       loading = true;
       error = null;
 
-      // Get workspace to find its configuration set
-      const workspace = await api.workspaces.get(workspaceId);
-
-      if (workspace.configuration_set_id) {
-        // Load priorities from configuration set
-        const configSet = await api.configurationSets.get(workspace.configuration_set_id);
-        priorities = configSet.priorities_detailed || [];
-      } else {
-        // No configuration set - load all priorities
-        priorities = await api.priorities.getAll();
-      }
+      const config = await workspaceDataStore.screenConfig(null);
+      const configuredPriorities = config?.priorities || [];
+      priorities = configuredPriorities.length > 0
+        ? configuredPriorities
+        : await api.priorities.getAll();
 
       // Sort by sort_order
       priorities = priorities.sort((a, b) => a.sort_order - b.sort_order);
@@ -100,15 +95,15 @@
 </script>
 
 {#if loading}
-  <div class="w-full px-3 py-2 text-sm text-gray-500 border rounded" style="background-color: var(--ds-background-input); border-color: var(--ds-border);">
+  <div class="w-full px-3 py-2 text-sm text-ds-text-subtle border rounded" style="background-color: var(--ds-background-input); border-color: var(--ds-border);">
     {t('pickers.loadingPriorities')}
   </div>
 {:else if error}
-  <div class="w-full px-3 py-2 text-sm text-red-500 border rounded" style="background-color: var(--ds-background-input); border-color: var(--ds-border);">
+  <div class="w-full px-3 py-2 text-sm text-ds-text-danger border rounded" style="background-color: var(--ds-background-input); border-color: var(--ds-border);">
     {error}
   </div>
 {:else if priorities.length === 0}
-  <div class="w-full px-3 py-2 text-sm text-gray-500 border rounded" style="background-color: var(--ds-background-input); border-color: var(--ds-border);">
+  <div class="w-full px-3 py-2 text-sm text-ds-text-subtle border rounded" style="background-color: var(--ds-background-input); border-color: var(--ds-border);">
     {t('pickers.noPrioritiesConfigured')}
   </div>
 {:else}

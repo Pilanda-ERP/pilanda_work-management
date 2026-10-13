@@ -5,11 +5,21 @@
  */
 import { api } from '../api.js';
 import { createSearchFilteredFields } from '../utils/fieldSearchUtils.js';
-import { canSystemFieldBeRequiredOnCreate } from '../utils/screenFields.js';
+import {
+  ALWAYS_VISIBLE_SYSTEM_FIELDS,
+  canSystemFieldBeRequiredOnCreate,
+  isAlwaysVisibleSystemField,
+} from '../utils/screenFields.js';
+import { DragStateStore } from './DragStateStore.svelte.js';
 import { getSystemFieldName, SYSTEM_FIELDS } from './fieldConfig.js';
-import { applyDragStateMixin } from './storeUtils.js';
 
-class ScreenEditorStore {
+const ALWAYS_VISIBLE_SYSTEM_FIELD_DEFAULTS = {
+  title: { is_required: true, field_width: 'full' },
+  description: { is_required: false, field_width: 'full' },
+  status: { is_required: false, field_width: 'half' },
+};
+
+class ScreenEditorStore extends DragStateStore {
   // === Screens List ===
   screens = $state([]);
   loading = $state(false);
@@ -32,28 +42,6 @@ class ScreenEditorStore {
 
   // === Field Search ===
   fieldSearchQuery = $state('');
-
-  // === Drag State ===
-  draggedField = $state(null);
-  fieldDragState = $state(new Map());
-
-  // === Drag state methods (defined here so TS sees them; mixin would otherwise add at runtime) ===
-  setDragState(fieldId, state) {
-    this.fieldDragState.set(fieldId, state);
-    this.fieldDragState = new Map(this.fieldDragState);
-  }
-  clearDragState() {
-    this.fieldDragState.forEach((_, id) => {
-      this.fieldDragState.set(id, { closestEdge: null });
-    });
-    this.fieldDragState = new Map(this.fieldDragState);
-  }
-  setDraggedField(field) {
-    this.draggedField = field;
-  }
-  clearDraggedField() {
-    this.draggedField = null;
-  }
 
   // === Field Width Options ===
   fieldWidths = [
@@ -101,11 +89,8 @@ class ScreenEditorStore {
       )
       .filter(
         (field) =>
-          // Filter out Title and Status fields since they're always auto-added
-          !(
-            field.type === 'system' &&
-            (field.identifier === 'title' || field.identifier === 'status')
-          )
+          // Filter out always-visible fields since they're auto-added and locked.
+          !(field.type === 'system' && isAlwaysVisibleSystemField(field.identifier))
       );
   }
 
@@ -136,8 +121,7 @@ class ScreenEditorStore {
 
   async loadCustomFields() {
     try {
-      const result = await api.customFields.getAll();
-      this.customFields = result?.data || [];
+      this.customFields = await api.customFields.getAll();
     } catch (err) {
       console.error('Failed to load custom fields:', err);
       this.customFields = [];
@@ -200,55 +184,7 @@ class ScreenEditorStore {
     try {
       const fields = await api.screens.getFields(screen.id);
       this.screenFields = fields || [];
-
-      // Ensure Title field is always present and first
-      const titleField = this.screenFields.find(
-        (f) => f.field_type === 'system' && f.field_identifier === 'title'
-      );
-      if (!titleField) {
-        const newTitleField = {
-          screen_id: screen.id,
-          field_type: 'system',
-          field_identifier: 'title',
-          display_order: 0,
-          is_required: true,
-          field_width: 'full',
-          field_name: 'Title',
-          field_label: 'Title',
-        };
-        this.screenFields = [
-          newTitleField,
-          ...this.screenFields.map((f) => ({ ...f, display_order: f.display_order + 1 })),
-        ];
-      }
-
-      // Ensure Status field is always present (after title)
-      const statusField = this.screenFields.find(
-        (f) => f.field_type === 'system' && f.field_identifier === 'status'
-      );
-      if (!statusField) {
-        const newStatusField = {
-          screen_id: screen.id,
-          field_type: 'system',
-          field_identifier: 'status',
-          display_order: 1,
-          is_required: false,
-          field_width: 'half',
-          field_name: 'Status',
-          field_label: 'Status',
-        };
-        const titleIndex = this.screenFields.findIndex(
-          (f) => f.field_type === 'system' && f.field_identifier === 'title'
-        );
-        const insertIndex = titleIndex >= 0 ? titleIndex + 1 : 0;
-        this.screenFields = [
-          ...this.screenFields.slice(0, insertIndex),
-          newStatusField,
-          ...this.screenFields
-            .slice(insertIndex)
-            .map((f) => ({ ...f, display_order: f.display_order + 1 })),
-        ];
-      }
+      this.ensureAlwaysVisibleSystemFields(screen.id);
 
       await this.loadCustomFields();
     } catch (err) {
@@ -257,8 +193,67 @@ class ScreenEditorStore {
     }
   }
 
+  ensureAlwaysVisibleSystemFields(screenId) {
+    let fields = [...this.screenFields];
+
+    for (const identifier of ALWAYS_VISIBLE_SYSTEM_FIELDS) {
+      const fieldName = getSystemFieldName(identifier);
+      const defaults = ALWAYS_VISIBLE_SYSTEM_FIELD_DEFAULTS[identifier];
+      const existingIndex = fields.findIndex(
+        (field) => field.field_type === 'system' && field.field_identifier === identifier
+      );
+      if (existingIndex >= 0) {
+        fields[existingIndex] = {
+          ...fields[existingIndex],
+          is_required: defaults.is_required,
+          field_width: defaults.field_width,
+        };
+        continue;
+      }
+
+      const insertIndex = this.#alwaysVisibleFieldInsertIndex(fields, identifier);
+      fields.splice(insertIndex, 0, {
+        screen_id: screenId,
+        field_type: 'system',
+        field_identifier: identifier,
+        display_order: insertIndex,
+        is_required: defaults.is_required,
+        field_width: defaults.field_width,
+        field_name: fieldName,
+        field_label: fieldName,
+      });
+    }
+
+    this.screenFields = fields.map((field, index) => ({ ...field, display_order: index }));
+  }
+
+  #alwaysVisibleFieldInsertIndex(fields, identifier) {
+    const orderIndex = ALWAYS_VISIBLE_SYSTEM_FIELDS.indexOf(identifier);
+
+    for (let i = orderIndex + 1; i < ALWAYS_VISIBLE_SYSTEM_FIELDS.length; i += 1) {
+      const nextIndex = fields.findIndex(
+        (field) =>
+          field.field_type === 'system' &&
+          field.field_identifier === ALWAYS_VISIBLE_SYSTEM_FIELDS[i]
+      );
+      if (nextIndex >= 0) return nextIndex;
+    }
+
+    for (let i = orderIndex - 1; i >= 0; i -= 1) {
+      const previousIndex = fields.findIndex(
+        (field) =>
+          field.field_type === 'system' &&
+          field.field_identifier === ALWAYS_VISIBLE_SYSTEM_FIELDS[i]
+      );
+      if (previousIndex >= 0) return previousIndex + 1;
+    }
+
+    return Math.min(orderIndex, fields.length);
+  }
+
   async saveScreenFields() {
     try {
+      this.ensureAlwaysVisibleSystemFields(this.editingScreenFields.id);
       await api.screens.updateFields(this.editingScreenFields.id, this.screenFields);
       this.cancelFieldEditor();
     } catch (err) {
@@ -345,11 +340,8 @@ class ScreenEditorStore {
   removeField(index) {
     const field = this.screenFields[index];
 
-    // Prevent removing the Title and Status fields
-    if (
-      field.field_type === 'system' &&
-      (field.field_identifier === 'title' || field.field_identifier === 'status')
-    ) {
+    // Prevent removing fields that are always visible on item screens.
+    if (field.field_type === 'system' && isAlwaysVisibleSystemField(field.field_identifier)) {
       return;
     }
 
@@ -372,8 +364,6 @@ class ScreenEditorStore {
     field.is_required = !field.is_required;
     this.screenFields = [...this.screenFields];
   }
-
-  // Drag state methods are added via applyDragStateMixin below.
 
   // === Helpers ===
 
@@ -425,11 +415,8 @@ class ScreenEditorStore {
     this.editingScreen = null;
     this.formData = { name: '', description: '' };
     this.fieldSearchQuery = '';
-    this.draggedField = null;
-    this.fieldDragState = new Map();
+    this.resetDragState();
   }
 }
-
-applyDragStateMixin(ScreenEditorStore);
 
 export const screenEditorStore = new ScreenEditorStore();

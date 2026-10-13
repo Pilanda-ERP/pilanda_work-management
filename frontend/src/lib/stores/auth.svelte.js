@@ -1,6 +1,16 @@
 import { derived, writable } from 'svelte/store';
+import { setAPIRequestSessionKey } from '../api/core.js';
 import { api } from '../api.js';
 import { clearStores, getStoreValue } from './storeUtils.js';
+import { workspacesStore } from './workspaces.svelte.js';
+
+function policyValue(error, field) {
+  return error?.[field] ?? error?.body?.[field];
+}
+
+function hasPolicyFlag(error, field) {
+  return policyValue(error, field) === true;
+}
 
 function createAuthStore() {
   /** @type {import('svelte/store').Writable<{id: string, email: string, name: string, language: string, avatar_url: string, role: string, is_system_admin?: boolean, [key: string]: any} | null>} */
@@ -9,6 +19,14 @@ function createAuthStore() {
   const isAuthenticated = writable(false);
   const loading = writable(false);
   const error = writable(null);
+
+  // Identity-scoped stores (workspace list, personal workspace id) must never
+  // survive an un-authentication event — the next login belongs to a
+  // potentially different user.
+  function resetIdentity() {
+    clearStores(user, session, error);
+    workspacesStore.clear();
+  }
 
   // Create a combined derived store for easy subscription
   const combined = derived(
@@ -22,6 +40,20 @@ function createAuthStore() {
       error: $error,
     })
   );
+
+  // Keep API request coalescing isolated to one authenticated session. The
+  // server does not expose the cookie token, so user id + session creation
+  // time is the stable public session marker; tests/legacy responses may
+  // provide an explicit id instead.
+  combined.subscribe((state) => {
+    if (!state.isAuthenticated || state.user?.id == null) {
+      setAPIRequestSessionKey(null);
+      return;
+    }
+    const marker =
+      state.session?.id || state.session?.created_at || state.session?.expires_at || 'active';
+    setAPIRequestSessionKey(`auth:${state.user.id}:${marker}`);
+  });
 
   return {
     // Subscribe to combined state
@@ -45,23 +77,41 @@ function createAuthStore() {
     },
 
     // Initialize auth state by checking current session
-    async init() {
+    async init(options) {
       loading.set(true);
 
       try {
-        const response = await api.auth.getCurrentUser();
+        const response = await api.auth.getCurrentUser(options);
+        if (response.session?.auth_pending_type === 'passkey_verification') {
+          // A refreshed password+passkey browser session is still only the
+          // first factor. Return to login rather than rendering the app as if
+          // authentication had completed; the user can restart the short flow.
+          clearStores(user, session);
+          isAuthenticated.set(false);
+          loading.set(false);
+          error.set(null);
+          return { status: 'unauthenticated' };
+        }
         user.set(response.user);
         session.set(response.session);
         isAuthenticated.set(true);
         loading.set(false);
         error.set(null);
-      } catch (_err) {
-        // If we can't get current user, user is not authenticated
-        user.set(null);
-        session.set(null);
-        isAuthenticated.set(false);
+        return { status: 'authenticated' };
+      } catch (err) {
         loading.set(false);
-        error.set(null);
+        if (err?.status === 401) {
+          // Only an explicit unauthenticated response proves that the browser
+          // session is invalid. A transport failure leaves the prior state
+          // intact and lets the bootstrap UI offer a meaningful retry.
+          user.set(null);
+          session.set(null);
+          isAuthenticated.set(false);
+          error.set(null);
+          return { status: 'unauthenticated' };
+        }
+        error.set(err?.message || 'Unable to verify your session.');
+        return { status: 'error', error: err };
       }
     },
 
@@ -84,6 +134,18 @@ function createAuthStore() {
             sso_required: true,
             policy_message:
               response.policy_message || 'Password login is disabled. Please use SSO.',
+          };
+        }
+
+        if (response.passkey_required) {
+          clearStores(user, session);
+          isAuthenticated.set(false);
+          loading.set(false);
+          error.set(null);
+          return {
+            success: false,
+            passkey_required: true,
+            policy_message: response.policy_message,
           };
         }
 
@@ -112,15 +174,28 @@ function createAuthStore() {
         }
       } catch (err) {
         // Check if error response contains policy info
-        if (err.sso_required) {
+        if (hasPolicyFlag(err, 'passkey_required')) {
           clearStores(user, session);
           isAuthenticated.set(false);
           loading.set(false);
-          error.set(err.policy_message || 'SSO login required');
+          error.set(null);
+          return {
+            success: false,
+            passkey_required: true,
+            policy_message: policyValue(err, 'policy_message'),
+          };
+        }
+
+        if (hasPolicyFlag(err, 'sso_required')) {
+          clearStores(user, session);
+          isAuthenticated.set(false);
+          loading.set(false);
+          const policyMessage = policyValue(err, 'policy_message');
+          error.set(policyMessage || 'SSO login required');
           return {
             success: false,
             sso_required: true,
-            policy_message: err.policy_message || 'Password login is disabled. Please use SSO.',
+            policy_message: policyMessage || 'Password login is disabled. Please use SSO.',
           };
         }
 
@@ -142,7 +217,7 @@ function createAuthStore() {
         console.warn('Logout API call failed:', err);
       }
 
-      clearStores(user, session, error);
+      resetIdentity();
       isAuthenticated.set(false);
       loading.set(false);
     },
@@ -157,7 +232,7 @@ function createAuthStore() {
         console.warn('Logout all API call failed:', err);
       }
 
-      clearStores(user, session, error);
+      resetIdentity();
       isAuthenticated.set(false);
       loading.set(false);
     },
@@ -198,19 +273,45 @@ function createAuthStore() {
 
     // Clear authentication (called on 401 errors)
     clearAuth() {
-      clearStores(user, session);
+      resetIdentity();
       isAuthenticated.set(false);
       loading.set(false);
       error.set('Session expired. Please log in again.');
     },
 
-    // Set authentication data (used by FIDO login)
+    // Confirm that a WebAuthn completion created/elevated the browser session,
+    // then populate canonical user and session metadata from /auth/me.
+    async completePasskeyLogin(fallbackUser = null) {
+      loading.set(true);
+      error.set(null);
+      try {
+        const response = await api.auth.getCurrentUser();
+        user.set(response.user || fallbackUser);
+        session.set(response.session);
+        isAuthenticated.set(true);
+        loading.set(false);
+        return true;
+      } catch (err) {
+        clearStores(user, session);
+        isAuthenticated.set(false);
+        loading.set(false);
+        error.set(err.message || 'Failed to complete passkey authentication');
+        throw err;
+      }
+    },
+
+    // Set authentication data directly for callers that already hold canonical
+    // session metadata.
     setAuthData(userData, sessionData) {
       user.set(userData);
       session.set(sessionData);
       isAuthenticated.set(true);
       loading.set(false);
       error.set(null);
+    },
+
+    patchCurrentUser(updates) {
+      user.update((current) => (current ? { ...current, ...updates } : current));
     },
 
     // Clear error

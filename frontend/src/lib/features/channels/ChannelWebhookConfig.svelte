@@ -9,8 +9,10 @@
   import Checkbox from '../../components/Checkbox.svelte';
   import Spinner from '../../components/Spinner.svelte';
   import WorkspacePicker from '../../pickers/WorkspacePicker.svelte';
-  import CollectionPicker from '../../pickers/CollectionPicker.svelte';
   import DescriptionText from '../../components/DescriptionText.svelte';
+  import Toggle from '../../components/Toggle.svelte';
+  import Radio from '../../components/Radio.svelte';
+	import TextField from '../../components/TextField.svelte';
 
   let {
     channelId,
@@ -22,7 +24,8 @@
       workspace_ids: [],
       collection_ids: [],
       auto_trigger: false,
-      subscribed_events: []
+      subscribed_events: [],
+      enabled: false
     }),
     isPluginOwned = false,
     pluginName = ''
@@ -52,12 +55,7 @@
     { id: 'item.updated', labelKey: 'channel.itemUpdated', categoryKey: 'channel.items' },
     { id: 'item.deleted', labelKey: 'channel.itemDeleted', categoryKey: 'channel.items' },
     { id: 'item.assigned', labelKey: 'channel.itemAssigned', categoryKey: 'channel.items' },
-    { id: 'status.changed', labelKey: 'channel.statusChanged', categoryKey: 'channel.items' },
-    { id: 'comment.created', labelKey: 'channel.commentCreated', categoryKey: 'channel.comments' },
-    { id: 'comment.updated', labelKey: 'channel.commentUpdated', categoryKey: 'channel.comments' },
-    { id: 'comment.deleted', labelKey: 'channel.commentDeleted', categoryKey: 'channel.comments' },
-    { id: 'item.linked', labelKey: 'channel.itemLinked', categoryKey: 'channel.links' },
-    { id: 'item.unlinked', labelKey: 'channel.itemUnlinked', categoryKey: 'channel.links' }
+    { id: 'status.changed', labelKey: 'channel.statusChanged', categoryKey: 'channel.items' }
   ];
 
   function addWebhookHeader() {
@@ -77,6 +75,7 @@
   }
 
   async function testWebhookSettings() {
+    if (loading) return;
     if (!channelId || !formData.url) {
       webhookTestResult = { success: false, message: t('channel.pleaseEnterUrl') };
       return;
@@ -90,6 +89,7 @@
     }
 
     webhookTestResult = { success: true, message: t('channel.sendingTestWebhook'), loading: true };
+    loading = true;
 
     try {
       const configData = getConfig();
@@ -114,6 +114,8 @@
         message: t('channel.testWebhookFailed') + ': ' + (error.message || error),
         loading: false
       };
+    } finally {
+      loading = false;
     }
   }
 
@@ -134,10 +136,9 @@
     return {
       webhook_url: formData.url,
       webhook_secret: formData.secret || undefined,
-      webhook_headers: Object.keys(headersObj).length > 0 ? headersObj : undefined,
+      webhook_headers: headersObj,
       webhook_scope_type: formData.scope_type,
       webhook_workspace_ids: formData.scope_type === 'workspaces' ? formData.workspace_ids : undefined,
-      webhook_collection_ids: formData.scope_type === 'collections' ? formData.collection_ids : undefined,
       webhook_auto_trigger: formData.auto_trigger,
       webhook_subscribed_events: formData.auto_trigger ? formData.subscribed_events : undefined
     };
@@ -161,13 +162,24 @@
     <div class="space-y-6">
       <div class="space-y-4">
         <div>
-          <Label color="default" required class="mb-2">{t('channel.webhookUrl')}</Label>
-          <Input type="url" bind:value={formData.url} required placeholder="https://your-server.com/webhook" />
+          <TextField
+            label={t('channel.webhookUrl')}
+            required
+            labelColor="default"
+            type="url"
+            placeholder="https://your-server.com/webhook"
+            bind:value={formData.url}
+          />
         </div>
 
         <div>
-          <Label color="default" class="mb-2">{t('channel.secretOptional')}</Label>
-          <Input type="password" bind:value={formData.secret} placeholder={t('channel.secretPlaceholder')} />
+          <TextField
+            label={t('channel.secretOptional')}
+            labelColor="default"
+            type="password"
+            placeholder={t('channel.secretPlaceholder')}
+            bind:value={formData.secret}
+          />
           <DescriptionText>
             {t('channel.secretHelp')}
           </DescriptionText>
@@ -202,25 +214,16 @@
         <h5 class="text-sm font-semibold mb-3" style="color: var(--ds-text);">{t('channel.scope')}</h5>
         <div class="space-y-3">
           <label class="flex items-center gap-2 cursor-pointer">
-            <input type="radio" name="webhookScope" value="all" bind:group={formData.scope_type} class="w-4 h-4" />
+            <Radio name="webhookScope" value="all" bind:groupValue={formData.scope_type} />
             <span class="text-sm" style="color: var(--ds-text);">{t('channel.allItems')}</span>
           </label>
           <label class="flex items-center gap-2 cursor-pointer">
-            <input type="radio" name="webhookScope" value="workspaces" bind:group={formData.scope_type} class="w-4 h-4" />
+            <Radio name="webhookScope" value="workspaces" bind:groupValue={formData.scope_type} />
             <span class="text-sm" style="color: var(--ds-text);">{t('channel.specificWorkspaces')}</span>
           </label>
           {#if formData.scope_type === 'workspaces'}
             <div class="ml-6">
               <WorkspacePicker bind:value={formData.workspace_ids} placeholder={t('channel.selectWorkspaces')} />
-            </div>
-          {/if}
-          <label class="flex items-center gap-2 cursor-pointer">
-            <input type="radio" name="webhookScope" value="collections" bind:group={formData.scope_type} class="w-4 h-4" />
-            <span class="text-sm" style="color: var(--ds-text);">{t('channel.specificCollections')}</span>
-          </label>
-          {#if formData.scope_type === 'collections'}
-            <div class="ml-6">
-              <CollectionPicker bind:value={formData.collection_ids} placeholder={t('channel.selectCollections')} />
             </div>
           {/if}
         </div>
@@ -240,7 +243,7 @@
 
         {#if formData.auto_trigger}
           <div class="mt-4 space-y-4">
-            {#each ['channel.items', 'channel.comments', 'channel.links'] as categoryKey}
+            {#each ['channel.items'] as categoryKey}
               <div>
                 <h6 class="text-xs font-medium uppercase tracking-wide mb-2" style="color: var(--ds-text-subtle);">{t(categoryKey)}</h6>
                 <div class="grid grid-cols-2 gap-2">
@@ -259,6 +262,20 @@
             {/each}
           </div>
         {/if}
+      </div>
+
+      <div class="flex items-center justify-between pt-4 border-t" style="border-color: var(--ds-border);">
+        <div>
+          <div class="text-sm font-medium" style="color: var(--ds-text);">
+            {t('channel.enableWebhook', 'Enable Webhook Channel')}
+          </div>
+          <div class="text-xs mt-1" style="color: var(--ds-text-subtle);">
+            {formData.enabled
+              ? t('channel.webhookIsActive', 'Webhook channel is active')
+              : t('channel.webhookIsInactive', 'Webhook channel is currently disabled')}
+          </div>
+        </div>
+        <Toggle bind:checked={formData.enabled} />
       </div>
     </div>
 

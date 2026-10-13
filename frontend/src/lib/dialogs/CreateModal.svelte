@@ -1,13 +1,15 @@
 <script>
+  import { untrack } from 'svelte';
   import { useEventListener } from 'runed';
   import { navigate, currentRoute } from '../router.js';
   import { milestonesStore } from '../stores/milestones.js';
-  import { workspacesStore, shouldNavigateAfterCreate, workItemFormStore, permissionStore, isSystemAdmin } from '../stores';
+  import { workspacesStore, shouldNavigateAfterCreate, workItemFormStore, permissionStore, isSystemAdmin, workspacePermissions } from '../stores';
   import { api } from '../api.js';
   import { X, Target, Building, FolderOpen, ChevronRight, FileText } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
   import Button from '../components/Button.svelte';
   import ModalBackdrop from '../components/ModalBackdrop.svelte';
+  import CreateFormFrame from '../forms/CreateFormFrame.svelte';
   import ChipPicker from '../pickers/ChipPicker.svelte';
   import { getShortcut, matchesShortcut, getDisplayString } from '../utils/keyboardShortcuts.js';
   import { errorToast } from '../stores/toasts.svelte.js';
@@ -60,6 +62,8 @@
     isOpen = $bindable(false),
     compactMode = false,
     initialType = 'work-item',
+    initialWorkspaceId = null,
+    initialParentContext = null,
     skipNavigate = false,
     onclose = null,
     oncreated = null
@@ -67,6 +71,10 @@
 
   // svelte-ignore state_referenced_locally
   let selectedType = $state(initialType);
+
+  // Set once item creation commits so a failed post-create step can be retried
+  // without creating a duplicate.
+  let recoverableItemId = $state(null);
 
   // Form references
   let milestoneFormRef = $state(null);
@@ -85,8 +93,21 @@
   let workspaceFormData = $state({
     name: '',
     key: '',
-    description: ''
+    description: '',
+    template_workspace_id: null,
+    template_pack: '',
+    restricted_to_creator: false
   });
+
+  let workspaceTemplateOptions = $state([]);
+  let workspaceTemplatesLoading = $state(false);
+  let workspaceTemplatesError = $state(null);
+  let workspaceTemplatesLoaded = $state(false);
+
+  let workspacePackOptions = $state([]);
+  let workspacePacksLoading = $state(false);
+  let workspacePacksError = $state(null);
+  let workspacePacksLoaded = $state(false);
 
   let collectionFormData = $state({
     name: '',
@@ -94,6 +115,15 @@
     workspace_id: null
   });
   let collectionCategoryId = $state(null);
+  let submitting = $state(false);
+
+  // The work-item create endpoint requires item.create in the target
+  // workspace (denied with 404), so the picker must only offer workspaces
+  // where creation is allowed. Mirrors CollectionBoard's quick-add filter;
+  // collections only need workspace access and stay unfiltered.
+  let creatableWorkspaces = $derived(
+    $workspacesStore.regularWorkspaces.filter((workspace) => workspacePermissions.canCreate(workspace.id))
+  );
 
   // Derived state for display
   let currentTypeName = $derived(typeLabels[selectedType] || 'Item');
@@ -130,6 +160,7 @@
   function close() {
     isOpen = false;
     selectedType = initialType;
+    recoverableItemId = null;
 
     // Reset work item form store
     workItemFormStore.resetForm();
@@ -145,7 +176,10 @@
     workspaceFormData = {
       name: '',
       key: '',
-      description: ''
+      description: '',
+      template_workspace_id: null,
+      template_pack: '',
+      restricted_to_creator: false
     };
 
     collectionFormData = {
@@ -165,6 +199,40 @@
     }
   }
 
+  async function loadWorkspacePacks() {
+    if (workspacePacksLoaded || workspacePacksLoading) return;
+    workspacePacksLoading = true;
+    workspacePacksError = null;
+    try {
+      const packs = await api.packs.list();
+      workspacePackOptions = Array.isArray(packs) ? packs : [];
+      workspacePacksLoaded = true;
+    } catch (error) {
+      console.error('Failed to load built-in packs:', error);
+      workspacePackOptions = [];
+      workspacePacksError = error?.message || String(error);
+    } finally {
+      workspacePacksLoading = false;
+    }
+  }
+
+  async function loadWorkspaceTemplates() {
+    if (workspaceTemplatesLoaded || workspaceTemplatesLoading) return;
+    workspaceTemplatesLoading = true;
+    workspaceTemplatesError = null;
+    try {
+      const templates = await api.workspaces.getTemplates();
+      workspaceTemplateOptions = Array.isArray(templates) ? templates : [];
+      workspaceTemplatesLoaded = true;
+    } catch (error) {
+      console.error('Failed to load workspace templates:', error);
+      workspaceTemplateOptions = [];
+      workspaceTemplatesError = error?.message || String(error);
+    } finally {
+      workspaceTemplatesLoading = false;
+    }
+  }
+
   async function uploadPendingDescriptionImages(itemId, description) {
     if (workItemFormStore.pendingDescriptionImages.length === 0) {
       return description;
@@ -174,18 +242,13 @@
     for (const image of workItemFormStore.pendingDescriptionImages) {
       if (!updatedDescription.includes(image.url)) continue;
 
-      const uploadFormData = new FormData();
-      uploadFormData.append('file', image.file);
-      uploadFormData.append('entity_type', 'item');
-      uploadFormData.append('entity_id', String(itemId));
-
-      const uploadResult = await api.attachments.upload(uploadFormData);
-      const attachmentId = uploadResult?.attachment?.id;
+      const attachment = await api.attachments.uploadToItem(itemId, image.file);
+      const attachmentId = attachment?.id;
       if (!attachmentId) {
         throw new Error('Image upload failed');
       }
 
-      const downloadUrl = `/api/attachments/${attachmentId}/download`;
+      const downloadUrl = api.attachments.getDownloadUrl(attachmentId);
       updatedDescription = updatedDescription.split(image.url).join(downloadUrl);
     }
 
@@ -193,6 +256,8 @@
   }
 
   async function handleSubmit() {
+    if (submitting) return;
+    submitting = true;
     try {
       if (selectedType === 'work-item') {
         // Validate using store
@@ -207,20 +272,23 @@
           return;
         }
 
-        let result = await api.items.create(formData);
-        if (formData.personal_label_ids?.length > 0) {
-          const labels = await api.personalLabels.setForItem(result.id, formData.personal_label_ids);
-          result = { ...result, personal_labels: labels || [] };
-        }
+        // Creation may have committed on an earlier attempt whose post-create
+        // work failed. Reuse that item instead of posting a duplicate.
+        const reusingItem = recoverableItemId != null;
+        let result = reusingItem ? { id: recoverableItemId } : await api.items.create(formData);
+        recoverableItemId = result.id;
+
         const originalDescription = formData.description || '';
         const updatedDescription = await uploadPendingDescriptionImages(result.id, originalDescription);
-        if (updatedDescription !== originalDescription) {
+        // Always reconcile the description when retrying a committed item: the
+        // first attempt stored the pre-upload text and may hold a temporary URL.
+        if (updatedDescription !== originalDescription || reusingItem) {
           result = await api.items.update(result.id, { description: updatedDescription });
           formData.description = updatedDescription;
         }
 
         window.dispatchEvent(new CustomEvent('refresh-work-items', {
-          detail: { itemId: result.id, parentId: formData.parent_id ?? null }
+          detail: { item: result, itemId: result.id, parentId: formData.parent_id ?? null }
         }));
         oncreated?.(result);
 
@@ -232,29 +300,59 @@
         } else {
           showCreatedItemToast(result);
         }
+        recoverableItemId = null;
         close();
       } else if (selectedType === 'milestone') {
+        // Scope the milestone to the opening context when the user may write
+        // there; otherwise fall back to a global milestone, which the
+        // milestone.create permission gating this option already authorizes.
+        const workspaceId = initialWorkspaceId
+          ? Number.parseInt(String(initialWorkspaceId), 10)
+          : null;
+        const canWriteWorkspace =
+          workspaceId != null &&
+          Number.isFinite(workspaceId) &&
+          (workspacePermissions.canAdminWorkspace(workspaceId) ||
+            workspacePermissions.hasPermission(workspaceId, 'item.edit'));
         await milestonesStore.add({
           name: milestoneFormData.name,
           description: milestoneFormData.description,
           target_date: milestoneFormData.target_date || null,
           status: milestoneFormData.status,
-          category_id: null
+          category_id: null,
+          is_global: !canWriteWorkspace,
+          workspace_id: canWriteWorkspace ? workspaceId : null
         });
 
         navigate('/milestones');
         close();
       } else if (selectedType === 'workspace') {
-        const result = await api.workspaces.create({
+        const payload = {
           name: workspaceFormData.name,
           key: workspaceFormData.key,
           description: workspaceFormData.description || '',
           icon: 'Package',
           color: '#3b82f6',
-          active: true
-        });
+          active: true,
+          restricted_to_creator: workspaceFormData.restricted_to_creator === true
+        };
+        if (workspaceFormData.template_workspace_id) {
+          payload.template_workspace_id = workspaceFormData.template_workspace_id;
+        }
+        if (workspaceFormData.template_pack) {
+          payload.template_pack = workspaceFormData.template_pack;
+        }
+        const result = await api.workspaces.create(payload);
 
-        window.dispatchEvent(new CustomEvent('refresh-workspaces'));
+        // The creator becomes the workspace administrator server-side; refresh
+        // the permission profile so the workspace nav immediately shows the
+        // admin-only entries (Agents, Settings).
+        await workspacePermissions.reload();
+
+        workspacesStore.add(result);
+        window.dispatchEvent(new CustomEvent('refresh-workspaces', {
+          detail: { workspace: result }
+        }));
         if (!skipNavigate) {
           navigate(`/workspaces/${result.id}`);
         }
@@ -275,11 +373,15 @@
     } catch (error) {
       console.error('Failed to create item:', error);
       const errorMsg = error.message || String(error);
-      if (errorMsg.includes('UNIQUE constraint failed: workspaces.key')) {
+      if (recoverableItemId != null && selectedType === 'work-item') {
+        errorToast(t('createModal.createdPartialError', { error: errorMsg }));
+      } else if (errorMsg.includes('UNIQUE constraint failed: workspaces.key')) {
         errorToast('A workspace with this key already exists. Please choose a different key.');
       } else {
         errorToast(`Failed to create ${currentTypeName.toLowerCase()}: ${errorMsg}`);
       }
+    } finally {
+      submitting = false;
     }
   }
 
@@ -287,7 +389,7 @@
     if (!isOpen) return;
     if (matchesShortcut(e, submitShortcut)) {
       e.preventDefault();
-      if (isFormValid) {
+      if (isFormValid && !submitting) {
         handleSubmit();
       }
     }
@@ -316,9 +418,46 @@
     }
   });
 
+  // Load template summaries when the workspace form opens for a user who may
+  // create workspaces. Blank creation works without them.
+  $effect(() => {
+    if (
+      isOpen &&
+      selectedType === 'workspace' &&
+      ($permissionStore.userPermissionKeys?.has('workspace.create') || $isSystemAdmin)
+    ) {
+      loadWorkspaceTemplates();
+      // Built-in packs are a system-administrator surface, matching GET /packs.
+      if ($isSystemAdmin) {
+        loadWorkspacePacks();
+      }
+    }
+  });
+
   // Sync selectedType when initialType prop changes (e.g. before modal opens)
   $effect(() => {
     selectedType = initialType;
+  });
+
+  // Apply opening context without overwriting later workspace selections.
+  $effect(() => {
+    const workspaceId = initialWorkspaceId;
+    if (isOpen && workspaceId) {
+      untrack(() => {
+        if (workItemFormStore.formData.workspace_id !== Number(workspaceId)) {
+          void applyWorkspace(workspaceId);
+        }
+      });
+    }
+  });
+
+  $effect(() => {
+    if (isOpen && initialParentContext) {
+      untrack(() => workItemFormStore.setParentItem(
+        initialParentContext.parent,
+        initialParentContext.allowedItemTypes,
+      ));
+    }
   });
 
   // Force work-item type when compact mode is enabled
@@ -340,23 +479,24 @@
 
   function handleSetCreateWorkspace(event) {
     if (event.detail?.workspaceId) {
-      const workspaceId = event.detail.workspaceId;
-      const workspaceIdNum = typeof workspaceId === 'string' ? parseInt(workspaceId, 10) : workspaceId;
+      applyWorkspace(event.detail.workspaceId);
+    }
+  }
 
-      collectionFormData.workspace_id = workspaceIdNum;
+  async function applyWorkspace(workspaceId) {
+    const workspaceIdNum = Number.parseInt(String(workspaceId), 10);
+    if (!Number.isFinite(workspaceIdNum)) return;
 
-      if ($workspacesStore.regularWorkspaces.length === 0) {
-        loadWorkspaces().then(() => {
-          const workspace = $workspacesStore.regularWorkspaces.find(w => w.id === workspaceIdNum);
-          if (workspace) {
-            workItemFormStore.setWorkspace(workspace);
-          }
-        });
-      } else {
-        const workspace = $workspacesStore.regularWorkspaces.find(w => w.id === workspaceIdNum);
-        if (workspace) {
-          workItemFormStore.setWorkspace(workspace);
-        }
+    collectionFormData.workspace_id = workspaceIdNum;
+    if ($workspacesStore.regularWorkspaces.length === 0) {
+      await loadWorkspaces();
+    }
+    const workspace = $workspacesStore.regularWorkspaces.find(w => w.id === workspaceIdNum);
+    if (workspace) {
+      // Skip the work-item pre-selection when item.create is missing; the
+      // picker offers the alternatives instead of a guaranteed denial.
+      if (workspacePermissions.canCreate(workspace.id)) {
+        workItemFormStore.setWorkspace(workspace);
       }
     }
   }
@@ -389,10 +529,8 @@
 
 <!-- shortcut-guard-exempt: Cmd+Enter submit is handled via svelte:window onkeydown (matchesShortcut) above, outside the ModalBackdrop block the guard scans. -->
 <ModalBackdrop bind:show={isOpen} opacity={0.4} align="top" paddingTop="pt-16" scrollable zIndex={60} closeOnClick={false} onclose={close}>
-    <!-- Modal -->
-    <div class="rounded-xl shadow-2xl w-full max-w-lg mx-4 mb-8 flex flex-col" style="background-color: var(--ds-surface-raised);">
-      <!-- Compact Header -->
-      <div class="flex items-center gap-2 px-4 py-3 border-b" style="border-color: var(--ds-border);">
+    <CreateFormFrame dataTestid="create-modal">
+      {#snippet header()}
         <!-- Type Selector FIRST (independent of workspace) -->
         {#if !workItemFormStore.parentItem && !compactMode}
           <ChipPicker
@@ -417,7 +555,7 @@
         {#if selectedType === 'work-item' && !workItemFormStore.parentItem}
           <ChipPicker
             value={workItemFormStore.formData.workspace_id}
-            items={$workspacesStore.regularWorkspaces}
+            items={creatableWorkspaces}
             getValue={(w) => w.id}
             getLabel={(w) => w.key || w.name}
             icon={Building}
@@ -460,7 +598,7 @@
           <ChevronRight size={14} style="color: var(--ds-text-subtle);" />
         {/if}
 
-        <span class="font-medium" style="color: var(--ds-text);">
+        <span data-testid="create-modal-heading" class="font-medium" style="color: var(--ds-text);">
           {#if workItemFormStore.parentItem}
             {t('createModal.newChildItem')}
           {:else}
@@ -469,6 +607,7 @@
         </span>
 
         <button
+          data-testid="create-modal-close"
           onclick={close}
           class="ml-auto p-1.5 rounded transition-colors"
           style="color: var(--ds-text-subtle);"
@@ -480,10 +619,9 @@
         >
           <X size={16} />
         </button>
-      </div>
+      {/snippet}
 
-      <!-- Body -->
-      <div class="px-4 py-3">
+      {#snippet body()}
         {#if selectedType === 'work-item'}
           <WorkItemForm
             bind:nameInputRef={nameInputRef}
@@ -498,6 +636,12 @@
           <WorkspaceForm
             bind:this={workspaceFormRef}
             bind:formData={workspaceFormData}
+            templates={workspaceTemplateOptions}
+            templatesLoading={workspaceTemplatesLoading}
+            templatesError={workspaceTemplatesError}
+            packs={workspacePackOptions}
+            packsLoading={workspacePacksLoading}
+            packsError={workspacePacksError}
             bind:nameInputRef={nameInputRef}
           />
         {:else if selectedType === 'collection'}
@@ -508,20 +652,20 @@
             bind:nameInputRef={nameInputRef}
           />
         {/if}
-      </div>
+      {/snippet}
 
-      <!-- Footer -->
-      <div class="flex items-center justify-end px-4 py-3 border-t" style="border-color: var(--ds-border);">
+      {#snippet footer()}
         <Button
           id="create-modal-submit"
           onclick={handleSubmit}
           variant="primary"
           size="medium"
           keyboardHint={getDisplayString(submitShortcut)}
-          disabled={!isFormValid}
+          loading={submitting}
+          disabled={!isFormValid || submitting}
         >
           {t('createModal.create')} {currentTypeName}
         </Button>
-      </div>
-    </div>
+      {/snippet}
+    </CreateFormFrame>
 </ModalBackdrop>

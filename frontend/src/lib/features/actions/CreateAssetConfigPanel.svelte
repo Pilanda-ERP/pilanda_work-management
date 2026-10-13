@@ -5,6 +5,8 @@
   import { t } from '../../stores/i18n.svelte.js';
   import { actionFlowStore } from '../../stores/actionFlowStore.svelte.js';
   import Select from '../../components/Select.svelte';
+  import Input from '../../components/Input.svelte';
+  import Textarea from '../../components/Textarea.svelte';
   import FieldMappingsEditor from './shared/FieldMappingsEditor.svelte';
   import {
     useAssetTypeFields,
@@ -160,7 +162,7 @@
       <div class="mb-3">
         <div class="flex items-center gap-1 mb-1">
           <label for="asset-title" class="block text-xs font-medium">{t('actions.config.assetTitle')}</label>
-          <span class="text-red-500 text-xs">*</span>
+          <span class="text-ds-text-danger text-xs">*</span>
           <button
             onclick={() => showPlaceholderModal = true}
             class="text-[var(--ds-text-subtlest)] hover:text-[var(--ds-interactive)] transition-colors"
@@ -169,10 +171,10 @@
             <HelpCircle class="w-3.5 h-3.5" />
           </button>
         </div>
-        <input
+        <Input
           id="asset-title"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
+          size="small"
           value={selectedNode.data?.config?.title || ''}
           oninput={handleTitleChange}
           placeholder="Laptop for {'{{'}item.title{'}}'}"
@@ -192,14 +194,13 @@
             <HelpCircle class="w-3.5 h-3.5" />
           </button>
         </div>
-        <textarea
+        <Textarea
           id="asset-description"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="2"
+          rows={2}
           value={selectedNode.data?.config?.description || ''}
           oninput={handleDescriptionChange}
           placeholder={t('actions.config.assetDescription')}
-        ></textarea>
+        />
       </div>
 
       <!-- Asset Tag -->
@@ -214,10 +215,10 @@
             <HelpCircle class="w-3.5 h-3.5" />
           </button>
         </div>
-        <input
+        <Input
           id="asset-tag"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
+          size="small"
           value={selectedNode.data?.config?.asset_tag || ''}
           oninput={handleAssetTagChange}
           placeholder="LAP-{'{{'}item.id{'}}'}"
@@ -258,17 +259,6 @@
 </div>
 
 <style>
-  .config-input {
-    background-color: var(--ds-surface);
-    border-color: var(--ds-border);
-    color: var(--ds-text);
-  }
-
-  .config-input:focus {
-    border-color: var(--ds-interactive);
-    outline: none;
-  }
-
   .hint-text {
     color: var(--ds-text-subtlest);
   }

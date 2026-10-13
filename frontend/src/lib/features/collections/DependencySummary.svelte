@@ -4,14 +4,7 @@
   import Tooltip from '../../components/Tooltip.svelte';
   import { splitDependencies, dependencyKey } from './dependencySummary.js';
 
-  // Lightweight dependency/blocker hover summary for board cards.
-  //
-  // Pulls counts + linked item titles from the item's existing links, scoped
-  // to the "Depends On" link type (see dependencySummary.js for the
-  // direction semantics). The summary only renders when the item has at
-  // least one such link, so cards stay clean otherwise. The hover popover
-  // reuses the shared Tooltip component. The first pass is intentionally
-  // counts + a short title list; a full graph is out of scope (see page:16).
+  // Board-card hover summary for Depends On links, rendered only when present.
   let {
     item,
     links = [],
@@ -76,17 +69,21 @@
     {/snippet}
 
     <span
-      class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium"
-      style="background: var(--ds-surface); color: var(--ds-text-subtle);"
+      class="inline-flex items-center gap-2 text-[11px] leading-4"
+      style="color: var(--ds-text-subtle);"
       data-testid={`board-card-dependency-summary-${currentItemId}`}
     >
       {#if dependency.blockers.length > 0}
-        <AlertTriangle class="w-3 h-3 flex-shrink-0" style="color: #f59e0b;" />
-        <span>{t('collections.blockersCount', { count: dependency.blockers.length })}</span>
+        <span class="inline-flex items-center gap-1">
+          <AlertTriangle class="h-3 w-3 shrink-0" style="color: var(--ds-icon-warning);" />
+          <span>{t('collections.blockersCount', { count: dependency.blockers.length })}</span>
+        </span>
       {/if}
       {#if dependency.blocking.length > 0}
-        <GitBranch class="w-3 h-3 flex-shrink-0" style="color: #3b82f6;" />
-        <span>{t('collections.blockingCount', { count: dependency.blocking.length })}</span>
+        <span class="inline-flex items-center gap-1">
+          <GitBranch class="h-3 w-3 shrink-0" style="color: var(--ds-icon-info);" />
+          <span>{t('collections.blockingCount', { count: dependency.blocking.length })}</span>
+        </span>
       {/if}
     </span>
   </Tooltip>

@@ -1,12 +1,15 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
-  import { Plus, Edit, Trash2, Power, PowerOff } from '@lucide/svelte';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
+  import { Plus, Edit, Trash2 } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
+  import Checkbox from '../components/Checkbox.svelte';
+  import WorkspaceCheckboxList from '../components/WorkspaceCheckboxList.svelte';
+  import Radio from '../components/Radio.svelte';
+  import Input from '../components/Input.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
-  import Modal from '../dialogs/Modal.svelte';
-  import ModalHeader from '../dialogs/ModalHeader.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import Lozenge from '../components/Lozenge.svelte';
   import Select from '../components/Select.svelte';
   import DataTable from '../components/DataTable.svelte';
@@ -14,6 +17,9 @@
   import { successToast, errorToast } from '../stores/toasts.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
+  import EnabledStatus from './EnabledStatus.svelte';
+  import EntityFormModal from './EntityFormModal.svelte';
+  import EntityRowActions from './EntityRowActions.svelte';
 
   let capabilities = $state([]);
   let llmConnections = $state([]);
@@ -240,7 +246,7 @@
 
   async function loadWorkspaces() {
     try {
-      workspaces = await api.workspaces.getAll();
+      workspaces = await workspacesStore.load();
     } catch (err) {
       console.error('Failed to load workspaces:', err);
     }
@@ -382,8 +388,8 @@
   const columns = [
     { key: 'name', label: t('settings.actionCapabilities.name'), slot: 'name' },
     { key: 'capability_type', label: t('settings.actionCapabilities.capabilityType'), slot: 'type' },
-    { key: 'is_enabled', label: 'Status', slot: 'status' },
-    { key: 'actions', label: 'Actions', slot: 'actions', align: 'text-right', width: 'w-32' },
+    { key: 'is_enabled', label: t('common.status'), slot: 'status' },
+    { key: 'actions', label: t('common.actions'), slot: 'actions', align: 'text-right', width: 'w-32' },
   ];
 </script>
 
@@ -397,9 +403,7 @@
   </PageHeader>
 
   {#if loading}
-    <div class="flex items-center justify-center py-12">
-      <Spinner />
-    </div>
+    <StateDisplay type="loading" />
   {:else if capabilities.length === 0}
     <div class="flex flex-col items-center py-12 gap-3 rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
       <p class="text-sm" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.noCapabilities')}</p>
@@ -416,36 +420,13 @@
         <Lozenge appearance={typeAppearance(cap.capability_type)} size="sm">{typeLabel(cap.capability_type)}</Lozenge>
       {/snippet}
       {#snippet status(cap)}
-        {#if cap.is_enabled}
-          <div class="flex items-center gap-1">
-            <Power size={14} style="color: var(--ds-icon-success);" />
-            <span class="text-xs" style="color: var(--ds-text-success);">Enabled</span>
-          </div>
-        {:else}
-          <div class="flex items-center gap-1">
-            <PowerOff size={14} style="color: var(--ds-text-subtle);" />
-            <span class="text-xs" style="color: var(--ds-text-subtle);">Disabled</span>
-          </div>
-        {/if}
+        <EnabledStatus enabled={cap.is_enabled} />
       {/snippet}
       {#snippet actions(cap)}
-        <div class="flex items-center justify-end gap-1">
-          <button
-            class="p-1.5 rounded hover:opacity-80"
-            style="color: var(--ds-text-subtle);"
-            title="Edit"
-            onclick={() => openEdit(cap)}
-          >
-            <Edit size={14} />
-          </button>
-          <Button
-            variant="danger-ghost"
-            size="small"
-            icon={Trash2}
-            title="Delete"
-            onclick={() => deleteCapability(cap)}
-          ></Button>
-        </div>
+        <EntityRowActions actions={[
+          { id: 'edit', icon: Edit, title: t('common.edit'), onclick: () => openEdit(cap) },
+          { id: 'delete', icon: Trash2, title: t('common.delete'), danger: true, onclick: () => deleteCapability(cap) },
+        ]} />
       {/snippet}
     </DataTable>
   {/if}
@@ -453,48 +434,33 @@
 
 <!-- Create Modal -->
 {#if showCreateModal}
-  <Modal
-    isOpen={true}
+  <EntityFormModal
+    title={t('settings.actionCapabilities.addCapability')}
     onclose={() => showCreateModal = false}
-    onSubmit={handleCreate}
-    submitDisabled={!canSubmit || saving}
+    onsubmit={handleCreate}
+    disabled={!canSubmit}
+    {saving}
+    confirmLabel={t('common.create')}
   >
-    {#snippet children(submitHint)}
-      <ModalHeader title={t('settings.actionCapabilities.addCapability')} onclose={() => showCreateModal = false} />
-      <div class="p-4 space-y-4">
-        {@render capabilityForm(false)}
-        <div class="flex justify-end gap-2 pt-2 border-t" style="border-color: var(--ds-border);">
-          <Button variant="secondary" onclick={() => showCreateModal = false} keyboardHint="Esc">Cancel</Button>
-          <Button variant="primary" onclick={handleCreate} loading={saving} disabled={!canSubmit} keyboardHint={submitHint}>
-            Create
-          </Button>
-        </div>
-      </div>
+    {#snippet fields()}
+      {@render capabilityForm(false)}
     {/snippet}
-  </Modal>
+  </EntityFormModal>
 {/if}
 
 <!-- Edit Modal -->
 {#if showEditModal}
-  <Modal
-    isOpen={true}
+  <EntityFormModal
+    title={t('settings.actionCapabilities.editCapability')}
     onclose={() => showEditModal = false}
-    onSubmit={handleUpdate}
-    submitDisabled={!canSubmit || saving}
+    onsubmit={handleUpdate}
+    disabled={!canSubmit}
+    {saving}
   >
-    {#snippet children(submitHint)}
-      <ModalHeader title={t('settings.actionCapabilities.editCapability')} onclose={() => showEditModal = false} />
-      <div class="p-4 space-y-4">
-        {@render capabilityForm(true)}
-        <div class="flex justify-end gap-2 pt-2 border-t" style="border-color: var(--ds-border);">
-          <Button variant="secondary" onclick={() => showEditModal = false} keyboardHint="Esc">Cancel</Button>
-          <Button variant="primary" onclick={handleUpdate} loading={saving} disabled={!canSubmit} keyboardHint={submitHint}>
-            Save
-          </Button>
-        </div>
-      </div>
+    {#snippet fields()}
+      {@render capabilityForm(true)}
     {/snippet}
-  </Modal>
+  </EntityFormModal>
 {/if}
 
 
@@ -502,13 +468,11 @@
   <!-- Name -->
   <div>
     <label for="cap-name" class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.name')}</label>
-    <input
+    <Input
       id="cap-name"
       type="text"
       bind:value={form.name}
       placeholder={t('settings.actionCapabilities.namePlaceholder')}
-      class="w-full px-3 py-2 text-sm rounded-md border"
-      style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
     />
   </div>
 
@@ -530,60 +494,44 @@
   </div>
 
   <!-- Enabled toggle -->
-  <div class="flex items-center gap-2">
-    <label class="flex items-center gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-      <input type="checkbox" bind:checked={form.is_enabled} class="rounded" />
-      <Power size={14} />
-      {t('settings.actionCapabilities.enabled')}
-    </label>
-  </div>
+  <Checkbox bind:checked={form.is_enabled} label={t('settings.actionCapabilities.enabled')} />
 
   <!-- Scope: applies to all workspaces vs. specific allowlist -->
   <div class="space-y-2 pt-2 border-t" style="border-color: var(--ds-border);">
-    <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">Workspace scope</div>
+    <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCapabilities.workspaceScope')}</div>
     <label class="flex items-start gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-      <input
-        type="radio"
+      <Radio
         name="cap-scope"
         checked={form.applies_to_all_workspaces}
         onchange={() => { form.applies_to_all_workspaces = true; }}
         class="mt-0.5"
       />
       <div>
-        <div>Available in all workspaces</div>
-        <div class="text-xs" style="color: var(--ds-text-subtle);">Any workspace's actions can reference this capability.</div>
+        <div>{t('settings.adminOperations.actionCapabilities.availableAll')}</div>
+        <div class="text-xs" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCapabilities.availableAllHelp')}</div>
       </div>
     </label>
     <label class="flex items-start gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-      <input
-        type="radio"
+      <Radio
         name="cap-scope"
         checked={!form.applies_to_all_workspaces}
         onchange={() => { form.applies_to_all_workspaces = false; }}
         class="mt-0.5"
       />
       <div>
-        <div>Restrict to specific workspaces</div>
-        <div class="text-xs" style="color: var(--ds-text-subtle);">Only the workspaces selected below can reference this capability.</div>
+        <div>{t('settings.adminOperations.actionCapabilities.restrict')}</div>
+        <div class="text-xs" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCapabilities.restrictHelp')}</div>
       </div>
     </label>
 
     {#if !form.applies_to_all_workspaces}
-      <div class="ml-6 mt-1 max-h-40 overflow-auto rounded-md border p-2" style="border-color: var(--ds-border); background: var(--ds-surface);">
-        {#if workspaces.length === 0}
-          <p class="text-xs" style="color: var(--ds-text-subtle);">No workspaces available.</p>
-        {:else}
-          {#each workspaces as ws}
-            <label class="flex items-center gap-2 text-sm py-1 cursor-pointer" style="color: var(--ds-text);">
-              <input
-                type="checkbox"
-                checked={form.workspace_ids.includes(ws.id)}
-                onchange={() => toggleWorkspaceScope(ws.id)}
-              />
-              {ws.name}
-            </label>
-          {/each}
-        {/if}
+      <div class="ml-6 mt-1">
+        <WorkspaceCheckboxList
+          workspaces={workspaces}
+          selected={form.workspace_ids}
+          onToggle={toggleWorkspaceScope}
+          emptyMessage={t('settings.adminOperations.actionCapabilities.noWorkspaces')}
+        />
       </div>
     {/if}
   </div>
@@ -605,13 +553,12 @@
     <!-- Image -->
     <div>
       <label for="docker-image" class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.docker.image')}</label>
-      <input
+      <Input
         id="docker-image"
         type="text"
         bind:value={form.docker_image}
         placeholder={t('settings.actionCapabilities.docker.imagePlaceholder')}
-        class="w-full px-3 py-2 text-sm rounded-md border"
-        style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+        size="small"
       />
     </div>
 
@@ -619,24 +566,22 @@
     <div class="grid grid-cols-2 gap-3">
       <div>
         <label for="docker-memory" class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.docker.memory')}</label>
-        <input
+        <Input
           id="docker-memory"
           type="text"
           bind:value={form.docker_memory}
           placeholder={t('settings.actionCapabilities.docker.memoryPlaceholder')}
-          class="w-full px-3 py-2 text-sm rounded-md border"
-          style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+          size="small"
         />
       </div>
       <div>
         <label for="docker-cpus" class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.docker.cpus')}</label>
-        <input
+        <Input
           id="docker-cpus"
           type="text"
           bind:value={form.docker_cpus}
           placeholder={t('settings.actionCapabilities.docker.cpusPlaceholder')}
-          class="w-full px-3 py-2 text-sm rounded-md border"
-          style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+          size="small"
         />
       </div>
     </div>
@@ -655,23 +600,24 @@
     <div>
       <div class="flex items-center justify-between mb-1">
         <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.docker.envVars')}</div>
-        <button class="text-xs font-medium px-2 py-0.5 rounded" style="color: var(--ds-link);" onclick={addEnvVar}>+ {t('settings.actionCapabilities.docker.addEnvVar')}</button>
+        <!-- shortcut-guard-exempt: inline add-row affordance inside a capability form; no global create shortcut owns it -->
+        <Button variant="link" size="small" onclick={addEnvVar}>{t('settings.actionCapabilities.docker.addEnvVar')}</Button>
       </div>
       {#each form.docker_env_vars as envVar, i}
         <div class="flex gap-2 mb-1">
-          <input
+          <Input
             type="text"
             bind:value={envVar.key}
             placeholder={t('settings.actionCapabilities.docker.key')}
-            class="flex-1 px-3 py-1.5 text-sm rounded-md border"
-            style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+            class="flex-1"
+            size="small"
           />
-          <input
+          <Input
             type="text"
             bind:value={envVar.value}
             placeholder={t('settings.actionCapabilities.docker.value')}
-            class="flex-1 px-3 py-1.5 text-sm rounded-md border"
-            style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+            class="flex-1"
+            size="small"
           />
           <button class="p-1 rounded hover:opacity-80" style="color: var(--ds-text-danger);" onclick={() => removeEnvVar(i)}>
             <Trash2 size={14} />
@@ -684,31 +630,28 @@
     <div>
       <div class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.docker.healthCheck')}</div>
       <div class="space-y-2">
-        <input
+        <Input
           type="text"
           bind:value={form.docker_health_endpoint}
           placeholder={t('settings.actionCapabilities.docker.endpointPlaceholder')}
-          class="w-full px-3 py-1.5 text-sm rounded-md border"
-          style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+          size="small"
         />
         {#if form.docker_health_endpoint}
           <div class="grid grid-cols-2 gap-2">
             <div>
               <div class="block text-xs mb-0.5" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.docker.intervalSecs')}</div>
-              <input
+              <Input
                 type="number"
                 bind:value={form.docker_health_interval}
-                class="w-full px-3 py-1.5 text-sm rounded-md border"
-                style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+                size="small"
               />
             </div>
             <div>
               <div class="block text-xs mb-0.5" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.docker.timeoutSecs')}</div>
-              <input
+              <Input
                 type="number"
                 bind:value={form.docker_health_timeout}
-                class="w-full px-3 py-1.5 text-sm rounded-md border"
-                style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+                size="small"
               />
             </div>
           </div>
@@ -724,16 +667,17 @@
     <div>
       <div class="flex items-center justify-between mb-1">
         <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.http.allowedPatterns')}</div>
-        <button class="text-xs font-medium px-2 py-0.5 rounded" style="color: var(--ds-link);" onclick={addPattern}>+ {t('settings.actionCapabilities.http.addPattern')}</button>
+        <!-- shortcut-guard-exempt: inline add-row affordance inside a capability form; no global create shortcut owns it -->
+        <Button variant="link" size="small" onclick={addPattern}>{t('settings.actionCapabilities.http.addPattern')}</Button>
       </div>
       {#each form.http_allowed_patterns as pattern, i}
         <div class="flex gap-2 mb-1">
-          <input
+          <Input
             type="text"
             bind:value={pattern.value}
             placeholder={t('settings.actionCapabilities.http.patternPlaceholder')}
-            class="flex-1 px-3 py-1.5 text-sm rounded-md border"
-            style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+            class="flex-1"
+            size="small"
           />
           <button class="p-1 rounded hover:opacity-80" style="color: var(--ds-text-danger);" onclick={() => removePattern(i)}>
             <Trash2 size={14} />
@@ -746,26 +690,27 @@
     <div>
       <div class="flex items-center justify-between mb-1">
         <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.http.defaultHeaders')}</div>
-        <button class="text-xs font-medium px-2 py-0.5 rounded" style="color: var(--ds-link);" onclick={addHeader}>+ {t('settings.actionCapabilities.http.addHeader')}</button>
+        <!-- shortcut-guard-exempt: inline add-row affordance inside a capability form; no global create shortcut owns it -->
+        <Button variant="link" size="small" onclick={addHeader}>{t('settings.actionCapabilities.http.addHeader')}</Button>
       </div>
       <p class="text-xs mb-1" style="color: var(--ds-text-subtle);">
-        Non-sensitive headers only (Accept, User-Agent, …). Auth tokens go in the Authentication section below.
+        {t('settings.adminOperations.actionCapabilities.defaultHeadersHelp')}
       </p>
       {#each form.http_default_headers as header, i}
         <div class="flex gap-2 mb-1">
-          <input
+          <Input
             type="text"
             bind:value={header.key}
             placeholder={t('settings.actionCapabilities.http.key')}
-            class="flex-1 px-3 py-1.5 text-sm rounded-md border"
-            style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+            class="flex-1"
+            size="small"
           />
-          <input
+          <Input
             type="text"
             bind:value={header.value}
             placeholder={t('settings.actionCapabilities.http.value')}
-            class="flex-1 px-3 py-1.5 text-sm rounded-md border"
-            style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+            class="flex-1"
+            size="small"
           />
           <button class="p-1 rounded hover:opacity-80" style="color: var(--ds-text-danger);" onclick={() => removeHeader(i)}>
             <Trash2 size={14} />
@@ -776,14 +721,11 @@
 
     <!-- Authentication (credential refs) -->
     <div class="rounded-md border p-3" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
-      <label class="flex items-center gap-2 mb-2">
-        <input type="checkbox" bind:checked={form.http_auth_enabled} />
-        <span class="text-sm font-medium" style="color: var(--ds-text);">Use an auth credential</span>
-      </label>
+      <Checkbox bind:checked={form.http_auth_enabled} label={t('settings.adminOperations.actionCapabilities.useCredential')} class="mb-2" />
       {#if form.http_auth_enabled}
         <div class="space-y-2 mt-2">
           <div>
-            <div class="text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">Credential</div>
+            <div class="text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCapabilities.credential')}</div>
             <CredentialPicker
               workspaceId={form.applies_to_all_workspaces ? 0 : form.workspace_ids[0] || 0}
               bind:value={form.http_auth_credential_id}
@@ -791,31 +733,31 @@
             />
             <p class="text-xs mt-1" style="color: var(--ds-text-subtle);">
               {#if form.applies_to_all_workspaces}
-                Global capabilities can only reference global credentials.
+                {t('settings.adminOperations.actionCapabilities.globalCredentialHelp')}
               {:else}
-                Workspace-scoped capabilities can reference globals or credentials in their workspace allowlist.
+                {t('settings.adminOperations.actionCapabilities.workspaceCredentialHelp')}
               {/if}
             </p>
           </div>
           <div class="grid grid-cols-2 gap-2">
             <label class="block">
-              <span class="text-xs font-medium" style="color: var(--ds-text-subtle);">Header name</span>
-              <input
+              <span class="text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCapabilities.headerName')}</span>
+              <Input
                 type="text"
                 bind:value={form.http_auth_header_name}
-                placeholder="Authorization"
-                class="mt-1 w-full px-3 py-1.5 text-sm rounded-md border"
-                style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+                placeholder={t('settings.adminOperations.actionCapabilities.authorizationPlaceholder')}
+                class="mt-1"
+                size="small"
               />
             </label>
             <label class="block">
-              <span class="text-xs font-medium" style="color: var(--ds-text-subtle);">Scheme (bearer tokens only)</span>
-              <input
+              <span class="text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCapabilities.scheme')}</span>
+              <Input
                 type="text"
                 bind:value={form.http_auth_scheme}
-                placeholder="Bearer"
-                class="mt-1 w-full px-3 py-1.5 text-sm rounded-md border"
-                style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+                placeholder={t('settings.adminOperations.actionCapabilities.bearerPlaceholder')}
+                class="mt-1"
+                size="small"
               />
             </label>
           </div>
@@ -826,20 +768,21 @@
     <!-- Secret header refs (APIs that need multiple secret headers) -->
     <div>
       <div class="flex items-center justify-between mb-1">
-        <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">Additional secret headers</div>
-        <button class="text-xs font-medium px-2 py-0.5 rounded" style="color: var(--ds-link);" onclick={addSecretHeaderRef}>+ Add secret header</button>
+        <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCapabilities.additionalHeaders')}</div>
+        <!-- shortcut-guard-exempt: inline add-row affordance inside a capability form; no global create shortcut owns it -->
+        <Button variant="link" size="small" onclick={addSecretHeaderRef}>{t('settings.adminOperations.actionCapabilities.addSecretHeader')}</Button>
       </div>
       <p class="text-xs mb-1" style="color: var(--ds-text-subtle);">
-        For APIs that need more than one secret header (e.g. X-API-Key + X-Signature). Each row resolves a credential at request time.
+        {t('settings.adminOperations.actionCapabilities.additionalHeadersHelp')}
       </p>
       {#each form.http_secret_header_refs as ref, i}
         <div class="flex gap-2 mb-1">
-          <input
+          <Input
             type="text"
             bind:value={ref.header}
-            placeholder="X-API-Key"
-            class="flex-1 px-3 py-1.5 text-sm rounded-md border"
-            style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+            placeholder={t('settings.adminOperations.actionCapabilities.apiKeyHeaderPlaceholder')}
+            class="flex-1"
+            size="small"
           />
           <div class="flex-1">
             <CredentialPicker
@@ -857,13 +800,12 @@
     <!-- Timeout -->
     <div>
       <label for="http-timeout" class="block text-xs font-medium mb-1" style="color: var(--ds-text-subtle);">{t('settings.actionCapabilities.http.timeout')}</label>
-      <input
+      <Input
         id="http-timeout"
         type="number"
         bind:value={form.http_timeout}
         placeholder={t('settings.actionCapabilities.http.timeoutPlaceholder')}
-        class="w-full px-3 py-2 text-sm rounded-md border"
-        style="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
+        size="small"
       />
     </div>
   </div>

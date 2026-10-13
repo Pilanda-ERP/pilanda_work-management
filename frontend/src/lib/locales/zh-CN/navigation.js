@@ -11,7 +11,12 @@ export default {
     organizations: '组织',
     create: '创建',
     search: '搜索',
+    aiChat: 'AI 聊天',
+    terminal: '终端',
     admin: '管理',
+    delegatedAdmin: '委派管理',
+    delegatedAdminSubtitle: '管理分配给您的区域',
+    delegatedAdminUnauthorized: '您没有访问任何委派管理区域的权限。',
     notifications: '通知',
     profile: '个人资料',
     expand: '展开',
@@ -27,6 +32,8 @@ export default {
     loading: '加载中...',
     retry: '重试',
     knowledgeBase: '知识库',
+    scrollDownForMore: '向下滚动查看更多',
+    scrollUpForMore: '向上滚动查看更多',
   },
 
   commandPalette: {
@@ -231,5 +238,11 @@ export default {
     getStartedMember: '以下是您可用的工作区',
     selectWorkspace: '选择工作区以开始',
     noWorkspacesAvailable: '暂无可用工作区。请联系管理员以获取工作区访问权限。',
+  },
+
+  workspaceDashboard: {
+    widgets: {
+      supportMetrics: { name: '支持指标', description: '客户工单的待办、首次响应、解决情况和 SLA 合规性' },
+    },
   },
 };

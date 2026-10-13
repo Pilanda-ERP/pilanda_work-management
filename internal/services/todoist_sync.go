@@ -11,12 +11,13 @@ import (
 	"windshift/internal/constants"
 	"windshift/internal/database"
 	"windshift/internal/integrations/todoist"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/sanitize"
 	"windshift/internal/sso"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // ErrTodoistSyncAlreadyRunning is returned by SyncConfig when another run
@@ -36,6 +37,10 @@ const syncLockLease = 10 * time.Minute
 // avoids timezone churn between Windshift's *time.Time and Todoist's mixed
 // date/datetime due object.
 const dueDateLayout = "2006-01-02"
+
+// todoistOrphanPageSize bounds each keyset page of the orphan-link sweep so
+// Pass C never materializes the whole mapping table.
+const todoistOrphanPageSize = 500
 
 // taskState is the canonical, side-agnostic view of a task that the reconciler
 // compares. Each of the three inputs to a merge — the Windshift item, the
@@ -61,7 +66,7 @@ type todoistAPI interface {
 type personalStore interface {
 	ListTasks(workspaceID int) ([]repository.PersonalWorkspaceTask, error)
 	CreateTask(workspaceID, userID int, st taskState) (int, error)
-	UpdateTask(itemID int, st taskState, fields []string) error
+	UpdateTask(itemID, userID int, st taskState, fields []string) error
 	DeleteTask(itemID int) error
 }
 
@@ -163,15 +168,20 @@ func (s *TodoistSyncService) reconcile(cfg models.TodoistSyncConfig, api todoist
 	if err != nil {
 		return stats, newToken, fmt.Errorf("list personal tasks: %w", err)
 	}
-	links, err := s.syncRepo.ListLinksByUser(cfg.UserID)
+
+	// Delta links only: the Todoist delta is small, so load mappings for the
+	// tasks it touched instead of the user's whole link table.
+	deltaTaskIDs := make([]string, 0, len(resp.Items))
+	for i := range resp.Items {
+		deltaTaskIDs = append(deltaTaskIDs, resp.Items[i].ID)
+	}
+	deltaLinks, err := s.syncRepo.ListLinksByTodoistIDs(cfg.UserID, deltaTaskIDs)
 	if err != nil {
-		return stats, newToken, fmt.Errorf("list task links: %w", err)
+		return stats, newToken, fmt.Errorf("list delta task links: %w", err)
 	}
 
-	linkByItem := make(map[int]models.TodoistTaskLink, len(links))
-	linkByTD := make(map[string]models.TodoistTaskLink, len(links))
-	for _, l := range links {
-		linkByItem[l.ItemID] = l
+	linkByTD := make(map[string]models.TodoistTaskLink, len(deltaLinks))
+	for _, l := range deltaLinks {
 		linkByTD[l.TodoistTaskID] = l
 	}
 	wsByItem := make(map[int]repository.PersonalWorkspaceTask, len(wsTasks))
@@ -222,6 +232,9 @@ func (s *TodoistSyncService) reconcile(cfg models.TodoistSyncConfig, api todoist
 				continue
 			}
 			s.saveSnapshot(cfg.UserID, itemID, td.ID, td.ProjectID, tdState)
+			// The link postdates the task snapshot, so the Pass C sweep and the
+			// Pass B chunks must not touch this item again this run.
+			handledItems[itemID] = true
 			stats.CreatedInWS++
 			continue
 		}
@@ -245,47 +258,82 @@ func (s *TodoistSyncService) reconcile(cfg models.TodoistSyncConfig, api todoist
 	}
 
 	// --- Pass B: Windshift tasks -> Todoist (items the delta didn't touch) ---
-	for _, ws := range wsTasks {
-		if handledItems[ws.ItemID] {
-			continue
-		}
-		link, linked := linkByItem[ws.ItemID]
-		if !linked {
-			st := stateFromWS(ws)
-			cmd, tempID := todoist.NewAddItemCommand(addArgs(cfg, st))
-			cmds = append(cmds, cmd)
-			capturedWS := ws
-			onSuccess[cmd.UUID] = func(r *todoist.SyncResponse) {
-				realID := r.TempIDMapping[tempID]
-				if realID == "" {
-					return
-				}
-				s.saveSnapshot(cfg.UserID, capturedWS.ItemID, realID, cfg.TodoistProjectID, stateFromWS(capturedWS))
-				stats.CreatedInTD++
+	// Links load per chunk of workspace tasks so no pass materializes the
+	// user's whole mapping table.
+	for start := 0; start < len(wsTasks); start += repository.TodoistLinkQueryChunk {
+		end := min(start+repository.TodoistLinkQueryChunk, len(wsTasks))
+		chunk := wsTasks[start:end]
+		chunkItemIDs := make([]int, 0, len(chunk))
+		for _, ws := range chunk {
+			if !handledItems[ws.ItemID] {
+				chunkItemIDs = append(chunkItemIDs, ws.ItemID)
 			}
-			continue
 		}
-		// Existing pair the Todoist delta didn't include: Todoist is unchanged, so
-		// its current state equals the snapshot. reconcilePair then pushes any
-		// Windshift-side change outward (and no-ops when nothing changed).
-		s.reconcilePair(cfg, link, stateFromWS(ws), stateFromSnapshot(link), link.TodoistTaskID, link.TodoistProjectID, store, &cmds, onSuccess, &stats)
+		chunkLinks, err := s.syncRepo.ListLinksByItemIDs(cfg.UserID, chunkItemIDs)
+		if err != nil {
+			return stats, newToken, fmt.Errorf("list task links for workspace tasks: %w", err)
+		}
+		linkByItem := make(map[int]models.TodoistTaskLink, len(chunkLinks))
+		for _, l := range chunkLinks {
+			linkByItem[l.ItemID] = l
+		}
+		for _, ws := range chunk {
+			if handledItems[ws.ItemID] {
+				continue
+			}
+			link, linked := linkByItem[ws.ItemID]
+			if !linked {
+				st := stateFromWS(ws)
+				cmd, tempID := todoist.NewAddItemCommand(addArgs(cfg, st))
+				cmds = append(cmds, cmd)
+				capturedWS := ws
+				onSuccess[cmd.UUID] = func(r *todoist.SyncResponse) {
+					realID := r.TempIDMapping[tempID]
+					if realID == "" {
+						return
+					}
+					s.saveSnapshot(cfg.UserID, capturedWS.ItemID, realID, cfg.TodoistProjectID, stateFromWS(capturedWS))
+					stats.CreatedInTD++
+				}
+				continue
+			}
+			// Existing pair the Todoist delta didn't include: Todoist is unchanged, so
+			// its current state equals the snapshot. reconcilePair then pushes any
+			// Windshift-side change outward (and no-ops when nothing changed).
+			s.reconcilePair(cfg, link, stateFromWS(ws), stateFromSnapshot(link), link.TodoistTaskID, link.TodoistProjectID, store, &cmds, onSuccess, &stats)
+		}
 	}
 
 	// --- Pass C: Windshift deletions (link whose item is gone) ---
-	for _, link := range links {
-		if handledItems[link.ItemID] {
-			continue
+	// Links page by keyset so the sweep never loads the whole mapping table.
+	lastTodoistID := ""
+	for {
+		page, err := s.syncRepo.ListLinksByUserAfter(cfg.UserID, lastTodoistID, todoistOrphanPageSize)
+		if err != nil {
+			return stats, newToken, fmt.Errorf("sweep task links: %w", err)
 		}
-		if _, exists := wsByItem[link.ItemID]; exists {
-			continue
+		if len(page) == 0 {
+			break
 		}
-		cmd := todoist.NewDeleteItemCommand(link.TodoistTaskID)
-		cmds = append(cmds, cmd)
-		capturedLink := link
-		onSuccess[cmd.UUID] = func(*todoist.SyncResponse) {
-			_ = s.syncRepo.DeleteLink(capturedLink.ID)
-			stats.DeletedInTD++
+		for _, link := range page {
+			if handledItems[link.ItemID] {
+				continue
+			}
+			if _, exists := wsByItem[link.ItemID]; exists {
+				continue
+			}
+			cmd := todoist.NewDeleteItemCommand(link.TodoistTaskID)
+			cmds = append(cmds, cmd)
+			capturedLink := link
+			onSuccess[cmd.UUID] = func(*todoist.SyncResponse) {
+				_ = s.syncRepo.DeleteLink(capturedLink.ID)
+				stats.DeletedInTD++
+			}
 		}
+		if len(page) < todoistOrphanPageSize {
+			break
+		}
+		lastTodoistID = page[len(page)-1].TodoistTaskID
 	}
 
 	if len(cmds) == 0 {
@@ -350,7 +398,7 @@ func (s *TodoistSyncService) reconcilePair(
 		changedFields = append(changedFields, "completed")
 	}
 	if len(changedFields) > 0 {
-		if err := store.UpdateTask(link.ItemID, resolved, changedFields); err != nil {
+		if err := store.UpdateTask(link.ItemID, mustUserID(cfg.UserID), resolved, changedFields); err != nil {
 			slog.Warn("todoist sync: update WS task failed", slog.String("component", "todoist-sync"), slog.Any("error", err))
 		} else {
 			stats.UpdatedInWS++
@@ -449,13 +497,7 @@ func inScope(cfg models.TodoistSyncConfig, projectID string) bool {
 	return true
 }
 
-// stateFromTodoist projects an inbound Todoist task to the canonical taskState.
-// Todoist content is external input, so title and description are sanitized
-// here at the ingress boundary — the same policies the item handlers apply
-// (PlainTextField for the title, RichText for the description). Because every
-// inbound value passes through this one function, the sanitized form is what
-// gets written to Windshift items AND what gets snapshotted, so the reconciler
-// never repeatedly tries to "restore" a raw/unsafe remote value.
+// stateFromTodoist sanitizes external content before persistence and reconciliation snapshots.
 func stateFromTodoist(td todoist.Item) taskState {
 	due := ""
 	if td.Due != nil {
@@ -516,6 +558,23 @@ func mustUserID(s string) int {
 	return id
 }
 
+// mapTodoistFieldToHistoryField converts a todoist change field to the
+// item_history field_name the regular update path would have written.
+func mapTodoistFieldToHistoryField(field string) string {
+	switch field {
+	case "title":
+		return "title"
+	case "description":
+		return "description"
+	case "due":
+		return "due_date"
+	case "completed":
+		return "status_id"
+	default:
+		return field
+	}
+}
+
 // --- Windshift-side store implementation ------------------------------------
 
 type itemPersonalStore struct {
@@ -529,21 +588,23 @@ func (st *itemPersonalStore) ListTasks(workspaceID int) ([]repository.PersonalWo
 func (st *itemPersonalStore) CreateTask(workspaceID, userID int, s taskState) (int, error) {
 	statusID := statusForCompleted(s.Completed)
 	params := ItemCreationParams{
-		WorkspaceID: workspaceID,
-		Title:       s.Title,
-		Description: s.Description,
-		StatusID:    &statusID,
-		IsTask:      true,
-		AssigneeID:  &userID,
-		CreatorID:   &userID,
-		DueDate:     dueTime(s.Due),
+		WorkspaceID:      workspaceID,
+		Title:            s.Title,
+		Description:      s.Description,
+		StatusID:         &statusID,
+		IsTask:           true,
+		AssigneeID:       &userID,
+		CreatorID:        &userID,
+		ValidatingUserID: userID,
+		DueDate:          dueTime(s.Due),
+		EventMetadata:    itemevents.Integration("todoist", "integration"),
 	}
 	id, err := CreateItem(st.db, params)
 	return int(id), err
 }
 
-func (st *itemPersonalStore) UpdateTask(itemID int, s taskState, fields []string) error {
-	update := map[string]interface{}{}
+func (st *itemPersonalStore) UpdateTask(itemID, userID int, s taskState, fields []string) error {
+	update := map[string]any{}
 	for _, f := range fields {
 		switch f {
 		case "title":
@@ -564,8 +625,59 @@ func (st *itemPersonalStore) UpdateTask(itemID int, s taskState, fields []string
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := repository.NewItemRepository(st.db).UpdateFields(tx, itemID, update); err != nil {
+	repo := repository.NewItemRepository(st.db)
+	original, err := repo.FindByIDForUpdate(tx, itemID)
+	if err != nil {
 		return err
+	}
+	if err := repo.UpdateFields(tx, itemID, update); err != nil {
+		return err
+	}
+	updated, err := repo.FindByIDForUpdate(tx, itemID)
+	if err != nil {
+		return err
+	}
+	metadata := itemevents.Integration("todoist", "integration")
+	recorder := itemevents.NewRecorder(st.db)
+	changes := itemevents.Changes(original, updated)
+	if _, statusChanged := update["status_id"]; statusChanged {
+		if _, err := recorder.StatusChanged(context.Background(), tx, updated, original.StatusID, updated.StatusID, changes, metadata); err != nil {
+			return err
+		}
+	} else if _, err := recorder.Updated(context.Background(), tx, updated, changes, metadata); err != nil {
+		return err
+	}
+	// The integration bypasses ItemUpdateService, so the field changes would
+	// otherwise never reach item history. Rows attribute to the personal
+	// workspace owner whose Todoist drove the change.
+	now := time.Now()
+	for _, field := range fields {
+		var oldValue, newValue string
+		switch field {
+		case "title":
+			oldValue, newValue = original.Title, updated.Title
+		case "description":
+			oldValue, newValue = original.Description, updated.Description
+		case "due":
+			oldValue, newValue = timePtrToString(original.DueDate), timePtrToString(updated.DueDate)
+		case "completed":
+			oldValue, newValue = intPtrToString(original.StatusID), intPtrToString(updated.StatusID)
+		default:
+			continue
+		}
+		if oldValue == newValue {
+			continue
+		}
+		if err := repo.RecordHistory(tx, repository.HistoryEntry{
+			ItemID:    itemID,
+			UserID:    userID,
+			FieldName: mapTodoistFieldToHistoryField(field),
+			OldValue:  oldValue,
+			NewValue:  newValue,
+			ChangedAt: now,
+		}); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -573,16 +685,13 @@ func (st *itemPersonalStore) UpdateTask(itemID int, s taskState, fields []string
 
 	// Live-update publish (WI-483): Todoist sync writes item fields directly,
 	// bypassing ItemUpdateService.
-	kind := ItemChangeUpdated
-	if _, ok := update["status_id"]; ok {
-		kind = ItemChangeStatus
-	}
-	PublishItemChange(itemID, kind)
+	PublishItemChange(itemID)
+	PublishWorkspaceChange(updated.WorkspaceID)
 	return nil
 }
 
 func (st *itemPersonalStore) DeleteTask(itemID int) error {
-	return NewItemCRUDService(st.db).DeleteSingle(itemID)
+	return NewItemCRUDService(st.db).DeleteSingleWithMetadata(itemID, itemevents.Integration("todoist", "integration"))
 }
 
 func statusForCompleted(completed bool) int {

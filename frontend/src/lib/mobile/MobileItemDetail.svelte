@@ -1,30 +1,27 @@
 <script>
-  import { Star, Play, Loader, ChevronDown, ChevronRight, GitPullRequest, Bot, RefreshCw, Plus, Check } from '@lucide/svelte';
+  import { Star, Play, Loader, ChevronDown, ChevronRight, GitPullRequest, Bot, RefreshCw, Plus, Check, Pencil } from '@lucide/svelte';
   import { api } from '../api.js';
-  import { agentRuns } from '../api/agentRuns.js';
+  import { loadMobileItemDetailSummary } from './mobileItemDetailData.js';
   import { agentRuns as agentRunBus } from '../stores/agentRuns.svelte.js';
   import { navigate } from '../router.js';
   import { notificationActions } from '../stores/notifications.js';
-  import { errorToast } from '../stores/toasts.svelte.js';
+  import { errorToast, infoToast } from '../stores/toasts.svelte.js';
   import { timerStore } from '../stores/timerStore.svelte.js';
-  import { useWorkItemPoller } from '../composables/useWorkItemPoller.svelte.js';
   import { useItemEventStream } from '../composables/useItemEventStream.svelte.js';
-  import { itemLiveUpdates } from '../stores/itemLiveUpdates.svelte.js';
   import { usePullToRefresh } from '../composables/usePullToRefresh.svelte.js';
-  import { renderMarkdown } from '../utils/render-markdown.js';
-  import { formatDate } from '../utils/dateFormatter.js';
+  import { formatDateOnly } from '../utils/dateFormatter.js';
   import { formatItemKey } from '../utils/itemKey.js';
   import { workspacesStore } from '../stores';
   import MobileHeader from './MobileHeader.svelte';
   import MobileItemRow from './MobileItemRow.svelte';
-  import MobileCreateDialog from './MobileCreateDialog.svelte';
+  import MobileOptionSheet from './MobileOptionSheet.svelte';
   import StatusPill from '../components/StatusPill.svelte';
   import Comments from '../features/items/Comments.svelte';
   import ItemSCMLinks from '../features/items/ItemSCMLinks.svelte';
   import ItemAgentLog from '../features/items/ItemAgentLog.svelte';
-  import BasePicker from '../pickers/BasePicker.svelte';
-  import UserPicker from '../pickers/UserPicker.svelte';
   import Avatar from '../components/Avatar.svelte';
+  import LazyMilkdownEditor from '../editors/LazyMilkdownEditor.svelte';
+  import { t } from '../stores/i18n.svelte.js';
 
   let { itemId } = $props();
 
@@ -36,40 +33,54 @@
   let isWatching = $state(false);
   let watchBusy = $state(false);
 
-  // Personal-workspace (workflow-less) items get no available status
-  // transitions from the backend, which left the workflow status picker
-  // disabled and made a personal task impossible to complete on the PWA. This
-  // mirrors the PWA's own PersonalView / the desktop personal-task view: a
-  // plain Done checkbox that toggles status_id between Open (1) and Done (3)
-  // via the existing transition endpoint, which already permits any transition
-  // for a workflow-less (personal) workspace. See WI-537.
-  // Statuses are global (workspace-agnostic), so 1/3 are stable ids.
+  // Workflow-less personal tasks use the permitted transition endpoint to toggle
+  // globally stable Open/Done IDs, matching desktop and PWA personal views.
   const PERSONAL_STATUS_OPEN = 1;
   const PERSONAL_STATUS_DONE = 3;
   let personalTaskCount = $state(0);
   let startingTimer = $state(false);
   let children = $state([]);
   let ancestors = $state([]);
-  // Item types one hierarchy level below this item's type — the set allowed as
-  // children. Computed the same way the desktop itemDetailStore does
-  // (#loadItemTypeData). Empty for the lowest level, which hides the
-  // "Add sub-item" affordance (mirrors the desktop's createChild gate).
+  // One-level-deeper item types allowed as children; empty hides Add sub-item.
   let availableSubIssueTypes = $state([]);
-  let createChildOpen = $state(false);
-  // Bumped on every itemId change so in-flight loads for a previous item can't
-  // write stale state when the user navigates item → item (e.g. tapping a
-  // sub-item) without the component remounting.
+
+  // Property editing happens in bottom sheets (the mobile replacement for the
+  // desktop floating pickers). Status options come from the workflow's
+  // available-transitions endpoint; assignee options load lazily from the
+  // workspace-scoped assignable-users endpoint on first open.
+  let statusSheetOpen = $state(false);
+  let assigneeSheetOpen = $state(false);
+  let assigneeOptions = $state(null);
+  let assigneeLoading = $state(false);
+
+  function userLabel(user) {
+    if (!user) return '';
+    return `${user.first_name || ''} ${user.last_name || ''}`.trim() || user.email || user.username || '';
+  }
+
+  async function openAssigneeSheet() {
+    assigneeSheetOpen = true;
+    if (assigneeOptions) return;
+    assigneeLoading = true;
+    try {
+      assigneeOptions = (await api.getAssignableUsers(item.workspace_id)) ?? [];
+    } catch (err) {
+      console.error('Failed to load assignable users:', err);
+      errorToast(t('mobile.item.assigneesFailed'));
+      assigneeOptions = [];
+    } finally {
+      assigneeLoading = false;
+    }
+  }
+  // Prevent prior-item loads from writing stale state during in-place navigation.
   let loadToken = 0;
 
-  // SCM (commits/PRs) + coding-agent panels — gated exactly like the desktop
-  // ItemDetail: SCM via the per-item connection-status probe (has_repositories),
-  // agent via a one-row agent-runs probe. Bodies mount lazily on expand.
+  // Load SCM bodies and agent logs only when their available panels expand.
   let scmAvailable = $state(false);
   let hasAgentRuns = $state(false);
   let scmOpen = $state(false);
   let agentOpen = $state(false);
 
-  const descriptionHtml = $derived(item?.description ? renderMarkdown(item.description) : '');
   const itemKey = $derived(formatItemKey(item) ?? '');
   const projectId = $derived(item?.time_project_id ?? item?.effective_project_id ?? null);
   const canStartTimer = $derived(!!item && !timerStore.hasActive && !!projectId);
@@ -80,10 +91,6 @@
   // personalWorkspace is fetched on demand once an item resolves here.
   const personalWorkspaceId = $derived($workspacesStore?.personalWorkspace?.id ?? null);
   const isPersonalItem = $derived(!!item && personalWorkspaceId != null && item.workspace_id === personalWorkspaceId);
-  // Stable parent context for the create-child dialog (id + title), derived so
-  // it only gets a new reference when the underlying item actually changes —
-  // avoids re-triggering the dialog's effects on unrelated re-renders.
-  const childParent = $derived(item ? { id: item.id, title: item.title } : null);
 
   function normalizeChild(c) {
     return {
@@ -94,7 +101,7 @@
       statusColor: c.status_color,
       priorityName: c.priority_name,
       priorityColor: c.priority_color,
-      dueDate: c.due_date ? new Date(c.due_date) : null,
+      dueDate: c.due_date || null,
     };
   }
 
@@ -102,9 +109,21 @@
     loading = true;
     errored = false;
     try {
-      const loaded = await api.items.get(id);
+      const summary = await loadMobileItemDetailSummary(id);
       if (token !== loadToken) return;
-      item = loaded;
+      item = summary?.item ?? null;
+      transitions = summary?.transitions?.available_transitions ?? [];
+      isWatching = summary?.watching || false;
+      personalTaskCount = summary?.personal_task_count ?? 0;
+      const childItems = Array.isArray(summary?.children) ? summary.children : [];
+      children = childItems.filter((child) => child?.id).map(normalizeChild);
+      ancestors = Array.isArray(summary?.ancestors)
+        ? summary.ancestors.filter((ancestor) => ancestor?.id)
+        : [];
+      availableSubIssueTypes = summary?.available_sub_issue_types ?? [];
+      scmAvailable = summary?.scm_available || false;
+      hasAgentRuns = summary?.has_agent_runs || false;
+      if (!item) throw new Error('Item detail summary did not include an item');
     } catch (err) {
       if (token !== loadToken) return;
       console.error('Failed to load item:', err);
@@ -114,81 +133,22 @@
     }
   }
 
-  async function loadAux(id, token) {
-    // Best-effort side data — failures here shouldn't blank the screen. Every
-    // assignment is guarded by the load token so a stale item's response can't
-    // overwrite the current one.
+  async function retryLoadItem() {
+    if (itemId == null || loading) return;
+    const token = ++loadToken;
+    item = null;
+    await loadItem(itemId, token);
+    if (token === loadToken && !errored) {
+      notificationActions.markItemAsRead(itemId);
+    }
+  }
+
+  async function refreshTransitionState(id, token) {
     try {
       const res = await api.items.getAvailableStatusTransitions(id);
       if (token === loadToken) transitions = res?.available_transitions ?? [];
     } catch (err) {
       console.error('Failed to load transitions:', err);
-    }
-    try {
-      const res = await api.items.getWatchStatus(id);
-      if (token === loadToken) isWatching = res?.watching || false;
-    } catch (err) {
-      console.error('Failed to load watch status:', err);
-    }
-    try {
-      const tasks = await api.items.getPersonalTasks(id);
-      if (token === loadToken) personalTaskCount = Array.isArray(tasks) ? tasks.length : (tasks?.items?.length ?? 0);
-    } catch {
-      if (token === loadToken) personalTaskCount = 0;
-    }
-    try {
-      const res = await api.items.getChildren(id);
-      const list = Array.isArray(res) ? res : (res?.items ?? []);
-      if (token === loadToken) children = list.filter((c) => c?.id).map(normalizeChild);
-    } catch {
-      if (token === loadToken) children = [];
-    }
-    // Parent chain (root → immediate parent) for the up-navigation breadcrumb.
-    if (item?.parent_id) {
-      try {
-        const anc = await api.items.getAncestors(id);
-        const list = Array.isArray(anc) ? anc : (anc?.items ?? []);
-        if (token === loadToken) ancestors = list.filter((a) => a?.id);
-      } catch {
-        if (token === loadToken) ancestors = [];
-      }
-    }
-    // SCM gate: show the panel unless the connection probe says the workspace
-    // has no repositories (matches ItemSCMLinks' own has_repositories gate;
-    // personal workspaces have no repos, so this also covers the desktop's
-    // non-personal check).
-    try {
-      const cs = await api.itemSCMLinks.getConnectionStatus(id);
-      if (token === loadToken) scmAvailable = cs?.has_repositories !== false;
-    } catch {
-      if (token === loadToken) scmAvailable = false;
-    }
-    // Agent gate: a coding-agent session exists iff a one-row probe is non-empty.
-    try {
-      const runs = await agentRuns.listForItem(id, { limit: 1 });
-      if (token === loadToken) hasAgentRuns = (runs?.length ?? 0) > 0;
-    } catch {
-      if (token === loadToken) hasAgentRuns = false;
-    }
-    // Sub-issue types: the item types one hierarchy level below this item's
-    // type. Used to gate + populate the "Add sub-item" dialog. Mirrors the
-    // desktop itemDetailStore's #loadItemTypeData (item types + hierarchy
-    // levels, filtered to level = current + 1).
-    try {
-      const currentTypeId = item?.item_type_id ?? null;
-      const [typesRes, levelsRes] = await Promise.all([
-        api.itemTypes.getAll(),
-        api.hierarchyLevels.getAll(),
-      ]);
-      const types = Array.isArray(typesRes) ? typesRes : (typesRes?.items ?? []);
-      const levels = Array.isArray(levelsRes) ? levelsRes : (levelsRes?.items ?? []);
-      const current = currentTypeId ? types.find((t) => t.id === currentTypeId) : null;
-      const level = current ? levels.find((l) => l.level === current.hierarchy_level) : null;
-      const nextLevel = level ? level.level + 1 : null;
-      const subTypes = nextLevel != null ? types.filter((t) => t.hierarchy_level === nextLevel) : [];
-      if (token === loadToken) availableSubIssueTypes = subTypes;
-    } catch {
-      if (token === loadToken) availableSubIssueTypes = [];
     }
   }
 
@@ -198,7 +158,7 @@
     try {
       const updated = await api.items.transition(itemId, statusId);
       item = { ...item, ...updated };
-      await loadAux(itemId, loadToken);
+      await refreshTransitionState(itemId, loadToken);
     } catch (err) {
       console.error('Failed to transition item:', err);
     } finally {
@@ -268,7 +228,7 @@
         workspace_id: item.workspace_id,
         item_id: item.id,
         project_id: projectId,
-        description: `Working on ${item.title}`,
+        description: t('mobile.timer.workingOn', { title: item.title }),
       });
       navigate('/m/timer');
     } catch (err) {
@@ -280,22 +240,23 @@
 
   function openCreateChild() {
     if (!canCreateChild) return;
-    createChildOpen = true;
+    // Dedicated create page with the parent pinned via query param; returning
+    // to the detail remounts this view and picks up the new sub-item.
+    navigate(`/m/new?parent=${itemId}`);
   }
 
-  // Called when the create-child dialog closes (both on submit and cancel).
-  // A silent refresh of the sub-item list is cheap and side-effect-free on
-  // cancel (the list is unchanged), so it doubles as the "new child appeared"
-  // handler without needing the dialog to report success.
-  async function handleCreateChildClose() {
-    try {
-      const res = await api.items.getChildren(itemId);
-      const list = Array.isArray(res) ? res : (res?.items ?? []);
-      children = list.filter((c) => c?.id).map(normalizeChild);
-    } catch {
-      /* keep prior list */
-    }
-  }
+  // Live updates (WI-484). The stream is coarse: any change runs refresh()
+  // (item record, transitions, children, watch) and dispatches the comment
+  // event the embedded Comments listens for. The stream opens before the
+  // initial snapshot so a first-connect reconcile is unnecessary.
+  useItemEventStream(() => itemId, {
+    onReconcile: () => {
+      refresh();
+      window.dispatchEvent(new CustomEvent('item-comments-changed', { detail: { itemId } }));
+      window.dispatchEvent(new CustomEvent('item-scm-links-changed', { detail: { itemId } }));
+    },
+    onDeleted: () => handleDeleted(),
+  });
 
   // Reload whenever the item id changes — the component is not remounted when
   // navigating item → item (e.g. tapping a sub-item), so onMount wouldn't fire.
@@ -315,10 +276,10 @@
     scmOpen = false;
     agentOpen = false;
     availableSubIssueTypes = [];
-    createChildOpen = false;
+    statusSheetOpen = false;
+    assigneeSheetOpen = false;
     loadItem(id, token).then(() => {
       if (token === loadToken && !errored) {
-        loadAux(id, token);
         // Clear notifications pointing at this item — viewing an item should
         // mark its notifications read regardless of entry point (PWA push,
         // deep link), not only when opened from the notification list.
@@ -345,6 +306,7 @@
       if (token !== loadToken) return;
       item = { ...item, ...fresh };
     } catch (err) {
+      if (token !== loadToken) return;
       // 404 => the item was deleted out from under us; leave the stale view.
       if (err?.status === 404) handleDeleted();
       return;
@@ -364,39 +326,13 @@
     } catch { /* keep prior */ }
   }
 
-  // Match desktop freshness: adaptive background poll (30s active / 5m idle) for
-  // changes made elsewhere (other users, automations, workflow side effects),
-  // plus an instant refresh when an AI run completes (chatStore emits on the bus).
-  // While the SSE stream is healthy the poll is demoted (WI-484); it resumes if
-  // the stream drops or is unsupported.
-  useWorkItemPoller(() => refresh(), { enabled: () => !itemLiveUpdates.isLive(itemId) });
+  // Refresh when an AI run completes (chatStore emits on the bus); live SSE
+  // changes drive the rest.
   $effect(() => agentRunBus.subscribe(() => refresh()));
-
-  // Live updates (WI-484). Mobile reloads via refresh() (item record,
-  // transitions, children, watch) for every granular kind — the same work the
-  // poll did — and dispatches the comment event the embedded Comments listens
-  // for. connect/reconnect/stale also run refresh() to reconcile.
-  useItemEventStream(() => itemId, {
-    // Full reconcile also refreshes the embedded Comments (separate component),
-    // so a comment that arrived before the stream connected isn't missed.
-    onReconcile: () => {
-      refresh();
-      window.dispatchEvent(new CustomEvent('item-comments-changed', { detail: { itemId } }));
-      window.dispatchEvent(new CustomEvent('item-scm-links-changed', { detail: { itemId } }));
-    },
-    onItem: () => refresh(),
-    onChildren: () => refresh(),
-    onLinks: () => {
-      refresh();
-      window.dispatchEvent(new CustomEvent('item-scm-links-changed', { detail: { itemId } }));
-    },
-    onDeleted: () => handleDeleted(),
-    onComment: () => window.dispatchEvent(new CustomEvent('item-comments-changed', { detail: { itemId } })),
-  });
 
   // The viewed item was deleted elsewhere: toast and leave the now-stale detail.
   function handleDeleted() {
-    errorToast('This item was deleted.');
+    infoToast(t('mobile.item.deleted'));
     if (window.history.length > 1) window.history.back();
     else navigate('/m');
   }
@@ -425,7 +361,10 @@
 {#if loading}
   <div class="center" data-testid="detail-loading"><Loader class="spin" size={22} /></div>
 {:else if errored || !item}
-  <p class="msg" data-testid="detail-error">Couldn't load this item.</p>
+  <div class="msg" data-testid="detail-error">
+    <p>{t('mobile.item.loadFailed')}</p>
+    <button class="retry" onclick={retryLoadItem} disabled={loading} type="button">{t('common.retry')}</button>
+  </div>
 {:else}
   <div
     class="detail"
@@ -456,7 +395,7 @@
     </div>
 
     {#if ancestors.length > 0}
-      <nav class="breadcrumb" data-testid="detail-breadcrumb" aria-label="Parent items">
+      <nav class="breadcrumb" data-testid="detail-breadcrumb" aria-label={t('mobile.item.parents')}>
         {#each ancestors as anc, i (anc.id)}
           {#if i > 0}<ChevronRight size={13} class="bc-sep" />{/if}
           <button class="bc-link" onclick={() => navigate(`/m/items/${anc.id}`)} data-testid="breadcrumb-link" type="button">
@@ -470,12 +409,24 @@
       <div class="status-line"><span class="type">{item.item_type_name}</span></div>
     {/if}
 
-    <h1 class="title" data-testid="detail-title">{item.title}</h1>
+    <div class="title-row">
+      <h1 class="title" data-testid="detail-title">{item.title}</h1>
+      <button
+        class="edit-btn"
+        onclick={() => navigate(`/m/items/${item.id}/edit`)}
+        data-testid="detail-edit"
+        aria-label={t('mobile.item.editTitleDescription')}
+        type="button"
+      >
+        <Pencil size={16} />
+        <span>{t('common.edit')}</span>
+      </button>
+    </div>
 
-    <!-- Status + assignee pickers. Status options come from the workflow's
-         available-transitions endpoint (not hardcoded), so custom workflows
-         and custom statuses work as-is. Assignee users come from the
-         workspace-scoped assignable-users endpoint via UserPicker. -->
+    <!-- Status + assignee rows open bottom sheets. Status options come from
+         the workflow's available-transitions endpoint (not hardcoded), so
+         custom workflows and custom statuses work as-is. Assignee users come
+         from the workspace-scoped assignable-users endpoint. -->
     <div class="fields">
       {#if isPersonalItem}
         <!-- Personal (workflow-less) tasks: the available-transitions endpoint
@@ -490,79 +441,63 @@
           aria-pressed={personalIsDone}
           type="button"
         >
-          <span class="field-label">Status</span>
+          <span class="field-label">{t('common.status')}</span>
           <span class="field-value" data-testid="detail-status">
             <span class="done-check" class:done={personalIsDone} aria-hidden="true">
               {#if personalIsDone}<Check size={12} strokeWidth={3} />{/if}
             </span>
-            {personalIsDone ? 'Done' : (item.status_name || 'Open')}
+            {personalIsDone ? t('common.done') : (item.status_name || t('statuses.defaults.open.name'))}
           </span>
         </button>
       {:else}
-      <BasePicker
-        value={item.status_id ?? null}
-        items={transitions}
-        getValue={(s) => s.id}
-        getLabel={(s) => s.name}
+      <button
+        class="field"
+        onclick={() => (statusSheetOpen = true)}
         disabled={transitioning || transitions.length === 0}
-        allowClear={false}
-        positioning={{ strategy: 'fixed', placement: 'bottom-start', sameWidth: true }}
-        onSelect={(s) => s && changeStatus(s.id)}
+        data-testid="status-picker-trigger"
+        type="button"
       >
-        {#snippet children()}
-          <div class="field" data-testid="status-picker-trigger">
-            <span class="field-label">Status</span>
-            <span class="field-value" data-testid="detail-status">
-              <StatusPill name={item.status_name} color={item.status_color} />
-              <ChevronDown size={16} class="chev" />
-            </span>
-          </div>
-        {/snippet}
-        {#snippet itemSnippet({ item: opt })}
-          <span class="opt">
-            <span class="opt-dot" style={opt.category_color ? `background-color: ${opt.category_color};` : ''}></span>
-            {opt.name}
-          </span>
-        {/snippet}
-      </BasePicker>
+        <span class="field-label">{t('common.status')}</span>
+        <span class="field-value" data-testid="detail-status">
+          <StatusPill name={item.status_name} color={item.status_color} />
+          <ChevronDown size={16} class="chev" />
+        </span>
+      </button>
       {/if}
 
-      <UserPicker
-        value={item.assignee_id ?? null}
-        workspaceId={item.workspace_id}
-        showUnassigned={true}
-        positioning={{ strategy: 'fixed', placement: 'bottom-start', sameWidth: true }}
-        onSelect={updateAssignee}
+      <button
+        class="field"
+        onclick={openAssigneeSheet}
+        data-testid="assignee-picker-trigger"
+        type="button"
       >
-        {#snippet children()}
-          <div class="field" data-testid="assignee-picker-trigger">
-            <span class="field-label">Assignee</span>
-            <span class="field-value">
-              {#if item.assignee_id && item.assignee_name}
-                <Avatar src={item.assignee_avatar} name={item.assignee_name} size="xs" variant="teal" />
-                <span class="assignee-name">{item.assignee_name}</span>
-              {:else}
-                <span class="muted">Unassigned</span>
-              {/if}
-              <ChevronDown size={16} class="chev" />
-            </span>
-          </div>
-        {/snippet}
-      </UserPicker>
+        <span class="field-label">{t('common.assignee')}</span>
+        <span class="field-value">
+          {#if item.assignee_id && item.assignee_name}
+            <Avatar src={item.assignee_avatar} name={item.assignee_name} size="xs" variant="teal" />
+            <span class="assignee-name">{item.assignee_name}</span>
+          {:else}
+            <span class="muted">{t('common.unassigned')}</span>
+          {/if}
+          <ChevronDown size={16} class="chev" />
+        </span>
+      </button>
     </div>
 
-    {#if descriptionHtml}
-      <div class="html-content desc" data-testid="detail-description">{@html descriptionHtml}</div>
+    {#if item.description}
+      <div class="html-content desc" data-testid="detail-description">
+        <LazyMilkdownEditor content={item.description} readonly={true} showToolbar={false} />
+      </div>
     {/if}
 
     <!-- Meta -->
     {#if item.due_date || personalTaskCount > 0}
       <dl class="meta">
         {#if item.due_date}
-          <div><dt>Due</dt><dd>{formatDate(item.due_date)}</dd></div>
+          <div><dt>{t('common.dueDate')}</dt><dd>{formatDateOnly(item.due_date)}</dd></div>
         {/if}
         {#if personalTaskCount > 0}
-          <div><dt>Personal tasks</dt><dd>{personalTaskCount} linked</dd></div>
+          <div><dt>{t('personal.personalTasks')}</dt><dd>{t('mobile.item.linkedCount', { count: personalTaskCount })}</dd></div>
         {/if}
       </dl>
     {/if}
@@ -571,11 +506,11 @@
     <div class="actions">
       <button class="act" class:on={isWatching} onclick={toggleWatch} disabled={watchBusy} data-testid="detail-watch" type="button">
         <Star size={16} fill={isWatching ? 'currentColor' : 'none'} />
-        {isWatching ? 'Watching' : 'Watch'}
+        {isWatching ? t('mobile.item.watching') : t('mobile.item.watch')}
       </button>
       {#if canStartTimer}
         <button class="act" onclick={startTimer} disabled={startingTimer} data-testid="detail-start-timer" type="button">
-          <Play size={16} /> Start timer
+          <Play size={16} /> {t('items.startTimer')}
         </button>
       {/if}
     </div>
@@ -586,15 +521,15 @@
     {#if canCreateChild}
       <section class="subitems" data-testid="detail-subitems">
         <h2 class="section-title">
-          Sub-items {#if children.length > 0}<span class="count">{children.length}</span>{/if}
+          {t('mobile.item.children')} {#if children.length > 0}<span class="count">{children.length}</span>{/if}
           <button
             class="add-child"
             onclick={openCreateChild}
             data-testid="detail-add-sub-item"
             type="button"
-            aria-label="Add sub-item"
+            aria-label={t('mobile.item.addChild')}
           >
-            <Plus size={16} /> Add
+            <Plus size={16} /> {t('common.add')}
           </button>
         </h2>
         {#if children.length > 0}
@@ -611,7 +546,7 @@
     {#if scmAvailable}
       <section class="panel" data-testid="scm-panel">
         <button class="panel-head" onclick={() => (scmOpen = !scmOpen)} aria-expanded={scmOpen} data-testid="scm-panel-toggle" type="button">
-          <span class="panel-title"><GitPullRequest size={16} /> Commits &amp; pull requests</span>
+          <span class="panel-title"><GitPullRequest size={16} /> {t('mobile.item.commitsPullRequests')}</span>
           <ChevronDown size={18} class={scmOpen ? 'chev open' : 'chev'} />
         </button>
         {#if scmOpen}
@@ -628,7 +563,7 @@
     {#if hasAgentRuns}
       <section class="panel" data-testid="agent-panel">
         <button class="panel-head" onclick={() => (agentOpen = !agentOpen)} aria-expanded={agentOpen} data-testid="agent-panel-toggle" type="button">
-          <span class="panel-title"><Bot size={16} /> Coding agent</span>
+          <span class="panel-title"><Bot size={16} /> {t('mobile.item.codingAgent')}</span>
           <ChevronDown size={18} class={agentOpen ? 'chev open' : 'chev'} />
         </button>
         {#if agentOpen}
@@ -642,23 +577,56 @@
     <!-- Comments. Keyed on itemId so it reloads when navigating item → item. -->
     <section class="comments">
       {#key itemId}
-        <Comments {itemId} onCommentsLoaded={() => {}} />
+        <Comments {itemId} workspaceId={item.workspace_id} onCommentsLoaded={() => {}} />
       {/key}
     </section>
   </div>
 {/if}
 
-<!-- Create-child dialog. Mounted lazily once the item loads; the parent
-     context pins the new item under this one and locks the type picker to the
-     allowed sub-issue types. Closes silently refresh the sub-item list. -->
-{#if item && canCreateChild}
-  <MobileCreateDialog
-    bind:isOpen={createChildOpen}
-    onclose={handleCreateChildClose}
-    parent={childParent}
-    availableItemTypes={availableSubIssueTypes}
-    workspaceId={item.workspace_id}
-  />
+{#if item && transitions.length > 0}
+  <MobileOptionSheet
+    bind:isOpen={statusSheetOpen}
+    title={t('common.status')}
+    options={transitions}
+    getValue={(s) => s.id}
+    getLabel={(s) => s.name}
+    selectedValue={item.status_id ?? null}
+    onSelect={(s) => s && changeStatus(s.id)}
+    emptyText={t('mobile.item.noStatuses')}
+    dataTestid="status-sheet"
+  >
+    {#snippet row(s)}
+      <span class="opt">
+        <span class="opt-dot" style={s.category_color ? `background-color: ${s.category_color};` : ''}></span>
+        {s.name}
+      </span>
+    {/snippet}
+  </MobileOptionSheet>
+{/if}
+
+{#if item}
+  <MobileOptionSheet
+    bind:isOpen={assigneeSheetOpen}
+    title={t('common.assignee')}
+    options={assigneeOptions ?? []}
+    loading={assigneeLoading}
+    getValue={(u) => u.id}
+    getLabel={userLabel}
+    selectedValue={item.assignee_id ?? null}
+    allowClear={true}
+    clearLabel={t('common.unassigned')}
+    onSelect={updateAssignee}
+    onClear={() => updateAssignee(null)}
+    emptyText={t('mobile.item.noAssignees')}
+    dataTestid="assignee-sheet"
+  >
+    {#snippet row(user)}
+      <span class="opt">
+        <Avatar src={user.avatar_url} name={userLabel(user)} size="xs" variant="teal" />
+        <span class="assignee-option-label">{userLabel(user)}</span>
+      </span>
+    {/snippet}
+  </MobileOptionSheet>
 {/if}
 
 <style>
@@ -667,6 +635,20 @@
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .msg { padding: 3rem 1.25rem; text-align: center; color: var(--ds-text-subtle); }
+  .msg p { margin: 0; }
+  .retry {
+    min-height: 40px;
+    margin-top: 0.75rem;
+    padding: 0.45rem 1rem;
+    border: 1px solid var(--ds-interactive);
+    border-radius: var(--radius-md, 6px);
+    background: var(--ds-interactive);
+    color: var(--ds-text-inverse, #fff);
+    font: inherit;
+    font-weight: var(--font-semibold, 600);
+    cursor: pointer;
+  }
+  .retry:disabled { opacity: 0.6; }
 
   .detail { padding: 0.75rem 0.875rem 2rem; position: relative; }
   /* Promote to its own layer only while the pull gesture is active. A
@@ -718,18 +700,44 @@
   .status-line { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
   .type { font-size: 0.75rem; color: var(--ds-text-subtle); text-transform: uppercase; letter-spacing: 0.02em; }
 
-  .title { font-size: 1.25rem; font-weight: var(--font-semibold, 600); color: var(--ds-text); margin: 0 0 1rem; line-height: 1.3; }
+  .title-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin: 0 0 1rem;
+  }
+  .title { font-size: 1.25rem; font-weight: var(--font-semibold, 600); color: var(--ds-text); margin: 0; line-height: 1.3; }
+  .edit-btn {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    min-height: 44px;
+    padding: 0.25rem 0.5rem;
+    margin: -0.25rem -0.25rem 0 0;
+    border: none;
+    border-radius: var(--radius-md, 6px);
+    background: transparent;
+    color: var(--ds-interactive);
+    font-size: 0.8125rem;
+    font-weight: var(--font-medium, 500);
+    cursor: pointer;
+  }
+  .edit-btn:active { background-color: var(--ds-background-neutral-hovered); }
 
-  /* Status + assignee picker field rows */
+  /* Status + assignee rows (buttons styled as list rows) */
   .fields {
     margin-bottom: 1rem; border: 1px solid var(--ds-border); border-radius: var(--radius-lg, 8px); overflow: hidden;
   }
   .field {
     display: flex; align-items: center; justify-content: space-between; gap: 1rem;
-    min-height: 48px; padding: 0.5rem 0.85rem; cursor: pointer;
+    width: 100%; min-height: 48px; padding: 0.5rem 0.85rem; cursor: pointer;
+    border: none; background: transparent; color: inherit; font: inherit; text-align: left;
   }
   .field:not(:last-child) { border-bottom: 1px solid var(--ds-border); }
   .field:active { background-color: var(--ds-background-neutral-hovered); }
+  .field:disabled { opacity: 0.6; cursor: default; }
   .field-label { font-size: 0.8125rem; color: var(--ds-text-subtle); }
   .field-value { display: inline-flex; align-items: center; gap: 0.5rem; min-width: 0; color: var(--ds-text); font-size: 0.875rem; }
   .field-value :global(.chev) { color: var(--ds-icon-subtle, var(--ds-text-subtle)); flex-shrink: 0; }
@@ -744,8 +752,9 @@
     color: #fff; background: transparent;
   }
   .done-check.done { background-color: var(--ds-success, #4cb782); border-color: var(--ds-success, #4cb782); }
-  .opt { display: inline-flex; align-items: center; gap: 0.5rem; }
+  .opt { display: inline-flex; align-items: center; gap: 0.5rem; min-width: 0; }
   .opt-dot { width: 8px; height: 8px; border-radius: var(--radius-full, 9999px); background-color: var(--ds-icon-subtle, var(--ds-text-subtle)); flex-shrink: 0; }
+  .assignee-option-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .desc {
     padding: 0.5rem 0 1rem; border-bottom: 1px solid var(--ds-border); margin-bottom: 1rem;

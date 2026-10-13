@@ -36,7 +36,9 @@ type Config struct {
 	// client/dialer reach loopback and private/RFC1918 destinations. It is the
 	// single switch operators flip to run self-hosted SCM (Gitea / GitHub
 	// Enterprise), Jira Data Center, or a local LLM gateway on a private
-	// network — instead of allowlisting each endpoint's CIDR. Off by default.
+	// network — instead of allowlisting each endpoint's CIDR. On by default;
+	// set the corresponding flag or environment variable to false to restore
+	// private-address blocking.
 	AllowLocalConnections bool
 
 	// Sub-configs grouped by concern
@@ -50,16 +52,21 @@ type Config struct {
 	CodingAgent  CodingAgentConfig
 	Logbook      LogbookConfig
 	Notification NotificationConfig
+	OutboundTLS  OutboundTLSConfig
 	Push         PushConfig
 	Jira         JiraConfig
+	Memory       MemoryConfig
 
 	// Flat fields (no logical grouping)
-	AttachmentPath      string
-	EnableAdminFallback bool
-	DisableIPRateLimit  bool
-	MaxUserConcurrency  int
-	MCPEnabled          bool
-	RecoverUser         string
+	AttachmentPath              string
+	EnableAdminFallback         bool
+	DisableIPRateLimit          bool
+	MaxUserConcurrency          int
+	MaxTemplateSeedItems        int
+	MCPEnabled                  bool
+	RecoverUser                 string
+	ActivateDurableActions      bool
+	ActivateDurableAssetActions bool
 
 	// Wire-time values (not env/flag-driven)
 	FrontendFiles embed.FS
@@ -67,14 +74,30 @@ type Config struct {
 	SilentMode    bool
 }
 
+// MemoryConfig declares the intended total memory budget for one Windshift
+// process. The runtime heap target and cache allocations are derived from it.
+type MemoryConfig struct {
+	LimitMB int
+}
+
 // DBConfig holds database connection + pool configuration.
 type DBConfig struct {
 	// PostgresConn, when non-empty, selects Postgres; otherwise SQLitePath is used.
-	PostgresConn  string
-	SQLitePath    string
-	MaxReadConns  int
-	MaxWriteConns int
+	PostgresConn       string
+	SQLitePath         string
+	MaxReadConns       int
+	MaxWriteConns      int
+	ReplicaCount       int
+	ConnectionHeadroom int
+	// RequestTimeout bounds database work owned by an ordinary HTTP request.
+	// It stays below the server's 30s write timeout so SQL is canceled before
+	// the connection can be severed while database work continues.
+	RequestTimeout time.Duration
 }
+
+// SSHDatabaseMaxConnections is the fixed per-process auxiliary SQL pool used
+// for SSH authentication and session lookups.
+const SSHDatabaseMaxConnections = 5
 
 // SSHConfig holds the SSH TUI server configuration.
 type SSHConfig struct {
@@ -84,19 +107,47 @@ type SSHConfig struct {
 	KeyPath string
 }
 
+// Session IP-binding modes, resolved from SESSION_IP_BINDING into
+// AuthConfig.SessionIPBinding. Deployments behind a load balancer with a
+// changing egress IP, or with mobile clients that roam between networks, need
+// a weaker binding than one serving a fixed office range.
+const (
+	// SessionIPBindingLog records a client-IP change on a session and serves
+	// the request anyway. It is the default so the mismatch rate is observable
+	// before an operator switches to strict.
+	SessionIPBindingLog = "log"
+	// SessionIPBindingStrict rejects a session presented from a client IP
+	// other than the one it was created from.
+	SessionIPBindingStrict = "strict"
+	// SessionIPBindingOff skips the client-IP comparison entirely.
+	SessionIPBindingOff = "off"
+
+	// DefaultSessionIPBinding applies when SESSION_IP_BINDING is unset or empty.
+	DefaultSessionIPBinding = SessionIPBindingLog
+)
+
 // AuthConfig holds session-signing / SSO credential-encryption secrets.
 type AuthConfig struct {
 	// SessionSecret is resolved from SSO_SECRET (preferred) with fallback to
 	// SESSION_SECRET. Empty means neither env var was set — Load will fatal
 	// before populating this field, so consumers can treat empty as unreachable.
 	SessionSecret string
+	// SessionValidationCacheTTL bounds local session/user-state staleness. Zero
+	// disables retained validation entries; the default is five seconds.
+	SessionValidationCacheTTL time.Duration
+	// SessionIPBinding selects how a client-IP change on an existing session is
+	// handled: SessionIPBindingLog, SessionIPBindingStrict or
+	// SessionIPBindingOff. Load validates it, so consumers can treat any other
+	// value as unreachable.
+	SessionIPBinding string
 }
 
 // WebAuthnConfig holds WebAuthn relying-party identity.
 type WebAuthnConfig struct {
 	// RPID is the relying party ID (usually the hostname). In production it is
-	// resolved from WEBAUTHN_RP_ID with fallback to os.Hostname(). In
-	// development the webauthn package overrides this to "localhost".
+	// resolved from WEBAUTHN_RP_ID, then the BASE_URL hostname, with
+	// os.Hostname() as a final fallback. In development the webauthn package
+	// overrides this to "localhost".
 	RPID string
 	// RPName is the displayed RP name; defaults to "Windshift".
 	RPName string
@@ -113,6 +164,9 @@ type PluginsConfig struct {
 	Disabled  bool
 	Dir       string
 	ExtraDirs []string // from PLUGIN_DIRS (comma-separated)
+	// LicensePubKey is the base64 Ed25519 public key that plugin license
+	// tokens must verify against. Empty disables license enforcement.
+	LicensePubKey string
 }
 
 // LLMConfig holds LLM-related configuration.
@@ -155,6 +209,15 @@ type NotificationConfig struct {
 	BatchInterval time.Duration
 }
 
+// OutboundTLSConfig controls process-wide certificate verification for
+// outbound TLS connections.
+type OutboundTLSConfig struct {
+	// SkipVerify permits self-signed or otherwise untrusted certificates. It is
+	// intentionally disabled by default because enabling it removes server
+	// identity verification from outbound TLS connections.
+	SkipVerify bool
+}
+
 // PushConfig holds Web Push (VAPID) configuration. Push is enabled only when
 // both keys are present; otherwise the push endpoints and dispatch are no-ops
 // and the mobile UI hides the enable-notifications affordance.
@@ -182,13 +245,15 @@ type JiraConfig struct {
 // sidecar binary (cmd/logbook/main.go). The sidecar never parses CLI flags
 // and has a narrower set of concerns than the main server.
 type LogbookSidecarConfig struct {
-	PostgresConn     string
-	Port             string
-	StoragePath      string
-	LLMEndpoint      string
-	ArticleEndpoint  string
-	MainServerURL    string
-	MainServerSecret string
-	BaseURL          string
-	Logging          LoggingConfig
+	PostgresConn           string
+	Port                   string
+	StoragePath            string
+	LLMEndpoint            string
+	ArticleEndpoint        string
+	MainServerURL          string
+	MainServerSecret       string
+	BaseURL                string
+	ActivateDurableActions bool
+	Logging                LoggingConfig
+	OutboundTLS            OutboundTLSConfig
 }

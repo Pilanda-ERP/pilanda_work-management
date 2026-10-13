@@ -14,19 +14,11 @@ func RegisterWorkspaceRoutes(deps *Deps) {
 	workspaceView := deps.PermissionMiddleware.RequireWorkspacePermission(models.PermissionItemView)
 
 	// Workspace endpoints
-	api.HandleH("GET /workspaces", auth(http.HandlerFunc(deps.Workspaces.Workspace.GetAll)))
-	api.HandleH("POST /workspaces", auth(http.HandlerFunc(deps.Workspaces.Workspace.Create)))
 	api.HandleH("GET /workspaces/personal", auth(http.HandlerFunc(deps.Workspaces.Workspace.GetOrCreatePersonalWorkspace)))
-	api.HandleH("GET /workspaces/{id}", auth(http.HandlerFunc(deps.Workspaces.Workspace.Get)))
-	api.HandleH("PUT /workspaces/{id}", auth(http.HandlerFunc(deps.Workspaces.Workspace.Update)))
-	api.HandleH("DELETE /workspaces/{id}", auth(http.HandlerFunc(deps.Workspaces.Workspace.Delete)))
+	api.HandleH("GET /workspaces/{id}/bootstrap", auth(http.HandlerFunc(deps.Workspaces.Bootstrap.Get)))
 	api.HandleH("GET /workspaces/{id}/stats", auth(workspaceView(http.HandlerFunc(deps.Workspaces.Workspace.GetStats))))
-	api.HandleH("GET /workspaces/{id}/statuses", auth(http.HandlerFunc(deps.Workspaces.Workspace.GetStatuses)))
 	api.HandleH("GET /workspaces/{id}/homepage/layout", auth(http.HandlerFunc(deps.Workspaces.Workspace.GetHomepageLayout)))
 	api.HandleH("PUT /workspaces/{id}/homepage/layout", auth(http.HandlerFunc(deps.Workspaces.Workspace.UpdateHomepageLayout)))
-
-	// Workspace-scoped time projects (with category restrictions)
-	api.HandleH("GET /workspaces/{id}/projects", auth(workspaceView(http.HandlerFunc(deps.TimeTracking.Project.GetByWorkspace))))
 
 	// Screen endpoints
 	api.HandleH("GET /screens", auth(http.HandlerFunc(deps.Workspaces.Screen.GetAll)))
@@ -37,6 +29,12 @@ func RegisterWorkspaceRoutes(deps *Deps) {
 	api.HandleH("GET /screens/{id}/fields", auth(http.HandlerFunc(deps.Workspaces.Screen.GetFields)))
 	api.HandleH("PUT /screens/{id}/fields", admin(http.HandlerFunc(deps.Workspaces.Screen.UpdateFields)))
 	api.HandleH("PUT /screens/{id}/system-fields", admin(http.HandlerFunc(deps.Workspaces.Screen.UpdateSystemFields)))
+
+	// Workspace-scoped configuration set assignment (WI-1359): workspace admins
+	// may choose which configuration set their workspace uses. All other
+	// configuration-set mutations stay system-admin-only.
+	workspaceAdmin := deps.PermissionMiddleware.RequireWorkspacePermission(models.PermissionWorkspaceAdmin)
+	api.HandleH("PUT /workspaces/{workspaceId}/configuration-set", auth(workspaceAdmin(http.HandlerFunc(deps.Workspaces.ConfigSet.AssignWorkspaceConfigurationSet))))
 
 	// Configuration Set endpoints
 	api.HandleH("GET /configuration-sets", auth(http.HandlerFunc(deps.Workspaces.ConfigSet.GetAll)))
@@ -65,20 +63,6 @@ func RegisterWorkspaceRoutes(deps *Deps) {
 	api.HandleH("DELETE /configuration-sets/{config_set_id}/notification-settings/{assignment_id}", admin(http.HandlerFunc(deps.Workspaces.ConfigSetNotification.UnassignNotificationFromConfigurationSet)))
 	api.HandleH("GET /configuration-sets/{config_set_id}/available-notification-settings", auth(http.HandlerFunc(deps.Workspaces.ConfigSetNotification.GetAvailableNotificationSettings)))
 
-	// Item Type endpoints
-	api.HandleH("GET /item-types", auth(http.HandlerFunc(deps.Workspaces.ItemType.GetAll)))
-	api.HandleH("POST /item-types", admin(http.HandlerFunc(deps.Workspaces.ItemType.Create)))
-	api.HandleH("GET /item-types/{id}", auth(http.HandlerFunc(deps.Workspaces.ItemType.Get)))
-	api.HandleH("PUT /item-types/{id}", admin(http.HandlerFunc(deps.Workspaces.ItemType.Update)))
-	api.HandleH("DELETE /item-types/{id}", admin(http.HandlerFunc(deps.Workspaces.ItemType.Delete)))
-
-	// Priority endpoints
-	api.HandleH("GET /priorities", auth(http.HandlerFunc(deps.Workspaces.Priority.GetAll)))
-	api.HandleH("POST /priorities", admin(http.HandlerFunc(deps.Workspaces.Priority.Create)))
-	api.HandleH("GET /priorities/{id}", auth(http.HandlerFunc(deps.Workspaces.Priority.Get)))
-	api.HandleH("PUT /priorities/{id}", admin(http.HandlerFunc(deps.Workspaces.Priority.Update)))
-	api.HandleH("DELETE /priorities/{id}", admin(http.HandlerFunc(deps.Workspaces.Priority.Delete)))
-
 	// Hierarchy Level endpoints
 	api.HandleH("GET /hierarchy-levels", auth(http.HandlerFunc(deps.Workspaces.HierarchyLevel.GetAll)))
 	api.HandleH("POST /hierarchy-levels", admin(http.HandlerFunc(deps.Workspaces.HierarchyLevel.Create)))
@@ -86,176 +70,77 @@ func RegisterWorkspaceRoutes(deps *Deps) {
 	api.HandleH("PUT /hierarchy-levels/{id}", admin(http.HandlerFunc(deps.Workspaces.HierarchyLevel.Update)))
 	api.HandleH("DELETE /hierarchy-levels/{id}", admin(http.HandlerFunc(deps.Workspaces.HierarchyLevel.Delete)))
 
-	// Status Category endpoints
-	api.HandleH("GET /status-categories", auth(http.HandlerFunc(deps.Workspaces.StatusCategory.GetAll)))
-	api.HandleH("POST /status-categories", admin(http.HandlerFunc(deps.Workspaces.StatusCategory.Create)))
-	api.HandleH("GET /status-categories/{id}", auth(http.HandlerFunc(deps.Workspaces.StatusCategory.Get)))
-	api.HandleH("PUT /status-categories/{id}", admin(http.HandlerFunc(deps.Workspaces.StatusCategory.Update)))
-	api.HandleH("DELETE /status-categories/{id}", admin(http.HandlerFunc(deps.Workspaces.StatusCategory.Delete)))
-
-	// Status endpoints
-	api.HandleH("GET /statuses", auth(http.HandlerFunc(deps.Workspaces.Status.GetAll)))
-	api.HandleH("POST /statuses", admin(http.HandlerFunc(deps.Workspaces.Status.Create)))
-	api.HandleH("GET /statuses/non-done-ids", auth(http.HandlerFunc(deps.Workspaces.StatusLegacy.GetNonDoneStatusIDs)))
-	api.HandleH("GET /statuses/{id}", auth(http.HandlerFunc(deps.Workspaces.Status.Get)))
-	api.HandleH("PUT /statuses/{id}", admin(http.HandlerFunc(deps.Workspaces.Status.Update)))
-	api.HandleH("DELETE /statuses/{id}", admin(http.HandlerFunc(deps.Workspaces.Status.Delete)))
-
-	// Workflow endpoints
-	api.HandleH("GET /workflows", auth(http.HandlerFunc(deps.Workspaces.Workflow.GetAll)))
-	api.HandleH("POST /workflows", admin(http.HandlerFunc(deps.Workspaces.Workflow.Create)))
-	api.HandleH("GET /workflows/{id}", auth(http.HandlerFunc(deps.Workspaces.Workflow.Get)))
-	api.HandleH("PUT /workflows/{id}", admin(http.HandlerFunc(deps.Workspaces.Workflow.Update)))
-	api.HandleH("DELETE /workflows/{id}", admin(http.HandlerFunc(deps.Workspaces.Workflow.Delete)))
-	api.HandleH("GET /workflows/{id}/transitions", auth(http.HandlerFunc(deps.Workspaces.Workflow.GetTransitions)))
-	api.HandleH("PUT /workflows/{id}/transitions", admin(http.HandlerFunc(deps.Workspaces.Workflow.UpdateTransitions)))
-	api.HandleH("GET /workflows/{id}/available-transitions/{statusId}", auth(http.HandlerFunc(deps.Workspaces.Workflow.GetAvailableTransitions)))
-
-	// Recurrence Rules (workspace-scoped listing)
-	if deps.Items.Recurrence != nil {
-		api.HandleH("GET /workspaces/{id}/recurrence-rules", auth(http.HandlerFunc(deps.Items.Recurrence.ListByWorkspace)))
-	}
-
-	// Condition Set endpoints
-	if deps.Workspaces.ConditionSet != nil {
-		api.HandleH("GET /condition-sets", auth(http.HandlerFunc(deps.Workspaces.ConditionSet.GetAll)))
-		api.HandleH("POST /condition-sets", admin(http.HandlerFunc(deps.Workspaces.ConditionSet.Create)))
-		api.HandleH("GET /condition-sets/{id}", auth(http.HandlerFunc(deps.Workspaces.ConditionSet.Get)))
-		api.HandleH("PUT /condition-sets/{id}", admin(http.HandlerFunc(deps.Workspaces.ConditionSet.Update)))
-		api.HandleH("DELETE /condition-sets/{id}", admin(http.HandlerFunc(deps.Workspaces.ConditionSet.Delete)))
-		api.HandleH("GET /workflows/{id}/condition-sets", auth(http.HandlerFunc(deps.Workspaces.ConditionSet.GetByWorkflow)))
-	}
-
-	// Per-transition governance lookup — powers the FE override-warning UI:
-	// returns the condition sets and approval sets that touch a transition.
-	if deps.Workspaces.TransitionGovernance != nil {
-		api.HandleH("GET /transitions/{id}/governance", auth(http.HandlerFunc(deps.Workspaces.TransitionGovernance.Get)))
-	}
-
-	// Approval Set endpoints (sibling of condition sets)
-	if deps.Workspaces.ApprovalSet != nil {
-		api.HandleH("GET /approval-sets", auth(http.HandlerFunc(deps.Workspaces.ApprovalSet.GetAll)))
-		api.HandleH("POST /approval-sets", admin(http.HandlerFunc(deps.Workspaces.ApprovalSet.Create)))
-		api.HandleH("GET /approval-sets/{id}", auth(http.HandlerFunc(deps.Workspaces.ApprovalSet.Get)))
-		api.HandleH("PUT /approval-sets/{id}", admin(http.HandlerFunc(deps.Workspaces.ApprovalSet.Update)))
-		api.HandleH("DELETE /approval-sets/{id}", admin(http.HandlerFunc(deps.Workspaces.ApprovalSet.Delete)))
-		api.HandleH("GET /workflows/{id}/approval-sets", auth(http.HandlerFunc(deps.Workspaces.ApprovalSet.GetByWorkflow)))
-	}
-
-	// Runtime approval endpoints (decide / cancel / delegate / refresh / escalate / inbox).
-	if deps.Workspaces.Approval != nil {
-		api.HandleH("GET /items/{id}/approvals", auth(http.HandlerFunc(deps.Workspaces.Approval.GetForItem)))
-		api.HandleH("GET /approvals/mine", auth(http.HandlerFunc(deps.Workspaces.Approval.MyPending)))
-		api.HandleH("GET /approvals/{id}", auth(http.HandlerFunc(deps.Workspaces.Approval.Get)))
-		api.HandleH("POST /approvals/{id}/decide", auth(http.HandlerFunc(deps.Workspaces.Approval.Decide)))
-		api.HandleH("POST /approvals/{id}/cancel", auth(http.HandlerFunc(deps.Workspaces.Approval.Cancel)))
-		api.HandleH("POST /approvals/{id}/delegate", auth(http.HandlerFunc(deps.Workspaces.Approval.Delegate)))
-		api.HandleH("POST /approvals/{id}/steps/{step_id}/refresh-approvers", auth(http.HandlerFunc(deps.Workspaces.Approval.RefreshApprovers)))
-		api.HandleH("POST /approvals/{id}/steps/{step_id}/escalate", auth(http.HandlerFunc(deps.Workspaces.Approval.EscalateNow)))
-	}
-
-	// Coding-agent harness binding endpoints (WI-88). workspace.admin
-	// permission gating happens inside the handler so we can render the
-	// same 403 surface regardless of the chokepoint's rejection reason.
+	// Binding handlers apply workspace-admin authorization consistently.
 	if deps.Workspaces.AgentBinding != nil {
+		api.HandleH("GET /workspaces/{workspaceId}/agent-profiles", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.Catalog)))
 		api.HandleH("GET /workspaces/{workspaceId}/agent-bindings", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.List)))
+		api.HandleH("GET /workspaces/{workspaceId}/agent-templates", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.Templates)))
+		api.HandleH("POST /workspaces/{workspaceId}/agent-profiles", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.CreateProfile)))
+		api.HandleH("PATCH /workspaces/{workspaceId}/agent-profiles/{id}", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.UpdateProfile)))
+		api.HandleH("POST /workspaces/{workspaceId}/agent-profiles/{id}/migrate-runner", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.MigrateLegacyProfile)))
+		api.HandleH("POST /workspaces/{workspaceId}/agent-profiles/{id}/connect-runner", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.ConnectCodingRunner)))
+		api.HandleH("POST /workspaces/{workspaceId}/agent-profiles/{id}/test", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.TestProfile)))
+		api.HandleH("GET /workspaces/{workspaceId}/agent-profiles/{id}/validation", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.ValidateProfile)))
+		api.HandleH("POST /workspaces/{workspaceId}/agent-profiles/{id}/ready", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.ActivateProfile)))
+		api.HandleH("POST /workspaces/{workspaceId}/agent-runner-pools/{poolId}/tokens", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.MintRunnerSetupToken)))
+		api.HandleH("GET /workspaces/{workspaceId}/agent-runner-pools/{poolId}/tokens", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.ListRunnerSetupTokens)))
+		api.HandleH("DELETE /workspaces/{workspaceId}/agent-runner-pools/{poolId}/tokens/{tokenId}", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.RevokeRunnerSetupToken)))
+		api.HandleH("GET /workspaces/{workspaceId}/agent-runner-pools/{poolId}/instances", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.ListRunnerSetupInstances)))
+		api.HandleH("GET /workspaces/{workspaceId}/agent-tool-capabilities", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.ToolCapabilities)))
+		api.HandleH("GET /workspaces/{workspaceId}/agent-bindings/standard-prompt", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.InitialPrompt)))
 		api.HandleH("POST /workspaces/{workspaceId}/agent-bindings", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.Create)))
 		api.HandleH("PUT /workspaces/{workspaceId}/agent-bindings/{id}", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.Update)))
 		api.HandleH("DELETE /workspaces/{workspaceId}/agent-bindings/{id}", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.Delete)))
+		api.HandleH("POST /workspaces/{workspaceId}/agent-bindings/{id}/restore", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.Restore)))
 		api.HandleH("POST /workspaces/{workspaceId}/agent-bindings/{id}/test-llm", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.TestLLM)))
 		api.HandleH("POST /workspaces/{workspaceId}/agent-bindings/{id}/test-run", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.TestRun)))
 		api.HandleH("PUT /workspaces/{workspaceId}/agent-bindings/{id}/agent-config", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.UpdateAgentConfig)))
-		api.HandleH("GET /workspaces/{workspaceId}/agent-skills", auth(http.HandlerFunc(deps.Workspaces.AgentSkill.List)))
-		api.HandleH("POST /workspaces/{workspaceId}/agent-skills", auth(http.HandlerFunc(deps.Workspaces.AgentSkill.Create)))
-		api.HandleH("GET /workspaces/{workspaceId}/agent-skills/{id}", auth(http.HandlerFunc(deps.Workspaces.AgentSkill.Get)))
-		api.HandleH("PUT /workspaces/{workspaceId}/agent-skills/{id}", auth(http.HandlerFunc(deps.Workspaces.AgentSkill.Update)))
-		api.HandleH("DELETE /workspaces/{workspaceId}/agent-skills/{id}", auth(http.HandlerFunc(deps.Workspaces.AgentSkill.Delete)))
 		api.HandleH("GET /workspaces/{workspaceId}/agent-binding-candidates", auth(http.HandlerFunc(deps.Workspaces.AgentBinding.Candidates)))
 	}
 
-	// Coding-agent runs (WI-91). Reads are item-view gated; cancel is
-	// workspace-admin gated inside the handler.
-	if deps.Workspaces.AgentRun != nil {
-		api.HandleH("GET /workspaces/{workspaceId}/agent-runs", auth(http.HandlerFunc(deps.Workspaces.AgentRun.List)))
-		api.HandleH("GET /items/{itemId}/agent-runs", auth(http.HandlerFunc(deps.Workspaces.AgentRun.ListForItem)))
-		api.HandleH("POST /items/{itemId}/agent-runs", auth(http.HandlerFunc(deps.Workspaces.AgentRun.Rerun)))
-		api.HandleH("GET /agent-runs/{id}", auth(http.HandlerFunc(deps.Workspaces.AgentRun.Get)))
-		api.HandleH("GET /agent-runs/{id}/usage", auth(http.HandlerFunc(deps.Workspaces.AgentRun.Usage)))
-		api.HandleH("GET /agent-runs/{id}/events", auth(http.HandlerFunc(deps.Workspaces.AgentRun.Events)))
-		api.HandleH("POST /agent-runs/{id}/cancel", auth(http.HandlerFunc(deps.Workspaces.AgentRun.Cancel)))
-	}
-
-	// Remote-runner control plane (WI-141). These are NOT user-session
-	// routes: authentication is the per-instance runner credential, checked
-	// inline in the handler (register exchanges a pool registration token).
-	// So they register without the user `auth` middleware, like other public
-	// endpoints.
+	// Runner control uses inline runner credentials rather than user sessions.
 	if deps.Workspaces.RunnerControl != nil {
-		runnerLimit := func(h http.HandlerFunc) http.Handler {
-			if deps.AuthRateLimiter != nil {
-				return deps.AuthRateLimiter.Limit(h)
-			}
-			return h
+		register := http.Handler(http.HandlerFunc(deps.Workspaces.RunnerControl.Register))
+		if deps.RunnerRegisterLimiter != nil {
+			register = deps.RunnerRegisterLimiter.Limit(register)
 		}
-		api.HandleH("POST /runner/register", runnerLimit(http.HandlerFunc(deps.Workspaces.RunnerControl.Register)))
-		api.HandleH("POST /runner/claim", runnerLimit(http.HandlerFunc(deps.Workspaces.RunnerControl.Claim)))
-		api.HandleH("POST /runner/runs/{id}/events", runnerLimit(http.HandlerFunc(deps.Workspaces.RunnerControl.Events)))
-		api.HandleH("POST /runner/runs/{id}/result", runnerLimit(http.HandlerFunc(deps.Workspaces.RunnerControl.Result)))
-		api.HandleH("POST /runner/heartbeat", runnerLimit(http.HandlerFunc(deps.Workspaces.RunnerControl.Heartbeat)))
+		api.HandleH("POST /runner/register", register)
+		api.HandleH("POST /runner/claim", http.HandlerFunc(deps.Workspaces.RunnerControl.Claim))
+		api.HandleH("POST /runner/runs/{id}/events", http.HandlerFunc(deps.Workspaces.RunnerControl.Events))
+		api.HandleH("POST /runner/runs/{id}/result", http.HandlerFunc(deps.Workspaces.RunnerControl.Result))
+		api.HandleH("POST /runner/heartbeat", http.HandlerFunc(deps.Workspaces.RunnerControl.Heartbeat))
 	}
 
-	// Secretless access layer (WI-144): brokers a granted credential to a
-	// running job, authenticated by the per-run token (inline).
+	// Broker routes authenticate with a per-run token.
 	if deps.Workspaces.RunnerBroker != nil {
 		api.HandleH("GET /secrets/{run}/{credentialId}", http.HandlerFunc(deps.Workspaces.RunnerBroker.GetSecret))
-		api.HandleH("POST /llm-proxy/{run}/{path...}", http.HandlerFunc(deps.Workspaces.RunnerBroker.ProxyLLM))
-		api.HandleH("GET /llm-proxy/{run}/{path...}", http.HandlerFunc(deps.Workspaces.RunnerBroker.ProxyLLM))
+		api.HandleH("POST /llm-proxy/{run}/complete", http.HandlerFunc(deps.Workspaces.RunnerBroker.ProxyLLM))
 		api.HandleH("GET /git-proxy/{ws}/{owner}/{repo}/{gitpath...}", http.HandlerFunc(deps.Workspaces.RunnerBroker.ProxyGit))
 		api.HandleH("POST /git-proxy/{ws}/{owner}/{repo}/{gitpath...}", http.HandlerFunc(deps.Workspaces.RunnerBroker.ProxyGit))
 		api.HandleH("GET /http-proxy/{run}", http.HandlerFunc(deps.Workspaces.RunnerBroker.ProxyHTTP))
 		api.HandleH("POST /http-proxy/{run}", http.HandlerFunc(deps.Workspaces.RunnerBroker.ProxyHTTP))
 	}
 
-	// Actions automation endpoints (workspace-scoped, requires action.manage permission)
 	if deps.Workspaces.Actions != nil {
 		actionManage := deps.PermissionMiddleware.RequireWorkspacePermission(models.PermissionActionManage)
 
-		api.HandleH("GET /workspaces/{workspaceId}/action-catalog", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.GetActionCatalog))))
-		api.HandleH("GET /workspaces/{workspaceId}/actions", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.ListActions))))
-		api.HandleH("POST /workspaces/{workspaceId}/actions", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.CreateAction))))
-		api.HandleH("GET /workspaces/{workspaceId}/actions/{id}", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.GetAction))))
-		api.HandleH("PUT /workspaces/{workspaceId}/actions/{id}", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.UpdateAction))))
-		api.HandleH("DELETE /workspaces/{workspaceId}/actions/{id}", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.DeleteAction))))
-		api.HandleH("POST /workspaces/{workspaceId}/actions/{id}/toggle", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.ToggleAction))))
-		api.HandleH("POST /workspaces/{workspaceId}/actions/{id}/execute", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.ExecuteAction))))
-		api.HandleH("GET /workspaces/{workspaceId}/actions/{id}/logs", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.GetActionLogs))))
+		// Execute performs its own per-action authorization: manual actions use
+		// their optional role allowlist (or item.edit by default), while testing
+		// event-driven actions remains action.manage-only.
 		api.HandleH("GET /workspaces/{workspaceId}/action-logs", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.GetWorkspaceLogs))))
 
-		// Workspace-scoped capability listing — node editors call this to
-		// populate their capability picker. action.manage gating mirrors
-		// CreateAction since the only legitimate consumer is action authoring.
+		// Capability listing shares action-authoring authorization.
 		api.HandleH("GET /workspaces/{workspaceId}/action-capabilities", auth(actionManage(http.HandlerFunc(deps.Workspaces.Actions.ListWorkspaceCapabilities))))
 
-		// Action templates: read-only registry shipped with the binary, plus
-		// instantiate-into-workspace. List is open to any authenticated user
-		// (read-only metadata); Apply requires action.manage on the target
-		// workspace, mirroring CreateAction. Path uses /action-templates/
-		// (not /actions/from-template/) to avoid Go ServeMux wildcard
-		// conflicts with the existing /actions/{id}/toggle route.
-		if deps.Workspaces.ActionTemplates != nil {
-			api.HandleH("GET /action-templates", auth(http.HandlerFunc(deps.Workspaces.ActionTemplates.ListTemplates)))
-			api.HandleH("POST /workspaces/{workspaceId}/action-templates/{templateKey}/apply", auth(actionManage(http.HandlerFunc(deps.Workspaces.ActionTemplates.CreateActionFromTemplate))))
-		}
+		// Template reads are authenticated; applying requires action.manage.
 
-		// Action capabilities (admin-provisioned resources)
 		api.HandleH("GET /admin/action-capabilities", admin(http.HandlerFunc(deps.Workspaces.Actions.ListCapabilities)))
 		api.HandleH("POST /admin/action-capabilities", admin(http.HandlerFunc(deps.Workspaces.Actions.CreateCapability)))
 		api.HandleH("GET /admin/action-capabilities/{capabilityId}", admin(http.HandlerFunc(deps.Workspaces.Actions.GetCapability)))
 		api.HandleH("PUT /admin/action-capabilities/{capabilityId}", admin(http.HandlerFunc(deps.Workspaces.Actions.UpdateCapability)))
 		api.HandleH("DELETE /admin/action-capabilities/{capabilityId}", admin(http.HandlerFunc(deps.Workspaces.Actions.DeleteCapability)))
 
-		// Runner-pool lifecycle (WI-177): registration tokens + runner
-		// instances managed as child resources of a runner_pool capability.
+		// Runner-pool child resources.
 		if deps.Workspaces.RunnerControl != nil {
 			api.HandleH("POST /admin/action-capabilities/{capabilityId}/runner-tokens", admin(http.HandlerFunc(deps.Workspaces.RunnerControl.MintRunnerToken)))
 			api.HandleH("GET /admin/action-capabilities/{capabilityId}/runner-tokens", admin(http.HandlerFunc(deps.Workspaces.RunnerControl.ListRunnerTokens)))
@@ -264,18 +149,14 @@ func RegisterWorkspaceRoutes(deps *Deps) {
 			api.HandleH("DELETE /admin/action-capabilities/{capabilityId}/runner-instances/{instanceId}", admin(http.HandlerFunc(deps.Workspaces.RunnerControl.RevokeRunnerInstance)))
 		}
 
-		// Action credentials (encrypted API tokens referenced by HTTP capabilities)
 		if deps.Workspaces.ActionCredentials != nil {
-			// Global credentials — system-admin only.
 			api.HandleH("GET /admin/action-credentials", admin(http.HandlerFunc(deps.Workspaces.ActionCredentials.ListGlobal)))
 			api.HandleH("POST /admin/action-credentials", admin(http.HandlerFunc(deps.Workspaces.ActionCredentials.CreateGlobal)))
 			api.HandleH("PUT /admin/action-credentials/{credentialId}", admin(http.HandlerFunc(deps.Workspaces.ActionCredentials.UpdateGlobal)))
 			api.HandleH("POST /admin/action-credentials/{credentialId}/rotate", admin(http.HandlerFunc(deps.Workspaces.ActionCredentials.RotateGlobal)))
 			api.HandleH("DELETE /admin/action-credentials/{credentialId}", admin(http.HandlerFunc(deps.Workspaces.ActionCredentials.DeleteGlobal)))
 
-			// Workspace-scoped credentials — require action.credential.manage in
-			// the workspace (handler enforces, since 404-on-missing-perm needs to
-			// happen *after* path resolution to avoid leaking workspace existence).
+			// Handler authorization preserves 404-on-missing-workspace access.
 			api.HandleH("GET /workspaces/{workspaceId}/action-credentials", auth(http.HandlerFunc(deps.Workspaces.ActionCredentials.ListForWorkspace)))
 			api.HandleH("POST /workspaces/{workspaceId}/action-credentials", auth(http.HandlerFunc(deps.Workspaces.ActionCredentials.CreateForWorkspace)))
 			api.HandleH("PUT /workspaces/{workspaceId}/action-credentials/{credentialId}", auth(http.HandlerFunc(deps.Workspaces.ActionCredentials.UpdateForWorkspace)))

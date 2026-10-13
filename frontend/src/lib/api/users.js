@@ -1,10 +1,11 @@
-import { fetchAPI } from './core.js';
+import { fetchAllV2Pages, fetchAPI, fetchV2Data } from './core.js';
 
 // Users
-export const getUsers = () => fetchAPI('/users');
+export const getUsers = () => fetchAllV2Pages('/users');
+export const getAdminUsers = () => fetchAllV2Pages('/admin/users');
 export const getAssignableUsers = (workspaceId) =>
-  fetchAPI(`/workspaces/${workspaceId}/assignable-users`);
-export const getUser = (id) => fetchAPI(`/users/${id}`);
+  fetchV2Data(`/workspaces/${workspaceId}/assignable-users`);
+export const getUser = (id) => fetchV2Data(`/users/${id}`);
 export const getAgentOwner = (id) => fetchAPI(`/users/${id}/agent-owner`);
 export const createUser = (data) =>
   fetchAPI('/users', {
@@ -17,9 +18,25 @@ export const inviteUser = (data) =>
     body: JSON.stringify(data),
   });
 export const updateUser = (id, data) =>
-  fetchAPI(`/users/${id}`, {
-    method: 'PUT',
-    body: JSON.stringify(data),
+  fetchV2Data(`/admin/users/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/merge-patch+json' },
+    body: JSON.stringify(
+      Object.fromEntries(
+        [
+          'email',
+          'username',
+          'first_name',
+          'last_name',
+          'avatar_url',
+          'timezone',
+          'language',
+          'is_active',
+        ]
+          .filter((field) => data[field] !== undefined)
+          .map((field) => [field, data[field]])
+      )
+    ),
   });
 export const updateUserAvatar = (id, avatar_url) =>
   fetchAPI(`/users/${id}/avatar`, {
@@ -52,12 +69,12 @@ export const deactivateUser = (id) =>
 // User Credentials
 export const getUserCredentials = (userId) => fetchAPI(`/users/${userId}/credentials`);
 export const startFIDORegistration = (userId, credentialName) =>
-  fetchAPI(`/users/${userId}/credentials/fido/register`, {
+  fetchAPI(`/users/${userId}/credentials/webauthn/register/start`, {
     method: 'POST',
     body: JSON.stringify({ credential_name: credentialName }),
   });
 export const completeFIDORegistration = (userId, credentialData) =>
-  fetchAPI(`/users/${userId}/credentials/fido/complete`, {
+  fetchAPI(`/users/${userId}/credentials/webauthn/register/complete`, {
     method: 'POST',
     body: JSON.stringify(credentialData),
   });
@@ -81,6 +98,11 @@ export const createMyAgent = (data) =>
     method: 'POST',
     body: JSON.stringify(data),
   });
+export const updateMyAgent = (agentId, data) =>
+  fetchAPI(`/me/agents/${agentId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
 export const deleteMyAgent = (agentId) =>
   fetchAPI(`/me/agents/${agentId}`, {
     method: 'DELETE',
@@ -100,6 +122,10 @@ export const revokeApiToken = (tokenId) =>
     method: 'DELETE',
   });
 export const validateApiToken = () => fetchAPI('/api-tokens/validate');
+// The authoritative list of grantable scopes, with the label/description/
+// grouping each picker renders. Sourced from auth.ScopeCatalog server-side so
+// the pickers can't drift from what the server actually accepts.
+export const getScopeCatalog = () => fetchAPI('/api-tokens/scope-catalog');
 
 // CLI onboarding (used by `ws init` — consent page + status probe)
 export const cliAuth = {
@@ -119,12 +145,13 @@ export const cliAuth = {
 // User Preferences API
 export const userPreferences = {
   // Get current user's preferences
-  get: () => fetchAPI('/user/preferences'),
+  get: () => fetchV2Data('/users/me/preferences'),
 
   // Update current user's preferences
   update: (data) =>
-    fetchAPI('/user/preferences', {
-      method: 'PUT',
+    fetchV2Data('/users/me/preferences', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/merge-patch+json' },
       body: JSON.stringify(data),
     }),
 };

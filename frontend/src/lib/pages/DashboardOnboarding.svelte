@@ -36,6 +36,14 @@
 
   // Derived: determine which step is active (first incomplete step, admin path only)
   let activeStep = $derived(workspaceCount === 0 ? 1 : (itemCount === 0 ? 2 : 0));
+  let welcomeText = $derived(
+    userName
+      ? t('dashboard.salutation.withName', {
+          salutation: t('onboarding.welcomeTo'),
+          name: userName,
+        })
+      : t('dashboard.salutation.withoutName', { salutation: t('onboarding.welcomeTo') })
+  );
 
   onMount(() => {
     // Check if user has dismissed the onboarding
@@ -121,7 +129,7 @@
         </div>
         <div class="flex-1">
           <h1 class="text-2xl font-semibold mb-1" style="color: var(--ds-text);">
-            {t('onboarding.welcomeTo')}, {userName}!
+            {welcomeText}
           </h1>
           <p class="text-sm" style="color: var(--ds-text-subtle);">
             {#if canCreateWorkspaces}
@@ -145,7 +153,7 @@
           <div class="w-full rounded-full h-2" style="background-color: var(--ds-surface);">
             <div
               class="h-2 rounded-full transition-all duration-300"
-              style="width: {progressPercent}%; background: linear-gradient(90deg, #1388E7 0%, #1AB1BC 100%);"
+              style="width: {progressPercent}%; background: linear-gradient(90deg, var(--ds-gradient-start) 0%, var(--ds-gradient-end) 100%);"
             ></div>
           </div>
         </div>
@@ -156,8 +164,9 @@
           <div
             class="rounded py-3 px-4 transition-all"
             class:border-l-6={activeStep === 1}
-            class:border-l-sky-600={activeStep === 1}
-            style={activeStep === 1 ? 'background-color: rgba(19, 136, 231, 0.05);' : ''}
+            style={activeStep === 1
+              ? 'background-color: var(--ds-surface-selected); border-color: var(--ds-interactive);'
+              : ''}
           >
             {#if workspaceCount > 0}
               <!-- Completed state: strikethrough -->
@@ -184,8 +193,9 @@
           <div
             class="rounded py-3 px-4 transition-all"
             class:border-l-6={activeStep === 2}
-            class:border-l-sky-600={activeStep === 2}
-            style={activeStep === 2 ? 'background-color: rgba(19, 136, 231, 0.05);' : ''}
+            style={activeStep === 2
+              ? 'background-color: var(--ds-surface-selected); border-color: var(--ds-interactive);'
+              : ''}
           >
             {#if itemCount > 0}
               <!-- Completed state: strikethrough -->
@@ -215,12 +225,12 @@
           {t('onboarding.selectWorkspace')}
         </p>
         <div class="space-y-2">
-          {#each accessibleWorkspaces as workspace}
+          {#each accessibleWorkspaces.slice(0, 12) as workspace}
             <ItemCard href="/workspaces/{workspace.id}" compact={true}>
               {#snippet children()}
                 {@const WsIcon = workspaceIconMap[workspace.icon] || Grip}
                 <div class="flex items-center gap-2">
-                  <div class="w-6 h-6 rounded flex items-center justify-center flex-shrink-0" style="background-color: {workspace.color || '#3b82f6'};">
+                  <div class="w-6 h-6 rounded flex items-center justify-center flex-shrink-0" style="background-color: {workspace.color || 'var(--color-blue-500)'};">
                     <WsIcon size={14} color="white" />
                   </div>
                   <div>
@@ -237,6 +247,13 @@
               {/snippet}
             </ItemCard>
           {/each}
+          {#if accessibleWorkspaces.length > 12}
+            <!-- First-login surface: bound the card list and hand off to the
+                 workspace directory instead of mounting every workspace. -->
+            <a href="/workspaces" class="block text-center text-sm py-2 hover:underline" style="color: var(--ds-interactive);">
+              {t('onboarding.browseAllWorkspaces', { count: accessibleWorkspaces.length })}
+            </a>
+          {/if}
         </div>
       {:else}
         <!-- Member path without workspaces: contact admin message -->

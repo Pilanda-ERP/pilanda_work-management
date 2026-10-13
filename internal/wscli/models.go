@@ -15,10 +15,16 @@ type PaginatedResponse[T any] struct {
 	Total      int            `json:"total,omitempty"` // Some endpoints use total instead of pagination
 }
 
+type DataDocument[T any] struct {
+	Data T `json:"data"`
+}
+
 type PaginationMeta struct {
 	Page       int `json:"page"`
 	Limit      int `json:"limit"`
 	Total      int `json:"total"`
+	PageSize   int `json:"page_size"`
+	TotalItems int `json:"total_items"`
 	TotalPages int `json:"total_pages"`
 }
 
@@ -69,18 +75,18 @@ type Workspace struct {
 // ============================================
 
 type Item struct {
-	ID                  int                    `json:"id"`
-	WorkspaceID         int                    `json:"workspace_id"`
-	WorkspaceKey        string                 `json:"workspace_key"`
-	Key                 string                 `json:"key"`
-	WorkspaceItemNumber int                    `json:"workspace_item_number"`
-	Title               string                 `json:"title"`
-	Description         string                 `json:"description,omitempty"`
-	IsTask              bool                   `json:"is_task"`
-	DueDate             *time.Time             `json:"due_date,omitempty"`
-	StartDate           *time.Time             `json:"start_date,omitempty"`
-	EndDate             *time.Time             `json:"end_date,omitempty"`
-	CustomFields        map[string]interface{} `json:"custom_fields,omitempty"`
+	ID                  int            `json:"id"`
+	WorkspaceID         int            `json:"workspace_id"`
+	WorkspaceKey        string         `json:"workspace_key"`
+	Key                 string         `json:"key"`
+	WorkspaceItemNumber int            `json:"workspace_item_number"`
+	Title               string         `json:"title"`
+	Description         string         `json:"description,omitempty"`
+	IsTask              bool           `json:"is_task"`
+	DueDate             *time.Time     `json:"due_date,omitempty"`
+	StartDate           *time.Time     `json:"start_date,omitempty"`
+	EndDate             *time.Time     `json:"end_date,omitempty"`
+	CustomFields        map[string]any `json:"custom_field_values,omitempty"`
 
 	// Hierarchy. ParentKey/ParentTitle are populated by the server on
 	// permission-checked single-item reads (omitted when the caller may not
@@ -89,16 +95,26 @@ type Item struct {
 	ParentKey   string `json:"parent_key,omitempty"`
 	ParentTitle string `json:"parent_title,omitempty"`
 
-	// Related entities
-	Status     *StatusSummary     `json:"status,omitempty"`
-	Priority   *PrioritySummary   `json:"priority,omitempty"`
-	ItemType   *ItemTypeSummary   `json:"item_type,omitempty"`
-	Assignee   *UserSummary       `json:"assignee,omitempty"`
-	Creator    *UserSummary       `json:"creator,omitempty"`
-	Workspace  *WorkspaceSummary  `json:"workspace,omitempty"`
-	Milestones []MilestoneSummary `json:"milestones,omitempty"`
-	Iteration  *IterationSummary  `json:"iteration,omitempty"`
-	Project    *ProjectSummary    `json:"project,omitempty"`
+	// Canonical v2 relationship fields use IDs and display names directly.
+	StatusID      *int               `json:"status_id,omitempty"`
+	StatusName    string             `json:"status_name,omitempty"`
+	StatusColor   string             `json:"status_color,omitempty"`
+	PriorityID    *int               `json:"priority_id,omitempty"`
+	PriorityName  string             `json:"priority_name,omitempty"`
+	PriorityIcon  string             `json:"priority_icon,omitempty"`
+	PriorityColor string             `json:"priority_color,omitempty"`
+	ItemTypeID    *int               `json:"item_type_id,omitempty"`
+	ItemTypeName  string             `json:"item_type_name,omitempty"`
+	AssigneeID    *int               `json:"assignee_id,omitempty"`
+	AssigneeName  string             `json:"assignee_name,omitempty"`
+	CreatorID     *int               `json:"creator_id,omitempty"`
+	CreatorName   string             `json:"creator_name,omitempty"`
+	WorkspaceName string             `json:"workspace_name,omitempty"`
+	IterationID   *int               `json:"iteration_id,omitempty"`
+	IterationName string             `json:"iteration_name,omitempty"`
+	ProjectID     *int               `json:"project_id,omitempty"`
+	ProjectName   string             `json:"project_name,omitempty"`
+	Milestones    []MilestoneSummary `json:"milestones,omitempty"`
 
 	// Expanded collections
 	Comments    []Comment    `json:"comments,omitempty"`
@@ -126,50 +142,51 @@ type EnforcedTemplate struct {
 }
 
 type ItemCreateRequest struct {
-	WorkspaceID  int                    `json:"workspace_id"`
-	Title        string                 `json:"title"`
-	Description  string                 `json:"description,omitempty"`
-	StatusID     *int                   `json:"status_id,omitempty"`
-	PriorityID   *int                   `json:"priority_id,omitempty"`
-	ItemTypeID   *int                   `json:"item_type_id,omitempty"`
-	AssigneeID   *int                   `json:"assignee_id,omitempty"`
-	ParentID     *int                   `json:"parent_id,omitempty"`
-	MilestoneIDs []int                  `json:"milestone_ids,omitempty"`
-	IterationID  *int                   `json:"iteration_id,omitempty"`
-	ProjectID    *int                   `json:"project_id,omitempty"`
-	DueDate      *time.Time             `json:"due_date,omitempty"`
-	StartDate    *time.Time             `json:"start_date,omitempty"`
-	EndDate      *time.Time             `json:"end_date,omitempty"`
-	IsTask       bool                   `json:"is_task,omitempty"`
-	CustomFields map[string]interface{} `json:"custom_fields,omitempty"`
+	WorkspaceID  int            `json:"workspace_id"`
+	Title        string         `json:"title"`
+	Description  string         `json:"description,omitempty"`
+	StatusID     *int           `json:"status_id,omitempty"`
+	PriorityID   *int           `json:"priority_id,omitempty"`
+	ItemTypeID   *int           `json:"item_type_id,omitempty"`
+	AssigneeID   *int           `json:"assignee_id,omitempty"`
+	ParentID     *int           `json:"parent_id,omitempty"`
+	MilestoneIDs []int          `json:"milestone_ids,omitempty"`
+	IterationID  *int           `json:"iteration_id,omitempty"`
+	ProjectID    *int           `json:"project_id,omitempty"`
+	DueDate      *time.Time     `json:"due_date,omitempty"`
+	StartDate    *time.Time     `json:"start_date,omitempty"`
+	EndDate      *time.Time     `json:"end_date,omitempty"`
+	IsTask       bool           `json:"is_task,omitempty"`
+	CustomFields map[string]any `json:"custom_field_values,omitempty"`
 }
 
-// ItemUpdateRequest is the body for PUT /rest/api/v1/items/{id}. It does NOT
+// ItemUpdateRequest is the merge patch for /rest/api/v2/items/{id}. It does not
 // carry status_id — status changes go through TransitionRequest on a
 // dedicated endpoint so workflow and condition rules are enforced.
 type ItemUpdateRequest struct {
-	Title        *string                `json:"title,omitempty"`
-	Description  *string                `json:"description,omitempty"`
-	PriorityID   *int                   `json:"priority_id,omitempty"`
-	ItemTypeID   *int                   `json:"item_type_id,omitempty"`
-	AssigneeID   *int                   `json:"assignee_id,omitempty"`
-	ParentID     *int                   `json:"parent_id,omitempty"`
-	MilestoneIDs *[]int                 `json:"milestone_ids,omitempty"`
-	IterationID  *int                   `json:"iteration_id,omitempty"`
-	ProjectID    *int                   `json:"project_id,omitempty"`
-	DueDate      *time.Time             `json:"due_date,omitempty"`
-	StartDate    *time.Time             `json:"start_date,omitempty"`
-	EndDate      *time.Time             `json:"end_date,omitempty"`
-	IsTask       *bool                  `json:"is_task,omitempty"`
-	CustomFields map[string]interface{} `json:"custom_fields,omitempty"`
+	Title       *string `json:"title,omitempty"`
+	Description *string `json:"description,omitempty"`
+	PriorityID  *int    `json:"priority_id,omitempty"`
+	ItemTypeID  *int    `json:"item_type_id,omitempty"`
+	AssigneeID  *int    `json:"assignee_id,omitempty"`
+	// nil omits the field; a pointer to nil clears it with JSON null.
+	ParentID     **int          `json:"parent_id,omitempty"`
+	MilestoneIDs *[]int         `json:"milestone_ids,omitempty"`
+	IterationID  *int           `json:"iteration_id,omitempty"`
+	ProjectID    *int           `json:"project_id,omitempty"`
+	DueDate      *time.Time     `json:"due_date,omitempty"`
+	StartDate    *time.Time     `json:"start_date,omitempty"`
+	EndDate      *time.Time     `json:"end_date,omitempty"`
+	IsTask       *bool          `json:"is_task,omitempty"`
+	CustomFields map[string]any `json:"custom_field_values,omitempty"`
 }
 
-// TransitionRequest is the body for POST /rest/api/v1/items/{id}/transition.
+// TransitionRequest is the body for POST /rest/api/v2/items/{id}/transition.
 type TransitionRequest struct {
 	ToStatusID int `json:"to_status_id"`
 }
 
-// ItemTypeChangeRequest is the body for POST /rest/api/v1/items/{id}/change-type.
+// ItemTypeChangeRequest is the body for POST /rest/api/v2/items/{id}/change-type.
 type ItemTypeChangeRequest struct {
 	TargetItemTypeID int  `json:"target_item_type_id"`
 	TargetStatusID   *int `json:"target_status_id,omitempty"`
@@ -196,6 +213,21 @@ type Status struct {
 	CategoryColor string `json:"category_color,omitempty"`
 	IsDefault     bool   `json:"is_default"`
 	IsCompleted   bool   `json:"is_completed"`
+}
+
+// StatusListResult makes the discovery scope explicit. Workspace-scoped
+// status output is safe to use for item transitions in that workspace;
+// system scope is only the global status catalog.
+type StatusListResult struct {
+	Scope     string               `json:"scope"`
+	Workspace *StatusListWorkspace `json:"workspace,omitempty"`
+	Statuses  []Status             `json:"statuses"`
+}
+
+type StatusListWorkspace struct {
+	ID   int    `json:"id"`
+	Key  string `json:"key"`
+	Name string `json:"name"`
 }
 
 type StatusSummary struct {
@@ -301,7 +333,6 @@ type MilestoneCreateRequest struct {
 	Description string `json:"description,omitempty"`
 	TargetDate  string `json:"target_date,omitempty"`
 	Status      string `json:"status,omitempty"`
-	WorkspaceID *int   `json:"workspace_id,omitempty"`
 }
 
 type MilestoneUpdateRequest struct {
@@ -328,10 +359,11 @@ type MilestoneProgress struct {
 }
 
 type MilestoneStatusBreakdown struct {
-	CategoryName  string `json:"category_name"`
-	CategoryColor string `json:"category_color,omitempty"`
-	ItemCount     int    `json:"item_count"`
-	IsCompleted   bool   `json:"is_completed"`
+	CategoryName       string `json:"category_name"`
+	CategoryBuiltinKey string `json:"category_builtin_key,omitempty"`
+	CategoryColor      string `json:"category_color,omitempty"`
+	ItemCount          int    `json:"item_count"`
+	IsCompleted        bool   `json:"is_completed"`
 }
 
 type MilestoneProgressItem struct {
@@ -353,8 +385,8 @@ type IterationSummary struct {
 	Name string `json:"name,omitempty"`
 }
 
-// Iteration mirrors the v1 IterationResponse payload returned by
-// /rest/api/v1/iterations and /rest/api/v1/workspaces/{id}/iterations.
+// Iteration is the canonical v2 iteration payload returned by
+// /rest/api/v2/iterations and /rest/api/v2/workspaces/{id}/iterations.
 type Iteration struct {
 	ID          int    `json:"id"`
 	Name        string `json:"name"`
@@ -377,15 +409,15 @@ type ProjectSummary struct {
 // Custom Fields
 // ============================================
 
-// CustomField mirrors the v1 CustomFieldResponse payload returned by
-// /rest/api/v1/custom-fields. Options is a JSON string for select /
+// CustomField is the canonical v2 custom-field payload returned by
+// /rest/api/v2/custom-fields. Options is a JSON string for select /
 // multiselect fields.
 type CustomField struct {
 	ID           int    `json:"id"`
 	Name         string `json:"name"`
 	FieldType    string `json:"field_type"`
 	Description  string `json:"description,omitempty"`
-	Options      string `json:"options,omitempty"`
+	Options      any    `json:"options"`
 	Required     bool   `json:"required"`
 	DisplayOrder int    `json:"display_order"`
 }
@@ -394,29 +426,21 @@ type CustomField struct {
 // Item Labels
 // ============================================
 
-// Label is a workspace-scoped work-item label (fully separate from the
-// page-label system). Mirrors models.Label on the wire.
+// Label is a global work-item label, separate from page labels.
 type Label struct {
-	ID          int       `json:"id"`
-	Name        string    `json:"name"`
-	Color       string    `json:"color"`
-	WorkspaceID int       `json:"workspace_id"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID        int       `json:"id"`
+	Name      string    `json:"name"`
+	Color     string    `json:"color"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// LabelListResponse is the {items:[...]} envelope used by the v1
-// workspace-label and item-label endpoints.
-type LabelListResponse struct {
-	Items []Label `json:"items"`
-}
-
-// ItemLabelSetRequest is the body for PUT /rest/api/v1/items/{id}/labels.
+// ItemLabelSetRequest is the body for PUT /rest/api/v2/items/{id}/labels.
 type ItemLabelSetRequest struct {
 	LabelIDs []int `json:"label_ids"`
 }
 
-// ItemLabelAddRequest is the body for POST /rest/api/v1/items/{id}/labels.
+// ItemLabelAddRequest is the body for POST /rest/api/v2/items/{id}/labels.
 type ItemLabelAddRequest struct {
 	LabelID int `json:"label_id"`
 }
@@ -434,10 +458,10 @@ type ItemTemplate struct {
 }
 
 // ItemTemplateListResponse is the envelope from GET
-// /rest/api/v1/workspaces/{id}/templates. MandatoryTemplateID is set when the
+// /rest/api/v2/workspaces/{id}/templates. MandatoryTemplateID is set when the
 // list was filtered by item_type_id and that type enforces a mandatory template.
 type ItemTemplateListResponse struct {
-	Items               []ItemTemplate `json:"items"`
+	Items               []ItemTemplate `json:"data"`
 	MandatoryTemplateID *int           `json:"mandatory_template_id,omitempty"`
 }
 
@@ -572,7 +596,7 @@ type TestRun struct {
 	ID             int        `json:"id"`
 	WorkspaceID    int        `json:"workspace_id"`
 	TemplateID     int        `json:"template_id,omitempty"`
-	SetID          int        `json:"set_id"`
+	PlanID         int        `json:"plan_id"`
 	Name           string     `json:"name"`
 	AssigneeID     *int       `json:"assignee_id,omitempty"`
 	AssigneeName   string     `json:"assignee_name,omitempty"`
@@ -584,7 +608,7 @@ type TestRun struct {
 }
 
 type TestRunCreateRequest struct {
-	SetID      int    `json:"set_id"`
+	PlanID     int    `json:"plan_id"`
 	Name       string `json:"name"`
 	TemplateID int    `json:"template_id,omitempty"`
 	AssigneeID *int   `json:"assignee_id,omitempty"`
@@ -613,8 +637,7 @@ type TestResultUpdateRequest struct {
 // Pages (workspace knowledge / wiki)
 // ============================================
 
-// Page mirrors dto.PageResponse on the v1 surface; fields are kept
-// lowercase JSON to match what the server emits.
+// Page is the canonical v2 page payload.
 type Page struct {
 	ID                 int             `json:"id"`
 	WorkspaceID        int             `json:"workspace_id"`
@@ -718,17 +741,47 @@ type PageCreateRequest struct {
 // no inherit_permissions field — that toggle is an admin-only operation
 // with its own endpoint and would not be accepted by the server here.
 type PageUpdateRequest struct {
-	Title   *string `json:"title,omitempty"`
-	Content *string `json:"content,omitempty"`
+	Title               *string `json:"title,omitempty"`
+	Content             *string `json:"content,omitempty"`
+	ExpectedContentHash *string `json:"expected_content_hash,omitempty"`
+}
+
+// PageDiagram is an immutable attachment-backed Excalidraw or Mermaid diagram
+// embedded in a Page's Markdown.
+type PageDiagram struct {
+	PageID         int             `json:"page_id"`
+	AttachmentID   int             `json:"attachment_id"`
+	Name           string          `json:"name"`
+	Kind           string          `json:"kind"`
+	Payload        json.RawMessage `json:"payload,omitempty"`
+	ContentHash    string          `json:"content_hash,omitempty"`
+	RevisionNumber int             `json:"revision_number,omitempty"`
+	CreatedAt      time.Time       `json:"created_at,omitempty"`
+}
+
+type PageDiagramCreateRequest struct {
+	Name                string          `json:"name"`
+	Mermaid             string          `json:"mermaid,omitempty"`
+	Excalidraw          json.RawMessage `json:"excalidraw,omitempty"`
+	Placement           string          `json:"placement"`
+	ExpectedContentHash *string         `json:"expected_content_hash,omitempty"`
+}
+
+type PageDiagramUpdateRequest struct {
+	Name                string          `json:"name,omitempty"`
+	Mermaid             string          `json:"mermaid,omitempty"`
+	Excalidraw          json.RawMessage `json:"excalidraw,omitempty"`
+	ExpectedContentHash *string         `json:"expected_content_hash,omitempty"`
 }
 
 // PageMoveRequest is the body for POST /workspaces/:id/pages/:pageId/move.
 // PrevSiblingID / NextSiblingID let callers place the page at a specific
 // position among its siblings; both omitted means server-default placement.
 type PageMoveRequest struct {
-	ParentID      *int `json:"parent_id"`
-	PrevSiblingID *int `json:"prev_sibling_id,omitempty"`
-	NextSiblingID *int `json:"next_sibling_id,omitempty"`
+	ParentID               *int `json:"parent_id"`
+	DestinationWorkspaceID *int `json:"destination_workspace_id,omitempty"`
+	PrevSiblingID          *int `json:"prev_sibling_id,omitempty"`
+	NextSiblingID          *int `json:"next_sibling_id,omitempty"`
 }
 
 // PageLabel is a workspace-scoped label that attaches to pages only.
@@ -780,6 +833,7 @@ type PageLabelAddRequest struct {
 // are valid.
 type LinkType struct {
 	ID                 int      `json:"id"`
+	BuiltinKey         string   `json:"builtin_key,omitempty"`
 	Name               string   `json:"name"`
 	Description        string   `json:"description,omitempty"`
 	ForwardLabel       string   `json:"forward_label"`
@@ -834,48 +888,48 @@ type LinkListResponse struct {
 
 // Asset is the CLI-side mirror of dto.AssetResponse.
 type Asset struct {
-	ID                int                    `json:"id"`
-	SetID             int                    `json:"set_id"`
-	Title             string                 `json:"title"`
-	Description       string                 `json:"description,omitempty"`
-	AssetTag          string                 `json:"asset_tag,omitempty"`
-	AssetTypeID       int                    `json:"asset_type_id"`
-	CategoryID        *int                   `json:"category_id,omitempty"`
-	StatusID          *int                   `json:"status_id,omitempty"`
-	CreatedBy         *int                   `json:"created_by,omitempty"`
-	CreatedAt         string                 `json:"created_at"`
-	UpdatedAt         string                 `json:"updated_at"`
-	CustomFieldValues map[string]interface{} `json:"custom_field_values,omitempty"`
-	Set               *AssetSetSummary       `json:"set,omitempty"`
-	AssetType         *AssetTypeSummary      `json:"asset_type,omitempty"`
-	Category          *AssetCategorySummary  `json:"category,omitempty"`
-	Status            *AssetStatusSummary    `json:"status,omitempty"`
-	Creator           *UserSummary           `json:"creator,omitempty"`
-	LinkedItemCount   int                    `json:"linked_item_count,omitempty"`
-	Warnings          []string               `json:"warnings"`
+	ID                int                   `json:"id"`
+	SetID             int                   `json:"set_id"`
+	Title             string                `json:"title"`
+	Description       string                `json:"description,omitempty"`
+	AssetTag          string                `json:"asset_tag,omitempty"`
+	AssetTypeID       int                   `json:"asset_type_id"`
+	CategoryID        *int                  `json:"category_id,omitempty"`
+	StatusID          *int                  `json:"status_id,omitempty"`
+	CreatedBy         *int                  `json:"created_by,omitempty"`
+	CreatedAt         string                `json:"created_at"`
+	UpdatedAt         string                `json:"updated_at"`
+	CustomFieldValues map[string]any        `json:"custom_field_values,omitempty"`
+	Set               *AssetSetSummary      `json:"set,omitempty"`
+	AssetType         *AssetTypeSummary     `json:"asset_type,omitempty"`
+	Category          *AssetCategorySummary `json:"category,omitempty"`
+	Status            *AssetStatusSummary   `json:"status,omitempty"`
+	Creator           *UserSummary          `json:"creator,omitempty"`
+	LinkedItemCount   int                   `json:"linked_item_count,omitempty"`
+	Warnings          []string              `json:"warnings"`
 }
 
 // AssetCreateRequest is the JSON body for POST /asset-sets/{setId}/assets.
 type AssetCreateRequest struct {
-	Title             string                 `json:"title"`
-	Description       string                 `json:"description,omitempty"`
-	AssetTag          string                 `json:"asset_tag,omitempty"`
-	AssetTypeID       int                    `json:"asset_type_id"`
-	CategoryID        *int                   `json:"category_id,omitempty"`
-	StatusID          *int                   `json:"status_id,omitempty"`
-	CustomFieldValues map[string]interface{} `json:"custom_field_values,omitempty"`
+	Title             string         `json:"title"`
+	Description       string         `json:"description,omitempty"`
+	AssetTag          string         `json:"asset_tag,omitempty"`
+	AssetTypeID       int            `json:"asset_type_id"`
+	CategoryID        *int           `json:"category_id,omitempty"`
+	StatusID          *int           `json:"status_id,omitempty"`
+	CustomFieldValues map[string]any `json:"custom_field_values,omitempty"`
 }
 
 // AssetUpdateRequest is the JSON body for PUT /assets/{id}. Pointers so
 // "not set" is distinguishable from "set to zero value".
 type AssetUpdateRequest struct {
-	Title             *string                 `json:"title,omitempty"`
-	Description       *string                 `json:"description,omitempty"`
-	AssetTag          *string                 `json:"asset_tag,omitempty"`
-	AssetTypeID       *int                    `json:"asset_type_id,omitempty"`
-	CategoryID        *int                    `json:"category_id,omitempty"`
-	StatusID          *int                    `json:"status_id,omitempty"`
-	CustomFieldValues *map[string]interface{} `json:"custom_field_values,omitempty"`
+	Title             *string         `json:"title,omitempty"`
+	Description       *string         `json:"description,omitempty"`
+	AssetTag          *string         `json:"asset_tag,omitempty"`
+	AssetTypeID       *int            `json:"asset_type_id,omitempty"`
+	CategoryID        *int            `json:"category_id,omitempty"`
+	StatusID          *int            `json:"status_id,omitempty"`
+	CustomFieldValues *map[string]any `json:"custom_field_values,omitempty"`
 }
 
 // AssetSet mirrors dto.AssetSetResponse.
@@ -977,24 +1031,24 @@ type AssetStatusSummary struct {
 	Color string `json:"color,omitempty"`
 }
 
-// TimeProject mirrors the v1 time-projects response.
+// TimeProject is the canonical v2 time-project payload.
 type TimeProject struct {
-	ID            int                    `json:"id"`
-	CustomerID    *int                   `json:"customer_id,omitempty"`
-	CategoryID    *int                   `json:"category_id,omitempty"`
-	Name          string                 `json:"name"`
-	Description   string                 `json:"description"`
-	Status        string                 `json:"status"`
-	Color         string                 `json:"color,omitempty"`
-	HourlyRate    float64                `json:"hourly_rate"`
-	Settings      map[string]interface{} `json:"settings,omitempty"`
-	CustomerName  string                 `json:"customer_name,omitempty"`
-	CategoryName  string                 `json:"category_name,omitempty"`
-	CategoryColor string                 `json:"category_color,omitempty"`
-	TotalHours    *float64               `json:"total_hours,omitempty"`
+	ID            int            `json:"id"`
+	CustomerID    *int           `json:"customer_id,omitempty"`
+	CategoryID    *int           `json:"category_id,omitempty"`
+	Name          string         `json:"name"`
+	Description   string         `json:"description"`
+	Status        string         `json:"status"`
+	Color         string         `json:"color,omitempty"`
+	HourlyRate    float64        `json:"hourly_rate"`
+	Settings      map[string]any `json:"settings,omitempty"`
+	CustomerName  string         `json:"customer_name,omitempty"`
+	CategoryName  string         `json:"category_name,omitempty"`
+	CategoryColor string         `json:"category_color,omitempty"`
+	TotalHours    *float64       `json:"total_hours,omitempty"`
 }
 
-// TimeWorklog mirrors the v1 worklog response.
+// TimeWorklog is the canonical v2 worklog payload.
 type TimeWorklog struct {
 	ID                  int      `json:"id"`
 	ProjectID           int      `json:"project_id"`
@@ -1017,7 +1071,7 @@ type TimeWorklog struct {
 	ProjectTotalHours   *float64 `json:"project_total_hours,omitempty"`
 }
 
-// TimeWorklogCreateRequest mirrors the v1 create-worklog request body.
+// TimeWorklogCreateRequest is the canonical v2 create-worklog request body.
 type TimeWorklogCreateRequest struct {
 	ProjectID       int    `json:"project_id"`
 	Description     string `json:"description"`
@@ -1027,10 +1081,9 @@ type TimeWorklogCreateRequest struct {
 	StartTime       string `json:"start_time,omitempty"`
 	EndTime         string `json:"end_time,omitempty"`
 	ItemID          *int   `json:"item_id,omitempty"`
-	ItemKey         string `json:"item_key,omitempty"`
 }
 
-// TimerStartRequest mirrors the v1 start-timer request body.
+// TimerStartRequest is the v2 start-timer request body.
 type TimerStartRequest struct {
 	WorkspaceID int    `json:"workspace_id"`
 	ProjectID   int    `json:"project_id"`
@@ -1038,18 +1091,29 @@ type TimerStartRequest struct {
 	Description string `json:"description"`
 }
 
-// AssetImportJob mirrors dto.AssetImportJobResponse.
+type AssetCSVUpload struct {
+	UploadID  string   `json:"upload_id"`
+	Headers   []string `json:"headers"`
+	TotalRows int      `json:"total_rows"`
+	Delimiter string   `json:"delimiter"`
+}
+
+type AssetImportProgress struct {
+	Phase         string   `json:"phase"`
+	TotalRows     int      `json:"total_rows"`
+	ImportedCount int      `json:"imported_count"`
+	FailedCount   int      `json:"failed_count"`
+	Errors        []string `json:"errors,omitempty"`
+}
+
+// AssetImportJob is the v2 asynchronous import job.
 type AssetImportJob struct {
-	ID            int     `json:"id"`
-	SetID         int     `json:"set_id"`
-	AssetTypeID   int     `json:"asset_type_id,omitempty"`
-	Status        string  `json:"status"`
-	TotalRows     int     `json:"total_rows"`
-	ProcessedRows int     `json:"processed_rows"`
-	CreatedRows   int     `json:"created_rows"`
-	ErrorRows     int     `json:"error_rows"`
-	ErrorMessage  string  `json:"error_message,omitempty"`
-	CreatedAt     string  `json:"created_at"`
-	StartedAt     *string `json:"started_at,omitempty"`
-	CompletedAt   *string `json:"completed_at,omitempty"`
+	JobID        string               `json:"job_id"`
+	Status       string               `json:"status"`
+	Phase        string               `json:"phase,omitempty"`
+	Progress     *AssetImportProgress `json:"progress,omitempty"`
+	ErrorMessage string               `json:"error_message,omitempty"`
+	CreatedAt    *time.Time           `json:"created_at,omitempty"`
+	StartedAt    *time.Time           `json:"started_at,omitempty"`
+	CompletedAt  *time.Time           `json:"completed_at,omitempty"`
 }

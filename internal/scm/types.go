@@ -1,5 +1,5 @@
 // Package scm provides SCM (Source Control Management) provider integration
-// for GitHub and Gitea/Forgejo.
+// for GitHub, GitLab, and Gitea/Forgejo.
 package scm
 
 import (
@@ -11,7 +11,7 @@ import (
 
 // Provider defines the interface that all SCM providers must implement
 type Provider interface {
-	// GetType returns the provider type (github, gitea)
+	// GetType returns the provider type (github, gitlab, gitea)
 	GetType() models.SCMProviderType
 
 	// TestConnection tests if the provider connection is working
@@ -85,6 +85,11 @@ type ListRepositoriesOptions struct {
 	Organization string // Filter by organization (if supported)
 	Visibility   string // public, private, all
 	Sort         string // created, updated, pushed, full_name
+	// Search restricts results server-side to repositories matching the
+	// query, for providers that support it (currently GitLab). Providers
+	// without native search ignore it and return the unfiltered page;
+	// callers narrow those client-side.
+	Search string
 }
 
 // ListPROptions contains options for listing pull requests
@@ -142,13 +147,16 @@ type Repository struct {
 
 // PullRequest represents a pull request from an SCM provider
 type PullRequest struct {
-	ID         int        `json:"id"`
-	Number     int        `json:"number"`
-	Title      string     `json:"title"`
-	Body       string     `json:"body,omitempty"`
-	State      string     `json:"state"` // open, closed, merged
-	URL        string     `json:"url"`
-	HeadBranch string     `json:"head_branch"`
+	ID         int    `json:"id"`
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	Body       string `json:"body,omitempty"`
+	State      string `json:"state"` // open, closed, merged
+	URL        string `json:"url"`
+	HeadBranch string `json:"head_branch"`
+	// HeadRepo is the full owner/repo containing HeadBranch. It differs from
+	// the base repository for fork PRs and must be known before granting push.
+	HeadRepo   string     `json:"head_repo,omitempty"`
 	HeadSHA    string     `json:"head_sha"`
 	BaseBranch string     `json:"base_branch"`
 	IsMerged   bool       `json:"is_merged"`
@@ -185,6 +193,7 @@ type Branch struct {
 type Tag struct {
 	Name      string    `json:"name"`
 	SHA       string    `json:"sha"` // target commit SHA
+	URL       string    `json:"url,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -217,11 +226,11 @@ type WebhookRegistration struct {
 
 // WebhookPayload represents a parsed webhook payload
 type WebhookPayload struct {
-	EventType  string                 `json:"event_type"`
-	Action     string                 `json:"action,omitempty"`
-	Repository Repository             `json:"repository"`
-	Sender     User                   `json:"sender"`
-	Raw        map[string]interface{} `json:"raw,omitempty"`
+	EventType  string         `json:"event_type"`
+	Action     string         `json:"action,omitempty"`
+	Repository Repository     `json:"repository"`
+	Sender     User           `json:"sender"`
+	Raw        map[string]any `json:"raw,omitempty"`
 	// Specific payloads
 	PullRequest *PullRequest `json:"pull_request,omitempty"`
 	Commit      *Commit      `json:"commit,omitempty"`
@@ -260,15 +269,29 @@ type GitHubAppInstallation struct {
 
 // Release represents a release from an SCM provider
 type Release struct {
-	ID           string     `json:"id"`
-	TagName      string     `json:"tag_name"`
-	Name         string     `json:"name"`
-	Body         string     `json:"body"`
-	URL          string     `json:"url"`
-	IsDraft      bool       `json:"is_draft"`
-	IsPrerelease bool       `json:"is_prerelease"`
-	CreatedAt    time.Time  `json:"created_at"`
-	PublishedAt  *time.Time `json:"published_at,omitempty"`
+	ID           string                   `json:"id"`
+	TagName      string                   `json:"tag_name"`
+	TagURL       string                   `json:"tag_url,omitempty"`
+	Name         string                   `json:"name"`
+	Body         string                   `json:"body"`
+	URL          string                   `json:"url"`
+	Status       string                   `json:"status,omitempty"`
+	Assets       []models.SCMReleaseAsset `json:"assets,omitempty"`
+	IsDraft      bool                     `json:"is_draft"`
+	IsPrerelease bool                     `json:"is_prerelease"`
+	CreatedAt    time.Time                `json:"created_at"`
+	PublishedAt  *time.Time               `json:"published_at,omitempty"`
+	ReleasedAt   *time.Time               `json:"released_at,omitempty"`
+}
+
+// ReleaseCandidate is an existing tag that can be attached to a milestone.
+// Release is populated when the provider has a first-class release for it.
+type ReleaseCandidate struct {
+	TagName string   `json:"tag_name"`
+	TagURL  string   `json:"tag_url,omitempty"`
+	SHA     string   `json:"sha,omitempty"`
+	Status  string   `json:"status"`
+	Release *Release `json:"release,omitempty"`
 }
 
 // CreateReleaseOptions contains options for creating a release
@@ -331,6 +354,8 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 	switch cfg.ProviderType {
 	case models.SCMProviderTypeGitHub:
 		return NewGitHubProvider(cfg)
+	case models.SCMProviderTypeGitLab:
+		return NewGitLabProvider(cfg)
 	case models.SCMProviderTypeGitea:
 		return NewGiteaProvider(cfg)
 	default:
@@ -340,11 +365,17 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 
 // IssueComment represents a comment on a GitHub issue
 type IssueComment struct {
-	ID        int64     `json:"id"`
-	Body      string    `json:"body"`
-	User      User      `json:"user"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID                int64     `json:"id"`
+	Kind              string    `json:"kind,omitempty"` // issue_comment | review | review_comment
+	Body              string    `json:"body"`
+	User              User      `json:"user"`
+	AuthorAssociation string    `json:"author_association,omitempty"`
+	Path              string    `json:"path,omitempty"`
+	Line              int       `json:"line,omitempty"`
+	Side              string    `json:"side,omitempty"`
+	ThreadID          string    `json:"thread_id,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // IssueCommentProvider is the narrow slice of issue operations that the
@@ -362,7 +393,23 @@ type IssueCommentProvider interface {
 	ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error)
 
 	// UpdateIssueComment updates an existing comment on an issue/PR
-	UpdateIssueComment(ctx context.Context, owner, repo string, commentID int64, body string) error
+	UpdateIssueComment(ctx context.Context, owner, repo string, number int, commentID int64, body string) error
+}
+
+// PullRequestReviewProvider exposes the review surfaces that are distinct
+// from issue comments on GitHub/Gitea: submitted review bodies, inline
+// comments, and thread replies. Implementations return normalized events.
+type PullRequestReviewProvider interface {
+	Provider
+	ListPullRequestReviewEvents(ctx context.Context, owner, repo string, number int) ([]IssueComment, error)
+}
+
+// RepositoryPermissionProvider answers whether an SCM identity may request a
+// coding-agent push. The provider token performs the repository-level check;
+// callers fail closed when it cannot be established.
+type RepositoryPermissionProvider interface {
+	Provider
+	CanUserWriteRepository(ctx context.Context, owner, repo, username string) (bool, error)
 }
 
 // IssueProvider extends Provider for providers that support issue operations
@@ -383,6 +430,15 @@ type IssueProvider interface {
 
 	// ListRepoMilestones lists all milestones for a repository
 	ListRepoMilestones(ctx context.Context, owner, repo string) ([]IssueMilestone, error)
+}
+
+// PaginatedIssueProvider is an optional extension for providers that can report
+// whether the remote API has another raw result page. This matters for APIs
+// such as GitHub's issue listing, which also returns pull requests: after those
+// are filtered out, the number of issues alone cannot determine whether the
+// remote page was full.
+type PaginatedIssueProvider interface {
+	ListIssuesPage(ctx context.Context, owner, repo string, opts ListIssueOptions) (issues []Issue, hasNext bool, err error)
 }
 
 // ListIssueOptions contains options for listing issues

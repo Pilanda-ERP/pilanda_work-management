@@ -1,61 +1,31 @@
 <script>
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { currentRoute, navigate } from '../router.js';
+  import Input from '../components/Input.svelte';
+  import LazyRootView from '../components/LazyRootView.svelte';
   import { t } from '../stores/i18n.svelte.js';
-  import CustomFields from '../settings/CustomFields.svelte';
-  import Workspaces from '../workspaces/Workspaces.svelte';
-  import Screens from './Screens.svelte';
-  import StatusContainer from '../features/workflows/StatusContainer.svelte';
-  import WorkflowBuilder from '../features/workflows/WorkflowBuilder.svelte';
-  import ConfigurationSetManager from '../settings/ConfigurationSetManager.svelte';
-  import LinkTypeManager from '../settings/LinkTypeManager.svelte';
-  import UserManager from '../settings/UserManager.svelte';
-  import GroupManager from '../settings/GroupManager.svelte';
-  import PermissionsContainer from '../layout/PermissionsContainer.svelte';
-  import RoleManager from '../settings/RoleManager.svelte';
-  import AttachmentSettings from '../settings/AttachmentSettings.svelte';
-  import ModuleSettings from '../settings/ModuleSettings.svelte';
-  import HierarchyLevelManager from '../settings/HierarchyLevelManager.svelte';
-  import ItemTypeManager from '../settings/ItemTypeManager.svelte';
-  import PriorityManager from '../settings/PriorityManager.svelte';
-  import NotificationSettings from '../settings/NotificationSettings.svelte';
-  import EmailTemplateManager from '../settings/EmailTemplateManager.svelte';
-  import ThemeManager from '../settings/ThemeManager.svelte';
-  import SSOContainer from '../settings/SSOContainer.svelte';
-  import SCMProviderManager from '../settings/SCMProviderManager.svelte';
-  import IntegrationsManager from '../settings/IntegrationsManager.svelte';
-  import SecuritySettings from '../settings/SecuritySettings.svelte';
-  import AIContainer from '../settings/AIContainer.svelte';
-  import ActionCapabilitiesManager from '../settings/ActionCapabilitiesManager.svelte';
-  import AssetManager from '../features/assets/AssetManager.svelte';
-  import Channels from '../features/channels/Channels.svelte';
-  import PermissionSetEdit from '../settings/PermissionSetEdit.svelte';
-  import ConfigurationSetDetail from '../settings/ConfigurationSetDetail.svelte';
-  import ConditionSetManager from '../settings/ConditionSetManager.svelte';
-  import ConditionSetDetail from '../settings/ConditionSetDetail.svelte';
-  import ApprovalSetManager from '../settings/ApprovalSetManager.svelte';
-  import ApprovalSetDetail from '../settings/ApprovalSetDetail.svelte';
-  import FormChannelPage from '../features/channels/FormChannelPage.svelte';
-  import PortalChannelPage from '../features/channels/PortalChannelPage.svelte';
-  import SystemImportPage from '../jira-import/SystemImportPage.svelte';
-  import Diagnostics from '../settings/Diagnostics.svelte';
   import { loadExtensions, getExtensionsForPoint } from '../stores/extensions.svelte.js';
   import IframePluginLoader from '../services/IframePluginLoader.svelte';
   import { resolvePluginIcon } from '../utils/pluginIcons.js';
   import PluginModalContainer from '../layout/PluginModalContainer.svelte';
   import LinkComponent from '../components/Link.svelte';
   import SidebarHeader from '../layout/SidebarHeader.svelte';
-  import { IconFileText, IconPuzzle, IconSearch, IconX } from '@tabler/icons-svelte-runes';
+  import ScrollableSidebar from '../layout/ScrollableSidebar.svelte';
+  import { IconFileText, IconMenu2, IconPuzzle, IconSearch, IconX } from '@tabler/icons-svelte-runes';
   import { useEventListener } from 'runed';
-  import PermissionGuard from '../layout/PermissionGuard.svelte';
+  import {
+    ADMIN_COMPONENT_LOADERS,
+    getAdminComponentProps,
+  } from '../admin/adminComponentRoutes.js';
   import { resolveAdminGroups } from '../admin/adminNavigation.js';
   import { isTypingInField } from '../utils/keyboardShortcuts.js';
+  import { isSystemAdmin } from '../stores/permissions.svelte.js';
 
   const ADMIN_DETAIL_ROUTES = [
-    { prefix: '/admin/permission-sets/',    tabId: 'permissions',         component: PermissionSetEdit },
-    { prefix: '/admin/configuration-sets/', tabId: 'configuration-sets',  component: ConfigurationSetDetail },
-    { prefix: '/admin/condition-sets/',     tabId: 'condition-sets',      component: ConditionSetDetail },
-    { prefix: '/admin/approval-sets/',      tabId: 'approval-sets',       component: ApprovalSetDetail },
+    { prefix: '/admin/permission-sets/', tabId: 'permissions', componentKey: 'permission-set-detail' },
+    { prefix: '/admin/configuration-sets/', tabId: 'configuration-sets', componentKey: 'configuration-set-detail' },
+    { prefix: '/admin/condition-sets/', tabId: 'condition-sets', componentKey: 'condition-set-detail' },
+    { prefix: '/admin/approval-sets/', tabId: 'approval-sets', componentKey: 'approval-set-detail' },
   ];
 
   const isFormChannelRoute = $derived(/^\/admin\/channels\/\d+\/forms$/.test($currentRoute.path));
@@ -77,7 +47,9 @@
 
   // Search functionality
   let searchQuery = $state('');
-  let searchInput;
+  let searchInput = $state(null);
+  let adminNavigationOpen = $state(false);
+  let adminNavigationToggle = $state(null);
 
   // Navigation focus management
   let navButtons = $state([]);
@@ -130,6 +102,20 @@
 
   // Create flat list of all items for search
   const allAdminItems = $derived(adminGroupsWithPlugins.flatMap(group => group.items));
+  const activeAdminItem = $derived(allAdminItems.find(item => item.id === activeTab));
+  const activePluginItem = $derived(activeAdminItem?.isPlugin ? activeAdminItem : null);
+  const adminComponentKey = $derived(
+    isFormChannelRoute
+      ? 'form-channel'
+      : isPortalChannelRoute
+        ? 'portal-channel'
+        : matchedDetailRoute?.componentKey || activeTab
+  );
+  const adminComponentLoader = $derived(ADMIN_COMPONENT_LOADERS[adminComponentKey]);
+  const adminComponentProps = $derived(getAdminComponentProps(adminComponentKey, loadedExtensions));
+  const isNestedComponent = $derived(
+    isFormChannelRoute || isPortalChannelRoute || !!matchedDetailRoute
+  );
 
   // Filter groups and items based on search
   const filteredGroups = $derived(
@@ -149,6 +135,19 @@
   function clearSearch() {
     searchQuery = '';
     searchInput?.focus();
+  }
+
+  async function openAdminNavigation() {
+    adminNavigationOpen = true;
+    await tick();
+    searchInput?.focus();
+  }
+
+  function closeAdminNavigation(restoreFocus = false) {
+    adminNavigationOpen = false;
+    if (restoreFocus) {
+      void tick().then(() => adminNavigationToggle?.focus());
+    }
   }
 
   // Keyboard navigation for search
@@ -212,12 +211,22 @@
 
   // Global keyboard shortcut handler
   function handleGlobalKeydown(event) {
+    if (event.key === 'Escape' && adminNavigationOpen) {
+      event.preventDefault();
+      closeAdminNavigation(true);
+      return;
+    }
+
     // Focus search on '/' key, but never steal printable input from forms/editors
     // or modal dialogs (e.g. the global create dialog opened over admin pages).
     if (event.key !== '/' || isTypingInField(event) || document.querySelector('[role="dialog"][aria-modal="true"]')) return;
 
     event.preventDefault();
-    searchInput?.focus();
+    if (window.matchMedia('(max-width: 1100px)').matches) {
+      void openAdminNavigation();
+    } else {
+      searchInput?.focus();
+    }
   }
 
   function handleTabClick(tabId) {
@@ -228,7 +237,7 @@
     // Load plugin extensions into component-local state for proper reactivity
     loadedExtensions = (await loadExtensions()) || {};
 
-    if (!$currentRoute.params?.tab && !isNestedRoute && !$currentRoute.path.startsWith('/admin/channels')) {
+    if (!$currentRoute.params?.tab && !$currentRoute.query?.tab && !isNestedRoute && !$currentRoute.path.startsWith('/admin/channels')) {
       navigate('/admin/custom-fields');
     }
   });
@@ -270,47 +279,91 @@
   }
 </script>
 
-<!-- Main container with sidebar layout -->
-<div class="flex min-h-screen" style="background-color: var(--ds-surface);">
-  <!-- Left Sidebar -->
-  <div class="w-64 border-r flex-shrink-0" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-    <div class="p-6">
-      <SidebarHeader title={t('settings.admin')} description={t('settings.systemSettings')} noBorder />
-      
-      <!-- Search -->
-      <div class="mb-4 relative">
-        <label for="admin-search" class="sr-only">Search admin settings</label>
-        <div class="relative">
-          <IconSearch size={16} stroke={1.5} class="absolute left-3 top-1/2 transform -translate-y-1/2" style="color: var(--ds-icon-subtle);" aria-hidden="true" />
-          <input
-            id="admin-search"
-            bind:this={searchInput}
-            bind:value={searchQuery}
-            onkeydown={handleSearchKeydown}
-            type="search"
-            placeholder={t('common.search')}
-            class="w-full pl-10 pr-8 py-2 text-sm border rounded-md focus:outline-none focus:ring-2"
-            style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text); --tw-ring-color: var(--ds-interactive);"
-            aria-describedby={searchQuery && filteredGroups.length === 0 ? 'search-no-results' : undefined}
-          />
-          {#if searchQuery}
-            <button
-              onclick={clearSearch}
-              class="absolute right-2 top-1/2 transform -translate-y-1/2 p-1 transition-colors"
-              style="color: var(--ds-icon-subtle);"
-              onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-icon)'}
-              onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-icon-subtle)'}
-              aria-label={t('search.clearSearch')}
-            >
-              <IconX size={12} stroke={1.5} aria-hidden="true" />
-            </button>
-          {/if}
-        </div>
-      </div>
+{#snippet activeAdminComponent()}
+  {#key adminComponentKey}
+    <LazyRootView
+      loader={adminComponentLoader}
+      componentProps={adminComponentProps}
+      label={activeAdminItem?.label || adminComponentKey}
+    />
+  {/key}
+{/snippet}
 
+{#snippet adminSidebarHeader()}
+  <div class="p-6 pb-3">
+    <div class="admin-sidebar-heading">
+      <div class="admin-sidebar-title">
+        <SidebarHeader title={t('settings.admin')} description={t('settings.systemSettings')} noBorder />
+      </div>
+      <button
+        type="button"
+        class="admin-navigation-close"
+        data-testid="admin-navigation-close"
+        aria-label="Close admin navigation"
+        onclick={() => closeAdminNavigation(true)}
+      >
+        <IconX size={20} stroke={1.5} aria-hidden="true" />
+      </button>
+    </div>
+
+    <!-- Search stays available while the navigation list scrolls. -->
+    <div class="relative">
+      <label for="admin-search" class="sr-only">Search admin settings</label>
+      <div class="relative">
+        <IconSearch size={16} stroke={1.5} class="absolute left-3 top-1/2 transform -translate-y-1/2" style="color: var(--ds-icon-subtle);" aria-hidden="true" />
+        <Input
+          id="admin-search"
+          bind:this={searchInput}
+          bind:value={searchQuery}
+          onkeydown={handleSearchKeydown}
+          type="search"
+          placeholder={t('common.search')}
+          class="pl-10 pr-8"
+          ariaDescribedby={searchQuery && filteredGroups.length === 0 ? 'search-no-results' : undefined}
+          size="small"
+        />
+        {#if searchQuery}
+          <button
+            onclick={clearSearch}
+            class="admin-clear-btn absolute right-2 top-1/2 transform -translate-y-1/2 p-1 transition-colors"
+            aria-label={t('search.clearSearch')}
+          >
+            <IconX size={12} stroke={1.5} aria-hidden="true" />
+          </button>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/snippet}
+
+<!-- Main container with sidebar layout -->
+<div class="admin-shell flex h-full min-h-0 min-w-0 overflow-hidden" style="background-color: var(--ds-surface);">
+  <!-- Channel managers can use channel routes without seeing the rest of the
+       system-administration navigation. Non-channel admin routes remain
+       guarded in MainApp. -->
+  {#if $isSystemAdmin}
+    {#if adminNavigationOpen}
+      <button
+        type="button"
+        class="admin-navigation-backdrop"
+        data-testid="admin-navigation-backdrop"
+        aria-label="Close admin navigation"
+        onclick={() => closeAdminNavigation(true)}
+      ></button>
+    {/if}
+    <ScrollableSidebar
+      as="aside"
+      id="admin-navigation"
+      class="admin-sidebar w-64 border-r flex-shrink-0 {adminNavigationOpen ? 'admin-navigation-open' : ''}"
+      style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);"
+      aria-label="Admin settings"
+      header={adminSidebarHeader}
+      scrollClass="px-6"
+      scrollTestid="admin-navigation-scroll"
+    >
       <!-- Navigation -->
       <nav class="space-y-6 pb-6" aria-label="Admin settings">
-        {#each filteredGroups as group}
+        {#each filteredGroups as group (group.id)}
           <div role="group" aria-labelledby="group-{group.id}">
             <!-- Group Header -->
             <div class="px-2 pt-3 pb-1 mb-1">
@@ -321,18 +374,18 @@
 
             <!-- Group Items -->
             <div class="space-y-1">
-              {#each group.items as item}
+              {#each group.items as item (item.id)}
                 {@const buttonIndex = buttonIndices.get(item.id)}
                 {@const isItemActive = activeTab === item.id}
                 <LinkComponent
+                  data-testid="admin-navigation-item"
+                  id="admin-navigation-item-{item.id}"
                   bind:element={navButtons[buttonIndex]}
                   href="/admin/{item.id}"
                   active={isItemActive}
+                  onClick={() => closeAdminNavigation()}
                   onkeydown={(e) => handleNavKeydown(e, buttonIndex)}
-                  class="w-full group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-all cursor-pointer"
-                  style={isItemActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-                  onmouseenter={(e) => { if (!isItemActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-                  onmouseleave={(e) => { if (!isItemActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+                  class="admin-nav-item w-full group flex items-center px-3 py-2 text-sm font-medium rounded-lg transition-all cursor-pointer {isItemActive ? 'active' : ''}"
                 >
                   {@const ItemIcon = item.icon}
                   <ItemIcon size={16} stroke={1.5} class="flex-shrink-0 -ml-1 mr-3" aria-hidden="true" />
@@ -348,10 +401,7 @@
             <p class="text-sm" style="color: var(--ds-text-subtle);">{t('search.noSearchResults')}</p>
             <button
               onclick={clearSearch}
-              class="text-xs mt-1"
-              style="color: var(--ds-link);"
-              onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-link-pressed)'}
-              onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-link)'}
+              class="clear-link text-xs mt-1"
             >
               {t('search.clearSearch')}
             </button>
@@ -367,193 +417,51 @@
           {/if}
         </div>
       </nav>
-    </div>
-  </div>
+    </ScrollableSidebar>
+  {/if}
 
   <!-- Main Content -->
-  <div class="flex-1 flex flex-col overflow-hidden">
-    <!-- Nested detail routes (no padding) -->
-    {#if isFormChannelRoute}
-      <FormChannelPage />
-    {:else if isPortalChannelRoute}
-      <PortalChannelPage />
-    {:else if matchedDetailRoute}
-      {@const DetailComponent = matchedDetailRoute.component}
-      <DetailComponent />
-    {:else}
-    <div class="px-16 py-12 pb-0 flex-1 overflow-y-auto">
-      <div class="pr-0 pl-0">
-      <!-- Custom Fields Tab -->
-  {#if activeTab === 'custom-fields'}
-    <CustomFields />
-  {/if}
-
-  <!-- Workspaces Tab -->
-  {#if activeTab === 'workspaces'}
-    <Workspaces noPadding />
-  {/if}
-
-  <!-- Screens Tab -->
-  {#if activeTab === 'screens'}
-    <Screens />
-  {/if}
-
-  <!-- Statuses (Categories & Individual) Tab -->
-  {#if activeTab === 'statuses'}
-    <StatusContainer />
-  {/if}
-
-  <!-- Workflows Tab -->
-  {#if activeTab === 'workflows'}
-    <WorkflowBuilder />
-  {/if}
-
-  <!-- Configuration Sets Tab -->
-  {#if activeTab === 'configuration-sets'}
-    <ConfigurationSetManager />
-  {/if}
-
-  <!-- Condition Sets Tab -->
-  {#if activeTab === 'condition-sets'}
-    <ConditionSetManager />
-  {/if}
-
-  <!-- Approval Sets Tab -->
-  {#if activeTab === 'approval-sets'}
-    <ApprovalSetManager />
-  {/if}
-
-  <!-- Notification Settings Tab -->
-  {#if activeTab === 'notification-settings'}
-    <NotificationSettings />
-  {/if}
-
-  <!-- Email Templates Tab -->
-  {#if activeTab === 'email-templates'}
-    <EmailTemplateManager />
-  {/if}
-
-  <!-- Channels Tab -->
-  {#if activeTab === 'channels'}
-    <Channels embedded={true} />
-  {/if}
-
-  <!-- Link Types Tab -->
-  {#if activeTab === 'link-types'}
-    <LinkTypeManager />
-  {/if}
-
-  <!-- User Management Tab -->
-  {#if activeTab === 'users'}
-    <UserManager />
-  {/if}
-
-  <!-- Group Management Tab -->
-  {#if activeTab === 'groups'}
-    <GroupManager />
-  {/if}
-
-  <!-- Permissions & Permission Sets Tab -->
-  {#if activeTab === 'permissions'}
-    <PermissionsContainer />
-  {/if}
-
-  <!-- Workspace Roles Tab -->
-  {#if activeTab === 'workspace-roles'}
-    <RoleManager />
-  {/if}
-
-  <!-- Attachment Settings Tab -->
-  {#if activeTab === 'attachments'}
-    <AttachmentSettings />
-  {/if}
-
-  <!-- Module Settings Tab -->
-  {#if activeTab === 'modules'}
-    <ModuleSettings />
-  {/if}
-
-  <!-- Theme Settings Tab -->
-  {#if activeTab === 'themes'}
-    <ThemeManager />
-  {/if}
-
-  <!-- Hierarchy Levels Tab -->
-  {#if activeTab === 'hierarchy-levels'}
-    <HierarchyLevelManager />
-  {/if}
-
-  <!-- Item Types Tab -->
-  {#if activeTab === 'item-types'}
-    <ItemTypeManager />
-  {/if}
-
-  <!-- Priorities Tab -->
-  {#if activeTab === 'priorities'}
-    <PriorityManager />
-  {/if}
-
-  <!-- SSO Settings Tab -->
-  {#if activeTab === 'sso'}
-    <SSOContainer extensions={loadedExtensions} />
-  {/if}
-
-  <!-- SCM Providers Tab -->
-  {#if activeTab === 'scm-providers'}
-    <SCMProviderManager />
-  {/if}
-
-  {#if activeTab === 'integration-providers'}
-    <IntegrationsManager />
-  {/if}
-
-  <!-- AI Connections Tab (with sub-tabs for Connections + Features) -->
-  {#if activeTab === 'llm-connections'}
-    <AIContainer />
-  {/if}
-
-  <!-- Action Capabilities Tab -->
-  {#if activeTab === 'action-capabilities'}
-    <ActionCapabilitiesManager />
-  {/if}
-
-  <!-- System Import Tab -->
-  {#if activeTab === 'system-import'}
-    <SystemImportPage />
-  {/if}
-
-  <!-- Security Settings Tab -->
-  {#if activeTab === 'security'}
-    <SecuritySettings />
-  {/if}
-
-  <!-- Asset Management Tab -->
-  {#if activeTab === 'assets'}
-    <AssetManager />
-  {/if}
-
-  <!-- System Diagnostics Tab -->
-  {#if activeTab === 'diagnostics'}
-    <Diagnostics />
-  {/if}
-
-  <!-- Plugin Components -->
-  {#each allAdminItems.filter(item => item.isPlugin) as pluginItem}
-    {#if activeTab === pluginItem.id}
-      {@const pluginName = pluginItem.pluginData?.pluginName || 'unknown'}
-      {@const iframeSrc = `/api/plugins/${pluginName}/assets/${pluginItem.pluginData?.component || 'index.html'}`}
-
-      <div class="plugin-component-container">
-        <!-- All plugins use iframe mode -->
-        <IframePluginLoader
-          pluginName={pluginItem.label}
-          src={iframeSrc}
-        />
-      </div>
+  <div class="admin-main flex-1 flex flex-col min-w-0 overflow-hidden">
+    {#if $isSystemAdmin}
+      <header class="admin-mobile-header">
+        <button
+          type="button"
+          class="admin-navigation-toggle"
+          data-testid="admin-navigation-toggle"
+          bind:this={adminNavigationToggle}
+          aria-label="Open admin navigation"
+          aria-controls="admin-navigation"
+          aria-expanded={adminNavigationOpen}
+          onclick={openAdminNavigation}
+        >
+          <IconMenu2 size={22} stroke={1.5} aria-hidden="true" />
+        </button>
+        <div class="min-w-0">
+          <p class="admin-mobile-eyebrow">{t('settings.admin')}</p>
+          <p class="admin-mobile-section" data-testid="admin-active-section">
+            {activeAdminItem?.label || t('settings.systemSettings')}
+          </p>
+        </div>
+      </header>
     {/if}
-  {/each}
+    {#if activePluginItem}
+      {@const pluginName = activePluginItem.pluginData?.pluginName || 'unknown'}
+      {@const iframeSrc = `/api/plugins/${pluginName}/assets/${activePluginItem.pluginData?.component || 'index.html'}`}
+      <div class="admin-content px-16 py-12 pb-0 flex-1 min-w-0 overflow-y-auto">
+        <div class="plugin-component-container">
+          <IframePluginLoader pluginName={activePluginItem.label} src={iframeSrc} />
+        </div>
       </div>
-    </div>
+    {:else if adminComponentLoader}
+      {#if isNestedComponent}
+        {@render activeAdminComponent()}
+      {:else}
+        <div class="admin-content px-16 py-12 pb-0 flex-1 min-w-0 overflow-y-auto">
+          <div class="min-w-0 pr-0 pl-0">
+            {@render activeAdminComponent()}
+          </div>
+        </div>
+      {/if}
     {/if}
   </div>
 </div>
@@ -562,6 +470,157 @@
 <PluginModalContainer />
 
 <style>
+  .admin-clear-btn {
+    color: var(--ds-icon-subtle);
+  }
+
+  .admin-clear-btn:hover {
+    color: var(--ds-icon);
+  }
+
+  /* Rendered inside the Link component, so the rules must be global. */
+  :global(.admin-nav-item) {
+    color: var(--ds-text-subtle);
+  }
+
+  :global(.admin-nav-item:hover:not(.active)) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  :global(.admin-nav-item.active) {
+    background: var(--ds-surface-selected);
+    color: var(--ds-text);
+  }
+
+  .clear-link {
+    color: var(--ds-link);
+  }
+
+  .clear-link:hover {
+    color: var(--ds-link-pressed);
+  }
+
+
+  .admin-shell {
+    position: relative;
+    width: 100%;
+  }
+
+  .admin-mobile-header,
+  .admin-navigation-close,
+  .admin-navigation-backdrop {
+    display: none;
+  }
+
+  @media (max-width: 1100px) {
+    :global(.admin-sidebar) {
+      position: absolute;
+      z-index: 30;
+      inset: 0 auto 0 0;
+      width: min(20rem, calc(100% - 3rem));
+      overflow-y: auto;
+      visibility: hidden;
+      transform: translateX(-100%);
+      transition:
+        transform var(--duration-normal, 200ms) var(--ease-smooth, ease),
+        visibility var(--duration-normal, 200ms) var(--ease-smooth, ease);
+      box-shadow: var(--ds-shadow-overlay, 0 8px 24px rgb(9 30 66 / 25%));
+    }
+
+    :global(.admin-sidebar.admin-navigation-open) {
+      visibility: visible;
+      transform: translateX(0);
+    }
+
+    .admin-sidebar-heading {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+    }
+
+    .admin-sidebar-title {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .admin-navigation-close,
+    .admin-navigation-toggle {
+      display: inline-flex;
+      width: 2.75rem;
+      height: 2.75rem;
+      flex: 0 0 2.75rem;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: 0.5rem;
+      color: var(--ds-icon);
+      background: transparent;
+    }
+
+    .admin-navigation-close:hover,
+    .admin-navigation-toggle:hover {
+      background: var(--ds-background-neutral-hovered);
+    }
+
+    .admin-navigation-close:focus-visible,
+    .admin-navigation-toggle:focus-visible {
+      outline: 2px solid var(--ds-border-focused, var(--ds-link));
+      outline-offset: 2px;
+    }
+
+    .admin-navigation-backdrop {
+      display: block;
+      position: absolute;
+      z-index: 20;
+      inset: 0;
+      border: 0;
+      background: color-mix(in srgb, var(--ds-blanket, #091e42) 54%, transparent);
+    }
+
+    .admin-mobile-header {
+      display: flex;
+      position: sticky;
+      z-index: 10;
+      top: 0;
+      min-width: 0;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.625rem 1rem;
+      border-bottom: 1px solid var(--ds-border);
+      background: var(--ds-surface-raised);
+    }
+
+    .admin-mobile-eyebrow {
+      color: var(--ds-text-subtle);
+      font-size: 0.6875rem;
+      font-weight: 600;
+      line-height: 1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .admin-mobile-section {
+      overflow: hidden;
+      color: var(--ds-text);
+      font-size: 0.875rem;
+      font-weight: 600;
+      line-height: 1.25rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .admin-content {
+      padding: 1.5rem clamp(1rem, 4vw, 2rem) 0;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    :global(.admin-sidebar) {
+      transition: none;
+    }
+  }
+
   :global(.tiptap-editor) {
     outline: none;
     white-space: pre-wrap;
@@ -644,7 +703,7 @@
   }
 
   :global(.tiptap-editor blockquote) {
-    border-left: 4px solid var(--ds-border);
+    border-left: 1px solid var(--ds-border);
     padding-left: 1rem;
     margin: 1rem 0;
     font-style: italic;

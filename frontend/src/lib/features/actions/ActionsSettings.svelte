@@ -12,6 +12,8 @@
   import ActionTemplatePicker from './ActionTemplatePicker.svelte';
   import Modal from '../../dialogs/Modal.svelte';
   import Button from '../../components/Button.svelte';
+  import Input from '../../components/Input.svelte';
+  import Textarea from '../../components/Textarea.svelte';
   import UnauthorizedAccess from '../../pages/UnauthorizedAccess.svelte';
 
   let { workspaceId, actionId = 0 } = $props();
@@ -38,8 +40,8 @@
     }
     if (editingAction?.id === id) return;
     let cancelled = false;
-    api
-      .get(`/workspaces/${workspaceId}/actions/${id}`)
+    api.actions
+      .get(workspaceId, id)
       .then((full) => {
         if (!cancelled) editingAction = full;
       })
@@ -80,8 +82,9 @@
 
   async function loadActions() {
     try {
-      actions = await api.get(`/workspaces/${workspaceId}/actions`) || [];
+      actions = await api.actions.getAll(workspaceId) || [];
     } catch (error) {
+      if (error?.name === 'AbortError') return;
       console.error('Failed to load actions:', error);
       errorToast(t('errors.failedToLoad'));
       actions = [];
@@ -110,7 +113,7 @@
     }
 
     try {
-      const newAction = await api.post(`/workspaces/${workspaceId}/actions`, {
+      const newAction = await api.actions.create(workspaceId, {
         name: newActionName.trim(),
         description: newActionDescription.trim(),
         trigger_type: 'status_transition',
@@ -133,7 +136,7 @@
 
   async function handleToggle(action) {
     try {
-      await api.post(`/workspaces/${workspaceId}/actions/${action.id}/toggle`);
+      await api.actions.update(workspaceId, action.id, { is_enabled: !action.is_enabled });
       await loadActions();
       successToast(action.is_enabled ? t('actions.disabled') : t('actions.enabled'));
     } catch (error) {
@@ -144,7 +147,7 @@
 
   async function handleDelete(action) {
     try {
-      await api.delete(`/workspaces/${workspaceId}/actions/${action.id}`);
+      await api.actions.delete(workspaceId, action.id);
       await loadActions();
       successToast(t('common.deleted'));
     } catch (error) {
@@ -163,7 +166,7 @@
 
   async function handleSaveAction(updatedAction) {
     try {
-      await api.put(`/workspaces/${workspaceId}/actions/${updatedAction.id}`, updatedAction);
+      await api.actions.update(workspaceId, updatedAction.id, updatedAction);
       await loadActions();
       successToast(t('common.saved'));
       navigate(`/workspaces/${workspaceId}/actions`);
@@ -235,23 +238,24 @@
     <div class="space-y-4">
       <div>
         <label for="action-name" class="block text-sm font-medium mb-1 modal-label">{t('common.name')}</label>
-        <input
+        <Input
           id="action-name"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm modal-input"
           bind:value={newActionName}
           placeholder={t('actions.newAction')}
+          size="small"
         />
       </div>
 
       <div>
         <label for="action-description" class="block text-sm font-medium mb-1 modal-label">{t('common.description')}</label>
-        <textarea
+        <Textarea
           id="action-description"
-          class="w-full px-3 py-2 border rounded-md text-sm modal-input"
-          rows="2"
+          rows={2}
           bind:value={newActionDescription}
-        ></textarea>
+          style="background-color: var(--ds-surface);"
+          size="small"
+        />
       </div>
     </div>
 
@@ -285,14 +289,4 @@
     color: var(--ds-text);
   }
 
-  .modal-input {
-    background-color: var(--ds-surface);
-    border-color: var(--ds-border);
-    color: var(--ds-text);
-  }
-
-  .modal-input:focus {
-    border-color: var(--ds-interactive);
-    outline: none;
-  }
 </style>

@@ -14,6 +14,7 @@
     emptyDescription = '',
     emptyIcon = null,
     actionItems = null,
+    actionTriggerTestid = null,
     onRowClick = null,
     selectedItemId = null,
     pagination = false,
@@ -170,6 +171,8 @@
           <tr>
             {#each columns as column, colIndex}
               <th
+                data-testid={`table-column-${column.key}`}
+                aria-sort={column.sortable ? (sortKey === column.key ? (sortDirection === 'asc' ? 'ascending' : 'descending') : 'none') : undefined}
                 class="{thClass} {getColumnAlign(column)} {getColumnWidth(column)} {column.sortable ? 'group cursor-pointer select-none' : ''}"
                 style="color: var(--ds-text); {getColumnWidthStyle(column)} {column.headerStyle || ''}"
                 onclick={() => toggleSort(column)}
@@ -182,7 +185,7 @@
                     {:else if sortKey === column.key && sortDirection === 'desc'}
                       <ArrowDown class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" />
                     {:else}
-                      <ArrowUpDown class="w-3.5 h-3.5 opacity-0 group-hover:opacity-100" style="color: var(--ds-text-subtlest);" />
+                      <ArrowUpDown class="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100" style="color: var(--ds-text-subtlest);" />
                     {/if}
                   {/if}
                 </span>
@@ -193,11 +196,10 @@
         <tbody class={tbodyClass} style="--tw-divide-opacity: 1; border-color: var(--ds-border);">
           {#each displayData as item (item[keyField])}
             <tr
-              class="{trClass} {onRowClick ? 'cursor-pointer' : ''}"
-              style="border-color: var(--ds-border); {item[keyField] === selectedItemId ? 'background-color: var(--ds-surface-selected);' : ''}"
+              class="data-row {trClass} {onRowClick ? 'cursor-pointer' : ''}"
+              class:selected={item[keyField] === selectedItemId}
+              style="border-color: var(--ds-border);"
               onclick={(e) => handleRowClick(item, e)}
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = item[keyField] === selectedItemId ? 'var(--ds-surface-selected)' : ''}
               {...rowAttrs ? rowAttrs(item) : {}}
             >
               {#each columns as column, colIndex}
@@ -212,6 +214,7 @@
                         maxWidth="max-w-48"
                         showChevron={false}
                         iconOnly={true}
+                        triggerTestid={actionTriggerTestid ? actionTriggerTestid(item) : ''}
                       />
                     </div>
                   {:else if column.slot && slotProps[column.slot]}
@@ -246,17 +249,19 @@
           <button
             onclick={prevPage}
             disabled={currentPage === 1}
+            data-testid="table-pagination-prev"
             class="p-1.5 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             style="background: var(--ds-background-neutral); color: var(--ds-text);"
           >
             <ChevronLeft class="w-4 h-4" />
           </button>
-          <span class="text-sm px-2" style="color: var(--ds-text-subtle);">
+          <span class="text-sm px-2" style="color: var(--ds-text-subtle);" data-testid="table-pagination-status">
             {t('components.pagination.pageOf', { current: currentPage, total: totalPages })}
           </span>
           <button
             onclick={nextPage}
             disabled={currentPage >= totalPages}
+            data-testid="table-pagination-next"
             class="p-1.5 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             style="background: var(--ds-background-neutral); color: var(--ds-text);"
           >
@@ -267,3 +272,17 @@
     {/if}
   {/if}
 </div>
+
+<style>
+  .data-row {
+    border-color: var(--ds-border);
+  }
+
+  .data-row:hover:not(.selected) {
+    background-color: var(--ds-surface-raised-hovered);
+  }
+
+  .data-row.selected {
+    background-color: var(--ds-surface-selected);
+  }
+</style>

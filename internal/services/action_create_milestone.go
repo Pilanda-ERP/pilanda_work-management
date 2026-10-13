@@ -27,11 +27,15 @@ type MilestoneCommitAttacher interface {
 // stays primitive so the interface adds no scm-package types to the
 // services-package surface.
 type MilestoneCommitAttachInput struct {
-	WorkspaceID     int
-	WorkspaceRepoID int
-	MilestoneID     int
-	BaseRef         string
-	HeadRef         string
+	WorkspaceID       int
+	WorkspaceRepoID   int
+	MilestoneID       int
+	BaseRef           string
+	HeadRef           string
+	ActorUserID       int
+	ExecutionChainID  string
+	CascadeDepth      int
+	SourceApplication string
 }
 
 // MilestoneCommitAttachResult is the summary the executor records in
@@ -217,7 +221,7 @@ func (e *CreateMilestoneExecutor) Execute(node *models.ActionNode, ctx *models.E
 		milestoneID = existing.ID
 	}
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"milestone_id": milestoneID,
 		"external_key": upsertKey,
 		"created":      created,
@@ -280,11 +284,15 @@ func (e *CreateMilestoneExecutor) runCommitIssueAttach(ctx *models.ExecutionCont
 		return
 	}
 	result, err := e.attacher.AttachCommitIssues(context.Background(), MilestoneCommitAttachInput{
-		WorkspaceID:     ctx.Event.WorkspaceID,
-		WorkspaceRepoID: repoID,
-		MilestoneID:     milestoneID,
-		BaseRef:         prevRef,
-		HeadRef:         headRef,
+		WorkspaceID:       ctx.Event.WorkspaceID,
+		WorkspaceRepoID:   repoID,
+		MilestoneID:       milestoneID,
+		BaseRef:           prevRef,
+		HeadRef:           headRef,
+		ActorUserID:       ctx.EffectiveActorID,
+		ExecutionChainID:  ctx.ChainID,
+		CascadeDepth:      ctx.Event.CascadeDepth + 1,
+		SourceApplication: "workspace",
 	})
 	if err != nil {
 		stepResult.Output["attach_commit_issues_error"] = err.Error()
@@ -305,6 +313,12 @@ func (e *CreateMilestoneExecutor) attachRelease(ctx *models.ExecutionContext, mi
 	}
 	sha, _ := ctx.Variables["new_ref.sha"].(string)
 	repoFullName, _ := ctx.Variables["new_repo.full_name"].(string)
+	var workspaceRepositoryID *int
+	if rawID, exists := ctx.Variables["new_repo.workspace_repository_id"]; exists {
+		if id, ok := coerceInt(rawID); ok && id > 0 {
+			workspaceRepositoryID = &id
+		}
+	}
 
 	var repoPtr *string
 	if repoFullName != "" {
@@ -313,9 +327,10 @@ func (e *CreateMilestoneExecutor) attachRelease(ctx *models.ExecutionContext, mi
 	}
 
 	return e.planning.AttachRelease(ReleaseMilestoneParams{
-		ID:              milestoneID,
-		TagName:         tagName,
-		TargetCommitish: sha,
-		SCMRepository:   repoPtr,
+		ID:                    milestoneID,
+		WorkspaceRepositoryID: workspaceRepositoryID,
+		TagName:               tagName,
+		TargetCommitish:       sha,
+		SCMRepository:         repoPtr,
 	})
 }

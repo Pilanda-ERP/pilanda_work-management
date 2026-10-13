@@ -1,19 +1,22 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
+	"time"
 
+	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 )
 
-// ============================================
-// Interfaces — set on ItemLinkService via With*
-// ============================================
+// Optional interfaces are wired on ItemLinkService via With* methods.
 
 // AssetPermissionChecker is the minimal slice of the AssetHandler the link
 // orchestration needs. Held as an interface because the implementation
@@ -21,6 +24,15 @@ import (
 // nil ⇒ fail-closed (asset endpoints always 404).
 type AssetPermissionChecker interface {
 	HasAssetSetPermission(userID, setID int, permissionKey string) (bool, error)
+}
+
+// WorkspacePermissionChecker is the effective-permission surface link
+// authorization needs. Keeping it narrow makes targeted-scope behavior
+// testable without constructing the full permission service.
+type WorkspacePermissionChecker interface {
+	HasWorkspacePermission(userID, workspaceID int, permission string) (bool, error)
+	AccessibleWorkspaceIDs(userID int) ([]int, error)
+	AccessibleWorkspaceIDKeys(userID int) ([]repository.IDKey, error)
 }
 
 // PagePermissionChecker is satisfied by *PagePermissionService (and by
@@ -43,9 +55,7 @@ type ItemLinkActionEmitter interface {
 	EmitActionEvent(event *models.ActionEvent)
 }
 
-// ============================================
-// Sentinel errors (HTTP layers map these to status codes)
-// ============================================
+// Sentinel errors map to HTTP status codes in the handlers.
 
 // EntityNotAccessibleError covers both "no such entity" and "no view/edit
 // permission" — they share an HTTP response (404, per the existence-leak
@@ -59,7 +69,6 @@ func (e *EntityNotAccessibleError) Error() string {
 	return fmt.Sprintf("%s %d not found or not accessible", e.EntityType, e.EntityID)
 }
 
-// IsEntityNotAccessible reports whether err is an EntityNotAccessibleError.
 func IsEntityNotAccessible(err error) bool {
 	var e *EntityNotAccessibleError
 	return errors.As(err, &e)
@@ -88,66 +97,46 @@ var (
 	ErrLinkCrossWorkspacePage = errors.New("page link endpoints must share a workspace")
 )
 
-// ============================================
-// With* dependency setters
-// ============================================
+// Dependency setters.
 
-// WithPermissionService wires the workspace-permission checker required
-// for orchestration on item / test_case endpoints.
-func (s *ItemLinkService) WithPermissionService(p *PermissionService) *ItemLinkService {
+func (s *ItemLinkService) WithPermissionService(p WorkspacePermissionChecker) *ItemLinkService {
 	s.perm = p
 	return s
 }
 
-// WithPagePermissionChecker wires the per-page ACL checker. Without it,
-// any link operation touching a page endpoint fails closed (404).
+// WithPagePermissionChecker wires the page ACL checker; nil fails closed.
 func (s *ItemLinkService) WithPagePermissionChecker(p PagePermissionChecker) *ItemLinkService {
 	s.pagePerm = p
 	return s
 }
 
 // WithAssetPermissionChecker wires the asset-set permission checker.
-// Without it, any link operation touching an asset endpoint fails closed.
 func (s *ItemLinkService) WithAssetPermissionChecker(c AssetPermissionChecker) *ItemLinkService {
 	s.assetPerm = c
 	return s
 }
 
-// WithNotificationEmitter wires an optional notification sink. Linked /
-// unlinked events for item-source links fire only when this is set AND
-// the source resolves to a real item.
+// WithNotificationEmitter wires optional item-link notifications.
 func (s *ItemLinkService) WithNotificationEmitter(e ItemLinkNotificationEmitter) *ItemLinkService {
 	s.notifications = e
 	return s
 }
 
-// WithActionEmitter wires an optional action-event sink (automation
-// workflows). Same item-source-only firing rule as notifications.
+// WithActionEmitter wires optional automation events for item-source links.
 func (s *ItemLinkService) WithActionEmitter(e ItemLinkActionEmitter) *ItemLinkService {
 	s.actions = e
 	return s
 }
 
-// ============================================
-// Public orchestration surface
-// ============================================
+// Public orchestration surface.
 
-// ListLinkTypes returns the active link-type catalog (system + custom).
-// Pass includeInactive=true for admin / debug views.
+// ListLinkTypes returns the active system and custom link types.
 func (s *ItemLinkService) ListLinkTypes(includeInactive bool) ([]models.LinkType, error) {
 	repo := repository.NewLinkTypeRepository(s.db)
 	return repo.List(includeInactive)
 }
 
-// ListLinksByCustomField returns the links managed by a specific custom
-// linking field for one item. Primary fields store their links with
-// (custom_field_id, source_type='item', source_id=item); mirror fields
-// store them under the *primary* field id with target_id=item. Pass
-// mirror=true to query the mirror-side view (the caller is expected to
-// have resolved fieldID to the primary's id before calling).
-//
-// Replaces the raw getLinksWhere call sites in handlers/item_links.go's
-// GetFieldLinks, so the SQL footgun stays inside the service.
+// ListLinksByCustomField returns links for a primary or mirror custom field.
 func (s *ItemLinkService) ListLinksByCustomField(fieldID, itemID int, mirror bool) ([]models.ItemLink, error) {
 	if mirror {
 		return s.getLinksWhere(
@@ -161,66 +150,32 @@ func (s *ItemLinkService) ListLinksByCustomField(fieldID, itemID int, mirror boo
 	)
 }
 
-// CreateLinkWithChecks runs the full create flow used by both the
-// cookie-auth handler and the v1 bearer handler. Returns the persisted
-// link with all joined display fields populated.
-//
-// Errors callers should expect (in order of when they may be returned):
-//   - ErrLinkSelfReference / ErrLinkInvalidEntityType — bad request
-//   - *EntityNotAccessibleError — 404 (missing or no permission)
-//   - ErrLinkCrossWorkspacePage — 404 (page invariant)
-//   - ErrLinkExists — 409
-//   - ErrInvalidLinkTypeForEntities — 400 (link-type / entity-type mismatch)
-//
-// Notifications and action events fire only when emitters are wired AND
-// the source resolves to an "item" (notifications are item-centric).
+// CreateLinkWithChecks validates, authorizes, and persists a link for both API
+// surfaces. Optional item-source notifications fire after persistence.
 func (s *ItemLinkService) CreateLinkWithChecks(userID int, params CreateItemLinkParams) (*models.ItemLink, error) {
-	if !isValidLinkEntityType(params.SourceType) || !isValidLinkEntityType(params.TargetType) {
-		return nil, ErrLinkInvalidEntityType
-	}
-	if params.SourceType == params.TargetType && params.SourceID == params.TargetID {
-		return nil, ErrLinkSelfReference
-	}
-
-	// Permission checks first so unauthorized callers never get a
-	// duplicate-detection 409 leak (would oracle the existence of a link).
-	if err := s.CheckEntityPermission(userID, params.SourceType, params.SourceID, models.PermissionItemEdit, AssetPermissionKeyEdit); err != nil {
+	if err := s.validateCreateLinkWithChecks(userID, params); err != nil {
 		return nil, err
-	}
-	if err := s.CheckEntityPermission(userID, params.TargetType, params.TargetID, models.PermissionItemView, AssetPermissionKeyView); err != nil {
-		return nil, err
-	}
-
-	// Item↔page links must stay in one workspace. Cross-workspace ⇒ 404.
-	if params.SourceType == "page" || params.TargetType == "page" {
-		ok, err := s.linkEndpointsShareWorkspace(params.SourceType, params.SourceID, params.TargetType, params.TargetID)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, ErrLinkCrossWorkspacePage
-		}
-	}
-
-	// Duplicate detection (either direction).
-	var existingID int
-	err := s.db.QueryRow(`
-		SELECT id FROM item_links
-		WHERE (source_type = ? AND source_id = ? AND target_type = ? AND target_id = ?)
-		   OR (source_type = ? AND source_id = ? AND target_type = ? AND target_id = ?)
-	`, params.SourceType, params.SourceID, params.TargetType, params.TargetID,
-		params.TargetType, params.TargetID, params.SourceType, params.SourceID).Scan(&existingID)
-	if err == nil {
-		return nil, ErrLinkExists
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("failed to probe duplicates: %w", err)
 	}
 
 	createdBy := userID
 	params.CreatedBy = &createdBy
 
-	id, err := s.CreateLink(params)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Check both directions for an existing link inside the write transaction.
+	exists, err := itemLinkExists(tx, params)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return nil, ErrLinkExists
+	}
+
+	id, err := createItemLink(tx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -228,39 +183,232 @@ func (s *ItemLinkService) CreateLinkWithChecks(userID int, params CreateItemLink
 		// CreateLink returns 0 on INSERT OR IGNORE; treat as duplicate.
 		return nil, ErrLinkExists
 	}
+	now := time.Now()
+	if err := s.touchLinkedItems(tx, now, params); err != nil {
+		return nil, err
+	}
+	metadata := itemevents.User(userID, "application")
+	metadata.OccurredAt = now
+	if _, err := itemevents.NewRecorder(s.db).LinkChanged(context.Background(), tx, itemevents.Linked, models.ItemLink{
+		ID: int(id), LinkTypeID: params.LinkTypeID,
+		SourceType: params.SourceType, SourceID: params.SourceID,
+		TargetType: params.TargetType, TargetID: params.TargetID,
+	}, metadata); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit item link: %w", err)
+	}
 
+	return s.finishCreatedLink(userID, params, id)
+}
+
+// ReplaceSingleValueFieldLinkWithChecks atomically replaces a non-multi field link.
+func (s *ItemLinkService) ReplaceSingleValueFieldLinkWithChecks(userID int, params CreateItemLinkParams) (*models.ItemLink, error) {
+	if params.CustomFieldID == nil {
+		return nil, fmt.Errorf("custom_field_id is required for single-value replacement")
+	}
+	if err := s.validateCreateLinkWithChecks(userID, params); err != nil {
+		return nil, err
+	}
+
+	createdBy := userID
+	params.CreatedBy = &createdBy
+	type replacementResult struct {
+		link     *models.ItemLink
+		affected []CreateItemLinkParams
+	}
+	result, err := database.WithTxResult(s.db, func(tx database.Tx) (*replacementResult, error) {
+		if err := lockLinkSource(tx, s.db.GetDriverName(), params.SourceType, params.SourceID); err != nil {
+			return nil, err
+		}
+		affected := []CreateItemLinkParams{params}
+		var previousLinks []models.ItemLink
+		rows, err := tx.Query(`
+			SELECT id, link_type_id, source_type, source_id, target_type, target_id
+			FROM item_links
+			WHERE custom_field_id = ? AND source_type = ? AND source_id = ?
+		`, *params.CustomFieldID, params.SourceType, params.SourceID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load previous field links: %w", err)
+		}
+		for rows.Next() {
+			var previous models.ItemLink
+			if err := rows.Scan(&previous.ID, &previous.LinkTypeID, &previous.SourceType, &previous.SourceID, &previous.TargetType, &previous.TargetID); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("failed to scan previous field link: %w", err)
+			}
+			affected = append(affected, CreateItemLinkParams{
+				LinkTypeID: previous.LinkTypeID, SourceType: previous.SourceType, SourceID: previous.SourceID,
+				TargetType: previous.TargetType, TargetID: previous.TargetID,
+			})
+			previousLinks = append(previousLinks, previous)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close previous field links: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("failed to iterate previous field links: %w", err)
+		}
+		if _, err := tx.ExecWrite(`
+			DELETE FROM item_links
+			WHERE custom_field_id = ? AND source_type = ? AND source_id = ?
+		`, *params.CustomFieldID, params.SourceType, params.SourceID); err != nil {
+			return nil, fmt.Errorf("failed to clear previous field link: %w", err)
+		}
+		metadata := itemevents.User(userID, "application")
+		recorder := itemevents.NewRecorder(s.db)
+		for _, previous := range previousLinks {
+			if _, err := recorder.LinkChanged(context.Background(), tx, itemevents.Unlinked, previous, metadata); err != nil {
+				return nil, err
+			}
+		}
+
+		exists, err := itemLinkExists(tx, params)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			return nil, ErrLinkExists
+		}
+
+		id, err := createItemLink(tx, params)
+		if err != nil {
+			return nil, err
+		}
+		if id == 0 {
+			return nil, ErrLinkExists
+		}
+		created, err := getLinkByIDFrom(tx, int(id))
+		if err != nil {
+			return nil, fmt.Errorf("failed to load replacement field link: %w", err)
+		}
+		if created == nil {
+			return nil, fmt.Errorf("failed to load replacement field link: %w", ErrLinkNotFound)
+		}
+		if err := s.touchLinkedItems(tx, time.Now(), affected...); err != nil {
+			return nil, err
+		}
+		if _, err := recorder.LinkChanged(context.Background(), tx, itemevents.Linked, *created, metadata); err != nil {
+			return nil, err
+		}
+		return &replacementResult{link: created, affected: affected}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if params.SourceType == "item" {
+		s.emitLinkedEvents(userID, params, result.link)
+	}
+	publishItemLinkChanges(result.affected...)
+	return result.link, nil
+}
+
+func lockLinkSource(tx database.Tx, driver, entityType string, entityID int) error {
+	table := ""
+	switch entityType {
+	case "item":
+		table = "items"
+	case "test_case":
+		table = "test_cases"
+	case "asset":
+		table = "assets"
+	case "page":
+		table = "pages"
+	default:
+		return ErrLinkInvalidEntityType
+	}
+	//nolint:gosec // table is selected from the hardcoded allowlist above.
+	query := "SELECT id FROM " + table + " WHERE id = ?"
+	if driver == "postgres" {
+		query += " FOR UPDATE"
+	}
+	var lockedID int
+	if err := tx.QueryRow(query, entityID).Scan(&lockedID); err != nil {
+		return fmt.Errorf("failed to lock field-link source: %w", err)
+	}
+	return nil
+}
+
+func (s *ItemLinkService) validateCreateLinkWithChecks(userID int, params CreateItemLinkParams) error {
+	if !isValidLinkEntityType(params.SourceType) || !isValidLinkEntityType(params.TargetType) {
+		return ErrLinkInvalidEntityType
+	}
+	if params.SourceType == params.TargetType && params.SourceID == params.TargetID {
+		return ErrLinkSelfReference
+	}
+
+	// Check permissions first so duplicate detection cannot reveal a link.
+	if err := s.CheckEntityPermission(userID, params.SourceType, params.SourceID, models.PermissionItemEdit, AssetPermissionKeyEdit); err != nil {
+		return err
+	}
+	if err := s.CheckEntityPermission(userID, params.TargetType, params.TargetID, models.PermissionItemView, AssetPermissionKeyView); err != nil {
+		return err
+	}
+
+	// Item↔page links must remain in one workspace; deny cross-workspace links opaquely.
+	if params.SourceType == "page" || params.TargetType == "page" {
+		ok, err := s.linkEndpointsShareWorkspace(params.SourceType, params.SourceID, params.TargetType, params.TargetID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrLinkCrossWorkspacePage
+		}
+	}
+	return nil
+}
+
+func itemLinkExists(db itemLinkQuerier, params CreateItemLinkParams) (bool, error) {
+	var existingID int
+	err := db.QueryRow(`
+		SELECT id FROM item_links
+		WHERE (source_type = ? AND source_id = ? AND target_type = ? AND target_id = ?)
+		   OR (source_type = ? AND source_id = ? AND target_type = ? AND target_id = ?)
+	`, params.SourceType, params.SourceID, params.TargetType, params.TargetID,
+		params.TargetType, params.TargetID, params.SourceType, params.SourceID).Scan(&existingID)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("failed to probe duplicates: %w", err)
+	}
+	return false, nil
+}
+
+func (s *ItemLinkService) finishCreatedLink(userID int, params CreateItemLinkParams, id int64) (*models.ItemLink, error) {
 	link, err := s.getLinkByID(int(id))
 	if err != nil {
 		return nil, fmt.Errorf("failed to load created link: %w", err)
 	}
+	if link == nil {
+		return nil, fmt.Errorf("failed to load created link: %w", ErrLinkNotFound)
+	}
+	return s.finishHydratedCreatedLink(userID, params, link), nil
+}
 
-	// Notification + action events — item-source only (matches legacy
-	// handler behavior). Failures here do not roll back the link.
+func (s *ItemLinkService) finishHydratedCreatedLink(userID int, params CreateItemLinkParams, link *models.ItemLink) *models.ItemLink {
+	// Emit optional item-source events without rolling back the link on failure.
 	if params.SourceType == "item" {
 		s.emitLinkedEvents(userID, params, link)
 	}
-	// Live-update publish (WI-483): a link is bidirectional in the UI, so refresh
-	// BOTH endpoints that are items, not only the source.
-	publishItemLinkChange(params.SourceType, params.SourceID, params.TargetType, params.TargetID)
-	return link, nil
+	// Refresh both item endpoints because the UI renders links bidirectionally.
+	publishItemLinkChanges(params)
+	return link
 }
 
-// publishItemLinkChange announces a link add/remove to every endpoint that is a
+// publishItemLinkChanges announces link changes to every affected endpoint that is a
 // work item (WI-483). The legacy notification path fires only for an item
 // source; an item that is merely the target (or whose link source is a page)
 // would otherwise never refresh its linked-items section.
-func publishItemLinkChange(sourceType string, sourceID int, targetType string, targetID int) {
-	if sourceType == "item" {
-		PublishItemChange(sourceID, ItemChangeLink)
-	}
-	if targetType == "item" {
-		PublishItemChange(targetID, ItemChangeLink)
+func publishItemLinkChanges(links ...CreateItemLinkParams) {
+	for _, itemID := range linkedItemIDs(links) {
+		PublishItemChange(itemID)
 	}
 }
 
-// DeleteLinkWithChecks looks up the link, requires edit permission on its
-// source, then deletes. Emits an unlinked notification when the source is
-// an item.
+// DeleteLinkWithChecks authorizes and deletes a link, then emits an item event.
 func (s *ItemLinkService) DeleteLinkWithChecks(userID, linkID int) error {
 	link, err := s.getLinkByID(linkID)
 	if err != nil {
@@ -273,30 +421,85 @@ func (s *ItemLinkService) DeleteLinkWithChecks(userID, linkID int) error {
 	if err := s.CheckEntityPermission(userID, link.SourceType, link.SourceID, models.PermissionItemEdit, AssetPermissionKeyEdit); err != nil {
 		return err
 	}
+	// Require visibility of the other endpoint to prevent hidden-link deletion.
+	if err := s.CheckEntityPermission(userID, link.TargetType, link.TargetID, models.PermissionItemView, AssetPermissionKeyView); err != nil {
+		return err
+	}
 
-	result, err := s.db.ExecWrite("DELETE FROM item_links WHERE id = ?", linkID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin item link deletion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.Exec("DELETE FROM item_links WHERE id = ?", linkID)
 	if err != nil {
 		return fmt.Errorf("failed to delete link: %w", err)
 	}
 	if rows, _ := result.RowsAffected(); rows == 0 {
 		return ErrLinkNotFound
 	}
+	now := time.Now()
+	if err := s.touchLinkedItems(tx, now, CreateItemLinkParams{
+		SourceType: link.SourceType,
+		SourceID:   link.SourceID,
+		TargetType: link.TargetType,
+		TargetID:   link.TargetID,
+	}); err != nil {
+		return err
+	}
+	metadata := itemevents.User(userID, "application")
+	metadata.OccurredAt = now
+	if _, err := itemevents.NewRecorder(s.db).LinkChanged(context.Background(), tx, itemevents.Unlinked, *link, metadata); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit item link deletion: %w", err)
+	}
 
 	if link.SourceType == "item" {
 		s.emitUnlinkedEvents(userID, link)
 	}
-	// Live-update publish (WI-483): refresh both item endpoints of the removed link.
-	publishItemLinkChange(link.SourceType, link.SourceID, link.TargetType, link.TargetID)
+	// Refresh both item endpoints after removal.
+	publishItemLinkChanges(CreateItemLinkParams{
+		SourceType: link.SourceType,
+		SourceID:   link.SourceID,
+		TargetType: link.TargetType,
+		TargetID:   link.TargetID,
+	})
 	return nil
 }
 
-// ListLinksForEntityWithChecks returns the (outgoing, incoming) link
-// slices visible to userID for the given entity. Per-page ACLs are
-// applied; entities the user cannot see have their entire link rows
-// dropped from the result (matches legacy handler behavior).
-//
-// entityType must be one of "item", "test_case", or "page". For "page",
-// callers should additionally gate the route via `pages:read`.
+func (s *ItemLinkService) touchLinkedItems(tx database.Tx, now time.Time, links ...CreateItemLinkParams) error {
+	itemRepo := repository.NewItemRepository(s.db)
+	for _, itemID := range linkedItemIDs(links) {
+		if err := itemRepo.TouchChanged(tx, itemID, now); err != nil {
+			return fmt.Errorf("touch linked item %d: %w", itemID, err)
+		}
+	}
+	return nil
+}
+
+func linkedItemIDs(links []CreateItemLinkParams) []int {
+	itemIDSet := make(map[int]struct{}, len(links)*2)
+	for _, link := range links {
+		if link.SourceType == "item" {
+			itemIDSet[link.SourceID] = struct{}{}
+		}
+		if link.TargetType == "item" {
+			itemIDSet[link.TargetID] = struct{}{}
+		}
+	}
+	itemIDs := make([]int, 0, len(itemIDSet))
+	for itemID := range itemIDSet {
+		itemIDs = append(itemIDs, itemID)
+	}
+	slices.Sort(itemIDs)
+	return itemIDs
+}
+
+// ListLinksForEntityWithChecks returns visible outgoing and incoming links;
+// inaccessible endpoints are dropped. entityType is item, test_case, or page.
 func (s *ItemLinkService) ListLinksForEntityWithChecks(userID int, entityType string, entityID int) (outgoing, incoming []models.ItemLink, err error) {
 	if entityType != "item" && entityType != "test_case" && entityType != "page" {
 		return nil, nil, ErrLinkInvalidEntityType
@@ -314,41 +517,29 @@ func (s *ItemLinkService) ListLinksForEntityWithChecks(userID int, entityType st
 		return nil, nil, err
 	}
 
-	// Compute the key-set and id-set of viewable workspaces in a single
-	// workspace scan + permission pass. AccessibleWorkspaceKeys and
-	// AccessibleWorkspaceIDs each do this independently; calling both per
-	// request doubled the scan and the HasWorkspacePermission loop over every
-	// active workspace.
-	accessibleKeys, accessibleWsIDs := s.accessibleWorkspaces(userID)
-	accessibleSets := s.AccessibleAssetSetIDs(userID)
-
-	outgoing = s.FilterLinksByAccess(outgoing, accessibleKeys, accessibleWsIDs, accessibleSets)
-	incoming = s.FilterLinksByAccess(incoming, accessibleKeys, accessibleWsIDs, accessibleSets)
-	outgoing = s.FilterPageLinksByACL(userID, outgoing)
-	incoming = s.FilterPageLinksByACL(userID, incoming)
+	outgoing = s.FilterLinksForUser(userID, outgoing)
+	incoming = s.FilterLinksForUser(userID, incoming)
 	return outgoing, incoming, nil
 }
 
-// EntityLinks is the outgoing/incoming link pair for a single entity, as
-// returned by the batch links endpoint.
 type EntityLinks struct {
 	Outgoing []models.ItemLink `json:"outgoing"`
 	Incoming []models.ItemLink `json:"incoming"`
 }
 
-// ListLinksForItemsWithChecks is the batch counterpart of
-// ListLinksForEntityWithChecks for entityType "item": it returns links for
-// many items keyed by item id, in a fixed handful of queries rather than the
-// per-item pair the single-entity path runs. Board/roadmap views use it so a
-// board render is one request (and one pooled DB connection) instead of one
-// per card.
-//
-// Every requested id appears in the result (empty slices when the item has no
-// visible links) so callers can cache misses without re-fetching. Links whose
-// endpoints are in workspaces / asset sets / pages the user cannot see are
-// dropped by the same access + ACL filters the single-item path applies — so a
-// requested item the user cannot view yields empty slices and nothing leaks.
+// ListLinksForItemsWithChecks batches visible links for many items. Every
+// requested ID is present, with empty slices for inaccessible or unlinked items.
 func (s *ItemLinkService) ListLinksForItemsWithChecks(userID int, itemIDs []int) (map[int]EntityLinks, error) {
+	return s.listLinksForItemsWithChecks(userID, itemIDs, false)
+}
+
+// ListLinksForItemsWithCustomFieldsAndChecks also includes custom-field links.
+func (s *ItemLinkService) ListLinksForItemsWithCustomFieldsAndChecks(userID int, itemIDs []int) (map[int]EntityLinks, error) {
+	return s.listLinksForItemsWithChecks(userID, itemIDs, true)
+}
+
+func (s *ItemLinkService) listLinksForItemsWithChecks(userID int, itemIDs []int, includeCustomFields bool) (map[int]EntityLinks, error) {
+	startedAt := time.Now()
 	result := map[int]EntityLinks{}
 	ids := dedupInts(itemIDs)
 	if len(ids) == 0 {
@@ -361,25 +552,46 @@ func (s *ItemLinkService) ListLinksForItemsWithChecks(userID int, itemIDs []int)
 	ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
 	idArgs := toIfaceSlice(ids)
 
+	outgoingFilter := "source_type = ? AND source_id IN (" + ph + ")"
+	if !includeCustomFields {
+		outgoingFilter += " AND il.custom_field_id IS NULL"
+	}
 	outgoing, err := s.getLinksWhere(
-		"source_type = ? AND source_id IN ("+ph+") AND il.custom_field_id IS NULL",
-		append([]interface{}{"item"}, idArgs...)...)
+		outgoingFilter,
+		append([]any{"item"}, idArgs...)...)
 	if err != nil {
 		return nil, err
 	}
+	incomingFilter := "target_type = ? AND target_id IN (" + ph + ")"
+	if !includeCustomFields {
+		incomingFilter += " AND il.custom_field_id IS NULL"
+	}
 	incoming, err := s.getLinksWhere(
-		"target_type = ? AND target_id IN ("+ph+")",
-		append([]interface{}{"item"}, idArgs...)...)
+		incomingFilter,
+		append([]any{"item"}, idArgs...)...)
 	if err != nil {
 		return nil, err
 	}
 
-	accessibleKeys, accessibleWsIDs := s.accessibleWorkspaces(userID)
-	accessibleSets := s.AccessibleAssetSetIDs(userID)
-	outgoing = s.FilterLinksByAccess(outgoing, accessibleKeys, accessibleWsIDs, accessibleSets)
-	incoming = s.FilterLinksByAccess(incoming, accessibleKeys, accessibleWsIDs, accessibleSets)
+	allLinks := make([]models.ItemLink, 0, len(outgoing)+len(incoming))
+	allLinks = append(allLinks, outgoing...)
+	allLinks = append(allLinks, incoming...)
+	access := s.authorizeReferencedLinkScopes(userID, allLinks)
+	outgoing = s.filterLinksByAccessWithScopes(outgoing, access.workspaceKeys, access.workspaceIDs, access.testWorkspaceIDs, access.assetSetIDs, access.scopes)
+	incoming = s.filterLinksByAccessWithScopes(incoming, access.workspaceKeys, access.workspaceIDs, access.testWorkspaceIDs, access.assetSetIDs, access.scopes)
 	outgoing = s.FilterPageLinksByACL(userID, outgoing)
 	incoming = s.FilterPageLinksByACL(userID, incoming)
+	slog.Debug("batch link authorization",
+		"requested_items", len(ids),
+		"link_rows", len(allLinks),
+		"referenced_workspace_scopes", access.workspaceScopeCount,
+		"referenced_test_workspace_scopes", access.testWorkspaceScopeCount,
+		"referenced_asset_set_scopes", access.assetSetScopeCount,
+		"workspace_permission_checks", access.workspacePermissionChecks,
+		"test_permission_checks", access.testPermissionChecks,
+		"asset_permission_checks", access.assetPermissionChecks,
+		"scope_sql_queries", access.scopeSQLQueries,
+		"latency_ms", time.Since(startedAt).Milliseconds())
 
 	for _, l := range outgoing {
 		if g, ok := result[l.SourceID]; ok {
@@ -396,6 +608,120 @@ func (s *ItemLinkService) ListLinksForItemsWithChecks(userID int, itemIDs []int)
 	return result, nil
 }
 
+type referencedLinkAccess struct {
+	workspaceKeys             map[string]bool
+	workspaceIDs              map[int]bool
+	testWorkspaceIDs          map[int]bool
+	assetSetIDs               map[int]bool
+	scopes                    map[scopeKey]endpointScope
+	workspaceScopeCount       int
+	testWorkspaceScopeCount   int
+	assetSetScopeCount        int
+	workspacePermissionChecks int
+	testPermissionChecks      int
+	assetPermissionChecks     int
+	scopeSQLQueries           int
+}
+
+// authorizeReferencedLinkScopes checks each referenced scope once and never
+// enumerates unrelated tenants or asset sets.
+func (s *ItemLinkService) authorizeReferencedLinkScopes(userID int, links []models.ItemLink) referencedLinkAccess {
+	access := referencedLinkAccess{
+		workspaceKeys:    map[string]bool{},
+		workspaceIDs:     map[int]bool{},
+		testWorkspaceIDs: map[int]bool{},
+		assetSetIDs:      map[int]bool{},
+		scopes:           s.resolveEndpointScopes(links),
+	}
+
+	workspaceKeysByID := map[int]map[string]struct{}{}
+	workspaceScopes := map[int]struct{}{}
+	testWorkspaceScopes := map[int]struct{}{}
+	assetSetScopes := map[int]struct{}{}
+	note := func(entityType string, entityID int, workspaceID *int, workspaceKey string) {
+		switch entityType {
+		case "item", "page":
+			if workspaceID != nil {
+				workspaceScopes[*workspaceID] = struct{}{}
+				if workspaceKey != "" {
+					if workspaceKeysByID[*workspaceID] == nil {
+						workspaceKeysByID[*workspaceID] = map[string]struct{}{}
+					}
+					workspaceKeysByID[*workspaceID][workspaceKey] = struct{}{}
+				}
+			}
+		case "test_case":
+			if scope, ok := access.scopes[scopeKey{entityType, entityID}]; ok {
+				testWorkspaceScopes[scope.wsID] = struct{}{}
+			}
+		case "asset":
+			if scope, ok := access.scopes[scopeKey{entityType, entityID}]; ok {
+				assetSetScopes[scope.setID] = struct{}{}
+			}
+		}
+	}
+	for _, link := range links {
+		note(link.SourceType, link.SourceID, link.SourceWorkspaceID, link.SourceWorkspaceKey)
+		note(link.TargetType, link.TargetID, link.TargetWorkspaceID, link.TargetWorkspaceKey)
+	}
+
+	access.workspaceScopeCount = len(workspaceScopes)
+	access.testWorkspaceScopeCount = len(testWorkspaceScopes)
+	access.assetSetScopeCount = len(assetSetScopes)
+	s.applyReferencedScopePermissions(userID, workspaceScopes, testWorkspaceScopes, assetSetScopes, workspaceKeysByID, &access)
+	access.scopeSQLQueries = referencedScopeQueryCount(links)
+	return access
+}
+
+func (s *ItemLinkService) applyReferencedScopePermissions(userID int, workspaceScopes, testWorkspaceScopes, assetSetScopes map[int]struct{}, workspaceKeysByID map[int]map[string]struct{}, access *referencedLinkAccess) {
+	for workspaceID := range workspaceScopes {
+		access.workspacePermissionChecks++
+		if s.perm == nil {
+			continue
+		}
+		allowed, err := s.perm.HasWorkspacePermission(userID, workspaceID, models.PermissionItemView)
+		if err != nil || !allowed {
+			continue
+		}
+		access.workspaceIDs[workspaceID] = true
+		for key := range workspaceKeysByID[workspaceID] {
+			access.workspaceKeys[key] = true
+		}
+	}
+	for workspaceID := range testWorkspaceScopes {
+		access.testPermissionChecks++
+		if s.perm == nil {
+			continue
+		}
+		allowed, err := s.perm.HasWorkspacePermission(userID, workspaceID, models.PermissionTestView)
+		if err == nil && allowed {
+			access.testWorkspaceIDs[workspaceID] = true
+		}
+	}
+	for setID := range assetSetScopes {
+		access.assetPermissionChecks++
+		if s.assetPerm == nil {
+			continue
+		}
+		allowed, err := s.assetPerm.HasAssetSetPermission(userID, setID, AssetPermissionKeyView)
+		if err == nil && allowed {
+			access.assetSetIDs[setID] = true
+		}
+	}
+}
+
+func referencedScopeQueryCount(links []models.ItemLink) int {
+	types := map[string]bool{}
+	for _, link := range links {
+		for _, entityType := range []string{link.SourceType, link.TargetType} {
+			if entityType == "test_case" || entityType == "asset" {
+				types[entityType] = true
+			}
+		}
+	}
+	return len(types)
+}
+
 // dedupInts returns in with duplicates removed, preserving first-seen order.
 func dedupInts(in []int) []int {
 	seen := make(map[int]bool, len(in))
@@ -409,12 +735,8 @@ func dedupInts(in []int) []int {
 	return out
 }
 
-// ============================================
-// Internal helpers
-// ============================================
+// Internal helpers.
 
-// isValidLinkEntityType reports whether s is one of the four entity
-// types the link table supports.
 func isValidLinkEntityType(s string) bool {
 	switch s {
 	case "item", "test_case", "asset", "page":
@@ -423,10 +745,8 @@ func isValidLinkEntityType(s string) bool {
 	return false
 }
 
-// pageOpForWorkspacePerm maps the workspace-permission strings the link
-// orchestration uses ("item.view" / "item.edit") onto the page-op
-// vocabulary expected by PagePermissionChecker.Can. Anything not
-// edit-or-higher resolves to view (safe default).
+// pageOpForWorkspacePerm maps workspace permissions to page operations;
+// unknown values default to view.
 func pageOpForWorkspacePerm(workspacePerm string) string {
 	if workspacePerm == models.PermissionItemEdit || workspacePerm == models.PermissionItemDelete {
 		return PageOpEdit
@@ -434,10 +754,8 @@ func pageOpForWorkspacePerm(workspacePerm string) string {
 	return PageOpView
 }
 
-// ResolveEntityScope returns the scoping identifier for a link endpoint:
-// items / test_cases / pages → workspace_id, assets → set_id. The
-// found=false branch is used so callers can issue a clean 404 without
-// leaking which lookup failed.
+// ResolveEntityScope returns workspace_id or set_id without exposing lookup
+// failures through the found=false result.
 func (s *ItemLinkService) ResolveEntityScope(entityType string, entityID int) (wsID, setID int, found bool, err error) {
 	switch entityType {
 	case "item":
@@ -484,10 +802,8 @@ func (s *ItemLinkService) ResolveEntityScope(entityType string, entityID int) (w
 	}
 }
 
-// CheckEntityPermission returns nil when userID may operate on the
-// endpoint with the given workspace permission, or
-// *EntityNotAccessibleError otherwise (covers "missing", "no perm
-// checker wired", and "permission denied" — all 404 per policy).
+// CheckEntityPermission returns an opaque not-accessible error for missing or
+// unauthorized endpoints.
 func (s *ItemLinkService) CheckEntityPermission(userID int, entityType string, entityID int, workspacePerm, assetPermKey string) error {
 	wsID, setID, found, err := s.ResolveEntityScope(entityType, entityID)
 	if err != nil {
@@ -498,11 +814,24 @@ func (s *ItemLinkService) CheckEntityPermission(userID int, entityType string, e
 	}
 
 	switch entityType {
-	case "item", "test_case":
+	case "item":
 		if s.perm == nil {
 			return &EntityNotAccessibleError{EntityType: entityType, EntityID: entityID}
 		}
 		hasPerm, err := s.perm.HasWorkspacePermission(userID, wsID, workspacePerm)
+		if err != nil || !hasPerm {
+			return &EntityNotAccessibleError{EntityType: entityType, EntityID: entityID}
+		}
+		return nil
+	case "test_case":
+		if s.perm == nil {
+			return &EntityNotAccessibleError{EntityType: entityType, EntityID: entityID}
+		}
+		permission := models.PermissionTestView
+		if workspacePerm == models.PermissionItemEdit || workspacePerm == models.PermissionItemDelete {
+			permission = models.PermissionTestManage
+		}
+		hasPerm, err := s.perm.HasWorkspacePermission(userID, wsID, permission)
 		if err != nil || !hasPerm {
 			return &EntityNotAccessibleError{EntityType: entityType, EntityID: entityID}
 		}
@@ -530,8 +859,6 @@ func (s *ItemLinkService) CheckEntityPermission(userID int, entityType string, e
 	return ErrLinkInvalidEntityType
 }
 
-// linkEndpointsShareWorkspace verifies both ends of a link are scoped to
-// the same workspace. Only relevant for item↔page links.
 func (s *ItemLinkService) linkEndpointsShareWorkspace(srcType string, srcID int, tgtType string, tgtID int) (bool, error) {
 	srcWs, _, srcFound, err := s.ResolveEntityScope(srcType, srcID)
 	if err != nil {
@@ -550,84 +877,36 @@ func (s *ItemLinkService) linkEndpointsShareWorkspace(srcType string, srcID int,
 	return srcWs == tgtWs, nil
 }
 
-// AccessibleWorkspaceIDs returns workspace IDs userID can view.
 func (s *ItemLinkService) AccessibleWorkspaceIDs(userID int) map[int]bool {
 	out := map[int]bool{}
 	if s.perm == nil {
 		return out
 	}
-	ids, err := repository.NewWorkspaceRepository(s.db).ListActiveIDs()
+	ids, err := s.perm.AccessibleWorkspaceIDs(userID)
 	if err != nil {
 		return out
 	}
 	for _, id := range ids {
-		hasView, err := s.perm.HasWorkspacePermission(userID, id, models.PermissionItemView)
-		if err != nil {
-			slog.Error("link orchestration: error checking workspace view permission", slog.Int("workspace_id", id), slog.Any("error", err))
-			continue
-		}
-		if hasView {
-			out[id] = true
-		}
+		out[id] = true
 	}
 	return out
 }
 
-// AccessibleWorkspaceKeys returns the set of workspace keys userID can
-// view (used as the fast path for item-endpoint visibility filtering).
 func (s *ItemLinkService) AccessibleWorkspaceKeys(userID int) map[string]bool {
 	out := map[string]bool{}
 	if s.perm == nil {
 		return out
 	}
-	pairs, err := repository.NewWorkspaceRepository(s.db).ListActiveIDKeys()
+	pairs, err := s.perm.AccessibleWorkspaceIDKeys(userID)
 	if err != nil {
 		return out
 	}
 	for _, p := range pairs {
-		hasView, err := s.perm.HasWorkspacePermission(userID, p.ID, models.PermissionItemView)
-		if err != nil {
-			continue
-		}
-		if hasView {
-			out[p.Key] = true
-		}
+		out[p.Key] = true
 	}
 	return out
 }
 
-// accessibleWorkspaces returns, from a single workspace scan and a single
-// HasWorkspacePermission pass, both the key-set and id-set of workspaces
-// userID can view. The links endpoint needs both forms (item endpoints match
-// by pre-joined key, test_case/page endpoints by id), so computing them
-// together avoids the duplicate work of calling AccessibleWorkspaceKeys and
-// AccessibleWorkspaceIDs back to back.
-func (s *ItemLinkService) accessibleWorkspaces(userID int) (keys map[string]bool, ids map[int]bool) {
-	keys = map[string]bool{}
-	ids = map[int]bool{}
-	if s.perm == nil {
-		return keys, ids
-	}
-	pairs, err := repository.NewWorkspaceRepository(s.db).ListActiveIDKeys()
-	if err != nil {
-		return keys, ids
-	}
-	for _, p := range pairs {
-		hasView, err := s.perm.HasWorkspacePermission(userID, p.ID, models.PermissionItemView)
-		if err != nil {
-			continue
-		}
-		if hasView {
-			keys[p.Key] = true
-			ids[p.ID] = true
-		}
-	}
-	return keys, ids
-}
-
-// AccessibleAssetSetIDs returns the set of asset-set IDs userID can view.
-// Iterates every set and asks the asset checker (matches the pattern
-// AssetHandler.canAccessEntity uses). Empty when no asset checker.
 func (s *ItemLinkService) AccessibleAssetSetIDs(userID int) map[int]bool {
 	out := map[int]bool{}
 	if s.assetPerm == nil {
@@ -654,13 +933,10 @@ func (s *ItemLinkService) AccessibleAssetSetIDs(userID int) map[int]bool {
 	return out
 }
 
-// EndpointVisible reports whether a single link endpoint is accessible
-// to a user, given pre-computed allow-sets. Items use the pre-joined
-// workspace key for the cheap path.
 func (s *ItemLinkService) EndpointVisible(entityType string, entityID int, workspaceKey string, accessibleKeys map[string]bool, accessibleWs, accessibleSets map[int]bool) bool {
 	switch entityType {
 	case "item":
-		return workspaceKey == "" || accessibleKeys[workspaceKey]
+		return workspaceKey != "" && accessibleKeys[workspaceKey]
 	case "test_case", "page":
 		wsID, _, found, err := s.ResolveEntityScope(entityType, entityID)
 		if err != nil || !found {
@@ -677,22 +953,28 @@ func (s *ItemLinkService) EndpointVisible(entityType string, entityID int, works
 	return false
 }
 
-// FilterLinksByAccess drops links whose endpoints are in workspaces /
-// asset sets the user cannot view. Counterpart of EndpointVisible.
-//
-// The scope (workspace_id / set_id) of every non-item endpoint is resolved up
-// front in one query per entity type — rather than a QueryRow per endpoint as
-// the per-link EndpointVisible path would — so a heavily-linked item no longer
-// fans out into dozens of serial round-trips (each holding a pooled connection)
-// per request.
+// FilterLinksByAccess resolves non-item scopes in batches, then drops links
+// whose endpoints are outside the user's allow-sets.
 func (s *ItemLinkService) FilterLinksByAccess(links []models.ItemLink, accessibleKeys map[string]bool, accessibleWs, accessibleSets map[int]bool) []models.ItemLink {
 	scopes := s.resolveEndpointScopes(links)
+	return s.filterLinksByAccessWithScopes(links, accessibleKeys, accessibleWs, accessibleWs, accessibleSets, scopes)
+}
+
+// FilterLinksForUser checks each endpoint in its own permission domain and
+// drops the whole link row when either endpoint is inaccessible.
+func (s *ItemLinkService) FilterLinksForUser(userID int, links []models.ItemLink) []models.ItemLink {
+	access := s.authorizeReferencedLinkScopes(userID, links)
+	visible := s.filterLinksByAccessWithScopes(links, access.workspaceKeys, access.workspaceIDs, access.testWorkspaceIDs, access.assetSetIDs, access.scopes)
+	return s.FilterPageLinksByACL(userID, visible)
+}
+
+func (s *ItemLinkService) filterLinksByAccessWithScopes(links []models.ItemLink, accessibleKeys map[string]bool, accessibleWs, accessibleTestWs, accessibleSets map[int]bool, scopes map[scopeKey]endpointScope) []models.ItemLink {
 	out := make([]models.ItemLink, 0, len(links))
 	for _, l := range links {
-		if !s.endpointVisibleScoped(l.SourceType, l.SourceID, l.SourceWorkspaceKey, accessibleKeys, accessibleWs, accessibleSets, scopes) {
+		if !s.endpointVisibleScoped(l.SourceType, l.SourceID, l.SourceWorkspaceKey, accessibleKeys, accessibleWs, accessibleTestWs, accessibleSets, scopes) {
 			continue
 		}
-		if !s.endpointVisibleScoped(l.TargetType, l.TargetID, l.TargetWorkspaceKey, accessibleKeys, accessibleWs, accessibleSets, scopes) {
+		if !s.endpointVisibleScoped(l.TargetType, l.TargetID, l.TargetWorkspaceKey, accessibleKeys, accessibleWs, accessibleTestWs, accessibleSets, scopes) {
 			continue
 		}
 		out = append(out, l)
@@ -700,52 +982,48 @@ func (s *ItemLinkService) FilterLinksByAccess(links []models.ItemLink, accessibl
 	return out
 }
 
-// scopeKey identifies a link endpoint for the pre-resolved scope map.
 type scopeKey struct {
 	typ string
 	id  int
 }
 
-// endpointScope is the batch-resolved scoping id for an endpoint: workspace_id
-// for test_cases/pages, set_id for assets. Absence from the map means the row
-// no longer exists, which callers treat as not-visible (fail closed).
+// endpointScope stores a batch-resolved workspace or asset-set ID.
 type endpointScope struct {
 	wsID  int
 	setID int
 }
 
-// resolveEndpointScopes batch-resolves the workspace/set scope for every
-// non-item endpoint referenced by links, keyed by (entityType, entityID).
-// Item endpoints are omitted — they are filtered by their pre-joined workspace
-// key and need no lookup.
+// resolveEndpointScopes batch-resolves scopes for non-item endpoints.
 func (s *ItemLinkService) resolveEndpointScopes(links []models.ItemLink) map[scopeKey]endpointScope {
 	testCaseIDs := map[int]bool{}
 	pageIDs := map[int]bool{}
 	assetIDs := map[int]bool{}
-	note := func(typ string, id int) {
+	out := map[scopeKey]endpointScope{}
+	note := func(typ string, id int, workspaceID *int) {
 		switch typ {
 		case "test_case":
 			testCaseIDs[id] = true
 		case "page":
-			pageIDs[id] = true
+			if workspaceID != nil {
+				out[scopeKey{typ, id}] = endpointScope{wsID: *workspaceID}
+			} else {
+				pageIDs[id] = true
+			}
 		case "asset":
 			assetIDs[id] = true
 		}
 	}
 	for _, l := range links {
-		note(l.SourceType, l.SourceID)
-		note(l.TargetType, l.TargetID)
+		note(l.SourceType, l.SourceID, l.SourceWorkspaceID)
+		note(l.TargetType, l.TargetID, l.TargetWorkspaceID)
 	}
 
-	out := map[scopeKey]endpointScope{}
 	s.fillWorkspaceScopes(out, "test_case", "test_cases", testCaseIDs)
 	s.fillWorkspaceScopes(out, "page", "pages", pageIDs)
 	s.fillAssetSetScopes(out, assetIDs)
 	return out
 }
 
-// fillWorkspaceScopes loads workspace_id for the given ids of a workspace-scoped
-// table (test_cases / pages) in one query and records them in out.
 func (s *ItemLinkService) fillWorkspaceScopes(out map[scopeKey]endpointScope, entityType, table string, idset map[int]bool) {
 	ids := keysOf(idset)
 	if len(ids) == 0 {
@@ -768,7 +1046,6 @@ func (s *ItemLinkService) fillWorkspaceScopes(out map[scopeKey]endpointScope, en
 	_ = rows.Err()
 }
 
-// fillAssetSetScopes loads set_id for the given asset ids in one query.
 func (s *ItemLinkService) fillAssetSetScopes(out map[scopeKey]endpointScope, idset map[int]bool) {
 	ids := keysOf(idset)
 	if len(ids) == 0 {
@@ -790,13 +1067,17 @@ func (s *ItemLinkService) fillAssetSetScopes(out map[scopeKey]endpointScope, ids
 	_ = rows.Err()
 }
 
-// endpointVisibleScoped is the batch-resolved counterpart of EndpointVisible:
-// it consults the pre-resolved scope map instead of issuing a per-endpoint query.
-func (s *ItemLinkService) endpointVisibleScoped(entityType string, entityID int, workspaceKey string, accessibleKeys map[string]bool, accessibleWs, accessibleSets map[int]bool, scopes map[scopeKey]endpointScope) bool {
+func (s *ItemLinkService) endpointVisibleScoped(entityType string, entityID int, workspaceKey string, accessibleKeys map[string]bool, accessibleWs, accessibleTestWs, accessibleSets map[int]bool, scopes map[scopeKey]endpointScope) bool {
 	switch entityType {
 	case "item":
-		return workspaceKey == "" || accessibleKeys[workspaceKey]
-	case "test_case", "page":
+		return workspaceKey != "" && accessibleKeys[workspaceKey]
+	case "test_case":
+		sc, ok := scopes[scopeKey{entityType, entityID}]
+		if !ok {
+			return false
+		}
+		return accessibleTestWs[sc.wsID]
+	case "page":
 		sc, ok := scopes[scopeKey{entityType, entityID}]
 		if !ok {
 			return false
@@ -812,7 +1093,6 @@ func (s *ItemLinkService) endpointVisibleScoped(entityType string, entityID int,
 	return false
 }
 
-// keysOf returns the keys of a set as a slice.
 func keysOf(set map[int]bool) []int {
 	out := make([]int, 0, len(set))
 	for k := range set {
@@ -821,9 +1101,8 @@ func keysOf(set map[int]bool) []int {
 	return out
 }
 
-// FilterPageLinksByACL drops links whose page endpoint is hidden by
-// per-page ACLs. No-op when there are no page endpoints in the input.
-// Fail-closed when the page checker is missing.
+// FilterPageLinksByACL drops links hidden by page ACLs and fails closed when
+// the checker is unavailable.
 func (s *ItemLinkService) FilterPageLinksByACL(userID int, links []models.ItemLink) []models.ItemLink {
 	if len(links) == 0 {
 		return links
@@ -901,14 +1180,31 @@ func (s *ItemLinkService) FilterPageLinksByACL(userID int, links []models.ItemLi
 	return out
 }
 
-// getLinksWhere is the joined SELECT used by every list endpoint —
-// pulls every display field the API surfaces in one round-trip.
-//
-// whereClause is appended to "WHERE " and may reference il (item_links),
-// lt (link_types), si/sit/sw/spw (source item / type / workspace / page-
-// workspace), ti/tit/tw/tpw (target equivalents), etc.
-func (s *ItemLinkService) getLinksWhere(whereClause string, args ...interface{}) ([]models.ItemLink, error) {
-	query := `
+// getLinksWhere is the shared joined projection for link list endpoints.
+func (s *ItemLinkService) getLinksWhere(whereClause string, args ...any) ([]models.ItemLink, error) {
+	return getLinksWhere(s.db, whereClause, args...)
+}
+
+func getLinksWhere(db itemLinkQuerier, whereClause string, args ...any) ([]models.ItemLink, error) {
+	rows, err := db.Query(itemLinksWhereQuery(whereClause), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanItemLinks(rows)
+}
+
+func getLinksWhereContext(ctx context.Context, db database.Database, whereClause string, args ...any) ([]models.ItemLink, error) {
+	rows, err := db.QueryContext(ctx, itemLinksWhereQuery(whereClause), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanItemLinks(rows)
+}
+
+func itemLinksWhereQuery(whereClause string) string {
+	return `
 		SELECT il.id, il.link_type_id, il.source_type, il.source_id, il.target_type, il.target_id,
 		       il.created_by, il.created_at,
 		       lt.name, lt.color, lt.forward_label, lt.reverse_label,
@@ -962,12 +1258,9 @@ func (s *ItemLinkService) getLinksWhere(whereClause string, args ...interface{})
 		WHERE ` + whereClause + `
 		ORDER BY lt.name, il.created_at DESC
 	`
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
+}
 
+func scanItemLinks(rows *sql.Rows) ([]models.ItemLink, error) {
 	var links []models.ItemLink
 	for rows.Next() {
 		var link models.ItemLink
@@ -994,10 +1287,12 @@ func (s *ItemLinkService) getLinksWhere(whereClause string, args ...interface{})
 	return links, nil
 }
 
-// getLinkByID returns nil when no row matches (lets callers map to a
-// clean ErrLinkNotFound).
 func (s *ItemLinkService) getLinkByID(id int) (*models.ItemLink, error) {
-	links, err := s.getLinksWhere("il.id = ?", id)
+	return getLinkByIDFrom(s.db, id)
+}
+
+func getLinkByIDFrom(db itemLinkQuerier, id int) (*models.ItemLink, error) {
+	links, err := getLinksWhere(db, "il.id = ?", id)
 	if err != nil {
 		return nil, err
 	}
@@ -1007,9 +1302,7 @@ func (s *ItemLinkService) getLinkByID(id int) (*models.ItemLink, error) {
 	return &links[0], nil
 }
 
-// emitLinkedEvents fires the "item linked" notification + action event
-// for an item-source link. Best-effort; failures here do not roll back
-// the create.
+// emitLinkedEvents publishes best-effort events for item-source links.
 func (s *ItemLinkService) emitLinkedEvents(actorUserID int, params CreateItemLinkParams, link *models.ItemLink) {
 	if s.notifications == nil && s.actions == nil {
 		return
@@ -1020,15 +1313,20 @@ func (s *ItemLinkService) emitLinkedEvents(actorUserID int, params CreateItemLin
 	}
 	actorName := s.lookupActorUsername(actorUserID)
 	if s.notifications != nil {
+		referencedWorkspaceID, referencedPermission := s.notificationReferenceAccess(params.TargetType, params.TargetID)
 		s.notifications.EmitEvent(&NotificationEvent{
-			EventType:   models.EventItemLinked,
-			WorkspaceID: sourceItem.WorkspaceID,
-			ActorUserID: actorUserID,
-			ItemID:      params.SourceID,
-			AssigneeID:  sourceItem.AssigneeID,
-			CreatorID:   sourceItem.CreatorID,
-			Title:       "Item Linked",
-			TemplateData: map[string]interface{}{
+			EventType:                     models.EventItemLinked,
+			WorkspaceID:                   sourceItem.WorkspaceID,
+			ActorUserID:                   actorUserID,
+			ItemID:                        params.SourceID,
+			AssigneeID:                    sourceItem.AssigneeID,
+			CreatorID:                     sourceItem.CreatorID,
+			Title:                         "Item Linked",
+			ReferencedWorkspaceID:         referencedWorkspaceID,
+			ReferencedWorkspacePermission: referencedPermission,
+			ReferencedEntityType:          params.TargetType,
+			ReferencedEntityID:            params.TargetID,
+			TemplateData: map[string]any{
 				"item.title":   sourceItem.Title,
 				"item.id":      params.SourceID,
 				"target.title": link.TargetTitle,
@@ -1043,7 +1341,7 @@ func (s *ItemLinkService) emitLinkedEvents(actorUserID int, params CreateItemLin
 			WorkspaceID: sourceItem.WorkspaceID,
 			ItemID:      params.SourceID,
 			ActorUserID: actorUserID,
-			NewValues: map[string]interface{}{
+			NewValues: map[string]any{
 				"link_type_id": params.LinkTypeID,
 				"target_type":  params.TargetType,
 				"target_id":    params.TargetID,
@@ -1052,8 +1350,7 @@ func (s *ItemLinkService) emitLinkedEvents(actorUserID int, params CreateItemLin
 	}
 }
 
-// emitUnlinkedEvents fires the "item unlinked" notification for an
-// item-source link.
+// emitUnlinkedEvents publishes the best-effort item-source unlink event.
 func (s *ItemLinkService) emitUnlinkedEvents(actorUserID int, link *models.ItemLink) {
 	if s.notifications == nil {
 		return
@@ -1062,15 +1359,20 @@ func (s *ItemLinkService) emitUnlinkedEvents(actorUserID int, link *models.ItemL
 	if err != nil {
 		return
 	}
+	referencedWorkspaceID, referencedPermission := s.notificationReferenceAccess(link.TargetType, link.TargetID)
 	s.notifications.EmitEvent(&NotificationEvent{
-		EventType:   models.EventItemUnlinked,
-		WorkspaceID: sourceItem.WorkspaceID,
-		ActorUserID: actorUserID,
-		ItemID:      link.SourceID,
-		AssigneeID:  sourceItem.AssigneeID,
-		CreatorID:   sourceItem.CreatorID,
-		Title:       "Item Unlinked",
-		TemplateData: map[string]interface{}{
+		EventType:                     models.EventItemUnlinked,
+		WorkspaceID:                   sourceItem.WorkspaceID,
+		ActorUserID:                   actorUserID,
+		ItemID:                        link.SourceID,
+		AssigneeID:                    sourceItem.AssigneeID,
+		CreatorID:                     sourceItem.CreatorID,
+		Title:                         "Item Unlinked",
+		ReferencedWorkspaceID:         referencedWorkspaceID,
+		ReferencedWorkspacePermission: referencedPermission,
+		ReferencedEntityType:          link.TargetType,
+		ReferencedEntityID:            link.TargetID,
+		TemplateData: map[string]any{
 			"item.title":   sourceItem.Title,
 			"item.id":      link.SourceID,
 			"target.title": link.TargetTitle,
@@ -1080,10 +1382,27 @@ func (s *ItemLinkService) emitUnlinkedEvents(actorUserID int, link *models.ItemL
 	})
 }
 
-// lookupActorUsername returns the actor's username for notification
-// template data. Empty on lookup failure — the template tolerates a
-// missing value and we never want to block link creation on a user-row
-// fetch error.
+func (s *ItemLinkService) notificationReferenceAccess(entityType string, entityID int) (workspaceID int, permission string) {
+	workspaceID, _, found, err := s.ResolveEntityScope(entityType, entityID)
+	permissionByType := map[string]string{
+		"item":      models.PermissionItemView,
+		"test_case": models.PermissionTestView,
+		"page":      models.PermissionPageView,
+		"asset":     AssetPermissionKeyView,
+	}
+	permission = permissionByType[entityType]
+	if permission == "" {
+		return 0, "invalid"
+	}
+	if err != nil || !found {
+		// Keep the required permission populated with an invalid scope so the
+		// notification service drops every recipient fail-closed.
+		return 0, permission
+	}
+	return workspaceID, permission
+}
+
+// lookupActorUsername returns template data without blocking link creation.
 func (s *ItemLinkService) lookupActorUsername(userID int) string {
 	user, err := repository.NewUserRepository(s.db).GetByID(userID)
 	if err != nil || user == nil {
@@ -1092,9 +1411,7 @@ func (s *ItemLinkService) lookupActorUsername(userID int) string {
 	return user.Username
 }
 
-// CanonicalEntityType maps user-facing path segments ("items",
-// "test-cases", "pages") to internal entity-type strings. Exposed so
-// HTTP layers don't reimplement the mapping.
+// CanonicalEntityType maps user-facing path segments to internal entity types.
 func CanonicalEntityType(pathSegment string) (string, bool) {
 	switch strings.ToLower(pathSegment) {
 	case "items", "item":

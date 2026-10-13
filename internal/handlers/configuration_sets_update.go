@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -19,7 +20,7 @@ func (h *ConfigurationSetHandler) Update(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Get the old configuration set for audit logging
-	oldCS, err := h.repo.FindByIDBasic(id)
+	oldCS, err := h.repo.FindByID(id)
 	if err == repository.ErrNotFound {
 		respondNotFound(w, r, "configuration_set")
 		return
@@ -29,10 +30,11 @@ func (h *ConfigurationSetHandler) Update(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	cs, ok := decodeJSON[models.ConfigurationSet](w, r)
+	cs, fields, ok := decodeJSONWithFields[models.ConfigurationSet](w, r)
 	if !ok {
 		return
 	}
+	preserveOmittedConfigurationSetFields(&cs, oldCS, fields)
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &cs.Name, Policy: sanitize.PlainTextField},
 		sanitize.Pair{Target: &cs.Description, Policy: sanitize.RichText},
@@ -52,6 +54,14 @@ func (h *ConfigurationSetHandler) Update(w http.ResponseWriter, r *http.Request)
 			respondBadRequest(w, r, "One or more workspaces not found")
 			return
 		}
+	}
+
+	// A condition set is bound to a workflow; attaching one from a different
+	// workflow would leave its transition bindings unmatched and silently
+	// disable the gate.
+	if err := h.provisioning.ValidateGovernanceRefs(&cs); err != nil {
+		handleServiceError(w, r, err)
+		return
 	}
 
 	// Snapshot the workspaces currently attached to this config set BEFORE
@@ -113,6 +123,14 @@ func (h *ConfigurationSetHandler) Update(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Narrowing this configuration set's explicit item-type allow-list can
+	// strand items in every workspace currently attached to it. Require an
+	// intra-set item-type migration first; the returned targets are constrained
+	// to the removed type's hierarchy level.
+	if h.respondIntraSetItemTypeConflictIfNeeded(w, r, id, oldWorkspaceIDs, cs.ItemTypeConfigs) {
+		return
+	}
+
 	// Detect intra-config-set workflow change. Workspaces that stay attached
 	// to this config set need a status migration when the default workflow
 	// itself changes — otherwise items can be left on status_ids that are
@@ -167,17 +185,17 @@ func (h *ConfigurationSetHandler) Update(w http.ResponseWriter, r *http.Request)
 	// Log audit event with change tracking
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
-		details := make(map[string]interface{})
+		details := make(map[string]any)
 
 		// Track what changed
 		if oldCS.Name != updatedCS.Name {
-			details["name_changed"] = map[string]interface{}{
+			details["name_changed"] = map[string]any{
 				"old": oldCS.Name,
 				"new": updatedCS.Name,
 			}
 		}
 		if oldCS.Description != updatedCS.Description {
-			details["description_changed"] = map[string]interface{}{
+			details["description_changed"] = map[string]any{
 				"old": oldCS.Description,
 				"new": updatedCS.Description,
 			}
@@ -192,7 +210,7 @@ func (h *ConfigurationSetHandler) Update(w http.ResponseWriter, r *http.Request)
 			newWorkflowID = *updatedCS.WorkflowID
 		}
 		if oldWorkflowID != newWorkflowID {
-			details["workflow_changed"] = map[string]interface{}{
+			details["workflow_changed"] = map[string]any{
 				"old": oldWorkflowID,
 				"new": newWorkflowID,
 			}
@@ -214,4 +232,52 @@ func (h *ConfigurationSetHandler) Update(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondJSONOKWithWarnings(w, updatedCS, warnings)
+}
+
+func preserveOmittedConfigurationSetFields(cs, old *models.ConfigurationSet, fields map[string]json.RawMessage) {
+	if _, ok := fields["name"]; !ok {
+		cs.Name = old.Name
+	}
+	if _, ok := fields["description"]; !ok {
+		cs.Description = old.Description
+	}
+	if _, ok := fields["is_default"]; !ok {
+		cs.IsDefault = old.IsDefault
+	}
+	if _, ok := fields["differentiate_by_item_type"]; !ok {
+		cs.DifferentiateByItemType = old.DifferentiateByItemType
+	}
+	if _, ok := fields["workflow_id"]; !ok {
+		cs.WorkflowID = old.WorkflowID
+	}
+	if _, ok := fields["notification_setting_id"]; !ok {
+		cs.NotificationSettingID = old.NotificationSettingID
+	}
+	if _, ok := fields["condition_set_id"]; !ok {
+		cs.ConditionSetID = old.ConditionSetID
+	}
+	if _, ok := fields["approval_set_id"]; !ok {
+		cs.ApprovalSetID = old.ApprovalSetID
+	}
+	if _, ok := fields["workspace_ids"]; !ok {
+		cs.WorkspaceIDs = old.WorkspaceIDs
+	}
+	if _, ok := fields["item_type_configs"]; !ok {
+		cs.ItemTypeConfigs = old.ItemTypeConfigs
+	}
+	if _, ok := fields["priority_ids"]; !ok {
+		cs.PriorityIDs = old.PriorityIDs
+	}
+	if _, ok := fields["create_screen_id"]; !ok {
+		cs.CreateScreenID = old.CreateScreenID
+	}
+	if _, ok := fields["edit_screen_id"]; !ok {
+		cs.EditScreenID = old.EditScreenID
+	}
+	if _, ok := fields["view_screen_id"]; !ok {
+		cs.ViewScreenID = old.ViewScreenID
+	}
+	if _, ok := fields["default_item_type_id"]; !ok {
+		cs.DefaultItemTypeID = old.DefaultItemTypeID
+	}
 }

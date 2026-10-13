@@ -1,10 +1,13 @@
 <script>
   import { AlertTriangle, X, Trash2, Users } from '@lucide/svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import Button from '../components/Button.svelte';
   import ModalBackdrop from '../components/ModalBackdrop.svelte';
   import Spinner from '../components/Spinner.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import FormField from '../components/FormField.svelte';
+  import Input from '../components/Input.svelte';
+  import Radio from '../components/Radio.svelte';
   import ItemPicker from '../pickers/ItemPicker.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import { api } from '../api';
@@ -27,14 +30,15 @@
   let error = $state(null);
   let reparentCandidates = $state([]);
   let selectedNewParentId = $state(null);
+  let requestedItemId = $state(null);
 
   // Derived values
-  const hasChildren = $derived(deleteInfo?.hasChildren || false);
-  const descendantCount = $derived(deleteInfo?.descendantCount || 0);
+  const hasChildren = $derived(deleteInfo?.has_children || false);
+  const descendantCount = $derived(deleteInfo?.descendant_count || 0);
   const totalCount = $derived(descendantCount + 1);
   const canConfirmDelete = $derived(
     (deleteInfo && !hasChildren) ||
-    (selectedMode === 'reparent' && (selectedNewParentId !== null || deleteInfo?.parentId === null)) ||
+    (selectedMode === 'reparent' && (selectedNewParentId !== null || deleteInfo?.parent_id === null)) ||
     (selectedMode === 'deleteAll' && confirmText.trim() === item?.title?.trim())
   );
 
@@ -53,45 +57,56 @@
 
   // Load delete info when dialog opens
   $effect(() => {
-    if (show && item?.id) {
-      loadDeleteInfo();
-    } else {
+    if (!show) {
       // Reset state when dialog closes
+      requestedItemId = null;
       deleteInfo = null;
       selectedMode = 'deleteAll';
       confirmText = '';
       error = null;
       reparentCandidates = [];
       selectedNewParentId = null;
+      return;
+    }
+
+    // Item detail may refresh from SSE while this dialog is open. Only reload
+    // delete metadata when the selected item actually changes so a same-item
+    // refresh cannot invalidate confirmation text the user already entered.
+    if (item?.id && requestedItemId !== item.id) {
+      requestedItemId = item.id;
+      loadDeleteInfo(item.id);
     }
   });
 
   // Load reparent candidates when reparent mode is selected and we have children
   $effect(() => {
-    if (selectedMode === 'reparent' && hasChildren && deleteInfo?.hierarchyLevel != null) {
+    if (selectedMode === 'reparent' && hasChildren && deleteInfo?.hierarchy_level != null) {
       loadReparentCandidates();
     }
   });
 
-  async function loadDeleteInfo() {
+  async function loadDeleteInfo(itemId) {
     loadingInfo = true;
     error = null;
     try {
-      deleteInfo = await api.items.getDeleteInfo(item.id);
+      const result = await api.items.getDeleteInfo(itemId);
+      if (!show || requestedItemId !== itemId) return;
+      deleteInfo = result;
       // If item has a parent, default to that as the new parent
-      if (deleteInfo?.parentId) {
-        selectedNewParentId = deleteInfo.parentId;
+      if (deleteInfo?.parent_id) {
+        selectedNewParentId = deleteInfo.parent_id;
       }
     } catch (err) {
+      if (!show || requestedItemId !== itemId) return;
       console.error('Failed to load delete info:', err);
       error = err.message;
     } finally {
-      loadingInfo = false;
+      if (requestedItemId === itemId) loadingInfo = false;
     }
   }
 
   async function loadReparentCandidates() {
-    if (!deleteInfo?.workspaceId || deleteInfo?.hierarchyLevel == null) {
+    if (!deleteInfo?.workspace_id || deleteInfo?.hierarchy_level == null) {
       reparentCandidates = [];
       return;
     }
@@ -101,12 +116,12 @@
       // Get items at the same hierarchy level in the same workspace
       // These are valid candidates for reparenting (siblings at the same level)
       const response = await api.items.getAll({
-        workspace_id: deleteInfo.workspaceId,
-        level: deleteInfo.hierarchyLevel,
+        workspace_id: deleteInfo.workspace_id,
+        level: deleteInfo.hierarchy_level,
         limit: 100
       });
 
-      const items = response?.items || response || [];
+      const items = response?.data ?? [];
       // Filter out the item being deleted and its descendants
       reparentCandidates = items.filter(i => i.id !== item.id);
     } catch (err) {
@@ -125,14 +140,13 @@
 
     try {
       if (selectedMode === 'reparent') {
-        // First reparent children to the selected new parent, then delete the item
+        // Move children before deleting their parent.
         await api.items.reparentChildren(item.id, selectedNewParentId);
         await api.items.delete(item.id);
         ondeleted?.({ mode: 'reparent', deletedCount: 1, newParentId: selectedNewParentId });
       } else {
-        // Cascade delete
-        const result = await api.items.deleteCascade(item.id);
-        ondeleted?.({ mode: 'deleteAll', deletedCount: result.deletedCount });
+        await api.items.deleteCascade(item.id);
+        ondeleted?.({ mode: 'deleteAll' });
       }
       show = false;
     } catch (err) {
@@ -161,7 +175,7 @@
     <div
       role="presentation"
       data-testid="delete-item-dialog"
-      class="bg-white rounded-xl shadow-xl max-w-md w-full transform transition-all"
+      class="bg-white rounded-lg shadow-xl max-w-md w-full transform transition-all"
       style="background-color: var(--ds-surface-raised);"
       onclick={(e) => e.stopPropagation()}
     >
@@ -194,9 +208,7 @@
       <!-- Body -->
       <div class="px-6 py-4">
         {#if loadingInfo}
-          <div class="flex items-center justify-center py-8">
-            <Spinner size="medium" />
-          </div>
+          <StateDisplay type="loading" />
         {:else if hasChildren}
           <!-- Has children - show options -->
           <p class="text-sm mb-4" style="color: var(--ds-text-subtle);">
@@ -209,14 +221,14 @@
           <div class="space-y-3 mb-4">
             <!-- Delete All option -->
             <label
-              class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors {selectedMode === 'deleteAll' ? 'border-red-500' : ''}"
-              style="border-color: {selectedMode === 'deleteAll' ? 'var(--ds-border-danger)' : 'var(--ds-border)'}; background-color: {selectedMode === 'deleteAll' ? 'var(--ds-background-danger)' : 'transparent'};"
+              class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors {selectedMode === 'deleteAll'
+                ? 'border-ds-border-danger bg-ds-danger-subtle'
+                : 'border-ds-border'}"
             >
-              <input
-                type="radio"
+              <Radio
                 name="deleteMode"
                 value="deleteAll"
-                bind:group={selectedMode}
+                bind:groupValue={selectedMode}
                 disabled={loading}
                 class="mt-1"
               />
@@ -235,14 +247,15 @@
 
             <!-- Reparent option -->
             <label
-              class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors"
-              style="border-color: {selectedMode === 'reparent' ? 'var(--ds-border-selected)' : 'var(--ds-border)'}; background-color: {selectedMode === 'reparent' ? 'var(--ds-background-selected)' : 'transparent'};"
+              class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors {selectedMode === 'reparent'
+                ? 'border-ds-interactive bg-ds-surface-selected'
+                : 'border-ds-border'}"
             >
-              <input
-                type="radio"
+              <Radio
                 name="deleteMode"
                 value="reparent"
-                bind:group={selectedMode}
+                dataTestid="item-delete-reparent"
+                bind:groupValue={selectedMode}
                 disabled={loading}
                 class="mt-1"
               />
@@ -294,14 +307,14 @@
           <!-- Confirmation text input for delete all -->
           {#if selectedMode === 'deleteAll'}
             <FormField label={t('items.typeToConfirm', { title: item?.title })} id="delete-confirm-input" class="mt-4">
-              <input
+              <Input
                 id="delete-confirm-input"
+                dataTestid="delete-item-confirmation"
                 type="text"
                 bind:value={confirmText}
                 placeholder={t('items.confirmationPlaceholder')}
                 disabled={loading}
-                class="w-full px-3 py-2 rounded-lg border text-sm"
-                style="border-color: var(--ds-border); background-color: var(--ds-background-input); color: var(--ds-text);"
+                size="small"
               />
             </FormField>
           {/if}
@@ -333,6 +346,8 @@
           <!-- Waiting for info to load -->
         {:else if hasChildren}
           <Button
+            id="item-delete-confirm"
+            dataTestid="delete-item-confirm"
             variant="danger"
             onclick={handleDelete}
             size="small"
@@ -345,6 +360,8 @@
           </Button>
         {:else}
           <Button
+            id="item-delete-confirm"
+            dataTestid="delete-item-confirm"
             variant="danger"
             onclick={handleDelete}
             size="small"

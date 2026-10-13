@@ -1,18 +1,18 @@
 package models
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
 )
-
-// SCM Provider Models
 
 // SCMProviderType represents the type of SCM provider
 type SCMProviderType string
 
 const (
 	SCMProviderTypeGitHub SCMProviderType = "github"
+	SCMProviderTypeGitLab SCMProviderType = "gitlab"
 	SCMProviderTypeGitea  SCMProviderType = "gitea"
 )
 
@@ -42,18 +42,13 @@ type SCMProvider struct {
 	GitHubAppPrivateKeyEncrypted string          `json:"-"`
 	GitHubAppInstallationID      string          `json:"github_app_installation_id,omitempty"`
 	GitHubOrgID                  *int64          `json:"github_org_id,omitempty"` // Stable org ID for GitHub App discovery
-	OAuthAccessTokenEncrypted    string          `json:"-"`
-	OAuthRefreshTokenEncrypted   string          `json:"-"`
-	OAuthTokenExpiresAt          *time.Time      `json:"oauth_token_expires_at,omitempty"`
 	Scopes                       string          `json:"scopes"`
 	WorkspaceRestrictionMode     string          `json:"workspace_restriction_mode"` // 'unrestricted' or 'restricted'
 	CreatedAt                    time.Time       `json:"created_at"`
 	UpdatedAt                    time.Time       `json:"updated_at"`
-	// Computed fields for API responses
-	HasOAuthClientSecret   bool `json:"has_oauth_client_secret,omitempty"`
-	HasPAT                 bool `json:"has_pat,omitempty"`
-	HasGitHubAppPrivateKey bool `json:"has_github_app_private_key,omitempty"`
-	HasOAuthToken          bool `json:"has_oauth_token,omitempty"`
+	HasOAuthClientSecret         bool            `json:"has_oauth_client_secret,omitempty"`
+	HasPAT                       bool            `json:"has_pat,omitempty"`
+	HasGitHubAppPrivateKey       bool            `json:"has_github_app_private_key,omitempty"`
 }
 
 // SCMProviderRequest represents the API request for creating/updating an SCM provider
@@ -78,14 +73,13 @@ type SCMProviderRequest struct {
 
 // SCMProviderWorkspaceAllowlist represents a workspace allowed to use an SCM provider
 type SCMProviderWorkspaceAllowlist struct {
-	ID          int       `json:"id"`
-	ProviderID  int       `json:"provider_id"`
-	WorkspaceID int       `json:"workspace_id"`
-	CreatedAt   time.Time `json:"created_at"`
-	CreatedBy   *int      `json:"created_by,omitempty"`
-	// Joined fields for API responses
-	WorkspaceName string `json:"workspace_name,omitempty"`
-	WorkspaceKey  string `json:"workspace_key,omitempty"`
+	ID            int       `json:"id"`
+	ProviderID    int       `json:"provider_id"`
+	WorkspaceID   int       `json:"workspace_id"`
+	CreatedAt     time.Time `json:"created_at"`
+	CreatedBy     *int      `json:"created_by,omitempty"`
+	WorkspaceName string    `json:"workspace_name,omitempty"`
+	WorkspaceKey  string    `json:"workspace_key,omitempty"`
 }
 
 // SCMOAuthState represents a temporary OAuth state token
@@ -102,28 +96,25 @@ type SCMOAuthState struct {
 
 // WorkspaceSCMConnection represents a connection between a workspace and an SCM provider
 type WorkspaceSCMConnection struct {
-	ID                   int       `json:"id"`
-	WorkspaceID          int       `json:"workspace_id"`
-	SCMProviderID        int       `json:"scm_provider_id"`
-	Enabled              bool      `json:"enabled"`
-	SmartCommitsEnabled  bool      `json:"smart_commits_enabled"`
-	DefaultBranchPattern string    `json:"default_branch_pattern,omitempty"`
-	ItemKeyPattern       string    `json:"item_key_pattern,omitempty"`
-	CreatedBy            *int      `json:"created_by,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
-	// Workspace-level credentials (encrypted)
-	OAuthAccessTokenEncrypted    string     `json:"-"`
-	OAuthRefreshTokenEncrypted   string     `json:"-"`
-	OAuthTokenExpiresAt          *time.Time `json:"oauth_token_expires_at,omitempty"`
-	PersonalAccessTokenEncrypted string     `json:"-"`
-	// Computed fields for API responses
-	HasOAuthToken bool `json:"has_oauth_token,omitempty"`
-	HasPAT        bool `json:"has_pat,omitempty"`
-	// Joined fields
-	ProviderName string          `json:"provider_name,omitempty"`
-	ProviderType SCMProviderType `json:"provider_type,omitempty"`
-	ProviderSlug string          `json:"provider_slug,omitempty"`
+	ID                           int             `json:"id"`
+	WorkspaceID                  int             `json:"workspace_id"`
+	SCMProviderID                int             `json:"scm_provider_id"`
+	Enabled                      bool            `json:"enabled"`
+	SmartCommitsEnabled          bool            `json:"smart_commits_enabled"`
+	DefaultBranchPattern         string          `json:"default_branch_pattern,omitempty"`
+	ItemKeyPattern               string          `json:"item_key_pattern,omitempty"`
+	CreatedBy                    *int            `json:"created_by,omitempty"`
+	CreatedAt                    time.Time       `json:"created_at"`
+	UpdatedAt                    time.Time       `json:"updated_at"`
+	OAuthAccessTokenEncrypted    string          `json:"-"`
+	OAuthRefreshTokenEncrypted   string          `json:"-"`
+	OAuthTokenExpiresAt          *time.Time      `json:"oauth_token_expires_at,omitempty"`
+	PersonalAccessTokenEncrypted string          `json:"-"`
+	HasOAuthToken                bool            `json:"has_oauth_token,omitempty"`
+	HasPAT                       bool            `json:"has_pat,omitempty"`
+	ProviderName                 string          `json:"provider_name,omitempty"`
+	ProviderType                 SCMProviderType `json:"provider_type,omitempty"`
+	ProviderSlug                 string          `json:"provider_slug,omitempty"`
 }
 
 // WorkspaceSCMConnectionRequest represents the API request for workspace SCM connections
@@ -136,20 +127,19 @@ type WorkspaceSCMConnectionRequest struct {
 
 // WorkspaceRepository represents a repository linked to a workspace
 type WorkspaceRepository struct {
-	ID                       int        `json:"id"`
-	WorkspaceSCMConnectionID int        `json:"workspace_scm_connection_id"`
-	RepositoryExternalID     string     `json:"repository_external_id"`
-	RepositoryName           string     `json:"repository_name"`
-	RepositoryURL            string     `json:"repository_url"`
-	DefaultBranch            string     `json:"default_branch"`
-	IsActive                 bool       `json:"is_active"`
-	LastSyncedAt             *time.Time `json:"last_synced_at,omitempty"`
-	CreatedAt                time.Time  `json:"created_at"`
-	UpdatedAt                time.Time  `json:"updated_at"`
-	// Joined fields
-	WorkspaceID  int             `json:"workspace_id,omitempty"`
-	ProviderType SCMProviderType `json:"provider_type,omitempty"`
-	ProviderSlug string          `json:"provider_slug,omitempty"`
+	ID                       int             `json:"id"`
+	WorkspaceSCMConnectionID int             `json:"workspace_scm_connection_id"`
+	RepositoryExternalID     string          `json:"repository_external_id"`
+	RepositoryName           string          `json:"repository_name"`
+	RepositoryURL            string          `json:"repository_url"`
+	DefaultBranch            string          `json:"default_branch"`
+	IsActive                 bool            `json:"is_active"`
+	LastSyncedAt             *time.Time      `json:"last_synced_at,omitempty"`
+	CreatedAt                time.Time       `json:"created_at"`
+	UpdatedAt                time.Time       `json:"updated_at"`
+	WorkspaceID              int             `json:"workspace_id,omitempty"`
+	ProviderType             SCMProviderType `json:"provider_type,omitempty"`
+	ProviderSlug             string          `json:"provider_slug,omitempty"`
 }
 
 // WorkspaceRepositoryRequest represents the API request for linking a repository
@@ -180,23 +170,22 @@ const (
 
 // ItemSCMLink represents a link between an item and an SCM resource (PR, commit, branch)
 type ItemSCMLink struct {
-	ID                    int          `json:"id"`
-	ItemID                int          `json:"item_id"`
-	WorkspaceRepositoryID int          `json:"workspace_repository_id"`
-	LinkType              SCMLinkType  `json:"link_type"`
-	ExternalID            string       `json:"external_id"`
-	ExternalURL           string       `json:"external_url,omitempty"`
-	Title                 string       `json:"title,omitempty"`
-	State                 SCMLinkState `json:"state,omitempty"`
-	AuthorExternalID      string       `json:"author_external_id,omitempty"`
-	AuthorName            string       `json:"author_name,omitempty"`
-	DetectionSource       string       `json:"detection_source,omitempty"`
-	CreatedAt             time.Time    `json:"created_at"`
-	UpdatedAt             time.Time    `json:"updated_at"`
-	// Joined fields
-	RepositoryName string          `json:"repository_name,omitempty"`
-	RepositoryURL  string          `json:"repository_url,omitempty"`
-	ProviderType   SCMProviderType `json:"provider_type,omitempty"`
+	ID                    int             `json:"id"`
+	ItemID                int             `json:"item_id"`
+	WorkspaceRepositoryID int             `json:"workspace_repository_id"`
+	LinkType              SCMLinkType     `json:"link_type"`
+	ExternalID            string          `json:"external_id"`
+	ExternalURL           string          `json:"external_url,omitempty"`
+	Title                 string          `json:"title,omitempty"`
+	State                 SCMLinkState    `json:"state,omitempty"`
+	AuthorExternalID      string          `json:"author_external_id,omitempty"`
+	AuthorName            string          `json:"author_name,omitempty"`
+	DetectionSource       string          `json:"detection_source,omitempty"`
+	CreatedAt             time.Time       `json:"created_at"`
+	UpdatedAt             time.Time       `json:"updated_at"`
+	RepositoryName        string          `json:"repository_name,omitempty"`
+	RepositoryURL         string          `json:"repository_url,omitempty"`
+	ProviderType          SCMProviderType `json:"provider_type,omitempty"`
 }
 
 // ItemSCMLinkRequest represents the API request for creating an SCM link
@@ -214,6 +203,7 @@ type ItemSCMLinkRequest struct {
 type SCMWebhook struct {
 	ID                     int        `json:"id"`
 	WorkspaceRepositoryID  int        `json:"workspace_repository_id"`
+	WebhookKey             string     `json:"webhook_key,omitempty"`
 	WebhookExternalID      string     `json:"webhook_external_id,omitempty"`
 	WebhookSecretEncrypted string     `json:"-"`      // Never expose
 	Events                 string     `json:"events"` // JSON array
@@ -236,7 +226,16 @@ type SCMWebhookDelivery struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
-// Issue Sync Models
+// SCMReleaseAsset is a downloadable source archive or an explicit external
+// link associated with an SCM release.
+type SCMReleaseAsset struct {
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	DirectURL string `json:"direct_url,omitempty"`
+	Format    string `json:"format,omitempty"`
+	LinkType  string `json:"link_type,omitempty"`
+}
 
 // IssueSyncLabelMode represents the label sync mode
 type IssueSyncLabelMode string
@@ -267,10 +266,9 @@ type IssueSyncConfig struct {
 	CreatedBy             *int               `json:"created_by,omitempty"`
 	CreatedAt             time.Time          `json:"created_at"`
 	UpdatedAt             time.Time          `json:"updated_at"`
-	// Joined fields for API responses
-	RepositoryName  string `json:"repository_name,omitempty"`
-	WorkspaceID     int    `json:"workspace_id,omitempty"`
-	SyncedItemCount int    `json:"synced_item_count,omitempty"`
+	RepositoryName        string             `json:"repository_name,omitempty"`
+	WorkspaceID           int                `json:"workspace_id,omitempty"`
+	SyncedItemCount       int                `json:"synced_item_count,omitempty"`
 }
 
 // IssueSyncConfigRequest represents the API request for creating/updating an issue sync config
@@ -302,10 +300,9 @@ type IssueSyncItem struct {
 	SyncLock            bool       `json:"sync_lock"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
-	// Joined fields
-	ItemTitle           string `json:"item_title,omitempty"`
-	WorkspaceItemNumber int    `json:"workspace_item_number,omitempty"`
-	WorkspaceKey        string `json:"workspace_key,omitempty"`
+	ItemTitle           string     `json:"item_title,omitempty"`
+	WorkspaceItemNumber int        `json:"workspace_item_number,omitempty"`
+	WorkspaceKey        string     `json:"workspace_key,omitempty"`
 }
 
 // LabelMapping represents a mapping between a GitHub label and a Windshift label
@@ -313,8 +310,6 @@ type LabelMapping struct {
 	GitHubLabel      string `json:"github_label"`
 	WindshiftLabelID int    `json:"windshift_label_id"`
 }
-
-// Time Tracking Models
 
 // TimeProjectCategory represents a category for time projects
 type TimeProjectCategory struct {
@@ -329,40 +324,38 @@ type TimeProjectCategory struct {
 
 // TimeProject represents a time tracking project
 type TimeProject struct {
-	ID          int                    `json:"id"`
-	CustomerID  *int                   `json:"customer_id,omitempty"` // Now optional
-	CategoryID  *int                   `json:"category_id,omitempty"` // Link to project category
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Status      string                 `json:"status"` // Active, On Hold, Completed, Archived
-	Color       string                 `json:"color,omitempty"`
-	HourlyRate  float64                `json:"hourly_rate"`
-	Settings    map[string]interface{} `json:"settings,omitempty"` // Flexible JSON attributes (e.g., max_hours)
-	CreatedAt   time.Time              `json:"created_at"`
-	UpdatedAt   time.Time              `json:"updated_at"`
-	// Joined fields for API responses
-	CustomerName  string   `json:"customer_name,omitempty"`
-	CategoryName  string   `json:"category_name,omitempty"`
-	CategoryColor string   `json:"category_color,omitempty"`
-	TotalHours    *float64 `json:"total_hours,omitempty"` // Computed from worklogs
-	IsManager     bool     `json:"is_manager,omitempty"`  // Whether current user is a manager of this project
+	ID            int            `json:"id"`
+	CustomerID    *int           `json:"customer_id,omitempty"` // Now optional
+	CategoryID    *int           `json:"category_id,omitempty"` // Link to project category
+	Name          string         `json:"name"`
+	Description   string         `json:"description"`
+	Status        string         `json:"status"` // Active, On Hold, Completed, Archived
+	Color         string         `json:"color,omitempty"`
+	HourlyRate    float64        `json:"hourly_rate"`
+	Settings      map[string]any `json:"settings,omitempty"` // Flexible JSON attributes (e.g., max_hours)
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+	CustomerName  string         `json:"customer_name,omitempty"`
+	CategoryName  string         `json:"category_name,omitempty"`
+	CategoryColor string         `json:"category_color,omitempty"`
+	TotalHours    *float64       `json:"total_hours,omitempty"` // Computed from worklogs
+	IsManager     bool           `json:"is_manager,omitempty"`  // Whether current user is a manager of this project
 }
 
 // Worklog represents a time tracking entry
 type Worklog struct {
-	ID           int    `json:"id"`
-	ProjectID    int    `json:"project_id"`
-	CustomerID   int    `json:"customer_id"`
-	UserID       *int   `json:"user_id,omitempty"` // User who created the worklog
-	ItemID       *int   `json:"item_id,omitempty"` // Optional link to work item
-	Description  string `json:"description"`
-	Date         int64  `json:"date"`       // Unix timestamp
-	StartTime    int64  `json:"start_time"` // Unix timestamp
-	EndTime      int64  `json:"end_time"`   // Unix timestamp
-	DurationMins int    `json:"duration_minutes"`
-	CreatedAt    int64  `json:"created_at"` // Unix timestamp
-	UpdatedAt    int64  `json:"updated_at"` // Unix timestamp
-	// Joined fields for API responses
+	ID                  int      `json:"id"`
+	ProjectID           int      `json:"project_id"`
+	CustomerID          int      `json:"customer_id"`
+	UserID              *int     `json:"user_id,omitempty"` // User who created the worklog
+	ItemID              *int     `json:"item_id,omitempty"` // Optional link to work item
+	Description         string   `json:"description"`
+	Date                int64    `json:"date"`       // Unix timestamp
+	StartTime           int64    `json:"start_time"` // Unix timestamp
+	EndTime             int64    `json:"end_time"`   // Unix timestamp
+	DurationMins        int      `json:"duration_minutes"`
+	CreatedAt           int64    `json:"created_at"` // Unix timestamp
+	UpdatedAt           int64    `json:"updated_at"` // Unix timestamp
 	CustomerName        string   `json:"customer_name,omitempty"`
 	ProjectName         string   `json:"project_name,omitempty"`
 	UserName            string   `json:"user_name,omitempty"`             // Name of user who created the worklog
@@ -376,15 +369,14 @@ type Worklog struct {
 
 // ActiveTimer represents a running timer
 type ActiveTimer struct {
-	ID           int    `json:"id"`
-	WorkspaceID  int    `json:"workspace_id"`
-	ItemID       *int   `json:"item_id,omitempty"` // Optional link to work item
-	ProjectID    int    `json:"project_id"`
-	UserID       int    `json:"user_id"`
-	Description  string `json:"description"`
-	StartTimeUTC int64  `json:"start_time_utc"` // Unix timestamp in UTC
-	CreatedAt    int64  `json:"created_at"`     // Unix timestamp
-	// Joined fields for API responses - nullable since they come from LEFT JOINs
+	ID                  int     `json:"id"`
+	WorkspaceID         int     `json:"workspace_id"`
+	ItemID              *int    `json:"item_id,omitempty"` // Optional link to work item
+	ProjectID           int     `json:"project_id"`
+	UserID              int     `json:"user_id"`
+	Description         string  `json:"description"`
+	StartTimeUTC        int64   `json:"start_time_utc"` // Unix timestamp in UTC
+	CreatedAt           int64   `json:"created_at"`     // Unix timestamp
 	ProjectName         *string `json:"project_name,omitempty"`
 	CustomerName        *string `json:"customer_name,omitempty"`
 	ItemTitle           *string `json:"item_title,omitempty"`
@@ -392,8 +384,6 @@ type ActiveTimer struct {
 	WorkspaceKey        *string `json:"workspace_key,omitempty"`
 	WorkspaceItemNumber *int    `json:"workspace_item_number,omitempty"`
 }
-
-// Review System Models
 
 // Review represents a daily or weekly personal review entry
 type Review struct {
@@ -404,9 +394,8 @@ type Review struct {
 	ReviewData string    `json:"review_data"` // JSON data - unstructured storage
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
-	// Joined fields for API responses
-	UserName  string `json:"user_name,omitempty"`
-	UserEmail string `json:"user_email,omitempty"`
+	UserName   string    `json:"user_name,omitempty"`
+	UserEmail  string    `json:"user_email,omitempty"`
 }
 
 // ReviewCreateRequest represents the payload for creating a new review
@@ -428,40 +417,97 @@ type CompletedItemsRequest struct {
 	UserID    int    `json:"user_id"`    // Filter by assignee
 }
 
-// Test Management Models
-
 // TestFolder represents a folder for organizing test cases
 type TestFolder struct {
-	ID          int       `json:"id"`
-	WorkspaceID int       `json:"workspace_id"`
-	ParentID    *int      `json:"parent_id,omitempty"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	SortOrder   int       `json:"sort_order"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	// Computed fields for API responses
-	TestCaseCount int `json:"test_case_count,omitempty"`
+	ID            int       `json:"id"`
+	WorkspaceID   int       `json:"workspace_id"`
+	ParentID      *int      `json:"parent_id,omitempty"`
+	Name          string    `json:"name"`
+	Description   string    `json:"description"`
+	SortOrder     int       `json:"sort_order"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	TestCaseCount int       `json:"test_case_count,omitempty"`
 }
 
 // TestCase represents a test case
+// Format is "steps" (default) or "bdd"; it is fixed at creation time.
 type TestCase struct {
-	ID                int       `json:"id"`
-	WorkspaceID       int       `json:"workspace_id"`
-	FolderID          *int      `json:"folder_id,omitempty"`
-	Title             string    `json:"title"`
-	Name              string    `json:"name"`
-	Priority          string    `json:"priority"`           // low, medium, high, critical
-	Status            string    `json:"status"`             // active, inactive, draft
-	EstimatedDuration int       `json:"estimated_duration"` // in seconds
-	Preconditions     string    `json:"preconditions"`
-	SortOrder         int       `json:"sort_order"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
-	// Computed fields for API responses
-	FolderName string      `json:"folder_name,omitempty"`
-	TestSteps  []TestStep  `json:"test_steps,omitempty"`
-	Labels     []TestLabel `json:"labels,omitempty"`
+	ID                int          `json:"id"`
+	WorkspaceID       int          `json:"workspace_id"`
+	FolderID          *int         `json:"folder_id,omitempty"`
+	Title             string       `json:"title"`
+	Name              string       `json:"name"`
+	Format            string       `json:"format"`
+	Priority          string       `json:"priority"`           // low, medium, high, critical
+	Status            string       `json:"status"`             // active, inactive, draft
+	EstimatedDuration int          `json:"estimated_duration"` // in seconds
+	Preconditions     string       `json:"preconditions"`
+	SortOrder         int          `json:"sort_order"`
+	CreatedAt         time.Time    `json:"created_at"`
+	UpdatedAt         time.Time    `json:"updated_at"`
+	FolderName        string       `json:"folder_name,omitempty"`
+	TestSteps         []TestStep   `json:"test_steps,omitempty"`
+	Labels            []TestLabel  `json:"labels,omitempty"`
+	BDD               *TestCaseBDD `json:"bdd,omitempty"`
+}
+
+// TestCaseBDD holds the authored Gherkin source (authoritative) and the
+// derived structure persisted alongside a BDD-format test case.
+type TestCaseBDD struct {
+	TestCaseID      int    `json:"test_case_id"`
+	Gherkin         string `json:"gherkin"`
+	FeatureName     string `json:"feature_name"`
+	ScenarioKeyword string `json:"scenario_keyword"`
+	// Spec is the JSON-encoded gherkin.ScenarioSpec derived from Gherkin.
+	Spec      string    `json:"spec"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TestRunCaseSnapshot is the run-scoped copy of a BDD case's specification.
+// It is written when a case enters a run; later case edits do not touch it.
+type TestRunCaseSnapshot struct {
+	ID            int       `json:"id"`
+	RunID         int       `json:"run_id"`
+	TestCaseID    int       `json:"test_case_id"`
+	Title         string    `json:"title"`
+	Preconditions string    `json:"preconditions"`
+	Gherkin       string    `json:"gherkin"`
+	Spec          string    `json:"spec"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// TestExampleResult is the manual-execution result of one Examples row of a
+// BDD case within a run. ExampleIndex and RowValues preserve the row's
+// identity and input values with its result.
+type TestExampleResult struct {
+	ID           int                     `json:"id"`
+	RunID        int                     `json:"run_id"`
+	TestCaseID   int                     `json:"test_case_id"`
+	ExampleIndex int                     `json:"example_index"`
+	RowValues    map[string]string       `json:"row_values"`
+	Status       string                  `json:"status"`
+	ActualResult string                  `json:"actual_result"`
+	Notes        string                  `json:"notes"`
+	ExecutedAt   *time.Time              `json:"executed_at"`
+	CreatedAt    time.Time               `json:"created_at"`
+	UpdatedAt    time.Time               `json:"updated_at"`
+	StepResults  []TestExampleStepResult `json:"step_results,omitempty"`
+}
+
+// TestExampleStepResult is a step-level result within one example execution.
+// StepNumber is the 1-based position in the expanded step list (Background
+// steps first, then the scenario's own steps).
+type TestExampleStepResult struct {
+	ID              int        `json:"id"`
+	ExampleResultID int        `json:"example_result_id"`
+	StepNumber      int        `json:"step_number"`
+	Status          string     `json:"status"`
+	ActualResult    string     `json:"actual_result"`
+	Notes           string     `json:"notes"`
+	ItemID          *int       `json:"item_id"`
+	ExecutedAt      *time.Time `json:"executed_at"`
 }
 
 // TestSet represents a collection of test cases
@@ -475,15 +521,23 @@ type TestSet struct {
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 
-	// Test case count
 	TestCaseCount int `json:"test_case_count,omitempty"`
 
-	// Test run statistics
 	TotalRuns      int        `json:"total_runs,omitempty"`
 	SuccessfulRuns int        `json:"successful_runs,omitempty"`
 	FailedRuns     int        `json:"failed_runs,omitempty"`
 	LastRunStatus  string     `json:"last_run_status,omitempty"`
 	LastRunDate    *time.Time `json:"last_run_date,omitempty"`
+}
+
+// MilestoneTestStats aggregates test-plan activity for a milestone.
+type MilestoneTestStats struct {
+	TotalTestPlans     int `json:"total_test_plans"`
+	TotalTestRuns      int `json:"total_test_runs"`
+	SuccessfulTestRuns int `json:"successful_test_runs"`
+	FailedTestRuns     int `json:"failed_test_runs"`
+	InProgressTestRuns int `json:"in_progress_test_runs"`
+	TotalTestCases     int `json:"total_test_cases"`
 }
 
 // SetTestCase represents the relationship between a test set and a test case
@@ -502,25 +556,23 @@ type TestRunTemplate struct {
 	Description string    `json:"description"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
-	// Joined fields for API responses
-	SetName string `json:"set_name,omitempty"`
+	SetName     string    `json:"set_name,omitempty"`
 }
 
 // TestRun represents an execution of a test set
 type TestRun struct {
-	ID          int        `json:"id"`
-	WorkspaceID int        `json:"workspace_id"`
-	TemplateID  int        `json:"template_id,omitempty"` // Optional reference to template
-	SetID       int        `json:"set_id"`
-	Name        string     `json:"name"`
-	AssigneeID  *int       `json:"assignee_id,omitempty"` // User assigned to execute this run
-	StartedAt   time.Time  `json:"started_at"`
-	EndedAt     *time.Time `json:"ended_at"`
-	CreatedAt   time.Time  `json:"created_at"`
-	// Computed fields from JOIN with users table
-	AssigneeName   string `json:"assignee_name,omitempty"`
-	AssigneeEmail  string `json:"assignee_email,omitempty"`
-	AssigneeAvatar string `json:"assignee_avatar,omitempty"`
+	ID             int        `json:"id"`
+	WorkspaceID    int        `json:"workspace_id"`
+	TemplateID     int        `json:"template_id,omitempty"` // Optional reference to template
+	SetID          int        `json:"set_id"`
+	Name           string     `json:"name"`
+	AssigneeID     *int       `json:"assignee_id,omitempty"` // User assigned to execute this run
+	StartedAt      time.Time  `json:"started_at"`
+	EndedAt        *time.Time `json:"ended_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	AssigneeName   string     `json:"assignee_name,omitempty"`
+	AssigneeEmail  string     `json:"assignee_email,omitempty"`
+	AssigneeAvatar string     `json:"assignee_avatar,omitempty"`
 }
 
 // TestResult represents the result of a test case execution
@@ -589,8 +641,6 @@ type TestCaseLabel struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
-// Test Coverage Models
-
 // TestCoverageConfiguration represents the requirement type configuration for a collection or workspace
 type TestCoverageConfiguration struct {
 	ID                     int       `json:"id"`
@@ -637,39 +687,32 @@ type TestCoverageListResponse struct {
 	Summary    TestCoverageSummary       `json:"summary"`
 }
 
-// Recurring Tasks Models
-
 // RecurrenceRule represents a recurring task pattern for generating instances
 type RecurrenceRule struct {
 	ID             int `json:"id"`
 	TemplateItemID int `json:"template_item_id"`
 	WorkspaceID    int `json:"workspace_id"`
 
-	// iCalendar RRULE configuration (RFC 5545)
 	RRule    string     `json:"rrule"`   // e.g., "FREQ=WEEKLY;BYDAY=MO,WE,FR"
 	DtStart  time.Time  `json:"dtstart"` // Recurrence start date
 	DtEnd    *time.Time `json:"dtend,omitempty"`
 	Timezone string     `json:"timezone"` // IANA timezone
 
-	// Generation settings
 	LeadTimeDays        int        `json:"lead_time_days"`
 	LastGeneratedUntil  *time.Time `json:"last_generated_until,omitempty"`
 	NextGenerationCheck *time.Time `json:"next_generation_check,omitempty"`
 
-	// Instance configuration (what to copy from template)
 	CopyAssignee     bool `json:"copy_assignee"`
 	CopyPriority     bool `json:"copy_priority"`
 	CopyCustomFields bool `json:"copy_custom_fields"`
 	CopyDescription  bool `json:"copy_description"`
 	StatusOnCreate   *int `json:"status_on_create,omitempty"`
 
-	// Lifecycle
 	IsActive  bool      `json:"is_active"`
 	CreatedBy *int      `json:"created_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
-	// Joined fields for API responses
 	TemplateTitle  string     `json:"template_title,omitempty"`
 	WorkspaceName  string     `json:"workspace_name,omitempty"`
 	WorkspaceKey   string     `json:"workspace_key,omitempty"`
@@ -687,7 +730,6 @@ type RecurrenceInstance struct {
 	SequenceNumber   int       `json:"sequence_number"`
 	CreatedAt        time.Time `json:"created_at"`
 
-	// Joined fields for API responses
 	ItemTitle  string `json:"item_title,omitempty"`
 	ItemStatus string `json:"item_status,omitempty"`
 }
@@ -729,8 +771,6 @@ type RRulePreviewRequest struct {
 	Count   int    `json:"count,omitempty"` // Number of occurrences to preview (default 10)
 }
 
-// Actions Automation Models
-
 // ActionTriggerType defines the type of event that triggers an action
 type ActionTriggerType string
 
@@ -740,6 +780,11 @@ const (
 	ActionTriggerItemUpdated      ActionTriggerType = "item_updated"
 	ActionTriggerItemLinked       ActionTriggerType = "item_linked"
 	ActionTriggerManual           ActionTriggerType = "manual"
+
+	// SLA-driven triggers emitted in the breach/warning transaction. They are
+	// configuration consumers, not fields on imported SLA goals.
+	ActionTriggerSLABreached ActionTriggerType = "sla_breached"
+	ActionTriggerSLAWarning  ActionTriggerType = "sla_warning"
 
 	// SCM-driven triggers emitted by the repo-sync loop when a new git ref
 	// matching the per-repository pattern is observed. Payload (in
@@ -755,6 +800,13 @@ const (
 	// (scm_pr_merged).
 	ActionTriggerSCMPRLinked ActionTriggerType = "scm_pr_linked"
 	ActionTriggerSCMPRMerged ActionTriggerType = "scm_pr_merged"
+
+	// Helpdesk triggers (WI-1132). comment_created fires after a comment is
+	// committed; NewValues carries comment_is_private and
+	// comment_from_customer. item_inactive fires from the inactivity
+	// sweeper for stale open tickets.
+	ActionTriggerCommentCreated ActionTriggerType = "comment_created"
+	ActionTriggerItemInactive   ActionTriggerType = "item_inactive"
 )
 
 // ActionNodeType defines the type of action node
@@ -790,6 +842,18 @@ const (
 	// row on scm_tag_created events. Registered via the node-executor
 	// registry rather than the legacy switch in action_service.go.
 	ActionNodeCreateMilestone ActionNodeType = "create_milestone"
+	// ActionNodeInsertCannedResponse renders a workspace canned response
+	// (WI-1138) with the execution variables and posts it as a comment on the
+	// trigger item. Private snippets become private comments; public snippets
+	// become public comments and flow through the normal reply-email path.
+	ActionNodeInsertCannedResponse ActionNodeType = "insert_canned_response"
+	// ActionNodeNotifyCustomer emails the portal customer who created the
+	// trigger item through the same threaded transport as reply
+	// notifications (WI-1132).
+	ActionNodeNotifyCustomer ActionNodeType = "notify_customer"
+	// ActionNodeAdjustLabels adds and removes item labels on the trigger
+	// item (WI-1132).
+	ActionNodeAdjustLabels ActionNodeType = "adjust_labels"
 )
 
 // IsIterator reports whether this node type fans out — i.e. the engine must
@@ -821,9 +885,12 @@ type Action struct {
 	// ActorUserID overrides the execution actor. NULL means the action runs under
 	// the triggering user's permissions. Setting this field requires the global
 	// action.set_actor permission because it grants cross-workspace impersonation.
-	ActorUserID *int      `json:"actor_user_id,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ActorUserID *int `json:"actor_user_id,omitempty"`
+	// AllowedRoleIDs restricts a manual action to members of these workspace
+	// roles. An empty list means every workspace editor may trigger it.
+	AllowedRoleIDs []int     `json:"allowed_role_ids"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 	// Joined fields for API responses
 	CreatorName string       `json:"creator_name,omitempty"`
 	ActorName   string       `json:"actor_name,omitempty"`
@@ -833,7 +900,6 @@ type Action struct {
 
 // ActionTriggerConfig represents trigger-specific configuration
 type ActionTriggerConfig struct {
-	// For status_transition
 	FromStatusID *int `json:"from_status_id,omitempty"` // null means any status
 	ToStatusID   *int `json:"to_status_id,omitempty"`   // null means any status
 	// ToStatusCategoryIsCompleted matches when the to-status's category has
@@ -841,23 +907,28 @@ type ActionTriggerConfig struct {
 	// that want to fire on "any terminal transition" without enumerating
 	// per-workflow status IDs. Evaluated after FromStatusID/ToStatusID; both
 	// can be set together.
-	ToStatusCategoryIsCompleted *bool `json:"to_status_category_completed,omitempty"`
-	// For item_created and item_updated
-	ItemTypeID *int `json:"item_type_id,omitempty"` // Filter by item type (optional)
-	// For item_updated
-	FieldName string `json:"field_name,omitempty"` // Which field changed
-	// For item_linked
-	LinkTypeID *int `json:"link_type_id,omitempty"` // Filter by link type (optional)
-	// For scm_pr_linked and scm_pr_merged: optional filter to a specific
+	ToStatusCategoryIsCompleted *bool  `json:"to_status_category_completed,omitempty"`
+	ItemTypeID                  *int   `json:"item_type_id,omitempty"` // Filter by item type (optional)
+	FieldName                   string `json:"field_name,omitempty"`   // Which field changed
+	LinkTypeID                  *int   `json:"link_type_id,omitempty"` // Filter by link type (optional)
+	// For SCM triggers: optional filter to a specific
 	// workspace repository. When nil the trigger fires for any repository.
 	WorkspaceRepositoryID *int `json:"workspace_repository_id,omitempty"`
 
-	// For scm_pr_linked and scm_pr_merged: optional filter to a specific
+	// For SCM triggers: optional filter to a specific
 	// repository slug (e.g. "owner/repo"). Empty matches any repository.
 	RepositoryFullName string `json:"repository_full_name,omitempty"`
 
-	// Cascade control - applies to all trigger types
 	RespondToCascades bool `json:"respond_to_cascades,omitempty"` // If true, action responds to events triggered by other actions
+
+	// For comment_created triggers (WI-1132): when true only customer
+	// comments (portal customer or email-intake sender) match; when false
+	// only agent-authored comments match; nil matches any author.
+	FromCustomer *bool `json:"from_customer,omitempty"`
+
+	// For item_inactive triggers (WI-1132): the open item must have had no
+	// comment or update for this many hours before the trigger fires.
+	InactiveHours int `json:"inactive_hours,omitempty"`
 }
 
 // ActionNode represents a step in the action flow
@@ -875,8 +946,19 @@ type ActionNode struct {
 // FlowNodeID returns the node's ID for generic action-flow helpers.
 func (n ActionNode) FlowNodeID() int { return n.ID }
 
+// GetID returns the node's ID for the shared action-flow runner.
+func (n ActionNode) GetID() int { return n.ID }
+
+// GetNodeType returns the node type for the shared action-flow runner.
+func (n ActionNode) GetNodeType() string { return string(n.NodeType) }
+
 // SetFlowActionID sets the node's action ID for generic action-flow helpers.
 func (n *ActionNode) SetFlowActionID(id int) { n.ActionID = id }
+
+// FlowNodeData returns the node fields for storage-level flow conversion.
+func (n ActionNode) FlowNodeData() (actionID int, nodeType, config string, x, y float64) {
+	return n.ActionID, string(n.NodeType), n.NodeConfig, n.PositionX, n.PositionY
+}
 
 // ActionEdge represents a connection between nodes
 type ActionEdge struct {
@@ -893,6 +975,15 @@ type ActionEdge struct {
 // SetFlowActionID sets the edge's action ID for generic action-flow helpers.
 func (e *ActionEdge) SetFlowActionID(id int) { e.ActionID = id }
 
+// GetSourceNodeID returns the edge's source node ID for the shared runner.
+func (e ActionEdge) GetSourceNodeID() int { return e.SourceNodeID }
+
+// GetTargetNodeID returns the edge's target node ID for the shared runner.
+func (e ActionEdge) GetTargetNodeID() int { return e.TargetNodeID }
+
+// GetEdgeType returns the edge's routing type for the shared runner.
+func (e ActionEdge) GetEdgeType() string { return e.EdgeType }
+
 // FlowSourceNodeID returns the edge's source node ID for generic action-flow helpers.
 func (e ActionEdge) FlowSourceNodeID() int { return e.SourceNodeID }
 
@@ -904,6 +995,14 @@ func (e *ActionEdge) SetFlowSourceNodeID(id int) { e.SourceNodeID = id }
 
 // SetFlowTargetNodeID sets the edge's target node ID for generic action-flow helpers.
 func (e *ActionEdge) SetFlowTargetNodeID(id int) { e.TargetNodeID = id }
+
+// FlowEdgeID returns the edge's ID for storage-level flow conversion.
+func (e ActionEdge) FlowEdgeID() int { return e.ID }
+
+// FlowEdgeData returns the edge fields for storage-level flow conversion.
+func (e ActionEdge) FlowEdgeData() (actionID int, edgeType, sourceHandle, targetHandle string) {
+	return e.ActionID, e.EdgeType, e.SourceHandle, e.TargetHandle
+}
 
 // ActionExecutionLog represents the audit trail for action executions
 type ActionExecutionLog struct {
@@ -919,44 +1018,59 @@ type ActionExecutionLog struct {
 	ErrorMessage         string                `json:"error_message,omitempty"`
 	ExecutionTrace       string                `json:"execution_trace,omitempty"` // JSON step log
 	// Joined fields for API responses
-	ActionName    string `json:"action_name,omitempty"`
-	ItemTitle     string `json:"item_title,omitempty"`
-	WorkspaceID   *int   `json:"workspace_id,omitempty"`
-	WorkspaceName string `json:"workspace_name,omitempty"`
-	DurationMs    *int64 `json:"duration_ms,omitempty"`
+	ActionName      string `json:"action_name,omitempty"`
+	ItemTitle       string `json:"item_title,omitempty"`
+	WorkspaceID     *int   `json:"workspace_id,omitempty"`
+	WorkspaceName   string `json:"workspace_name,omitempty"`
+	DurationMs      *int64 `json:"duration_ms,omitempty"`
+	DurableEventKey string `json:"-"`
 }
 
 // ActionEvent represents an event that can trigger actions
 type ActionEvent struct {
-	EventType   ActionTriggerType      `json:"event_type"`
-	WorkspaceID int                    `json:"workspace_id"`
-	ItemID      int                    `json:"item_id"`
-	ActorUserID int                    `json:"actor_user_id"`
-	OldValues   map[string]interface{} `json:"old_values,omitempty"` // Previous field values
-	NewValues   map[string]interface{} `json:"new_values,omitempty"` // New field values
+	EventType   ActionTriggerType `json:"event_type"`
+	WorkspaceID int               `json:"workspace_id"`
+	ItemID      int               `json:"item_id"`
+	ActorUserID int               `json:"actor_user_id"`
+	// ItemTypeID is the item's type at event time. NewValues carries only
+	// changed fields for item.updated, so type-filter matching reads this
+	// instead. Nil on events that predate the field.
+	ItemTypeID *int           `json:"item_type_id,omitempty"`
+	OldValues  map[string]any `json:"old_values,omitempty"` // Previous field values
+	NewValues  map[string]any `json:"new_values,omitempty"` // New field values
 	// Cascade control fields for loop prevention
 	TriggeredByAction bool   `json:"triggered_by_action,omitempty"` // True if this event was emitted by an action
 	ExecutionChainID  string `json:"execution_chain_id,omitempty"`  // UUID to look up cached chain state for cycle detection
 	CascadeDepth      int    `json:"cascade_depth,omitempty"`       // Depth level of this event (0 = user-triggered)
 	SourceApplication string `json:"source_application,omitempty"`  // "workspace", "logbook", or "asset"
+	// TriggerCommentIsPrivate carries the privacy of a comment_created
+	// trigger across cascades. Customer-visible nodes must not emit
+	// outward-facing output when it is set.
+	TriggerCommentIsPrivate bool `json:"trigger_comment_is_private,omitempty"`
 }
 
 // ExecutionContext holds context during action execution
 type ExecutionContext struct {
-	Action *Action      `json:"action"`
-	Event  *ActionEvent `json:"event"`
-	Item   *Item        `json:"item,omitempty"`
-	Actor  *User        `json:"actor,omitempty"`
+	Context         context.Context `json:"-"`
+	DurableEventKey string          `json:"-"`
+	Action          *Action         `json:"action"`
+	Event           *ActionEvent    `json:"event"`
+	Item            *Item           `json:"item,omitempty"`
+	Actor           *User           `json:"actor,omitempty"`
 	// EffectiveActorID is the user whose permissions govern this execution and
 	// whose identity downstream services record as the actor for side effects
 	// (comments authored, item history entries, etc.). It equals the action's
 	// ActorUserID override when set, otherwise the triggering user from the
 	// event. All node executors MUST use this instead of Event.ActorUserID.
-	EffectiveActorID int                    `json:"effective_actor_id"`
-	Variables        map[string]interface{} `json:"variables,omitempty"` // Dynamic variables during execution
-	StepResults      []StepResult           `json:"step_results,omitempty"`
+	EffectiveActorID int            `json:"effective_actor_id"`
+	Variables        map[string]any `json:"variables,omitempty"` // Dynamic variables during execution
+	StepResults      []StepResult   `json:"step_results,omitempty"`
 	// ChainID is set when this action is part of a cascade chain (for emitting chained events)
 	ChainID string `json:"-"` // Not serialized - internal use only
+	// TriggerCommentIsPrivate is true when this execution, directly or through
+	// a cascade, descends from a private/internal comment. Nodes that produce
+	// customer-visible output must stay internal or skip.
+	TriggerCommentIsPrivate bool `json:"-"`
 	// TotalSteps counts every node execution within this action invocation,
 	// including iterator body nodes summed across iterations. Bounded by the
 	// engine's per-flow step budget so a misconfigured nested iterator can't
@@ -966,13 +1080,13 @@ type ExecutionContext struct {
 
 // StepResult holds the result of executing a single node
 type StepResult struct {
-	NodeID       int                    `json:"node_id"`
-	NodeType     ActionNodeType         `json:"node_type"`
-	Status       ActionExecutionStatus  `json:"status"`
-	StartedAt    time.Time              `json:"started_at"`
-	CompletedAt  *time.Time             `json:"completed_at,omitempty"`
-	ErrorMessage string                 `json:"error_message,omitempty"`
-	Output       map[string]interface{} `json:"output,omitempty"`
+	NodeID       int                   `json:"node_id"`
+	NodeType     ActionNodeType        `json:"node_type"`
+	Status       ActionExecutionStatus `json:"status"`
+	StartedAt    time.Time             `json:"started_at"`
+	CompletedAt  *time.Time            `json:"completed_at,omitempty"`
+	ErrorMessage string                `json:"error_message,omitempty"`
+	Output       map[string]any        `json:"output,omitempty"`
 	// Iterations is populated when the node is an iterator (related_items).
 	// Each entry holds the per-item subgraph step results so the trace can
 	// show which downstream nodes ran for which item.
@@ -991,8 +1105,9 @@ type IterationResult struct {
 // SetFieldNodeConfig configures a set_field node.
 //
 // A node targets either a real items-table column or a custom field:
-//   - Target == "" or "column": update items.<FieldName>. FieldName must pass
-//     repository.IsAllowedItemColumn.
+//   - Target == "" or "column": update a supported item field through its
+//     domain service. Status changes are routed through workflow transitions;
+//     item type and ordering changes require their dedicated workflows.
 //   - Target == "custom_field": update a single key inside items.custom_field_values.
 //     CustomFieldID must reference a row in custom_field_definitions.
 //
@@ -1091,6 +1206,28 @@ type TransitionItemNodeConfig struct {
 type AddCommentNodeConfig struct {
 	Content   string `json:"content"` // Can contain {{variable}} templates
 	IsPrivate bool   `json:"is_private"`
+}
+
+// InsertCannedResponseNodeConfig configures an insert_canned_response node
+// (WI-1138). The referenced canned response must be active; private snippets
+// are inserted as private comments.
+type InsertCannedResponseNodeConfig struct {
+	CannedResponseID int `json:"canned_response_id"`
+}
+
+// NotifyCustomerNodeConfig configures a notify_customer node (WI-1132). The
+// message supports {{variable}} templates and is emailed to the portal
+// customer who created the item.
+type NotifyCustomerNodeConfig struct {
+	Subject string `json:"subject,omitempty"`
+	Message string `json:"message"`
+}
+
+// AdjustLabelsNodeConfig configures an adjust_labels node (WI-1132). At
+// least one of the two lists must be non-empty.
+type AdjustLabelsNodeConfig struct {
+	AddLabelIDs    []int `json:"add_label_ids,omitempty"`
+	RemoveLabelIDs []int `json:"remove_label_ids,omitempty"`
 }
 
 // NotifyUserNodeConfig configures a notify_user node
@@ -1294,6 +1431,64 @@ type HTTPAuthRef struct {
 	Scheme       string `json:"scheme,omitempty"`    // e.g. "Bearer"
 }
 
+// IsValidHTTPHeaderName reports whether name is a non-empty RFC 9110 token.
+// Header maps are persisted before net/http sees them, so rejecting malformed
+// names here prevents CR/LF and whitespace tricks from becoming latent runtime
+// failures (or confusing case-insensitive collision checks).
+func IsValidHTTPHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !isHTTPTokenChar(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHTTPTokenChar(c byte) bool {
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+// IsValidHTTPAuthScheme validates the auth-scheme grammar (RFC 9110 §11.1).
+// In particular it excludes spaces, so a scheme field cannot smuggle an
+// inline credential alongside the encrypted credential reference.
+func IsValidHTTPAuthScheme(scheme string) bool {
+	if scheme == "" {
+		return true
+	}
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(i > 0 && ((c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// NormalizeActionHTTPMethod canonicalizes the intentionally small method set
+// supported by action HTTP nodes and agent HTTP tools.
+func NormalizeActionHTTPMethod(method string) (string, bool) {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	switch method {
+	case "GET", "POST", "PUT", "DELETE", "PATCH":
+		return method, true
+	default:
+		return method, false
+	}
+}
+
 // IsSensitiveHeaderName reports whether the given HTTP header name is
 // considered sensitive and must therefore not appear as a literal in
 // DefaultHeaders or in an HTTPRequestNodeConfig.Headers map. Matching is
@@ -1316,6 +1511,7 @@ func IsSensitiveHeaderName(name string) bool {
 		"x-auth-token",
 		"x-access-token",
 		"x-secret-key",
+		"x-signature",
 		"x-amz-security-token",
 		"x-github-token":
 		return true
@@ -1326,7 +1522,8 @@ func IsSensitiveHeaderName(name string) bool {
 	return strings.HasSuffix(lk, "-token") ||
 		strings.HasSuffix(lk, "-key") ||
 		strings.HasSuffix(lk, "-secret") ||
-		strings.HasSuffix(lk, "-password")
+		strings.HasSuffix(lk, "-password") ||
+		strings.HasSuffix(lk, "-signature")
 }
 
 // LLMConnectionCapabilityConfig is the config for an llm_connection capability.
@@ -1364,13 +1561,15 @@ type UpdateCapabilityRequest struct {
 
 // CreateActionRequest represents the API request to create an action
 type CreateActionRequest struct {
-	Name          string            `json:"name"`
-	Description   string            `json:"description,omitempty"`
-	TriggerType   ActionTriggerType `json:"trigger_type"`
-	TriggerConfig string            `json:"trigger_config,omitempty"`
-	ActorUserID   *int              `json:"actor_user_id,omitempty"` // requires action.set_actor global permission
-	Nodes         []ActionNode      `json:"nodes,omitempty"`
-	Edges         []ActionEdge      `json:"edges,omitempty"`
+	Name           string            `json:"name"`
+	Description    string            `json:"description,omitempty"`
+	TriggerType    ActionTriggerType `json:"trigger_type"`
+	TriggerConfig  string            `json:"trigger_config,omitempty"`
+	IsEnabled      *bool             `json:"is_enabled,omitempty"`
+	ActorUserID    *int              `json:"actor_user_id,omitempty"` // requires action.set_actor global permission
+	AllowedRoleIDs []int             `json:"allowed_role_ids,omitempty"`
+	Nodes          []ActionNode      `json:"nodes,omitempty"`
+	Edges          []ActionEdge      `json:"edges,omitempty"`
 }
 
 // ActionActorUpdate carries an optional actor_user_id patch for an action.
@@ -1399,12 +1598,13 @@ func (a *ActionActorUpdate) UnmarshalJSON(data []byte) error {
 
 // UpdateActionRequest represents the API request to update an action
 type UpdateActionRequest struct {
-	Name          *string            `json:"name,omitempty"`
-	Description   *string            `json:"description,omitempty"`
-	TriggerType   *ActionTriggerType `json:"trigger_type,omitempty"`
-	TriggerConfig *string            `json:"trigger_config,omitempty"`
-	IsEnabled     *bool              `json:"is_enabled,omitempty"`
-	ActorUserID   ActionActorUpdate  `json:"actor_user_id,omitempty"` // requires action.set_actor global permission when present
-	Nodes         []ActionNode       `json:"nodes,omitempty"`
-	Edges         []ActionEdge       `json:"edges,omitempty"`
+	Name           *string            `json:"name,omitempty"`
+	Description    *string            `json:"description,omitempty"`
+	TriggerType    *ActionTriggerType `json:"trigger_type,omitempty"`
+	TriggerConfig  *string            `json:"trigger_config,omitempty"`
+	IsEnabled      *bool              `json:"is_enabled,omitempty"`
+	ActorUserID    ActionActorUpdate  `json:"actor_user_id,omitempty"` // requires action.set_actor global permission when present
+	AllowedRoleIDs []int              `json:"allowed_role_ids,omitempty"`
+	Nodes          []ActionNode       `json:"nodes,omitempty"`
+	Edges          []ActionEdge       `json:"edges,omitempty"`
 }

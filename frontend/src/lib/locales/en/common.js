@@ -92,6 +92,7 @@ export default {
     assignTo: 'Assign To',
     assign: 'Assign',
     assignee: 'Assignee',
+    team: 'Team',
     allAssignees: 'All Assignees',
     unassigned: 'Unassigned',
     members: 'Members',
@@ -136,8 +137,11 @@ export default {
 
     // Status indicators
     loading: 'Loading...',
+    loadingSlow: 'This can take a moment on a slow connection.',
+    skipToMainContent: 'Skip to main content',
     saving: 'Saving...',
     deleting: 'Deleting...',
+    submitting: 'Submitting...',
     processing: 'Processing...',
     uploading: 'Uploading...',
     downloading: 'Downloading...',
@@ -155,6 +159,7 @@ export default {
     loadingMore: 'Loading more...',
     remaining: 'remaining',
     showingOfTotal: 'Showing {count} of {total}',
+    showingXofY: 'Showing {from}–{to} of {total}',
 
     // Results
     noResults: 'No results found',
@@ -181,6 +186,11 @@ export default {
     now: 'Now',
     never: 'Never',
     always: 'Always',
+    deleted: 'Deleted',
+    dismiss: 'Dismiss',
+    error: 'Error',
+    notFound: 'Not Found',
+    workspace: 'Workspace',
 
     // Additional common terms
     none: 'None',
@@ -223,6 +233,7 @@ export default {
     updated: 'Updated successfully',
     copied: 'Copied to clipboard',
     failed: 'Operation failed',
+    layoutSaveFailed: 'Dashboard changes could not be saved. Your edits will be lost on reload.',
   },
 
   // Backend error codes
@@ -261,8 +272,11 @@ export default {
     // Generic
     UNKNOWN: 'An unknown error occurred.',
     generic: 'Something went wrong. Please try again.',
+    failedToCreate: 'Failed to create',
     failedToSave: 'Failed to save',
     failedToDelete: 'Failed to delete',
+    failedToLoad: 'Failed to load',
+    failedToUpdate: 'Failed to update',
   },
 
   // Validation messages
@@ -282,6 +296,7 @@ export default {
     emailTaken: 'This email is already in use',
     usernameTaken: 'This username is already taken',
     slugInvalid: 'Only lowercase letters, numbers, and hyphens allowed',
+    nameRequired: 'Name is required',
     fillRequired: 'Please fill in all required fields',
   },
 
@@ -313,5 +328,16 @@ export default {
     noRequirements: 'No requirements configured',
     configureFilter: 'Configure filter to see items',
     createToStart: 'Create {item} to get started',
+  },
+  dueDate: {
+    noDueDate: 'No due date',
+    dueToday: 'Due today',
+    dueTomorrow: 'Due tomorrow',
+    dueYesterday: 'Due yesterday',
+    dueInDays: 'Due in {days} days',
+    overdueByDays: 'Overdue by {days} days',
+    overdueTooltip: 'Overdue by {days} days — was due {date}',
+    dueSoonTooltip: 'Due in {days} days — {date}',
+    dueLaterTooltip: 'Due {date}',
   },
 };

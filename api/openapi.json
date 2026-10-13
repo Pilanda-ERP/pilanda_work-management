@@ -82,7 +82,7 @@
             "type": "integer"
           },
           "custom_field_values": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "description": {
@@ -179,7 +179,7 @@
             "$ref": "#/components/schemas/dto.UserSummary"
           },
           "custom_field_values": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "description": {
@@ -442,7 +442,7 @@
             "type": "integer"
           },
           "custom_field_values": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "description": {
@@ -491,6 +491,14 @@
           },
           "uploader": {
             "$ref": "#/components/schemas/dto.UserSummary"
+          },
+          "uploader_portal_customer": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/dto.PortalCustomerSummary"
+              }
+            ],
+            "description": "UploaderPortalCustomer carries the portal-customer uploader when the\nfile was submitted through a portal or public form."
           }
         },
         "type": "object"
@@ -512,6 +520,9 @@
             "$ref": "#/components/schemas/dto.UserSummary"
           },
           "content": {
+            "type": "string"
+          },
+          "content_html": {
             "type": "string"
           },
           "created_at": {
@@ -562,6 +573,10 @@
       },
       "dto.HistoryResponse": {
         "properties": {
+          "actor_kind": {
+            "description": "ActorKind is \"user\" (also when absent, for legacy rows),\n\"portal_customer\", or \"system\". PortalCustomer carries the acting\nportal customer for portal_customer entries.",
+            "type": "string"
+          },
           "changed_at": {
             "type": "string"
           },
@@ -579,6 +594,9 @@
           },
           "old_value": {
             "type": "string"
+          },
+          "portal_customer": {
+            "$ref": "#/components/schemas/dto.PortalCustomerSummary"
           },
           "resolved_new_value": {
             "type": "string"
@@ -598,7 +616,7 @@
             "type": "integer"
           },
           "custom_fields": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "description": {
@@ -638,6 +656,7 @@
             "type": "string"
           },
           "status_id": {
+            "description": "Optional create-time placement. If omitted, the item uses the workflow initial status.\nIf provided, it must be the initial status or directly reachable from the initial status\nwithout workflow conditions, validators, or approval gates.",
             "type": "integer"
           },
           "title": {
@@ -726,10 +745,13 @@
             "$ref": "#/components/schemas/dto.UserSummary"
           },
           "custom_fields": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "description": {
+            "type": "string"
+          },
+          "description_html": {
             "type": "string"
           },
           "due_date": {
@@ -844,6 +866,9 @@
       },
       "dto.ItemTypeSummary": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
           "color": {
             "type": "string"
           },
@@ -868,7 +893,7 @@
             "type": "integer"
           },
           "custom_fields": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "description": {
@@ -1013,6 +1038,10 @@
             },
             "type": "array"
           },
+          "metadata": {
+            "additionalProperties": {},
+            "type": "object"
+          },
           "parent_id": {
             "type": "integer"
           },
@@ -1084,8 +1113,25 @@
         },
         "type": "object"
       },
+      "dto.PortalCustomerSummary": {
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "dto.PrioritySummary": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
           "color": {
             "type": "string"
           },
@@ -1114,6 +1160,12 @@
       },
       "dto.StatusSummary": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
+          "category_builtin_key": {
+            "type": "string"
+          },
           "category_color": {
             "type": "string"
           },
@@ -1148,6 +1200,9 @@
       },
       "dto.TransitionResponse": {
         "properties": {
+          "from_all_statuses": {
+            "type": "boolean"
+          },
           "from_status": {
             "$ref": "#/components/schemas/dto.StatusSummary"
           },
@@ -1219,6 +1274,61 @@
           },
           "name": {
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.AIChatRequest": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.AIChatResponse": {
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "iterations": {
+            "type": "integer"
+          },
+          "message_id": {
+            "type": "integer"
+          },
+          "run_id": {
+            "type": "integer"
+          },
+          "stop_reason": {
+            "type": "string"
+          },
+          "user_message_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.AIDailyBriefingResponse": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "references": {
+            "additionalProperties": {},
+            "type": "object"
           }
         },
         "type": "object"
@@ -1338,13 +1448,45 @@
         },
         "type": "object"
       },
+      "handlers.AgentRunResponse": {
+        "properties": {
+          "ended_at": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "job_kind": {
+            "type": "string"
+          },
+          "queued_at": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "handlers.AuditLogEntryResponse": {
         "properties": {
           "action_type": {
             "type": "string"
           },
           "details": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "error_message": {
@@ -1472,10 +1614,19 @@
       },
       "handlers.ItemTypeResponse": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
           "color": {
             "type": "string"
           },
           "description": {
+            "type": "string"
+          },
+          "display_description": {
+            "type": "string"
+          },
+          "display_name": {
             "type": "string"
           },
           "hierarchy_level": {
@@ -1583,6 +1734,30 @@
         },
         "type": "object"
       },
+      "handlers.IterationUpdateRequest": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "end_date": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "start_date": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "type_id": {
+            "nullable": true,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "handlers.MilestoneCreateRequest": {
         "properties": {
           "category_id": {
@@ -1620,10 +1795,16 @@
           "item_number": {
             "type": "integer"
           },
+          "priority_builtin_key": {
+            "type": "string"
+          },
           "priority_color": {
             "type": "string"
           },
           "priority_name": {
+            "type": "string"
+          },
+          "status_builtin_key": {
             "type": "string"
           },
           "status_color": {
@@ -1711,6 +1892,9 @@
           "id": {
             "type": "integer"
           },
+          "is_global": {
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -1731,12 +1915,18 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "workspace_id": {
+            "type": "integer"
           }
         },
         "type": "object"
       },
       "handlers.MilestoneStatusBreakdownResponse": {
         "properties": {
+          "category_builtin_key": {
+            "type": "string"
+          },
           "category_color": {
             "type": "string"
           },
@@ -1752,6 +1942,28 @@
         },
         "type": "object"
       },
+      "handlers.MilestoneUpdateRequest": {
+        "properties": {
+          "category_id": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "target_date": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "handlers.PaginatedResponse": {
         "properties": {
           "data": {},
@@ -1763,10 +1975,19 @@
       },
       "handlers.PriorityResponse": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
           "color": {
             "type": "string"
           },
           "description": {
+            "type": "string"
+          },
+          "display_description": {
+            "type": "string"
+          },
+          "display_name": {
             "type": "string"
           },
           "icon": {
@@ -1789,10 +2010,19 @@
       },
       "handlers.StatusCategoryResponse": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
           "color": {
             "type": "string"
           },
           "description": {
+            "type": "string"
+          },
+          "display_description": {
+            "type": "string"
+          },
+          "display_name": {
             "type": "string"
           },
           "id": {
@@ -1812,6 +2042,12 @@
       },
       "handlers.StatusResponse": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
+          "category_builtin_key": {
+            "type": "string"
+          },
           "category_color": {
             "type": "string"
           },
@@ -1822,6 +2058,12 @@
             "type": "string"
           },
           "description": {
+            "type": "string"
+          },
+          "display_description": {
+            "type": "string"
+          },
+          "display_name": {
             "type": "string"
           },
           "id": {
@@ -1839,8 +2081,33 @@
         },
         "type": "object"
       },
+      "handlers.TranslationResolveRequest": {
+        "properties": {
+          "locale": {
+            "type": "string"
+          },
+          "targets": {
+            "items": {
+              "$ref": "#/components/schemas/objecttranslation.Target"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.TranslationUpsertRequest": {
+        "properties": {
+          "value": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "handlers.WorkflowResponse": {
         "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
           "created_at": {
             "type": "string"
           },
@@ -1887,6 +2154,12 @@
           "name": {
             "maxLength": 100,
             "type": "string"
+          },
+          "template_pack": {
+            "type": "string"
+          },
+          "template_workspace_id": {
+            "type": "integer"
           }
         },
         "required": [
@@ -1921,11 +2194,17 @@
           "is_personal": {
             "type": "boolean"
           },
+          "is_template": {
+            "type": "boolean"
+          },
           "key": {
             "type": "string"
           },
           "name": {
             "type": "string"
+          },
+          "time_project_id": {
+            "type": "integer"
           },
           "updated_at": {
             "type": "string"
@@ -1935,6 +2214,35 @@
               "type": "string"
             },
             "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.WorkspaceTemplateSummaryResponse": {
+        "properties": {
+          "color": {
+            "type": "string"
+          },
+          "configuration_set_name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "icon": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "item_count": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "template_count": {
+            "type": "integer"
           }
         },
         "type": "object"
@@ -1951,6 +2259,12 @@
             "type": "string"
           },
           "icon": {
+            "type": "string"
+          },
+          "is_template": {
+            "type": "boolean"
+          },
+          "key": {
             "type": "string"
           },
           "name": {
@@ -2016,6 +2330,32 @@
         },
         "type": "object"
       },
+      "handlers.batchItemLinksResponse": {
+        "properties": {
+          "has_more_links": {
+            "type": "boolean"
+          },
+          "incoming": {
+            "items": {
+              "$ref": "#/components/schemas/models.ItemLink"
+            },
+            "type": "array"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "next_after_link_id": {
+            "type": "integer"
+          },
+          "outgoing": {
+            "items": {
+              "$ref": "#/components/schemas/models.ItemLink"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "handlers.capabilityDTO": {
         "properties": {
           "capability_type": {
@@ -2056,6 +2396,41 @@
         },
         "type": "object"
       },
+      "handlers.createWorklogRequest": {
+        "properties": {
+          "date": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "duration": {
+            "type": "string"
+          },
+          "duration_minutes": {
+            "type": "integer"
+          },
+          "end_time": {
+            "type": "string"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "item_key": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "integer"
+          },
+          "start_time": {
+            "type": "string"
+          },
+          "timezone": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "handlers.diagramListResponse": {
         "properties": {
           "items": {
@@ -2073,6 +2448,40 @@
             "type": "string"
           },
           "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.itemChangeResponse": {
+        "properties": {
+          "change_type": {
+            "type": "string"
+          },
+          "item_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.itemChangesResponse": {
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/handlers.itemChangeResponse"
+            },
+            "type": "array"
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "reset_required": {
+            "type": "boolean"
+          },
+          "watermark": {
             "type": "string"
           }
         },
@@ -2201,11 +2610,26 @@
           "is_home": {
             "type": "boolean"
           },
+          "metadata": {
+            "additionalProperties": {},
+            "type": "object"
+          },
           "parent_id": {
             "type": "integer"
           },
           "title": {
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.pageDiagramListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/services.PageDiagram"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -2311,6 +2735,9 @@
       },
       "handlers.pageMoveRequest": {
         "properties": {
+          "destination_workspace_id": {
+            "type": "integer"
+          },
           "next_sibling_id": {
             "type": "integer"
           },
@@ -2356,6 +2783,13 @@
           "content": {
             "type": "string"
           },
+          "expected_content_hash": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": {},
+            "type": "object"
+          },
           "title": {
             "type": "string"
           }
@@ -2384,33 +2818,19 @@
         },
         "type": "object"
       },
-      "handlers.rrulePreviewRequest": {
+      "handlers.startTimerRequest": {
         "properties": {
-          "count": {
+          "description": {
+            "type": "string"
+          },
+          "item_id": {
             "type": "integer"
           },
-          "dtstart": {
-            "type": "string"
+          "project_id": {
+            "type": "integer"
           },
-          "rrule": {
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
-      "handlers.rrulePreviewResponse": {
-        "properties": {
-          "dtstart": {
-            "type": "string"
-          },
-          "occurrences": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "rrule": {
-            "type": "string"
+          "workspace_id": {
+            "type": "integer"
           }
         },
         "type": "object"
@@ -2490,42 +2910,6 @@
         },
         "type": "object"
       },
-      "handlers.testResultWithCaseTitle": {
-        "properties": {
-          "actual_result": {
-            "type": "string"
-          },
-          "created_at": {
-            "type": "string"
-          },
-          "executed_at": {
-            "type": "string"
-          },
-          "id": {
-            "type": "integer"
-          },
-          "notes": {
-            "type": "string"
-          },
-          "run_id": {
-            "type": "integer"
-          },
-          "status": {
-            "description": "\"passed\", \"failed\", \"blocked\", \"skipped\", \"not_run\"",
-            "type": "string"
-          },
-          "test_case_id": {
-            "type": "integer"
-          },
-          "test_case_title": {
-            "type": "string"
-          },
-          "updated_at": {
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
       "handlers.testRunCreateRequest": {
         "properties": {
           "assignee_id": {
@@ -2539,6 +2923,51 @@
           },
           "template_id": {
             "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.timeProjectResponse": {
+        "properties": {
+          "category_color": {
+            "type": "string"
+          },
+          "category_id": {
+            "type": "integer"
+          },
+          "category_name": {
+            "type": "string"
+          },
+          "color": {
+            "type": "string"
+          },
+          "customer_id": {
+            "type": "integer"
+          },
+          "customer_name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "hourly_rate": {
+            "type": "number"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "settings": {
+            "additionalProperties": {},
+            "type": "object"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total_hours": {
+            "type": "number"
           }
         },
         "type": "object"
@@ -2560,6 +2989,14 @@
         },
         "type": "object"
       },
+      "handlers.updateWorklogRequest": {
+        "properties": {
+          "description": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "handlers.validateActionResponse": {
         "properties": {
           "errors": {
@@ -2567,6 +3004,87 @@
               "$ref": "#/components/schemas/actioncatalog.ValidationError"
             },
             "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "handlers.worklogResponse": {
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "customer_id": {
+            "type": "integer"
+          },
+          "customer_name": {
+            "type": "string"
+          },
+          "date": {
+            "type": "integer"
+          },
+          "description": {
+            "type": "string"
+          },
+          "duration_minutes": {
+            "type": "integer"
+          },
+          "end_time": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "item_title": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "integer"
+          },
+          "project_max_hours": {
+            "type": "number"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_total_hours": {
+            "type": "number"
+          },
+          "start_time": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "workspace_id": {
+            "type": "integer"
+          },
+          "workspace_item_number": {
+            "type": "integer"
+          },
+          "workspace_key": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "health.livenessResponse": {
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "health.readinessResponse": {
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
           }
         },
         "type": "object"
@@ -2625,6 +3143,13 @@
           "actor_user_id": {
             "description": "ActorUserID overrides the execution actor. NULL means the action runs under\nthe triggering user's permissions. Setting this field requires the global\naction.set_actor permission because it grants cross-workspace impersonation.",
             "type": "integer"
+          },
+          "allowed_role_ids": {
+            "description": "AllowedRoleIDs restricts a manual action to members of these workspace\nroles. An empty list means every workspace editor may trigger it.",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
           },
           "created_at": {
             "type": "string"
@@ -2782,6 +3307,8 @@
           "item_updated",
           "item_linked",
           "manual",
+          "sla_breached",
+          "sla_warning",
           "scm_tag_created",
           "scm_release_branch_created",
           "scm_pr_linked",
@@ -2794,11 +3321,63 @@
           "ActionTriggerItemUpdated",
           "ActionTriggerItemLinked",
           "ActionTriggerManual",
+          "ActionTriggerSLABreached",
+          "ActionTriggerSLAWarning",
           "ActionTriggerSCMTagCreated",
           "ActionTriggerSCMReleaseBranchCreated",
           "ActionTriggerSCMPRLinked",
           "ActionTriggerSCMPRMerged"
         ]
+      },
+      "models.ActiveTimer": {
+        "properties": {
+          "created_at": {
+            "description": "Unix timestamp",
+            "type": "integer"
+          },
+          "customer_name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "item_id": {
+            "description": "Optional link to work item",
+            "type": "integer"
+          },
+          "item_title": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "start_time_utc": {
+            "description": "Unix timestamp in UTC",
+            "type": "integer"
+          },
+          "user_id": {
+            "type": "integer"
+          },
+          "workspace_id": {
+            "type": "integer"
+          },
+          "workspace_item_number": {
+            "type": "integer"
+          },
+          "workspace_key": {
+            "type": "string"
+          },
+          "workspace_name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
       },
       "models.Attachment": {
         "properties": {
@@ -2832,11 +3411,19 @@
           "uploaded_by": {
             "type": "integer"
           },
+          "uploaded_by_portal_customer_id": {
+            "description": "UploadedByPortalCustomerID carries the portal-customer uploader when\nthe file was submitted through a portal or public form; UploadedBy is\nnil in that case.",
+            "type": "integer"
+          },
           "uploader_email": {
             "type": "string"
           },
           "uploader_name": {
             "description": "Joined fields for API responses",
+            "type": "string"
+          },
+          "uploader_portal_customer_name": {
+            "description": "UploaderPortalCustomerName is the resolved portal-customer uploader\nname for portal/form submissions.",
             "type": "string"
           }
         },
@@ -2940,6 +3527,86 @@
         },
         "type": "object"
       },
+      "models.Incident": {
+        "properties": {
+          "acknowledged_at": {
+            "type": "string"
+          },
+          "acknowledged_by": {
+            "type": "integer"
+          },
+          "acknowledged_by_name": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "escalation_policy_id": {
+            "type": "integer"
+          },
+          "escalation_repeat_count": {
+            "type": "integer"
+          },
+          "escalation_step": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "item_key": {
+            "type": "string"
+          },
+          "item_title": {
+            "type": "string"
+          },
+          "next_escalation_at": {
+            "type": "string"
+          },
+          "policy_name": {
+            "description": "Joined fields",
+            "type": "string"
+          },
+          "resolved_at": {
+            "type": "string"
+          },
+          "resolved_by": {
+            "type": "integer"
+          },
+          "resolved_by_name": {
+            "type": "string"
+          },
+          "source": {
+            "description": "manual, automation, webhook, item",
+            "type": "string"
+          },
+          "status": {
+            "description": "triggered, acknowledged, resolved",
+            "type": "string"
+          },
+          "team_id": {
+            "type": "integer"
+          },
+          "team_name": {
+            "type": "string"
+          },
+          "triggered_at": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "urgency": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "models.Item": {
         "properties": {
           "assignee_avatar": {
@@ -3010,10 +3677,13 @@
             "type": "string"
           },
           "custom_field_values": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "description": {
+            "type": "string"
+          },
+          "description_html": {
             "type": "string"
           },
           "due_date": {
@@ -3042,6 +3712,13 @@
           "id": {
             "type": "integer"
           },
+          "incident": {
+            "$ref": "#/components/schemas/models.Incident"
+          },
+          "incident_id": {
+            "description": "Current/latest incident. Non-nil means this item is an incident; the\nincident's own history lives in the incidents table.",
+            "type": "integer"
+          },
           "inherit_project": {
             "description": "If true, ProjectID is ignored and the parent item's effective project is used",
             "type": "boolean"
@@ -3049,6 +3726,9 @@
           "is_task": {
             "description": "Flag to mark this item as a task (checklist item)",
             "type": "boolean"
+          },
+          "item_type_builtin_key": {
+            "type": "string"
           },
           "item_type_id": {
             "description": "Optional, defaults to workspace's default item type",
@@ -3067,8 +3747,12 @@
           "iteration_name": {
             "type": "string"
           },
+          "key": {
+            "description": "Ready-to-display workspace key and item number",
+            "type": "string"
+          },
           "labels": {
-            "description": "Workspace-scoped labels",
+            "description": "Global item labels",
             "items": {
               "$ref": "#/components/schemas/models.Label"
             },
@@ -3088,6 +3772,9 @@
             "description": "Hierarchy fields",
             "type": "integer"
           },
+          "parent_key": {
+            "type": "string"
+          },
           "parent_title": {
             "type": "string"
           },
@@ -3100,6 +3787,9 @@
               "$ref": "#/components/schemas/models.PersonalLabel"
             },
             "type": "array"
+          },
+          "priority_builtin_key": {
+            "type": "string"
           },
           "priority_color": {
             "type": "string"
@@ -3171,6 +3861,10 @@
             "description": "Start date for item",
             "type": "string"
           },
+          "status_builtin_key": {
+            "description": "Stable key for translating built-in statuses",
+            "type": "string"
+          },
           "status_color": {
             "description": "Color from the status category (joined field)",
             "type": "string"
@@ -3191,6 +3885,20 @@
             "description": "Estimation",
             "type": "number"
           },
+          "team_avatar_url": {
+            "type": "string"
+          },
+          "team_color": {
+            "type": "string"
+          },
+          "team_id": {
+            "description": "Team assignment. Mirrors AssigneeID at the team level and is the team\nwhose on-call policy governs an incident on this item.",
+            "type": "integer"
+          },
+          "team_name": {
+            "description": "Team information for API responses",
+            "type": "string"
+          },
           "time_project_id": {
             "type": "integer"
           },
@@ -3205,7 +3913,7 @@
             "type": "string"
           },
           "virtual_field_data": {
-            "additionalProperties": true,
+            "additionalProperties": {},
             "type": "object"
           },
           "workspace_id": {
@@ -3449,9 +4157,6 @@
           },
           "updated_at": {
             "type": "string"
-          },
-          "workspace_id": {
-            "type": "integer"
           }
         },
         "type": "object"
@@ -3468,6 +4173,9 @@
             },
             "type": "array"
           },
+          "builtin_key": {
+            "type": "string"
+          },
           "color": {
             "type": "string"
           },
@@ -3475,6 +4183,12 @@
             "type": "string"
           },
           "description": {
+            "type": "string"
+          },
+          "display_description": {
+            "type": "string"
+          },
+          "display_name": {
             "type": "string"
           },
           "forward_label": {
@@ -3566,6 +4280,12 @@
       },
       "models.MilestoneRelease": {
         "properties": {
+          "assets": {
+            "items": {
+              "$ref": "#/components/schemas/models.SCMReleaseAsset"
+            },
+            "type": "array"
+          },
           "body": {
             "type": "string"
           },
@@ -3584,10 +4304,19 @@
           "is_prerelease": {
             "type": "boolean"
           },
+          "last_synced_at": {
+            "type": "string"
+          },
           "milestone_id": {
             "type": "integer"
           },
           "name": {
+            "type": "string"
+          },
+          "release_status": {
+            "type": "string"
+          },
+          "released_at": {
             "type": "string"
           },
           "scm_connection_id": {
@@ -3607,8 +4336,14 @@
           "tag_name": {
             "type": "string"
           },
+          "tag_url": {
+            "type": "string"
+          },
           "target_commitish": {
             "type": "string"
+          },
+          "workspace_repository_id": {
+            "type": "integer"
           }
         },
         "type": "object"
@@ -3686,6 +4421,21 @@
         },
         "type": "object"
       },
+      "models.RRulePreviewRequest": {
+        "properties": {
+          "count": {
+            "description": "Number of occurrences to preview (default 10)",
+            "type": "integer"
+          },
+          "dtstart": {
+            "type": "string"
+          },
+          "rrule": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "models.RecurrenceInstance": {
         "properties": {
           "created_at": {
@@ -3701,7 +4451,6 @@
             "type": "string"
           },
           "item_title": {
-            "description": "Joined fields for API responses",
             "type": "string"
           },
           "recurrence_rule_id": {
@@ -3719,7 +4468,6 @@
       "models.RecurrenceRule": {
         "properties": {
           "copy_assignee": {
-            "description": "Instance configuration (what to copy from template)",
             "type": "boolean"
           },
           "copy_custom_fields": {
@@ -3754,14 +4502,12 @@
             "type": "integer"
           },
           "is_active": {
-            "description": "Lifecycle",
             "type": "boolean"
           },
           "last_generated_until": {
             "type": "string"
           },
           "lead_time_days": {
-            "description": "Generation settings",
             "type": "integer"
           },
           "next_generation_check": {
@@ -3771,7 +4517,7 @@
             "type": "string"
           },
           "rrule": {
-            "description": "iCalendar RRULE configuration (RFC 5545)",
+            "description": "e.g., \"FREQ=WEEKLY;BYDAY=MO,WE,FR\"",
             "type": "string"
           },
           "status_on_create": {
@@ -3781,7 +4527,6 @@
             "type": "integer"
           },
           "template_title": {
-            "description": "Joined fields for API responses",
             "type": "string"
           },
           "timezone": {
@@ -3803,10 +4548,74 @@
         },
         "type": "object"
       },
+      "models.SCMReleaseAsset": {
+        "properties": {
+          "direct_url": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "link_type": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "models.SkillActivationUsage": {
+        "properties": {
+          "bytes": {
+            "type": "integer"
+          },
+          "estimated_tokens": {
+            "type": "integer"
+          },
+          "max_bytes": {
+            "type": "integer"
+          },
+          "max_tokens": {
+            "type": "integer"
+          },
+          "page_prefix_bytes": {
+            "type": "integer"
+          },
+          "page_prefix_runes": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "models.SkillPageReference": {
         "properties": {
+          "activation_bytes": {
+            "type": "integer"
+          },
+          "activation_runes": {
+            "type": "integer"
+          },
           "id": {
             "type": "integer"
+          },
+          "page_updated_at": {
+            "type": "string"
+          },
+          "snapshot_at": {
+            "type": "string"
+          },
+          "snapshot_title": {
+            "type": "string"
+          },
+          "stale": {
+            "type": "boolean"
           },
           "title": {
             "type": "string"
@@ -3816,6 +4625,9 @@
       },
       "models.TestCase": {
         "properties": {
+          "bdd": {
+            "$ref": "#/components/schemas/models.TestCaseBDD"
+          },
           "created_at": {
             "type": "string"
           },
@@ -3827,7 +4639,9 @@
             "type": "integer"
           },
           "folder_name": {
-            "description": "Computed fields for API responses",
+            "type": "string"
+          },
+          "format": {
             "type": "string"
           },
           "id": {
@@ -3874,6 +4688,109 @@
         },
         "type": "object"
       },
+      "models.TestCaseBDD": {
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "feature_name": {
+            "type": "string"
+          },
+          "gherkin": {
+            "type": "string"
+          },
+          "scenario_keyword": {
+            "type": "string"
+          },
+          "spec": {
+            "description": "Spec is the JSON-encoded gherkin.ScenarioSpec derived from Gherkin.",
+            "type": "string"
+          },
+          "test_case_id": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "models.TestExampleResult": {
+        "properties": {
+          "actual_result": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "example_index": {
+            "type": "integer"
+          },
+          "executed_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "row_values": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "run_id": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "step_results": {
+            "items": {
+              "$ref": "#/components/schemas/models.TestExampleStepResult"
+            },
+            "type": "array"
+          },
+          "test_case_id": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "models.TestExampleStepResult": {
+        "properties": {
+          "actual_result": {
+            "type": "string"
+          },
+          "example_result_id": {
+            "type": "integer"
+          },
+          "executed_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "step_number": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "models.TestFolder": {
         "properties": {
           "created_at": {
@@ -3895,7 +4812,6 @@
             "type": "integer"
           },
           "test_case_count": {
-            "description": "Computed fields for API responses",
             "type": "integer"
           },
           "updated_at": {
@@ -3946,7 +4862,6 @@
             "type": "integer"
           },
           "assignee_name": {
-            "description": "Computed fields from JOIN with users table",
             "type": "string"
           },
           "created_at": {
@@ -3977,6 +4892,35 @@
         },
         "type": "object"
       },
+      "models.TestRunCaseSnapshot": {
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "gherkin": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "preconditions": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "integer"
+          },
+          "spec": {
+            "type": "string"
+          },
+          "test_case_id": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "models.TestRunTemplate": {
         "properties": {
           "created_at": {
@@ -3995,7 +4939,6 @@
             "type": "integer"
           },
           "set_name": {
-            "description": "Joined fields for API responses",
             "type": "string"
           },
           "updated_at": {
@@ -4040,11 +4983,9 @@
             "type": "integer"
           },
           "test_case_count": {
-            "description": "Test case count",
             "type": "integer"
           },
           "total_runs": {
-            "description": "Test run statistics",
             "type": "integer"
           },
           "updated_at": {
@@ -4123,6 +5064,20 @@
         },
         "type": "object"
       },
+      "models.UserTUIPreferences": {
+        "properties": {
+          "last_workspace_id": {
+            "type": "integer"
+          },
+          "split_ratio": {
+            "type": "number"
+          },
+          "theme": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "models.WorkspaceAgentSkill": {
         "properties": {
           "body": {
@@ -4148,7 +5103,7 @@
             "type": "string"
           },
           "pages": {
-            "description": "Pages are the workspace pages referenced by this skill (WI-517). On the\nadmin surface they round-trip so the editor can render the current\nselection; on the agent-facing `ws skill get` surface their markdown is\ninlined into Body instead. nil/omitted when the skill references none.",
+            "description": "Pages are the workspace pages referenced by this skill (WI-517). On the\nadmin surface they round-trip with snapshot review state; the exact saved\ncontent is rendered into a run grant. nil/omitted when there are none.",
             "items": {
               "$ref": "#/components/schemas/models.SkillPageReference"
             },
@@ -4157,8 +5112,117 @@
           "updated_at": {
             "type": "string"
           },
+          "usage": {
+            "$ref": "#/components/schemas/models.SkillActivationUsage"
+          },
           "workspace_id": {
             "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "objecttranslation.CanonicalDifference": {
+        "properties": {
+          "builtin_key": {
+            "type": "string"
+          },
+          "canonical": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "object_id": {
+            "type": "integer"
+          },
+          "object_type": {
+            "type": "string"
+          },
+          "system": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "objecttranslation.ObjectDefinition": {
+        "properties": {
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "object_type": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "objecttranslation.ResolvedValue": {
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "locale": {
+            "type": "string"
+          },
+          "object_id": {
+            "type": "integer"
+          },
+          "object_type": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "objecttranslation.Target": {
+        "properties": {
+          "fallback": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "object_id": {
+            "type": "integer"
+          },
+          "object_type": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "objecttranslation.Translation": {
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "locale": {
+            "type": "string"
+          },
+          "object_id": {
+            "type": "integer"
+          },
+          "object_type": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
           }
         },
         "type": "object"
@@ -4212,6 +5276,189 @@
         },
         "type": "object"
       },
+      "services.CreatePageDiagramInput": {
+        "properties": {
+          "excalidraw": {
+            "type": "object"
+          },
+          "expected_content_hash": {
+            "type": "string"
+          },
+          "mermaid": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "placement": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "services.PageDiagram": {
+        "properties": {
+          "attachment_id": {
+            "type": "integer"
+          },
+          "content_hash": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "page_id": {
+            "type": "integer"
+          },
+          "payload": {
+            "type": "object"
+          },
+          "revision_number": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "services.RecurrencePreview": {
+        "properties": {
+          "dtstart": {
+            "type": "string"
+          },
+          "occurrences": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rrule": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "services.TestRunDetail": {
+        "properties": {
+          "bdd_snapshots": {
+            "items": {
+              "$ref": "#/components/schemas/models.TestRunCaseSnapshot"
+            },
+            "type": "array"
+          },
+          "example_results": {
+            "items": {
+              "$ref": "#/components/schemas/models.TestExampleResult"
+            },
+            "type": "array"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/services.TestRunResultWithCaseTitle"
+            },
+            "type": "array"
+          },
+          "run": {
+            "$ref": "#/components/schemas/models.TestRun"
+          },
+          "step_results": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/services.TestRunStepResult"
+            },
+            "type": "object"
+          },
+          "test_cases": {
+            "items": {
+              "$ref": "#/components/schemas/models.TestCase"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "services.TestRunResultWithCaseTitle": {
+        "properties": {
+          "actual_result": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "executed_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "integer"
+          },
+          "status": {
+            "description": "\"passed\", \"failed\", \"blocked\", \"skipped\", \"not_run\"",
+            "type": "string"
+          },
+          "test_case_id": {
+            "type": "integer"
+          },
+          "test_case_title": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "services.TestRunStepResult": {
+        "properties": {
+          "actual_result": {
+            "type": "string"
+          },
+          "executed_at": {
+            "type": "string"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "integer"
+          },
+          "test_case_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "services.UpdatePageDiagramInput": {
+        "properties": {
+          "excalidraw": {
+            "type": "object"
+          },
+          "expected_content_hash": {
+            "type": "string"
+          },
+          "mermaid": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "windshift_internal_restapi_v1_handlers.AuditLogStreamResponse": {
         "properties": {
           "entries": {
@@ -4231,6 +5478,9 @@
       },
       "windshift_internal_restapi_v1_handlers.UserResponse": {
         "properties": {
+          "agent_presence": {
+            "type": "string"
+          },
           "avatar_url": {
             "type": "string"
           },
@@ -4250,6 +5500,9 @@
             "type": "integer"
           },
           "is_active": {
+            "type": "boolean"
+          },
+          "is_agent": {
             "type": "boolean"
           },
           "language": {
@@ -4285,8 +5538,8 @@
   },
   "info": {
     "contact": {},
-    "description": "Public REST API for Windshift work-management. Authenticate every request with a bearer token (`Authorization: Bearer crw_*`). Tokens are scoped per route — see each operation's `security` block for the required scopes.",
-    "title": "Windshift REST API",
+    "description": "Public API reference for Windshift. REST operations use the `/rest/api/v1` base path and bearer tokens (`Authorization: Bearer crw_*`). Operational health and metrics endpoints are unauthenticated and use root-level paths.",
+    "title": "Windshift HTTP API",
     "version": "1"
   },
   "openapi": "3.0.3",
@@ -5026,6 +6279,531 @@
         ]
       }
     },
+    "/admin/object-translations/canonical-differences": {
+      "get": {
+        "description": "System-admin only. Compares canonical values with shipped base-locale copy without changing either.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/objecttranslation.CanonicalDifference"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List built-in object values needing translation review",
+        "tags": [
+          "admin",
+          "object-translations"
+        ]
+      }
+    },
+    "/admin/object-translations/definitions": {
+      "get": {
+        "description": "System-admin only. Returns the allowlisted object types and translatable fields.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/objecttranslation.ObjectDefinition"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List configurable object translation definitions",
+        "tags": [
+          "admin",
+          "object-translations"
+        ]
+      }
+    },
+    "/admin/object-translations/orphans": {
+      "get": {
+        "description": "System-admin only. Reports corruption without mutating it.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/objecttranslation.Translation"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Detect orphaned configurable object translations",
+        "tags": [
+          "admin",
+          "object-translations"
+        ]
+      }
+    },
+    "/admin/object-translations/resolve": {
+      "post": {
+        "description": "System-admin only. Query count is bounded by object type and field, not target count.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handlers.TranslationResolveRequest"
+              }
+            }
+          },
+          "description": "Locale and canonical targets",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/objecttranslation.ResolvedValue"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Resolve configurable object display values in bulk",
+        "tags": [
+          "admin",
+          "object-translations"
+        ]
+      }
+    },
+    "/admin/object-translations/{objectType}/{objectId}": {
+      "get": {
+        "description": "System-admin only. Returns all locale and source rows for one object.",
+        "parameters": [
+          {
+            "description": "Allowlisted object type",
+            "in": "path",
+            "name": "objectType",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Object ID",
+            "in": "path",
+            "name": "objectId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/objecttranslation.Translation"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List translations for a configurable object",
+        "tags": [
+          "admin",
+          "object-translations"
+        ]
+      }
+    },
+    "/admin/object-translations/{objectType}/{objectId}/{field}/{locale}": {
+      "delete": {
+        "description": "System-admin only. Shipped system translations are unaffected.",
+        "parameters": [
+          {
+            "description": "Allowlisted object type",
+            "in": "path",
+            "name": "objectType",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Object ID",
+            "in": "path",
+            "name": "objectId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Translatable field",
+            "in": "path",
+            "name": "field",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "BCP 47 locale",
+            "in": "path",
+            "name": "locale",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Delete an instance object translation",
+        "tags": [
+          "admin",
+          "object-translations"
+        ]
+      },
+      "put": {
+        "description": "System-admin only. Writes the instance source and never overwrites shipped system rows.",
+        "parameters": [
+          {
+            "description": "Allowlisted object type",
+            "in": "path",
+            "name": "objectType",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Object ID",
+            "in": "path",
+            "name": "objectId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Translatable field",
+            "in": "path",
+            "name": "field",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "BCP 47 locale",
+            "in": "path",
+            "name": "locale",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handlers.TranslationUpsertRequest"
+              }
+            }
+          },
+          "description": "Translation value",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/objecttranslation.Translation"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Create or replace an instance object translation",
+        "tags": [
+          "admin",
+          "object-translations"
+        ]
+      }
+    },
     "/admin/users": {
       "get": {
         "description": "System-admin only. Returns the full user record including email, timezone, language, and group memberships.",
@@ -5211,6 +6989,160 @@
         "summary": "Update a user (admin)",
         "tags": [
           "admin"
+        ]
+      }
+    },
+    "/ai/chat": {
+      "post": {
+        "description": "Agentic chat: the assistant can query workspaces and items via tool calls. Conversation history persists server-side per session; the durable general session is used when no session_id is given. Requires the ai:chat scope; workspace-level data access stays within the token owner's permissions.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handlers.AIChatRequest"
+              }
+            }
+          },
+          "description": "Chat message",
+          "required": true,
+          "x-originalParamName": "request"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.AIChatResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the ai:chat scope"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Agent session already has an active turn"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "AI rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Chat with the AI assistant",
+        "tags": [
+          "ai"
+        ]
+      }
+    },
+    "/ai/daily-briefing": {
+      "get": {
+        "description": "Returns the latest successful daily briefing generated for the token owner, with item-key references resolved. Empty content means no briefing is available today. Requires the ai:read scope.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.AIDailyBriefingResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the ai:read scope"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get the daily briefing",
+        "tags": [
+          "ai"
         ]
       }
     },
@@ -6485,7 +8417,7 @@
     },
     "/comments/{id}": {
       "delete": {
-        "description": "The caller must be the comment author or hold edit permission on the comment's workspace.",
+        "description": "The caller must be the comment author or hold comment.edit_others on the comment's workspace.",
         "parameters": [
           {
             "description": "Comment ID",
@@ -6648,7 +8580,7 @@
         ]
       },
       "put": {
-        "description": "The caller must be the comment author or hold edit permission on the comment's workspace.",
+        "description": "The caller must be the comment author or hold comment.edit_others on the comment's workspace.",
         "parameters": [
           {
             "description": "Comment ID",
@@ -7150,6 +9082,32 @@
         ]
       }
     },
+    "/healthz": {
+      "get": {
+        "description": "Reports whether the Windshift HTTP process and router are serving requests. Public; no authentication required.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/health.livenessResponse"
+                }
+              }
+            },
+            "description": "OK"
+          }
+        },
+        "summary": "Check server liveness",
+        "tags": [
+          "operations"
+        ]
+      },
+      "servers": [
+        {
+          "url": "/"
+        }
+      ]
+    },
     "/item-types": {
       "get": {
         "responses": {
@@ -7473,7 +9431,7 @@
         ]
       },
       "post": {
-        "description": "Creates an item in the workspace specified by `workspace_id`. The caller must have edit permission on that workspace.",
+        "description": "Creates an item in the workspace specified by `workspace_id`. The caller must have edit permission on that workspace. If `status_id` is omitted, the workflow initial status is used. If `status_id` is provided (for example, board column quick-add), it must be the initial status or directly reachable from the initial status without workflow conditions, validators, or approval gates.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -7505,7 +9463,7 @@
                 }
               }
             },
-            "description": "Invalid request body or missing required field"
+            "description": "Invalid request body, missing required field, or invalid create-time status_id"
           },
           "401": {
             "content": {
@@ -7629,6 +9587,117 @@
         ]
       }
     },
+    "/items/changes": {
+      "get": {
+        "description": "Returns item upsert/delete events for one visible workspace. Omit since to obtain a cursor before a full load. Keep passing the first page's watermark as through while paging.",
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "query",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exclusive change cursor",
+            "in": "query",
+            "name": "since",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive snapshot watermark",
+            "in": "query",
+            "name": "through",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Changes per page (max 500)",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.itemChangesResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List ordered item changes",
+        "tags": [
+          "items"
+        ]
+      }
+    },
     "/items/{id}": {
       "delete": {
         "description": "Cascade-deletes the item along with its descendants, links, history and attachments.",
@@ -7687,6 +9756,16 @@
             },
             "description": "Item not found or not visible to caller"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Item or descendant still has a protected integration link"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -7709,7 +9788,7 @@
         ]
       },
       "get": {
-        "description": "Returns 404 (not 403) when the item exists but isn't visible to the caller — item existence is never leaked.",
+        "description": "Returns 404 (not 403) when the item exists but isn't visible to the caller — item existence is never leaked. When `expand=comments` is requested, the response embeds the 25 newest comments; use the comments link for additional pages.",
         "parameters": [
           {
             "description": "Item ID",
@@ -7894,6 +9973,102 @@
           }
         ],
         "summary": "Update an item",
+        "tags": [
+          "items"
+        ]
+      }
+    },
+    "/items/{id}/agent-runs": {
+      "get": {
+        "description": "Returns the coding-agent runs triggered against one work item, newest first. Mirrors the session surface's item agent-run list. Gated on view access to the item's workspace; both a missing item and a missing permission return 404 so item existence never leaks.",
+        "parameters": [
+          {
+            "description": "Item ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Max runs to return (default 50)",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: only runs with id \u003c before_id",
+            "in": "query",
+            "name": "before_id",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/handlers.AgentRunResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the items:read scope"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Item not found or not accessible"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List coding-agent runs for an item",
         "tags": [
           "items"
         ]
@@ -8290,15 +10465,7 @@
             }
           },
           {
-            "description": "Sort field",
-            "in": "query",
-            "name": "sort",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Sort order: asc or desc",
+            "description": "Sort order by creation time: asc or desc",
             "in": "query",
             "name": "order",
             "schema": {
@@ -8311,10 +10478,22 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/dto.CommentResponse"
-                  },
-                  "type": "array"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/handlers.PaginatedResponse"
+                    },
+                    {
+                      "properties": {
+                        "data": {
+                          "items": {
+                            "$ref": "#/components/schemas/dto.CommentResponse"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  ]
                 }
               }
             },
@@ -8943,7 +11122,7 @@
                 }
               }
             },
-            "description": "Item not found, not editable, or label doesn't belong to the workspace"
+            "description": "Item not found, not editable, or label not found"
           },
           "409": {
             "content": {
@@ -8977,7 +11156,7 @@
         ]
       },
       "put": {
-        "description": "Atomically replaces every label attached to the item with the supplied IDs. Labels must belong to the item's workspace.",
+        "description": "Atomically replaces every global label attached to the item with the supplied IDs.",
         "parameters": [
           {
             "description": "Item ID",
@@ -9050,7 +11229,7 @@
                 }
               }
             },
-            "description": "Item not found, not editable, or label doesn't belong to the workspace"
+            "description": "Item not found, not editable, or label not found"
           },
           "500": {
             "content": {
@@ -9255,7 +11434,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Recurrence rule deleted"
+            "description": "No Content"
           },
           "400": {
             "content": {
@@ -9265,7 +11444,7 @@
                 }
               }
             },
-            "description": "Invalid item ID"
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -9285,7 +11464,7 @@
                 }
               }
             },
-            "description": "Token lacks the items:write scope"
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -9295,7 +11474,7 @@
                 }
               }
             },
-            "description": "Item or recurrence rule not found"
+            "description": "Not Found"
           },
           "500": {
             "content": {
@@ -9319,7 +11498,6 @@
         ]
       },
       "get": {
-        "description": "Returns the item's recurrence rule, or JSON null when the item has no recurrence configured.",
         "parameters": [
           {
             "description": "Item ID",
@@ -9350,7 +11528,7 @@
                 }
               }
             },
-            "description": "Invalid item ID"
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -9370,7 +11548,7 @@
                 }
               }
             },
-            "description": "Token lacks the items:read scope"
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -9380,7 +11558,7 @@
                 }
               }
             },
-            "description": "Item not found or not visible to caller"
+            "description": "Not Found"
           },
           "500": {
             "content": {
@@ -9404,7 +11582,6 @@
         ]
       },
       "post": {
-        "description": "Creates a new recurrence rule for the item. Returns 409 if a rule already exists.",
         "parameters": [
           {
             "description": "Item ID",
@@ -9424,7 +11601,7 @@
               }
             }
           },
-          "description": "Recurrence rule to create",
+          "description": "Recurrence rule",
           "required": true,
           "x-originalParamName": "body"
         },
@@ -9447,7 +11624,7 @@
                 }
               }
             },
-            "description": "Invalid request body or validation error"
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -9467,7 +11644,7 @@
                 }
               }
             },
-            "description": "Token lacks the items:write scope"
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -9477,7 +11654,7 @@
                 }
               }
             },
-            "description": "Item not found or not visible to caller"
+            "description": "Not Found"
           },
           "409": {
             "content": {
@@ -9487,7 +11664,7 @@
                 }
               }
             },
-            "description": "A recurrence rule already exists for this item"
+            "description": "Conflict"
           },
           "500": {
             "content": {
@@ -9511,7 +11688,6 @@
         ]
       },
       "put": {
-        "description": "Partial update of the recurrence rule attached to the item. Only fields present in the body are changed.",
         "parameters": [
           {
             "description": "Item ID",
@@ -9554,7 +11730,7 @@
                 }
               }
             },
-            "description": "Invalid request body or validation error"
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -9574,7 +11750,7 @@
                 }
               }
             },
-            "description": "Token lacks the items:write scope"
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -9584,7 +11760,7 @@
                 }
               }
             },
-            "description": "Item or recurrence rule not found"
+            "description": "Not Found"
           },
           "500": {
             "content": {
@@ -9610,7 +11786,6 @@
     },
     "/items/{id}/recurrence/generate": {
       "post": {
-        "description": "Triggers immediate generation of recurrence instances due up to the rule's lead-time horizon, bypassing the periodic scheduler.",
         "parameters": [
           {
             "description": "Item ID",
@@ -9641,7 +11816,7 @@
                 }
               }
             },
-            "description": "Invalid item ID"
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -9661,7 +11836,7 @@
                 }
               }
             },
-            "description": "Token lacks the items:write scope"
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -9671,7 +11846,7 @@
                 }
               }
             },
-            "description": "Item or recurrence rule not found"
+            "description": "Not Found"
           },
           "500": {
             "content": {
@@ -9689,7 +11864,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Force-generate instances for a recurrence rule",
+        "summary": "Force-generate recurrence instances",
         "tags": [
           "recurrence"
         ]
@@ -9697,7 +11872,6 @@
     },
     "/items/{id}/recurrence/instances": {
       "get": {
-        "description": "Paginated list of instances generated from the item's recurrence rule. `page` (default 1) and `limit` (1-100, default 50) query parameters control paging, matching the rest of the v1 surface.",
         "parameters": [
           {
             "description": "Item ID",
@@ -9709,7 +11883,7 @@
             }
           },
           {
-            "description": "Page number (1-based, default 1)",
+            "description": "Page number",
             "in": "query",
             "name": "page",
             "schema": {
@@ -9717,7 +11891,7 @@
             }
           },
           {
-            "description": "Page size (1-100, default 50)",
+            "description": "Page size",
             "in": "query",
             "name": "limit",
             "schema": {
@@ -9744,7 +11918,7 @@
                 }
               }
             },
-            "description": "Invalid item ID"
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -9764,7 +11938,7 @@
                 }
               }
             },
-            "description": "Token lacks the items:read scope"
+            "description": "Forbidden"
           },
           "404": {
             "content": {
@@ -9774,7 +11948,7 @@
                 }
               }
             },
-            "description": "Item or recurrence rule not found"
+            "description": "Not Found"
           },
           "500": {
             "content": {
@@ -9792,7 +11966,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "List generated instances for a recurrence rule",
+        "summary": "List generated recurrence instances",
         "tags": [
           "recurrence"
         ]
@@ -10357,7 +12531,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/handlers.IterationCreateRequest"
+                "$ref": "#/components/schemas/handlers.IterationUpdateRequest"
               }
             }
           },
@@ -10575,6 +12749,153 @@
         ]
       }
     },
+    "/links/batch": {
+      "get": {
+        "description": "Selects up to 100 visible anchor items by CQL or explicit ids and returns at most 50 direct item-to-item links per anchor. The operation is one hop only. Supply exactly one of `ql` or `ids`. When an item has more links, request that single item with `ids` and `after_id` to continue.",
+        "parameters": [
+          {
+            "description": "CQL selecting anchor items",
+            "in": "query",
+            "name": "ql",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated anchor item ids (max 100)",
+            "in": "query",
+            "name": "ids",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CQL item page (1-based)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "CQL items per page (max 100)",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "CQL item sort field",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "CQL item sort order: asc or desc",
+            "in": "query",
+            "name": "order",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive link cursor; valid only with one explicit item id",
+            "in": "query",
+            "name": "after_id",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Include links managed by custom fields",
+            "in": "query",
+            "name": "include_custom_fields",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/handlers.PaginatedResponse"
+                    },
+                    {
+                      "properties": {
+                        "data": {
+                          "items": {
+                            "$ref": "#/components/schemas/handlers.batchItemLinksResponse"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List direct links for a batch of items",
+        "tags": [
+          "links"
+        ]
+      }
+    },
     "/links/{id}": {
       "delete": {
         "parameters": [
@@ -10643,6 +12964,37 @@
           "links"
         ]
       }
+    },
+    "/metrics": {
+      "get": {
+        "description": "Returns Go runtime, process, database, HTTP, agent, webhook, and SCM metrics. Public; no authentication required. Restrict access at the reverse proxy or network boundary when metrics should not be publicly reachable.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/openmetrics-text": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Prometheus or OpenMetrics text exposition"
+          }
+        },
+        "summary": "Read Prometheus metrics",
+        "tags": [
+          "operations"
+        ]
+      },
+      "servers": [
+        {
+          "url": "/"
+        }
+      ]
     },
     "/milestones": {
       "get": {
@@ -11070,7 +13422,7 @@
         ]
       },
       "put": {
-        "description": "Updates a milestone in place. Scope (global vs workspace-scoped) is taken from the persisted row, not the request body — milestones cannot be retargeted between scopes.",
+        "description": "Updates a milestone in place. Omitted fields keep their current value; explicit null clears target_date and category_id. Scope (global vs workspace-scoped) is taken from the persisted row, not the request body — milestones cannot be retargeted between scopes.",
         "parameters": [
           {
             "description": "Milestone ID",
@@ -11086,7 +13438,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/handlers.MilestoneCreateRequest"
+                "$ref": "#/components/schemas/handlers.MilestoneUpdateRequest"
               }
             }
           },
@@ -11410,27 +13762,6 @@
         ]
       }
     },
-    "/openapi.yaml": {
-      "get": {
-        "description": "Returns the OpenAPI 3.0 description of this API. Public; no auth required.",
-        "responses": {
-          "200": {
-            "content": {
-              "application/yaml": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            },
-            "description": "OpenAPI 3.0 document"
-          }
-        },
-        "summary": "OpenAPI 3.0 spec (YAML)",
-        "tags": [
-          "meta"
-        ]
-      }
-    },
     "/pages/{id}/links": {
       "get": {
         "description": "Returns outgoing and incoming links for the given entity. The URL prefix (items / pages / test-cases) selects the entity type. Required scope depends on the route: items:read for items/test-cases, pages:read for pages.",
@@ -11653,18 +13984,53 @@
         ]
       }
     },
+    "/readyz": {
+      "get": {
+        "description": "Reports whether Windshift can serve requests and reach its database. Public; no authentication required.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/health.readinessResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/health.readinessResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Check server readiness",
+        "tags": [
+          "operations"
+        ]
+      },
+      "servers": [
+        {
+          "url": "/"
+        }
+      ]
+    },
     "/recurrence-rules/preview": {
       "post": {
-        "description": "Validates an iCalendar RRULE and returns the first N occurrences (default 10, max 50) from a given dtstart. Pure validation — no rule or item is created.",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/handlers.rrulePreviewRequest"
+                "$ref": "#/components/schemas/models.RRulePreviewRequest"
               }
             }
           },
-          "description": "RRULE to preview",
+          "description": "RRULE preview",
           "required": true,
           "x-originalParamName": "body"
         },
@@ -11673,7 +14039,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/handlers.rrulePreviewResponse"
+                  "$ref": "#/components/schemas/services.RecurrencePreview"
                 }
               }
             },
@@ -11687,7 +14053,7 @@
                 }
               }
             },
-            "description": "Invalid request body or validation error"
+            "description": "Bad Request"
           },
           "401": {
             "content": {
@@ -11707,7 +14073,7 @@
                 }
               }
             },
-            "description": "Token lacks the items:read scope"
+            "description": "Forbidden"
           },
           "500": {
             "content": {
@@ -12239,6 +14605,630 @@
         ]
       }
     },
+    "/time/projects": {
+      "get": {
+        "description": "Returns the time projects the authenticated user may book time on, optionally filtered by status.",
+        "parameters": [
+          {
+            "description": "Filter by project status (e.g. Active)",
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/handlers.timeProjectResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List time projects",
+        "tags": [
+          "time-tracking"
+        ]
+      }
+    },
+    "/time/projects/{id}": {
+      "get": {
+        "description": "Returns a single time project. Responds 404 (not 403) when the project exists but the caller cannot view it.",
+        "parameters": [
+          {
+            "description": "Time project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.timeProjectResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get a time project",
+        "tags": [
+          "time-tracking"
+        ]
+      }
+    },
+    "/time/worklogs": {
+      "get": {
+        "description": "Returns the authenticated user's worklogs, newest first, with optional date-range and project filters.",
+        "parameters": [
+          {
+            "description": "Inclusive start date (YYYY-MM-DD)",
+            "in": "query",
+            "name": "date_from",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive end date (YYYY-MM-DD)",
+            "in": "query",
+            "name": "date_to",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "IANA timezone used to interpret date_from/date_to (defaults to the profile timezone)",
+            "in": "query",
+            "name": "timezone",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by time project ID",
+            "in": "query",
+            "name": "project_id",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page (1-indexed)",
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/handlers.PaginatedResponse"
+                    },
+                    {
+                      "properties": {
+                        "data": {
+                          "items": {
+                            "$ref": "#/components/schemas/handlers.worklogResponse"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List my worklogs",
+        "tags": [
+          "time-tracking"
+        ]
+      },
+      "post": {
+        "description": "Creates a worklog for the authenticated user. Provide either `duration`/`duration_minutes` or a `start_time`+`end_time` pair; `item_id`/`item_key` optionally link the entry to a work item.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handlers.createWorklogRequest"
+              }
+            }
+          },
+          "description": "Worklog to create",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "No permission to book time on this project"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Log time",
+        "tags": [
+          "time-tracking"
+        ]
+      }
+    },
+    "/time/worklogs/{id}": {
+      "delete": {
+        "description": "Removes a worklog. Only the owning user may delete; other users get 403.",
+        "parameters": [
+          {
+            "description": "Worklog ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Caller does not own the worklog"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Delete a worklog",
+        "tags": [
+          "time-tracking"
+        ]
+      },
+      "put": {
+        "description": "Changes the description of an existing worklog. Only the owning user may update; other users get 403.",
+        "parameters": [
+          {
+            "description": "Worklog ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handlers.updateWorklogRequest"
+              }
+            }
+          },
+          "description": "New description",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Caller does not own the worklog"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Update a worklog description",
+        "tags": [
+          "time-tracking"
+        ]
+      }
+    },
+    "/timer/active": {
+      "get": {
+        "description": "Returns the authenticated user's currently running timer, or a null body when no timer is running.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/models.ActiveTimer"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get the active timer",
+        "tags": [
+          "time-tracking"
+        ]
+      }
+    },
+    "/timer/start": {
+      "post": {
+        "description": "Starts the authenticated user's active timer. A user has at most one running timer; starting while one runs is rejected.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/handlers.startTimerRequest"
+              }
+            }
+          },
+          "description": "Timer to start",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "A timer is already running"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Start a timer",
+        "tags": [
+          "time-tracking"
+        ]
+      }
+    },
+    "/timer/stop": {
+      "delete": {
+        "description": "Stops the authenticated user's running timer and creates the corresponding worklog. Takes no timer ID — a user has at most one active timer.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/restapi.ErrorResponse"
+                }
+              }
+            },
+            "description": "No timer is running"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Stop the active timer",
+        "tags": [
+          "time-tracking"
+        ]
+      }
+    },
     "/users": {
       "get": {
         "description": "Requires the global `user.list` permission in addition to the users:read token scope. Non-admin callers receive a stripped response with sensitive fields (email, timezone, language) omitted.",
@@ -12395,6 +15385,138 @@
           }
         ],
         "summary": "Get the authenticated user",
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/users/me/tui-preferences": {
+      "get": {
+        "description": "Returns the SSH TUI preferences sub-document for the bearer token's owning user. Empty fields mean \"unset\" — the TUI applies its defaults.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/models.UserTUIPreferences"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the user-preferences:read scope"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get the authenticated user's TUI preferences",
+        "tags": [
+          "users"
+        ]
+      },
+      "put": {
+        "description": "Full replace of the SSH TUI preferences sub-document (theme, split ratio, last workspace). Values are normalized server-side (theme truncated to 64 chars, split ratio clamped to [0.1, 0.9]); other preference sub-documents are untouched.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/models.UserTUIPreferences"
+              }
+            }
+          },
+          "description": "TUI preferences",
+          "required": true,
+          "x-originalParamName": "preferences"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/models.UserTUIPreferences"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Malformed body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the user-preferences:write scope"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Replace the authenticated user's TUI preferences",
         "tags": [
           "users"
         ]
@@ -12729,6 +15851,65 @@
         ]
       }
     },
+    "/workspace-templates": {
+      "get": {
+        "description": "Active, non-personal workspaces marked as templates and visible to the caller, with configuration-set name and copy counts.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/handlers.WorkspaceTemplateSummaryResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the workspaces:read scope"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List workspaces usable as creation templates",
+        "tags": [
+          "workspaces"
+        ]
+      }
+    },
     "/workspaces": {
       "get": {
         "parameters": [
@@ -12746,6 +15927,14 @@
             "name": "limit",
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "Case-insensitive substring match on name, key, and description",
+            "in": "query",
+            "name": "search",
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -12833,7 +16022,7 @@
         ]
       },
       "post": {
-        "description": "Requires the global `workspace.create` permission in addition to the workspaces:write token scope.",
+        "description": "Requires the global `workspace.create` permission in addition to the workspaces:write token scope. Optionally pass template_workspace_id to clone a visible template workspace's configuration-set assignment, work-item templates, and seed items.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -12887,6 +16076,16 @@
             },
             "description": "Token lacks workspaces:write or caller lacks workspace.create"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "TEMPLATE_WORKSPACE_NOT_FOUND: template workspace missing or not visible"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -12896,6 +16095,16 @@
               }
             },
             "description": "A workspace with this key already exists"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "INVALID_WORKSPACE_TEMPLATE or WORKSPACE_TEMPLATE_TOO_LARGE"
           },
           "500": {
             "content": {
@@ -12975,6 +16184,16 @@
               }
             },
             "description": "Workspace not found or caller cannot delete it"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Workspace still has externally linked items"
           },
           "500": {
             "content": {
@@ -13462,6 +16681,52 @@
       }
     },
     "/workspaces/{id}/actions/{actionId}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Action ID",
+            "in": "path",
+            "name": "actionId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Delete an action",
+        "tags": [
+          "actions"
+        ]
+      },
       "get": {
         "parameters": [
           {
@@ -13644,7 +16909,7 @@
                 }
               }
             },
-            "description": "Workspace not found or caller lacks item.view"
+            "description": "No active run snapshot for this token and workspace"
           },
           "500": {
             "content": {
@@ -13729,7 +16994,17 @@
                 }
               }
             },
-            "description": "Skill not found in this workspace or caller lacks item.view"
+            "description": "Skill not present in this run snapshot"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Saved activation exceeds the supported budget"
           },
           "500": {
             "content": {
@@ -13750,6 +17025,86 @@
         "summary": "Get an agent skill by ID",
         "tags": [
           "agents"
+        ]
+      }
+    },
+    "/workspaces/{id}/assignable-users": {
+      "get": {
+        "description": "Returns active users who can view the workspace, plus only agents with a ready workspace binding. Unlike /users this needs no global user.list permission. Sensitive fields (email, timezone, language) are always stripped. Shared by assignment and mention pickers.",
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/windshift_internal_restapi_v1_handlers.UserResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the users:read scope"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Workspace not found or not accessible"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List assignable users for a workspace",
+        "tags": [
+          "users"
         ]
       }
     },
@@ -14404,7 +17759,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/handlers.IterationCreateRequest"
+                "$ref": "#/components/schemas/handlers.IterationUpdateRequest"
               }
             }
           },
@@ -14488,7 +17843,7 @@
     },
     "/workspaces/{id}/labels": {
       "get": {
-        "description": "Returns every item label defined in the workspace, alphabetically.",
+        "description": "Returns the global item-label catalog alphabetically. The workspace path controls access.",
         "parameters": [
           {
             "description": "Workspace ID",
@@ -14567,13 +17922,13 @@
             "BearerAuth": []
           }
         ],
-        "summary": "List workspace labels",
+        "summary": "List global labels",
         "tags": [
           "labels"
         ]
       },
       "post": {
-        "description": "Creates a new item label in the workspace. `color` defaults to a neutral blue if omitted.",
+        "description": "Creates a global item label. The workspace path controls access; `color` defaults to neutral blue.",
         "parameters": [
           {
             "description": "Workspace ID",
@@ -14656,7 +18011,7 @@
                 }
               }
             },
-            "description": "A label with this name already exists in the workspace"
+            "description": "A global label with this name already exists"
           },
           "500": {
             "content": {
@@ -14674,7 +18029,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Create a workspace label",
+        "summary": "Create a global label",
         "tags": [
           "labels"
         ]
@@ -14745,7 +18100,7 @@
                 }
               }
             },
-            "description": "Label not found in this workspace or not editable by caller"
+            "description": "Workspace not editable or label not found"
           },
           "500": {
             "content": {
@@ -14763,7 +18118,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Delete a workspace label",
+        "summary": "Delete a global label",
         "tags": [
           "labels"
         ]
@@ -14838,7 +18193,7 @@
                 }
               }
             },
-            "description": "Label not found in this workspace or not visible to caller"
+            "description": "Workspace not visible or label not found"
           },
           "500": {
             "content": {
@@ -14856,13 +18211,13 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Get a workspace label by ID",
+        "summary": "Get a global label by ID",
         "tags": [
           "labels"
         ]
       },
       "put": {
-        "description": "Partial update: only fields supplied in the body are touched. Pass `color` as `\"\"` to reset to the default neutral blue.",
+        "description": "Updates a global label. The workspace path controls access. Pass `color` as `\"\"` to reset it.",
         "parameters": [
           {
             "description": "Workspace ID",
@@ -14944,7 +18299,7 @@
                 }
               }
             },
-            "description": "Label not found in this workspace or not editable by caller"
+            "description": "Workspace not editable or label not found"
           },
           "409": {
             "content": {
@@ -14954,7 +18309,7 @@
                 }
               }
             },
-            "description": "Another label in this workspace already has the new name"
+            "description": "Another global label already has the new name"
           },
           "500": {
             "content": {
@@ -14972,7 +18327,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Update a workspace label",
+        "summary": "Update a global label",
         "tags": [
           "labels"
         ]
@@ -15498,7 +18853,7 @@
         ]
       },
       "put": {
-        "description": "Updates a workspace-scoped milestone. The milestone cannot be retargeted to another workspace via the body — workspace ownership is taken from the URL.",
+        "description": "Updates a workspace-scoped milestone. Omitted fields keep their current value; explicit null clears target_date and category_id. The milestone cannot be retargeted to another workspace via the body — workspace ownership is taken from the URL.",
         "parameters": [
           {
             "description": "Workspace ID",
@@ -15523,7 +18878,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/handlers.MilestoneCreateRequest"
+                "$ref": "#/components/schemas/handlers.MilestoneUpdateRequest"
               }
             }
           },
@@ -16443,7 +19798,7 @@
                 }
               }
             },
-            "description": "Slug conflict with existing sibling or page-tree depth exceeded"
+            "description": "Page-tree depth exceeded or a uniqueness rule rejected the write"
           },
           "500": {
             "content": {
@@ -16469,7 +19824,7 @@
     },
     "/workspaces/{id}/pages/search": {
       "get": {
-        "description": "Returns non-archived pages in the workspace whose title matches the q substring and that the caller can view. Bodies are omitted; fetch via GET .../pages/{pageId}.",
+        "description": "Returns visible, non-archived pages whose title or Markdown body contains the q substring. Bodies are omitted; fetch via GET .../pages/{pageId}.",
         "parameters": [
           {
             "description": "Workspace ID",
@@ -16481,7 +19836,7 @@
             }
           },
           {
-            "description": "Title search substring",
+            "description": "Title or content search substring",
             "in": "query",
             "name": "q",
             "required": true,
@@ -16555,7 +19910,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Search pages by title",
+        "summary": "Search pages by keyword",
         "tags": [
           "pages"
         ]
@@ -16902,6 +20257,385 @@
         "summary": "Upload an attachment to a workspace knowledge page",
         "tags": [
           "pages"
+        ]
+      }
+    },
+    "/workspaces/{id}/pages/{pageId}/diagrams": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page ID",
+            "in": "path",
+            "name": "pageId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.pageDiagramListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks pages:read"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Page not found or page.view denied"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List diagrams embedded in a Page",
+        "tags": [
+          "page-diagrams"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page ID",
+            "in": "path",
+            "name": "pageId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/services.CreatePageDiagramInput"
+              }
+            }
+          },
+          "description": "Diagram payload and placement",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/services.PageDiagram"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid scene, name, or placement"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks pages:write"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Page not found or page.edit denied"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Stale content hash"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Create and embed a Page diagram",
+        "tags": [
+          "page-diagrams"
+        ]
+      }
+    },
+    "/workspaces/{id}/pages/{pageId}/diagrams/{attachmentId}": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page ID",
+            "in": "path",
+            "name": "pageId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page attachment ID",
+            "in": "path",
+            "name": "attachmentId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/services.PageDiagram"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks pages:read"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Diagram not found, wrong Page, or page.view denied"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get an embedded Page diagram",
+        "tags": [
+          "page-diagrams"
+        ]
+      },
+      "put": {
+        "description": "Creates a new immutable attachment and replaces the one matching Page fence. No delete endpoint is exposed because Page history retains older references.",
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page ID",
+            "in": "path",
+            "name": "pageId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Current Page attachment ID",
+            "in": "path",
+            "name": "attachmentId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/services.UpdatePageDiagramInput"
+              }
+            }
+          },
+          "description": "Replacement payload",
+          "required": true,
+          "x-originalParamName": "body"
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/services.PageDiagram"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid scene"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks pages:write"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Diagram not found, wrong Page, or page.edit denied"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Stale content hash or ambiguous reference"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Replace an embedded Page diagram",
+        "tags": [
+          "page-diagrams"
         ]
       }
     },
@@ -18829,6 +22563,97 @@
         ]
       }
     },
+    "/workspaces/{id}/workflows": {
+      "get": {
+        "description": "Returns the distinct workflows selected by the workspace configuration set and its item-type overrides.",
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/handlers.WorkflowResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid workspace ID"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the workspaces:read scope"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Workspace not found or not visible to caller"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List workflows effective for a workspace",
+        "tags": [
+          "workspaces",
+          "workflows"
+        ]
+      }
+    },
     "/workspaces/{workspaceId}/test-cases": {
       "get": {
         "description": "Optional `folder_id` query parameter filters to a single folder; pass `null` to retrieve top-level cases. `all=true` includes archived cases.",
@@ -19026,6 +22851,85 @@
           }
         ],
         "summary": "Create a new test case",
+        "tags": [
+          "tests"
+        ]
+      }
+    },
+    "/workspaces/{workspaceId}/test-cases/count": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "workspaceId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "integer"
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the tests:read scope"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Workspace not found or caller lacks test.view"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Count test cases in a workspace",
         "tags": [
           "tests"
         ]
@@ -23783,6 +27687,91 @@
         ]
       }
     },
+    "/workspaces/{workspaceId}/test-runs/{id}/detail": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Workspace ID",
+            "in": "path",
+            "name": "workspaceId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Test run ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/services.TestRunDetail"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Token lacks the tests:read scope"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Test run not found in this workspace"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/handlers.ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Get a complete test-run detail snapshot",
+        "tags": [
+          "tests"
+        ]
+      }
+    },
     "/workspaces/{workspaceId}/test-runs/{id}/end": {
       "post": {
         "parameters": [
@@ -23899,7 +27888,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "$ref": "#/components/schemas/handlers.testResultWithCaseTitle"
+                    "$ref": "#/components/schemas/services.TestRunResultWithCaseTitle"
                   },
                   "type": "array"
                 }
@@ -25254,7 +29243,7 @@
     },
     "/workspaces/{ws_key}/items/{number}": {
       "get": {
-        "description": "Resolves an item by its stable (workspace_key, workspace_item_number) pair. Returns 404 (not 403) when the item exists but isn't visible to the caller — item existence is never leaked.",
+        "description": "Resolves an item by its stable (workspace_key, workspace_item_number) pair. Returns 404 (not 403) when the item exists but isn't visible to the caller — item existence is never leaked. When `expand=comments` is requested, the response embeds the 25 newest comments; use the comments link for additional pages.",
         "parameters": [
           {
             "description": "Workspace key (e.g. PROJ)",

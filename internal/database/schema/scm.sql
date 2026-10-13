@@ -1,5 +1,5 @@
 -- SCM (Source Control Management) provider integration tables
--- Supports GitHub and Gitea/Forgejo
+-- Supports GitHub, GitLab, and Gitea/Forgejo
 
 -- SCM Providers (system-level configuration)
 -- Similar pattern to sso_providers table
@@ -9,8 +9,8 @@ CREATE TABLE IF NOT EXISTS scm_providers (
 	name TEXT NOT NULL,                           -- Display name (e.g., "GitHub - Main Org")
 	provider_type TEXT NOT NULL,                  -- 'github', 'gitlab', 'gitea', 'bitbucket'
 	auth_method TEXT NOT NULL,                    -- 'oauth', 'pat', 'github_app'
-	enabled BOOLEAN DEFAULT 0,
-	is_default BOOLEAN DEFAULT 0,
+	enabled BOOLEAN DEFAULT FALSE,
+	is_default BOOLEAN DEFAULT FALSE,
 	-- Connection settings
 	base_url TEXT,                                -- API base URL (null = use provider default)
 	-- OAuth credentials
@@ -74,11 +74,11 @@ CREATE TABLE IF NOT EXISTS workspace_scm_connections (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	workspace_id INTEGER NOT NULL,
 	scm_provider_id INTEGER NOT NULL,
-	enabled BOOLEAN DEFAULT 1,
+	enabled BOOLEAN DEFAULT TRUE,
 	-- Smart-commit processing (#comment / #<transition>) on PR merge. Default
 	-- off — acting-user resolution trusts the raw git committer email, which
 	-- is not authenticated. Workspace admins must opt in knowingly.
-	smart_commits_enabled BOOLEAN DEFAULT 0,
+	smart_commits_enabled BOOLEAN DEFAULT FALSE,
 	-- Workspace-specific settings
 	default_branch_pattern TEXT,                  -- e.g., "main", "develop"
 	item_key_pattern TEXT,                        -- Regex for detecting item keys (default uses workspace key)
@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS workspace_repositories (
 	repository_name TEXT NOT NULL,                -- e.g., "org/repo-name"
 	repository_url TEXT NOT NULL,                 -- Clone/web URL
 	default_branch TEXT DEFAULT 'main',
-	is_active BOOLEAN DEFAULT 1,
+	is_active BOOLEAN DEFAULT TRUE,
 	last_synced_at DATETIME,
 	milestone_tag_pattern TEXT NOT NULL DEFAULT 'v*',           -- Glob of tags that trigger the milestone-from-tag action
 	milestone_branch_pattern TEXT NOT NULL DEFAULT 'release/*', -- Glob of branches that trigger the planning-milestone action
@@ -120,6 +120,56 @@ CREATE TABLE IF NOT EXISTS workspace_repositories (
 CREATE INDEX IF NOT EXISTS idx_workspace_repos_connection ON workspace_repositories(workspace_scm_connection_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_repos_name ON workspace_repositories(repository_name);
 CREATE INDEX IF NOT EXISTS idx_workspace_repos_active ON workspace_repositories(is_active);
+
+CREATE TABLE IF NOT EXISTS scm_webhooks (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	workspace_repository_id INTEGER NOT NULL UNIQUE REFERENCES workspace_repositories(id) ON DELETE CASCADE,
+	webhook_key TEXT NOT NULL UNIQUE,
+	webhook_external_id TEXT,
+	webhook_secret_encrypted TEXT NOT NULL,
+	events TEXT NOT NULL DEFAULT '["push","tag_push","merge_request","note","release"]',
+	is_active BOOLEAN NOT NULL DEFAULT true,
+	last_delivery_at DATETIME,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS scm_webhook_deliveries (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	scm_webhook_id INTEGER NOT NULL REFERENCES scm_webhooks(id) ON DELETE CASCADE,
+	delivery_id TEXT NOT NULL,
+	event_type TEXT NOT NULL,
+	payload_summary TEXT,
+	status TEXT NOT NULL DEFAULT 'pending',
+	error_message TEXT,
+	processing_time_ms INTEGER,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(scm_webhook_id, delivery_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scm_webhook_deliveries_status ON scm_webhook_deliveries(status, created_at);
+
+-- Durable health snapshots for scheduled SCM operations. One row per
+-- connection and operation keeps diagnostics useful without retaining an
+-- unbounded failure history.
+CREATE TABLE IF NOT EXISTS scm_connection_health (
+	workspace_scm_connection_id INTEGER NOT NULL,
+	operation TEXT NOT NULL,
+	last_attempt_at DATETIME NOT NULL,
+	last_success_at DATETIME,
+	last_failure_at DATETIME,
+	consecutive_failures INTEGER NOT NULL DEFAULT 0,
+	checked_resources INTEGER NOT NULL DEFAULT 0,
+	failed_resources INTEGER NOT NULL DEFAULT 0,
+	last_error TEXT,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (workspace_scm_connection_id, operation),
+	FOREIGN KEY (workspace_scm_connection_id) REFERENCES workspace_scm_connections(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_scm_connection_health_failures
+	ON scm_connection_health(consecutive_failures, last_failure_at);
 
 -- Item SCM Links (PRs, commits, branches linked to items)
 CREATE TABLE IF NOT EXISTS item_scm_links (
@@ -161,6 +211,56 @@ CREATE TABLE IF NOT EXISTS pr_comment_cursors (
 	FOREIGN KEY (workspace_repository_id) REFERENCES workspace_repositories(id) ON DELETE CASCADE
 );
 
+-- Durable inbox/outbox for coding-agent PR review requests. The cursor above
+-- is discovery-only; this ledger owns idempotency, retries and reply delivery.
+CREATE TABLE IF NOT EXISTS agent_pr_review_events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	workspace_repository_id INTEGER NOT NULL,
+	workspace_id INTEGER NOT NULL,
+	item_id INTEGER NOT NULL,
+	pr_number INTEGER NOT NULL,
+	event_kind TEXT NOT NULL,
+	external_id INTEGER NOT NULL,
+	author_id TEXT,
+	author_login TEXT,
+	author_association TEXT,
+	body TEXT NOT NULL,
+	context_json TEXT,
+	status TEXT NOT NULL DEFAULT 'pending',
+	agent_run_id INTEGER,
+	ack_comment_id INTEGER,
+	terminal_comment_id INTEGER,
+	terminal_body TEXT,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	last_error TEXT,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(workspace_repository_id, pr_number, event_kind, external_id),
+	FOREIGN KEY (workspace_repository_id) REFERENCES workspace_repositories(id) ON DELETE CASCADE,
+	FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+	FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_pr_review_events_status ON agent_pr_review_events(status, updated_at);
+
+-- Stable ownership makes review routing independent from whichever agent most
+-- recently touched the linked item.
+CREATE TABLE IF NOT EXISTS agent_pr_ownerships (
+	workspace_repository_id INTEGER NOT NULL,
+	pr_number INTEGER NOT NULL,
+	item_id INTEGER NOT NULL,
+	agent_run_id INTEGER NOT NULL,
+	binding_id INTEGER NOT NULL,
+	triggered_by_user_id INTEGER,
+	head_repo TEXT NOT NULL,
+	head_branch TEXT NOT NULL,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (workspace_repository_id, pr_number),
+	FOREIGN KEY (workspace_repository_id) REFERENCES workspace_repositories(id) ON DELETE CASCADE,
+	FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+	FOREIGN KEY (triggered_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
 -- SCM Processed Commits (idempotency ledger for smart-commit actions)
 CREATE TABLE IF NOT EXISTS scm_processed_commits (
 	commit_sha              TEXT NOT NULL,
@@ -168,6 +268,19 @@ CREATE TABLE IF NOT EXISTS scm_processed_commits (
 	processed_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
 	actions_applied         INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (commit_sha, workspace_repository_id),
+	FOREIGN KEY (workspace_repository_id) REFERENCES workspace_repositories(id) ON DELETE CASCADE
+);
+
+-- Milestone commit attachment has its own object-scoped ledger. It must not
+-- consume smart-commit records, and overlapping milestones must each scan the
+-- same commit independently.
+CREATE TABLE IF NOT EXISTS scm_milestone_processed_commits (
+	milestone_id            INTEGER NOT NULL,
+	workspace_repository_id INTEGER NOT NULL,
+	commit_sha              TEXT NOT NULL,
+	processed_at            DATETIME DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (milestone_id, workspace_repository_id, commit_sha),
+	FOREIGN KEY (milestone_id) REFERENCES milestones(id) ON DELETE CASCADE,
 	FOREIGN KEY (workspace_repository_id) REFERENCES workspace_repositories(id) ON DELETE CASCADE
 );
 
@@ -228,7 +341,7 @@ CREATE INDEX IF NOT EXISTS idx_user_scm_tokens_provider ON user_scm_oauth_tokens
 CREATE TABLE IF NOT EXISTS issue_sync_configs (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	workspace_repository_id INTEGER NOT NULL UNIQUE,
-	sync_enabled BOOLEAN DEFAULT 0,
+	sync_enabled BOOLEAN DEFAULT FALSE,
 	-- Status mapping: GitHub state → Windshift status ID
 	status_mapping TEXT DEFAULT '{}',               -- JSON: {"open": <status_id>, "closed": <status_id>}
 	reverse_status_mapping TEXT DEFAULT '{}',        -- JSON: {<status_id>: "open"|"closed", ...}
@@ -243,7 +356,7 @@ CREATE TABLE IF NOT EXISTS issue_sync_configs (
 	default_item_type_id INTEGER,
 	default_priority_id INTEGER,
 	-- Comment sync
-	sync_comments BOOLEAN DEFAULT 0,
+	sync_comments BOOLEAN DEFAULT FALSE,
 	-- Sync state
 	last_full_sync_at DATETIME,
 	last_sync_error TEXT,
@@ -267,7 +380,7 @@ CREATE TABLE IF NOT EXISTS issue_sync_items (
 	github_issue_url TEXT NOT NULL,
 	last_synced_at DATETIME,
 	last_github_updated_at DATETIME,                 -- GitHub's updated_at at last sync
-	sync_lock BOOLEAN DEFAULT 0,                     -- Prevents re-entrant sync during pushback
+	sync_lock BOOLEAN DEFAULT FALSE,                     -- Prevents re-entrant sync during pushback
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (issue_sync_config_id) REFERENCES issue_sync_configs(id) ON DELETE CASCADE,
@@ -295,3 +408,5 @@ CREATE TABLE IF NOT EXISTS issue_sync_comments (
 
 CREATE INDEX IF NOT EXISTS idx_issue_sync_comments_item ON issue_sync_comments(issue_sync_item_id);
 CREATE INDEX IF NOT EXISTS idx_issue_sync_comments_comment ON issue_sync_comments(comment_id);
+
+-- migration: 0021_workspace_scm_connections_smart_commits_enabled

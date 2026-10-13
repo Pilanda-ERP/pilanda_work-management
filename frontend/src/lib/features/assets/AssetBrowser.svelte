@@ -6,8 +6,10 @@
   import { api } from '../../api.js';
   import { navigate, currentRoute, updateQueryParams } from '../../router.js';
   import Button from '../../components/Button.svelte';
+  import Input from '../../components/Input.svelte';
   import Label from '../../components/Label.svelte';
   import PageHeader from '../../layout/PageHeader.svelte';
+  import SidebarResizeHandle from '../../layout/SidebarResizeHandle.svelte';
   import Modal from '../../dialogs/Modal.svelte';
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
@@ -18,12 +20,20 @@
   import { permissionStore } from '../../stores/permissions.svelte.js';
   import AssetRelationshipGraph from './AssetRelationshipGraph.svelte';
   import AssetImportWizard from './import/AssetImportWizard.svelte';
+  import QlQueryBar from '../shared/QlQueryBar.svelte';
+  import { buildAssetQlCatalog } from './assetQlCompletion.js';
   import AssetSubFilterBar from './AssetSubFilterBar.svelte';
   import CustomFieldRenderer from '../items/CustomFieldRenderer.svelte';
+  import AssetDetailContent from './AssetDetailContent.svelte';
+  import { retainValuesForType } from './assetFormValues.js';
+  import { loadAssetTypeFields } from './assetTypeFields.js';
+  import { isBooleanCustomFieldType } from '../../utils/customFieldTypes.js';
   import { toHotkeyString } from '../../utils/keyboardShortcuts.js';
   import { formatDateSimple } from '../../utils/dateFormatter.js';
   import { fetchAssetCategories, fetchAssetStatuses, flattenCategories } from './shared/assetSetUtils.js';
-  import { useEventListener } from 'runed';
+	import TextField from '../../components/TextField.svelte';
+	import SelectField from '../../components/SelectField.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
 
   // Props for detail view
   let { assetId = null } = $props();
@@ -54,6 +64,7 @@
   let assetFormData = $state({
     title: '',
     description: '',
+    asset_tag: '',
     asset_type_id: null,
     category_id: null,
     status_id: null,
@@ -63,32 +74,10 @@
   let statuses = $state([]);
   let displayTypeFields = $state([]);
   let showRelationshipGraph = $state(false);
+  let savingAsset = $state(false);
 
   // Asset detail panel resize state
   let assetPanelWidth = $state(320);
-  let isResizingAssetPanel = $state(false);
-  let assetResizeStartX = 0;
-  let assetResizeStartWidth = 0;
-
-  function startAssetPanelResize(event) {
-    event.preventDefault();
-    assetResizeStartX = event.clientX;
-    assetResizeStartWidth = assetPanelWidth;
-    isResizingAssetPanel = true;
-  }
-
-  function onAssetResizeMove(e) {
-    const deltaX = assetResizeStartX - e.clientX;
-    assetPanelWidth = Math.max(280, Math.min(600, assetResizeStartWidth + deltaX));
-  }
-
-  function onAssetResizeEnd() {
-    isResizingAssetPanel = false;
-  }
-
-  useEventListener(() => (isResizingAssetPanel ? document : null), 'mousemove', onAssetResizeMove);
-  useEventListener(() => (isResizingAssetPanel ? document : null), 'mouseup', onAssetResizeEnd);
-
   // Filter state
   let selectedCategoryId = $state(null);
   let searchMode = $state('simple'); // 'simple' or 'ql'
@@ -96,6 +85,10 @@
   let activeQuery = $state(''); // The committed query that triggers API calls
   let filterBarQL = $state(''); // QL from the visual filter bar
   let allCustomFields = $state([]); // Aggregated custom fields from all asset types
+
+  let completionCatalog = $derived(buildAssetQlCatalog({
+    statuses, assetTypes, categories: assetCategories, customFields: allCustomFields,
+  }));
 
   // Pagination state
   let currentPage = $derived(parseInt($currentRoute.query?.page) || 1);
@@ -105,6 +98,12 @@
 
   // Loading state
   let loading = $state(true);
+  let assetTypesRequestSeq = 0;
+  let assetCategoriesRequestSeq = 0;
+  let assetStatusesRequestSeq = 0;
+  let allCustomFieldsRequestSeq = 0;
+  let selectedTypeFieldsRequestSeq = 0;
+  let assetsRequestSeq = 0;
 
   onMount(async () => {
     await loadAssetSets();
@@ -158,49 +157,59 @@
 
   async function loadAssetTypes() {
     if (!selectedSetId) return;
+    const setId = selectedSetId;
+    const requestSeq = ++assetTypesRequestSeq;
     try {
-      const types = await api.assetTypes.getAll(selectedSetId);
+      const types = await api.assetTypes.getAll(setId);
+      if (requestSeq !== assetTypesRequestSeq || selectedSetId !== setId) return;
       assetTypes = (types || []).filter(t => t.is_active);
-      loadAllCustomFields();
+      void loadAllCustomFields(setId, assetTypes);
     } catch (error) {
+      if (requestSeq !== assetTypesRequestSeq || selectedSetId !== setId) return;
       console.error('Failed to load asset types:', error);
     }
   }
 
-  async function loadAllCustomFields() {
-    if (assetTypes.length === 0) {
+  async function loadAllCustomFields(setId = selectedSetId, types = assetTypes) {
+    const requestSeq = ++allCustomFieldsRequestSeq;
+    if (types.length === 0) {
       allCustomFields = [];
       return;
     }
+    const isStale = () => requestSeq !== allCustomFieldsRequestSeq || selectedSetId !== setId;
     try {
-      const seenFieldIds = new Set();
-      const fields = [];
-      for (const type of assetTypes) {
-        const typeFields = await api.assetTypes.getFields(type.id);
-        for (const f of (typeFields || [])) {
-          if (!seenFieldIds.has(f.custom_field_id)) {
-            seenFieldIds.add(f.custom_field_id);
-            fields.push(f);
-          }
-        }
-      }
+      const fields = await loadAssetTypeFields(types, (typeId) => api.assetTypes.getFields(typeId), {
+        isStale,
+      });
+      if (isStale()) return;
       allCustomFields = fields;
     } catch (error) {
+      if (isStale()) return;
       console.error('Failed to load custom fields for filter:', error);
       allCustomFields = [];
     }
   }
 
   async function loadAssetCategories() {
-    assetCategories = await fetchAssetCategories(selectedSetId);
+    const setId = selectedSetId;
+    const requestSeq = ++assetCategoriesRequestSeq;
+    const categories = await fetchAssetCategories(setId);
+    if (requestSeq !== assetCategoriesRequestSeq || selectedSetId !== setId) return;
+    assetCategories = categories;
   }
 
   async function loadStatuses() {
-    statuses = await fetchAssetStatuses(selectedSetId);
+    const setId = selectedSetId;
+    const requestSeq = ++assetStatusesRequestSeq;
+    const nextStatuses = await fetchAssetStatuses(setId);
+    if (requestSeq !== assetStatusesRequestSeq || selectedSetId !== setId) return;
+    statuses = nextStatuses;
   }
 
   async function loadAssets() {
     if (!selectedSetId) return;
+    const setId = selectedSetId;
+    const requestSeq = ++assetsRequestSeq;
     try {
       const filters = {
         limit: pageSize,
@@ -226,10 +235,12 @@
       if (qlParts.length > 0) {
         filters.ql = qlParts.join(' AND ');
       }
-      const result = await api.assets.getAll(selectedSetId, filters);
-      assets = result?.assets || [];
-      totalAssets = result?.total || 0;
+      const result = await api.assets.getAll(setId, filters);
+      if (requestSeq !== assetsRequestSeq || selectedSetId !== setId) return;
+		assets = result?.data || [];
+		totalAssets = result?.pagination?.total_items || 0;
     } catch (error) {
+      if (requestSeq !== assetsRequestSeq || selectedSetId !== setId) return;
       console.error('Failed to load assets:', error);
     }
   }
@@ -293,11 +304,39 @@
     }
   });
 
+  // The create form defaults to the set's first asset type. If the form
+  // opened while the set's types were still loading after a set switch,
+  // that default can be a stale type from the previously selected set —
+  // the API rejects foreign asset_type_ids, so re-default once the real
+  // list arrives.
+  $effect(() => {
+    if (!showAssetForm || editingAsset) return;
+    const types = assetTypes;
+    if (types.some(t => t.id === assetFormData.asset_type_id)) return;
+    if (types.length === 0 && assetFormData.asset_type_id === null) return;
+    assetFormData = { ...assetFormData, asset_type_id: types.length > 0 ? types[0].id : null };
+  });
+
   async function loadTypeFields(typeId) {
+    const requestSeq = ++selectedTypeFieldsRequestSeq;
     try {
       const fields = await api.assetTypes.getFields(typeId);
+      if (
+        requestSeq !== selectedTypeFieldsRequestSeq ||
+        Number(assetFormData.asset_type_id) !== Number(typeId)
+      ) return;
       selectedTypeFields = fields || [];
+      if (editingAsset && Number(assetFormData.asset_type_id) === Number(typeId)) {
+        assetFormData.custom_field_values = retainValuesForType(
+          assetFormData.custom_field_values,
+          selectedTypeFields,
+        );
+      }
     } catch (error) {
+      if (
+        requestSeq !== selectedTypeFieldsRequestSeq ||
+        Number(assetFormData.asset_type_id) !== Number(typeId)
+      ) return;
       console.error('Failed to load type fields:', error);
       selectedTypeFields = [];
     }
@@ -327,10 +366,15 @@
     editingAsset = null;
     // Find default status
     const defaultStatus = statuses.find(s => s.is_default);
+    // Never seed the type from a possibly-stale list: after a set switch the
+    // loaded types can belong to the previous set, and the API rejects
+    // foreign asset_type_ids. The re-default effect picks types[0] once the
+    // current set's types arrive.
     assetFormData = {
       title: '',
       description: '',
-      asset_type_id: assetTypes.length > 0 ? assetTypes[0].id : null,
+      asset_tag: '',
+      asset_type_id: null,
       category_id: selectedCategoryId ?? null,
       status_id: defaultStatus?.id ?? null,
       custom_field_values: {}
@@ -343,6 +387,7 @@
     assetFormData = {
       title: asset.title,
       description: asset.description || '',
+      asset_tag: asset.asset_tag || '',
       asset_type_id: asset.asset_type_id ?? null,
       category_id: asset.category_id ?? null,
       status_id: asset.status_id ?? null,
@@ -351,10 +396,13 @@
   }
 
   async function handleAssetSubmit() {
+    if (savingAsset) return;
+    savingAsset = true;
+
     try {
       // Validate required custom fields
       for (const field of selectedTypeFields) {
-        if (field.is_required) {
+        if (field.is_required && !isBooleanCustomFieldType(field.field_type)) {
           const value = assetFormData.custom_field_values[field.custom_field_id];
           if (value === undefined || value === null || value === '') {
             errorToast(t('validation.requiredField', { field: field.field_name }));
@@ -393,6 +441,8 @@
     } catch (error) {
       console.error('Failed to save asset:', error);
       errorToast(t('dialogs.alerts.failedToSave', { error: error.message }));
+    } finally {
+      savingAsset = false;
     }
   }
 
@@ -443,7 +493,8 @@
   const assetColumns = [
     {
       key: 'title',
-      label: 'NAME'
+      label: 'NAME',
+      slot: 'title'
     },
     {
       key: 'asset_type_name',
@@ -507,10 +558,8 @@
       {:else if directAsset}
         <!-- Back button -->
         <button
-          class="inline-flex items-center gap-1.5 mb-6 text-sm font-medium rounded-lg px-3 py-1.5 transition-colors"
-          style="color: var(--ds-text-subtle); background: transparent;"
-          onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-          onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+          class="hover-bg inline-flex items-center gap-1.5 mb-6 text-sm font-medium rounded-lg px-3 py-1.5 transition-colors"
+          style="color: var(--ds-text-subtle);"
           onclick={() => navigate('/assets')}
         >
           <IconArrowLeft class="w-4 h-4" />
@@ -522,10 +571,7 @@
           <h1 class="text-2xl font-semibold" style="color: var(--ds-text);">{directAsset.title}</h1>
           <div class="flex items-center gap-2">
             <button
-              class="p-2 rounded-lg transition-colors"
-              style="background: transparent;"
-              onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+              class="hover-bg p-2 rounded-lg transition-colors"
               onclick={() => { showRelationshipGraph = true; }}
               title="Relationship Graph"
             >
@@ -533,20 +579,16 @@
             </button>
             {#if canEdit}
               <button
-                class="p-2 rounded-lg transition-colors"
-                style="background: transparent;"
-                onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-                onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+                data-testid="asset-edit"
+                class="hover-bg p-2 rounded-lg transition-colors"
                 onclick={() => showEditAssetForm(directAsset)}
                 title={t('common.edit')}
               >
                 <IconEdit class="w-4 h-4" style="color: var(--ds-icon);" />
               </button>
               <button
-                class="p-2 rounded-lg transition-colors"
-                style="background: transparent; color: var(--ds-text-danger);"
-                onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-                onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+                class="hover-bg p-2 rounded-lg transition-colors"
+                style="color: var(--ds-text-danger);"
                 onclick={() => deleteAsset(directAsset.id)}
                 title={t('common.delete')}
               >
@@ -558,91 +600,7 @@
 
         <!-- Detail content -->
         <div class="rounded-lg p-6" style="background: var(--ds-surface-raised); border: 1px solid var(--ds-border);">
-          {#if directAsset.description}
-            <div class="mb-6">
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.description')}</h4>
-              <p class="text-sm" style="color: var(--ds-text);">{directAsset.description}</p>
-            </div>
-          {/if}
-          <div class="grid grid-cols-2 gap-4">
-            {#if directAsset.asset_type_name}
-              <div>
-                <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.type')}</h4>
-                <span class="inline-flex items-center gap-1" style="color: var(--ds-text);">
-                  <ColorDot color={directAsset.asset_type_color || '#6b7280'} />
-                  {directAsset.asset_type_name}
-                </span>
-              </div>
-            {/if}
-            {#if directAsset.category_name}
-              <div>
-                <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.category')}</h4>
-                <span class="inline-flex items-center gap-1" style="color: var(--ds-text);">
-                  <IconFolder class="w-4 h-4 text-yellow-500" />
-                  {directAsset.category_name}
-                </span>
-              </div>
-            {/if}
-            {#if directAsset.status_name}
-              <div>
-                <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.status')}</h4>
-                <span class="inline-flex items-center gap-1.5" style="color: var(--ds-text);">
-                  <span class="w-2 h-2 rounded-full" style="background-color: {directAsset.status_color || '#6b7280'};"></span>
-                  {directAsset.status_name}
-                </span>
-              </div>
-            {/if}
-            {#if directAsset.asset_tag}
-              <div>
-                <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">Asset Tag</h4>
-                <span class="text-sm font-mono" style="color: var(--ds-text);">{directAsset.asset_tag}</span>
-              </div>
-            {/if}
-            {#if directAsset.creator_name}
-              <div>
-                <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.createdBy')}</h4>
-                <span class="text-sm" style="color: var(--ds-text);">{directAsset.creator_name}</span>
-              </div>
-            {/if}
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.created')}</h4>
-              <span class="text-sm" style="color: var(--ds-text);">{formatDateSimple(directAsset.created_at)}</span>
-            </div>
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.updated')}</h4>
-              <span class="text-sm" style="color: var(--ds-text);">{formatDateSimple(directAsset.updated_at)}</span>
-            </div>
-            {#if directAsset.linked_item_count > 0}
-              <div>
-                <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">Linked Items</h4>
-                <span class="text-sm" style="color: var(--ds-text);">{directAsset.linked_item_count}</span>
-              </div>
-            {/if}
-          </div>
-          {#if directAsset.custom_field_values && Object.keys(directAsset.custom_field_values).length > 0}
-            <div class="border-t pt-4 mt-4" style="border-color: var(--ds-border);">
-              <h4 class="text-xs font-medium uppercase mb-3" style="color: var(--ds-text-subtlest);">Custom Fields</h4>
-              {#each Object.entries(directAsset.custom_field_values) as [fieldId, value]}
-                {@const fieldDef = displayTypeFields.find(f => String(f.custom_field_id) === String(fieldId))}
-                {#if fieldDef && value !== null && value !== ''}
-                  <div class="mb-3">
-                    <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{fieldDef.field_name}</h4>
-                    <CustomFieldRenderer
-                      field={{
-                        id: fieldDef.custom_field_id,
-                        name: fieldDef.field_name,
-                        field_type: fieldDef.field_type,
-                        options: fieldDef.field_options
-                      }}
-                      value={value}
-                      readonly={true}
-                      noPadding={true}
-                    />
-                  </div>
-                {/if}
-              {/each}
-            </div>
-          {/if}
+          <AssetDetailContent asset={directAsset} fieldDefinitions={displayTypeFields} layout="grid" />
         </div>
       {:else}
         <EmptyState
@@ -659,21 +617,25 @@
     <AssetRelationshipGraph bind:isOpen={showRelationshipGraph} assetId={directAsset.id} />
   {/if}
 {:else}
-<div class="flex h-full min-h-screen" style="background: var(--ds-surface);">
+<div
+  class="flex h-full min-h-screen"
+  data-testid="asset-browser"
+  data-total-assets={totalAssets}
+  style="background: var(--ds-surface);"
+>
   <!-- Left sidebar: Category tree -->
   <div class="w-64 flex flex-col" style="border-right: 1px solid var(--ds-border); background: var(--ds-surface-raised);">
     <!-- Set selector -->
     <div class="px-4 h-[80px] flex items-center" style="border-bottom: 1px solid var(--ds-border);">
-      <Select bind:value={selectedSetId} class="w-full" options={assetSets.length === 0 ? [{ value: null, label: 'No asset sets available', disabled: true }] : assetSets.map(set => ({ value: set.id, label: set.name }))} />
+      <Select id="asset-set-select" bind:value={selectedSetId} class="w-full" options={assetSets.length === 0 ? [{ value: null, label: 'No asset sets available', disabled: true }] : assetSets.map(set => ({ value: set.id, label: set.name }))} />
     </div>
 
     <!-- Category tree -->
     <div class="flex-1 overflow-auto p-4">
       <button
-        class="w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-2"
-        style={selectedCategoryId === null ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-        onmouseenter={(e) => { if (selectedCategoryId !== null) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-        onmouseleave={(e) => { if (selectedCategoryId !== null) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+        class="nav-link w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-2"
+
+        class:active={selectedCategoryId === null}
         onclick={() => selectCategory(null)}
       >
         <IconPackage class="w-4 h-4" />
@@ -687,20 +649,16 @@
               <div
                 role="button"
                 tabindex="0"
-                class="w-full text-left px-3 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-1 cursor-pointer"
-                style={selectedCategoryId === category.id ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-                onmouseenter={(e) => { if (selectedCategoryId !== category.id) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-                onmouseleave={(e) => { if (selectedCategoryId !== category.id) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+                class="nav-link w-full text-left px-3 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-1 cursor-pointer"
+
+                class:active={selectedCategoryId === category.id}
                 onclick={() => selectCategory(category.id)}
                 onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectCategory(category.id); } }}
               >
                 {#if category.has_children}
                   <button
                     type="button"
-                    class="p-0.5 rounded"
-                    style="background: transparent;"
-                    onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-                    onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+                    class="hover-bg p-0.5 rounded"
                     onclick={(e) => { e.stopPropagation(); toggleCategory(category.id); }}
                   >
                     {#if expandedCategories.has(category.id)}
@@ -713,13 +671,13 @@
                   <span class="w-4"></span>
                 {/if}
                 {#if expandedCategories.has(category.id)}
-                  <IconFolderOpen class="w-4 h-4 text-yellow-500" />
+                  <IconFolderOpen class="w-4 h-4 text-ds-accent-yellow" />
                 {:else}
-                  <IconFolder class="w-4 h-4 text-yellow-500" />
+                  <IconFolder class="w-4 h-4 text-ds-accent-yellow" />
                 {/if}
                 <span class="truncate">{category.name}</span>
                 {#if category.asset_count > 0}
-                  <span class="text-xs text-gray-400 ml-auto">{category.asset_count}</span>
+                  <span class="text-xs text-ds-text-subtlest ml-auto">{category.asset_count}</span>
                 {/if}
               </div>
               {#if category.has_children && expandedCategories.has(category.id) && category.children}
@@ -738,23 +696,39 @@
   </div>
 
   <!-- Main content -->
-  <div class="flex-1 flex flex-col overflow-hidden">
+  <div class="flex-1 min-w-0 min-h-0 flex flex-col">
     <!-- Header with search -->
     <div class="px-4 h-[80px] flex items-center gap-4" style="border-bottom: 1px solid var(--ds-border);">
-      <div class="flex-1 relative max-w-lg flex items-center gap-2">
+      <div class="flex-1 min-w-0 relative flex items-center gap-2">
         <div class="flex-1 relative">
-          <IconSearch class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2" style="color: var(--ds-icon);" />
-          <input
-            type="text"
-            placeholder={searchMode === 'ql' ? 'Query: status = "Active" (press Enter)' : 'Search by name...'}
-            bind:value={searchInput}
-            onkeydown={(e) => { if (searchMode === 'ql' && e.key === 'Enter') activeQuery = searchInput; }}
-            class="w-full pl-9 pr-4 py-2 rounded-lg text-sm {searchMode === 'ql' ? 'font-mono' : ''}"
-            style="background: var(--ds-background-input); border: 1px solid var(--ds-border); color: var(--ds-text);"
-            title={searchMode === 'ql' ? 'QL Query - Press Enter to search. Examples: status = "Active", type IN ("Laptop", "Desktop"), title ~ "server"' : 'Search by title or description'}
-          />
+          {#if searchMode === 'ql'}
+            {#key selectedSetId}
+              <QlQueryBar
+                compact
+                mode="raw"
+                editorTestId="asset-search"
+                placeholder={'Query: status = "Active" (press Enter)'}
+                query={searchInput}
+                {completionCatalog}
+                onquerychange={(query) => { searchInput = query; }}
+                onexecute={() => { activeQuery = searchInput; }}
+              />
+            {/key}
+          {:else}
+            <IconSearch class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2" style="color: var(--ds-icon);" />
+            <Input
+              dataTestid="asset-search"
+              type="text"
+              placeholder="Search by name..."
+              bind:value={searchInput}
+              class="pl-9"
+              size="small"
+              title="Search by title or description"
+            />
+          {/if}
         </div>
         <button
+          data-testid="asset-search-toggle-ql"
           onclick={() => {
             searchMode = searchMode === 'simple' ? 'ql' : 'simple';
             searchInput = '';
@@ -776,16 +750,15 @@
           />
         {/if}
       </div>
-      <div class="flex-1"></div>
       {#if selectedSetId}
         {#if isAdmin}
-          <Button onclick={() => { showImportWizard = true; }} variant="default" class="whitespace-nowrap">
+          <Button dataTestid="asset-import-open" onclick={() => { showImportWizard = true; }} variant="default" class="whitespace-nowrap">
             <IconUpload class="w-4 h-4 mr-1" />
             Import
           </Button>
         {/if}
         {#if canEdit}
-          <Button onclick={showAddAssetForm} class="whitespace-nowrap" keyboardHint="A" hotkeyConfig={{ key: toHotkeyString('assets', 'upload'), guard: () => !!(selectedSetId && !showAssetForm) }}>
+          <Button dataTestid="asset-create" onclick={showAddAssetForm} class="whitespace-nowrap" keyboardHint="A" hotkeyConfig={{ key: toHotkeyString('assets', 'upload'), guard: () => !!(selectedSetId && !showAssetForm) }}>
             <IconPlus class="w-4 h-4 mr-1" />
             {t('common.create')}
           </Button>
@@ -813,7 +786,7 @@
 
       {#if loading}
         <div class="flex items-center justify-center h-full">
-          <div class="text-gray-500">{t('common.loading')}</div>
+          <div class="text-ds-text-subtle">{t('common.loading')}</div>
         </div>
       {:else if assetSets.length === 0}
         <EmptyState
@@ -843,7 +816,16 @@
           {currentPage}
           totalItems={totalAssets}
           onPageChange={handlePageChange}
+          rowAttrs={(asset) => ({
+            'data-asset-id': asset.id,
+            'data-asset-tag': asset.asset_tag || ''
+          })}
         >
+          {#snippet title(item)}
+            <span data-testid="asset-row">
+              <span data-testid={`asset-title-${item.id}`}>{item.title}</span>
+            </span>
+          {/snippet}
           {#snippet type(item)}
             <div class="flex items-center gap-2">
             {#if item.asset_type_name}
@@ -858,7 +840,7 @@
           {#snippet category(item)}
             {#if item.category_name}
               <span class="inline-flex items-center gap-1">
-                <IconFolder class="w-3 h-3 text-yellow-500" />
+                <IconFolder class="w-3 h-3 text-ds-accent-yellow" />
                 {item.category_name}
               </span>
             {:else}
@@ -883,24 +865,22 @@
 
   <!-- Right sidebar: Asset detail (when selected) -->
   {#if selectedAsset}
-    <div class="flex-shrink-0 flex flex-col relative" style="width: {assetPanelWidth}px; min-width: 280px; max-width: 600px; border-left: 1px solid var(--ds-border);">
-      <!-- Resize handle -->
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        class="absolute left-0 top-0 bottom-0 w-1 cursor-ew-resize transition-colors z-10"
-        style="background-color: transparent;"
-        onmouseenter={(e) => e.currentTarget.style.backgroundColor = '#3b82f6'}
-        onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-        onmousedown={startAssetPanelResize}
-      ></div>
+    <div data-testid="asset-detail-pane" class="flex-shrink-0 flex flex-col relative" style="width: {assetPanelWidth}px; min-width: 280px; max-width: 600px; border-left: 1px solid var(--ds-border);">
+      <SidebarResizeHandle
+        width={assetPanelWidth}
+        minWidth={280}
+        maxWidth={600}
+        defaultWidth={320}
+        edge="left"
+        label="Resize asset details"
+        title="Drag to resize, double-click to reset"
+        onresize={(width) => assetPanelWidth = width}
+      />
       <div class="p-4 flex items-center justify-between" style="border-bottom: 1px solid var(--ds-border);">
         <h2 class="font-semibold truncate" style="color: var(--ds-text);">{selectedAsset.title}</h2>
         <div class="flex items-center gap-1">
           <button
-            class="p-1 rounded"
-            style="background: transparent;"
-            onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+            class="hover-bg p-1 rounded"
             onclick={() => { showRelationshipGraph = true; }}
             title="Relationship Graph"
           >
@@ -908,10 +888,8 @@
           </button>
           {#if canEdit}
             <button
-              class="p-1 rounded"
-              style="background: transparent;"
-              onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+              data-testid="asset-edit"
+              class="hover-bg p-1 rounded"
               onclick={() => showEditAssetForm(selectedAsset)}
               title={t('common.edit')}
             >
@@ -919,10 +897,7 @@
             </button>
           {/if}
           <button
-            class="p-1 rounded"
-            style="background: transparent;"
-            onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.background = 'transparent'}
+            class="hover-bg p-1 rounded"
             onclick={() => { selectedAsset = null; updateQueryParams({ asset: null }); }}
           >
             <IconChevronRight class="w-4 h-4" style="color: var(--ds-icon);" />
@@ -930,91 +905,7 @@
         </div>
       </div>
       <div class="flex-1 overflow-auto p-4">
-        {#if selectedAsset.description}
-          <div class="mb-4">
-            <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.description')}</h4>
-            <p class="text-sm" style="color: var(--ds-text);">{selectedAsset.description}</p>
-          </div>
-        {/if}
-        <div class="space-y-3">
-          {#if selectedAsset.asset_type_name}
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.type')}</h4>
-              <span class="inline-flex items-center gap-1" style="color: var(--ds-text);">
-                <ColorDot color={selectedAsset.asset_type_color || '#6b7280'} />
-                {selectedAsset.asset_type_name}
-              </span>
-            </div>
-          {/if}
-          {#if selectedAsset.category_name}
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.category')}</h4>
-              <span class="inline-flex items-center gap-1" style="color: var(--ds-text);">
-                <IconFolder class="w-4 h-4 text-yellow-500" />
-                {selectedAsset.category_name}
-              </span>
-            </div>
-          {/if}
-          {#if selectedAsset.status_name}
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.status')}</h4>
-              <span class="inline-flex items-center gap-1.5" style="color: var(--ds-text);">
-                <span class="w-2 h-2 rounded-full" style="background-color: {selectedAsset.status_color || '#6b7280'};"></span>
-                {selectedAsset.status_name}
-              </span>
-            </div>
-          {/if}
-          {#if selectedAsset.asset_tag}
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">Asset Tag</h4>
-              <span class="text-sm font-mono" style="color: var(--ds-text);">{selectedAsset.asset_tag}</span>
-            </div>
-          {/if}
-          {#if selectedAsset.creator_name}
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.createdBy')}</h4>
-              <span class="text-sm" style="color: var(--ds-text);">{selectedAsset.creator_name}</span>
-            </div>
-          {/if}
-          <div>
-            <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.created')}</h4>
-            <span class="text-sm" style="color: var(--ds-text);">{formatDateSimple(selectedAsset.created_at)}</span>
-          </div>
-          <div>
-            <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{t('common.updated')}</h4>
-            <span class="text-sm" style="color: var(--ds-text);">{formatDateSimple(selectedAsset.updated_at)}</span>
-          </div>
-          {#if selectedAsset.linked_item_count > 0}
-            <div>
-              <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">Linked Items</h4>
-              <span class="text-sm" style="color: var(--ds-text);">{selectedAsset.linked_item_count}</span>
-            </div>
-          {/if}
-        </div>
-        {#if selectedAsset.custom_field_values && Object.keys(selectedAsset.custom_field_values).length > 0}
-          <div class="border-t pt-4 mt-4" style="border-color: var(--ds-border);">
-            <h4 class="text-xs font-medium uppercase mb-3" style="color: var(--ds-text-subtlest);">Custom Fields</h4>
-            {#each Object.entries(selectedAsset.custom_field_values) as [fieldId, value]}
-              {@const fieldDef = displayTypeFields.find(f => String(f.custom_field_id) === String(fieldId))}
-              {#if fieldDef && value !== null && value !== ''}
-                <div class="mb-3">
-                  <h4 class="text-xs font-medium uppercase mb-1" style="color: var(--ds-text-subtlest);">{fieldDef.field_name}</h4>
-                  <CustomFieldRenderer
-                    field={{
-                      id: fieldDef.custom_field_id,
-                      name: fieldDef.field_name,
-                      field_type: fieldDef.field_type,
-                      options: fieldDef.field_options
-                    }}
-                    value={value}
-                    readonly={true}
-                    noPadding={true}
-                  />
-                </div>
-              {/if}
-            {/each}
-          </div>
-        {/if}
+        <AssetDetailContent asset={selectedAsset} fieldDefinitions={displayTypeFields} />
       </div>
     </div>
   {/if}
@@ -1022,40 +913,70 @@
 {/if}
 
 <!-- Asset Form Modal -->
-<Modal isOpen={showAssetForm} onclose={() => showAssetForm = false} onSubmit={handleAssetSubmit}>
+<Modal
+  isOpen={showAssetForm}
+  preventClose={savingAsset}
+  submitDisabled={savingAsset || (!editingAsset && !assetFormData.asset_type_id)}
+  onclose={() => showAssetForm = false}
+  onSubmit={handleAssetSubmit}
+>
   <ModalHeader title={editingAsset ? 'Edit Asset' : 'New Asset'} onClose={() => showAssetForm = false} />
   <form onsubmit={(e) => { e.preventDefault(); handleAssetSubmit(); }} class="p-6">
     <div class="space-y-4">
       <div>
-        <Label color="default" class="mb-1">Title</Label>
-        <input
-          type="text"
-          bind:value={assetFormData.title}
+        <TextField
+          label={"Title"}
+          id="asset-title-input"
           required
-          class="w-full px-3 py-2 rounded-lg"
-          style="background: var(--ds-background-input); border: 1px solid var(--ds-border); color: var(--ds-text);"
+          labelColor="default"
+          type="text"
+          size="small"
+          bind:value={assetFormData.title}
         />
       </div>
       <div>
-        <Label color="default" class="mb-1">Description</Label>
-        <textarea
+        <TextareaField
+          label={"Description"}
+          labelColor="default"
+          rows={3}
+          size="small"
           bind:value={assetFormData.description}
-          rows="3"
-          class="w-full px-3 py-2 rounded-lg"
-          style="background: var(--ds-background-input); border: 1px solid var(--ds-border); color: var(--ds-text);"
-        ></textarea>
+        />
       </div>
       <div>
-        <Label color="default" class="mb-1">Asset Type</Label>
-        <Select bind:value={assetFormData.asset_type_id} options={[{ value: null, label: 'No Type' }, ...assetTypes.map(type => ({ value: type.id, label: type.name }))]} />
+        <TextField
+          label={"Asset Tag"}
+          id="asset-tag-input"
+          labelColor="default"
+          type="text"
+          size="small"
+          bind:value={assetFormData.asset_tag}
+        />
       </div>
       <div>
-        <Label color="default" class="mb-1">Category</Label>
-        <Select bind:value={assetFormData.category_id} options={[{ value: null, label: 'No Category' }, ...flatCategories.map(cat => ({ value: cat.id, label: '  '.repeat(cat.level) + cat.name }))]} />
+        <SelectField
+          label={"Asset Type"}
+          id="asset-type-select"
+          labelColor="default"
+          options={[{ value: null, label: 'No Type' }, ...assetTypes.map(type => ({ value: type.id, label: type.name }))]}
+          bind:value={assetFormData.asset_type_id}
+        />
       </div>
       <div>
-        <Label color="default" class="mb-1">Status</Label>
-        <Select bind:value={assetFormData.status_id} options={statuses.map(status => ({ value: status.id, label: status.name }))} />
+        <SelectField
+          label={"Category"}
+          labelColor="default"
+          options={[{ value: null, label: 'No Category' }, ...flatCategories.map(cat => ({ value: cat.id, label: '  '.repeat(cat.level) + cat.name }))]}
+          bind:value={assetFormData.category_id}
+        />
+      </div>
+      <div>
+        <SelectField
+          label={"Status"}
+          labelColor="default"
+          options={statuses.map(status => ({ value: status.id, label: status.name }))}
+          bind:value={assetFormData.status_id}
+        />
       </div>
       {#if selectedTypeFields.length > 0}
         <div class="border-t pt-4 mt-4" style="border-color: var(--ds-border);">
@@ -1087,7 +1008,13 @@
     </div>
     <div class="flex justify-end gap-2 mt-6">
       <Button variant="outline" type="button" onclick={() => showAssetForm = false} keyboardHint="Esc">{t('common.cancel')}</Button>
-      <Button type="submit" keyboardHint="↵">{editingAsset ? t('common.save') : t('common.create')}</Button>
+      <Button
+        dataTestid="asset-submit"
+        type="submit"
+        disabled={savingAsset || (!editingAsset && !assetFormData.asset_type_id)}
+        loading={savingAsset}
+        keyboardHint="↵"
+      >{editingAsset ? t('common.save') : t('common.create')}</Button>
     </div>
   </form>
 </Modal>
@@ -1106,3 +1033,18 @@
   <AssetRelationshipGraph bind:isOpen={showRelationshipGraph} assetId={selectedAsset.id} />
 {/if}
 
+<style>
+  .nav-link {
+    color: var(--ds-text-subtle);
+  }
+
+  .nav-link:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .nav-link.active {
+    background: var(--ds-surface-selected);
+    color: var(--ds-text);
+  }
+</style>

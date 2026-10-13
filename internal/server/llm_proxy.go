@@ -13,6 +13,8 @@ import (
 
 const logbookArticlesFeature = "logbook_articles"
 
+const internalLLMProxyMaxBody = 16 << 20
+
 // NewInternalLLMProxy creates an HTTP handler that proxies chat completion
 // requests to the admin-configured default LLM connection.
 // Authentication uses a shared secret (SSO_SECRET) with constant-time comparison.
@@ -23,8 +25,14 @@ func NewInternalLLMProxy(llmManager *llm.ConnectionManager, secret string) http.
 			return
 		}
 
-		var req llm.ChatCompletionRequest
+		r.Body = http.MaxBytesReader(w, r.Body, internalLLMProxyMaxBody)
+		var req llm.CompletionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeLLMProxyError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
 			writeLLMProxyError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
@@ -38,7 +46,7 @@ func NewInternalLLMProxy(llmManager *llm.ConnectionManager, secret string) http.
 			return
 		}
 
-		resp, err := client.ChatCompletion(r.Context(), req)
+		resp, err := client.Complete(r.Context(), req)
 		if err != nil {
 			slog.Error("LLM proxy: chat completion failed", "error", err)
 			writeLLMProxyError(w, http.StatusBadGateway, "LLM request failed")

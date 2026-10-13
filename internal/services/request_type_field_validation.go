@@ -2,26 +2,27 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"reflect"
 	"strings"
-	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/sanitize"
 	"windshift/internal/validation"
 )
 
 // IsBlankSubmittedField reports whether a value submitted in a portal/form
 // payload should be treated as "no value" by required-field validation. JSON
-// unmarshalling produces []interface{} / map[string]interface{} for empty
+// unmarshalling produces []any / map[string]any for empty
 // arrays and objects respectively, and the old `== nil || == ""` check let
 // those slip through, allowing required multiselect/object fields to be
 // satisfied by `[]` or `{}`. Scalars `false` and `0` (and `0.0`) are NOT
 // blank — they're legitimate values.
-func IsBlankSubmittedField(value interface{}) bool {
+func IsBlankSubmittedField(value any) bool {
 	if value == nil {
 		return true
 	}
@@ -39,9 +40,15 @@ func IsBlankSubmittedField(value interface{}) bool {
 
 // RequestTypeValidationResult contains the result of request type field validation.
 type RequestTypeValidationResult struct {
-	ItemTypeID         *int
-	VirtualFieldValues map[string]interface{}
-	CustomFieldValues  map[string]interface{}
+	ItemTypeID *int
+	// WorkspaceID is the request type's own target workspace, when set. It is
+	// the source of truth for submission routing: callers create the item in
+	// this workspace, falling back to the channel's first configured workspace
+	// only when it is nil. Nullable in the schema, so a request type may not
+	// pin a workspace.
+	WorkspaceID        *int
+	VirtualFieldValues map[string]any
+	CustomFieldValues  map[string]any
 	// TitleFieldInForm is true when the request type's field config includes
 	// the default "title" field — meaning the submitter saw a title input on
 	// the form. Callers that need a title (every item create) use this to
@@ -49,8 +56,164 @@ type RequestTypeValidationResult struct {
 	TitleFieldInForm bool
 }
 
+type virtualRequestField struct {
+	fieldType string
+	options   string
+	required  bool
+}
+
+// isPublicFormFillableCustomFieldType keeps public forms to values that can be
+// entered without loading options from authenticated internal APIs.
+func isPublicFormFillableCustomFieldType(fieldType string) bool {
+	switch models.CanonicalCustomFieldType(fieldType) {
+	case "text", "textarea", "select", "multiselect", "number", "date",
+		models.CustomFieldTypeBoolean, "email", "url":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeVirtualFieldValue(fieldID string, field virtualRequestField, raw any) (any, error) {
+	switch field.fieldType {
+	case "text":
+		value, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("field %s must be text", fieldID)
+		}
+		normalized := sanitize.PlainTextField.Sanitize(value)
+		if field.required && IsBlankSubmittedField(normalized) {
+			return nil, fmt.Errorf("field %s is required", fieldID)
+		}
+		return normalized, nil
+	case "textarea":
+		value, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("field %s must be text", fieldID)
+		}
+		normalized := sanitize.RichText.Sanitize(value)
+		if field.required && IsBlankSubmittedField(normalized) {
+			return nil, fmt.Errorf("field %s is required", fieldID)
+		}
+		return normalized, nil
+	case "checkbox":
+		if raw == nil {
+			return nil, nil
+		}
+		return validation.ValidateCheckboxValue(fieldID, raw)
+	case "select":
+		if IsBlankSubmittedField(raw) {
+			return raw, nil
+		}
+		var configured []any
+		if field.options == "" {
+			return nil, fmt.Errorf("field %s has no configured options", fieldID)
+		}
+		if err := json.Unmarshal([]byte(field.options), &configured); err != nil {
+			return nil, fmt.Errorf("field %s has invalid options: %w", fieldID, err)
+		}
+		for _, option := range configured {
+			value := option
+			if object, ok := option.(map[string]any); ok {
+				configuredValue, exists := object["value"]
+				if !exists {
+					continue
+				}
+				value = configuredValue
+			}
+			if reflect.DeepEqual(value, raw) {
+				return raw, nil
+			}
+		}
+		return nil, fmt.Errorf("field %s contains an invalid option", fieldID)
+	default:
+		return nil, fmt.Errorf("field %s has unsupported virtual type %q", fieldID, field.fieldType)
+	}
+}
+
+// AllowedCreateScreenCustomFieldIdentifiers resolves the custom fields that
+// may be used when creating an item of itemTypeID in workspaceID. Public form
+// schemas and submissions both use this list so stale or forged field rows do
+// not expose or write fields outside the effective create screen.
+func AllowedCreateScreenCustomFieldIdentifiers(db database.Database, workspaceID, itemTypeID int) (map[string]struct{}, error) {
+	allowed := make(map[string]struct{})
+	if workspaceID <= 0 || itemTypeID <= 0 {
+		return allowed, nil
+	}
+	itemTypeAllowed, err := IsItemTypeAllowedInWorkspace(db, workspaceID, itemTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if !itemTypeAllowed {
+		return allowed, nil
+	}
+
+	screenRepo := repository.NewScreenRepository(db)
+	createScreenID, err := screenRepo.GetCreateScreenID(workspaceID, itemTypeID)
+	if err != nil || createScreenID == nil {
+		return allowed, err
+	}
+	fields, err := screenRepo.ListFields(*createScreenID)
+	if err != nil {
+		return nil, err
+	}
+	for _, field := range fields {
+		if field.FieldType == "custom" && field.FieldIdentifier != "" && field.FieldName != "" &&
+			isPublicFormFillableCustomFieldType(field.CustomFieldType) {
+			allowed[field.FieldIdentifier] = struct{}{}
+		}
+	}
+	return allowed, nil
+}
+
+func allowedRequestTypeCustomFieldIdentifiers(ctx context.Context, db database.Database, requestTypeID int) (map[string]struct{}, error) {
+	var itemTypeID int
+	var workspaceID sql.NullInt64
+	var channelType, direction, configJSON string
+	err := db.QueryRowContext(ctx, `
+		SELECT rt.item_type_id, rt.workspace_id, c.type, c.direction, COALESCE(c.config, '{}')
+		FROM request_types rt
+		JOIN channels c ON c.id = rt.channel_id
+		WHERE rt.id = ? AND rt.is_active = true
+	`, requestTypeID).Scan(&itemTypeID, &workspaceID, &channelType, &direction, &configJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	var config models.ChannelConfig
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return nil, fmt.Errorf("parse request type channel config: %w", err)
+	}
+	var servedWorkspaceIDs []int
+	if direction == "inbound" {
+		switch channelType {
+		case "portal":
+			servedWorkspaceIDs = config.PortalWorkspaceIDs
+		case "form":
+			servedWorkspaceIDs = config.FormWorkspaceIDs
+		}
+	}
+	// A request type pins its workspace at creation; an unpinned row is not
+	// routable and exposes no custom fields.
+	if len(servedWorkspaceIDs) == 0 || !workspaceID.Valid {
+		return map[string]struct{}{}, nil
+	}
+	effectiveWorkspaceID := int(workspaceID.Int64)
+	served := false
+	for _, candidate := range servedWorkspaceIDs {
+		if candidate == effectiveWorkspaceID {
+			served = true
+			break
+		}
+	}
+	if !served {
+		return map[string]struct{}{}, nil
+	}
+	return AllowedCreateScreenCustomFieldIdentifiers(db, effectiveWorkspaceID, itemTypeID)
+}
+
 // ValidateAndSeparateRequestFields validates request type fields and separates virtual from custom fields.
-func ValidateAndSeparateRequestFields(ctx context.Context, db database.Database, requestTypeID *int, title, description string, customFields map[string]interface{}) (*RequestTypeValidationResult, error) {
+func ValidateAndSeparateRequestFields(ctx context.Context, db database.Database, requestTypeID *int, title, description string, customFields map[string]any) (*RequestTypeValidationResult, error) {
 	result := &RequestTypeValidationResult{}
 
 	if requestTypeID == nil {
@@ -63,32 +226,59 @@ func ValidateAndSeparateRequestFields(ctx context.Context, db database.Database,
 	var rtID int
 	var rtName string
 	var itemTypeID int
-	err := db.QueryRowContext(ctx, `SELECT id, name, item_type_id FROM request_types WHERE id = ? AND is_active = true`, *requestTypeID).Scan(
-		&rtID, &rtName, &itemTypeID,
+	var workspaceID sql.NullInt64
+	err := db.QueryRowContext(ctx, `SELECT id, name, item_type_id, workspace_id FROM request_types WHERE id = ? AND is_active = true`, *requestTypeID).Scan(
+		&rtID, &rtName, &itemTypeID, &workspaceID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("invalid request type (ID: %d): %w", *requestTypeID, err)
 	}
 	result.ItemTypeID = &itemTypeID
+	if workspaceID.Valid {
+		wsID := int(workspaceID.Int64)
+		result.WorkspaceID = &wsID
+	}
+	allowedCustomFieldIDs, err := allowedRequestTypeCustomFieldIdentifiers(ctx, db, *requestTypeID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve request type create-screen fields: %w", err)
+	}
 
-	virtualFieldIDs := make(map[string]bool)
+	virtualFields := make(map[string]virtualRequestField)
 	configuredCustomFieldIDs := make(map[string]bool)
-	rows, err := db.QueryContext(ctx, `SELECT field_identifier, field_type, is_required FROM request_type_fields WHERE request_type_id = ? ORDER BY display_order`, *requestTypeID)
+	rows, err := db.QueryContext(ctx, `
+		SELECT rtf.field_identifier, rtf.field_type, rtf.is_required,
+		       COALESCE(rtf.virtual_field_type, ''), COALESCE(rtf.virtual_field_options, ''),
+		       COALESCE(cfd.field_type, '')
+		FROM request_type_fields rtf
+		LEFT JOIN custom_field_definitions cfd
+		  ON rtf.field_type = 'custom' AND CAST(cfd.id AS TEXT) = rtf.field_identifier
+		WHERE rtf.request_type_id = ?
+		ORDER BY rtf.display_order
+	`, *requestTypeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load request type fields: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
-		var fieldID, fieldType string
+		var fieldID, fieldType, virtualFieldType, virtualFieldOptions, customFieldType string
 		var isRequired bool
-		if err := rows.Scan(&fieldID, &fieldType, &isRequired); err != nil {
-			continue
+		if err := rows.Scan(&fieldID, &fieldType, &isRequired, &virtualFieldType, &virtualFieldOptions, &customFieldType); err != nil {
+			return nil, fmt.Errorf("scan request type field: %w", err)
+		}
+		if fieldType == "custom" {
+			if _, allowed := allowedCustomFieldIDs[fieldID]; !allowed {
+				continue
+			}
 		}
 
 		switch fieldType {
 		case "virtual":
-			virtualFieldIDs[fieldID] = true
+			virtualFields[fieldID] = virtualRequestField{
+				fieldType: virtualFieldType,
+				options:   virtualFieldOptions,
+				required:  isRequired,
+			}
 		case "custom":
 			configuredCustomFieldIDs[fieldID] = true
 		}
@@ -107,10 +297,23 @@ func ValidateAndSeparateRequestFields(ctx context.Context, db database.Database,
 		if isRequired {
 			switch fieldType {
 			case "default":
-				if fieldID == "description" && description == "" {
+				// Description is sanitized with sanitize.Comment, which does not
+				// trim, so the blank check must trim explicitly to match title
+				// and custom/virtual fields.
+				if fieldID == "description" && IsBlankSubmittedField(description) {
 					return nil, fmt.Errorf("description is required")
 				}
-			case "custom", "virtual":
+			case "custom":
+				if models.IsBooleanCustomFieldType(customFieldType) {
+					continue
+				}
+				if customFields == nil || IsBlankSubmittedField(customFields[fieldID]) {
+					return nil, fmt.Errorf("field %s is required", fieldID)
+				}
+			case "virtual":
+				if virtualFieldType == "checkbox" {
+					continue
+				}
 				if customFields == nil || IsBlankSubmittedField(customFields[fieldID]) {
 					return nil, fmt.Errorf("field %s is required", fieldID)
 				}
@@ -124,89 +327,25 @@ func ValidateAndSeparateRequestFields(ctx context.Context, db database.Database,
 	// Partition submitted fields. Keys that are neither configured custom fields
 	// nor virtual fields are dropped silently — a 400 would act as an oracle
 	// telling probers which field IDs exist on the request type.
-	result.VirtualFieldValues = make(map[string]interface{})
-	result.CustomFieldValues = make(map[string]interface{})
+	result.VirtualFieldValues = make(map[string]any)
+	result.CustomFieldValues = make(map[string]any)
 	for fieldID, value := range customFields {
-		switch {
-		case virtualFieldIDs[fieldID]:
-			result.VirtualFieldValues[fieldID] = value
-		case configuredCustomFieldIDs[fieldID]:
+		if virtualField, ok := virtualFields[fieldID]; ok {
+			normalized, err := normalizeVirtualFieldValue(fieldID, virtualField, value)
+			if err != nil {
+				return nil, err
+			}
+			result.VirtualFieldValues[fieldID] = normalized
+		} else if configuredCustomFieldIDs[fieldID] {
+			if IsBlankSubmittedField(value) {
+				continue
+			}
 			result.CustomFieldValues[fieldID] = value
 		}
 	}
+	if err := validation.ValidateAndNormalizeCustomFieldValues(db, result.CustomFieldValues); err != nil {
+		return nil, err
+	}
 
 	return result, nil
-}
-
-// StoreCustomFieldValues stores custom field values for an item.
-// The component parameter is used for log attribution (e.g. "forms", "portal").
-func StoreCustomFieldValues(ctx context.Context, db database.Database, component string, itemID int64, customFields map[string]interface{}) {
-	if len(customFields) == 0 {
-		return
-	}
-
-	// Forms/portal submissions carry raw anonymous-user text; bound
-	// text/textarea values before they reach either persistence target
-	// below. Failure to load field definitions only skips sanitization
-	// (logged), matching this function's tolerant store-what-we-can style.
-	if err := validation.SanitizeCustomFieldTextValues(db, customFields); err != nil {
-		slog.Warn("failed to sanitize custom field values", slog.String("component", component), slog.Int64("item_id", itemID), slog.Any("error", err))
-	}
-
-	now := time.Now()
-	for fieldIDStr, value := range customFields {
-		if value == nil || value == "" {
-			continue
-		}
-
-		var valueStr string
-		switch v := value.(type) {
-		case string:
-			valueStr = v
-		case float64:
-			valueStr = fmt.Sprintf("%v", v)
-		case bool:
-			valueStr = fmt.Sprintf("%v", v)
-		default:
-			valueBytes, err := json.Marshal(v)
-			if err == nil {
-				valueStr = string(valueBytes)
-			}
-		}
-
-		if valueStr != "" {
-			if _, err := db.ExecWriteContext(ctx, `
-				INSERT INTO custom_field_values (item_id, custom_field_id, value, created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?)
-				ON CONFLICT(item_id, custom_field_id) DO UPDATE SET value = ?, updated_at = ?
-			`, itemID, fieldIDStr, valueStr, now, now, valueStr, now); err != nil {
-				slog.Warn("failed to save custom field value", slog.String("component", component), slog.Int64("item_id", itemID), slog.String("field_id", fieldIDStr), slog.Any("error", err))
-			}
-		}
-	}
-
-	customFieldsJSON, err := json.Marshal(customFields)
-	if err == nil {
-		if err := repository.NewItemRepository(db).SetCustomFieldValuesRaw(ctx, int(itemID), string(customFieldsJSON)); err != nil {
-			slog.Warn("failed to update item custom_field_values", slog.String("component", component), slog.Int64("item_id", itemID), slog.Any("error", err))
-		}
-	}
-}
-
-// StoreVirtualFieldValues stores virtual field values for an item.
-// The component parameter is used for log attribution (e.g. "forms", "portal").
-func StoreVirtualFieldValues(ctx context.Context, db database.Database, component string, itemID int64, virtualFields map[string]interface{}) {
-	if len(virtualFields) == 0 {
-		return
-	}
-
-	virtualFieldsJSON, err := json.Marshal(virtualFields)
-	if err != nil {
-		slog.Warn("failed to marshal virtual field values", slog.String("component", component), slog.Int64("item_id", itemID), slog.Any("error", err))
-		return
-	}
-
-	if err := repository.NewItemRepository(db).SetVirtualFieldDataRaw(ctx, int(itemID), string(virtualFieldsJSON)); err != nil {
-		slog.Warn("failed to update item virtual_field_data", slog.String("component", component), slog.Int64("item_id", itemID), slog.Any("error", err))
-	}
 }

@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { currentRoute, navigate } from '../router.js';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-  import { IconEdit as Edit2, IconTrash as Trash2 } from '@tabler/icons-svelte-runes';
+  import { IconEdit as Edit2, IconTrash as Trash2, IconLock as Lock, IconLockOpen2 as Unlock } from '@tabler/icons-svelte-runes';
   import { api } from '../api.js';
   import { confirm } from '../composables/useConfirm.js';
   import { errorToast } from '../stores/toasts.svelte.js';
@@ -139,7 +139,7 @@
 
   async function loadCustomFields() {
     try {
-      customFields = (await api.customFields.getAll())?.data || [];
+      customFields = await api.customFields.getAll();
       portalCustomerFields = customFields.filter(f => f.applies_to_portal_customers);
     } catch (err) {
       console.error('Failed to load custom fields:', err);
@@ -154,6 +154,14 @@
       console.error('Failed to load customer organisations:', err);
       error = t('workspaces.customers.failedToLoadOrganisations');
     }
+  }
+
+  // Replace the stored organisation so a later revisit re-hydrates the detail
+  // view from the values that were actually saved.
+  function handleOrganisationUpdated(orgId, settings) {
+    customerOrganisations = customerOrganisations.map((org) =>
+      org.id === orgId ? { ...org, settings } : org
+    );
   }
 
   async function loadPortalCustomers() {
@@ -317,6 +325,41 @@
     }
   }
 
+  // Deactivation cuts portal access (sign-out + auth refusal) without
+  // exercising the erasure right; reactivation is the explicit inverse.
+  async function handleToggleDeactivation(customer) {
+    const deactivating = !customer.deactivated_at;
+    const confirmed = await confirm({
+      title: deactivating ? t('workspaces.customers.deactivateCustomer') : t('workspaces.customers.activateCustomer'),
+      message: deactivating
+        ? t('workspaces.customers.confirmDeactivateCustomer', { name: customer.name })
+        : t('workspaces.customers.confirmActivateCustomer', { name: customer.name }),
+      confirmText: deactivating ? t('workspaces.customers.deactivateCustomer') : t('workspaces.customers.activateCustomer'),
+      cancelText: t('common.cancel'),
+      variant: deactivating ? 'danger' : 'default'
+    });
+
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      if (deactivating) {
+        await api.portalCustomers.deactivate(customer.id);
+      } else {
+        await api.portalCustomers.activate(customer.id);
+      }
+      await loadPortalCustomers();
+    } catch (err) {
+      console.error('Failed to toggle portal customer deactivation:', err);
+      errorToast(
+        err.message ||
+          String(err) ||
+          (deactivating ? t('workspaces.customers.failedToDeactivateCustomer') : t('workspaces.customers.failedToActivateCustomer'))
+      );
+    }
+  }
+
   function buildCustomerActions(customer) {
     if (!canManage) return [];
 
@@ -327,6 +370,13 @@
         icon: Edit2,
         title: t('common.edit'),
         onClick: () => openDetail(customer)
+      },
+      {
+        id: 'toggle-deactivation',
+        type: 'regular',
+        icon: customer.deactivated_at ? Unlock : Lock,
+        title: customer.deactivated_at ? t('workspaces.customers.activateCustomer') : t('workspaces.customers.deactivateCustomer'),
+        onClick: () => handleToggleDeactivation(customer)
       },
       { type: 'divider' },
       {
@@ -342,7 +392,13 @@
   }
 </script>
 
-<div class="flex min-h-screen" style="background-color: var(--ds-surface);">
+<div
+  class="flex h-full min-h-0 overflow-hidden"
+  style="background-color: var(--ds-surface);"
+  data-testid="portal-customers-page"
+  data-ready={!loading && !error}
+  data-total-customers={portalCustomers.length}
+>
   <!-- Sidebar Navigation -->
   <CustomerOrganisationNavigation
     organisations={filteredOrganisations}
@@ -356,7 +412,7 @@
   />
 
   <!-- Main Content -->
-  <div class="flex-1 p-6">
+  <div class="flex-1 min-w-0 min-h-0 overflow-y-auto p-6">
     {#if loading}
       <div class="flex items-center justify-center h-64">
         <Spinner />
@@ -368,6 +424,7 @@
         contactId={contactDetailId}
         {customerOrganisations}
         {portalCustomerFields}
+        {canManage}
         onBack={() => navigate('/organizations')}
         onCustomerUpdated={() => loadPortalCustomers()}
       />
@@ -386,6 +443,7 @@
         {hasMoreCustomers}
         onLoadMore={loadMoreCustomers}
         {buildCustomerActions}
+        onOrganisationUpdated={handleOrganisationUpdated}
       />
     {/if}
   </div>
@@ -446,10 +504,10 @@
         <div class="col-span-full pt-4 border-t" style="border-color: var(--ds-border);">
           <h3 class="text-sm font-medium mb-3" style="color: var(--ds-text);">{t('workspaces.customers.customFields')}</h3>
           <div class="space-y-4">
-            {#each portalCustomerFields as field}
+            {#each portalCustomerFields as field (field.id ?? field.name)}
               <CustomFieldRenderer
                 {field}
-                bind:value={formData.custom_field_values[field.name]}
+                value={formData.custom_field_values[field.name] ?? ''}
                 readonly={false}
                 onChange={(val) => {
                   formData.custom_field_values[field.name] = val;

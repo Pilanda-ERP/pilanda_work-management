@@ -1,5 +1,6 @@
 <script>
   import { api } from '../api.js';
+  import Input from '../components/Input.svelte';
   import Label from '../components/Label.svelte';
   import Modal from './Modal.svelte';
   import ModalHeader from './ModalHeader.svelte';
@@ -7,6 +8,8 @@
   import { successToast, errorToast } from '../stores/toasts.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import DescriptionText from '../components/DescriptionText.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let { branchLink, itemKey = '', itemTitle = '', oncreated, onclose } = $props();
 
@@ -19,6 +22,7 @@
   // svelte-ignore state_referenced_locally
   let prBody = $state(itemKey ? `Linked to ${itemKey}` : '');
   let baseBranch = $state('');
+  const isGitLab = $derived(branchLink?.provider_type === 'gitlab');
 
   async function submit() {
     if (!branchLink?.id) {
@@ -37,7 +41,7 @@
       };
 
       const result = await api.itemSCMLinks.createPRFromBranch(branchLink.id, data);
-      successToast(t('scm.prCreatedSuccess', { prNumber: result.pr_number }));
+      successToast(t(isGitLab ? 'scm.mrCreatedSuccess' : 'scm.prCreatedSuccess', { prNumber: result.pr_number }));
       oncreated?.(result);
     } catch (err) {
       console.error('Failed to create PR:', err);
@@ -53,9 +57,15 @@
   }
 </script>
 
-<Modal isOpen={true} maxWidth="max-w-md" onclose={close}>
+<Modal
+  isOpen={true}
+  maxWidth="max-w-md"
+  onSubmit={submit}
+  submitDisabled={submitting}
+  onclose={close}
+>
   <ModalHeader
-    title={t('scm.createPullRequest')}
+    title={t(isGitLab ? 'scm.createMergeRequest' : 'scm.createPullRequest')}
     subtitle={`${t('scm.createPRFrom', { branch: '' })} ${branchLink?.external_id || branchLink?.title || 'branch'}`}
     onClose={close}
   />
@@ -64,37 +74,37 @@
     <div class="px-6 py-4 space-y-4">
       <!-- PR Title -->
       <div>
-        <Label color="default" class="mb-1.5">{t('scm.prTitle')}</Label>
-        <input
+        <TextField
+          label={t('scm.prTitle')}
+          labelColor="default"
           type="text"
-          bind:value={prTitle}
           placeholder={itemKey ? `${itemKey}: ${itemTitle}` : 'Pull request title'}
-          class="w-full px-3 py-2 rounded-lg border text-sm"
-          style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+          size="small"
+          bind:value={prTitle}
         />
       </div>
 
       <!-- PR Body -->
       <div>
-        <Label color="default" class="mb-1.5">{t('scm.description')}</Label>
-        <textarea
-          bind:value={prBody}
+        <TextareaField
+          label={t('scm.description')}
+          labelColor="default"
           placeholder={itemKey ? `Linked to ${itemKey}` : 'Pull request description'}
-          rows="3"
-          class="w-full px-3 py-2 rounded-lg border text-sm resize-none"
-          style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-        ></textarea>
+          rows={3}
+          size="small"
+          bind:value={prBody}
+        />
       </div>
 
       <!-- Base Branch -->
       <div>
         <Label color="default" class="mb-1.5">{t('scm.baseBranchPR')}</Label>
-        <input
+        <Input
           type="text"
           bind:value={baseBranch}
           placeholder="main"
-          class="w-full px-3 py-2 rounded-lg border text-sm font-mono"
-          style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+          class="font-mono"
+          size="small"
         />
         <DescriptionText variant="subtlest">
           {t('scm.baseBranchPRHelp')}
@@ -110,8 +120,9 @@
   <DialogFooter
     onCancel={close}
     onConfirm={submit}
-    confirmLabel={t('scm.createPR')}
+    confirmLabel={isGitLab ? 'Create MR' : t('scm.createPR')}
     loading={submitting}
     loadingLabel={t('scm.creating')}
+    showKeyboardHint={true}
   />
 </Modal>

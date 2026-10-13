@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"windshift/internal/database"
 	"windshift/internal/models"
+	"windshift/internal/restapi"
 	"windshift/internal/restapi/v1/dto"
 	"windshift/internal/services"
+	"windshift/internal/validation"
 )
 
 // CommentHandler handles public API requests for standalone comments
@@ -29,26 +32,27 @@ func NewCommentHandler(db database.Database, permissionService *services.Permiss
 	}
 }
 
-// checkCommentEditPermission verifies the user is the comment author or has workspace edit permission.
+// checkCommentEditPermission verifies the user is the comment author or holds
+// the dedicated comment.edit_others permission. General item edit access does
+// not grant ownership override.
 // Returns false and writes an error response on failure.
 func (h *CommentHandler) checkCommentEditPermission(w http.ResponseWriter, r *http.Request, commentID, userID int) bool {
-	authorID, err := h.commentService.GetAuthorID(commentID)
+	comment, err := h.commentService.Get(commentID)
 	if err != nil {
 		h.RespondNotFound(w, r)
 		return false
 	}
-
-	if authorID != nil && *authorID == userID {
-		return true
-	}
-
-	workspaceID, err := h.commentService.GetWorkspaceIDForComment(commentID)
-	if err != nil {
-		h.RespondInternalError(w, r)
+	canView, err := h.Perms.CanViewWorkspace(userID, comment.WorkspaceID)
+	if err != nil || !canView {
+		h.RespondNotFound(w, r)
 		return false
 	}
 
-	canEdit, permErr := h.Perms.CanEditWorkspace(userID, workspaceID)
+	if comment.AuthorID != nil && *comment.AuthorID == userID {
+		return true
+	}
+
+	canEdit, permErr := h.PermissionService.HasWorkspacePermission(userID, comment.WorkspaceID, models.PermissionCommentEditOthers)
 	if permErr != nil || !canEdit {
 		h.RespondNotFound(w, r)
 		return false
@@ -97,22 +101,7 @@ func (h *CommentHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert to DTO response
-	comment := dto.CommentResponse{
-		ID:        commentWithDetails.ID,
-		ItemID:    commentWithDetails.ItemID,
-		Content:   commentWithDetails.Content,
-		CreatedAt: commentWithDetails.CreatedAt,
-		UpdatedAt: commentWithDetails.UpdatedAt,
-	}
-	if commentWithDetails.AuthorName != "" {
-		comment.Author = &dto.UserSummary{
-			FullName: commentWithDetails.AuthorName,
-			Email:    commentWithDetails.AuthorEmail,
-		}
-	}
-
-	h.RespondOK(w, comment)
+	h.RespondOK(w, dto.MapCommentToResponse(&commentWithDetails.Comment))
 }
 
 // requireEditableComment authenticates the caller, parses the comment ID from
@@ -136,7 +125,7 @@ func (h *CommentHandler) requireEditableComment(w http.ResponseWriter, r *http.R
 // Update handles PUT /rest/api/v1/comments/{id}
 //
 // @Summary      Update a comment
-// @Description  The caller must be the comment author or hold edit permission on the comment's workspace.
+// @Description  The caller must be the comment author or hold comment.edit_others on the comment's workspace.
 // @Tags         comments
 // @Accept       json
 // @Produce      json
@@ -168,32 +157,22 @@ func (h *CommentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Use service to update comment
 	updatedComment, err := h.commentService.Update(commentID, req.Content, user.ID)
 	if err != nil {
+		var validationErr *validation.ValidationError
+		if errors.As(err, &validationErr) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, validationErr.Message).WithDetails(map[string]string{"field": validationErr.Field}))
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
 
-	// Convert to DTO response
-	comment := dto.CommentResponse{
-		ID:        updatedComment.ID,
-		ItemID:    updatedComment.ItemID,
-		Content:   updatedComment.Content,
-		CreatedAt: updatedComment.CreatedAt,
-		UpdatedAt: updatedComment.UpdatedAt,
-	}
-	if updatedComment.AuthorName != "" {
-		comment.Author = &dto.UserSummary{
-			FullName: updatedComment.AuthorName,
-			Email:    updatedComment.AuthorEmail,
-		}
-	}
-
-	h.RespondOK(w, comment)
+	h.RespondOK(w, dto.MapCommentToResponse(updatedComment))
 }
 
 // Delete handles DELETE /rest/api/v1/comments/{id}
 //
 // @Summary      Delete a comment
-// @Description  The caller must be the comment author or hold edit permission on the comment's workspace.
+// @Description  The caller must be the comment author or hold comment.edit_others on the comment's workspace.
 // @Tags         comments
 // @Security     BearerAuth
 // @Param        id   path  int  true  "Comment ID"

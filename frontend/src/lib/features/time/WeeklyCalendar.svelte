@@ -13,8 +13,10 @@
   import { errorToast, infoToast } from '../../stores/toasts.svelte.js';
   import { navigate } from '../../router.js';
   import { publicBaseURL } from '../../runtime/contextPath.js';
-  import { formatDate, formatDateWithOptions } from '../../utils/dateFormatter.js';
+  import { dateOnlyKey, formatDate, formatDateOnly, formatDateWithOptions } from '../../utils/dateFormatter.js';
+  import { serverNow } from '../../utils/serverClock.js';
   import Checkbox from '../../components/Checkbox.svelte';
+  import Input from '../../components/Input.svelte';
   import DescriptionText from '../../components/DescriptionText.svelte';
 
   // Get current date and week
@@ -138,7 +140,7 @@
         assignee_id: user.id,
         limit: 50
       });
-      const assignedItems = assignedResponse.items || [];
+      const assignedItems = assignedResponse.data ?? [];
 
       // 2. Items from personal workspace (regardless of assignee)
       let personalItems = [];
@@ -147,7 +149,7 @@
           workspace_id: workspace.id,
           limit: 50
         });
-        personalItems = personalResponse.items || [];
+        personalItems = personalResponse.data ?? [];
       }
 
       // Merge and deduplicate by item ID
@@ -167,11 +169,13 @@
     }
   }
 
-  // Check if item is from personal workspace (should be checkbox)
+  // Check if item is from personal workspace (should be checkbox).
+  // Compare against the actual personal workspace id — name matching breaks
+  // for renamed personal workspaces and shared workspaces named "Personal …"
+  // (WI-1385).
   function isPersonalWorkspaceItem(item) {
-    return item.workspace_name === "User's Todo List" ||
-           item.workspace_name?.toLowerCase().includes('personal') ||
-           item.workspace_name?.toLowerCase().includes('todo');
+    const workspace = $workspacesStore.personalWorkspace;
+    return item.workspace_id != null && workspace?.id != null && item.workspace_id === workspace.id;
   }
 
   // Personal task helpers (same as TodoList)
@@ -301,7 +305,7 @@
   }
 
   function isToday(date) {
-    const today = new Date();
+    const today = serverNow();
     return date.toDateString() === today.toDateString();
   }
 
@@ -355,18 +359,13 @@
         throw new Error('No personal workspace found');
       }
 
-      // Find default status
-      const defaultStatus = availableStatuses.find(s => s.is_default) ||
-                           availableStatuses.find(s => s.name.toLowerCase() === 'open') ||
-                           availableStatuses[0];
-
-      // Create the item in the database
+      // Create the item in the database. Omit status_id so the backend uses
+      // the workspace/item-type workflow initial status.
       const itemData = {
         title: title.trim(),
         description: '',
         workspace_id: workspace.id,
-        assignee_id: user.id,
-        status_id: defaultStatus?.id || 1
+        assignee_id: user.id
       };
 
       const newItem = await api.items.create(itemData);
@@ -1037,6 +1036,7 @@
                         style="top: {top}px; height: {height}px;"
                         class:calendar-item-personal={workItem.is_personal}
                         class:calendar-item-work={!workItem.is_personal}
+                        data-testid={`calendar-scheduled-item-${workItem.id}`}
                         draggable="true"
                         ondragstart={(e) => {
                           isDragging = true;
@@ -1072,10 +1072,10 @@
                                 {workItem.scheduledTime} - {minutesToTime(timeToMinutes(workItem.scheduledTime) + workItem.durationMinutes)}
                               </p>
                               {#if workItem.dueDate}
-                                {@const dueDate = new Date(workItem.dueDate)}
-                                {@const isOverdue = dueDate < new Date() && dueDate.toDateString() !== new Date().toDateString()}
+                                {@const dueDate = dateOnlyKey(workItem.dueDate)}
+                                {@const isOverdue = dueDate < formatDate(serverNow())}
                                 <p class="text-[10px]" style="color: {isOverdue ? 'var(--ds-text-danger)' : 'var(--ds-text-subtle)'};">
-                                  Due: {formatDateWithOptions(dueDate, { month: 'short', day: 'numeric' })}
+                                  Due: {formatDateOnly(dueDate, { month: 'short', day: 'numeric' })}
                                 </p>
                               {/if}
                               <button
@@ -1111,6 +1111,7 @@
                         class="mx-1 mt-1 rounded p-2 group/item cursor-grab"
                         class:calendar-item-personal={workItem.is_personal}
                         class:calendar-item-work={!workItem.is_personal}
+                        data-testid={`calendar-scheduled-item-${workItem.id}`}
                         draggable="true"
                         ondragstart={(e) => {
                           isDragging = true;
@@ -1137,10 +1138,10 @@
                             >×</button>
                           </div>
                           {#if workItem.dueDate}
-                            {@const dueDate = new Date(workItem.dueDate)}
-                            {@const isOverdue = dueDate < new Date() && dueDate.toDateString() !== new Date().toDateString()}
+                            {@const dueDate = dateOnlyKey(workItem.dueDate)}
+                            {@const isOverdue = dueDate < formatDate(serverNow())}
                             <p class="text-[10px]" style="color: {isOverdue ? 'var(--ds-text-danger)' : 'var(--ds-text-subtle)'};">
-                              Due: {formatDateWithOptions(dueDate, { month: 'short', day: 'numeric' })}
+                              Due: {formatDateOnly(dueDate, { month: 'short', day: 'numeric' })}
                             </p>
                           {/if}
                           <button
@@ -1166,8 +1167,7 @@
                       <p class="text-[10px] mb-1" style="color: var(--ds-text-subtle);">
                         {creatingTaskAt.time} - {minutesToTime(timeToMinutes(creatingTaskAt.time) + DEFAULT_DURATION)}
                       </p>
-                      <!-- svelte-ignore a11y_autofocus -->
-                      <input
+                      <Input
                         type="text"
                         bind:value={newTaskTitle}
                         placeholder={t('time.calendar.newTaskPlaceholder')}

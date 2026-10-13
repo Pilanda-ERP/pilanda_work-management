@@ -42,8 +42,8 @@ type User struct {
 	AgentProvenance string `json:"agent_provenance,omitempty"`
 	OAuthClientID   *int   `json:"oauth_client_id,omitempty"`
 	// AgentPresence is a transient, workspace-scoped availability signal for
-	// assignment pickers (WI-272): online | offline | local | unbound. Never
-	// persisted; populated only by the assignable-users endpoint.
+	// actionable-user pickers (WI-272): online | offline | local. Unbound agents
+	// are omitted from workspace rosters.
 	AgentPresence string `json:"agent_presence,omitempty"`
 }
 
@@ -93,7 +93,6 @@ type UserPermissionCache struct {
 	RoleAssignments      map[int][]int             `json:"role_assignments"`      // workspace_id -> role_ids
 	DirectPermissions    map[int][]string          `json:"direct_permissions"`    // workspace_id -> permission_keys (direct assignments)
 	PermissionSources    map[int]map[string]string `json:"permission_sources"`    // workspace_id -> permission_key -> source (role/direct/group)
-	ItemWorkspaceMap     map[int]int               `json:"item_workspace_map"`    // item_id -> workspace_id (lazy-loaded on demand)
 	CachedAt             time.Time                 `json:"cached_at"`
 	ExpiresAt            time.Time                 `json:"expires_at"`
 }
@@ -112,19 +111,15 @@ type UserPreferencesData struct {
 	ColorMode       string               `json:"color_mode,omitempty"` // "light", "dark", or "system"
 	ThemeID         *int                 `json:"theme_id,omitempty"`
 	DashboardLayout *UserDashboardLayout `json:"dashboard_layout,omitempty"`
+	TUI             *UserTUIPreferences  `json:"tui,omitempty"`
 }
 
-// UserPreferencesRequest represents the API request for updating preferences
-type UserPreferencesRequest struct {
-	ColorMode string `json:"color_mode,omitempty"`
-	ThemeID   *int   `json:"theme_id,omitempty"`
-}
-
-// UserPreferencesResponse represents the API response with resolved data
-type UserPreferencesResponse struct {
-	ColorMode string `json:"color_mode"`
-	ThemeID   *int   `json:"theme_id,omitempty"`
-	Theme     *Theme `json:"theme,omitempty"` // Resolved theme if theme_id is set
+// UserTUIPreferences is the SSH TUI's persisted state sub-document. Pointer
+// fields distinguish "unset" from zero values.
+type UserTUIPreferences struct {
+	Theme           string   `json:"theme,omitempty"`
+	SplitRatio      *float64 `json:"split_ratio,omitempty"`
+	LastWorkspaceID *int     `json:"last_workspace_id,omitempty"`
 }
 
 // UserDashboardSection represents a section on the user's personal dashboard
@@ -138,18 +133,19 @@ type UserDashboardSection struct {
 
 // UserDashboardWidget represents a single widget on the user's personal dashboard
 type UserDashboardWidget struct {
-	ID        string                 `json:"id"`
-	Type      string                 `json:"type"`
-	SectionID string                 `json:"section_id"`
-	Position  int                    `json:"position"`
-	Width     int                    `json:"width"`
-	Config    map[string]interface{} `json:"config,omitempty"`
+	ID        string         `json:"id"`
+	Type      string         `json:"type"`
+	SectionID string         `json:"section_id"`
+	Position  int            `json:"position"`
+	Width     int            `json:"width"`
+	Config    map[string]any `json:"config,omitempty"`
 }
 
 // UserDashboardLayout represents the complete personal dashboard layout
 type UserDashboardLayout struct {
-	Sections []UserDashboardSection `json:"sections"`
-	Widgets  []UserDashboardWidget  `json:"widgets"`
+	GridColumns int                    `json:"grid_columns,omitempty"`
+	Sections    []UserDashboardSection `json:"sections"`
+	Widgets     []UserDashboardWidget  `json:"widgets"`
 }
 
 // TeamGroup represents a user group for access control and organization
@@ -225,19 +221,26 @@ type TeamGroupMembershipResponse struct {
 
 // Theme represents the application's visual theme settings
 type Theme struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	IsDefault   bool   `json:"is_default"`
-	IsActive    bool   `json:"is_active"`
+	ID                 int    `json:"id"`
+	BuiltinKey         string `json:"builtin_key,omitempty"`
+	Name               string `json:"name"`
+	DisplayName        string `json:"display_name"`
+	Description        string `json:"description"`
+	DisplayDescription string `json:"display_description,omitempty"`
+	IsDefault          bool   `json:"is_default"`
+	IsActive           bool   `json:"is_active"`
 	// Navigation bar theme properties for light mode
 	NavBackgroundColorLight string `json:"nav_background_color_light"` // CSS color value (hex, rgb, etc.)
 	NavTextColorLight       string `json:"nav_text_color_light"`       // CSS color value (hex, rgb, etc.)
 	// Navigation bar theme properties for dark mode
-	NavBackgroundColorDark string    `json:"nav_background_color_dark"` // CSS color value (hex, rgb, etc.)
-	NavTextColorDark       string    `json:"nav_text_color_dark"`       // CSS color value (hex, rgb, etc.)
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	NavBackgroundColorDark string `json:"nav_background_color_dark"` // CSS color value (hex, rgb, etc.)
+	NavTextColorDark       string `json:"nav_text_color_dark"`       // CSS color value (hex, rgb, etc.)
+	// Optional company logo shown instead of the product mark. LogoURL is the
+	// default/light logo; LogoURLDark overrides it in dark mode when set.
+	LogoURL     string    `json:"logo_url,omitempty"`
+	LogoURLDark string    `json:"logo_url_dark,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // ThemeCreateRequest represents the payload for creating a new theme
@@ -248,6 +251,8 @@ type ThemeCreateRequest struct {
 	NavTextColorLight       string `json:"nav_text_color_light"`
 	NavBackgroundColorDark  string `json:"nav_background_color_dark"`
 	NavTextColorDark        string `json:"nav_text_color_dark"`
+	LogoURL                 string `json:"logo_url"`
+	LogoURLDark             string `json:"logo_url_dark"`
 }
 
 // ThemeUpdateRequest represents the payload for updating a theme
@@ -258,5 +263,7 @@ type ThemeUpdateRequest struct {
 	NavTextColorLight       string `json:"nav_text_color_light"`
 	NavBackgroundColorDark  string `json:"nav_background_color_dark"`
 	NavTextColorDark        string `json:"nav_text_color_dark"`
+	LogoURL                 string `json:"logo_url"`
+	LogoURLDark             string `json:"logo_url_dark"`
 	IsActive                bool   `json:"is_active"`
 }

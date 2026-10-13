@@ -5,19 +5,34 @@
   import { IconArrowLeft, IconPlayerPlay, IconAlertTriangle, IconFileText, IconTrash } from '@tabler/icons-svelte-runes';
   import Button from '../../components/Button.svelte';
   import { confirm } from '../../composables/useConfirm.js';
-  import Spinner from '../../components/Spinner.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
-  import { getStatusBadgeCSS, getStatusLabel } from '../../utils/statusColors.js';
+  import Card from '../../components/Card.svelte';
+  import Panel from '../../components/Panel.svelte';
+  import Progress from '../../components/Progress.svelte';
+  import EmptyState from '../../components/EmptyState.svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
+  import PageHeader from '../../layout/PageHeader.svelte';
+  import SectionHeader from '../../layout/SectionHeader.svelte';
+  import { getStatusLabel, getTestStatusColor } from '../../utils/statusColors.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { workspacePermissions } from '../../stores/index.js';
   import { errorToast, infoToast } from '../../stores/toasts.svelte.js';
-  import { escapeHtml } from '../../utils/sanitize.ts';
+  import { loadTestRunDetail } from './testRunDetailData.js';
+  import { formatExampleRow } from './bddSpec.js';
+  import { formatAuthenticatedDateTime } from '../../utils/authenticatedDateFormatter.js';
 
   let testRun = $state(null);
+  let bddSnapshots = $state({});
+  let bddExampleResults = $state({});
   let testResults = $state([]);
   let loading = $state(true);
 
   let workspaceId = $derived($currentRoute.params.id);
   let runId = $derived($currentRoute.params.runId);
+  // Run execution (start/continue/rerun) is the test.execute tier; run deletion
+  // is test.manage. Both are denied server-side with 404 otherwise.
+  let canExecuteTests = $derived(workspacePermissions.canExecuteTests(workspaceId));
+  let canManageTests = $derived(workspacePermissions.canManageTests(workspaceId));
   let fromPage = $derived($currentRoute.query?.from);
 
   onMount(async () => {
@@ -29,24 +44,22 @@
   async function loadTestRun(runId) {
     try {
       loading = true;
-      testRun = await api.tests.testRuns.get(workspaceId, runId);
+      const detail = await loadTestRunDetail(api, workspaceId, runId);
+      testRun = detail.run;
+      bddSnapshots = detail.bddSnapshots;
+      const groupedExampleResults = {};
+      for (const result of detail.bddExampleResults) {
+        (groupedExampleResults[result.test_case_id] ??= []).push(result);
+      }
+      bddExampleResults = groupedExampleResults;
       
       // Load test results if the run has been executed
       if (testRun.ended_at) {
-        const results = await api.tests.testRuns.getResults(workspaceId, runId);
-        const stepResults = await api.tests.testRuns.getStepResults(workspaceId, runId);
-        
-        // Load test cases to get their steps for proper association
-        const testSet = await api.tests.testSets.get(workspaceId, testRun.set_id);
-        const testCases = await api.tests.testSets.getTestCases(workspaceId, testRun.set_id);
-        
-        // Load test steps for each test case
-        for (let testCase of testCases) {
-          testCase.test_steps = await api.tests.testCases.steps.getAll(workspaceId, testCase.id) || [];
-        }
+        const testCases = detail.testCases;
+        const stepResults = detail.stepResults;
         
         // Combine results with step results for display
-        testResults = results.map(result => {
+        testResults = detail.results.map(result => {
           // Find the corresponding test case
           const testCase = testCases.find(tc => tc.id === result.test_case_id);
           
@@ -64,6 +77,7 @@
           
           return {
             ...result,
+            format: testCase?.format || 'steps',
             test_steps: testCase?.test_steps || [],
             stepResults: caseStepResults
           };
@@ -89,47 +103,19 @@
     return `${base}${suffix}`;
   }
 
-  async function exportResults() {
+  function exportResults() {
     if (!testRun || !testRun.ended_at) {
       infoToast(t('testing.noResultsForExport'));
       return;
     }
     
-    try {
-      const response = await fetch(`/api/workspaces/${workspaceId}/test-runs/${runId}/summary`);
-      const data = await response.json();
-      
-      // Open summary in a new window/tab with formatted markdown
-      const summaryWindow = window.open('', '_blank');
-      summaryWindow.document.write(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <title>Test Run Summary - ${escapeHtml(testRun.name)}</title>
-          <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-            pre { background: #f5f5f5; padding: 15px; border-radius: 5px; white-space: pre-wrap; }
-            table { border-collapse: collapse; width: 100%; margin: 15px 0; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #f2f2f2; }
-          </style>
-        </head>
-        <body>
-          <pre>${escapeHtml(data.markdown)}</pre>
-        </body>
-        </html>
-      `);
-      summaryWindow.document.close();
-    } catch (error) {
-      console.error('Failed to get summary:', error);
-      errorToast(t('testing.failedToLoadSummary'));
-    }
+    window.open(testPath(`/runs/${runId}/print`), '_blank');
   }
 
   async function executeRun() {
     try {
       // Get existing runs for this test plan to generate sequential numbering
-      const setRuns = await api.tests.testSets.getRuns(workspaceId, testRun.set_id);
+      const setRuns = await api.tests.testPlans.getRuns(workspaceId, testRun.plan_id);
       const executionCount = setRuns.length;
       
       const newRunName = prompt(
@@ -143,7 +129,7 @@
       
       // Create a new test run instance for this execution
       const newRun = await api.tests.testRuns.create(workspaceId, {
-        set_id: testRun.set_id,
+        plan_id: testRun.plan_id,
         name: newRunName
       });
       
@@ -154,17 +140,8 @@
     }
   }
 
-  // Status colors now handled by imported utility (getStatusBadgeCSS, getStatusLabel)
-
-  function getStatusIcon(status) {
-    switch (status) {
-      case 'passed': return '✓';
-      case 'failed': return '✗';
-      case 'blocked': return '⚠';
-      case 'skipped': return '⊘';
-      default: return '○';
-    }
-  }
+  const isBddResult = (result) => result.format === 'bdd';
+  const exampleRowLabel = (row) => formatExampleRow(row.row_values);
 
   function getStepStatusStyle(status) {
     const styles = {
@@ -238,49 +215,50 @@
   }
 </script>
 
-<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface-raised);">
-  <div class="flex-1 -mx-6 -mb-6 px-10 py-6">
+<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface);" data-testid="test-run-detail">
+  <div class="flex-1">
     {#if loading}
-      <div class="flex items-center justify-center py-12">
-        <Spinner />
-      </div>
+      <StateDisplay type="loading" message={t('common.loading')} size="lg" />
     {:else if testRun}
       <!-- Header -->
-      <div class="flex items-center justify-between mb-6">
-        <div class="flex items-center gap-3">
-          <button
-            onclick={goBack}
-            class="p-2 rounded cursor-pointer"
-            style="color: var(--ds-icon);"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
-          >
-            <IconArrowLeft class="w-5 h-5" />
-          </button>
-          <div>
-            <h1 class="text-2xl font-semibold" style="color: var(--ds-text);">
-              {testRun.name}
-            </h1>
-            <div class="text-sm mt-1" style="color: var(--ds-text-subtle);">
-              {t('testing.started')}: {new Date(testRun.started_at).toLocaleString()}
-              {#if testRun.ended_at}
-                • {t('testing.ended')}: {new Date(testRun.ended_at).toLocaleString()}
-              {/if}
-            </div>
-          </div>
-        </div>
-
-        <div class="flex items-center gap-3">
+      <Button
+        onclick={goBack}
+        dataTestid="test-run-detail-back"
+        variant="ghost"
+        size="small"
+        icon={IconArrowLeft}
+        class="mb-4"
+      >
+        {fromPage === 'reports' ? t('testing.testRunReport') : t('testing.testRuns')}
+      </Button>
+      <PageHeader
+        title={testRun.name}
+        subtitle={`${t('testing.started')}: ${formatAuthenticatedDateTime(testRun.started_at)}${testRun.ended_at ? ` • ${t('testing.ended')}: ${formatAuthenticatedDateTime(testRun.ended_at)}` : ''}`}
+      >
+        {#snippet actions()}
+        <div class="flex flex-wrap items-center gap-3">
           {#if testRun.ended_at}
+            {#if canExecuteTests}
+              <Button
+                onclick={executeRun}
+                variant="default"
+                size="medium"
+                icon={IconPlayerPlay}
+                dataTestid="test-run-rerun"
+              >
+                {t('testing.startExecution')}
+              </Button>
+            {/if}
             <Button
               onclick={exportResults}
               variant="primary"
               size="medium"
               icon={IconFileText}
+              dataTestid="test-run-export-results"
             >
               {t('testing.exportResults')}
             </Button>
-          {:else}
+          {:else if canExecuteTests}
             <Button
               variant="primary"
               onclick={() => navigate(testPath(`/runs/${runId}/execute`))}
@@ -290,56 +268,56 @@
               {t('testing.continueExecution')}
             </Button>
           {/if}
-          <Button
-            onclick={confirmDelete}
-            variant="danger"
-            size="medium"
-            icon={IconTrash}
-            title={t('testing.deleteTestRun')}
-          >
-            {t('common.delete')}
-          </Button>
+          {#if canManageTests}
+            <Button
+              onclick={confirmDelete}
+              variant="danger"
+              size="medium"
+              icon={IconTrash}
+              title={t('testing.deleteTestRun')}
+            >
+              {t('common.delete')}
+            </Button>
+          {/if}
         </div>
-      </div>
+        {/snippet}
+      </PageHeader>
 
       <!-- Test Run Details -->
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <!-- Status Overview -->
         <div class="lg:col-span-2">
           <div>
-            <h2 class="text-lg font-semibold mb-4" style="color: var(--ds-text);">{t('testing.testResults')}</h2>
+            <SectionHeader title={t('testing.testResults')} />
             
             {#if testResults.length > 0}
               <!-- Test Results Display -->
               <div class="space-y-4">
                 {#each testResults as result}
-                  <div class="border rounded p-4" style="border-color: var(--ds-border);">
+                  <Card variant="outlined" padding="default" dataTestid={`test-run-result-${result.test_case_id}`}>
                     <div class="flex items-center justify-between mb-3">
                       <h3 class="font-medium" style="color: var(--ds-text);">
                         {result.test_case_title}
                       </h3>
-                      <span class="px-3 py-1 text-sm rounded-full" style={getStatusBadgeCSS(result.status)}>
-                        {getStatusIcon(result.status)}
-                        {getStatusLabel(result.status)}
-                      </span>
+                      <Lozenge color={getTestStatusColor(result.status)} text={getStatusLabel(result.status)} size="md" />
                     </div>
 
 
                     {#if result.actual_result}
                       <div class="mb-3">
                         <h4 class="text-sm font-medium mb-1" style="color: var(--ds-text);">{t('testing.actualResult')}</h4>
-                        <p class="text-sm p-2 rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
+                        <Panel padding="compact" rounded="md" class="text-sm" style="color: var(--ds-text-subtle);">
                           {result.actual_result}
-                        </p>
+                        </Panel>
                       </div>
                     {/if}
 
                     {#if result.notes}
                       <div class="mb-3">
                         <h4 class="text-sm font-medium mb-1" style="color: var(--ds-text);">{t('common.notes')}</h4>
-                        <p class="text-sm p-2 rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
+                        <Panel padding="compact" rounded="md" class="text-sm" style="color: var(--ds-text-subtle);">
                           {result.notes}
-                        </p>
+                        </Panel>
                       </div>
                     {/if}
                     
@@ -351,12 +329,20 @@
                           <div class="space-y-3">
                             {#each result.test_steps as step, index}
                               {@const stepResult = result.stepResults[step.id]}
-                              <div class="border rounded p-3" style="border-color: var(--ds-border); background-color: var(--ds-surface);">
+                              <Panel padding="compact" rounded="md" style="background-color: var(--ds-surface);">
+                                <div data-testid={`test-run-step-result-${step.id}`}>
                                 <div class="flex items-center gap-2 text-sm mb-2">
                                   <span class="w-2 h-2 rounded-full" style="background-color: {getStepStatusStyle(stepResult?.status || 'not_run')};"></span>
                                   <span class="font-medium" style="color: var(--ds-text);">{t('testing.stepNumber', { number: index + 1 })}: {getStatusLabel(stepResult?.status || 'not_run')}</span>
-                                  {#if stepResult?.defect_id}
-                                    <IconAlertTriangle class="w-3 h-3" style="color: var(--ds-status-warning-text);" />
+                                  {#if stepResult?.item_id}
+                                    <a
+                                      href={`/workspaces/${workspaceId}/items/${stepResult.item_id}`}
+                                      data-testid={`test-run-step-item-${step.id}`}
+                                      aria-label={t('testing.linked')}
+                                      title={t('testing.linked')}
+                                    >
+                                      <IconAlertTriangle class="w-3 h-3" style="color: var(--ds-status-warning-text);" />
+                                    </a>
                                   {/if}
                                 </div>
 
@@ -371,7 +357,7 @@
                                 {#if stepResult?.actual_result}
                                   <div class="mt-2">
                                     <div class="text-xs font-medium mb-1" style="color: var(--ds-text);">{t('testing.actualResult')}:</div>
-                                    <div class="text-xs p-2 rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
+                                    <div data-testid={`test-run-step-actual-${step.id}`} class="text-xs p-2 rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
                                       {stepResult.actual_result}
                                     </div>
                                   </div>
@@ -380,12 +366,13 @@
                                 {#if stepResult?.notes}
                                   <div class="mt-2">
                                     <div class="text-xs font-medium mb-1" style="color: var(--ds-text);">{t('common.notes')}:</div>
-                                    <div class="text-xs p-2 rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
+                                    <div data-testid={`test-run-step-notes-${step.id}`} class="text-xs p-2 rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
                                       {stepResult.notes}
                                     </div>
                                   </div>
                                 {/if}
-                              </div>
+                                </div>
+                              </Panel>
                             {/each}
                           </div>
                         </div>
@@ -406,31 +393,56 @@
                       </div>
                     {/if}
 
-                    {#if result.executed_at}
-                      <div class="text-xs mt-3 pt-2 border-t" style="border-color: var(--ds-border); color: var(--ds-text-subtle);">
-                        {t('testing.executed')}: {new Date(result.executed_at).toLocaleString()}
+                    {#if isBddResult(result)}
+                      {@const rows = bddExampleResults[result.test_case_id] || []}
+                      <div class="mt-4 pt-3 border-t" style="border-color: var(--ds-border);" data-testid={`test-run-example-results-${result.test_case_id}`}>
+                        <h4 class="text-sm font-medium mb-2" style="color: var(--ds-text);">{t('testing.exampleResults')}</h4>
+                        {#if rows.length === 0}
+                          <div class="text-sm italic" style="color: var(--ds-text-subtle);">{t('testing.examplesNotExecuted')}</div>
+                        {:else}
+                          <div class="space-y-2">
+                            {#each rows as row (row.example_index)}
+                              <div class="flex items-start gap-2 text-sm">
+                                <span class="w-2 h-2 mt-1.5 rounded-full shrink-0" style="background-color: {getStepStatusStyle(row.status || 'not_run')};"></span>
+                                <div class="min-w-0">
+                                  <span class="font-medium" style="color: var(--ds-text);">
+                                    {t('testing.exampleN', { n: row.example_index + 1 })}:
+                                  </span>
+                                  <span style="color: var(--ds-text-subtle);">
+                                    {exampleRowLabel(row)}
+                                  </span>
+                                  {#if row.notes}
+                                    <div class="text-xs" style="color: var(--ds-text-subtle);">{row.notes}</div>
+                                  {/if}
+                                </div>
+                              </div>
+                            {/each}
+                          </div>
+                        {/if}
                       </div>
                     {/if}
-                  </div>
+
+                    {#if result.executed_at}
+                      <div class="text-xs mt-3 pt-2 border-t" style="border-color: var(--ds-border); color: var(--ds-text-subtle);">
+                        {t('testing.executed')}: {formatAuthenticatedDateTime(result.executed_at)}
+                      </div>
+                    {/if}
+                  </Card>
                 {/each}
               </div>
             {:else}
-              <div class="text-center py-8">
-                <div class="text-6xl mb-4">🧪</div>
-                <div class="text-lg font-medium mb-2" style="color: var(--ds-text);">{t('testing.noResultsYet')}</div>
-                <div class="text-sm" style="color: var(--ds-text-subtle);">
-                  {t('testing.executeToSeeResults')}
-                </div>
-                <Button
-                  variant="primary"
-                  onclick={() => navigate(testPath(`/runs/${runId}/execute`))}
-                  icon={IconPlayerPlay}
-                  size="medium"
-                  class="mt-4"
-                >
-                  {t('testing.startExecution')}
-                </Button>
-              </div>
+              <EmptyState icon={IconPlayerPlay} title={t('testing.noResultsYet')} description={t('testing.executeToSeeResults')}>
+                {#snippet action()}
+                  <Button
+                    variant="primary"
+                    onclick={() => navigate(testPath(`/runs/${runId}/execute`))}
+                    icon={IconPlayerPlay}
+                    size="medium"
+                  >
+                    {t('testing.startExecution')}
+                  </Button>
+                {/snippet}
+              </EmptyState>
             {/if}
           </div>
         </div>
@@ -439,8 +451,8 @@
         <div class="space-y-6">
           <!-- Summary Stats -->
           {#if testResults.length > 0}
-            <div>
-              <h3 class="font-semibold mb-4" style="color: var(--ds-text);">{t('testing.resultsSummary')}</h3>
+            <Card variant="raised" padding="spacious" shadow>
+              <SectionHeader title={t('testing.resultsSummary')} />
 
               {#if testResults.length > 0}
                 {@const summary = getResultsSummary(testResults)}
@@ -477,14 +489,19 @@
                     </span>
                   </div>
                 </div>
+                <Progress
+                  value={summary.successRate}
+                  color={summary.successRate >= 80 ? 'success' : summary.successRate >= 60 ? 'warning' : 'danger'}
+                  class="pt-1"
+                />
               </div>
               {/if}
-            </div>
+            </Card>
           {/if}
 
           <!-- Run Information -->
-          <div>
-            <h3 class="font-semibold mb-4" style="color: var(--ds-text);">{t('testing.runInformation')}</h3>
+          <Card variant="raised" padding="spacious" shadow>
+            <SectionHeader title={t('testing.runInformation')} />
 
             <div class="space-y-3">
               <div>
@@ -497,7 +514,7 @@
               <div>
                 <div class="text-sm font-medium" style="color: var(--ds-text-subtle);">{t('testing.started')}</div>
                 <div class="text-sm" style="color: var(--ds-text);">
-                  {new Date(testRun.started_at).toLocaleString()}
+                  {formatAuthenticatedDateTime(testRun.started_at)}
                 </div>
               </div>
               
@@ -505,7 +522,7 @@
                 <div>
                   <div class="text-sm font-medium" style="color: var(--ds-text-subtle);">{t('testing.ended')}</div>
                   <div class="text-sm" style="color: var(--ds-text);">
-                    {new Date(testRun.ended_at).toLocaleString()}
+                    {formatAuthenticatedDateTime(testRun.ended_at)}
                   </div>
                 </div>
 
@@ -517,22 +534,17 @@
                 </div>
               {/if}
             </div>
-          </div>
+          </Card>
         </div>
       </div>
     {:else}
-      <div class="text-center py-12">
-        <div style="color: var(--ds-text-subtle);">{t('testing.testRunNotFound')}</div>
-        <Button
-          onclick={goBack}
-          variant="primary"
-          size="medium"
-          class="mt-4"
-        >
-          {t('testing.backToTestRuns')}
-        </Button>
-      </div>
+      <StateDisplay type="empty" icon={IconFileText} title={t('testing.testRunNotFound')}>
+        {#snippet action()}
+          <Button onclick={goBack} variant="primary" size="medium">
+            {t('testing.backToTestRuns')}
+          </Button>
+        {/snippet}
+      </StateDisplay>
     {/if}
   </div>
 </div>
-

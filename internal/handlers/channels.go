@@ -2,16 +2,18 @@ package handlers
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +31,58 @@ import (
 	"windshift/internal/webhook"
 )
 
+const (
+	channelRequestBodyMaxBytes = 1 << 20
+	channelManagerBatchMax     = 100
+)
+
+// decodeChannelRequest bounds channel-management JSON before decoding and
+// rejects concatenated values after the first document. Channel configs can
+// contain form/portal layout data, so the cap is deliberately roomy while
+// still preventing an authenticated manager from forcing unbounded reads.
+func decodeChannelRequest(w http.ResponseWriter, r *http.Request, target any, optional bool) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, channelRequestBodyMaxBytes)
+	decoder := newJSONDecoder(w, r)
+	if err := decoder.Decode(target); err != nil {
+		if optional && errors.Is(err, io.EOF) {
+			return true
+		}
+		if isRequestBodyTooLarge(err) {
+			respondRequestTooLarge(w, r)
+		} else {
+			respondValidationError(w, r, "Invalid JSON")
+		}
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if isRequestBodyTooLarge(err) {
+			respondRequestTooLarge(w, r)
+		} else {
+			respondValidationError(w, r, "Invalid JSON")
+		}
+		return false
+	}
+	return true
+}
+
+func decodeChannelJSON[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
+	var value T
+	ok := decodeChannelRequest(w, r, &value, false)
+	return value, ok
+}
+
+// bareEmailAddress accepts only a mailbox address, not a display-name form.
+// SMTP envelope recipients must not carry header syntax or control characters.
+func bareEmailAddress(raw string) (string, bool) {
+	address := strings.TrimSpace(raw)
+	parsed, err := mail.ParseAddress(address)
+	if err != nil || parsed.Address == "" || parsed.Address != address {
+		return "", false
+	}
+	return address, true
+}
+
 // ChannelHandler handles HTTP requests for channels
 type ChannelHandler struct {
 	channelRepo       *repository.ChannelRepository
@@ -37,10 +91,12 @@ type ChannelHandler struct {
 	permissionService *services.PermissionService
 	webhookSender     *webhook.WebhookSender
 	emailScheduler    *scheduler.EmailScheduler
+	emailReplies      *services.EmailReplyService
 	encryption        email.Encryptor
 	baseURL           string
 	smtpSender        *windshiftsmtp.NotificationSMTPSender
 	service           *services.ChannelService
+	configUpdate      *services.ChannelConfigUpdateService
 	credManager       *email.CredentialManager
 }
 
@@ -53,19 +109,27 @@ func NewChannelHandler(
 	webhookSender *webhook.WebhookSender,
 	auditor *logger.Auditor,
 ) *ChannelHandler {
-	return &ChannelHandler{
+	handler := &ChannelHandler{
 		channelRepo:       channelRepo,
 		userRepo:          userRepo,
 		auditor:           auditor,
 		permissionService: permissionService,
 		webhookSender:     webhookSender,
 		service:           channelService,
+		configUpdate:      services.NewChannelConfigUpdateService(channelService, permissionService),
 	}
+	handler.configUpdate.SetURLValidator(webhook.ValidateWebhookURL)
+	handler.configUpdate.SetEmailConfigValidator(email.ValidateConfigForEnable)
+	handler.configUpdate.SetSubscriptionInvalidator(handler.invalidateWebhookSubscriptions)
+	return handler
 }
 
 // SetEncryption sets the encryption service for OAuth credential handling
 func (h *ChannelHandler) SetEncryption(enc email.Encryptor) {
 	h.encryption = enc
+	h.configUpdate.SetSecretEncryptor(func(secret string) (string, error) {
+		return email.EncryptSecret(enc, secret)
+	})
 }
 
 // SetBaseURL sets the base URL for OAuth callbacks
@@ -73,9 +137,21 @@ func (h *ChannelHandler) SetBaseURL(baseURL string) {
 	h.baseURL = baseURL
 }
 
+// SetKnowledgeBasePageValidator wires the page-existence check used when a
+// portal wires a page subtree into its knowledge base.
+func (h *ChannelHandler) SetKnowledgeBasePageValidator(validate func(workspaceID, pageID int) error) {
+	h.configUpdate.SetKnowledgeBasePageValidator(validate)
+}
+
 // SetEmailScheduler sets the email scheduler (used to avoid circular dependencies)
 func (h *ChannelHandler) SetEmailScheduler(es *scheduler.EmailScheduler) {
 	h.emailScheduler = es
+}
+
+// SetEmailReplyService wires the outbound customer-reply service so the
+// channel surface can list, retry, and discard queued replies.
+func (h *ChannelHandler) SetEmailReplyService(rs *services.EmailReplyService) {
+	h.emailReplies = rs
 }
 
 // SetSMTPSender sets the SMTP sender for sending test emails
@@ -90,11 +166,18 @@ func (h *ChannelHandler) SetCredentialManager(cm *email.CredentialManager) {
 	h.credManager = cm
 }
 
+func (h *ChannelHandler) invalidateWebhookSubscriptions() {
+	if h.webhookSender != nil {
+		h.webhookSender.InvalidateSubscriptions()
+	}
+}
+
 // requireChannelManageAccess is defense-in-depth on top of the
 // RequireChannelManagement route middleware: writes 401 when unauthenticated,
-// 404 when the user is not a manager (matches the existence-hiding rule from
-// CheckItemPermission in base.go), or 500 on lookup error. Returns the user on
-// success so callers can reuse it for audit logging.
+// 403 when the authenticated user is not a manager, or 500 on lookup error.
+// The route middleware already limits this per-record decision to users with
+// at least one channel-management assignment. Returns the user on success so
+// callers can reuse it for audit logging.
 func (h *ChannelHandler) requireChannelManageAccess(ctx context.Context, w http.ResponseWriter, r *http.Request, channelID int) (*models.User, bool) {
 	user, ok := RequireAuth(w, r)
 	if !ok {
@@ -106,15 +189,32 @@ func (h *ChannelHandler) requireChannelManageAccess(ctx context.Context, w http.
 		return nil, false
 	}
 	if !canManage {
-		respondNotFound(w, r, "channel")
+		respondForbidden(w, r)
 		return nil, false
 	}
 	return user, true
 }
 
+func (h *ChannelHandler) canCompleteEmailOAuth(ctx context.Context, userID, channelID int) (bool, error) {
+	canManage, err := h.service.UserCanManage(ctx, userID, channelID)
+	if err != nil || !canManage {
+		return canManage, err
+	}
+	channel, err := h.service.GetByID(ctx, channelID)
+	if err != nil {
+		return false, err
+	}
+	if channel == nil || channel.Type != "email" || channel.Direction != "inbound" {
+		return false, nil
+	}
+	if !channel.IsDefault {
+		return true, nil
+	}
+	return h.service.UserIsSystemAdmin(userID)
+}
+
 // GetChannels returns all channels (admins) or only managed channels (non-admins)
 func (h *ChannelHandler) GetChannels(w http.ResponseWriter, r *http.Request) {
-	// Get current user
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
@@ -123,8 +223,6 @@ func (h *ChannelHandler) GetChannels(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Parse query-string filters. Unknown values are dropped silently — the
-	// service layer rejects them via its own validation if it cares.
 	q := r.URL.Query()
 	categoryFilter := q.Get("category_id")
 
@@ -165,23 +263,60 @@ func (h *ChannelHandler) CreateChannel(w http.ResponseWriter, r *http.Request) {
 		Description string `json:"description"`
 		Status      string `json:"status"`
 		IsDefault   bool   `json:"is_default"`
-		Config      string `json:"config"`
 		CategoryID  *int   `json:"category_id"`
+		Slug        string `json:"slug"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondValidationError(w, r, "Invalid JSON")
+	if !decodeChannelRequest(w, r, &req, false) {
 		return
 	}
-	// Channel Name renders in the channel directory, picker chips, and
-	// the workspace admin UI; Description shows in the channel list and
-	// detail views. Both are user-supplied free-form text. Type +
-	// Direction + Status are enums the service validates; Config is a
-	// JSON blob handled by UpdateChannelConfig + the catalog work
-	// tracked under the WI-180 follow-up.
+	if req.IsDefault {
+		respondValidationError(w, r, "Default channels cannot be created through this endpoint")
+		return
+	}
+	// Sanitize user-facing text; service validation owns enum and config fields.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
 		sanitize.Pair{Target: &req.Description, Policy: sanitize.RichText, Label: "Description"},
 	)
+	config := map[string]any{}
+	req.Slug = strings.TrimSpace(req.Slug)
+	if (req.Type == "portal" || req.Type == "form") && req.Slug != "" {
+		if !slugFormatOK(req.Slug) {
+			respondValidationError(w, r, "slug must be 3-64 chars: lowercase letters, digits, or hyphens (no leading/trailing hyphen)")
+			return
+		}
+		inUse, slugErr := h.channelRepo.SlugInUse(ctx, req.Type, req.Slug, 0)
+		if slugErr != nil {
+			respondInternalError(w, r, slugErr)
+			return
+		}
+		if inUse {
+			respondConflict(w, r, fmt.Sprintf("Slug %q is already in use by another %s channel", req.Slug, req.Type))
+			return
+		}
+		if req.Type == "portal" {
+			config["portal_slug"] = req.Slug
+			config["portal_title"] = req.Name
+		} else {
+			config["form_slug"] = req.Slug
+		}
+	}
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if req.CategoryID != nil {
+		exists, categoryErr := h.channelRepo.CategoryExists(ctx, *req.CategoryID)
+		if categoryErr != nil {
+			respondInternalError(w, r, categoryErr)
+			return
+		}
+		if !exists {
+			respondValidationError(w, r, "Channel category not found")
+			return
+		}
+	}
 
 	channel, err := h.service.Create(ctx, services.ChannelCreateRequest{
 		Name:        req.Name,
@@ -190,10 +325,14 @@ func (h *ChannelHandler) CreateChannel(w http.ResponseWriter, r *http.Request) {
 		Description: req.Description,
 		Status:      req.Status,
 		IsDefault:   req.IsDefault,
-		Config:      req.Config,
+		Config:      string(configJSON),
 		CategoryID:  req.CategoryID,
 	})
 	if err != nil {
+		if errors.Is(err, repository.ErrChannelSlugConflict) {
+			respondConflict(w, r, "That public channel slug was claimed by another request; choose a different slug")
+			return
+		}
 		if errors.Is(err, services.ErrInvalidChannelField) ||
 			err.Error() == "name, type, and direction are required" {
 			respondValidationError(w, r, err.Error())
@@ -208,6 +347,7 @@ func (h *ChannelHandler) CreateChannel(w http.ResponseWriter, r *http.Request) {
 		channelID := channel.ID
 		h.auditor.Log(r, currentUser, logger.ActionChannelCreate, logger.ResourceChannel, &channelID, channel.Name)
 	}
+	h.invalidateWebhookSubscriptions()
 
 	respondJSONCreated(w, struct {
 		*models.Channel
@@ -225,9 +365,7 @@ func (h *ChannelHandler) GetChannel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Gate by manager scope so direct GET /channels/{id} matches the
-	// visibility filter already applied by GET /channels. See bughunt2.md
-	// Run 6 finding #4.
+	// Match the manager gate used by the collection endpoint.
 	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
 		return
 	}
@@ -252,13 +390,11 @@ func (h *ChannelHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updates, ok := decodeJSON[models.Channel](w, r)
-	if !ok {
+	var updates models.Channel
+	if !decodeChannelRequest(w, r, &updates, false) {
 		return
 	}
-	// Channel Name + Description are the user-facing free-form fields on
-	// the model; everything else is enum/ID/JSON-blob. See CreateChannel
-	// for the full rationale.
+	// Sanitize the two user-facing text fields before updating the channel.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: &updates.Name, Policy: sanitize.PlainTextField, Label: "Name"},
 		sanitize.Pair{Target: &updates.Description, Policy: sanitize.RichText, Label: "Description"},
@@ -267,8 +403,7 @@ func (h *ChannelHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	user, ok := h.requireChannelManageAccess(ctx, w, r, id)
-	if !ok {
+	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
 		return
 	}
 
@@ -292,31 +427,21 @@ func (h *ChannelHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default-channel status is an admin-only attribute. A non-admin channel
-	// manager who could flip is_default would (a) lock themselves out (the
-	// manage-default middleware refuses non-admins) and (b) put product
-	// semantics tied to "default channel" under non-admin control.
-	isAdmin, err := h.permissionService.IsSystemAdmin(user.ID)
-	if err != nil {
-		respondInternalError(w, r, err)
+	// Default status changes go through the dedicated atomic workflow.
+	if updates.IsDefault != existing.IsDefault {
+		respondValidationError(w, r, "Default-channel status cannot be changed through the metadata endpoint")
 		return
 	}
-	if !isAdmin && updates.IsDefault != existing.IsDefault {
-		respondForbidden(w, r)
-		return
-	}
-
-	// Preserve config when not supplied — config edits go through
-	// UpdateChannelConfig, which merges. GetByID returns a scrubbed config so
-	// we read the raw value separately.
-	configToWrite := updates.Config
-	if configToWrite == "" {
-		raw, err := h.service.GetConfig(ctx, id)
-		if err != nil {
-			respondInternalError(w, r, err)
+	if updates.CategoryID != nil {
+		exists, categoryErr := h.channelRepo.CategoryExists(ctx, *updates.CategoryID)
+		if categoryErr != nil {
+			respondInternalError(w, r, categoryErr)
 			return
 		}
-		configToWrite = raw
+		if !exists {
+			respondValidationError(w, r, "Channel category not found")
+			return
+		}
 	}
 
 	updated, err := h.service.Update(ctx, id, services.ChannelUpdateRequest{
@@ -324,7 +449,6 @@ func (h *ChannelHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		Description: updates.Description,
 		Status:      existing.Status, // status is changed via ToggleChannel only
 		IsDefault:   updates.IsDefault,
-		Config:      configToWrite,
 		CategoryID:  updates.CategoryID,
 	})
 	if err != nil {
@@ -340,6 +464,7 @@ func (h *ChannelHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 	if currentUser != nil {
 		h.auditor.Log(r, currentUser, logger.ActionChannelUpdate, logger.ResourceChannel, &id, updates.Name)
 	}
+	h.invalidateWebhookSubscriptions()
 
 	respondJSONOK(w, struct {
 		*models.Channel
@@ -381,6 +506,10 @@ func (h *ChannelHandler) DeleteChannel(w http.ResponseWriter, r *http.Request) {
 
 	err = h.service.Delete(ctx, id)
 	if err != nil {
+		if errors.Is(err, repository.ErrDefaultChannel) {
+			respondValidationError(w, r, "Cannot delete default channel")
+			return
+		}
 		if errors.Is(err, repository.ErrNotFound) {
 			respondNotFound(w, r, "channel")
 			return
@@ -393,6 +522,7 @@ func (h *ChannelHandler) DeleteChannel(w http.ResponseWriter, r *http.Request) {
 	if currentUser != nil {
 		h.auditor.Log(r, currentUser, logger.ActionChannelDelete, logger.ResourceChannel, &id, "")
 	}
+	h.invalidateWebhookSubscriptions()
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -431,10 +561,10 @@ func (h *ChannelHandler) ToggleChannel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
+	user, ok := h.requireChannelManageAccess(ctx, w, r, id)
+	if !ok {
 		return
 	}
-
 	channel, err := h.service.GetByID(ctx, id)
 	if err != nil {
 		respondInternalError(w, r, err)
@@ -444,7 +574,6 @@ func (h *ChannelHandler) ToggleChannel(w http.ResponseWriter, r *http.Request) {
 		respondNotFound(w, r, "channel")
 		return
 	}
-
 	isPluginManaged, err := h.service.IsPluginManaged(ctx, id)
 	if err != nil {
 		respondInternalError(w, r, err)
@@ -461,32 +590,49 @@ func (h *ChannelHandler) ToggleChannel(w http.ResponseWriter, r *http.Request) {
 		newStatus = "disabled"
 	}
 
-	// Block enabling an inbound email channel that's missing required fields.
-	// The scheduler would otherwise spin and increment error state on every
-	// tick; we'd rather give the operator a precise 400 here.
-	if newStatus == "enabled" && channel.Type == "email" && channel.Direction == "inbound" {
-		rawConfig, cfgErr := h.service.GetConfig(ctx, id)
-		if cfgErr != nil {
-			respondInternalError(w, r, cfgErr)
-			return
-		}
-		var cfg models.ChannelConfig
-		if rawConfig != "" {
-			if jsonErr := json.Unmarshal([]byte(rawConfig), &cfg); jsonErr != nil {
-				respondInternalError(w, r, jsonErr)
-				return
+	// Enabling validates the stored configuration first so the operator gets
+	// a precise error instead of a later scheduler failure, then the status
+	// transition is compare-and-swapped against that same configuration so a
+	// concurrent edit cannot bypass validation.
+	validatedConfig, err := h.configUpdate.PrepareEnable(ctx, user.ID, id)
+	if err != nil {
+		var configErr *services.ChannelConfigError
+		if errors.As(err, &configErr) {
+			switch configErr.Kind {
+			case services.ChannelConfigInvalid:
+				respondValidationError(w, r, configErr.Message)
+			case services.ChannelConfigForbidden:
+				respondForbidden(w, r)
+			case services.ChannelConfigWorkspaceForbidden:
+				respondError(w, r, restapi.NewAPIError(http.StatusForbidden, restapi.ErrCodeInsufficientPermission, configErr.Message))
+			case services.ChannelConfigConflict:
+				respondConflict(w, r, configErr.Message)
 			}
-		}
-		if vErr := email.ValidateConfigForEnable(channel, &cfg); vErr != nil {
-			respondValidationError(w, r, vErr.Error())
 			return
 		}
-	}
-
-	if err := h.service.SetStatus(ctx, id, newStatus); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respondNotFound(w, r, "channel")
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
+
+	if validatedConfig != "" {
+		updated, statusErr := h.service.SetStatusIfConfigUnchanged(ctx, id, newStatus, validatedConfig)
+		if statusErr != nil {
+			respondInternalError(w, r, statusErr)
+			return
+		}
+		if !updated {
+			respondConflict(w, r, "Channel configuration changed while it was being enabled; review it and try again")
+			return
+		}
+	} else if err := h.service.SetStatus(ctx, id, newStatus); err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	h.invalidateWebhookSubscriptions()
 
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
@@ -497,7 +643,7 @@ func (h *ChannelHandler) ToggleChannel(w http.ResponseWriter, r *http.Request) {
 		h.auditor.LogWithDetails(r, currentUser,
 			actionType, logger.ResourceChannel,
 			&id, channel.Name,
-			map[string]interface{}{
+			map[string]any{
 				"old_status": currentStatus,
 				"new_status": newStatus,
 			},
@@ -521,12 +667,10 @@ func (h *ChannelHandler) TestChannel(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 
-	// Parse request body for test email address
 	var testRequest struct {
 		TestEmail string `json:"test_email"`
 	}
-	if err = json.NewDecoder(r.Body).Decode(&testRequest); err != nil {
-		respondValidationError(w, r, "Invalid JSON")
+	if !decodeChannelRequest(w, r, &testRequest, false) {
 		return
 	}
 
@@ -534,6 +678,12 @@ func (h *ChannelHandler) TestChannel(w http.ResponseWriter, r *http.Request) {
 		respondValidationError(w, r, "test_email is required")
 		return
 	}
+	testEmail, valid := bareEmailAddress(testRequest.TestEmail)
+	if !valid {
+		respondValidationError(w, r, "test_email must be a valid bare email address")
+		return
+	}
+	testRequest.TestEmail = testEmail
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second) // Longer timeout for network operations
 	defer cancel()
@@ -560,7 +710,7 @@ func (h *ChannelHandler) TestChannel(w http.ResponseWriter, r *http.Request) {
 	channel := *got
 	channel.Config = rawConfig
 
-	result := make(map[string]interface{})
+	result := make(map[string]any)
 	result["channel_id"] = channel.ID
 	result["channel_name"] = channel.Name
 	result["test_time"] = time.Now()
@@ -572,7 +722,6 @@ func (h *ChannelHandler) TestChannel(w http.ResponseWriter, r *http.Request) {
 		result["success"] = success
 		result["message"] = message
 		if success {
-			// Update last activity
 			h.updateChannelActivity(ctx, channel.ID)
 		}
 	default:
@@ -595,8 +744,7 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 	var testData struct {
 		Config models.ChannelConfig `json:"config"`
 	}
-	if err = json.NewDecoder(r.Body).Decode(&testData); err != nil {
-		respondValidationError(w, r, "Invalid JSON")
+	if !decodeChannelRequest(w, r, &testData, false) {
 		return
 	}
 
@@ -617,9 +765,41 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	channelType := channel.Type
+	if channelType == "smtp" && testData.Config.SMTPPassword == "" {
+		rawConfig, configErr := h.service.GetConfig(ctx, id)
+		if configErr != nil {
+			respondInternalError(w, r, configErr)
+			return
+		}
+		var stored models.ChannelConfig
+		if configErr = json.Unmarshal([]byte(rawConfig), &stored); configErr != nil {
+			respondInternalError(w, r, configErr)
+			return
+		}
+		// Preserve an omitted password for tests just as config updates do. The
+		// SMTP sender owns decryption immediately before authentication.
+		testData.Config.SMTPPassword = stored.SMTPPassword
+	}
+	if channelType == "webhook" && testData.Config.WebhookSecret == "" {
+		rawConfig, configErr := h.service.GetConfig(ctx, id)
+		if configErr != nil {
+			respondInternalError(w, r, configErr)
+			return
+		}
+		var stored models.ChannelConfig
+		if configErr = json.Unmarshal([]byte(rawConfig), &stored); configErr != nil {
+			respondInternalError(w, r, configErr)
+			return
+		}
+		secret, decryptErr := email.DecryptOrLegacy(h.encryption, stored.WebhookSecret)
+		if decryptErr != nil {
+			respondInternalError(w, r, decryptErr)
+			return
+		}
+		testData.Config.WebhookSecret = secret
+	}
 
-	// Test the configuration based on channel type
-	result := make(map[string]interface{})
+	result := make(map[string]any)
 	result["channel_id"] = id
 	result["test_time"] = time.Now()
 
@@ -669,47 +849,7 @@ func (h *ChannelHandler) testSMTPChannelWithEmail(channel models.Channel, testEm
 
 	// Create a test email
 	subject := "Windshift SMTP Test Email"
-	htmlBody := `<!DOCTYPE html>
-<html>
-<head>
-	<meta charset="UTF-8">
-	<title>Windshift SMTP Test</title>
-	<style>
-		body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }
-		.container { max-width: 600px; margin: 0 auto; background-color: white; border-radius: 8px; padding: 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-		.header { text-align: center; color: #2563eb; margin-bottom: 24px; }
-		.content { color: #374151; line-height: 1.6; }
-		.success { background-color: #dcfce7; border: 1px solid #16a34a; color: #15803d; padding: 12px; border-radius: 6px; margin: 16px 0; }
-	</style>
-</head>
-<body>
-	<div class="container">
-		<div class="header">
-			<h1>Windshift SMTP Test</h1>
-		</div>
-		<div class="content">
-			<div class="success">
-				<strong>Success!</strong> Your SMTP configuration is working correctly.
-			</div>
-			<p>This test email was sent from Windshift to verify your SMTP settings.</p>
-			<p><strong>Channel:</strong> ` + channel.Name + `</p>
-			<p><strong>Test Time:</strong> ` + time.Now().Format("January 2, 2006 at 3:04 PM MST") + `</p>
-			<p>If you received this email, your SMTP configuration is ready to send notifications.</p>
-		</div>
-	</div>
-</body>
-</html>`
-
-	textBody := `Windshift SMTP Test Email
-
-Success! Your SMTP configuration is working correctly.
-
-This test email was sent from Windshift to verify your SMTP settings.
-
-Channel: ` + channel.Name + `
-Test Time: ` + time.Now().Format("January 2, 2006 at 3:04 PM MST") + `
-
-If you received this email, your SMTP configuration is ready to send notifications.`
+	htmlBody, textBody := buildSMTPTestEmailBodies(channel.Name, time.Now())
 
 	// Check if SMTP sender is configured
 	if h.smtpSender == nil {
@@ -738,6 +878,53 @@ If you received this email, your SMTP configuration is ready to send notificatio
 	return true, "Test email sent successfully to " + testEmail
 }
 
+func buildSMTPTestEmailBodies(channelName string, testTime time.Time) (htmlBody, textBody string) {
+	htmlChannelName := html.EscapeString(channelName)
+	htmlBody = `<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8">
+	<title>Windshift SMTP Test</title>
+	<style>
+		body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }
+		.container { max-width: 600px; margin: 0 auto; background-color: white; border-radius: 8px; padding: 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+		.header { text-align: center; color: #2563eb; margin-bottom: 24px; }
+		.content { color: #374151; line-height: 1.6; }
+		.success { background-color: #dcfce7; border: 1px solid #16a34a; color: #15803d; padding: 12px; border-radius: 6px; margin: 16px 0; }
+	</style>
+</head>
+<body>
+	<div class="container">
+		<div class="header">
+			<h1>Windshift SMTP Test</h1>
+		</div>
+		<div class="content">
+			<div class="success">
+				<strong>Success!</strong> Your SMTP configuration is working correctly.
+			</div>
+			<p>This test email was sent from Windshift to verify your SMTP settings.</p>
+			<p><strong>Channel:</strong> ` + htmlChannelName + `</p>
+			<p><strong>Test Time:</strong> ` + testTime.Format("January 2, 2006 at 3:04 PM MST") + `</p>
+			<p>If you received this email, your SMTP configuration is ready to send notifications.</p>
+		</div>
+	</div>
+</body>
+</html>`
+
+	textBody = `Windshift SMTP Test Email
+
+Success! Your SMTP configuration is working correctly.
+
+This test email was sent from Windshift to verify your SMTP settings.
+
+Channel: ` + channelName + `
+Test Time: ` + testTime.Format("January 2, 2006 at 3:04 PM MST") + `
+
+If you received this email, your SMTP configuration is ready to send notifications.`
+
+	return htmlBody, textBody
+}
+
 // testSMTPConfig tests SMTP configuration directly. Dial goes through
 // utils.SafeNetDialer so a channel manager cannot use this endpoint to
 // port-scan loopback / private-IP / link-local services.
@@ -763,68 +950,13 @@ func (h *ChannelHandler) updateChannelActivity(ctx context.Context, channelID in
 	_ = h.service.UpdateLastActivity(ctx, channelID)
 }
 
-// channelSlugRegex matches the shape the frontend enforces for portal/form
-// slugs: lowercase alphanumerics with optional internal hyphens, 3-64 chars,
-// no leading/trailing hyphen. (collections.go has its own copy with the
-// same rules — kept separate so the channel-slug constraint can evolve
-// without affecting collection slugs.) Slugs land in public URLs, so
-// anything outside this set would either fail to route or invite escaping
-// bugs in the routing layer.
+// channelSlugRegex accepts routable public portal/form slugs: lowercase 3–64
+// alphanumerics with internal hyphens. It evolves independently from collections.
 var channelSlugRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`)
 
 // slugFormatOK reports whether s is a valid portal/form slug.
 func slugFormatOK(s string) bool {
 	return channelSlugRegex.MatchString(s)
-}
-
-// emailOAuthAuthFields are config keys only meaningful when EmailAuthMethod
-// == "oauth". They include the OAuth app credentials, the tenant ID, and the
-// tokens persisted after a successful OAuth flow.
-var emailOAuthAuthFields = []string{
-	"email_oauth_provider_type",
-	"email_oauth_client_id",
-	"email_oauth_client_secret",
-	"email_oauth_tenant_id",
-	"email_oauth_access_token",
-	"email_oauth_refresh_token",
-	"email_oauth_expires_at",
-	"email_oauth_email",
-}
-
-// emailBasicAuthFields are config keys only meaningful when EmailAuthMethod
-// == "basic". IMAP host/port/encryption come from the generic provider config
-// for basic auth; for OAuth providers they're set by the provider itself.
-var emailBasicAuthFields = []string{
-	"imap_host",
-	"imap_port",
-	"imap_username",
-	"imap_password",
-	"imap_encryption",
-}
-
-// normalizeEmailAuthConfig strips fields belonging to the inactive auth mode
-// from a merged email channel config map. No-op when email_auth_method is
-// absent (the caller may be updating non-email-auth fields) or when the
-// channel isn't using email auth at all.
-func normalizeEmailAuthConfig(cfg map[string]interface{}) {
-	rawMethod, ok := cfg["email_auth_method"]
-	if !ok {
-		return
-	}
-	method, ok := rawMethod.(string)
-	if !ok {
-		return
-	}
-	switch strings.ToLower(method) {
-	case "basic":
-		for _, k := range emailOAuthAuthFields {
-			delete(cfg, k)
-		}
-	case "oauth":
-		for _, k := range emailBasicAuthFields {
-			delete(cfg, k)
-		}
-	}
 }
 
 // UpdateChannelConfig updates only the configuration of a channel
@@ -834,233 +966,99 @@ func (h *ChannelHandler) UpdateChannelConfig(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var err error
-
 	var rawRequest map[string]json.RawMessage
-	if err = json.NewDecoder(r.Body).Decode(&rawRequest); err != nil {
-		respondValidationError(w, r, "Invalid JSON")
+	if !decodeChannelRequest(w, r, &rawRequest, false) {
 		return
 	}
-
 	rawConfig, ok := rawRequest["config"]
 	if !ok {
 		respondValidationError(w, r, "Missing config field")
 		return
 	}
 
-	var incomingConfig map[string]interface{}
-	if err = json.Unmarshal(rawConfig, &incomingConfig); err != nil {
+	var incomingConfig map[string]any
+	if err := json.Unmarshal(rawConfig, &incomingConfig); err != nil {
 		respondValidationError(w, r, "Invalid config JSON")
 		return
 	}
-
-	// Encrypt basic-auth secrets in the incoming payload before merging so
-	// they land on disk as AES-GCM ciphertext rather than plaintext JSON. We
-	// touch only fields the caller actually sent — omitted keys keep their
-	// existing (already-encrypted) value through the merge below. Empty
-	// strings are passed through so the caller can clear a credential.
-	// email_oauth_client_secret is included so the start-OAuth path can
-	// decrypt it consistently with EmailOAuthAccessToken / EmailOAuthRefreshToken.
-	for _, key := range []string{"smtp_password", "imap_password", "webhook_secret", "email_oauth_client_secret"} {
-		raw, ok := incomingConfig[key]
-		if !ok {
-			continue
-		}
-		s, ok := raw.(string)
-		if !ok || s == "" {
-			continue
-		}
-		if h.encryption == nil {
-			continue
-		}
-		ciphertext, encErr := h.encryption.Encrypt(s)
-		if encErr != nil {
-			respondInternalError(w, r, fmt.Errorf("encrypt %s: %w", key, encErr))
-			return
-		}
-		incomingConfig[key] = ciphertext
+	if incomingConfig == nil {
+		respondValidationError(w, r, "Config must be a JSON object")
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-
-	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
+	user, ok := RequireAuth(w, r)
+	if !ok {
 		return
 	}
-
-	existingConfigJSON, err := h.service.GetConfig(ctx, id)
-	if errors.Is(err, repository.ErrNotFound) {
-		respondNotFound(w, r, "channel")
-		return
-	}
+	updated, err := h.configUpdate.Update(ctx, user.ID, id, incomingConfig)
 	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	isPluginManaged, err := h.service.IsPluginManaged(ctx, id)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if isPluginManaged {
-		respondForbidden(w, r)
-		return
-	}
-
-	// Merge existing config with new config to preserve unmodified fields
-	var mergedConfig map[string]interface{}
-
-	// Unmarshal existing config into map
-	if existingConfigJSON != "" {
-		if err = json.Unmarshal([]byte(existingConfigJSON), &mergedConfig); err != nil {
-			// If existing config is invalid, start with empty map
-			mergedConfig = make(map[string]interface{})
-		}
-	} else {
-		mergedConfig = make(map[string]interface{})
-	}
-
-	// Merge: incoming config overwrites existing config for keys that are present
-	for key, value := range incomingConfig {
-		mergedConfig[key] = value
-	}
-
-	// For email channels, drop fields from the inactive auth mode so a basic →
-	// OAuth switch can't keep the IMAP password around (and vice versa). Stale
-	// inline OAuth credentials are especially dangerous: CredentialManager.
-	// GetProviderForChannel checks them before falling back to IMAPHost, so a
-	// leftover client_id/client_secret can pin a "switched to basic" channel
-	// onto OAuth.
-	normalizeEmailAuthConfig(mergedConfig)
-
-	// Convert merged config back to JSON
-	configJSON, err := json.Marshal(mergedConfig)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Unmarshal merged config into ChannelConfig struct for validation
-	var finalConfig models.ChannelConfig
-	if err = json.Unmarshal(configJSON, &finalConfig); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Validate knowledge base URL if set
-	if finalConfig.KnowledgeBaseURL != "" {
-		if err := utils.ValidateExternalURL(finalConfig.KnowledgeBaseURL); err != nil {
-			respondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, "Knowledge base URL must be a valid public HTTPS URL"))
-			return
-		}
-	}
-
-	// Validate webhook URL at write time as defense-in-depth: the webhook
-	// sender already rejects private targets at send time via
-	// webhook.ValidateWebhookURL, but failing fast here gives the admin a
-	// clear error in the UI instead of a silent send-time skip later.
-	if finalConfig.WebhookURL != "" {
-		if err := webhook.ValidateWebhookURL(finalConfig.WebhookURL); err != nil {
-			respondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, "Webhook URL must target a public host"))
-			return
-		}
-	}
-
-	// Form redirect URL ends up at window.location.href in the form
-	// submitter's browser. Reject non-http(s) schemes (javascript:, data:,
-	// vbscript:) at write time so an admin can't XSS form visitors.
-	if finalConfig.FormRedirectURL != "" {
-		if err := utils.ValidateClientRedirectURL(finalConfig.FormRedirectURL); err != nil {
-			respondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, "Form redirect URL must be an http(s) URL"))
-			return
-		}
-	}
-	// Same for the form logo, which is rendered as <img src> on the public
-	// form page — javascript: in src would be ignored by modern browsers but
-	// data: HTML is still a click-through phishing surface.
-	if finalConfig.FormLogoURL != "" {
-		if err := utils.ValidateClientRedirectURL(finalConfig.FormLogoURL); err != nil {
-			respondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeValidationFailed, "Form logo URL must be an http(s) URL"))
-			return
-		}
-	}
-
-	// Portal/form target workspace IDs must reference real, non-personal
-	// workspaces. The UI filters them, but a direct API caller can submit
-	// bad IDs that would later surface as runtime failures in SubmitForm
-	// or GetPortal. Personal workspaces are off-limits for public ingest
-	// since they're a single-user scratch space.
-	if len(finalConfig.PortalWorkspaceIDs) > 0 || len(finalConfig.FormWorkspaceIDs) > 0 {
-		all := append([]int(nil), finalConfig.PortalWorkspaceIDs...)
-		all = append(all, finalConfig.FormWorkspaceIDs...)
-		bad, wsErr := h.channelRepo.FindBadWorkspaceIDs(all)
-		if wsErr != nil {
-			respondInternalError(w, r, wsErr)
-			return
-		}
-		if len(bad) > 0 {
-			respondValidationError(w, r, fmt.Sprintf("Workspace IDs %v are missing or personal and cannot be used as portal/form targets", bad))
-			return
-		}
-	}
-
-	// Slug format + uniqueness for portal/form channels. Slugs are routed
-	// via findChannelBySlug, which scans enabled channels and returns the
-	// first match by creation order. Without server-side validation a
-	// channel manager could pick a duplicate slug and hijack traffic from
-	// an older portal/form. Format regex matches the frontend rules.
-	if channel, chErr := h.service.GetByID(ctx, id); chErr == nil && channel != nil {
-		var (
-			slug      string
-			slugLabel string
-		)
-		switch channel.Type {
-		case "portal":
-			slug = finalConfig.PortalSlug
-			slugLabel = "portal_slug"
-		case "form":
-			slug = finalConfig.FormSlug
-			slugLabel = "form_slug"
-		}
-		if slug != "" {
-			if !slugFormatOK(slug) {
-				respondValidationError(w, r, fmt.Sprintf("%s must be 1-64 chars: lowercase letters, digits, or hyphens (no leading/trailing hyphen)", slugLabel))
-				return
+		var configErr *services.ChannelConfigError
+		if errors.As(err, &configErr) {
+			switch configErr.Kind {
+			case services.ChannelConfigInvalid:
+				respondValidationError(w, r, configErr.Message)
+			case services.ChannelConfigForbidden:
+				respondForbidden(w, r)
+			case services.ChannelConfigWorkspaceForbidden:
+				respondError(w, r, restapi.NewAPIError(http.StatusForbidden, restapi.ErrCodeInsufficientPermission, configErr.Message))
+			case services.ChannelConfigConflict:
+				respondConflict(w, r, configErr.Message)
 			}
-			inUse, slugErr := h.channelRepo.SlugInUse(ctx, channel.Type, slug, id)
-			if slugErr != nil {
-				respondInternalError(w, r, slugErr)
-				return
-			}
-			if inUse {
-				respondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeValidationFailed, fmt.Sprintf("%s %q is already in use by another %s channel", slugLabel, slug, channel.Type)))
-				return
-			}
-		}
-	}
-
-	// If the channel is already enabled and this is an inbound email channel,
-	// the merged config must still satisfy the ingestion-readiness rules.
-	// Without this gate, a partial config update (e.g. clearing the OAuth
-	// refresh token) would silently leave the channel enabled but broken.
-	if channel, chErr := h.service.GetByID(ctx, id); chErr == nil && channel != nil &&
-		channel.Status == "enabled" && channel.Type == "email" && channel.Direction == "inbound" {
-		if vErr := email.ValidateConfigForEnable(channel, &finalConfig); vErr != nil {
-			respondValidationError(w, r, vErr.Error())
 			return
 		}
-	}
-
-	if err := h.service.UpdateConfig(ctx, id, string(configJSON)); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			respondNotFound(w, r, "channel")
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
-		"success": true,
+	resourceName := ""
+	var previousSources []models.KnowledgeBasePageSource
+	if channel, lookupErr := h.service.GetByID(ctx, id); lookupErr == nil && channel != nil {
+		resourceName = channel.Name
+		previousSources = decodeKBSources(channel.Config)
+	}
+	h.auditor.LogWithDetails(r, user,
+		logger.ActionChannelUpdate, logger.ResourceChannel,
+		&id, resourceName,
+		map[string]any{"change_type": "configuration"},
+	)
+
+	// Publishing a pages tree through a portal knowledge base exposes
+	// workspace content to customers (WI-1142): the publish scope change is
+	// its own audit event, not just a config edit.
+	if updatedChannel, lookupErr := h.service.GetByID(ctx, id); lookupErr == nil && updatedChannel != nil {
+		updatedSources := decodeKBSources(updatedChannel.Config)
+		if !slices.EqualFunc(previousSources, updatedSources, func(a, b models.KnowledgeBasePageSource) bool {
+			return a.WorkspaceID == b.WorkspaceID &&
+				(a.RootPageID == b.RootPageID || (a.RootPageID != nil && b.RootPageID != nil && *a.RootPageID == *b.RootPageID))
+		}) {
+			h.auditor.LogWithDetails(r, user,
+				logger.ActionChannelKBPublish, logger.ResourceChannel,
+				&id, resourceName,
+				map[string]any{"sources": updatedSources},
+			)
+		}
+	}
+
+	respondJSONOK(w, map[string]any{
+		"success": updated,
 		"message": "Channel configuration updated successfully",
 	})
+}
+
+// decodeKBSources extracts the portal knowledge base publish scope from a
+// channel config JSON document.
+func decodeKBSources(configJSON string) []models.KnowledgeBasePageSource {
+	var config models.ChannelConfig
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return nil
+	}
+	return config.KnowledgeBasePageSources
 }
 
 // GetChannelManagers returns all managers for a channel. Gated by manage
@@ -1098,12 +1096,11 @@ func (h *ChannelHandler) AddChannelManager(w http.ResponseWriter, r *http.Reques
 
 	var err error
 
-	request, ok := decodeJSON[models.ChannelManagerRequest](w, r)
-	if !ok {
+	var request models.ChannelManagerRequest
+	if !decodeChannelRequest(w, r, &request, false) {
 		return
 	}
 
-	// Validate request
 	if request.ManagerType != "user" && request.ManagerType != "group" {
 		respondValidationError(w, r, "manager_type must be 'user' or 'group'")
 		return
@@ -1112,6 +1109,24 @@ func (h *ChannelHandler) AddChannelManager(w http.ResponseWriter, r *http.Reques
 		respondValidationError(w, r, "manager_ids must contain at least one ID")
 		return
 	}
+	if len(request.ManagerIDs) > channelManagerBatchMax {
+		respondValidationError(w, r, fmt.Sprintf("manager_ids must contain at most %d IDs", channelManagerBatchMax))
+		return
+	}
+	uniqueManagerIDs := make([]int, 0, len(request.ManagerIDs))
+	seenManagerIDs := make(map[int]struct{}, len(request.ManagerIDs))
+	for _, managerID := range request.ManagerIDs {
+		if managerID <= 0 {
+			respondValidationError(w, r, "manager_ids must contain positive IDs")
+			return
+		}
+		if _, duplicate := seenManagerIDs[managerID]; duplicate {
+			continue
+		}
+		seenManagerIDs[managerID] = struct{}{}
+		uniqueManagerIDs = append(uniqueManagerIDs, managerID)
+	}
+	request.ManagerIDs = uniqueManagerIDs
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -1131,6 +1146,7 @@ func (h *ChannelHandler) AddChannelManager(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	managerNames := make(map[int]string, len(request.ManagerIDs))
 	for _, managerID := range request.ManagerIDs {
 		// channel_managers.manager_id is polymorphic (user or group) and has
 		// no FK, so existence has to be enforced in app code. Reject up front
@@ -1139,7 +1155,7 @@ func (h *ChannelHandler) AddChannelManager(w http.ResponseWriter, r *http.Reques
 		var exists bool
 		switch request.ManagerType {
 		case "user":
-			exists, err = h.userRepo.Exists(managerID)
+			exists, err = h.userRepo.ActiveExists(managerID)
 		case "group":
 			exists, err = h.channelRepo.GroupExists(ctx, managerID)
 		}
@@ -1148,19 +1164,7 @@ func (h *ChannelHandler) AddChannelManager(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if !exists {
-			respondValidationError(w, r, fmt.Sprintf("Invalid %s ID: %d does not exist", request.ManagerType, managerID))
-			return
-		}
-
-		err := h.service.AddManager(ctx, channelID, request.ManagerType, managerID, user.ID)
-		if err != nil {
-			// Belt-and-braces: catch a deferred FK violation from any
-			// future schema change that adds a real foreign key.
-			if strings.Contains(err.Error(), "FOREIGN KEY") || strings.Contains(err.Error(), "foreign key") {
-				respondValidationError(w, r, fmt.Sprintf("Invalid %s ID: %d does not exist", request.ManagerType, managerID))
-				return
-			}
-			respondInternalError(w, r, err)
+			respondValidationError(w, r, fmt.Sprintf("Invalid %s ID: %d does not exist or is inactive", request.ManagerType, managerID))
 			return
 		}
 
@@ -1171,21 +1175,30 @@ func (h *ChannelHandler) AddChannelManager(w http.ResponseWriter, r *http.Reques
 		case "group":
 			managerName, _ = h.channelRepo.GetGroupName(ctx, managerID)
 		}
+		managerNames[managerID] = managerName
+	}
 
+	insertedManagerIDs, err := h.service.AddManagers(ctx, channelID, request.ManagerType, request.ManagerIDs, user.ID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+
+	for _, managerID := range insertedManagerIDs {
 		h.auditor.LogWithDetails(r, user,
 			logger.ActionChannelAddManager, logger.ResourceChannelManager,
 			&channelID, channel.Name,
-			map[string]interface{}{
+			map[string]any{
 				"manager_type": request.ManagerType,
 				"manager_id":   managerID,
-				"manager_name": managerName,
+				"manager_name": managerNames[managerID],
 			},
 		)
 	}
 
-	respondJSONCreated(w, map[string]interface{}{
+	respondJSONCreated(w, map[string]any{
 		"success": true,
-		"message": fmt.Sprintf("Added %d manager(s) to channel", len(request.ManagerIDs)),
+		"message": fmt.Sprintf("Added %d manager(s) to channel", len(insertedManagerIDs)),
 	})
 }
 
@@ -1258,7 +1271,7 @@ func (h *ChannelHandler) RemoveChannelManager(w http.ResponseWriter, r *http.Req
 	h.auditor.LogWithDetails(r, user,
 		logger.ActionChannelRemoveManager, logger.ResourceChannelManager,
 		&channelID, channel.Name,
-		map[string]interface{}{
+		map[string]any{
 			"manager_type": managerType,
 			"manager_id":   actualManagerID,
 			"manager_name": managerName,
@@ -1272,20 +1285,17 @@ func (h *ChannelHandler) RemoveChannelManager(w http.ResponseWriter, r *http.Req
 // This is primarily used for testing to avoid waiting for the scheduler interval.
 // POST /api/channels/{id}/process-emails
 func (h *ChannelHandler) ProcessEmailsNow(w http.ResponseWriter, r *http.Request) {
-	// Get current user
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
 	}
 
-	// Check if user is a system admin
 	isSystemAdmin, err := h.permissionService.IsSystemAdmin(user.ID)
 	if err != nil || !isSystemAdmin {
 		respondAdminRequired(w, r)
 		return
 	}
 
-	// Get channel ID from path
 	channelIDStr := r.PathValue("id")
 	channelID, err := strconv.Atoi(channelIDStr)
 	if err != nil {
@@ -1293,7 +1303,7 @@ func (h *ChannelHandler) ProcessEmailsNow(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 
 	channel, err := h.service.GetByID(ctx, channelID)
@@ -1310,7 +1320,6 @@ func (h *ChannelHandler) ProcessEmailsNow(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check if email scheduler is available
 	if h.emailScheduler == nil {
 		respondError(w, r, &restapi.APIError{
 			StatusCode: http.StatusServiceUnavailable,
@@ -1320,17 +1329,426 @@ func (h *ChannelHandler) ProcessEmailsNow(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Trigger processing
-	err = h.emailScheduler.ProcessChannelNow(channelID)
+	err = h.emailScheduler.ProcessChannelNow(ctx, channelID)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success":    true,
 		"channel_id": channelID,
 		"message":    "Email processing triggered",
+	})
+}
+
+// RequeueRateLimitedEmails rewinds the channel's IMAP watermark to the
+// earliest flood-declined message and invalidates its preclaim lease so the
+// next poll deterministically reprocesses it against the current cap instead
+// of waiting out the stale-claim window. Rate-limited mail was left in the
+// mailbox, so nothing is re-downloaded from the sender: recovery only re-reads
+// what is already there.
+// POST /channels/{id}/email/requeue-rate-limited
+func (h *ChannelHandler) RequeueRateLimitedEmails(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	id, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
+		return
+	}
+	if !h.requireInboundEmailChannel(ctx, w, r, id) {
+		return
+	}
+
+	requeuedCount := 0
+	earliestUID := 0
+	foundAny := false
+
+	// Since WI-1644 the poll cursor is per intake, so requeue must rewind each
+	// intake's own watermark. Tracking rows carry the intake that ingested them.
+	intakes, err := repository.NewIntakeRepository(h.channelRepo.DB()).ListEnabledForMailbox(ctx, id)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	for _, intake := range intakes {
+		uid, found, err := h.channelRepo.GetEarliestRateLimitedUIDForIntake(ctx, intake.ID, intake.UIDValidity)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		if !found {
+			continue
+		}
+		if err := h.channelRepo.ResetIntakeWatermarkToUID(ctx, intake.ID, uid-1); err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		n, err := h.channelRepo.RequeueRateLimitedClaimsForIntake(ctx, intake.ID, intake.UIDValidity)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		requeuedCount += n
+		if !foundAny || uid < earliestUID {
+			earliestUID = uid
+		}
+		foundAny = true
+	}
+
+	// Pre-split tracking rows (intake_id NULL) still use the channel watermark.
+	state, err := h.channelRepo.GetEmailChannelState(ctx, id)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		respondInternalError(w, r, err)
+		return
+	}
+	var uidValidity uint32
+	if state != nil {
+		uidValidity = state.UIDValidity
+	}
+	legacyUID, legacyFound, err := h.channelRepo.GetEarliestRateLimitedUID(ctx, id, uidValidity)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if legacyFound {
+		if err := h.channelRepo.ResetEmailWatermarkToUID(ctx, id, legacyUID-1); err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		n, err := h.channelRepo.RequeueRateLimitedClaims(ctx, id, uidValidity)
+		if err != nil {
+			respondInternalError(w, r, err)
+			return
+		}
+		requeuedCount += n
+		if !foundAny || legacyUID < earliestUID {
+			earliestUID = legacyUID
+		}
+		foundAny = true
+	}
+
+	if !foundAny {
+		respondJSONOK(w, map[string]any{
+			"requeued":   false,
+			"channel_id": id,
+			"message":    "No rate-limited messages to requeue",
+		})
+		return
+	}
+
+	slog.Info("requeued rate-limited email messages",
+		"channel_id", id,
+		"from_uid", earliestUID,
+		"count", requeuedCount,
+	)
+	respondJSONOK(w, map[string]any{
+		"requeued":       true,
+		"channel_id":     id,
+		"from_uid":       earliestUID,
+		"requeued_count": requeuedCount,
+		"message":        "Rate-limited messages requeued for reprocessing",
+	})
+}
+
+// requireInboundEmailChannel is the shared channel lookup + shape check for
+// the per-channel email endpoints.
+func (h *ChannelHandler) requireInboundEmailChannel(ctx context.Context, w http.ResponseWriter, r *http.Request, id int) bool {
+	return h.requireChannelOfTypes(ctx, w, r, id, "inbound email channel", "email")
+}
+
+// requireReplyOutboxChannel accepts inbound email channels and portal
+// channels: portal-originated tickets' customer replies live in the origin
+// (portal) channel's outbox (WI-1546), so operators manage them there.
+func (h *ChannelHandler) requireReplyOutboxChannel(ctx context.Context, w http.ResponseWriter, r *http.Request, id int) bool {
+	return h.requireChannelOfTypes(ctx, w, r, id, "inbound email or portal channel", "email", "portal")
+}
+
+// requireChannelOfTypes is the shared channel lookup + shape check for the
+// family of guards above.
+func (h *ChannelHandler) requireChannelOfTypes(ctx context.Context, w http.ResponseWriter, r *http.Request, id int, description string, types ...string) bool {
+	channel, err := h.service.GetByID(ctx, id)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return false
+	}
+	if channel == nil {
+		respondNotFound(w, r, "channel")
+		return false
+	}
+	if channel.Direction != "inbound" {
+		respondValidationError(w, r, fmt.Sprintf("Channel is not an %s", description))
+		return false
+	}
+	for _, t := range types {
+		if channel.Type == t {
+			return true
+		}
+	}
+	respondValidationError(w, r, fmt.Sprintf("Channel is not an %s", description))
+	return false
+}
+
+// ListEmailReplies returns the channel's outbound customer-reply queue:
+// envelope metadata and delivery state, never message bodies.
+// GET /channels/{id}/email/replies?status=pending&page=1&page_size=50
+func (h *ChannelHandler) ListEmailReplies(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	id, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	user, ok := h.requireChannelManageAccess(ctx, w, r, id)
+	if !ok {
+		return
+	}
+	if !h.requireReplyOutboxChannel(ctx, w, r, id) {
+		return
+	}
+
+	status := repository.EmailReplyOutboxPending
+	if s := r.URL.Query().Get("status"); s != "" {
+		switch repository.EmailReplyOutboxStatus(s) {
+		case repository.EmailReplyOutboxPending, repository.EmailReplyOutboxDelivered,
+			repository.EmailReplyOutboxDiscarded, repository.EmailReplyOutboxAll:
+			status = repository.EmailReplyOutboxStatus(s)
+		default:
+			respondValidationError(w, r, "status must be pending, delivered, discarded, or all")
+			return
+		}
+	}
+
+	page, pageSize := 1, 50
+	if p := r.URL.Query().Get("page"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 {
+			page = v
+		}
+	}
+	if ps := r.URL.Query().Get("page_size"); ps != "" {
+		if v, err := strconv.Atoi(ps); err == nil && v > 0 && v <= 100 {
+			pageSize = v
+		}
+	}
+
+	isSystemAdmin, err := h.permissionService.IsSystemAdmin(user.ID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+
+	total, err := h.channelRepo.CountEmailReplies(ctx, id, status)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	rows, err := h.channelRepo.ListEmailReplies(ctx, id, status, page, pageSize)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+
+	// Same workspace-scoped redaction as the inbound log: the recipient and
+	// subject stay hidden from channel managers without item-view on the
+	// ticket's workspace. Bodies are never returned regardless.
+	workspaceIDs := map[int]bool{}
+	for _, row := range rows {
+		if row.WorkspaceID != nil {
+			workspaceIDs[*row.WorkspaceID] = true
+		}
+	}
+	allowedWS := map[int]bool{}
+	for wsID := range workspaceIDs {
+		allowed, permErr := h.permissionService.HasWorkspacePermission(user.ID, wsID, models.PermissionItemView)
+		if permErr != nil {
+			respondInternalError(w, r, permErr)
+			return
+		}
+		allowedWS[wsID] = allowed
+	}
+
+	type emailReply struct {
+		ID            int        `json:"id"`
+		CommentID     int        `json:"comment_id"`
+		ItemID        int        `json:"item_id"`
+		ToEmail       string     `json:"to_email"`
+		ToName        string     `json:"to_name"`
+		Subject       string     `json:"subject"`
+		AttemptCount  int        `json:"attempt_count"`
+		NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+		LastError     string     `json:"last_error,omitempty"`
+		DeliveredAt   *time.Time `json:"delivered_at,omitempty"`
+		DiscardedAt   *time.Time `json:"discarded_at,omitempty"`
+		CreatedAt     time.Time  `json:"created_at"`
+		WorkspaceKey  string     `json:"workspace_key,omitempty"`
+		Redacted      bool       `json:"redacted,omitempty"`
+	}
+
+	replies := make([]emailReply, 0, len(rows))
+	for _, row := range rows {
+		reply := emailReply{
+			ID:           row.ID,
+			CommentID:    row.CommentID,
+			ItemID:       row.ItemID,
+			ToEmail:      row.ToEmail,
+			ToName:       row.ToName,
+			Subject:      row.Subject,
+			AttemptCount: row.AttemptCount,
+			LastError:    row.LastError.String,
+			CreatedAt:    row.CreatedAt,
+			WorkspaceKey: row.WorkspaceKey,
+		}
+		if row.NextAttemptAt.Valid {
+			t := row.NextAttemptAt.Time
+			reply.NextAttemptAt = &t
+		}
+		if row.DeliveredAt.Valid {
+			t := row.DeliveredAt.Time
+			reply.DeliveredAt = &t
+		}
+		if row.DiscardedAt.Valid {
+			t := row.DiscardedAt.Time
+			reply.DiscardedAt = &t
+		}
+		if !isSystemAdmin && (row.WorkspaceID == nil || !allowedWS[*row.WorkspaceID]) {
+			reply.ToEmail = "[redacted]"
+			reply.ToName = ""
+			reply.Subject = "[redacted]"
+			reply.WorkspaceKey = ""
+			reply.Redacted = true
+		}
+		replies = append(replies, reply)
+	}
+
+	respondJSONOK(w, map[string]any{
+		"replies":   replies,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+	})
+}
+
+// RetryEmailReply attempts immediate delivery of a queued customer reply on
+// behalf of an operator, bypassing the backoff schedule once.
+// POST /channels/{id}/email/replies/{commentId}/retry
+func (h *ChannelHandler) RetryEmailReply(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	id, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	commentID, ok := requireIDParam(w, r, "commentId")
+	if !ok {
+		return
+	}
+	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
+		return
+	}
+	if !h.requireReplyOutboxChannel(ctx, w, r, id) {
+		return
+	}
+	if h.emailReplies == nil {
+		respondError(w, r, &restapi.APIError{
+			StatusCode: http.StatusServiceUnavailable,
+			Code:       "SERVICE_UNAVAILABLE",
+			Message:    "Email reply service not available",
+		})
+		return
+	}
+
+	delivered, err := h.emailReplies.RetryPendingReply(id, commentID)
+	switch {
+	case errors.Is(err, repository.ErrNotFound):
+		respondNotFound(w, r, "email reply")
+		return
+	case errors.Is(err, services.ErrEmailReplyNotRetryable):
+		respondError(w, r, &restapi.APIError{
+			StatusCode: http.StatusConflict,
+			Code:       "EMAIL_REPLY_NOT_RETRYABLE",
+			Message:    "Reply is already delivered or discarded",
+		})
+		return
+	case errors.Is(err, services.ErrEmailReplyInFlight):
+		respondError(w, r, &restapi.APIError{
+			StatusCode: http.StatusConflict,
+			Code:       "EMAIL_REPLY_IN_FLIGHT",
+			Message:    "Reply is being delivered right now; retry once the queue shows its final state",
+		})
+		return
+	case errors.Is(err, services.ErrSMTPNotConfigured):
+		respondError(w, r, &restapi.APIError{
+			StatusCode: http.StatusConflict,
+			Code:       "SMTP_NOT_CONFIGURED",
+			Message:    "Outbound SMTP is not configured; configure it first or discard the reply",
+		})
+		return
+	case err != nil:
+		respondInternalError(w, r, err)
+		return
+	}
+
+	respondJSONOK(w, map[string]any{
+		"delivered":  delivered,
+		"comment_id": commentID,
+		"message":    "Retry attempted; see the queue for the current state",
+	})
+}
+
+// DiscardEmailReply marks a queued customer reply as never-send. The row
+// stays visible for audit and stops retrying.
+// POST /channels/{id}/email/replies/{commentId}/discard
+func (h *ChannelHandler) DiscardEmailReply(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	id, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	commentID, ok := requireIDParam(w, r, "commentId")
+	if !ok {
+		return
+	}
+	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
+		return
+	}
+	if !h.requireReplyOutboxChannel(ctx, w, r, id) {
+		return
+	}
+
+	outcome, err := h.channelRepo.DiscardEmailReply(ctx, id, commentID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if outcome == repository.EmailReplySending {
+		respondError(w, r, &restapi.APIError{
+			StatusCode: http.StatusConflict,
+			Code:       "EMAIL_REPLY_SENDING",
+			Message:    "Reply is being delivered right now and can no longer be canceled",
+		})
+		return
+	}
+	if outcome != repository.EmailReplyDiscarded {
+		respondError(w, r, &restapi.APIError{
+			StatusCode: http.StatusConflict,
+			Code:       "EMAIL_REPLY_NOT_DISCARDABLE",
+			Message:    "Reply is already delivered, discarded, or does not exist",
+		})
+		return
+	}
+
+	slog.Info("discarded queued email reply", "channel_id", id, "comment_id", commentID)
+	respondJSONOK(w, map[string]any{
+		"discarded":  true,
+		"comment_id": commentID,
 	})
 }
 
@@ -1344,7 +1762,6 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 
-	// Parse pagination params
 	page := 1
 	pageSize := 50
 	if p := r.URL.Query().Get("page"); p != "" {
@@ -1368,6 +1785,18 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	isAdmin, err := h.permissionService.IsSystemAdmin(user.ID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	// Searching raw sender/subject columns would expose a count oracle for
+	// workspace-redacted rows. System administrators can search the full audit
+	// log; channel managers can browse the same page with protected rows redacted.
+	if search != "" && !isAdmin {
+		respondForbidden(w, r)
+		return
+	}
 
 	channel, err := h.service.GetByID(ctx, id)
 	if err != nil {
@@ -1384,6 +1813,20 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get channel state. ErrNotFound just means "fresh channel, no state yet".
+	// emailIntakeState is the per-folder cursor and health the log renders for
+	// each intake. The channel-level last_uid is only meaningful for a legacy
+	// mailbox with no intake rows.
+	type emailIntakeState struct {
+		IntakeID         int        `json:"intake_id"`
+		Folder           string     `json:"folder"`
+		WorkspaceID      int        `json:"workspace_id"`
+		PortalChannelID  *int       `json:"portal_channel_id,omitempty"`
+		Status           string     `json:"status"`
+		LastUID          int        `json:"last_uid"`
+		UIDValidity      uint32     `json:"uid_validity"`
+		LastPolledAt     *time.Time `json:"last_polled_at,omitempty"`
+		RateLimitedCount int        `json:"rate_limited_count"`
+	}
 	type emailChannelState struct {
 		LastCheckedAt *time.Time `json:"last_checked_at"`
 		LastUID       int        `json:"last_uid"`
@@ -1392,8 +1835,14 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 		// Healthy is derived: a non-empty last_error means the last poll either
 		// failed or dropped a poison message, so the channel needs attention.
 		Healthy bool `json:"healthy"`
+		// RateLimitedCount is how many messages flood protection declined and
+		// are waiting for operator requeue.
+		RateLimitedCount int `json:"rate_limited_count"`
+		// Intakes carries each folder's cursor so operators can see per-intake
+		// progress; the channel-level cursor above is legacy-only.
+		Intakes []emailIntakeState `json:"intakes"`
 	}
-	state := emailChannelState{Healthy: true}
+	state := emailChannelState{Healthy: true, Intakes: []emailIntakeState{}}
 	if got, err := h.channelRepo.GetEmailChannelState(ctx, id); err == nil {
 		state.LastUID = got.LastUID
 		state.LastCheckedAt = got.LastCheckedAt
@@ -1403,6 +1852,31 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 	} else if !errors.Is(err, repository.ErrNotFound) {
 		respondInternalError(w, r, err)
 		return
+	}
+	rateLimitedCount, err := h.channelRepo.CountRateLimitedEmails(ctx, id)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	state.RateLimitedCount = rateLimitedCount
+
+	intakes, err := repository.NewIntakeRepository(h.channelRepo.DB()).ListByMailbox(ctx, id)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	for _, intake := range intakes {
+		state.Intakes = append(state.Intakes, emailIntakeState{
+			IntakeID:         intake.ID,
+			Folder:           intake.Folder,
+			WorkspaceID:      intake.WorkspaceID,
+			PortalChannelID:  intake.PortalChannelID,
+			Status:           intake.Status,
+			LastUID:          intake.LastUID,
+			UIDValidity:      intake.UIDValidity,
+			LastPolledAt:     intake.LastPolledAt,
+			RateLimitedCount: intake.RateLimitedCount,
+		})
 	}
 
 	total, err := h.channelRepo.CountEmailMessages(ctx, id, search)
@@ -1418,16 +1892,17 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type emailMessage struct {
-		ID                  int       `json:"id"`
-		FromEmail           string    `json:"from_email"`
-		FromName            string    `json:"from_name"`
-		Subject             string    `json:"subject"`
-		ItemID              *int      `json:"item_id"`
-		CommentID           *int      `json:"comment_id"`
-		ProcessedAt         time.Time `json:"processed_at"`
-		WorkspaceKey        string    `json:"workspace_key,omitempty"`
-		WorkspaceItemNumber int       `json:"workspace_item_number,omitempty"`
-		Redacted            bool      `json:"redacted,omitempty"`
+		ID                  int        `json:"id"`
+		FromEmail           string     `json:"from_email"`
+		FromName            string     `json:"from_name"`
+		Subject             string     `json:"subject"`
+		ItemID              *int       `json:"item_id"`
+		CommentID           *int       `json:"comment_id"`
+		ProcessedAt         time.Time  `json:"processed_at"`
+		RateLimitedAt       *time.Time `json:"rate_limited_at,omitempty"`
+		WorkspaceKey        string     `json:"workspace_key,omitempty"`
+		WorkspaceItemNumber int        `json:"workspace_item_number,omitempty"`
+		Redacted            bool       `json:"redacted,omitempty"`
 	}
 
 	// Collect distinct workspace IDs so we batch the permission checks.
@@ -1457,6 +1932,7 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 			ItemID:              m.ItemID,
 			CommentID:           m.CommentID,
 			ProcessedAt:         m.ProcessedAt,
+			RateLimitedAt:       m.RateLimitedAt,
 			WorkspaceKey:        m.WorkspaceKey,
 			WorkspaceItemNumber: m.WorkspaceItemNumber,
 		}
@@ -1465,7 +1941,7 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 		// to read inbound customer email contents when the resulting item lives
 		// in a workspace the manager has no item-view on. Redacted=true lets
 		// the UI render a placeholder rather than blanks.
-		if m.WorkspaceID != nil && !allowedWS[*m.WorkspaceID] {
+		if !isAdmin && (m.WorkspaceID == nil || !allowedWS[*m.WorkspaceID]) {
 			msg.FromEmail = "[redacted]"
 			msg.FromName = ""
 			msg.Subject = "[redacted]"
@@ -1476,7 +1952,7 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 		messages = append(messages, msg)
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"state":     state,
 		"messages":  messages,
 		"total":     total,
@@ -1519,6 +1995,12 @@ func (h *ChannelHandler) StartChannelEmailOAuth(w http.ResponseWriter, r *http.R
 
 	user, ok := h.requireChannelManageAccess(ctx, w, r, channelID)
 	if !ok {
+		return
+	}
+	var startRequest struct {
+		RestoreChannelEnabled bool `json:"restore_channel_enabled"`
+	}
+	if !decodeChannelRequest(w, r, &startRequest, true) {
 		return
 	}
 
@@ -1572,19 +2054,20 @@ func (h *ChannelHandler) StartChannelEmailOAuth(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Generate state token
-	stateBytes := make([]byte, 32)
-	if _, err = rand.Read(stateBytes); err != nil {
+	// Generate a one-time state token bound to the exact config used to build
+	// this authorization request. A callback from a stale tab must not attach
+	// tokens after another manager changes the channel.
+	state, err := newEmailOAuthState(configJSON)
+	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
-	state := hex.EncodeToString(stateBytes)
 
 	// Store state in database (expires in 5 minutes). The repo records this
-	// in email_oauth_state with provider_id = 0 to distinguish channel-flow
+	// in email_oauth_state with a NULL provider_id to distinguish channel-flow
 	// from provider-flow.
 	expiresAt := time.Now().Add(5 * time.Minute)
-	if err = h.channelRepo.CreateOAuthState(ctx, state, channelID, user.ID, expiresAt); err != nil {
+	if err = h.channelRepo.CreateOAuthState(ctx, state, channelID, user.ID, startRequest.RestoreChannelEnabled, expiresAt); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
@@ -1633,8 +2116,14 @@ func (h *ChannelHandler) ChannelEmailOAuthCallback(w http.ResponseWriter, r *htt
 	if errorParam != "" {
 		errorDesc := r.URL.Query().Get("error_description")
 		slog.Error("OAuth error", "error", errorParam, "description", errorDesc)
+		if state != "" {
+			_, channelID, _, restoreEnabled, consumeErr := h.channelRepo.ConsumeOAuthState(r.Context(), state, false)
+			if consumeErr == nil {
+				h.restoreEmailChannelAfterOAuth(r.Context(), channelID, restoreEnabled, state, "")
+			}
+		}
 		// URL-encode the error parameter to prevent open redirect attacks
-		http.Redirect(w, r, "/channels?oauth_error="+url.QueryEscape(errorParam), http.StatusFound)
+		http.Redirect(w, r, "/admin/channels?oauth_error="+url.QueryEscape(errorParam), http.StatusFound)
 		return
 	}
 
@@ -1647,8 +2136,9 @@ func (h *ChannelHandler) ChannelEmailOAuthCallback(w http.ResponseWriter, r *htt
 	defer cancel()
 
 	// Validate state, get associated channel ID, and delete the state row in one call.
-	// providerID and userID are recorded by the start-flow but unused here.
-	_, channelID, _, err := h.channelRepo.ConsumeOAuthState(ctx, state)
+	// providerID is NULL for this flow. The captured user is re-authorized
+	// before credentials are changed, so permission revocation takes effect.
+	_, channelID, stateUserID, restoreEnabled, err := h.channelRepo.ConsumeOAuthState(ctx, state, false)
 	if errors.Is(err, repository.ErrNotFound) {
 		respondValidationError(w, r, "Invalid or expired state")
 		return
@@ -1657,18 +2147,45 @@ func (h *ChannelHandler) ChannelEmailOAuthCallback(w http.ResponseWriter, r *htt
 		respondInternalError(w, r, err)
 		return
 	}
+	var savedConfigJSON string
+	defer func() {
+		h.restoreEmailChannelAfterOAuth(context.Background(), channelID, restoreEnabled, state, savedConfigJSON)
+	}()
+	// Bind the callback to the account that started the flow. The state carries
+	// the initiating user; the browser completing the redirect must be signed in
+	// as that same user, otherwise a forwarded authorization URL could attach the
+	// victim's mailbox credentials to another identity.
+	currentUser := utils.GetCurrentUser(r)
+	if currentUser == nil || currentUser.ID != stateUserID {
+		slog.Warn("email channel OAuth state/account mismatch", "channel_id", channelID)
+		http.Redirect(w, r, "/admin/channels?oauth_error=authorization_failed", http.StatusFound)
+		return
+	}
+	canManage, err := h.canCompleteEmailOAuth(ctx, stateUserID, channelID)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if !canManage {
+		http.Redirect(w, r, "/admin/channels?oauth_error=authorization_failed", http.StatusFound)
+		return
+	}
 
 	configJSON, err := h.service.GetConfig(ctx, channelID)
 	if err != nil {
 		slog.Error("failed to get channel config", "error", err, "channel_id", channelID)
-		http.Redirect(w, r, "/channels?oauth_error=channel_not_found", http.StatusFound)
+		http.Redirect(w, r, "/admin/channels?oauth_error=channel_not_found", http.StatusFound)
+		return
+	}
+	if !emailOAuthStateMatchesConfig(state, configJSON) {
+		http.Redirect(w, r, "/admin/channels?oauth_error=config_changed", http.StatusFound)
 		return
 	}
 
 	var config models.ChannelConfig
 	if configJSON != "" {
 		if err = json.Unmarshal([]byte(configJSON), &config); err != nil {
-			http.Redirect(w, r, "/channels?oauth_error=invalid_config", http.StatusFound)
+			http.Redirect(w, r, "/admin/channels?oauth_error=invalid_config", http.StatusFound)
 			return
 		}
 	}
@@ -1679,7 +2196,7 @@ func (h *ChannelHandler) ChannelEmailOAuthCallback(w http.ResponseWriter, r *htt
 	clientSecret, err := email.DecryptOrLegacy(h.encryption, config.EmailOAuthClientSecret)
 	if err != nil {
 		slog.Error("failed to decrypt client secret", "error", err, "channel_id", channelID)
-		http.Redirect(w, r, "/channels?oauth_error=decrypt_failed", http.StatusFound)
+		http.Redirect(w, r, "/admin/channels?oauth_error=decrypt_failed", http.StatusFound)
 		return
 	}
 
@@ -1701,34 +2218,52 @@ func (h *ChannelHandler) ChannelEmailOAuthCallback(w http.ResponseWriter, r *htt
 		tokens, err = p.ExchangeCode(ctx, code, redirectURI)
 		if err != nil {
 			slog.Error("failed to exchange code", "error", err)
-			http.Redirect(w, r, "/channels?oauth_error=exchange_failed", http.StatusFound)
+			http.Redirect(w, r, "/admin/channels?oauth_error=exchange_failed", http.StatusFound)
 			return
 		}
-		userEmail, _ = p.GetUserEmail(ctx, tokens.AccessToken)
+		userEmail, err = p.GetUserEmail(ctx, tokens.AccessToken)
+		if err != nil || strings.TrimSpace(userEmail) == "" {
+			slog.Error("failed to get Microsoft mailbox identity", "error", err)
+			http.Redirect(w, r, "/admin/channels?oauth_error=identity_failed", http.StatusFound)
+			return
+		}
 
 	case "google":
 		p := email.NewGoogleProvider(config.EmailOAuthClientID, clientSecret, scopes)
 		tokens, err = p.ExchangeCode(ctx, code, redirectURI)
 		if err != nil {
 			slog.Error("failed to exchange code", "error", err)
-			http.Redirect(w, r, "/channels?oauth_error=exchange_failed", http.StatusFound)
+			http.Redirect(w, r, "/admin/channels?oauth_error=exchange_failed", http.StatusFound)
 			return
 		}
-		userEmail, _ = p.GetUserEmail(ctx, tokens.AccessToken)
+		userEmail, err = p.GetUserEmail(ctx, tokens.AccessToken)
+		if err != nil || strings.TrimSpace(userEmail) == "" {
+			slog.Error("failed to get Google mailbox identity", "error", err)
+			http.Redirect(w, r, "/admin/channels?oauth_error=identity_failed", http.StatusFound)
+			return
+		}
 
 	default:
-		http.Redirect(w, r, "/channels?oauth_error=unsupported_provider", http.StatusFound)
+		http.Redirect(w, r, "/admin/channels?oauth_error=unsupported_provider", http.StatusFound)
 		return
 	}
 
 	// Save tokens to channel config via the injected credential manager.
-	err = h.credManager.SaveOAuthTokens(ctx, channelID, tokens, userEmail)
+	canManage, err = h.canCompleteEmailOAuth(ctx, stateUserID, channelID)
 	if err != nil {
-		slog.Error("failed to save tokens", "error", err)
-		http.Redirect(w, r, "/channels?oauth_error=save_failed", http.StatusFound)
+		respondInternalError(w, r, err)
 		return
 	}
-
+	if !canManage {
+		http.Redirect(w, r, "/admin/channels?oauth_error=authorization_failed", http.StatusFound)
+		return
+	}
+	savedConfigJSON, err = h.credManager.SaveOAuthTokens(ctx, channelID, tokens, userEmail, &config)
+	if err != nil {
+		slog.Error("failed to save tokens", "error", err)
+		http.Redirect(w, r, "/admin/channels?oauth_error=save_failed", http.StatusFound)
+		return
+	}
 	slog.Info("OAuth completed for email channel (inline credentials)",
 		"channel_id", channelID,
 		"email", userEmail,
@@ -1736,5 +2271,53 @@ func (h *ChannelHandler) ChannelEmailOAuthCallback(w http.ResponseWriter, r *htt
 
 	// Redirect back to channel config
 	// #nosec G710 -- local relative URL built from a server-side int (channelID); no caller-controlled component reaches the destination
-	http.Redirect(w, r, fmt.Sprintf("/channels/%d?oauth_success=true", channelID), http.StatusFound)
+	http.Redirect(w, r, fmt.Sprintf("/admin/channels/%d?oauth_success=true", channelID), http.StatusFound)
+}
+
+func (h *ChannelHandler) restoreEmailChannelAfterOAuth(ctx context.Context, channelID int, restore bool, state, savedConfigJSON string) {
+	if !restore {
+		return
+	}
+	// The request context is commonly canceled as soon as the callback returns.
+	// Give restoration a small independent budget, then revalidate the exact
+	// config we are enabling. This matters when the OAuth identity was changed:
+	// a denied/failed flow has no tokens for the new identity and must stay
+	// disabled, while a reconnect that retained valid tokens can safely recover.
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	channel, err := h.service.GetByID(restoreCtx, channelID)
+	if err != nil {
+		slog.Error("failed to restore email channel after OAuth", "channel_id", channelID, "error", err)
+		return
+	}
+	configJSON, err := h.service.GetConfig(restoreCtx, channelID)
+	if err != nil {
+		slog.Error("failed to load email channel config for OAuth restoration", "channel_id", channelID, "error", err)
+		return
+	}
+	if savedConfigJSON == "" {
+		if !emailOAuthStateMatchesConfig(state, configJSON) {
+			slog.Warn("email channel remains disabled because its config changed during OAuth", "channel_id", channelID)
+			return
+		}
+	} else if configJSON != savedConfigJSON {
+		slog.Warn("email channel remains disabled because its config changed after OAuth credentials were saved", "channel_id", channelID)
+		return
+	}
+	var config models.ChannelConfig
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		slog.Error("invalid email channel config during OAuth restoration", "channel_id", channelID, "error", err)
+		return
+	}
+	if err := email.ValidateConfigForEnable(channel, &config); err != nil {
+		slog.Warn("email channel remains disabled after incomplete OAuth", "channel_id", channelID, "error", err)
+		return
+	}
+	updated, err := h.service.SetStatusIfConfigUnchanged(restoreCtx, channelID, "enabled", configJSON)
+	if err != nil {
+		slog.Error("failed to restore email channel after OAuth", "channel_id", channelID, "error", err)
+	} else if !updated {
+		slog.Warn("email channel config changed during OAuth restoration; leaving disabled", "channel_id", channelID)
+	}
 }

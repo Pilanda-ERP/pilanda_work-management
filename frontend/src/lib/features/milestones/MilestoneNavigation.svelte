@@ -7,7 +7,7 @@
   import Button from '../../components/Button.svelte';
   import { getHexFromColorName } from '../../utils/colors.js';
   import { t } from '../../stores/i18n.svelte.js';
-  import SidebarHeader from '../../layout/SidebarHeader.svelte';
+  import NavigationSidebar from '../../layout/NavigationSidebar.svelte';
   
   // Get active category from URL params
   let activeCategoryId = $derived($currentRoute.params?.categoryId || null);
@@ -33,22 +33,32 @@
   );
 </script>
 
+{#snippet sidebarFooter()}
+  {#if canManageCategories}
+    <div class="px-6 pb-6 pt-4 border-t" style="border-color: var(--ds-border);">
+      <Button
+        variant="default"
+        icon={Tag}
+        onclick={handleManageCategories}
+        class="w-full justify-center"
+      >
+        {t('milestones.manageCategories')}
+      </Button>
+    </div>
+  {/if}
+{/snippet}
+
 <!-- Milestone Navigation Sidebar -->
-<div class="w-64 border-r flex flex-col p-6" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-  <!-- Header -->
-  <SidebarHeader title={t('milestones.title')} description={t('milestones.subtitle')} noBorder />
-  
+<NavigationSidebar title={t('milestones.title')} description={t('milestones.subtitle')} footer={sidebarFooter}>
   <!-- Navigation -->
   <nav class="flex-1 space-y-1">
     <!-- All Categories -->
     <a
       href={categoryHref(null)}
-      class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
-      style={isAllActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-      onmouseenter={(e) => { if (!isAllActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-      onmouseleave={(e) => { if (!isAllActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+      class="nav-link w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
+      class:active={isAllActive}
     >
-      <div class="w-4 h-4 rounded bg-gradient-to-br from-purple-400 to-purple-600 flex-shrink-0"></div>
+      <div class="w-4 h-4 rounded bg-gradient-to-br from-ds-nav-purple-from to-ds-nav-purple-to flex-shrink-0"></div>
       <span>{t('milestones.allCategories')}</span>
     </a>
 
@@ -57,10 +67,8 @@
       {@const isCatActive = activeCategoryId === category.id.toString()}
       <a
         href={categoryHref(category.id)}
-        class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
-        style={isCatActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-        onmouseenter={(e) => { if (!isCatActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-        onmouseleave={(e) => { if (!isCatActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+        class="nav-link w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
+        class:active={isCatActive}
         title={category.description || category.name}
       >
         <div
@@ -72,17 +80,21 @@
     {/each}
   </nav>
   
-  <!-- Footer - Manage Categories -->
-  {#if canManageCategories}
-    <div class="pt-4 border-t" style="border-color: var(--ds-border);">
-      <Button
-        variant="default"
-        icon={Tag}
-        onclick={handleManageCategories}
-        class="w-full justify-center"
-      >
-        {t('milestones.manageCategories')}
-      </Button>
-    </div>
-  {/if}
-</div>
+</NavigationSidebar>
+
+
+<style>
+  .nav-link {
+    color: var(--ds-text-subtle);
+  }
+
+  .nav-link:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .nav-link.active {
+    background: var(--ds-surface-selected);
+    color: var(--ds-text);
+  }
+</style>

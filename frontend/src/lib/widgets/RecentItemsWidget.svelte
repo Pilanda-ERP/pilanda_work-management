@@ -1,8 +1,10 @@
 <script>
   import { Clock } from '@lucide/svelte';
   import { api } from '../api.js';
+  import { homepageStore } from '../stores';
   import { formatRelativeCompact } from '../utils/dateFormatter.js';
   import WidgetState from './WidgetState.svelte';
+  import ItemKey from '../components/ItemKey.svelte';
   import { t } from '../stores/i18n.svelte.js';
 
   let { workspaceId = null, collectionFilter = null, maxItems = 10 } = $props();
@@ -42,9 +44,7 @@
         });
         if (currentVersion !== fetchVersion) return;
 
-        const rawItems = Array.isArray(response)
-          ? response
-          : (response?.items ?? []);
+        const rawItems = response?.data ?? [];
 
         items = rawItems
           .filter(item => item && item.id)
@@ -58,7 +58,7 @@
           }))
           .slice(0, maxItems);
       } else {
-        const data = await api.homepage.get();
+        const data = await homepageStore.getSnapshot();
         if (currentVersion !== fetchVersion) return;
 
         const sources = [
@@ -123,14 +123,14 @@
           href={`/workspaces/${item.workspace_id}/items/${item.item_id}`}
         >
           <div class="flex-shrink-0">
-            <div class="rounded-full bg-blue-50 text-blue-600 p-2">
+            <div class="rounded-full bg-ds-accent-blue-subtle text-ds-accent-blue p-2">
               <Clock class="h-4 w-4" />
             </div>
           </div>
           <div class="min-w-0 flex-1">
             <p class="truncate text-sm font-medium" style="color: var(--ds-text);">{item.title}</p>
-            <p class="text-xs" style="color: var(--ds-text-subtle);">
-              {item.workspace_key}-{item.workspace_item_number}
+            <p class="text-xs">
+              <ItemKey item={item} clickable={false} />
             </p>
           </div>
           <div class="text-xs" style="color: var(--ds-text-subtlest);">

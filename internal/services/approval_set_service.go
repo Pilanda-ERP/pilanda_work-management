@@ -51,7 +51,7 @@ type ApprovalSetValidationError struct{ Msg string }
 
 func (e *ApprovalSetValidationError) Error() string { return e.Msg }
 func (e *ApprovalSetValidationError) Unwrap() error { return ErrApprovalSetValidation }
-func newApprovalSetValidation(format string, args ...interface{}) error {
+func newApprovalSetValidation(format string, args ...any) error {
 	return &ApprovalSetValidationError{Msg: fmt.Sprintf(format, args...)}
 }
 
@@ -147,7 +147,7 @@ func (s *ApprovalSetService) Update(ctx context.Context, id int, input models.Ap
 		if err := s.repo.UpdateSet(ctx, tx, id, input.Name, input.Description); err != nil {
 			return err
 		}
-		// Soft-archive: drop unreferenced rows, flip the rest to is_active=0,
+		// Soft-archive: drop unreferenced rows, flip the rest to is_active=FALSE,
 		// then insert fresh active rows. In-flight requests' FK to the
 		// archived snapshot is preserved.
 		if err := s.repo.DeleteUnreferencedStatuses(ctx, tx, id); err != nil {
@@ -238,8 +238,9 @@ func (s *ApprovalSetService) persistSetStatuses(ctx context.Context, tx database
 }
 
 // validateSetStatuses runs the full template-validation pass: per-status
-// invariants (transitions originate at the configured status, both transitions
-// differ, etc.) plus per-step invariants delegated to validateApprovalStep.
+// invariants (transitions are valid from the configured status directly or via
+// a from-all row, both transitions differ, etc.) plus per-step invariants
+// delegated to validateApprovalStep.
 func (s *ApprovalSetService) validateSetStatuses(ctx context.Context, workflowID int, setStatuses []models.ApprovalSetStatus) error {
 	seenStatus := make(map[int]bool, len(setStatuses))
 	for _, ass := range setStatuses {

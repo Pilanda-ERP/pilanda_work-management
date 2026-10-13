@@ -21,7 +21,7 @@
 # --------------------------------------------------------------------
 # Stage 1: cross-compile the ws CLI for linux/<TARGETARCH>
 # --------------------------------------------------------------------
-FROM golang:1.26.4-bookworm@sha256:dc8e692a67c88c1a76afc36bea0814e8be5ab0d37210695f19e47cf136e0fcd5 AS ws-build
+FROM golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS ws-build
 
 WORKDIR /src
 

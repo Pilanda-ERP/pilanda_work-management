@@ -7,7 +7,9 @@
   // candidates endpoint just keeps the picker honest.
 
   import { onDestroy, onMount, untrack } from 'svelte';
-  import { Bot, FlaskConical, Loader2, Pencil, Plus, Trash2 } from '@lucide/svelte';
+  import Spinner from '../components/Spinner.svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import { ChevronDown, FlaskConical, Orbit, Pencil, Plus, Trash2 } from '@lucide/svelte';
   import { agentBindings, agentRuns, agentSkills, api } from '../api.js';
   import Panel from '../components/Panel.svelte';
   import Button from '../components/Button.svelte';
@@ -15,6 +17,7 @@
   import UserPicker from '../pickers/UserPicker.svelte';
   import Select from '../components/Select.svelte';
   import Input from '../components/Input.svelte';
+  import Radio from '../components/Radio.svelte';
   import Label from '../components/Label.svelte';
   import Textarea from '../components/Textarea.svelte';
   import AlertBox from '../components/AlertBox.svelte';
@@ -26,10 +29,12 @@
   import ConfirmDialog from '../dialogs/ConfirmDialog.svelte';
   import { errorToast, successToast } from '../stores/toasts.svelte.js';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+	import TextField from '../components/TextField.svelte';
+	import SelectField from '../components/SelectField.svelte';
 
   // skillsVersion: bumped by the parent when the skills panel below this one
   // creates/edits/deletes a skill, so the attach-pickers here don't go stale.
-  let { workspaceId, skillsVersion = 0 } = $props();
+  let { workspaceId, skillsVersion = 0, oncreatingchange = () => {} } = $props();
 
   let loading = $state(true);
   let bindings = $state([]);
@@ -45,9 +50,8 @@
   // runtime (null target).
   let runnerPools = $state([]);
 
-  // Add/edit modal state. editingBinding is null for create, or the binding
-  // being edited (only its persona/skills are mutable — the identity, repo,
-  // LLM, and budget are fixed at create time, so edit shows them read-only).
+  // Create uses an inline, page-sized flow; edit remains a compact modal.
+  // editingBinding is null for create, or the binding being edited.
   let showModal = $state(false);
   let editingBinding = $state(null);
   let formActingUserId = $state(null);
@@ -69,6 +73,13 @@
   let formInstructions = $state('');
   let formSkillIds = $state([]);
   let saving = $state(false);
+
+  // The effective server prompt is intentionally lazy-loaded: it is long and
+  // may be runtime-overridden, so it is fetched and shown only on request.
+  let standardPromptOpen = $state(false);
+  let standardPromptLoading = $state(false);
+  let standardPrompt = $state('');
+  let standardPromptError = $state('');
 
   // Workspace skills library (WI-258) for the attach pickers.
   let workspaceSkills = $state([]);
@@ -94,6 +105,7 @@
   const watchTokens = {}; // id -> Symbol
   onDestroy(() => {
     for (const id of Object.keys(watchTokens)) delete watchTokens[id];
+    if (showModal && !editingBinding) oncreatingchange(false);
   });
 
   const TEST_RUN_POLL_MS = 1500;
@@ -133,14 +145,8 @@
     return 'var(--ds-text-subtle)';
   }
 
-  // Render one run event as a transcript line, or null to drop it. The runner
-  // wraps the windshift-agent's NDJSON in "stdout" events; the inner payload's
-  // own `type` is the agent's event vocabulary. We surface the canonical final
-  // `message` and tool calls, and DROP the streaming `content` deltas — the
-  // agent emits the final answer both ways (agent.go: content stream + a final
-  // message), so rendering both is what double-printed the reply. Server-level
-  // lifecycle/status events are conveyed by the status badge, not the
-  // transcript.
+  // Render canonical agent messages and tool calls. Drop streaming content
+  // duplicates and lifecycle events, which the status badge already conveys.
   function eventText(ev) {
     if (ev.type === 'lifecycle') return null;
     let payload;
@@ -151,24 +157,28 @@
     }
     switch (payload.type) {
       case 'message':
-        // The canonical final assistant message.
+        // Canonical final assistant message.
         return typeof payload.text === 'string' ? payload.text : null;
       case 'content':
-        // Streaming deltas — duplicate of `message`; drop to avoid doubling.
+        // Duplicate streaming delta.
         return null;
-      case 'tool_start':
-        // Show the command compactly: "$ ls -1 /workspace" for bash, else the tool.
-        return payload.args?.cmd ? `$ ${payload.args.cmd}` : `→ ${payload.tool || 'tool'}`;
+      case 'tool_start': {
+        if (payload.args?.cmd) return `$ ${payload.args.cmd}`;
+        const path = payload.tool === 'read_file' && typeof payload.args?.path === 'string'
+          ? payload.args.path.trim()
+          : '';
+        return `→ ${payload.tool || 'tool'}${path ? ` ${path}` : ''}`;
+      }
       case 'tool_done':
-        return null; // output is large + already implied by the next message
+        return null; // Large output is implied by the next message.
       case 'error':
         return payload.message ? `⚠ ${payload.message}` : null;
       case 'lifecycle':
       case 'starting':
       case 'session_idle':
-        return null; // status-level, not transcript content
+        return null; // Status-level, not transcript content.
       default:
-        // Unknown shape: surface a text/message field if present, else drop.
+        // Surface known text from unknown shapes when available.
         return typeof (payload.text ?? payload.message ?? payload.line) === 'string'
           ? (payload.text ?? payload.message ?? payload.line)
           : null;
@@ -434,7 +444,9 @@
   function openCreate() {
     editingBinding = null;
     resetForm();
+    standardPromptOpen = false;
     showModal = true;
+    oncreatingchange(true);
   }
 
   function openEdit(b) {
@@ -487,9 +499,28 @@
   }
 
   function closeModal() {
+    const wasCreating = !editingBinding;
     showModal = false;
     editingBinding = null;
+    standardPromptOpen = false;
     resetForm();
+    if (wasCreating) oncreatingchange(false);
+  }
+
+  async function toggleStandardPrompt() {
+    standardPromptOpen = !standardPromptOpen;
+    if (!standardPromptOpen || standardPrompt || standardPromptLoading) return;
+    standardPromptLoading = true;
+    standardPromptError = '';
+    try {
+      const response = await agentBindings.getStandardPrompt(workspaceId);
+      standardPrompt = response?.prompt || '';
+      if (!standardPrompt) standardPromptError = 'The standard prompt is not configured on this server.';
+    } catch (err) {
+      standardPromptError = err?.message || 'Failed to load the standard prompt';
+    } finally {
+      standardPromptLoading = false;
+    }
   }
 
   async function submitModal() {
@@ -635,6 +666,7 @@
   </div>
 {/snippet}
 
+{#if !showModal || editingBinding}
 <Panel padding="spacious">
   <SectionHeader
     title="Agent bindings"
@@ -655,20 +687,20 @@
   </SectionHeader>
 
   {#if loading}
-    <div class="flex items-center justify-center py-8">
-      <Loader2 class="w-5 h-5 animate-spin" style="color: var(--ds-icon-subtle);" />
-    </div>
+    <StateDisplay type="loading" />
   {:else if bindings.length === 0}
-    <EmptyState
-      icon={Bot}
-      title="No bindings yet"
-      description="Add one to enable assignee-driven coding-agent runs in this workspace."
-    >
-      {#snippet action()}
-        <!-- shortcut-guard-exempt: duplicate of the section-header "Add binding" action, which carries the A hotkey -->
-        <Button size="sm" icon={Plus} onclick={openCreate}>Add binding</Button>
-      {/snippet}
-    </EmptyState>
+    <div data-testid="binding-empty-state">
+      <EmptyState
+        icon={Orbit}
+        title="No bindings yet"
+        description="Add one to enable assignee-driven coding-agent runs in this workspace."
+      >
+        {#snippet action()}
+          <!-- shortcut-guard-exempt: duplicate of the section-header "Add binding" action, which carries the A hotkey -->
+          <Button size="sm" icon={Plus} onclick={openCreate}>Add binding</Button>
+        {/snippet}
+      </EmptyState>
+    </div>
   {:else}
     <div class="border rounded-md overflow-hidden" style="border-color: var(--ds-border);">
       <table class="w-full text-sm">
@@ -749,7 +781,7 @@
                           {testRunStatusLabel(testResults[b.id].status)}
                         </span>
                         {#if !isTerminalTestStatus(testResults[b.id].status)}
-                          <Loader2 class="w-3 h-3 animate-spin" />
+                          <Spinner size="sm" />
                         {/if}
                       </div>
                       {#if testResults[b.id].lines?.length}
@@ -777,17 +809,27 @@
     </div>
   {/if}
 </Panel>
+{/if}
 
-<!-- Add / edit binding modal. Create shows the full wiring form; edit only
-     exposes the mutable persona + skills (identity/repo/LLM are fixed). -->
-<Modal isOpen={showModal} onclose={closeModal} onSubmit={submitModal} submitDisabled={!canSubmit} maxWidth="max-w-4xl">
+<!-- Creation is an inline, page-sized flow. Editing retains dialog treatment
+     because it is a shorter update to an existing binding. -->
+<Modal
+  isOpen={showModal}
+  inline={!editingBinding}
+  onclose={closeModal}
+  onSubmit={submitModal}
+  submitDisabled={!canSubmit}
+  maxWidth="max-w-4xl"
+>
   {#snippet children(submitHint)}
     <ModalHeader
       title={editingBinding ? 'Edit binding' : 'Add agent binding'}
-      icon={Bot}
+      subtitle={editingBinding ? '' : 'Configure how this agent runs and what context it receives.'}
+      icon={Orbit}
+      showCloseButton={!!editingBinding}
       onclose={closeModal}
     />
-    <div class="px-6 py-4" data-testid="binding-modal">
+    <div class="px-6 py-5" data-testid={editingBinding ? 'binding-modal' : 'binding-create-page'}>
       {#if !editingBinding && candidates.length === 0}
         <AlertBox variant="warning" message="No acting identities are available. Ask a global admin to create a service user (User management → Create user → Service user), enable centralized service users in Security settings, and allowlist it for this workspace." />
       {:else}
@@ -822,12 +864,12 @@
           </div>
           {#if formTargetPoolId}
             <div>
-              <Label for="binding-runner-image" class="mb-1">Custom runner image</Label>
-              <Input
+              <TextField
+                label={"Custom runner image"}
                 id="binding-runner-image"
                 dataTestid="binding-runner-image"
-                bind:value={formRunnerImage}
                 placeholder="ghcr.io/windshiftapp/windshift-agent:latest"
+                bind:value={formRunnerImage}
               />
               <p class="text-xs mt-1 text-[var(--ds-text-subtle)]">
                 Optional. Container image for this pool's coding-agent runs — e.g. a Node+Chrome image for Playwright e2e. Leave blank for the default agent image.
@@ -835,8 +877,13 @@
             </div>
           {/if}
           <div>
-            <Label for="binding-llm" required class="mb-1">LLM connection</Label>
-            <Select id="binding-llm" bind:value={formLLMConnectionId} options={llmOptions} />
+            <SelectField
+              label={"LLM connection"}
+              id="binding-llm"
+              required
+              options={llmOptions}
+              bind:value={formLLMConnectionId}
+            />
             {#if llmConnections.length === 0}
               <p class="text-xs mt-1" style="color: var(--ds-text-danger);">No enabled LLM connections. Ask a global admin to add one under Admin → AI Connections.</p>
             {:else if selectedLLMIsDirectAnthropic}
@@ -846,8 +893,14 @@
             {/if}
           </div>
           <div>
-            <Label for="binding-ttl" class="mb-1">Per-run token TTL (minutes)</Label>
-            <Input id="binding-ttl" type="number" min="5" max="1440" bind:value={formTokenTTLMinutes} />
+            <TextField
+              label={"Per-run token TTL (minutes)"}
+              id="binding-ttl"
+              type="number"
+              min="5"
+              max="1440"
+              bind:value={formTokenTTLMinutes}
+            />
           </div>
           <!-- Max runs / day is hidden for now but the capability is retained:
                formMaxRunsPerDay is still primed on edit and sent in the payload,
@@ -899,12 +952,11 @@
                 <Input id={`binding-repo-base-${idx}`} size="small" value={repo.repoBaseRef} oninput={(e) => { formRepos[idx].repoBaseRef = e.currentTarget.value; }} placeholder="main" />
               </div>
               <label class="flex items-center gap-1 text-xs pb-2" style="color: var(--ds-text-subtle);">
-                <input
-                  type="radio"
+                <Radio
                   name="binding-primary-repo"
                   checked={repo.isPrimary}
                   onchange={() => setPrimaryRepo(idx)}
-                  data-testid="binding-repo-primary"
+                  dataTestid="binding-repo-primary"
                 />
                 Primary
               </label>
@@ -933,7 +985,44 @@
         </div>
         <!-- Persona + skills (WI-258): appended to the run's standard prompt. -->
         <div class="mt-5 pt-4 border-t" style="border-color: var(--ds-border);">
-          <Label for="binding-instructions" class="mb-1">Custom instructions (optional persona — "You are our release manager…")</Label>
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-1">
+            <Label for="binding-instructions">Custom instructions (optional persona — "You are our release manager…")</Label>
+            <button
+              type="button"
+              class="inline-flex items-center gap-1 text-xs font-medium hover:underline focus:outline-none focus:ring-2 rounded"
+              style="color: var(--ds-text-link);"
+              aria-expanded={standardPromptOpen}
+              onclick={toggleStandardPrompt}
+              data-testid="binding-standard-prompt-toggle"
+            >
+              {standardPromptOpen ? 'Hide standard prompt' : 'View standard prompt'}
+              <ChevronDown class={`w-3.5 h-3.5 transition-transform ${standardPromptOpen ? 'rotate-180' : ''}`} />
+            </button>
+          </div>
+          <p class="text-xs mb-2" style="color: var(--ds-text-subtle);">
+            These instructions are appended to Windshift's standard operational prompt.
+          </p>
+          {#if standardPromptOpen}
+            <div
+              class="mb-3 rounded-md border p-3"
+              style="border-color: var(--ds-border); background-color: var(--ds-surface-sunken, var(--ds-background-neutral));"
+              data-testid="binding-standard-prompt"
+            >
+              {#if standardPromptLoading}
+                <div class="flex items-center gap-2 text-xs" style="color: var(--ds-text-subtle);">
+                  <Spinner size="sm" /> Loading standard prompt…
+                </div>
+              {:else if standardPromptError}
+                <p class="text-xs" style="color: var(--ds-text-danger);">{standardPromptError}</p>
+              {:else}
+                <pre
+                  class="m-0 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs leading-5"
+                  style="color: var(--ds-text);"
+                  data-testid="binding-standard-prompt-content"
+                >{standardPrompt}</pre>
+              {/if}
+            </div>
+          {/if}
           <Textarea
             id="binding-instructions"
             bind:value={formInstructions}
@@ -966,7 +1055,7 @@
       disabled={!canSubmit}
       loading={saving}
       confirmTestid="binding-save"
-      showKeyboardHint
+      showKeyboardHint={!!editingBinding}
       confirmKeyboardHint={submitHint}
     />
   {/snippet}

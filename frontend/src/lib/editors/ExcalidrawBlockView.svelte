@@ -1,12 +1,14 @@
 <script>
-  import { Pencil, AlertTriangle, Loader2 } from '@lucide/svelte';
+  import { Pencil, AlertTriangle, Loader2, Trash2 } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import { preparePageDiagramScene } from '../features/pages/pageDiagramScene.js';
 
   let {
     attachmentId,
     name = '',
     readonly = false,
     onEdit = () => {},
+    onDelete = () => {},
   } = $props();
 
   let svgHost = $state(null);
@@ -30,7 +32,7 @@
         return;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const scene = await res.json();
+      const scene = await preparePageDiagramScene(await res.json());
       const { exportToSvg } = await import('@excalidraw/excalidraw');
       const svg = await exportToSvg({
         elements: scene.elements || [],
@@ -39,7 +41,6 @@
         exportPadding: 16,
       });
       svg.setAttribute('width', '100%');
-      svg.setAttribute('height', 'auto');
       svg.style.maxWidth = '100%';
       svg.style.height = 'auto';
       if (svgHost) {
@@ -65,7 +66,13 @@
   }
 </script>
 
-<figure class="excalidraw-block" class:readonly data-excalidraw-block data-status={status}>
+<figure
+  class="excalidraw-block"
+  class:readonly
+  data-excalidraw-block
+  data-status={status}
+  data-testid="page-diagram-block"
+>
   <div
     class="excalidraw-block__canvas"
     bind:this={svgHost}
@@ -74,6 +81,7 @@
     role="button"
     tabindex={readonly ? -1 : 0}
     aria-label={name || t('editors.diagramOpen')}
+    data-testid="page-diagram-canvas"
   >
     {#if status === 'loading' || status === 'idle'}
       <div class="excalidraw-block__placeholder">
@@ -88,22 +96,37 @@
       <div class="excalidraw-block__placeholder error">
         <AlertTriangle size={18} />
         <span>{t('editors.diagramRenderError')}</span>
+        {#if errorMsg}
+          <span class="excalidraw-block__error-msg" title={errorMsg}>{errorMsg}</span>
+        {/if}
       </div>
     {/if}
   </div>
   <figcaption class="excalidraw-block__caption">
-    <span class="excalidraw-block__name">{name || t('editors.diagramUntitled')}</span>
+    <span class="excalidraw-block__name" data-testid="page-diagram-caption">{name || t('editors.diagramUntitled')}</span>
     {#if !readonly}
-      <button
-        type="button"
-        class="excalidraw-block__edit"
-        onclick={() => onEdit()}
-        title={t('editors.diagramEdit')}
-        aria-label={t('editors.diagramEdit')}
-        data-testid="excalidraw-block-edit"
-      >
-        <Pencil size={14} />
-      </button>
+      <div class="excalidraw-block__actions">
+        <button
+          type="button"
+          class="excalidraw-block__action"
+          onclick={() => onEdit()}
+          title={t('editors.diagramEdit')}
+          aria-label={t('editors.diagramEdit')}
+          data-testid="excalidraw-block-edit"
+        >
+          <Pencil size={14} />
+        </button>
+        <button
+          type="button"
+          class="excalidraw-block__action excalidraw-block__delete"
+          onclick={() => onDelete()}
+          title={t('common.delete')}
+          aria-label={t('common.delete')}
+          data-testid="excalidraw-block-delete"
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
     {/if}
   </figcaption>
 </figure>
@@ -112,9 +135,9 @@
   .excalidraw-block {
     display: block;
     margin: 0.75rem 0;
-    border: 1px solid var(--border-color, #d1d5db);
+    border: 1px solid var(--ds-border);
     border-radius: 6px;
-    background: var(--surface-1, #fff);
+    background: var(--ds-surface-raised);
     overflow: hidden;
   }
   .excalidraw-block__canvas {
@@ -136,28 +159,42 @@
     display: flex;
     gap: 6px;
     align-items: center;
-    color: var(--text-muted, #6b7280);
+    color: var(--ds-text-subtle);
     font-size: 0.875rem;
   }
   .excalidraw-block__placeholder.error {
-    color: var(--danger-color, #b91c1c);
+    color: var(--ds-text-danger);
+  }
+  .excalidraw-block__error-msg {
+    overflow: hidden;
+    max-width: 60ch;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
   }
   .excalidraw-block__caption {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 6px 10px;
-    border-top: 1px solid var(--border-color, #d1d5db);
-    background: var(--surface-2, #f9fafb);
+    border-top: 1px solid var(--ds-border);
+    background: var(--ds-surface-hovered);
     font-size: 0.8125rem;
-    color: var(--text-muted, #4b5563);
+    color: var(--ds-text-subtle);
   }
   .excalidraw-block__name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .excalidraw-block__edit {
+  .excalidraw-block__actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+  .excalidraw-block__action {
     background: none;
     border: 1px solid transparent;
     border-radius: 4px;
@@ -167,9 +204,12 @@
     display: inline-flex;
     align-items: center;
   }
-  .excalidraw-block__edit:hover {
-    background: var(--surface-3, #e5e7eb);
-    border-color: var(--border-color, #d1d5db);
+  .excalidraw-block__action:hover {
+    background: var(--ds-surface-raised-hovered);
+    border-color: var(--ds-border);
+  }
+  .excalidraw-block__delete {
+    color: var(--ds-text-danger, #b91c1c);
   }
   :global(.spin) {
     animation: excal-spin 1s linear infinite;

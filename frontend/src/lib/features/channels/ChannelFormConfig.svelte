@@ -1,12 +1,10 @@
 <script>
   import { t } from '../../stores/i18n.svelte.js';
   import Input from '../../components/Input.svelte';
-  import Textarea from '../../components/Textarea.svelte';
   import Label from '../../components/Label.svelte';
-  import WorkspacePicker from '../../pickers/WorkspacePicker.svelte';
-  import FormIntegrationPanel from './FormIntegrationPanel.svelte';
   import DescriptionText from '../../components/DescriptionText.svelte';
-  import Toggle from '../../components/Toggle.svelte';
+	import TextField from '../../components/TextField.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
 
   let {
     formData = $bindable({
@@ -18,7 +16,7 @@
       logo_url: '',
       success_message: '',
       redirect_url: ''
-    })
+    }),
   } = $props();
 
   const themes = [
@@ -27,7 +25,7 @@
     { value: 'auto', label: 'Auto' }
   ];
 
-  const SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
+  const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
   const HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
 
   function isValidHttpUrl(value) {
@@ -47,9 +45,6 @@
     if (!SLUG_PATTERN.test(formData.slug.trim())) {
       return { valid: false, message: t('channel.formSlugInvalid') };
     }
-    if (!formData.workspace_ids?.length) {
-      return { valid: false, message: t('channel.selectAtLeastOneWorkspace') };
-    }
     if (formData.brand_color && !HEX_COLOR_PATTERN.test(formData.brand_color)) {
       return { valid: false, message: t('channel.formBrandColorInvalid') };
     }
@@ -64,7 +59,7 @@
 
   export function getConfig() {
     return {
-      form_slug: formData.slug,
+      form_slug: formData.slug.trim(),
       form_workspace_ids: formData.workspace_ids,
       form_theme: formData.theme || 'light',
       form_brand_color: formData.brand_color || '#14b8a6',
@@ -77,8 +72,11 @@
 
 <div class="pt-6 border-t" style="border-color: var(--ds-border);">
   <h4 class="text-sm font-semibold mb-4" style="color: var(--ds-text);">{t('channel.formConfiguration')}</h4>
+  <DescriptionText>
+    Set the shared public URL and optional appearance for this channel.
+  </DescriptionText>
 
-  <div class="space-y-4">
+  <div class="mt-4 space-y-4">
     <div>
       <Label color="default" required class="mb-2">
         {t('channel.formSlug')} <span class="text-xs font-normal" style="color: var(--ds-text-subtle);">({t('channel.formSlugHelp')})</span>
@@ -91,16 +89,8 @@
         title={t('validation.slugInvalid')}
       />
       <DescriptionText>
-        {t('channel.formUrl')}: /forms/{formData.slug || 'your-slug'}
+        Forms will be shared at /forms/{formData.slug || 'your-url'}.
       </DescriptionText>
-    </div>
-
-    <div>
-      <WorkspacePicker
-        bind:value={formData.workspace_ids}
-        label="{t('channel.targetWorkspaces')} *"
-        placeholder={t('channel.searchWorkspaces')}
-      />
     </div>
 
     <div>
@@ -133,44 +123,35 @@
     </div>
 
     <div>
-      <Label color="default" class="mb-2">{t('channel.formLogoUrl')}</Label>
-      <Input bind:value={formData.logo_url} placeholder="https://example.com/logo.png" />
-    </div>
-
-    <div>
-      <Label color="default" class="mb-2">{t('channel.formSuccessMessage')}</Label>
-      <Textarea
-        bind:value={formData.success_message}
-        placeholder={t('channel.formSuccessMessagePlaceholder')}
-        rows={2}
+      <TextField
+        label={t('channel.formLogoUrl')}
+        labelColor="default"
+        placeholder="https://example.com/logo.png"
+        bind:value={formData.logo_url}
       />
     </div>
 
     <div>
-      <Label color="default" class="mb-2">{t('channel.formRedirectUrl')}</Label>
-      <Input bind:value={formData.redirect_url} placeholder="https://example.com/thank-you" />
+      <TextareaField
+        label={t('channel.formSuccessMessage')}
+        labelColor="default"
+        placeholder={t('channel.formSuccessMessagePlaceholder')}
+        rows={2}
+        bind:value={formData.success_message}
+      />
+    </div>
+
+    <div>
+      <TextField
+        label={t('channel.formRedirectUrl')}
+        labelColor="default"
+        placeholder="https://example.com/thank-you"
+        bind:value={formData.redirect_url}
+      />
       <DescriptionText>
         {t('channel.formRedirectUrlHelp')}
       </DescriptionText>
     </div>
 
-    <!-- Integration Panel (only show when slug is set) -->
-    {#if formData.slug}
-      <div class="pt-4 border-t" style="border-color: var(--ds-border);">
-        <FormIntegrationPanel slug={formData.slug} />
-      </div>
-    {/if}
-
-    <div class="flex items-center justify-between">
-      <div>
-        <div class="text-sm font-medium" style="color: var(--ds-text);">
-          {t('channel.enableForm')}
-        </div>
-        <div class="text-xs mt-1" style="color: var(--ds-text-subtle);">
-          {formData.enabled ? t('channel.formIsActive') : t('channel.formIsInactive')}
-        </div>
-      </div>
-      <Toggle bind:checked={formData.enabled} />
-    </div>
   </div>
 </div>

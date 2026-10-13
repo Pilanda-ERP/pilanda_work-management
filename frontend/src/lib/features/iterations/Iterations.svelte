@@ -10,6 +10,7 @@
   import DataTable from '../../components/DataTable.svelte';
   import Button from '../../components/Button.svelte';
   import IterationModal from '../../dialogs/IterationModal.svelte';
+  import { preservePlanningScope } from '../../utils/planningScope.js';
   import IterationNavigation from './IterationNavigation.svelte';
   import { formatDateShort } from '../../utils/dateFormatter.js';
   import { api } from '../../api.js';
@@ -82,9 +83,9 @@
   async function loadData() {
     try {
       loading = true;
-      // In global view, load all iterations; in workspace view, filter by workspace
+      // Global lists exclude local iterations; workspace lists include both scopes.
       const filters = isGlobalView
-        ? {}
+        ? { is_global: true }
         : { workspace_id: workspaceId, include_global: true };
       const [iterationsData, typesData] = await Promise.all([
         api.iterations.getAll(filters),
@@ -120,7 +121,10 @@
   async function handleSave(data) {
     try {
       if (editingIteration) {
-        await api.iterations.update(editingIteration.id, data);
+        await api.iterations.update(
+          editingIteration.id,
+          preservePlanningScope(data, editingIteration)
+        );
       } else {
         await api.iterations.create(data);
       }
@@ -265,14 +269,14 @@
 </script>
 
 <!-- Main container with conditional two-panel layout for global view -->
-<div class="flex min-h-screen" style="background-color: var(--ds-surface);">
+<div class="flex h-full min-h-0 overflow-hidden" style="background-color: var(--ds-surface);">
   <!-- Left Sidebar - Navigation (only in global view) -->
   {#if isGlobalView}
     <IterationNavigation />
   {/if}
 
   <!-- Main Content -->
-  <div class="flex-1">
+  <div class="flex-1 min-h-0 overflow-y-auto">
     <div class="p-6">
       <!-- Header -->
       <PageHeader
@@ -324,7 +328,7 @@
             {item.type_name}
           </span>
         {:else}
-          <span class="text-gray-400">-</span>
+          <span class="text-ds-text-subtlest">-</span>
         {/if}
       {/snippet}
 
@@ -456,4 +460,3 @@
     oncancel={handleCancel}
   />
 {/if}
-

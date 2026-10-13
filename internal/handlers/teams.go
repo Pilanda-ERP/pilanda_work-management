@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"windshift/internal/logger"
@@ -15,14 +16,16 @@ import (
 type TeamHandler struct {
 	teamRepo          *repository.TeamRepository
 	leaveRepo         *repository.LeaveRepository
+	slaRepo           *repository.SLARepository
 	permissionService *services.PermissionService
 	auditor           *logger.Auditor
 }
 
-func NewTeamHandler(teamRepo *repository.TeamRepository, leaveRepo *repository.LeaveRepository, permissionService *services.PermissionService, auditor *logger.Auditor) *TeamHandler {
+func NewTeamHandler(teamRepo *repository.TeamRepository, leaveRepo *repository.LeaveRepository, slaRepo *repository.SLARepository, permissionService *services.PermissionService, auditor *logger.Auditor) *TeamHandler {
 	return &TeamHandler{
 		teamRepo:          teamRepo,
 		leaveRepo:         leaveRepo,
+		slaRepo:           slaRepo,
 		permissionService: permissionService,
 		auditor:           auditor,
 	}
@@ -187,7 +190,7 @@ func (h *TeamHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.auditor.LogWithDetails(r, user, logger.ActionTeamCreate, logger.ResourceTeam, &teamID, req.Name, map[string]interface{}{
+	h.auditor.LogWithDetails(r, user, logger.ActionTeamCreate, logger.ResourceTeam, &teamID, req.Name, map[string]any{
 		"description": req.Description,
 	})
 
@@ -233,6 +236,12 @@ func (h *TeamHandler) Update(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
+	if user := utils.GetCurrentUser(r); user != nil {
+		h.auditor.LogWithDetails(r, user, logger.ActionTeamUpdate, logger.ResourceTeam, &id, team.Name, map[string]any{
+			"description": team.Description,
+			"is_active":   team.IsActive,
+		})
+	}
 
 	respondJSONOK(w, team)
 }
@@ -266,6 +275,19 @@ func (h *TeamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A team calendar referenced by a goal target must not be deleted out
+	// from under a workspace's SLA promise; report that as a conflict instead
+	// of letting the calendar FK surface as an internal error.
+	references, err := h.slaRepo.TeamReferencedCalendars(r.Context(), id)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if references > 0 {
+		respondConflict(w, r, fmt.Sprintf("team cannot be deleted while %d SLA goal target(s) reference its calendars", references))
+		return
+	}
+
 	err = h.teamRepo.Delete(id)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -276,7 +298,7 @@ func (h *TeamHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.auditor.LogWithDetails(r, user, logger.ActionTeamDelete, logger.ResourceTeam, &id, team.Name, map[string]interface{}{
+	h.auditor.LogWithDetails(r, user, logger.ActionTeamDelete, logger.ResourceTeam, &id, team.Name, map[string]any{
 		"description": team.Description,
 		"is_active":   team.IsActive,
 	})
@@ -360,7 +382,10 @@ func (h *TeamHandler) AddMembers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	if currentUser != nil {
+		h.auditor.LogWithDetails(r, currentUser, logger.ActionTeamAddMember, logger.ResourceTeam, &id, "", map[string]any{"user_ids": req.UserIDs})
+	}
+	respondJSONOK(w, map[string]any{
 		"message": "Members added successfully",
 	})
 }
@@ -385,7 +410,11 @@ func (h *TeamHandler) RemoveMembers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	user := utils.GetCurrentUser(r)
+	if user != nil {
+		h.auditor.LogWithDetails(r, user, logger.ActionTeamRemoveMember, logger.ResourceTeam, &id, "", map[string]any{"user_ids": req.UserIDs})
+	}
+	respondJSONOK(w, map[string]any{
 		"message": "Members removed successfully",
 	})
 }
@@ -417,7 +446,11 @@ func (h *TeamHandler) UpdateMemberRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	user := utils.GetCurrentUser(r)
+	if user != nil {
+		h.auditor.LogWithDetails(r, user, logger.ActionTeamUpdateMemberRole, logger.ResourceTeam, &teamID, "", map[string]any{"user_id": userID, "role": req.Role})
+	}
+	respondJSONOK(w, map[string]any{
 		"message": "Member role updated successfully",
 	})
 }
@@ -460,8 +493,9 @@ func (h *TeamHandler) AddGroups(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	h.auditor.LogWithDetails(r, currentUser, logger.ActionTeamAddGroup, logger.ResourceTeam, &id, "", map[string]any{"group_ids": req.GroupIDs})
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"message": "Groups added successfully",
 	})
 }
@@ -485,8 +519,11 @@ func (h *TeamHandler) RemoveGroups(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if user := utils.GetCurrentUser(r); user != nil {
+		h.auditor.LogWithDetails(r, user, logger.ActionTeamRemoveGroup, logger.ResourceTeam, &id, "", map[string]any{"group_ids": req.GroupIDs})
+	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"message": "Groups removed successfully",
 	})
 }

@@ -3,7 +3,7 @@
   import { User } from '@lucide/svelte';
   import { createAsyncLoader } from '../composables';
   import { api } from '../api.js';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   let {
     value = $bindable(null),
@@ -11,13 +11,22 @@
     showUnassigned = false,
     unassignedLabel = 'None',
     disabled = false,
+    customers: providedCustomers = null,
+    loading = false,
+    onOpen = null,
+    autoOpen = false,
+    // (value) => string | null. Labels a selected customer id that is not in
+    // the loaded options (options load lazily on mount/open).
+    resolveMissingLabel = null,
     class: className = '',
     onSelect = () => {},
     onCancel = () => {}
   } = $props();
 
   const customers = createAsyncLoader(() => api.portalCustomers.getAll());
-  onMount(() => customers.load());
+  onMount(() => { if (providedCustomers === null) customers.load(); });
+  onDestroy(() => customers.dispose());
+  const customerOptions = $derived(providedCustomers ?? customers.data ?? []);
 </script>
 
 {#snippet customerRow({ item })}
@@ -32,18 +41,21 @@
 
 <BasePicker
   bind:value
-  items={customers.data || []}
-  loading={customers.loading}
+  items={customerOptions}
+  loading={providedCustomers === null ? customers.loading : loading}
   {placeholder}
   {showUnassigned}
   {unassignedLabel}
   {disabled}
   allowClear={true}
+  {autoOpen}
   class={className}
   itemSnippet={customerRow}
   searchFields={['name', 'email', 'customer_organisation_name']}
   getValue={(item) => item?.id}
   getLabel={(item) => item?.name || ''}
+  {resolveMissingLabel}
+  onOpen={() => onOpen?.()}
   onSelect={(item) => onSelect(item)}
   onCancel={() => onCancel()}
 />

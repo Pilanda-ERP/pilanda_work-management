@@ -27,20 +27,20 @@ func ValidateConfigForEnable(channel *models.Channel, config *models.ChannelConf
 		return nil
 	}
 
-	if config.EmailWorkspaceID == 0 {
-		return fmt.Errorf("%w: email_workspace_id is required", ErrConfigNotReady)
+	// Routing (workspace/portal/item type/folder) lives on intakes since
+	// WI-1644; the channel config only needs a usable connection. Intake
+	// presence is validated by the caller, which has DB access.
+	if config.EmailRateLimitPerHour != nil && *config.EmailRateLimitPerHour < 0 {
+		return fmt.Errorf("%w: email_rate_limit_per_hour must be 0 (unlimited) or a positive number", ErrConfigNotReady)
 	}
-	if config.EmailItemTypeID == nil || *config.EmailItemTypeID == 0 {
-		return fmt.Errorf("%w: email_item_type_id is required", ErrConfigNotReady)
-	}
-	if strings.TrimSpace(config.EmailMailbox) == "" {
-		return fmt.Errorf("%w: email_mailbox is required (default \"INBOX\")", ErrConfigNotReady)
+	if !IsValidEmailDisposition(config.EmailProcessingDisposition) {
+		return fmt.Errorf("%w: email_processing_disposition must be leave, mark_read, or delete", ErrConfigNotReady)
 	}
 
 	switch strings.ToLower(config.EmailAuthMethod) {
 	case "oauth":
-		if config.EmailOAuthProviderType == "" {
-			return fmt.Errorf("%w: email_oauth_provider_type is required", ErrConfigNotReady)
+		if config.EmailOAuthProviderType != models.EmailProviderTypeMicrosoft && config.EmailOAuthProviderType != models.EmailProviderTypeGoogle {
+			return fmt.Errorf("%w: email_oauth_provider_type must be microsoft or google", ErrConfigNotReady)
 		}
 		if config.EmailOAuthClientID == "" {
 			return fmt.Errorf("%w: email_oauth_client_id is required", ErrConfigNotReady)
@@ -66,9 +66,47 @@ func ValidateConfigForEnable(channel *models.Channel, config *models.ChannelConf
 		if config.IMAPPassword == "" {
 			return fmt.Errorf("%w: imap_password is required", ErrConfigNotReady)
 		}
+		if config.IMAPPort <= 0 || config.IMAPPort > 65535 {
+			return fmt.Errorf("%w: imap_port must be between 1 and 65535", ErrConfigNotReady)
+		}
+		switch strings.ToLower(config.IMAPEncryption) {
+		case "ssl", "tls", "starttls":
+		default:
+			return fmt.Errorf("%w: imap_encryption must be ssl or starttls", ErrConfigNotReady)
+		}
 	default:
 		return fmt.Errorf("%w: unknown email_auth_method %q", ErrConfigNotReady, config.EmailAuthMethod)
 	}
 
 	return nil
+}
+
+// ResolveEmailDisposition returns the effective post-processing action for a
+// channel. The explicit enum wins; an empty value (legacy config) maps the two
+// booleans, with delete taking precedence over mark-read.
+func ResolveEmailDisposition(config *models.ChannelConfig) string {
+	if config == nil {
+		return models.EmailDispositionLeave
+	}
+	if config.EmailProcessingDisposition != "" && IsValidEmailDisposition(config.EmailProcessingDisposition) {
+		return config.EmailProcessingDisposition
+	}
+	if config.EmailDeleteAfterProcess {
+		return models.EmailDispositionDelete
+	}
+	if config.EmailMarkAsRead {
+		return models.EmailDispositionMarkRead
+	}
+	return models.EmailDispositionLeave
+}
+
+// IsValidEmailDisposition reports whether value is a recognized disposition or
+// the empty legacy sentinel.
+func IsValidEmailDisposition(value string) bool {
+	switch value {
+	case "", models.EmailDispositionLeave, models.EmailDispositionMarkRead, models.EmailDispositionDelete:
+		return true
+	default:
+		return false
+	}
 }

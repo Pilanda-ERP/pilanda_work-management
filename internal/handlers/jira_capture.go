@@ -56,6 +56,15 @@ func newRecordingClient(inner jira.Client, captureDir string) *recordingClient {
 		filepath.Join(captureDir, "jira_sprints.jsonl"),
 		filepath.Join(captureDir, "jira_issue_comments.jsonl"),
 		filepath.Join(captureDir, "jira_issue_worklogs.jsonl"),
+		filepath.Join(captureDir, "jira_issue_watchers.jsonl"),
+		filepath.Join(captureDir, "jira_custom_field_configurations.jsonl"),
+		filepath.Join(captureDir, "jira_service_desks.jsonl"),
+		filepath.Join(captureDir, "jira_service_desk_request_types.jsonl"),
+		filepath.Join(captureDir, "jira_service_desk_request_comments.jsonl"),
+		filepath.Join(captureDir, "jira_service_desk_organizations.jsonl"),
+		filepath.Join(captureDir, "jira_service_desk_organization_users.jsonl"),
+		filepath.Join(captureDir, "jira_project_workflow_configuration.jsonl"),
+		filepath.Join(captureDir, "jira_project_screen_configuration.jsonl"),
 	}
 	for _, path := range rc.jsonlPaths {
 		if err := os.WriteFile(path, nil, 0o600); err != nil { //nolint:gosec // path built from operator-supplied dir
@@ -177,6 +186,58 @@ func (r *recordingClient) GetProject(ctx context.Context, projectKey string) (*j
 	return r.inner.GetProject(ctx, projectKey)
 }
 
+func (r *recordingClient) ListServiceDesks(ctx context.Context) ([]jira.JiraServiceDesk, error) {
+	resp, err := r.inner.ListServiceDesks(ctx)
+	if err == nil {
+		r.appendJSONL("jira_service_desks.jsonl", resp)
+	}
+	return resp, err
+}
+
+func (r *recordingClient) ListServiceDeskRequestTypes(ctx context.Context, serviceDeskID string) ([]jira.JiraServiceDeskRequestType, error) {
+	resp, err := r.inner.ListServiceDeskRequestTypes(ctx, serviceDeskID)
+	if err == nil {
+		r.appendJSONL("jira_service_desk_request_types.jsonl", map[string]any{
+			"service_desk_id": serviceDeskID,
+			"response":        resp,
+		})
+	}
+	return resp, err
+}
+
+func (r *recordingClient) ListServiceDeskRequestComments(ctx context.Context, issueKey string) ([]jira.JiraServiceDeskComment, error) {
+	resp, err := r.inner.ListServiceDeskRequestComments(ctx, issueKey)
+	if err == nil {
+		r.appendJSONL("jira_service_desk_request_comments.jsonl", map[string]any{
+			"issue_key": issueKey,
+			"response":  resp,
+		})
+	}
+	return resp, err
+}
+
+func (r *recordingClient) ListServiceDeskOrganizations(ctx context.Context, serviceDeskID string) ([]jira.JiraServiceDeskOrganization, error) {
+	resp, err := r.inner.ListServiceDeskOrganizations(ctx, serviceDeskID)
+	if err == nil {
+		r.appendJSONL("jira_service_desk_organizations.jsonl", map[string]any{
+			"service_desk_id": serviceDeskID,
+			"response":        resp,
+		})
+	}
+	return resp, err
+}
+
+func (r *recordingClient) ListServiceDeskOrganizationUsers(ctx context.Context, organizationID string) ([]jira.JiraUser, error) {
+	resp, err := r.inner.ListServiceDeskOrganizationUsers(ctx, organizationID)
+	if err == nil {
+		r.appendJSONL("jira_service_desk_organization_users.jsonl", map[string]any{
+			"organization_id": organizationID,
+			"response":        resp,
+		})
+	}
+	return resp, err
+}
+
 func (r *recordingClient) ListIssueTypes(ctx context.Context) ([]jira.JiraIssueType, error) {
 	return r.inner.ListIssueTypes(ctx)
 }
@@ -205,22 +266,92 @@ func (r *recordingClient) GetProjectWorkflowScheme(ctx context.Context, projectK
 	return r.inner.GetProjectWorkflowScheme(ctx, projectKey)
 }
 
-func (r *recordingClient) GetProjectIssueTypeStatuses(ctx context.Context, projectKey string) ([]jira.JiraIssueTypeWithStatuses, error) {
-	return r.inner.GetProjectIssueTypeStatuses(ctx, projectKey)
+func (r *recordingClient) GetProjectWorkflowConfiguration(
+	ctx context.Context,
+	projectID string,
+	issueTypeIDs []string,
+) (*jira.JiraProjectWorkflowConfiguration, error) {
+	capable, ok := r.inner.(jira.WorkflowConfigurationClient)
+	if !ok {
+		return nil, jira.ErrWorkflowConfigurationNotAvailable
+	}
+	resp, err := capable.GetProjectWorkflowConfiguration(ctx, projectID, issueTypeIDs)
+	if err == nil {
+		r.appendJSONL("jira_project_workflow_configuration.jsonl", map[string]any{
+			"project_id":     projectID,
+			"issue_type_ids": issueTypeIDs,
+			"response":       resp,
+		})
+	}
+	return resp, err
 }
 
-func (r *recordingClient) SearchIssues(ctx context.Context, opts jira.SearchOptions) (*jira.SearchResult, error) {
-	return r.inner.SearchIssues(ctx, opts)
+func (r *recordingClient) GetProjectScreenConfiguration(
+	ctx context.Context,
+	projectID string,
+	projectKey string,
+	issueTypeIDs []string,
+) (*jira.JiraProjectScreenConfiguration, error) {
+	capable, ok := r.inner.(jira.ScreenConfigurationClient)
+	if !ok {
+		return nil, jira.ErrScreenConfigurationNotAvailable
+	}
+	resp, err := capable.GetProjectScreenConfiguration(ctx, projectID, projectKey, issueTypeIDs)
+	if err == nil {
+		r.appendJSONL("jira_project_screen_configuration.jsonl", map[string]any{
+			"project_id":     projectID,
+			"project_key":    projectKey,
+			"issue_type_ids": issueTypeIDs,
+			"response":       resp,
+		})
+	}
+	return resp, err
+}
+
+func (r *recordingClient) GetProjectIssueTypeStatuses(ctx context.Context, projectKey string) ([]jira.JiraIssueTypeWithStatuses, error) {
+	return r.inner.GetProjectIssueTypeStatuses(ctx, projectKey)
 }
 
 func (r *recordingClient) GetIssue(ctx context.Context, issueKey string, expand []string) (*jira.JiraIssue, error) {
 	return r.inner.GetIssue(ctx, issueKey, expand)
 }
 
+func (r *recordingClient) GetIssueWatchers(ctx context.Context, issueKey string) (*jira.JiraIssueWatchers, error) {
+	capable, ok := r.inner.(jira.IssueWatchersClient)
+	if !ok {
+		return nil, fmt.Errorf("jira issue watchers capability unavailable")
+	}
+	resp, err := capable.GetIssueWatchers(ctx, issueKey)
+	if err == nil && resp != nil {
+		r.appendJSONL("jira_issue_watchers.jsonl", map[string]any{"issue_key": issueKey, "response": resp})
+	}
+	return resp, err
+}
+
 func (r *recordingClient) GetIssueComments(ctx context.Context, issueKey string, startAt, maxResults int) (*jira.JiraCommentContainer, error) {
 	resp, err := r.inner.GetIssueComments(ctx, issueKey, startAt, maxResults)
 	if err == nil && resp != nil {
 		r.appendJSONL("jira_issue_comments.jsonl", map[string]any{"issue_key": issueKey, "response": resp})
+	}
+	return resp, err
+}
+
+func (r *recordingClient) GetCustomFieldConfiguration(
+	ctx context.Context,
+	fieldID string,
+	includeOptions bool,
+) (*jira.JiraCustomFieldConfiguration, error) {
+	capable, ok := r.inner.(jira.CustomFieldConfigurationClient)
+	if !ok {
+		return nil, jira.ErrCustomFieldConfigurationNotAvailable
+	}
+	resp, err := capable.GetCustomFieldConfiguration(ctx, fieldID, includeOptions)
+	if err == nil && resp != nil {
+		r.appendJSONL("jira_custom_field_configurations.jsonl", map[string]any{
+			"field_id":        fieldID,
+			"include_options": includeOptions,
+			"response":        resp,
+		})
 	}
 	return resp, err
 }

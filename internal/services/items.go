@@ -1,15 +1,15 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
 	"windshift/internal/database"
-	"windshift/internal/repository"
+	"windshift/internal/itemevents"
 )
 
 // ErrMissingItemType is returned by CreateItem when the caller did not
@@ -93,16 +93,20 @@ type ItemCreationParams struct {
 	IsTask                  bool
 	ParentID                *int
 	MilestoneIDs            []int
+	LabelIDs                []int
 	IterationID             *int
 	ProjectID               *int
 	InheritProject          bool
 	TimeProjectID           *int
 	AssigneeID              *int
+	TeamID                  *int // Team assigned to own/handle the item
 	ReporterID              *int // Reporter/submitter of the item
 	CreatorID               *int
 	CreatorPortalCustomerID *int
 	ChannelID               *int       // Portal-specific: track portal/channel
 	RequestTypeID           *int       // Portal-specific: track request type
+	IntakeID                *int       // Email-specific: intake that created this item (WI-1644)
+	PortalOrgShared         bool       // Portal-specific: creator shared the request with their organisation (WI-1139)
 	DueDate                 *time.Time // Due date for the item
 	StartDate               *time.Time // Start date for the item
 	EndDate                 *time.Time // End date for the item
@@ -110,6 +114,7 @@ type ItemCreationParams struct {
 	StoryPoints             *float64   // Story points for velocity tracking
 	EstimateMinutes         *int       // Time estimate in minutes (compared against logged worklog time)
 	CustomFieldValuesJSON   string     // JSON string of custom field values
+	VirtualFieldDataJSON    string     // JSON string of request-type virtual values
 	// CreatedAt / UpdatedAt override the default `time.Now()` timestamps. Used
 	// by the Jira importer to preserve the original issue chronology so audit
 	// views, reports, and "recent" filters reflect Jira's history rather than
@@ -120,12 +125,24 @@ type ItemCreationParams struct {
 	// bulk paths (e.g. the Jira importer) where pre-assigned items must not
 	// each start an agent run.
 	SkipAssigneeTrigger bool
-	// ValidatingUserID and PermService enable project-assignment access control.
-	// When ValidatingUserID > 0 and PermService is non-nil, CreateItem rejects a
+	// SkipPublish suppresses live item-change publication for callers that
+	// explicitly defer or replace post-commit publication.
+	SkipPublish bool
+	// SkipMandatoryTemplate preserves source content for reconciliation and
+	// import paths. User-facing creation keeps template enforcement enabled.
+	SkipMandatoryTemplate bool
+	// AfterCreate extends the canonical creation transaction with source-owned
+	// records that must commit atomically with the item and its milestones.
+	AfterCreate ItemCreateTransactionHook
+	// AllowUnparentedGenericSubtask permits the Jira importer's two-phase
+	// insert-then-link flow to stage a level -1 item before its source parent
+	// has been imported. No interactive or automation caller should set it.
+	AllowUnparentedGenericSubtask bool
+	// ValidatingUserID marks user-facing creation. CreateItem uses it to reject
+	// assignees who cannot act in the workspace. PermService also rejects a
 	// ProjectID / TimeProjectID the user may not view (returning ErrProjectNotFound,
 	// indistinguishable from a non-existent project to avoid ID enumeration).
-	// User-facing create handlers set both; internal callers (import, recurrence,
-	// copy of already-authorized items) leave them zero to skip the check.
+	// Internal callers such as imports leave it zero to preserve imported identity.
 	ValidatingUserID int
 	PermService      *PermissionService
 	// MandatoryTemplateOut, when non-nil, is populated by CreateItem with the
@@ -134,7 +151,13 @@ type ItemCreationParams struct {
 	// ws CLI) echo the enforced structure even when they supplied their own
 	// description. TemplateID == 0 after the call means the type enforces none.
 	MandatoryTemplateOut *MandatoryTemplateInfo
+	// EventMetadata overrides inferred actor/source provenance for the canonical
+	// item.created fact. Empty fields receive safe defaults.
+	EventMetadata itemevents.Metadata
 }
+
+// ItemCreateTransactionHook extends the item creation transaction.
+type ItemCreateTransactionHook func(context.Context, database.Tx, int) error
 
 // MandatoryTemplateInfo reports the mandatory template a resolved item type
 // enforces at create time and whether CreateItem applied its body (only when
@@ -177,286 +200,81 @@ func validateProjectAssignmentAccess(db database.Database, perm *PermissionServi
 	return nil
 }
 
+func resolveItemTypeForCreation(db database.Database, workspaceID int, itemTypeID *int) (*int, error) {
+	if itemTypeID != nil {
+		if *itemTypeID <= 0 {
+			return nil, ErrInvalidItemType
+		}
+		var exists bool
+		if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM item_types WHERE id = ?)", *itemTypeID).Scan(&exists); err != nil {
+			return nil, fmt.Errorf("failed to check item type existence: %w", err)
+		}
+		if !exists {
+			return nil, ErrInvalidItemType
+		}
+
+		allowed, err := IsItemTypeAllowedInWorkspace(db, workspaceID, *itemTypeID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check item type restriction: %w", err)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("item type is not allowed in this workspace")
+		}
+		return itemTypeID, nil
+	}
+
+	// Prefer the workspace config set's default item type, but only when it is
+	// actually part of the set. A set with a NULL or stale default would
+	// otherwise resolve to a type the workspace does not allow.
+	var defaultItemTypeID int
+	err := db.QueryRow(`
+		SELECT cs.default_item_type_id FROM configuration_sets cs
+		INNER JOIN workspace_configuration_sets wcs ON cs.id = wcs.configuration_set_id
+		INNER JOIN configuration_set_item_types csit
+			ON csit.configuration_set_id = cs.id AND csit.item_type_id = cs.default_item_type_id
+		WHERE wcs.workspace_id = ? AND cs.default_item_type_id IS NOT NULL
+		ORDER BY cs.is_default DESC
+		LIMIT 1
+	`, workspaceID).Scan(&defaultItemTypeID)
+	if err != nil {
+		// Fall back to the first item type the workspace's config set allows.
+		err = db.QueryRow(`
+			SELECT csit.item_type_id FROM configuration_set_item_types csit
+			INNER JOIN workspace_configuration_sets wcs ON wcs.configuration_set_id = csit.configuration_set_id
+			WHERE wcs.workspace_id = ?
+			ORDER BY csit.item_type_id
+			LIMIT 1
+		`, workspaceID).Scan(&defaultItemTypeID)
+	}
+	if err != nil {
+		// No config set restriction (or an unrestricted empty set): use the
+		// global default item type.
+		err = db.QueryRow("SELECT id FROM item_types WHERE is_default = true LIMIT 1").Scan(&defaultItemTypeID)
+	}
+	if err != nil || defaultItemTypeID == 0 {
+		return nil, ErrMissingItemType
+	}
+	return &defaultItemTypeID, nil
+}
+
 // CreateItem creates a new item with proper transaction handling and number generation
 // This centralizes the item creation logic used by normal creation, portal submissions, and copying
 func CreateItem(db database.Database, params ItemCreationParams) (int64, error) {
-	// Enforce project-assignment access control: a user may only attach a
-	// project_id / time_project_id they can view. Skipped for internal callers
-	// that don't set a validating user.
-	if params.ValidatingUserID > 0 && params.PermService != nil {
-		if err := validateProjectAssignmentAccess(db, params.PermService, params.ValidatingUserID, params.ProjectID, params.TimeProjectID); err != nil {
-			return 0, err
-		}
+	return createItem(context.Background(), db, params)
+}
+
+func createItem(ctx context.Context, db database.Database, params ItemCreationParams) (int64, error) {
+	creation, err := prepareItemCreation(ctx, db, params)
+	if err != nil {
+		return 0, err
 	}
 
-	// Validate the supplied item type before anything else. IsItemTypeAllowedInWorkspace
-	// returns true for workspaces with no config set, so a bogus numeric id (e.g.
-	// `ws task create --type 999`) would otherwise slip through and be stored as a
-	// dangling reference — verify the row exists first, then the config-set restriction.
-	if params.ItemTypeID != nil && *params.ItemTypeID != 0 {
-		var itemTypeExists bool
-		if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM item_types WHERE id = ?)", *params.ItemTypeID).Scan(&itemTypeExists); err != nil {
-			return 0, fmt.Errorf("failed to check item type existence: %w", err)
-		}
-		if !itemTypeExists {
-			return 0, ErrInvalidItemType
-		}
-
-		allowed, err := IsItemTypeAllowedInWorkspace(db, params.WorkspaceID, *params.ItemTypeID)
-		if err != nil {
-			return 0, fmt.Errorf("failed to check item type restriction: %w", err)
-		}
-		if !allowed {
-			return 0, fmt.Errorf("item type is not allowed in this workspace")
-		}
+	itemID, err := creation.insert()
+	if err != nil {
+		return 0, err
 	}
-
-	// Resolve default item type when omitted. Prefer the workspace's default
-	// configuration set's default_item_type_id; fall back to any item type
-	// flagged is_default globally. Mirrors the status/priority fallbacks so
-	// callers that don't specify a type (e.g. AI Chat's create_item tool) get
-	// a sensible default instead of a NULL item_type_id.
-	if params.ItemTypeID == nil {
-		var defaultItemTypeID int
-		err := db.QueryRow(`
-			SELECT cs.default_item_type_id FROM configuration_sets cs
-			INNER JOIN workspace_configuration_sets wcs ON cs.id = wcs.configuration_set_id
-			WHERE wcs.workspace_id = ? AND cs.default_item_type_id IS NOT NULL
-			ORDER BY cs.is_default DESC
-			LIMIT 1
-		`, params.WorkspaceID).Scan(&defaultItemTypeID)
-		if err != nil {
-			err = db.QueryRow("SELECT id FROM item_types WHERE is_default = true LIMIT 1").Scan(&defaultItemTypeID)
-		}
-		if err == nil && defaultItemTypeID != 0 {
-			params.ItemTypeID = &defaultItemTypeID
-		}
-	}
-
-	if params.ItemTypeID == nil {
-		return 0, ErrMissingItemType
-	}
-
-	// Apply a mandatory work item template (WI-438). Every create path funnels
-	// through here, so this single seam gives uniform mandatory-template
-	// behavior. If the resolved type enforces an active mandatory template,
-	// fill an empty description with its body (decision #2: only when empty so
-	// agents/importers that supply a description stay predictable), and report
-	// what was enforced regardless of whether it was applied.
-	if mandatory, terr := repository.NewTemplateRepository(db).GetMandatoryForType(params.WorkspaceID, *params.ItemTypeID); terr == nil {
-		applied := false
-		if strings.TrimSpace(params.Description) == "" {
-			params.Description = mandatory.DescriptionBody
-			applied = true
-		}
-		if params.MandatoryTemplateOut != nil {
-			*params.MandatoryTemplateOut = MandatoryTemplateInfo{
-				TemplateID: mandatory.ID,
-				Name:       mandatory.Name,
-				Applied:    applied,
-			}
-		}
-	} else if !errors.Is(terr, repository.ErrNotFound) {
-		return 0, fmt.Errorf("failed to resolve mandatory template: %w", terr)
-	}
-
-	now := time.Now()
-	createdAt := now
-	if params.CreatedAt != nil {
-		createdAt = *params.CreatedAt
-	}
-	updatedAt := now
-	if params.UpdatedAt != nil {
-		updatedAt = *params.UpdatedAt
-	}
-
-	// Resolve status ID BEFORE starting the transaction to avoid holding the TX open during lookups
-	// Direct ID takes precedence, then text mapping, then workflow initial status (cached)
-	var statusID *int
-	if params.StatusID != nil {
-		statusID = params.StatusID
-	} else if params.Status != "" {
-		statusID = mapTextStatusToID(params.Status)
-	}
-
-	// If status is still nil, resolve from workflow initial status using cache
-	if statusID == nil {
-		workflowService := NewWorkflowService(db)
-		statusID, _ = workflowService.GetInitialStatusIDCached(params.WorkspaceID, params.ItemTypeID)
-	}
-
-	// Resolve priority ID BEFORE transaction: direct ID takes precedence, then text mapping, then default
-	var priorityID *int
-	if params.PriorityID != nil {
-		priorityID = params.PriorityID
-	} else if params.Priority != "" {
-		priorityID = mapTextPriorityToID(params.Priority)
-	}
-
-	// If priority is still nil, get the default priority scoped to the workspace's configuration set
-	if priorityID == nil {
-		var defaultPriorityID int
-		err := db.QueryRow(`
-			SELECT p.id FROM priorities p
-			INNER JOIN configuration_set_priorities csp ON p.id = csp.priority_id
-			INNER JOIN workspace_configuration_sets wcs ON csp.configuration_set_id = wcs.configuration_set_id
-			WHERE p.is_default = true AND wcs.workspace_id = ?
-			LIMIT 1
-		`, params.WorkspaceID).Scan(&defaultPriorityID)
-		if err != nil {
-			// Fallback to global default if workspace has no configuration set
-			err = db.QueryRow("SELECT id FROM priorities WHERE is_default = true LIMIT 1").Scan(&defaultPriorityID)
-		}
-		if err == nil {
-			priorityID = &defaultPriorityID
-		}
-	}
-
-	// runInsertTx executes the per-attempt portion of CreateItem inside a
-	// single transaction: read MAX(frac_index), compute the next key (with a
-	// random jitter suffix so concurrent appends don't collide), INSERT the
-	// item, attach milestones. Hoisted into a closure so the retry loop can
-	// re-issue the whole transaction without re-running the upstream item-type
-	// / status / priority resolution. Both the MAX read and the INSERT share
-	// the same tx snapshot, so no cache is needed.
-	runInsertTx := func() (int64, string, error) {
-		tx, err := db.Begin()
-		if err != nil {
-			return 0, "", fmt.Errorf("failed to start transaction: %w", err)
-		}
-		defer func() { _ = tx.Rollback() }()
-
-		fracIndex, err := repository.GenerateFracIndexForNewItem(tx)
-		if err != nil {
-			return 0, "", fmt.Errorf("failed to generate frac_index: %w", err)
-		}
-
-		// Get next workspace-specific item number (within transaction to prevent race conditions)
-		nextWorkspaceItemNumber, err := repository.NewItemRepository(db).GetNextWorkspaceItemNumber(tx, params.WorkspaceID)
-		if err != nil {
-			return 0, "", fmt.Errorf("failed to generate workspace item number: %w", err)
-		}
-
-		// Insert item with all fields
-		// Note: Uses RETURNING id for both SQLite (3.35+) and PostgreSQL
-		insertQuery := `
-			INSERT INTO items (
-				workspace_id, workspace_item_number, item_type_id, title, description, status_id, priority_id, is_task,
-				iteration_id, project_id, inherit_project, time_project_id, assignee_id, reporter_id, creator_id, creator_portal_customer_id,
-				channel_id, request_type_id, due_date, start_date, end_date, related_work_item_id,
-				story_points, estimate_minutes, custom_field_values, parent_id,
-				frac_index, created_at, updated_at, last_active_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			RETURNING id
-		`
-
-		var itemID int64
-		if err := tx.QueryRow(insertQuery,
-			params.WorkspaceID,
-			nextWorkspaceItemNumber,
-			params.ItemTypeID,
-			params.Title,
-			params.Description,
-			statusID,
-			priorityID,
-			params.IsTask,
-			params.IterationID,
-			params.ProjectID,
-			params.InheritProject,
-			params.TimeProjectID,
-			params.AssigneeID,
-			params.ReporterID,
-			params.CreatorID,
-			params.CreatorPortalCustomerID,
-			params.ChannelID,
-			params.RequestTypeID,
-			params.DueDate,
-			params.StartDate,
-			params.EndDate,
-			params.RelatedWorkItemID,
-			params.StoryPoints,
-			params.EstimateMinutes,
-			nullString(params.CustomFieldValuesJSON),
-			params.ParentID,
-			fracIndex,
-			createdAt,
-			updatedAt,
-			updatedAt, // last_active_at: a new item is "active" as of creation
-		).Scan(&itemID); err != nil {
-			return 0, "", fmt.Errorf("failed to insert item: %w", err)
-		}
-
-		// Attach milestones inside the same transaction so a milestone-validation
-		// failure rolls back the item insert. Empty/nil slice = no milestones.
-		for _, mID := range params.MilestoneIDs {
-			if _, err := tx.Exec(
-				"INSERT INTO item_milestones (item_id, milestone_id, created_at) VALUES (?, ?, ?)",
-				itemID, mID, now,
-			); err != nil {
-				return 0, "", fmt.Errorf("failed to attach milestone %d to new item: %w", mID, err)
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			return 0, "", fmt.Errorf("failed to commit transaction: %w", err)
-		}
-		return itemID, fracIndex, nil
-	}
-
-	// Catch-only retry on the two collision-prone unique constraints:
-	// idx_items_frac_index and (workspace_id, workspace_item_number). The
-	// success path takes one iteration. Each iteration runs a fresh
-	// transaction; MAX(frac_index) is re-read (jitter makes a repeat collision
-	// astronomically unlikely) and MAX(workspace_item_number) is re-read locked
-	// on Postgres, so concurrent writers' commits are picked up automatically —
-	// no cache to invalidate.
-	var itemID int64
-	for attempt := 0; attempt < repository.FracIndexMaxRetries; attempt++ {
-		id, fracIndex, ierr := runInsertTx()
-		if ierr == nil {
-			itemID = id
-			break
-		}
-		retriable := repository.IsFracIndexUniqueViolation(ierr) ||
-			repository.IsWorkspaceItemNumberUniqueViolation(ierr)
-		if !retriable {
-			return 0, ierr
-		}
-		slog.Warn("item insert unique violation, retrying",
-			slog.Int("attempt", attempt+1),
-			slog.String("frac_index", fracIndex),
-			slog.String("component", "fracindex"))
-		if attempt == repository.FracIndexMaxRetries-1 {
-			return 0, fmt.Errorf("failed to insert item after %d retries: %w", repository.FracIndexMaxRetries, ierr)
-		}
-	}
-
-	// Record item creation history asynchronously if a creator is specified
-	if params.CreatorID != nil {
-		historyService := GetHistoryService(db)
-		historyService.RecordItemCreationHistoryAsync(db, int(itemID), *params.CreatorID)
-	}
-
-	// Items created with an assignee already set fire the coding-agent
-	// binding trigger exactly like a later assignment would (the create
-	// surfaces previously skipped it, so create-with-agent-assignee
-	// silently never started a run).
-	if !params.SkipAssigneeTrigger && params.AssigneeID != nil {
-		triggeredBy := params.ValidatingUserID
-		if triggeredBy == 0 && params.CreatorID != nil {
-			triggeredBy = *params.CreatorID
-		}
-		maybeTriggerAssigneeRun(params.WorkspaceID, int(itemID), nil, params.AssigneeID, triggeredBy)
-	}
-
-	// Live-update publish (WI-483): the insert has committed. Announce the new
-	// item, and refresh the parent's child list if this item has a parent.
-	PublishItemChange(int(itemID), ItemChangeCreated)
-	if params.ParentID != nil {
-		PublishItemChange(*params.ParentID, ItemChangeUpdated)
-	}
-
-	return itemID, nil
+	creation.finish(itemID)
+	return int64(itemID), nil
 }
 
 // GetInitialStatusForItemType determines the initial status for an item type
@@ -494,13 +312,15 @@ func GetInitialStatusForItemType(db database.Database, itemTypeID int) (string, 
 	}
 
 	// Now get the initial status from the workflow
-	// The initial status is identified by from_status_id IS NULL in workflow_transitions
+	// The initial status is identified by from_status_id IS NULL (and not a
+	// from-all row) in workflow_transitions
 	statusQuery := `
 		SELECT s.name
 		FROM workflow_transitions wt
 		JOIN statuses s ON wt.to_status_id = s.id
 		WHERE wt.workflow_id = ?
 		  AND wt.from_status_id IS NULL
+		  AND wt.from_all_statuses = FALSE
 		ORDER BY wt.display_order ASC
 		LIMIT 1
 	`
@@ -515,12 +335,4 @@ func GetInitialStatusForItemType(db database.Database, itemTypeID int) (string, 
 	}
 
 	return statusName, nil
-}
-
-// nullString converts an empty string to sql.NullString
-func nullString(s string) sql.NullString {
-	if s == "" {
-		return sql.NullString{Valid: false}
-	}
-	return sql.NullString{String: s, Valid: true}
 }

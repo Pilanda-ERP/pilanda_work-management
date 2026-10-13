@@ -15,6 +15,8 @@
   import Checkbox from '../components/Checkbox.svelte';
   import Textarea from '../components/Textarea.svelte';
   import { Mail, Edit, Eye } from '@lucide/svelte';
+	import TextField from '../components/TextField.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
 
   // Per-template variable hints shown in the editor sidebar so admins know
   // which {{.Variables}} are available for each row. Mirrors the data
@@ -48,6 +50,13 @@
       { name: '{{.ItemTitle}}', description: 'Item title.' },
       { name: '{{.Content}}', description: 'The reply text. Auto-escaped for HTML safety.' },
       { name: '{{.OriginalSubject}}', description: 'Used as the email subject (with "Re:" prefix added by the threading flow).' },
+      { name: '{{.PortalURL}}', description: 'Link to the request in the portal. Empty when the request is not exposed to a portal.' },
+    ],
+    intake_confirmation: [
+      { name: '{{.FirstName}}', description: 'Name of the person who emailed the intake.' },
+      { name: '{{.ItemKey}}', description: 'Item key of the created request (e.g. ACME-42).' },
+      { name: '{{.ItemTitle}}', description: 'Title of the created request.' },
+      { name: '{{.PortalURL}}', description: 'Link to the request in the portal. Empty when the intake is not linked to a portal.' },
     ],
   };
 
@@ -199,12 +208,12 @@
   <div class="px-6 py-4 grid grid-cols-1 lg:grid-cols-3 gap-6">
     <div class="lg:col-span-2 flex flex-col gap-4">
       <div>
-        <Label color="default" class="mb-2">{t('settings.emailTemplates.subject')}</Label>
-        <input
+        <TextField
+          label={t('settings.emailTemplates.subject')}
+          labelColor="default"
           type="text"
+          size="small"
           bind:value={formData.subject}
-          class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-          style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
         />
       </div>
 
@@ -227,8 +236,12 @@
       </div>
 
       <div>
-        <Label color="default" class="mb-2">{t('settings.emailTemplates.adminNotes')}</Label>
-        <Textarea bind:value={formData.description} rows={2} />
+        <TextareaField
+          label={t('settings.emailTemplates.adminNotes')}
+          labelColor="default"
+          rows={2}
+          bind:value={formData.description}
+        />
       </div>
 
       <div>

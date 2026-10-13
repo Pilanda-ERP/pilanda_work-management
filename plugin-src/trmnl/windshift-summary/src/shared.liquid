@@ -1,0 +1,87 @@
+{%- comment -%}
+  Shared markup is prepended to every view layout before rendering, so the
+  assigns below are in scope for all four layouts.
+
+  Polled responses (see settings.yml polling_url):
+    IDX_0 = /users/me
+    IDX_1 = the scope query, page_size 1, newest first — supplies open_total,
+            and its item is the Next-up fallback when nothing has a due date
+    IDX_2 = overdue count    (scope AND due_date <  today)
+    IDX_3 = due-or-overdue   (scope AND due_date <= today)
+    IDX_4 = soonest-due open item — the real Next up
+    IDX_5 = closed-today count (status entered Done today; only pagination.total_items is read)
+    IDX_6 = today's activity across all visible workspaces
+    IDX_7/IDX_8 = next in-progress / planned milestone of the configured
+            workspace (optional poll — both lines vanish when the milestone
+            workspace ID field is blank)
+
+  Accuracy note: every counter comes from pagination.total_items and is exact
+  for any backlog size. due_today_count is derived as IDX_3 minus IDX_2, both
+  server-side counts taken moments apart, so an item whose due date lands on
+  today is counted correctly even with a backlog far larger than any window.
+{%- endcomment -%}
+
+{%- assign me = IDX_0.data -%}
+{%- assign open_total = IDX_1.pagination.total_items -%}
+{%- assign overdue_count = IDX_2.pagination.total_items -%}
+{%- assign due_today_count = IDX_3.pagination.total_items | minus: overdue_count -%}
+{%- assign closed_today = IDX_5.pagination.total_items -%}
+{%- assign activity = IDX_6.data -%}
+{%- assign activity_total = IDX_6.pagination.total_items -%}
+
+{%- comment -%}
+  A failed poll yields {} rather than an exception, so an unreachable server
+  or a rejected query would otherwise render as a silently blank screen. The
+  device has no logs to check, so name the fault on the screen itself.
+{%- endcomment -%}
+{%- assign fault = '' -%}
+{%- unless me.id -%}
+  {%- assign fault = 'Cannot reach Windshift. Check the server URL and API token.' -%}
+{%- endunless -%}
+{%- if fault == '' -%}
+  {%- unless IDX_1.pagination and IDX_2.pagination and IDX_3.pagination and IDX_4.pagination -%}
+    {%- assign fault = 'Windshift rejected the scope query. Check the QL syntax.' -%}
+  {%- endunless -%}
+{%- endif -%}
+
+{%- comment -%}
+  Next up is the soonest-due open item that is not overdue (IDX_4, server-side
+  sort by due date ascending, overdue already excluded by the query). With no
+  due dates anywhere, fall back to the most recently touched item so the
+  "Next up" slot still says something useful.
+{%- endcomment -%}
+{%- assign next_up = IDX_4.data.first -%}
+{%- unless next_up -%}{%- assign next_up = IDX_1.data.first -%}{%- endunless -%}
+
+{%- comment -%}
+  Next milestone is the first in-progress or planned milestone in the
+  configured workspace's manual ordering, whichever sorts first. The poll is
+  optional, so a blank field or a failed request just hides the row.
+{%- endcomment -%}
+{%- assign next_milestone = IDX_7.data.first -%}
+{%- if IDX_8.data.first and IDX_8.data.first.position < next_milestone.position -%}
+  {%- assign next_milestone = IDX_8.data.first -%}
+{%- endif -%}
+{%- unless next_milestone -%}{%- assign next_milestone = IDX_8.data.first -%}{%- endunless -%}
+
+{%- assign owner_name = me.first_name -%}
+{%- if owner_name == blank -%}{%- assign owner_name = me.full_name | split: ' ' | first -%}{%- endif -%}
+{%- if owner_name == blank -%}{%- assign owner_name = me.username -%}{%- endif -%}
+
+{%- comment -%} Centred message, used for the fault state. {%- endcomment -%}
+{% template notice %}
+  <div class="layout layout--col layout--center">
+    <span class="value value--small">{{ headline }}</span>
+    <span class="label">{{ detail }}</span>
+  </div>
+{% endtemplate %}
+
+{%- comment -%} One stat tile. {% render %} is scope-isolated, so pass everything in. {%- endcomment -%}
+{% template stat %}
+  <div class="item">
+    <div class="content">
+      <span class="value value--{{ size | default: 'base' }} value--tnums">{{ number }}</span>
+      <span class="label label--small">{{ caption }}</span>
+    </div>
+  </div>
+{% endtemplate %}

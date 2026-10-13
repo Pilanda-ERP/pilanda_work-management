@@ -1,7 +1,11 @@
 package wscli
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,10 +15,8 @@ import (
 
 var attachmentCmd = &cobra.Command{
 	Use:   "attachment",
-	Short: "List and download work item attachments",
-	Long: `Commands for inspecting and downloading files attached to work items.
-
-Uploading is not supported from the CLI (use the web UI for that).`,
+	Short: "Upload, list, and download work item attachments",
+	Long:  `Commands for attaching files to work items and inspecting or downloading them.`,
 }
 
 var attachmentListCmd = &cobra.Command{
@@ -84,10 +86,7 @@ Examples:
 			return nil
 		}
 
-		// Resolve the destination path. We need the server's filename for the
-		// default-CWD and directory-target cases, so download into a temp file
-		// first, then rename. This also avoids leaving a half-written file at
-		// the final destination if the transfer fails mid-stream.
+		// Download to a temporary file before resolving and renaming the destination.
 		destDir := "."
 		destName := ""
 		if attachmentDownloadOutput != "" {
@@ -132,7 +131,7 @@ Examples:
 		if outputFormat == "table" {
 			_, _ = fmt.Fprintf(stdout, "Downloaded %s\n", finalPath)
 		} else {
-			NewOutput().Print(map[string]interface{}{
+			NewOutput().Print(map[string]any{
 				"attachment_id": id,
 				"path":          finalPath,
 			})
@@ -141,10 +140,144 @@ Examples:
 	},
 }
 
+// maxItemAttachmentUpload mirrors the route's fixed multipart request cap.
+// Configurable limits and MIME validation remain server-side to avoid stale CLI policy.
+const maxItemAttachmentUpload = 32 << 20
+
+var attachmentUploadCmd = &cobra.Command{
+	Use:   "upload <id|KEY-123> <file> [file...]",
+	Short: "Upload one or more files to a work item",
+	Long: `Upload local files as attachments on a work item.
+
+Every file is checked (exists, readable, within the upload endpoint's
+32 MB request limit) before the first upload is attempted, so a typo in
+the last path does not leave you with a partial batch. Files upload in
+the order given; if one fails mid-batch the command reports which files
+did land and exits non-zero.
+
+Your server enforces further restrictions that this command cannot check
+up front: an administrator-configured size limit and allowed MIME types,
+a fixed blocklist of executable extensions (.exe, .sh, .js, .svg, ...),
+a requirement that files have an extension matching their actual content,
+and a global switch that can turn attachments off entirely. Those are
+reported with the server's own explanation.
+
+Examples:
+  ws attachment upload PROJ-45 mockup.png
+  ws attachment upload 123 before.png after.png notes.pdf
+  ws attachment upload PROJ-45 ./shots/*.png       # shell expands the glob
+  ws attachment upload PROJ-45 report.pdf -o json`,
+	Args: cobra.MinimumNArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		paths := args[1:]
+		if err := checkUploadableFiles(paths); err != nil {
+			return err
+		}
+
+		client, err := NewClient()
+		if err != nil {
+			return err
+		}
+		itemID, err := client.ResolveItemID(args[0])
+		if err != nil {
+			return fmt.Errorf("failed to resolve item: %w", err)
+		}
+
+		uploaded := make([]Attachment, 0, len(paths))
+		for _, path := range paths {
+			att, err := uploadOneAttachment(client, itemID, path)
+			if err != nil {
+				// Report completed uploads so the remainder can be retried.
+				if len(uploaded) > 0 {
+					NewOutput().Print(uploaded)
+				}
+				return err
+			}
+			uploaded = append(uploaded, *att)
+		}
+
+		NewOutput().Print(uploaded)
+		return nil
+	},
+}
+
+// uploadOneAttachment streams a single local file to the item, translating
+// the server's errors into CLI-appropriate ones.
+func uploadOneAttachment(client *Client, itemID int, path string) (*Attachment, error) {
+	f, err := os.Open(path) //nolint:gosec // G304: path supplied by the user on the command line, intentional
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	att, err := client.UploadItemAttachment(itemID, filepath.Base(path), f)
+	if err != nil {
+		return nil, translateItemAttachmentError(err, path)
+	}
+	return att, nil
+}
+
+// checkUploadableFiles validates every path up front so the command fails
+// before touching the network when any of them is missing, a directory, or
+// too large for the upload route to accept.
+func checkUploadableFiles(paths []string) error {
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("cannot upload %s: %w", path, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("cannot upload %s: is a directory", path)
+		}
+		if info.Size() == 0 {
+			return fmt.Errorf("cannot upload %s: file is empty", path)
+		}
+		// The request cap includes the multipart envelope.
+		if total := info.Size() + multipartEnvelopeSize(filepath.Base(path)); total > maxItemAttachmentUpload {
+			return fmt.Errorf("cannot upload %s: %d bytes exceeds the upload endpoint's %d MB request limit", path, info.Size(), maxItemAttachmentUpload>>20)
+		}
+		// Verify readability before the batch starts.
+		f, err := os.Open(path) //nolint:gosec // G304: path supplied by the user on the command line, intentional
+		if err != nil {
+			return fmt.Errorf("cannot upload %s: %w", path, err)
+		}
+		_ = f.Close()
+	}
+	return nil
+}
+
+// multipartEnvelopeSize returns the exact number of bytes the multipart
+// wrapper adds around a file part named filename. The boundary is random but
+// fixed-length, so this is deterministic for a given filename.
+func multipartEnvelopeSize(filename string) int64 {
+	var buf bytes.Buffer
+	mp := multipart.NewWriter(&buf)
+	if _, err := mp.CreateFormFile("file", filename); err != nil {
+		return 0
+	}
+	if err := mp.Close(); err != nil {
+		return 0
+	}
+	return int64(buf.Len())
+}
+
+// translateItemAttachmentError adds the file being uploaded as context and
+// expands the upload route's 404 into the two things it can mean. The
+// handler deliberately returns the same 404 for "no such item" and "no
+// item.edit here", so the message must not imply the item exists.
+func translateItemAttachmentError(err error, path string) error {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+		return fmt.Errorf("upload %s: item not found, or you lack item.edit in its workspace (Editor role required)", path)
+	}
+	return fmt.Errorf("upload %s: %w", path, err)
+}
+
 func init() {
 	rootCmd.AddCommand(attachmentCmd)
 	attachmentCmd.AddCommand(attachmentListCmd)
 	attachmentCmd.AddCommand(attachmentDownloadCmd)
+	attachmentCmd.AddCommand(attachmentUploadCmd)
 
 	attachmentDownloadCmd.Flags().StringVar(&attachmentDownloadOutput, "to", "", "output path: file, directory, or - for stdout (default: current directory using the server-supplied filename)")
 }

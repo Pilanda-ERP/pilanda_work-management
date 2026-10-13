@@ -16,13 +16,13 @@ const sseHeartbeatInterval = 20 * time.Second
 // (live updates disabled), the Events endpoint returns 503.
 func (h *ItemHandler) SetSSEHub(hub *services.SSEHub) { h.sseHub = hub }
 
-// Events streams item-change events for one item as Server-Sent Events
+// Events streams coarse item-change events for one item as Server-Sent Events
 // (WI-484). GET /items/{id}/events.
 //
-// The client (useItemEventStream) maps each event's `kind` to a targeted
-// reload, and treats `connected`/`reload`/unknown kinds as a full reload, so
-// any section not covered by a granular event (attachments, diagrams, worklogs)
-// is still reconciled on connect/reconnect/drop.
+// The wire is deliberately coarse: `changed` means "reload the whole detail"
+// and `deleted` means "the item is gone". The client does not decode a change
+// taxonomy, so any mutation that publishes reaches every visible section and a
+// dropped frame is harmless.
 //
 // Gated on item.view, returning 404 on a missing item or missing permission
 // (the item-existence-non-leak invariant). The handler holds NO database
@@ -42,24 +42,31 @@ func (h *ItemHandler) Events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	itemRepo := repository.NewItemRepository(h.db)
-	if !CheckItemPermission(w, r, itemRepo, h.permissionService, itemID, models.PermissionItemView) {
+	workspaceID, err := itemRepo.GetWorkspaceID(itemID)
+	if err != nil {
+		respondNotFound(w, r, "Item")
+		return
+	}
+	allowed, err := h.permissionService.HasWorkspacePermission(user.ID, workspaceID, models.PermissionItemView)
+	if err != nil || !allowed {
+		respondNotFound(w, r, "Item")
 		return
 	}
 
-	// authorized re-evaluates item.view for this user. The stream is authorized
-	// at connect AND re-checked on every heartbeat (below), so a mid-stream
-	// permission revocation — or the item's deletion — stops delivery within one
-	// heartbeat instead of continuing to leak changes (WI-484). The check is a
-	// brief query, not a held connection, so the idle stream still holds no DB
-	// connection between heartbeats.
-	authorized := func() bool {
-		workspaceID, err := itemRepo.GetWorkspaceID(itemID)
-		if err != nil {
-			return false // item no longer exists
-		}
+	// Recheck ownership against a workspace before writes. The workspace is
+	// re-read on the event path (a move is a change), so heartbeats reuse the
+	// cached id instead of querying the item row every tick.
+	authorized := func(workspaceID int) bool {
 		ok, err := h.permissionService.HasWorkspacePermission(user.ID, workspaceID, models.PermissionItemView)
 		return err == nil && ok
 	}
+
+	release, ok := h.sseHub.AcquireUserStream(user.ID)
+	if !ok {
+		respondTooManyRequests(w, r, "Too many live update streams are already open for this account")
+		return
+	}
+	defer release()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -96,21 +103,32 @@ func (h *ItemHandler) Events(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case ev := <-sub.Events():
-			writeSSEEvent(w, string(ev.Kind), ev.ItemID)
-			if sub.TakeStale() {
-				// A later event was dropped (buffer overflow); tell the client to
-				// reconcile fully so nothing is missed.
-				writeSSEEvent(w, "reload", itemID)
+			if ev.Deleted {
+				// Deletion carries the final workspace; the item row is already gone.
+				if !authorized(ev.WorkspaceID) {
+					return
+				}
+				writeSSEEvent(w, "deleted", ev.ItemID)
+				flusher.Flush()
+				return
 			}
+			// Re-resolve the workspace: the change may be a move, which can move
+			// the item beyond this user's reach.
+			current, err := itemRepo.GetWorkspaceID(itemID)
+			if err != nil || !authorized(current) {
+				return
+			}
+			workspaceID = current
+			writeSSEEvent(w, "changed", itemID)
 			flusher.Flush()
 		case <-heartbeat.C:
-			// Re-authorize before the next heartbeat write: stop streaming if the
-			// user lost item.view (or the item was deleted) since connecting.
-			if !authorized() {
+			if !authorized(workspaceID) {
 				return
 			}
 			if sub.TakeStale() {
-				writeSSEEvent(w, "reload", itemID)
+				// A frame was dropped (buffer overflow) with no later change to
+				// cover it; force the client to reconcile.
+				writeSSEEvent(w, "changed", itemID)
 			}
 			_, _ = fmt.Fprint(w, ": ping\n\n")
 			flusher.Flush()
@@ -120,10 +138,10 @@ func (h *ItemHandler) Events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// writeSSEEvent writes one SSE frame: an `event:` line naming the kind and a
-// `data:` line carrying the item id and kind as JSON.
-func writeSSEEvent(w http.ResponseWriter, kind string, itemID int) {
-	_, _ = fmt.Fprintf(w, "event: %s\ndata: {\"item_id\":%d,\"kind\":%q}\n\n", kind, itemID, kind) //nolint:gosec // G705: kind is a controlled enum and itemID an int; response is text/event-stream, not HTML
+// writeSSEEvent writes one SSE frame: an `event:` line naming the coarse event
+// and a `data:` line carrying the item id and event name as JSON.
+func writeSSEEvent(w http.ResponseWriter, event string, itemID int) {
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: {\"item_id\":%d,\"kind\":%q}\n\n", event, itemID, event) //nolint:gosec // G705: event is a controlled constant and itemID an int; response is text/event-stream, not HTML
 }
 
 // sseRetryMillis returns a reconnect delay in 3000–6999ms, spread by item id so

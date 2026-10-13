@@ -3,11 +3,13 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"time"
 
 	"windshift/internal/database"
 	"windshift/internal/models"
 	"windshift/internal/restapi"
 	"windshift/internal/restapi/v1/dto"
+	"windshift/internal/restapi/v1/middleware"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
 )
@@ -20,6 +22,19 @@ type MilestoneHandler struct {
 	BaseHandler
 	planningService *services.PlanningService
 	itemCRUD        *services.ItemCRUDService
+}
+
+func (b *BaseHandler) respondPlanningMutationError(w http.ResponseWriter, r *http.Request, err error) bool {
+	validationErr, ok := services.AsPlanningValidationError(err)
+	if !ok {
+		return false
+	}
+	b.RespondError(w, r, restapi.NewAPIError(
+		http.StatusBadRequest,
+		restapi.ErrCodeValidationFailed,
+		validationErr.Error(),
+	).WithDetails(map[string]any{"field": validationErr.Field}))
+	return true
 }
 
 func NewMilestoneHandler(db database.Database, permissionService *services.PermissionService) *MilestoneHandler {
@@ -42,6 +57,8 @@ type MilestoneResponse struct {
 	CategoryID    *int     `json:"category_id,omitempty"`
 	CategoryName  string   `json:"category_name,omitempty"`
 	CategoryColor string   `json:"category_color,omitempty"`
+	IsGlobal      bool     `json:"is_global"`
+	WorkspaceID   *int     `json:"workspace_id,omitempty"`
 	Position      int      `json:"position"`
 	CreatedAt     string   `json:"created_at"`
 	UpdatedAt     string   `json:"updated_at"`
@@ -55,6 +72,11 @@ type MilestoneCreateRequest struct {
 	Status      string `json:"status,omitempty"`
 	CategoryID  *int   `json:"category_id,omitempty"`
 }
+
+// MilestoneUpdateRequest is the body for the milestone PUT endpoints. Every
+// field is optional: absent fields keep their persisted value, so a caller can
+// change one attribute without re-sending the whole milestone.
+type MilestoneUpdateRequest = models.MilestonePatch
 
 // sortOrderFromPagination translates the pagination SortAsc flag into the
 // "asc"/"desc" string the service layer expects.
@@ -84,6 +106,8 @@ func toMilestoneResponse(m *services.MilestoneResult) MilestoneResponse {
 		CategoryID:    m.CategoryID,
 		CategoryName:  m.CategoryName,
 		CategoryColor: m.CategoryColor,
+		IsGlobal:      m.IsGlobal,
+		WorkspaceID:   m.WorkspaceID,
 		Position:      m.Position,
 		CreatedAt:     m.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		UpdatedAt:     m.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
@@ -107,18 +131,25 @@ func toMilestoneResponse(m *services.MilestoneResult) MilestoneResponse {
 // @Failure      500    {object}  handlers.ErrorResponse
 // @Router       /milestones [get]
 func (h *MilestoneHandler) List(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.RequireAuth(w, r)
+	user, ok := h.RequireAuth(w, r)
 	if !ok {
+		return
+	}
+	workspaceIDs, err := h.Perms.GetAccessibleWorkspaceIDs(user.ID)
+	if err != nil {
+		h.RespondInternalError(w, r)
 		return
 	}
 
 	pagination := h.ParsePagination(r)
 
 	results, total, err := h.planningService.ListMilestones(services.MilestoneListParams{
-		Limit:     pagination.Limit,
-		Offset:    pagination.Offset,
-		SortBy:    milestoneSortByFromRequest(r, pagination.SortBy),
-		SortOrder: sortOrderFromPagination(pagination.SortAsc),
+		Limit:         pagination.Limit,
+		Offset:        pagination.Offset,
+		WorkspaceIDs:  workspaceIDs,
+		IncludeGlobal: true,
+		SortBy:        milestoneSortByFromRequest(r, pagination.SortBy),
+		SortOrder:     sortOrderFromPagination(pagination.SortAsc),
 	})
 	if err != nil {
 		h.RespondInternalError(w, r)
@@ -210,14 +241,20 @@ func (h *MilestoneHandler) Create(w http.ResponseWriter, r *http.Request) {
 		targetDate = &req.TargetDate
 	}
 
+	auditActor := h.AuditActor(r, user)
 	m, err := h.planningService.CreateMilestone(services.CreateMilestoneParams{
 		Name:        req.Name,
 		Description: req.Description,
 		TargetDate:  targetDate,
 		Status:      req.Status,
 		CategoryID:  req.CategoryID,
+		IsGlobal:    true,
+		AuditActor:  &auditActor,
 	})
 	if err != nil {
+		if h.respondPlanningMutationError(w, r, err) {
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -264,8 +301,7 @@ func (h *MilestoneHandler) requireMilestoneAccessByID(w http.ResponseWriter, r *
 		return user.ID, id, nil, true
 	}
 	if wsID == nil {
-		// workspace-scoped row missing workspace_id — treat as not found rather
-		// than 500; this should be impossible per the schema constraint.
+		// Treat an invalid workspace-scoped row as not found.
 		h.RespondNotFound(w, r)
 		return 0, 0, nil, false
 	}
@@ -283,16 +319,78 @@ func (h *MilestoneHandler) requireMilestoneAccessByID(w http.ResponseWriter, r *
 	return user.ID, id, wsID, true
 }
 
+// storedMilestoneTargetDate normalizes the driver's timestamp for partial
+// updates; an empty value represents a stored NULL.
+func storedMilestoneTargetDate(stored string) *string {
+	if stored == "" {
+		return nil
+	}
+	if parsed, err := time.Parse(time.RFC3339, stored); err == nil {
+		date := parsed.Format("2006-01-02")
+		return &date
+	}
+	return &stored
+}
+
+// applyMilestoneUpdate merges a partial request with the stored row before
+// writing every column; workspaceID keeps the update in its original scope.
+func (h *MilestoneHandler) applyMilestoneUpdate(w http.ResponseWriter, r *http.Request, current *services.MilestoneResult, workspaceID *int) {
+	var req MilestoneUpdateRequest
+	if !h.DecodeBodyOrRespond(w, r, &req) {
+		return
+	}
+
+	merged := req.Apply(models.Milestone{
+		Name:        current.Name,
+		Description: current.Description,
+		TargetDate:  storedMilestoneTargetDate(current.TargetDate),
+		Status:      current.Status,
+		CategoryID:  current.CategoryID,
+	})
+	warnings := sanitize.ApplyAllWithWarnings(
+		sanitize.Pair{Target: &merged.Name, Policy: sanitize.PlainTextField, Label: "Name"},
+		sanitize.Pair{Target: &merged.Description, Policy: sanitize.RichText, Label: "Description"},
+	)
+
+	user := middleware.GetUser(r.Context())
+	var auditActor *services.AuditActor
+	if user != nil {
+		actor := h.AuditActor(r, user)
+		auditActor = &actor
+	}
+	updated, err := h.planningService.UpdateMilestone(services.UpdateMilestoneParams{
+		ID:          current.ID,
+		Name:        merged.Name,
+		Description: merged.Description,
+		TargetDate:  merged.TargetDate,
+		Status:      merged.Status,
+		CategoryID:  merged.CategoryID,
+		WorkspaceID: workspaceID,
+		AuditActor:  auditActor,
+	})
+	if err != nil {
+		if h.respondPlanningMutationError(w, r, err) {
+			return
+		}
+		h.RespondInternalError(w, r)
+		return
+	}
+
+	resp := toMilestoneResponse(updated)
+	resp.Warnings = warnings
+	h.RespondOK(w, resp)
+}
+
 // Update handles PUT /rest/api/v1/milestones/{id}
 //
 // @Summary      Update a milestone
-// @Description  Updates a milestone in place. Scope (global vs workspace-scoped) is taken from the persisted row, not the request body — milestones cannot be retargeted between scopes.
+// @Description  Updates a milestone in place. Omitted fields keep their current value; explicit null clears target_date and category_id. Scope (global vs workspace-scoped) is taken from the persisted row, not the request body — milestones cannot be retargeted between scopes.
 // @Tags         milestones
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
 // @Param        id    path      int                              true  "Milestone ID"
-// @Param        body  body      handlers.MilestoneCreateRequest  true  "Fields to update"
+// @Param        body  body      handlers.MilestoneUpdateRequest  true  "Fields to update"
 // @Success      200   {object}  handlers.MilestoneResponse
 // @Failure      400   {object}  handlers.ErrorResponse  "Invalid milestone ID or request body"
 // @Failure      401   {object}  handlers.ErrorResponse
@@ -306,41 +404,13 @@ func (h *MilestoneHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req MilestoneCreateRequest
-	if !h.DecodeBodyOrRespond(w, r, &req) {
-		return
-	}
-	warnings := sanitize.ApplyAllWithWarnings(
-		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
-		sanitize.Pair{Target: &req.Description, Policy: sanitize.RichText, Label: "Description"},
-	)
-
-	var updateTargetDate *string
-	if req.TargetDate != "" {
-		updateTargetDate = &req.TargetDate
-	}
-
-	// WorkspaceID scopes the SQL UPDATE to the resolved milestone's owning
-	// workspace (nil for global). UpdateMilestoneParams refuses cross-scope
-	// edits via its WHERE clause, so this also defends against a milestone
-	// being retargeted between scopes via concurrent modification.
-	m, err := h.planningService.UpdateMilestone(services.UpdateMilestoneParams{
-		ID:          id,
-		Name:        req.Name,
-		Description: req.Description,
-		TargetDate:  updateTargetDate,
-		Status:      req.Status,
-		CategoryID:  req.CategoryID,
-		WorkspaceID: workspaceID,
-	})
+	current, err := h.planningService.GetMilestone(id)
 	if err != nil {
-		h.RespondInternalError(w, r)
+		h.RespondNotFound(w, r)
 		return
 	}
 
-	resp := toMilestoneResponse(m)
-	resp.Warnings = warnings
-	h.RespondOK(w, resp)
+	h.applyMilestoneUpdate(w, r, current, workspaceID)
 }
 
 // Delete handles DELETE /rest/api/v1/milestones/{id}
@@ -357,12 +427,17 @@ func (h *MilestoneHandler) Update(w http.ResponseWriter, r *http.Request) {
 // @Failure      500  {object}  handlers.ErrorResponse
 // @Router       /milestones/{id} [delete]
 func (h *MilestoneHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	_, id, _, ok := h.requireMilestoneAccessByID(w, r, true)
+	userID, id, _, ok := h.requireMilestoneAccessByID(w, r, true)
 	if !ok {
 		return
 	}
 
-	err := h.planningService.DeleteMilestone(id)
+	user := middleware.GetUser(r.Context())
+	if user == nil || user.ID != userID {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	err := h.planningService.DeleteMilestone(id, h.AuditActor(r, user))
 	if err != nil {
 		h.RespondInternalError(w, r)
 		return
@@ -391,7 +466,12 @@ func (h *MilestoneHandler) applyMilestoneReorder(w http.ResponseWriter, r *http.
 	}
 	scope.CategoryID = req.CategoryID
 
-	if err := h.planningService.ReorderMilestones(scope, req.OrderedIDs); err != nil {
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	if err := h.planningService.ReorderMilestones(scope, req.OrderedIDs, h.AuditActor(r, user)); err != nil {
 		if errors.Is(err, services.ErrInvalidMilestoneReorder) {
 			restapi.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, err.Error()))
 			return
@@ -470,24 +550,27 @@ type MilestoneProgressResponse struct {
 }
 
 type MilestoneStatusBreakdownResponse struct {
-	CategoryName  string `json:"category_name"`
-	CategoryColor string `json:"category_color,omitempty"`
-	ItemCount     int    `json:"item_count"`
-	IsCompleted   bool   `json:"is_completed"`
+	CategoryName       string `json:"category_name"`
+	CategoryBuiltinKey string `json:"category_builtin_key,omitempty"`
+	CategoryColor      string `json:"category_color,omitempty"`
+	ItemCount          int    `json:"item_count"`
+	IsCompleted        bool   `json:"is_completed"`
 }
 
 type MilestoneProgressItemResponse struct {
-	ID             int    `json:"id"`
-	Title          string `json:"title"`
-	WorkspaceID    int    `json:"workspace_id"`
-	WorkspaceKey   string `json:"workspace_key"`
-	ItemNumber     int    `json:"item_number"`
-	StatusName     string `json:"status_name,omitempty"`
-	StatusColor    string `json:"status_color,omitempty"`
-	PriorityName   string `json:"priority_name,omitempty"`
-	PriorityColor  string `json:"priority_color,omitempty"`
-	AssigneeName   string `json:"assignee_name,omitempty"`
-	AssigneeAvatar string `json:"assignee_avatar,omitempty"`
+	ID                 int    `json:"id"`
+	Title              string `json:"title"`
+	WorkspaceID        int    `json:"workspace_id"`
+	WorkspaceKey       string `json:"workspace_key"`
+	ItemNumber         int    `json:"item_number"`
+	StatusName         string `json:"status_name,omitempty"`
+	StatusBuiltinKey   string `json:"status_builtin_key,omitempty"`
+	StatusColor        string `json:"status_color,omitempty"`
+	PriorityName       string `json:"priority_name,omitempty"`
+	PriorityBuiltinKey string `json:"priority_builtin_key,omitempty"`
+	PriorityColor      string `json:"priority_color,omitempty"`
+	AssigneeName       string `json:"assignee_name,omitempty"`
+	AssigneeAvatar     string `json:"assignee_avatar,omitempty"`
 }
 
 func toMilestoneProgressResponse(r *services.MilestoneProgressReport) MilestoneProgressResponse {
@@ -505,10 +588,11 @@ func toMilestoneProgressResponse(r *services.MilestoneProgressReport) MilestoneP
 	resp.StatusBreakdown = make([]MilestoneStatusBreakdownResponse, 0, len(r.StatusBreakdown))
 	for _, sb := range r.StatusBreakdown {
 		resp.StatusBreakdown = append(resp.StatusBreakdown, MilestoneStatusBreakdownResponse{
-			CategoryName:  sb.CategoryName,
-			CategoryColor: sb.CategoryColor,
-			ItemCount:     sb.ItemCount,
-			IsCompleted:   sb.IsCompleted,
+			CategoryName:       sb.CategoryName,
+			CategoryBuiltinKey: sb.CategoryBuiltinKey,
+			CategoryColor:      sb.CategoryColor,
+			ItemCount:          sb.ItemCount,
+			IsCompleted:        sb.IsCompleted,
 		})
 	}
 	if len(r.ItemsByCategory) > 0 {
@@ -517,17 +601,19 @@ func toMilestoneProgressResponse(r *services.MilestoneProgressReport) MilestoneP
 			converted := make([]MilestoneProgressItemResponse, 0, len(items))
 			for _, it := range items {
 				converted = append(converted, MilestoneProgressItemResponse{
-					ID:             it.ID,
-					Title:          it.Title,
-					WorkspaceID:    it.WorkspaceID,
-					WorkspaceKey:   it.WorkspaceKey,
-					ItemNumber:     it.ItemNumber,
-					StatusName:     it.StatusName,
-					StatusColor:    it.StatusColor,
-					PriorityName:   it.PriorityName,
-					PriorityColor:  it.PriorityColor,
-					AssigneeName:   it.AssigneeName,
-					AssigneeAvatar: it.AssigneeAvatar,
+					ID:                 it.ID,
+					Title:              it.Title,
+					WorkspaceID:        it.WorkspaceID,
+					WorkspaceKey:       it.WorkspaceKey,
+					ItemNumber:         it.ItemNumber,
+					StatusName:         it.StatusName,
+					StatusBuiltinKey:   it.StatusBuiltinKey,
+					StatusColor:        it.StatusColor,
+					PriorityName:       it.PriorityName,
+					PriorityBuiltinKey: it.PriorityBuiltinKey,
+					PriorityColor:      it.PriorityColor,
+					AssigneeName:       it.AssigneeName,
+					AssigneeAvatar:     it.AssigneeAvatar,
 				})
 			}
 			resp.ItemsByCategory[category] = converted
@@ -552,12 +638,17 @@ func toMilestoneProgressResponse(r *services.MilestoneProgressReport) MilestoneP
 // @Failure      500  {object}  handlers.ErrorResponse
 // @Router       /milestones/{id}/progress [get]
 func (h *MilestoneHandler) GetProgress(w http.ResponseWriter, r *http.Request) {
-	_, id, _, ok := h.requireMilestoneAccessByID(w, r, false)
+	userID, id, _, ok := h.requireMilestoneAccessByID(w, r, false)
 	if !ok {
 		return
 	}
+	workspaceIDs, err := h.Perms.GetAccessibleWorkspaceIDs(userID)
+	if err != nil {
+		h.RespondInternalError(w, r)
+		return
+	}
 
-	report, err := h.planningService.GetMilestoneProgress(id)
+	report, err := h.planningService.GetMilestoneProgress(id, workspaceIDs)
 	if err != nil {
 		h.RespondNotFound(w, r)
 		return
@@ -591,9 +682,7 @@ func (h *MilestoneHandler) GetItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Even with view access on the milestone, the items list is filtered to
-	// workspaces the user can access — a global milestone may aggregate items
-	// across many workspaces, and we don't surface items the caller can't see.
+	// Filter aggregated items to workspaces visible to the caller.
 	accessibleWorkspaceIDs, err := h.Perms.GetAccessibleWorkspaceIDs(userID)
 	if err != nil {
 		h.RespondInternalError(w, r)
@@ -749,6 +838,12 @@ func (h *MilestoneHandler) CreateInWorkspace(w http.ResponseWriter, r *http.Requ
 		targetDate = &req.TargetDate
 	}
 
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	auditActor := h.AuditActor(r, user)
 	m, err := h.planningService.CreateMilestone(services.CreateMilestoneParams{
 		Name:        req.Name,
 		Description: req.Description,
@@ -757,8 +852,12 @@ func (h *MilestoneHandler) CreateInWorkspace(w http.ResponseWriter, r *http.Requ
 		CategoryID:  req.CategoryID,
 		IsGlobal:    false,
 		WorkspaceID: &wsID,
+		AuditActor:  &auditActor,
 	})
 	if err != nil {
+		if h.respondPlanningMutationError(w, r, err) {
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -801,14 +900,14 @@ func (h *MilestoneHandler) GetInWorkspace(w http.ResponseWriter, r *http.Request
 // UpdateInWorkspace handles PUT /rest/api/v1/workspaces/{id}/milestones/{milestoneId}
 //
 // @Summary      Update a workspace milestone
-// @Description  Updates a workspace-scoped milestone. The milestone cannot be retargeted to another workspace via the body — workspace ownership is taken from the URL.
+// @Description  Updates a workspace-scoped milestone. Omitted fields keep their current value; explicit null clears target_date and category_id. The milestone cannot be retargeted to another workspace via the body — workspace ownership is taken from the URL.
 // @Tags         workspaces, milestones
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
 // @Param        id           path      int                              true  "Workspace ID"
 // @Param        milestoneId  path      int                              true  "Milestone ID"
-// @Param        body         body      handlers.MilestoneCreateRequest  true  "Fields to update"
+// @Param        body         body      handlers.MilestoneUpdateRequest  true  "Fields to update"
 // @Success      200          {object}  handlers.MilestoneResponse
 // @Failure      400          {object}  handlers.ErrorResponse  "Invalid workspace ID, milestone ID, or request body"
 // @Failure      401          {object}  handlers.ErrorResponse
@@ -827,39 +926,8 @@ func (h *MilestoneHandler) UpdateInWorkspace(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var req MilestoneCreateRequest
-	if !h.DecodeBodyOrRespond(w, r, &req) {
-		return
-	}
-	warnings := sanitize.ApplyAllWithWarnings(
-		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
-		sanitize.Pair{Target: &req.Description, Policy: sanitize.RichText, Label: "Description"},
-	)
-
-	var updateTargetDate *string
-	if req.TargetDate != "" {
-		updateTargetDate = &req.TargetDate
-	}
-
-	// WorkspaceID in the UpdateMilestoneParams scopes the SQL UPDATE to this
-	// workspace as a defense-in-depth check beyond the URL match above.
-	updated, err := h.planningService.UpdateMilestone(services.UpdateMilestoneParams{
-		ID:          m.ID,
-		Name:        req.Name,
-		Description: req.Description,
-		TargetDate:  updateTargetDate,
-		Status:      req.Status,
-		CategoryID:  req.CategoryID,
-		WorkspaceID: &wsID,
-	})
-	if err != nil {
-		h.RespondInternalError(w, r)
-		return
-	}
-
-	resp := toMilestoneResponse(updated)
-	resp.Warnings = warnings
-	h.RespondOK(w, resp)
+	// Scope the update to the resolved workspace as defense in depth.
+	h.applyMilestoneUpdate(w, r, m, &wsID)
 }
 
 // DeleteInWorkspace handles DELETE /rest/api/v1/workspaces/{id}/milestones/{milestoneId}
@@ -887,7 +955,12 @@ func (h *MilestoneHandler) DeleteInWorkspace(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.planningService.DeleteMilestone(m.ID); err != nil {
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	if err := h.planningService.DeleteMilestone(m.ID, h.AuditActor(r, user)); err != nil {
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -983,7 +1056,7 @@ func (h *MilestoneHandler) GetProgressInWorkspace(w http.ResponseWriter, r *http
 		return
 	}
 
-	report, err := h.planningService.GetMilestoneProgress(m.ID)
+	report, err := h.planningService.GetMilestoneProgress(m.ID, []int{wsID})
 	if err != nil {
 		h.RespondNotFound(w, r)
 		return
@@ -1037,6 +1110,8 @@ type IterationCreateRequest struct {
 	WorkspaceID *int   `json:"workspace_id,omitempty"`
 }
 
+type IterationUpdateRequest = models.IterationPatch
+
 func toIterationResponse(iter *services.IterationResult) IterationResponse {
 	return IterationResponse{
 		ID:          iter.ID,
@@ -1072,16 +1147,23 @@ func toIterationResponse(iter *services.IterationResult) IterationResponse {
 // @Failure      500    {object}  handlers.ErrorResponse
 // @Router       /iterations [get]
 func (h *IterationHandler) List(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.RequireAuth(w, r)
+	user, ok := h.RequireAuth(w, r)
 	if !ok {
+		return
+	}
+	workspaceIDs, err := h.Perms.GetAccessibleWorkspaceIDs(user.ID)
+	if err != nil {
+		h.RespondInternalError(w, r)
 		return
 	}
 
 	pagination := h.ParsePagination(r)
 
 	results, total, err := h.planningService.ListIterations(services.IterationListParams{
-		Limit:  pagination.Limit,
-		Offset: pagination.Offset,
+		Limit:         pagination.Limit,
+		Offset:        pagination.Offset,
+		WorkspaceIDs:  workspaceIDs,
+		IncludeGlobal: true,
 	})
 	if err != nil {
 		h.RespondInternalError(w, r)
@@ -1209,12 +1291,15 @@ func (h *IterationHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.IsGlobal || req.WorkspaceID == nil {
-		if !h.RequireGlobalPermission(w, r, user.ID, models.PermissionIterationManage, "iteration.manage") {
-			return
-		}
+	if req.WorkspaceID != nil {
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "workspace_id is only accepted on the workspace iteration endpoint"))
+		return
+	}
+	if !h.RequireGlobalPermission(w, r, user.ID, models.PermissionIterationManage, "iteration.manage") {
+		return
 	}
 
+	auditActor := h.AuditActor(r, user)
 	iter, err := h.planningService.CreateIteration(services.CreateIterationParams{
 		Name:        req.Name,
 		Description: req.Description,
@@ -1222,10 +1307,14 @@ func (h *IterationHandler) Create(w http.ResponseWriter, r *http.Request) {
 		EndDate:     req.EndDate,
 		Status:      req.Status,
 		TypeID:      req.TypeID,
-		IsGlobal:    req.IsGlobal,
-		WorkspaceID: req.WorkspaceID,
+		IsGlobal:    true,
+		WorkspaceID: nil,
+		AuditActor:  &auditActor,
 	})
 	if err != nil {
+		if h.respondPlanningMutationError(w, r, err) {
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -1244,7 +1333,7 @@ func (h *IterationHandler) Create(w http.ResponseWriter, r *http.Request) {
 // @Produce      json
 // @Security     BearerAuth
 // @Param        id    path      int                              true  "Iteration ID"
-// @Param        body  body      handlers.IterationCreateRequest  true  "Fields to update"
+// @Param        body  body      handlers.IterationUpdateRequest  true  "Fields to update"
 // @Success      200   {object}  handlers.IterationResponse
 // @Failure      400   {object}  handlers.ErrorResponse  "Invalid iteration ID or request body"
 // @Failure      401   {object}  handlers.ErrorResponse
@@ -1253,33 +1342,59 @@ func (h *IterationHandler) Create(w http.ResponseWriter, r *http.Request) {
 // @Failure      500   {object}  handlers.ErrorResponse
 // @Router       /iterations/{id} [put]
 func (h *IterationHandler) Update(w http.ResponseWriter, r *http.Request) {
-	// Scope is taken from the persisted iteration, not the request body — body
-	// fields for workspace_id / is_global cannot be used to retarget.
+	// Use the persisted scope; request fields cannot retarget an iteration.
 	id, workspaceID, ok := h.requireIterationAccessByID(w, r, true)
 	if !ok {
 		return
 	}
 
-	var req IterationCreateRequest
+	var req IterationUpdateRequest
 	if !h.DecodeBodyOrRespond(w, r, &req) {
 		return
 	}
+	existing, err := h.planningService.GetIteration(id)
+	if err != nil {
+		h.RespondNotFound(w, r)
+		return
+	}
+	merged := req.Apply(models.Iteration{
+		Name:        existing.Name,
+		Description: existing.Description,
+		StartDate:   existing.StartDate,
+		EndDate:     existing.EndDate,
+		Status:      existing.Status,
+		TypeID:      existing.TypeID,
+	})
 	warnings := sanitize.ApplyAllWithWarnings(
-		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
-		sanitize.Pair{Target: &req.Description, Policy: sanitize.RichText, Label: "Description"},
+		sanitize.Pair{Target: &merged.Name, Policy: sanitize.PlainTextField, Label: "Name"},
+		sanitize.Pair{Target: &merged.Description, Policy: sanitize.RichText, Label: "Description"},
 	)
 
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	auditActor := h.AuditActor(r, user)
 	iter, err := h.planningService.UpdateIteration(services.UpdateIterationParams{
 		ID:          id,
-		Name:        req.Name,
-		Description: req.Description,
-		StartDate:   req.StartDate,
-		EndDate:     req.EndDate,
-		Status:      req.Status,
-		TypeID:      req.TypeID,
+		Name:        merged.Name,
+		Description: merged.Description,
+		StartDate:   merged.StartDate,
+		EndDate:     merged.EndDate,
+		Status:      merged.Status,
+		TypeID:      merged.TypeID,
 		WorkspaceID: workspaceID,
+		AuditActor:  &auditActor,
 	})
 	if err != nil {
+		if h.respondPlanningMutationError(w, r, err) {
+			return
+		}
+		if errors.Is(err, services.ErrIterationCompletionRequired) || errors.Is(err, services.ErrIterationLifecycleConflict) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeConflict, err.Error()))
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -1308,7 +1423,12 @@ func (h *IterationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.planningService.DeleteIteration(id); err != nil {
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	if err := h.planningService.DeleteIteration(id, h.AuditActor(r, user)); err != nil {
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -1426,6 +1546,12 @@ func (h *IterationHandler) CreateInWorkspace(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	auditActor := h.AuditActor(r, user)
 	iter, err := h.planningService.CreateIteration(services.CreateIterationParams{
 		Name:        req.Name,
 		Description: req.Description,
@@ -1435,8 +1561,12 @@ func (h *IterationHandler) CreateInWorkspace(w http.ResponseWriter, r *http.Requ
 		TypeID:      req.TypeID,
 		IsGlobal:    false,
 		WorkspaceID: &wsID,
+		AuditActor:  &auditActor,
 	})
 	if err != nil {
+		if h.respondPlanningMutationError(w, r, err) {
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -1486,7 +1616,7 @@ func (h *IterationHandler) GetInWorkspace(w http.ResponseWriter, r *http.Request
 // @Security     BearerAuth
 // @Param        id           path      int                              true  "Workspace ID"
 // @Param        iterationId  path      int                              true  "Iteration ID"
-// @Param        body         body      handlers.IterationCreateRequest  true  "Fields to update"
+// @Param        body         body      handlers.IterationUpdateRequest  true  "Fields to update"
 // @Success      200          {object}  handlers.IterationResponse
 // @Failure      400          {object}  handlers.ErrorResponse  "Invalid workspace ID, iteration ID, or request body"
 // @Failure      401          {object}  handlers.ErrorResponse
@@ -1505,28 +1635,49 @@ func (h *IterationHandler) UpdateInWorkspace(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var req IterationCreateRequest
+	var req IterationUpdateRequest
 	if !h.DecodeBodyOrRespond(w, r, &req) {
 		return
 	}
+	merged := req.Apply(models.Iteration{
+		Name:        iter.Name,
+		Description: iter.Description,
+		StartDate:   iter.StartDate,
+		EndDate:     iter.EndDate,
+		Status:      iter.Status,
+		TypeID:      iter.TypeID,
+	})
 	warnings := sanitize.ApplyAllWithWarnings(
-		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
-		sanitize.Pair{Target: &req.Description, Policy: sanitize.RichText, Label: "Description"},
+		sanitize.Pair{Target: &merged.Name, Policy: sanitize.PlainTextField, Label: "Name"},
+		sanitize.Pair{Target: &merged.Description, Policy: sanitize.RichText, Label: "Description"},
 	)
 
-	// WorkspaceID scopes the SQL UPDATE to this workspace as defense-in-depth
-	// beyond the URL match above.
+	// Scope the update to the resolved workspace as defense in depth.
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	auditActor := h.AuditActor(r, user)
 	updated, err := h.planningService.UpdateIteration(services.UpdateIterationParams{
 		ID:          iter.ID,
-		Name:        req.Name,
-		Description: req.Description,
-		StartDate:   req.StartDate,
-		EndDate:     req.EndDate,
-		Status:      req.Status,
-		TypeID:      req.TypeID,
+		Name:        merged.Name,
+		Description: merged.Description,
+		StartDate:   merged.StartDate,
+		EndDate:     merged.EndDate,
+		Status:      merged.Status,
+		TypeID:      merged.TypeID,
 		WorkspaceID: &wsID,
+		AuditActor:  &auditActor,
 	})
 	if err != nil {
+		if h.respondPlanningMutationError(w, r, err) {
+			return
+		}
+		if errors.Is(err, services.ErrIterationCompletionRequired) || errors.Is(err, services.ErrIterationLifecycleConflict) {
+			h.RespondError(w, r, restapi.NewAPIError(http.StatusConflict, restapi.ErrCodeConflict, err.Error()))
+			return
+		}
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -1561,7 +1712,12 @@ func (h *IterationHandler) DeleteInWorkspace(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.planningService.DeleteIteration(iter.ID); err != nil {
+	user := middleware.GetUser(r.Context())
+	if user == nil {
+		h.RespondUnauthorized(w, r)
+		return
+	}
+	if err := h.planningService.DeleteIteration(iter.ID, h.AuditActor(r, user)); err != nil {
 		h.RespondInternalError(w, r)
 		return
 	}

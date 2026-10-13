@@ -1,7 +1,6 @@
 package webauthn
 
 import (
-	"encoding/base64"
 	"fmt"
 	"strconv"
 
@@ -9,6 +8,7 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"windshift/internal/models"
+	"windshift/internal/webauthn/persistence"
 )
 
 // User wraps the application User model to implement webauthn.User interface
@@ -86,82 +86,22 @@ func (u *User) CredentialExcludeList() []protocol.CredentialDescriptor {
 
 // WebAuthnCredential represents a stored WebAuthn credential in the database
 type WebAuthnCredential struct {
-	ID                  string   `json:"id"` // Base64 encoded credential ID
-	UserID              int      `json:"user_id"`
-	CredentialName      string   `json:"credential_name"`
-	PublicKey           []byte   `json:"-"` // COSE encoded public key (not sent to client)
-	AttestationType     string   `json:"attestation_type"`
-	AAGUID              []byte   `json:"-"` // Authenticator GUID
-	SignCount           uint32   `json:"sign_count"`
-	CloneWarning        bool     `json:"clone_warning"`
-	Transport           []string `json:"transport"` // ['usb', 'nfc', 'ble', 'internal']
-	FlagsUserPresent    bool     `json:"flags_user_present"`
-	FlagsUserVerified   bool     `json:"flags_user_verified"`
-	FlagsBackupEligible bool     `json:"flags_backup_eligible"`
-	FlagsBackupState    bool     `json:"flags_backup_state"`
-	CreatedAt           string   `json:"created_at"`
-	UpdatedAt           string   `json:"updated_at"`
-	LastUsedAt          *string  `json:"last_used_at,omitempty"`
+	UserID int `json:"user_id"`
+	persistence.CredentialWireFields
 }
 
 // ToWebAuthnCredential converts database credential to webauthn.Credential
 func (wc *WebAuthnCredential) ToWebAuthnCredential() (webauthn.Credential, error) {
-	// Decode credential ID from base64
-	credID, err := base64.RawURLEncoding.DecodeString(wc.ID)
-	if err != nil {
-		return webauthn.Credential{}, fmt.Errorf("failed to decode credential ID: %w", err)
-	}
-
-	// Convert transport strings to AuthenticatorTransport
-	transports := []protocol.AuthenticatorTransport{}
-	for _, t := range wc.Transport {
-		transports = append(transports, protocol.AuthenticatorTransport(t))
-	}
-
-	return webauthn.Credential{
-		ID:              credID,
-		PublicKey:       wc.PublicKey,
-		AttestationType: wc.AttestationType,
-		Transport:       transports,
-		Flags: webauthn.CredentialFlags{
-			UserPresent:    wc.FlagsUserPresent,
-			UserVerified:   wc.FlagsUserVerified,
-			BackupEligible: wc.FlagsBackupEligible,
-			BackupState:    wc.FlagsBackupState,
-		},
-		Authenticator: webauthn.Authenticator{
-			AAGUID:       wc.AAGUID,
-			SignCount:    wc.SignCount,
-			CloneWarning: wc.CloneWarning,
-			Attachment:   "", // Can be set based on transport if needed
-		},
-	}, nil
+	return credentialRecordFromWebAuthnCredential(wc).ToWebAuthnCredential()
 }
 
-// FromWebAuthnCredential creates a WebAuthnCredential from webauthn.Credential
-func FromWebAuthnCredential(userID int, name string, cred *webauthn.Credential) *WebAuthnCredential {
-	// Encode credential ID to base64 for storage
-	credID := base64.RawURLEncoding.EncodeToString(cred.ID)
-
-	// Convert transport to string array
-	transports := make([]string, 0, len(cred.Transport))
-	for _, t := range cred.Transport {
-		transports = append(transports, string(t))
+func webAuthnCredentialFromRecord(record persistence.CredentialRecord) WebAuthnCredential {
+	return WebAuthnCredential{
+		UserID:               record.OwnerID,
+		CredentialWireFields: record.WireFields(),
 	}
+}
 
-	return &WebAuthnCredential{
-		ID:                  credID,
-		UserID:              userID,
-		CredentialName:      name,
-		PublicKey:           cred.PublicKey,
-		AttestationType:     cred.AttestationType,
-		AAGUID:              cred.Authenticator.AAGUID,
-		SignCount:           cred.Authenticator.SignCount,
-		CloneWarning:        cred.Authenticator.CloneWarning,
-		Transport:           transports,
-		FlagsUserPresent:    cred.Flags.UserPresent,
-		FlagsUserVerified:   cred.Flags.UserVerified,
-		FlagsBackupEligible: cred.Flags.BackupEligible,
-		FlagsBackupState:    cred.Flags.BackupState,
-	}
+func credentialRecordFromWebAuthnCredential(credential *WebAuthnCredential) persistence.CredentialRecord {
+	return persistence.RecordFromWireFields(credential.CredentialWireFields, credential.UserID)
 }

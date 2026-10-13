@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"windshift/internal/itemevents"
 	"windshift/internal/jira"
 	"windshift/internal/models"
 	"windshift/internal/repository"
@@ -22,7 +24,7 @@ import (
 	"windshift/internal/services"
 	"windshift/internal/validation"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // ensureUsers matches or creates users for import.
@@ -35,7 +37,6 @@ func (h *JiraImportHandler) ensureUsers(ctx context.Context, jobID string, users
 	result := make(map[string]int)
 	usernames := make(map[string]string)
 
-	// First pass: fetch missing emails via API
 	for i := range users {
 		if users[i].AccountID == "" {
 			continue
@@ -44,7 +45,6 @@ func (h *JiraImportHandler) ensureUsers(ctx context.Context, jobID string, users
 			continue // Already have email
 		}
 
-		// Try to fetch email via API
 		email, err := client.GetUserEmail(ctx, users[i].AccountID)
 		if err != nil {
 			slog.Debug("Failed to fetch email for user", slog.String("component", "jira"),
@@ -56,9 +56,7 @@ func (h *JiraImportHandler) ensureUsers(ctx context.Context, jobID string, users
 		}
 	}
 
-	// Second pass: create/match users
 	for _, u := range users {
-		// Skip users without account ID
 		if u.AccountID == "" {
 			continue
 		}
@@ -73,54 +71,53 @@ func (h *JiraImportHandler) ensureUsers(ctx context.Context, jobID string, users
 			u.Email = syntheticEmailForAccount(u.AccountID)
 		}
 
-		// Check if we already have a mapping for this user in this job
-		var existingUserID int
-		var existingUsername string
-		err := h.db.QueryRow(`
-			SELECT u.id, u.username
-			FROM jira_import_user_mappings m
-			JOIN users u ON u.id = m.windshift_user_id
-			WHERE m.job_id = ? AND m.jira_account_id = ?
-		`, jobID, u.AccountID).Scan(&existingUserID, &existingUsername)
-		if err == nil {
-			result[u.AccountID] = existingUserID
-			usernames[u.AccountID] = existingUsername
+		// Check if we already have a mapping for this user in this job.
+		if existing, ok := h.imports.UserMapping(jobID, u.AccountID); ok {
+			result[u.AccountID] = existing.UserID
+			usernames[u.AccountID] = existing.Username
 			continue
 		}
 
 		// Try to find existing Windshift user by email
-		var userID int
-		var existingByEmailUsername string
 		if u.Email != "" {
-			err = h.db.QueryRow(`SELECT id, username FROM users WHERE email = ?`, u.Email).Scan(&userID, &existingByEmailUsername)
+			existing, err := h.imports.FindUserByEmail(u.Email)
 			if err == nil {
 				// Found existing user
-				result[u.AccountID] = userID
-				usernames[u.AccountID] = existingByEmailUsername
-				h.recordUserMapping(jobID, u, userID, false)
+				result[u.AccountID] = existing.UserID
+				usernames[u.AccountID] = existing.Username
+				h.recordUserMapping(jobID, u, existing.UserID, false)
+				continue
+			}
+			if !errors.Is(err, repository.ErrNotFound) {
+				slog.Error("Failed to find existing user by email", slog.String("component", "jira"), slog.String("displayName", u.DisplayName), slog.Any("error", err))
 				continue
 			}
 		}
 
-		// Create new inactive user
 		firstName, lastName := parseDisplayName(u.DisplayName)
-		username := generateUsername(u.Email, u.DisplayName)
+		username, err := h.imports.UniqueImportedUsername(generateUsername(u.Email, u.DisplayName))
+		if err != nil {
+			slog.Error("Failed to allocate username for imported user", slog.String("component", "jira"), slog.String("displayName", u.DisplayName), slog.Any("error", err))
+			continue
+		}
 
-		var newUserID int64
-		err = h.db.QueryRow(`
-			INSERT INTO users (email, username, first_name, last_name, is_active, avatar_url, requires_password_reset, created_at, updated_at)
-			VALUES (?, ?, ?, ?, false, ?, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id
-		`, u.Email, username, firstName, lastName, u.AvatarURL).Scan(&newUserID)
+		newUserID, err := h.imports.CreateImportedUser(
+			u.Email,
+			username,
+			firstName,
+			lastName,
+			u.AvatarURL,
+		)
 		if err != nil {
 			slog.Error("Failed to create user", slog.String("component", "jira"), slog.String("displayName", u.DisplayName), slog.String("email", u.Email), slog.Any("error", err))
 			continue
 		}
 
-		result[u.AccountID] = int(newUserID)
+		result[u.AccountID] = newUserID
 		usernames[u.AccountID] = username
-		h.recordUserMapping(jobID, u, int(newUserID), true)
+		h.recordUserMapping(jobID, u, newUserID, true)
 
-		slog.Debug("Created user", slog.String("component", "jira"), slog.String("displayName", u.DisplayName), slog.String("email", u.Email), slog.Int64("userID", newUserID))
+		slog.Debug("Created user", slog.String("component", "jira"), slog.String("displayName", u.DisplayName), slog.String("email", u.Email), slog.Int("userID", newUserID))
 	}
 
 	return result, usernames, nil
@@ -128,43 +125,19 @@ func (h *JiraImportHandler) ensureUsers(ctx context.Context, jobID string, users
 
 // recordUserMapping stores a Jira user to Windshift user mapping
 func (h *JiraImportHandler) recordUserMapping(jobID string, user JiraUserSummary, windshiftUserID int, wasCreated bool) {
-	_, err := h.db.ExecWrite(`
-		INSERT INTO jira_import_user_mappings (job_id, jira_account_id, jira_email, jira_display_name, windshift_user_id, was_created)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, jobID, user.AccountID, user.Email, user.DisplayName, windshiftUserID, wasCreated)
+	err := h.imports.RecordUserMapping(jobID, user.AccountID, user.Email, user.DisplayName, windshiftUserID, wasCreated)
 	if err != nil {
 		slog.Error("Failed to record user mapping", slog.String("component", "jira"), slog.Any("error", err))
 	}
 }
 
-// ensureLabel returns the workspace-scoped label ID for name, creating the
-// label row if it doesn't exist yet. Color/created_at/updated_at fall back to
-// the schema defaults.
-func (h *JiraImportHandler) ensureLabel(workspaceID int, name string) (int, error) {
-	var id int
-	err := h.db.QueryRow(
-		`SELECT id FROM labels WHERE workspace_id = ? AND name = ?`,
-		workspaceID, name,
-	).Scan(&id)
-	if err == nil {
-		return id, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, err
-	}
-	var newID int64
-	if err := h.db.QueryRow(
-		`INSERT INTO labels (name, workspace_id) VALUES (?, ?) RETURNING id`,
-		name, workspaceID,
-	).Scan(&newID); err != nil {
-		return 0, err
-	}
-	return int(newID), nil
+// ensureLabel returns the global label ID for name, creating it when needed.
+func (h *JiraImportHandler) ensureLabel(_ int, name string) (int, error) {
+	return h.imports.EnsureLabel(name)
 }
 
-// importLabels ensures each Jira label exists in the workspace and links it to
-// the imported item. Duplicates within the input slice are silently collapsed
-// so we don't trip the (item_id, label_id) UNIQUE constraint.
+// importLabels ensures each Jira label exists and links it to the imported
+// item. Duplicate input names are collapsed.
 func (h *JiraImportHandler) importLabels(workspaceID, itemID int, labels []string) {
 	if len(labels) == 0 {
 		return
@@ -189,10 +162,7 @@ func (h *JiraImportHandler) importLabels(workspaceID, itemID int, labels []strin
 				slog.Any("error", err))
 			continue
 		}
-		if _, err := h.db.ExecWrite(
-			`INSERT INTO item_labels (item_id, label_id) VALUES (?, ?)`,
-			itemID, labelID,
-		); err != nil {
+		if err := h.imports.AddItemLabel(itemID, labelID); err != nil {
 			slog.Error("Failed to link label to item",
 				slog.String("component", "jira"),
 				slog.String("label", name),
@@ -215,29 +185,7 @@ const importedDummyUserEmail = "imported-user@jira-import.invalid"
 // becomes a real account. Concurrent imports that race on creation are handled
 // by re-SELECTing after a UNIQUE-violating INSERT.
 func (h *JiraImportHandler) ensureImportedDummyUser() (int, error) {
-	var id int
-	err := h.db.QueryRow(`SELECT id FROM users WHERE email = ?`, importedDummyUserEmail).Scan(&id)
-	if err == nil {
-		return id, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, err
-	}
-
-	var newID int64
-	err = h.db.QueryRow(`
-		INSERT INTO users (email, username, first_name, last_name, is_active, requires_password_reset, created_at, updated_at)
-		VALUES (?, ?, ?, ?, false, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id
-	`, importedDummyUserEmail, "jira-imported-user", "Imported", "(Jira)").Scan(&newID)
-	if err == nil {
-		return int(newID), nil
-	}
-
-	// Lost a race with another import — re-fetch.
-	if e := h.db.QueryRow(`SELECT id FROM users WHERE email = ?`, importedDummyUserEmail).Scan(&id); e == nil {
-		return id, nil
-	}
-	return 0, err
+	return h.imports.EnsureImportedDummyUser(importedDummyUserEmail)
 }
 
 // syntheticEmailForAccount produces a deterministic, RFC-safe email for a Jira
@@ -270,33 +218,35 @@ func parseDisplayName(displayName string) (firstName, lastName string) {
 
 // generateUsername creates a unique username from email or display name
 func generateUsername(email, displayName string) string {
-	// Try to use email prefix first
 	if email != "" {
 		parts := strings.Split(email, "@")
 		if len(parts) > 0 && parts[0] != "" {
 			return strings.ToLower(parts[0])
 		}
 	}
-	// Fall back to display name
 	if displayName != "" {
 		return strings.ToLower(strings.ReplaceAll(displayName, " ", "."))
 	}
 	return fmt.Sprintf("user_%d", time.Now().UnixNano())
 }
 
+// uniqueImportUsername returns an available, case-insensitively unique username.
+// Jira accounts commonly share the same email local-part across domains, so the
+// plain generated name is not guaranteed to satisfy users.username's uniqueness
+// constraint.
 // collectUsersFromCustomField extracts users from a custom field value
-func collectUsersFromCustomField(value interface{}, fieldType string,
+func collectUsersFromCustomField(value any, fieldType string,
 	existingMap map[string]int, usersToProcess *[]JiraUserSummary, seen map[string]bool) {
 
 	switch fieldType {
 	case "user":
-		if userObj, ok := value.(map[string]interface{}); ok {
+		if userObj, ok := value.(map[string]any); ok {
 			addUserFromObject(userObj, existingMap, usersToProcess, seen)
 		}
 	case "multi_user":
-		if users, ok := value.([]interface{}); ok {
+		if users, ok := value.([]any); ok {
 			for _, u := range users {
-				if userObj, ok := u.(map[string]interface{}); ok {
+				if userObj, ok := u.(map[string]any); ok {
 					addUserFromObject(userObj, existingMap, usersToProcess, seen)
 				}
 			}
@@ -309,11 +259,11 @@ func collectUsersFromCustomField(value interface{}, fieldType string,
 // assignee/reporter/comment-author fields; pre-collecting them lets the ADF
 // converter resolve to Windshift @username syntax instead of falling back to
 // inert display text.
-func collectUsersFromADF(value interface{}, existingMap map[string]int, usersToProcess *[]JiraUserSummary, seen map[string]bool) {
+func collectUsersFromADF(value any, existingMap map[string]int, usersToProcess *[]JiraUserSummary, seen map[string]bool) {
 	switch v := value.(type) {
-	case map[string]interface{}:
+	case map[string]any:
 		if nodeType, _ := v["type"].(string); nodeType == "mention" {
-			if attrs, ok := v["attrs"].(map[string]interface{}); ok {
+			if attrs, ok := v["attrs"].(map[string]any); ok {
 				accountID, _ := attrs["id"].(string)
 				if accountID == "" {
 					accountID, _ = attrs["accountId"].(string)
@@ -328,7 +278,7 @@ func collectUsersFromADF(value interface{}, existingMap map[string]int, usersToP
 		for _, child := range v {
 			collectUsersFromADF(child, existingMap, usersToProcess, seen)
 		}
-	case []interface{}:
+	case []any:
 		for _, child := range v {
 			collectUsersFromADF(child, existingMap, usersToProcess, seen)
 		}
@@ -365,6 +315,7 @@ func addJiraUserSummaryFromUser(user *jira.JiraUser, existingMap map[string]int,
 	}
 	*usersToProcess = append(*usersToProcess, JiraUserSummary{
 		AccountID:   accountID,
+		AccountType: user.AccountType,
 		Email:       user.EmailAddress,
 		DisplayName: user.DisplayName,
 		AvatarURL:   avatarURL,
@@ -373,7 +324,7 @@ func addJiraUserSummaryFromUser(user *jira.JiraUser, existingMap map[string]int,
 }
 
 // addUserFromObject extracts user data from a Jira user object and adds it to the processing list
-func addUserFromObject(userObj map[string]interface{}, existingMap map[string]int,
+func addUserFromObject(userObj map[string]any, existingMap map[string]int,
 	usersToProcess *[]JiraUserSummary, seen map[string]bool) {
 
 	accountID, _ := userObj["accountId"].(string)
@@ -394,14 +345,16 @@ func addUserFromObject(userObj map[string]interface{}, existingMap map[string]in
 	}
 
 	email, _ := userObj["emailAddress"].(string)
+	accountType, _ := userObj["accountType"].(string)
 	displayName, _ := userObj["displayName"].(string)
 	avatarURL := ""
-	if avatars, ok := userObj["avatarUrls"].(map[string]interface{}); ok {
+	if avatars, ok := userObj["avatarUrls"].(map[string]any); ok {
 		avatarURL, _ = avatars["48x48"].(string)
 	}
 
 	*usersToProcess = append(*usersToProcess, JiraUserSummary{
 		AccountID:   accountID,
+		AccountType: accountType,
 		Email:       email,
 		DisplayName: displayName,
 		AvatarURL:   avatarURL,
@@ -415,6 +368,30 @@ func isJiraStoryPointsField(mapping CustomFieldMapping) bool {
 	return mapping.JiraType == "com.pyxis.greenhopper.jira:jsw-story-points" || strings.EqualFold(strings.TrimSpace(mapping.JiraName), "Story Points")
 }
 
+func shouldImportJiraStoryPoints(mapping CustomFieldMapping) bool {
+	return mapping.Action != "skip" && isJiraStoryPointsField(mapping)
+}
+
+// importedStoryPoints resolves the issue's story-points estimate from the
+// custom-field mappings. Later mappings win. Windshift never persists
+// negative points, so unusable values are skipped rather than guessed.
+func importedStoryPoints(customFieldMappings []CustomFieldMapping, fields *jira.JiraIssueFields) *float64 {
+	var storyPoints *float64
+	for _, mapping := range customFieldMappings {
+		if !isJiraStoryPointsField(mapping) || !shouldImportJiraStoryPoints(mapping) {
+			continue
+		}
+		raw, ok := fields.CustomFields[mapping.JiraID]
+		if !ok {
+			continue
+		}
+		if sp, ok := numericCustomFieldValue(raw); ok && sp >= 0 {
+			storyPoints = &sp
+		}
+	}
+	return storyPoints
+}
+
 // isJiraSprintField identifies Jira Software's sprint field. Windshift has a
 // first-class iteration_id on items, so sprint data should resolve there rather
 // than into a generic custom field bag.
@@ -426,22 +403,32 @@ func isJiraSprintField(mapping CustomFieldMapping) bool {
 // that belongs in the item's custom_field_values JSON bag. Returns (nil, false)
 // for skip/unmapped paths.
 func (h *JiraImportHandler) customFieldType(fieldID int) string {
-	var fieldType string
-	if err := h.db.QueryRow(`SELECT field_type FROM custom_field_definitions WHERE id = ?`, fieldID).Scan(&fieldType); err != nil {
-		return ""
-	}
-	return fieldType
+	return h.imports.CustomFieldType(fieldID)
 }
 
 func (h *JiraImportHandler) customFieldAssetAllowsMultiple(fieldID int) bool {
-	var options sql.NullString
-	if err := h.db.QueryRow(`SELECT options FROM custom_field_definitions WHERE id = ?`, fieldID).Scan(&options); err != nil || !options.Valid {
+	options := h.imports.CustomFieldOptions(fieldID)
+	if options == "" {
 		return false
 	}
 	var config struct {
 		Multi bool `json:"multi"`
 	}
-	return json.Unmarshal([]byte(options.String), &config) == nil && config.Multi
+	return json.Unmarshal([]byte(options), &config) == nil && config.Multi
+}
+
+func (h *JiraImportHandler) customFieldAssetSetID(fieldID int) int {
+	options := h.imports.CustomFieldOptions(fieldID)
+	if options == "" {
+		return 0
+	}
+	var config struct {
+		AssetSetID int `json:"asset_set_id"`
+	}
+	if json.Unmarshal([]byte(options), &config) != nil {
+		return 0
+	}
+	return config.AssetSetID
 }
 
 func assetCustomFieldValue(ref jiraIssueAssetReference) map[string]any {
@@ -455,7 +442,25 @@ func assetCustomFieldValue(ref jiraIssueAssetReference) map[string]any {
 	return value
 }
 
-func extractCustomFieldValue(mapping CustomFieldMapping, fields *jira.JiraIssueFields, userMap, versionMap map[string]int) (any, bool) {
+func jiraIssueAssetReferencesForSet(refs []jiraIssueAssetReference, setID int) []jiraIssueAssetReference {
+	if setID <= 0 {
+		return refs
+	}
+	matching := make([]jiraIssueAssetReference, 0, len(refs))
+	for _, ref := range refs {
+		if ref.SetID == setID {
+			matching = append(matching, ref)
+		}
+	}
+	return matching
+}
+
+func extractCustomFieldValueWithOptions(
+	mapping CustomFieldMapping,
+	fields *jira.JiraIssueFields,
+	userMap, versionMap map[string]int,
+	choiceOptionIDs map[string]int,
+) (any, bool) {
 	if mapping.Action == "skip" || isJiraStoryPointsField(mapping) || isJiraSprintField(mapping) {
 		return nil, false
 	}
@@ -466,10 +471,17 @@ func extractCustomFieldValue(mapping CustomFieldMapping, fields *jira.JiraIssueF
 	if !exists || value == nil {
 		return nil, false
 	}
+	if mapping.PreserveRaw {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return nil, false
+		}
+		return string(data), true
+	}
 
 	switch mapping.WindshiftType {
 	case "user":
-		userObj, ok := value.(map[string]interface{})
+		userObj, ok := value.(map[string]any)
 		if !ok {
 			return nil, false
 		}
@@ -483,13 +495,13 @@ func extractCustomFieldValue(mapping CustomFieldMapping, fields *jira.JiraIssueF
 		}
 		return uid, true
 	case "multi_user":
-		users, ok := value.([]interface{})
+		users, ok := value.([]any)
 		if !ok {
 			return nil, false
 		}
 		var userIDs []int
 		for _, u := range users {
-			userObj, ok := u.(map[string]interface{})
+			userObj, ok := u.(map[string]any)
 			if !ok {
 				continue
 			}
@@ -511,19 +523,36 @@ func extractCustomFieldValue(mapping CustomFieldMapping, fields *jira.JiraIssueF
 		}
 	case "date":
 		if s := customFieldDisplayValue(value); s != "" {
-			if t := jira.ParseJiraTimestamp(s); t != nil {
-				return t.UTC().Format(time.RFC3339), true
+			if _, err := time.Parse(time.DateOnly, s); err == nil {
+				return s, true
 			}
-			return s, true
+			if t := jira.ParseJiraTimestamp(s); t != nil {
+				return t.Format(time.DateOnly), true
+			}
 		}
 	case "select":
 		if s := customFieldDisplayValue(value); s != "" {
-			return s, true
+			optionID := choiceOptionIDs[strings.ToLower(strings.TrimSpace(s))]
+			if optionID > 0 {
+				return optionID, true
+			}
 		}
 	case "multiselect":
 		values := customFieldDisplayValues(value)
 		if len(values) > 0 {
-			return values, true
+			optionIDs := make([]int, 0, len(values))
+			seen := make(map[int]bool)
+			for _, label := range values {
+				optionID := choiceOptionIDs[strings.ToLower(strings.TrimSpace(label))]
+				if optionID <= 0 || seen[optionID] {
+					continue
+				}
+				seen[optionID] = true
+				optionIDs = append(optionIDs, optionID)
+			}
+			if len(optionIDs) > 0 {
+				return optionIDs, true
+			}
 		}
 	case "milestone":
 		if id := customFieldIDValue(value); id != "" {
@@ -531,23 +560,105 @@ func extractCustomFieldValue(mapping CustomFieldMapping, fields *jira.JiraIssueF
 				return mid, true
 			}
 		}
-		if s := customFieldDisplayValue(value); s != "" {
-			return s, true
-		}
 	case "asset":
 		values := customFieldDisplayValues(value)
 		if len(values) > 0 {
 			return strings.Join(values, "\n"), true
 		}
 	case "text", "textarea":
+		// Rich-text custom fields carry ADF documents. Render them as Markdown
+		// instead of JSON-marshaling the document so the field reads naturally;
+		// an explicit PreserveRaw mapping keeps the JSON above.
+		if jira.IsADFDocument(value) {
+			if s := strings.TrimSpace(jira.ConvertADFToMarkdown(value, nil, nil)); s != "" {
+				return s, true
+			}
+			return nil, false
+		}
 		if s := customFieldDisplayValue(value); s != "" {
 			return s, true
+		}
+	case models.CustomFieldTypeBoolean, models.CustomFieldTypeCheckbox:
+		if b, ok := jiraCheckboxValue(value); ok {
+			return b, true
 		}
 	}
 	return nil, false
 }
 
-func userIdentifierFromObject(userObj map[string]interface{}) string {
+func unresolvedJiraCustomFieldRawValue(
+	mapping CustomFieldMapping,
+	fields *jira.JiraIssueFields,
+	typedValueResolved bool,
+	choiceOptionIDs map[string]int,
+) (any, bool) {
+	// A datetime mapped to a Windshift date resolves to a calendar date but
+	// drops time-of-day and offset. Preserve the original Jira timestamp text
+	// in item metadata so the source precision is retained separately and the
+	// import-time loss is reportable.
+	if typedValueResolved && mapping.WindshiftType == "date" && jiraMappingIsDateTime(mapping) {
+		if mapping.Action == "skip" || mapping.PreserveRaw {
+			return nil, false
+		}
+		if fields == nil || fields.CustomFields == nil {
+			return nil, false
+		}
+		if raw, exists := fields.CustomFields[mapping.JiraID]; exists && raw != nil {
+			return raw, true
+		}
+		return nil, false
+	}
+	if typedValueResolved && mapping.WindshiftType != "multiselect" {
+		return nil, false
+	}
+	if mapping.Action == "skip" || mapping.PreserveRaw || isJiraStoryPointsField(mapping) || isJiraSprintField(mapping) {
+		return nil, false
+	}
+	switch mapping.WindshiftType {
+	case "date", "select", "multiselect", "milestone":
+	default:
+		return nil, false
+	}
+	if fields == nil || fields.CustomFields == nil {
+		return nil, false
+	}
+	raw, exists := fields.CustomFields[mapping.JiraID]
+	if !exists || raw == nil {
+		return nil, false
+	}
+	if !typedValueResolved {
+		return raw, true
+	}
+
+	for _, label := range customFieldDisplayValues(raw) {
+		if choiceOptionIDs[strings.ToLower(strings.TrimSpace(label))] <= 0 {
+			return raw, true
+		}
+	}
+	return nil, false
+}
+
+// jiraMappingIsDateTime reports whether a Jira custom field carries a
+// datetime value, which a Windshift date field can only store as a calendar
+// date.
+func jiraMappingIsDateTime(mapping CustomFieldMapping) bool {
+	return strings.Contains(strings.ToLower(mapping.JiraType), "datetime")
+}
+
+func preserveUnresolvedJiraCustomField(
+	values map[string]any,
+	mapping CustomFieldMapping,
+	raw any,
+) {
+	values["_jira_custom_field_"+mapping.JiraID] = map[string]any{
+		"jira_field_id":   mapping.JiraID,
+		"jira_field_name": mapping.JiraName,
+		"jira_field_type": mapping.JiraType,
+		"value":           raw,
+	}
+}
+
+func userIdentifierFromObject(userObj map[string]any) string {
 	for _, key := range []string{"accountId", "name", "key"} {
 		if v, _ := userObj[key].(string); v != "" {
 			return v
@@ -574,8 +685,38 @@ func numericCustomFieldValue(value any) (float64, bool) {
 	}
 }
 
+// jiraCheckboxValue converts a Jira boolean representation to a canonical Go
+// boolean. It accepts a raw JSON/Go bool, exact true/false strings from export
+// payloads, and known wrapper shapes containing one of those values. Unknown
+// or ambiguous shapes are not coerced — the caller reports them as
+// unmapped/skipped import data rather than persisting a guessed value.
+func jiraCheckboxValue(value any) (result, ok bool) {
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	case map[string]any:
+		for _, k := range []string{"value", "checked", "enabled", "name"} {
+			if b, ok := jiraCheckboxValue(v[k]); ok {
+				return b, true
+			}
+		}
+	case []any:
+		if len(v) == 1 {
+			return jiraCheckboxValue(v[0])
+		}
+	}
+	return false, false
+}
+
 func customFieldIDValue(value any) string {
-	if m, ok := value.(map[string]interface{}); ok {
+	if m, ok := value.(map[string]any); ok {
 		for _, key := range []string{"id", "key", "accountId", "name"} {
 			if s, _ := m[key].(string); s != "" {
 				return s
@@ -593,12 +734,12 @@ func customFieldDisplayValue(value any) string {
 		return strconv.FormatFloat(v, 'f', -1, 64)
 	case bool:
 		return strconv.FormatBool(v)
-	case map[string]interface{}:
+	case map[string]any:
 		// Jira option/version/user-like objects usually carry a human label in one
 		// of these fields. Prefer labels over IDs so imports preserve admin-facing
 		// display values instead of opaque Jira identifiers.
 		if parent := firstStringKey(v, "value", "name", "displayName", "label", "key"); parent != "" {
-			if child, ok := v["child"].(map[string]interface{}); ok {
+			if child, ok := v["child"].(map[string]any); ok {
 				if childLabel := customFieldDisplayValue(child); childLabel != "" {
 					return parent + " / " + childLabel
 				}
@@ -612,7 +753,7 @@ func customFieldDisplayValue(value any) string {
 		if err == nil {
 			return string(b)
 		}
-	case []interface{}:
+	case []any:
 		values := customFieldDisplayValues(v)
 		if len(values) > 0 {
 			return strings.Join(values, ", ")
@@ -622,7 +763,7 @@ func customFieldDisplayValue(value any) string {
 }
 
 func customFieldDisplayValues(value any) []string {
-	arr, ok := value.([]interface{})
+	arr, ok := value.([]any)
 	if !ok {
 		if s := customFieldDisplayValue(value); s != "" {
 			return []string{s}
@@ -638,14 +779,9 @@ func customFieldDisplayValues(value any) []string {
 	return values
 }
 
-// sanitizeJiraImportStrings applies a conservative plain-text sanitize +
-// length cap (sanitize.PlainTextField) to every string inside a Jira-derived
-// custom-field value, recursing through the map/slice shapes the importer
-// builds (component metadata, affects-version metadata, asset references,
-// multiselect display labels). These are external display strings, not
-// user-authored option sets, so a uniform plain-text bound is the policy.
-// Maps are mutated in place; non-string scalars pass through untouched, so
-// the pass is an idempotent no-op on already-clean values.
+// sanitizeJiraImportStrings recursively plain-text-sanitizes external display
+// strings in importer map/slice shapes. It mutates maps, preserves scalars, and
+// is idempotent for clean values.
 func sanitizeJiraImportStrings(value any) any {
 	switch v := value.(type) {
 	case string:
@@ -685,7 +821,7 @@ func sanitizeJiraImportStrings(value any) any {
 	}
 }
 
-func firstStringKey(m map[string]interface{}, keys ...string) string {
+func firstStringKey(m map[string]any, keys ...string) string {
 	for _, key := range keys {
 		if s, _ := m[key].(string); strings.TrimSpace(s) != "" {
 			return strings.TrimSpace(s)
@@ -721,11 +857,11 @@ func sprintIDsFromValue(value any) []string {
 	switch v := value.(type) {
 	case nil:
 		return nil
-	case map[string]interface{}:
+	case map[string]any:
 		if id := sprintIDFromMap(v); id != "" {
 			return []string{id}
 		}
-	case []interface{}:
+	case []any:
 		ids := make([]string, 0, len(v))
 		for _, entry := range v {
 			ids = append(ids, sprintIDsFromValue(entry)...)
@@ -750,7 +886,7 @@ func sprintIDsFromValue(value any) []string {
 	return nil
 }
 
-func sprintIDFromMap(m map[string]interface{}) string {
+func sprintIDFromMap(m map[string]any) string {
 	switch raw := m["id"].(type) {
 	case string:
 		return strings.TrimSpace(raw)
@@ -815,59 +951,126 @@ func affectedVersionOptionValues(issue *jira.JiraIssue, field *jiraAffectsVersio
 }
 
 // importIssue imports a single Jira issue as a Windshift work item
-func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, workspaceID int, issue *jira.JiraIssue, statusMap, itemTypeMap, userMap map[string]int, usernameMap map[string]string, versionMap, iterationMap, customFieldIDMap map[string]int, timeProjectID *int, affectsVersionField *jiraAffectsVersionCustomField, customFieldMappings []CustomFieldMapping, client jira.Client, progress *ImportProgress) error {
-	mentionResolver := jira.MentionResolver(func(accountID string) string {
-		return usernameMap[accountID]
-	})
-	// Get mapped status and item type (use nil instead of 0 for missing mappings)
-	var statusID *int
+// importIssue imports one Jira issue as a Windshift item through a fixed
+// stage sequence: resolve field references, convert the description, build
+// custom field values, create or update the item, record the mapping, then
+// import subresources. The order is contractual — the mapping must exist
+// before watchers and labels reference the item, and attachments must import
+// before the description re-render links media to them.
+func (h *JiraImportHandler) importIssue(ctx context.Context, im *jiraImportContext, issue *jira.JiraIssue) error {
+	refs := h.resolveJiraIssueReferences(im, issue)
+	resolver := im.mentionResolver()
+	rawDescription, description := convertJiraIssueDescription(issue, resolver)
+
+	customFieldValuesJSON, err := h.buildJiraIssueCustomFieldValues(im, issue, refs)
+	if err != nil {
+		return err
+	}
+
+	itemID, previous, forked, err := h.upsertJiraIssueItem(im, issue, refs, description, customFieldValuesJSON)
+	if err != nil {
+		return err
+	}
+
+	if err := h.recordJiraIssueMapping(im, issue, refs, previous, itemID); err != nil {
+		return err
+	}
+
+	return h.importJiraIssueSubresources(ctx, im, issue, itemID, rawDescription, description, resolver, forked)
+}
+
+// previousSubresourceMapping returns the previous mapping a re-import may
+// reuse. A fork (changed project→workspace mapping) deliberately leaves the
+// old workspace's item and its comments, attachments, and worklogs intact, so
+// forked imports never reuse a previous mapping and always create new rows.
+// Even when the item is reused, a prior mapping is only reusable when the
+// resource it points at is owned by the destination item; otherwise a partial
+// fork retry would move the original workspace's resource instead of copying
+// it.
+func (h *JiraImportHandler) previousSubresourceMapping(jobID, entityType, jiraID string, itemID int, forked bool) (*previousJiraImportMapping, error) {
+	if forked {
+		return nil, nil
+	}
+	previous, err := h.findPreviousJiraImportMapping(jobID, entityType, jiraID)
+	if err != nil || previous == nil {
+		return previous, err
+	}
+	owned, err := h.imports.SubresourceBelongsToItem(entityType, previous.WindshiftID, itemID)
+	if err != nil {
+		return nil, err
+	}
+	if !owned {
+		return nil, nil
+	}
+	return previous, nil
+}
+
+// resolveJiraIssueReferences maps the issue's direct Jira fields onto
+// Windshift identities through the import context's reference maps.
+func (h *JiraImportHandler) resolveJiraIssueReferences(im *jiraImportContext, issue *jira.JiraIssue) *jiraIssueReferences {
+	refs := &jiraIssueReferences{}
+
 	if issue.Fields.Status != nil {
-		if sid, ok := statusMap[issue.Fields.Status.ID]; ok {
-			statusID = &sid
+		if sid, ok := im.statusMap[issue.Fields.Status.ID]; ok {
+			refs.statusID = &sid
 		}
 	}
 
-	var itemTypeID *int
 	if issue.Fields.IssueType != nil {
-		if tid, ok := itemTypeMap[issue.Fields.IssueType.ID]; ok {
-			itemTypeID = &tid
+		if tid, ok := im.itemTypeMap[issue.Fields.IssueType.ID]; ok {
+			refs.itemTypeID = &tid
 		}
 	}
 
-	// Map assignee and reporter
-	var assigneeID *int
 	if issue.Fields.Assignee != nil && issue.Fields.Assignee.GetIdentifier() != "" {
-		if uid, ok := userMap[issue.Fields.Assignee.GetIdentifier()]; ok {
-			assigneeID = &uid
+		if uid, ok := im.userMap[issue.Fields.Assignee.GetIdentifier()]; ok {
+			refs.assigneeID = &uid
 		}
 	}
 
-	var reporterID *int
 	if issue.Fields.Reporter != nil && issue.Fields.Reporter.GetIdentifier() != "" {
-		if uid, ok := userMap[issue.Fields.Reporter.GetIdentifier()]; ok {
-			reporterID = &uid
+		if uid, ok := im.userMap[issue.Fields.Reporter.GetIdentifier()]; ok {
+			refs.reporterID = &uid
 		}
 	}
 
 	// Creator (immutable in Jira) is distinct from Reporter (mutable). Preserve
 	// it on items.creator_id so audit views in Windshift reflect who originated
 	// the issue, not who happened to run the import.
-	var creatorID *int
 	if issue.Fields.Creator != nil && issue.Fields.Creator.GetIdentifier() != "" {
-		if uid, ok := userMap[issue.Fields.Creator.GetIdentifier()]; ok {
-			creatorID = &uid
+		if uid, ok := im.userMap[issue.Fields.Creator.GetIdentifier()]; ok {
+			refs.creatorID = &uid
+		}
+	}
+
+	for _, candidate := range []*jira.JiraUser{issue.Fields.Reporter, issue.Fields.Creator} {
+		if candidate == nil || candidate.GetIdentifier() == "" {
+			continue
+		}
+		if customerID, ok := im.portalCustomerMap[candidate.GetIdentifier()]; ok {
+			refs.creatorPortalCustomerID = &customerID
+			break
+		}
+	}
+
+	refs.jiraRequestType = jiraRequestTypeID(issue, im.customFieldMappings)
+	if im.jsmImport != nil {
+		channelID := im.jsmImport.ChannelID
+		refs.channelID = &channelID
+		if mappedID, ok := im.jsmImport.RequestTypes[refs.jiraRequestType]; ok {
+			refs.requestTypeID = &mappedID
 		}
 	}
 
 	// Map all Jira fixVersions to Windshift milestones. Older importer builds
 	// only attached the first version, losing multi-release semantics even though
 	// Windshift supports multiple item_milestones rows.
-	milestoneIDs := make([]int, 0, len(issue.Fields.FixVersions))
+	refs.milestoneIDs = make([]int, 0, len(issue.Fields.FixVersions))
 	seenMilestones := make(map[int]struct{}, len(issue.Fields.FixVersions))
 	for _, version := range issue.Fields.FixVersions {
-		if mid, ok := versionMap[version.ID]; ok {
+		if mid, ok := im.versionMap[version.ID]; ok {
 			if _, exists := seenMilestones[mid]; !exists {
-				milestoneIDs = append(milestoneIDs, mid)
+				refs.milestoneIDs = append(refs.milestoneIDs, mid)
 				seenMilestones[mid] = struct{}{}
 			}
 		}
@@ -876,49 +1079,104 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 	// Map priority through the synonym table so Jira-only names (Highest, Lowest,
 	// Blocker, Major, Minor, Trivial) land on canonical Windshift priorities
 	// instead of falling back to the workspace default.
-	var priorityName string
 	if issue.Fields.Priority != nil && issue.Fields.Priority.Name != "" {
-		priorityName = jira.SuggestPriorityMapping(issue.Fields.Priority.Name)
+		refs.priorityName = jira.SuggestPriorityMapping(issue.Fields.Priority.Name)
 	}
 
-	// Parse due date
-	var dueDate *time.Time
 	if issue.Fields.DueDate != "" {
 		if parsed, err := time.Parse("2006-01-02", issue.Fields.DueDate); err == nil {
-			dueDate = &parsed
+			refs.dueDate = &parsed
 		}
 	}
 
 	// Preserve Jira's original timestamps so chronology survives the import.
 	// Without this every imported item appears created at import time, which
 	// breaks reports, "recent" filters, and the timeline view.
-	createdAt := jira.ParseJiraTimestamp(issue.Fields.Created)
-	updatedAt := jira.ParseJiraTimestamp(issue.Fields.Updated)
+	refs.createdAt = jira.ParseJiraTimestamp(issue.Fields.Created)
+	refs.updatedAt = jira.ParseJiraTimestamp(issue.Fields.Updated)
 
-	// Convert description from ADF to markdown, resolving Jira accountIDs to
-	// Windshift usernames so MentionService picks up @mentions on import. Media
-	// nodes are converted without a resolver here (placeholders); once
-	// attachments are imported below we re-render with a media resolver that
-	// links them to the imported attachments, and persist the updated text.
-	rawDescription := issue.Fields.Description
-	description := ""
-	if rawDescription != nil {
-		description = jira.ConvertADFToMarkdown(rawDescription, mentionResolver, nil)
+	if issue.Fields.TimeTracking != nil && issue.Fields.TimeTracking.OriginalEstimateSeconds > 0 {
+		minutes := issue.Fields.TimeTracking.OriginalEstimateSeconds / 60
+		if minutes == 0 {
+			minutes = 1
+		}
+		refs.estimateMinutes = &minutes
 	}
 
+	refs.iterationID = extractSprintIterationID(&issue.Fields, im.customFieldMappings, im.iterationMap)
+	refs.storyPoints = importedStoryPoints(im.customFieldMappings, &issue.Fields)
+
+	return refs
+}
+
+// convertJiraIssueDescription renders the ADF description to markdown without
+// a media resolver (media nodes become placeholders); once attachments are
+// imported, the subresource stage re-renders with a resolver that links them.
+func convertJiraIssueDescription(issue *jira.JiraIssue, resolver jira.MentionResolver) (rawDescription any, markdown string) {
+	rawDescription = issue.Fields.Description
+	if rawDescription != nil {
+		markdown = jira.ConvertADFToMarkdown(rawDescription, resolver, nil)
+	}
+	return rawDescription, markdown
+}
+
+// buildJiraIssueCustomFieldValues assembles the issue's custom field value
+// bag: importer preservation metadata under underscore-prefixed keys,
+// user-selected Jira custom fields keyed by Windshift custom field ID, then
+// sanitization and validation.
+func (h *JiraImportHandler) buildJiraIssueCustomFieldValues(im *jiraImportContext, issue *jira.JiraIssue, refs *jiraIssueReferences) (string, error) {
 	// Process custom fields. Standard top-level fields that have no dedicated
 	// Windshift column ride along inside the same JSON bag so reports and exports
 	// can still surface them. Underscore-prefixed keys are importer metadata;
 	// user-selected Jira custom fields are keyed by Windshift custom field ID.
-	customFieldValues := make(map[string]interface{})
+	customFieldValues := make(map[string]any)
 	customFieldValues["_jira_issue_id"] = issue.ID
 	customFieldValues["_jira_issue_key"] = issue.Key
+	if jiraKeyFieldID := im.customFieldIDMap[jiraIssueKeyFieldSourceID]; jiraKeyFieldID > 0 && issue.Key != "" {
+		customFieldValues[strconv.Itoa(jiraKeyFieldID)] = issue.Key
+	}
 	if issue.Self != "" {
 		customFieldValues["_jira_self"] = issue.Self
 	}
 	if issue.Fields.Project != nil {
 		customFieldValues["_jira_project_key"] = issue.Fields.Project.Key
 	}
+
+	h.collectJiraTrackingMetadata(issue, customFieldValues)
+	h.collectJiraIdentityMetadata(im, issue, customFieldValues)
+	h.collectJiraStructuralMetadata(im, issue, refs, customFieldValues)
+	h.applyJiraCustomFieldMappings(im, issue, customFieldValues)
+
+	// Plain-text-sanitize untrusted imported values except text/textarea fields,
+	// which receive their type-correct policy below.
+	fieldTypes, err := validation.CustomFieldTypes(h.db, customFieldValues)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve custom field types: %w", err)
+	}
+	for key, v := range customFieldValues {
+		if ft := fieldTypes[key]; ft == "text" || ft == "textarea" {
+			continue
+		}
+		customFieldValues[key] = sanitizeJiraImportStrings(v)
+	}
+	if err := validation.ValidateAndNormalizeCustomFieldValues(h.db, customFieldValues); err != nil {
+		return "", fmt.Errorf("failed to validate custom field values: %w", err)
+	}
+
+	if len(customFieldValues) == 0 {
+		return "", nil
+	}
+	// A marshal failure imports the issue with empty custom field values,
+	// matching the pre-staging behavior.
+	jsonBytes, marshalErr := json.Marshal(customFieldValues)
+	if marshalErr != nil {
+		jsonBytes = nil
+	}
+	return string(jsonBytes), nil
+}
+
+// collectJiraTrackingMetadata preserves chronology and time-tracking fields.
+func (h *JiraImportHandler) collectJiraTrackingMetadata(issue *jira.JiraIssue, customFieldValues map[string]any) {
 	if resolved := jira.ParseJiraTimestamp(issue.Fields.Resolved); resolved != nil {
 		customFieldValues["_jira_resolved_at"] = resolved.UTC().Format(time.RFC3339)
 	}
@@ -930,6 +1188,64 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 			customFieldValues["_jira_time_spent_seconds"] = issue.Fields.TimeTracking.TimeSpentSeconds
 		}
 	}
+	if issue.Fields.Watches != nil {
+		customFieldValues["_jira_watcher_count"] = issue.Fields.Watches.WatchCount
+	}
+	customFieldValues["_jira_watcher_identities_available"] = issue.Fields.WatcherIdentitiesAvailable
+	if issue.Fields.WatcherFetchError != "" {
+		customFieldValues["_jira_watcher_fetch_error"] = issue.Fields.WatcherFetchError
+	}
+}
+
+// collectJiraIdentityMetadata preserves the people referenced by the issue:
+// reporter, creator, assignee, watchers, and voters.
+func (h *JiraImportHandler) collectJiraIdentityMetadata(im *jiraImportContext, issue *jira.JiraIssue, customFieldValues map[string]any) {
+	if reporter := jiraUserIdentityMetadata(issue.Fields.Reporter); len(reporter) > 0 {
+		customFieldValues["_jira_reporter"] = reporter
+	}
+	if creator := jiraUserIdentityMetadata(issue.Fields.Creator); len(creator) > 0 {
+		customFieldValues["_jira_creator"] = creator
+	}
+	if assignee := jiraUserIdentityMetadata(issue.Fields.Assignee); len(assignee) > 0 {
+		customFieldValues["_jira_assignee"] = assignee
+	}
+	if len(issue.Fields.Watchers) > 0 {
+		watchers := make([]map[string]any, 0, len(issue.Fields.Watchers))
+		for idx := range issue.Fields.Watchers {
+			if identity := jiraUserIdentityMetadata(&issue.Fields.Watchers[idx]); len(identity) > 0 {
+				_, mapped := im.userMap[issue.Fields.Watchers[idx].GetIdentifier()]
+				identity["mapped"] = mapped
+				watchers = append(watchers, identity)
+			}
+		}
+		if len(watchers) > 0 {
+			customFieldValues["_jira_watchers"] = watchers
+		}
+	}
+	if issue.Fields.Votes != nil {
+		votes := map[string]any{
+			"count":     issue.Fields.Votes.Votes,
+			"has_voted": issue.Fields.Votes.HasVoted,
+		}
+		if len(issue.Fields.Votes.Voters) > 0 {
+			voters := make([]map[string]any, 0, len(issue.Fields.Votes.Voters))
+			for idx := range issue.Fields.Votes.Voters {
+				if identity := jiraUserIdentityMetadata(&issue.Fields.Votes.Voters[idx]); len(identity) > 0 {
+					voters = append(voters, identity)
+				}
+			}
+			if len(voters) > 0 {
+				votes["voters"] = voters
+			}
+		}
+		customFieldValues["_jira_votes"] = votes
+	}
+}
+
+// collectJiraStructuralMetadata preserves the issue's structural fields that
+// have no first-class Windshift schema yet: components, security level,
+// request type, and affected versions.
+func (h *JiraImportHandler) collectJiraStructuralMetadata(im *jiraImportContext, issue *jira.JiraIssue, refs *jiraIssueReferences, customFieldValues map[string]any) {
 	if len(issue.Fields.Components) > 0 {
 		components := make([]map[string]string, 0, len(issue.Fields.Components))
 		for _, component := range issue.Fields.Components {
@@ -941,37 +1257,49 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 		}
 		customFieldValues["_jira_components"] = components
 	}
+	if issue.Fields.Security != nil {
+		customFieldValues["_jira_security_level"] = map[string]string{
+			"id":          issue.Fields.Security.ID,
+			"name":        issue.Fields.Security.Name,
+			"description": issue.Fields.Security.Description,
+			"self":        issue.Fields.Security.Self,
+		}
+	}
+	if refs.jiraRequestType != "" {
+		customFieldValues["_jira_request_type_id"] = refs.jiraRequestType
+	}
 	if len(issue.Fields.Versions) > 0 {
 		affectsVersions := make([]map[string]any, 0, len(issue.Fields.Versions))
 		for _, version := range issue.Fields.Versions {
 			affectsVersions = append(affectsVersions, jiraVersionMetadata(version))
 		}
 		customFieldValues["_jira_affects_versions"] = affectsVersions
-		if affectsVersionField != nil {
-			if values := affectedVersionOptionValues(issue, affectsVersionField); len(values) > 0 {
-				customFieldValues[strconv.Itoa(affectsVersionField.FieldID)] = values
+		if im.affectsVersionField != nil {
+			if values := affectedVersionOptionValues(issue, im.affectsVersionField); len(values) > 0 {
+				customFieldValues[strconv.Itoa(im.affectsVersionField.FieldID)] = values
 			}
 		}
 	}
+}
 
-	iterationID := extractSprintIterationID(&issue.Fields, customFieldMappings, iterationMap)
-
-	var storyPoints *float64
-	for _, mapping := range customFieldMappings {
-		if isJiraStoryPointsField(mapping) {
-			if raw, ok := issue.Fields.CustomFields[mapping.JiraID]; ok {
-				if sp, ok := numericCustomFieldValue(raw); ok {
-					storyPoints = &sp
-				}
-			}
+// applyJiraCustomFieldMappings resolves user-selected Jira custom fields onto
+// Windshift custom field IDs, including asset-typed references and
+// preservation of unresolvable raw values.
+func (h *JiraImportHandler) applyJiraCustomFieldMappings(im *jiraImportContext, issue *jira.JiraIssue, customFieldValues map[string]any) {
+	for _, mapping := range im.customFieldMappings {
+		if mapping.JiraType == jiraRequestTypeFieldType || strings.EqualFold(strings.TrimSpace(mapping.JiraName), "Request Type") {
 			continue
 		}
-		fieldID, mapped := customFieldIDMap[mapping.JiraID]
+		if isJiraStoryPointsField(mapping) {
+			continue
+		}
+		fieldID, mapped := im.customFieldIDMap[mapping.JiraID]
 		if !mapped {
 			continue
 		}
 		if mapping.WindshiftType == string(jira.FieldTypeAsset) && h.customFieldType(fieldID) == string(jira.FieldTypeAsset) {
-			refs := h.resolveJiraIssueAssetReferences(jobID, issue.Fields.CustomFields[mapping.JiraID])
+			refs := h.resolveJiraIssueAssetReferences(im.jobID, issue.Fields.CustomFields[mapping.JiraID])
+			refs = jiraIssueAssetReferencesForSet(refs, h.customFieldAssetSetID(fieldID))
 			if h.customFieldAssetAllowsMultiple(fieldID) && len(refs) > 0 {
 				values := make([]map[string]any, 0, len(refs))
 				for _, ref := range refs {
@@ -989,82 +1317,101 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 			}
 			continue
 		}
-		if v, ok := extractCustomFieldValue(mapping, &issue.Fields, userMap, versionMap); ok {
+		v, resolved := extractCustomFieldValueWithOptions(
+			mapping,
+			&issue.Fields,
+			im.userMap,
+			im.versionMap,
+			im.choiceOptionIDs[mapping.JiraID],
+		)
+		if resolved {
 			customFieldValues[strconv.Itoa(fieldID)] = v
 		}
-	}
-
-	var estimateMinutes *int
-	if issue.Fields.TimeTracking != nil && issue.Fields.TimeTracking.OriginalEstimateSeconds > 0 {
-		minutes := issue.Fields.TimeTracking.OriginalEstimateSeconds / 60
-		if minutes == 0 {
-			minutes = 1
-		}
-		estimateMinutes = &minutes
-	}
-
-	// Imported Jira values are untrusted external content — every string
-	// in the bag gets a conservative plain-text sanitize + length cap
-	// before persisting: select/multiselect display labels, date/milestone
-	// raw fallbacks, the "_jira_*" metadata (component names/descriptions,
-	// asset-field labels, version metadata) and asset-reference titles.
-	// text/textarea fields are excluded here so the type-correct pass below
-	// (PlainTextField vs RichText with its larger cap, WI-319) applies
-	// instead of the 256-rune plain-text cap.
-	fieldTypes, err := validation.CustomFieldTypes(h.db, customFieldValues)
-	if err != nil {
-		return fmt.Errorf("failed to resolve custom field types: %w", err)
-	}
-	for key, v := range customFieldValues {
-		if ft := fieldTypes[key]; ft == "text" || ft == "textarea" {
-			continue
-		}
-		customFieldValues[key] = sanitizeJiraImportStrings(v)
-	}
-	if err := validation.SanitizeCustomFieldTextValues(h.db, customFieldValues); err != nil {
-		return fmt.Errorf("failed to sanitize custom field values: %w", err)
-	}
-
-	// Serialize custom field values to JSON
-	customFieldValuesJSON := ""
-	if len(customFieldValues) > 0 {
-		if jsonBytes, err := json.Marshal(customFieldValues); err == nil {
-			customFieldValuesJSON = string(jsonBytes)
+		if raw, preserve := unresolvedJiraCustomFieldRawValue(
+			mapping,
+			&issue.Fields,
+			resolved,
+			im.choiceOptionIDs[mapping.JiraID],
+		); preserve {
+			preserveUnresolvedJiraCustomField(customFieldValues, mapping, raw)
 		}
 	}
+}
 
-	// Create the work item using centralized service (handles workspace_item_number, frac_index, etc.)
+// recordJiraIssueMapping records the issue→item mapping together with the
+// metadata later stages need for parent linking, issue links, and reimport
+// bookkeeping.
+// upsertJiraIssueItem creates the Windshift item, or updates the previously
+// imported item when reimporting the same issue into the same workspace.
+func (h *JiraImportHandler) upsertJiraIssueItem(im *jiraImportContext, issue *jira.JiraIssue, refs *jiraIssueReferences, description, customFieldValuesJSON string) (itemID int64, previous *previousJiraImportMapping, forked bool, err error) {
 	// The summary gets the same title sanitize the normal item-create path applies.
-	itemID, err := services.CreateItem(h.db, services.ItemCreationParams{
-		WorkspaceID:           workspaceID,
-		Title:                 sanitize.PlainTextField.Sanitize(issue.Fields.Summary),
-		Description:           description,
-		StatusID:              statusID,
-		ItemTypeID:            itemTypeID,
-		Priority:              priorityName,
-		DueDate:               dueDate,
-		AssigneeID:            assigneeID,
-		ReporterID:            reporterID,
-		CreatorID:             creatorID,
-		MilestoneIDs:          milestoneIDs,
-		IterationID:           iterationID,
-		TimeProjectID:         timeProjectID,
-		StoryPoints:           storyPoints,
-		EstimateMinutes:       estimateMinutes,
-		CustomFieldValuesJSON: customFieldValuesJSON,
-		CreatedAt:             createdAt,
-		UpdatedAt:             updatedAt,
+	itemParams := services.ItemCreationParams{
+		WorkspaceID:             im.workspaceID,
+		Title:                   sanitize.PlainTextField.Sanitize(issue.Fields.Summary),
+		Description:             description,
+		StatusID:                refs.statusID,
+		ItemTypeID:              refs.itemTypeID,
+		Priority:                refs.priorityName,
+		DueDate:                 refs.dueDate,
+		AssigneeID:              refs.assigneeID,
+		ReporterID:              refs.reporterID,
+		CreatorID:               refs.creatorID,
+		CreatorPortalCustomerID: refs.creatorPortalCustomerID,
+		ChannelID:               refs.channelID,
+		RequestTypeID:           refs.requestTypeID,
+		MilestoneIDs:            refs.milestoneIDs,
+		IterationID:             refs.iterationID,
+		TimeProjectID:           im.timeProjectID,
+		StoryPoints:             refs.storyPoints,
+		EstimateMinutes:         refs.estimateMinutes,
+		CustomFieldValuesJSON:   customFieldValuesJSON,
+		CreatedAt:               refs.createdAt,
+		UpdatedAt:               refs.updatedAt,
+		EventMetadata:           itemevents.Import(im.jobID),
 		// A bulk import of issues pre-assigned to an agent user must not
 		// start one agent run per imported item.
-		SkipAssigneeTrigger: true,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create item: %w", err)
+		SkipAssigneeTrigger:           true,
+		AllowUnparentedGenericSubtask: true,
 	}
+	previousItemMapping := previous
+	if im.forceReimport && issue.ID != "" {
+		previousItemMapping, err = h.findPreviousJiraImportMapping(im.jobID, "item", issue.ID)
+		if err != nil {
+			return 0, nil, false, fmt.Errorf("find previous Jira item mapping: %w", err)
+		}
+		if previousItemMapping != nil {
+			previousWorkspaceID, lookupErr := h.imports.ItemWorkspaceID(previousItemMapping.WindshiftID)
+			if lookupErr != nil {
+				if !errors.Is(lookupErr, sql.ErrNoRows) {
+					return 0, nil, false, fmt.Errorf("load previous Jira item: %w", lookupErr)
+				}
+				previousItemMapping = nil
+			} else if previousWorkspaceID != im.workspaceID {
+				// A changed project→workspace mapping is a deliberate fork, not
+				// an update of the old workspace's item. Leave the previous item
+				// and its subresources intact.
+				previousItemMapping = nil
+				forked = true
+			}
+		}
+	}
+	if previousItemMapping != nil {
+		itemID, err = h.updateImportedJiraItem(previousItemMapping.WindshiftID, itemParams)
+	} else {
+		itemID, err = services.CreateItem(h.db, itemParams)
+	}
+	if err != nil {
+		return 0, nil, false, fmt.Errorf("failed to create or update item: %w", err)
+	}
+	return itemID, previousItemMapping, forked, nil
+}
 
-	// Build metadata for the mapping (includes parent key for later linking)
-	meta := map[string]interface{}{
+func (h *JiraImportHandler) recordJiraIssueMapping(im *jiraImportContext, issue *jira.JiraIssue, refs *jiraIssueReferences, previous *previousJiraImportMapping, itemID int64) error {
+	meta := map[string]any{
 		"summary": issue.Fields.Summary,
+	}
+	if refs.jiraRequestType != "" {
+		meta["jira_request_type_id"] = refs.jiraRequestType
 	}
 	// Resolve the parent issue key across the three places Jira encodes it:
 	//   1. Fields.Parent — team-managed projects (always populated when present).
@@ -1079,7 +1426,7 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 	case issue.Fields.Epic != nil && issue.Fields.Epic.Key != "":
 		parentKey = issue.Fields.Epic.Key
 	default:
-		for _, mapping := range customFieldMappings {
+		for _, mapping := range im.customFieldMappings {
 			if mapping.JiraType == "com.pyxis.greenhopper.jira:gh-epic-link" {
 				if v, ok := issue.Fields.CustomFields[mapping.JiraID].(string); ok && v != "" {
 					parentKey = v
@@ -1092,9 +1439,9 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 		meta["parent_key"] = parentKey
 	}
 	if len(issue.Fields.IssueLinks) > 0 {
-		var links []map[string]interface{}
+		links := make([]map[string]any, 0, len(issue.Fields.IssueLinks))
 		for _, link := range issue.Fields.IssueLinks {
-			entry := map[string]interface{}{}
+			entry := map[string]any{}
 			if link.Type != nil {
 				entry["type_name"] = link.Type.Name
 				entry["inward"] = link.Type.Inward
@@ -1111,8 +1458,24 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 		meta["issue_links"] = links
 	}
 
-	// Record the mapping
-	h.recordMapping(jobID, "item", issue.ID, issue.Key, int(itemID), meta)
+	if previous != nil {
+		meta["action"] = "update_existing"
+		meta["was_created"] = jiraImportMappingWasCreated(previous.Metadata)
+		meta["reimported_from_job_id"] = previous.JobID
+	}
+	if err := h.recordMappingAndTransferOwnership(im.jobID, "item", issue.ID, issue.Key, int(itemID), meta, previous); err != nil {
+		return fmt.Errorf("record Jira item mapping: %w", err)
+	}
+	return nil
+}
+
+// importJiraIssueSubresources imports the issue's dependent records in
+// contractual order: watchers, labels, attachments, description media
+// re-render, comments, and worklogs.
+func (h *JiraImportHandler) importJiraIssueSubresources(ctx context.Context, im *jiraImportContext, issue *jira.JiraIssue, itemID int64, rawDescription any, description string, mentionResolver jira.MentionResolver, forked bool) error {
+	if err := h.importIssueWatchers(im.jobID, int(itemID), issue, im.userMap); err != nil {
+		return fmt.Errorf("import Jira issue watchers: %w", err)
+	}
 
 	// Attach Jira labels (top-level Fields.Labels, distinct from labels-typed
 	// custom fields). Workspace-scoped — same name in different workspaces is
@@ -1120,12 +1483,16 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 	// schema yet, so preserve them as prefixed labels in addition to Jira metadata.
 	importLabels := append([]string{}, issue.Fields.Labels...)
 	importLabels = append(importLabels, jiraPreservationLabels(issue)...)
-	h.importLabels(workspaceID, int(itemID), importLabels)
+	h.importLabels(im.workspaceID, int(itemID), importLabels)
 
 	// Import attachments for this issue before comments/description media
 	// linking so the Jira attachment ids are mapped to Windshift attachments,
 	// letting ADF media nodes reference the imported files.
-	mediaRefs := h.importAttachments(ctx, jobID, int(itemID), issue, userMap, client, progress)
+	internalAttachmentIDs := jiraInternalAttachmentIDs(issue, rawDescription, im.jsmImport != nil)
+	mediaRefs, err := h.importAttachments(ctx, im.jobID, int(itemID), issue, im.userMap, im.client, internalAttachmentIDs, im.progress, forked)
+	if err != nil {
+		return fmt.Errorf("import Jira attachments: %w", err)
+	}
 	var mediaResolver jira.MediaResolver
 	if len(mediaRefs) > 0 {
 		mediaResolver = jira.NewMediaResolver(mediaRefs)
@@ -1136,26 +1503,86 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 	if mediaResolver != nil && rawDescription != nil {
 		linked := jira.ConvertADFToMarkdown(rawDescription, mentionResolver, mediaResolver)
 		if linked != "" && linked != description {
-			if _, err := h.db.ExecWrite(`UPDATE items SET description = ? WHERE id = ?`, linked, itemID); err != nil {
+			if err := h.imports.UpdateItemDescription(int(itemID), linked, itemevents.Import(im.jobID)); err != nil {
 				slog.Warn("Failed to update item description with linked media",
 					slog.String("component", "jira"),
 					slog.String("issue", issue.Key),
 					slog.Any("error", err))
-			} else {
-				description = linked
 			}
 		}
 	}
 
-	// Import comments for this issue
-	h.importComments(jobID, int(itemID), issue, userMap, mentionResolver, mediaResolver, progress)
+	if err := h.importComments(im.jobID, int(itemID), issue, im.userMap, im.portalCustomerMap, mentionResolver, mediaResolver, im.progress, forked); err != nil {
+		return fmt.Errorf("import Jira comments: %w", err)
+	}
 
 	// Import Jira worklogs into Windshift time tracking when the project has a
 	// time-project target. Jira exposes only the first page in the issue payload;
 	// import what we have and log if pagination would be needed.
-	h.importWorklogs(jobID, int(itemID), issue, userMap, mentionResolver, timeProjectID, progress)
+	if err := h.importWorklogs(im.jobID, int(itemID), issue, im.userMap, mentionResolver, im.timeProjectID, im.progress, forked); err != nil {
+		return fmt.Errorf("import Jira worklogs: %w", err)
+	}
 
 	return nil
+}
+
+func (h *JiraImportHandler) importIssueWatchers(
+	jobID string,
+	itemID int,
+	issue *jira.JiraIssue,
+	userMap map[string]int,
+) error {
+	if issue == nil || len(issue.Fields.Watchers) == 0 {
+		return nil
+	}
+	itemRepo := repository.NewItemRepository(h.db)
+	stableIssueID := issue.ID
+	if stableIssueID == "" {
+		stableIssueID = issue.Key
+	}
+	for idx := range issue.Fields.Watchers {
+		accountID := issue.Fields.Watchers[idx].GetIdentifier()
+		userID, mapped := userMap[accountID]
+		if !mapped || accountID == "" {
+			continue
+		}
+		externalID := stableIssueID + ":" + accountID
+		previousMapping, err := h.findPreviousJiraImportMapping(jobID, "watch", externalID)
+		if err != nil {
+			return fmt.Errorf("find previous watch mapping for %s: %w", accountID, err)
+		}
+		wasWatching, err := itemRepo.IsWatching(userID, itemID)
+		if err != nil {
+			return err
+		}
+		if err := itemRepo.Watch(userID, itemID, ""); err != nil {
+			return err
+		}
+		wasCreated := !wasWatching
+		metadata := map[string]any{
+			"user_id":     userID,
+			"account_id":  accountID,
+			"was_created": wasCreated,
+		}
+		ownershipMapping := previousMapping
+		if previousMapping != nil && previousMapping.WindshiftID == itemID {
+			metadata["was_created"] = jiraImportMappingWasCreated(previousMapping.Metadata)
+			metadata["reimported_from_job_id"] = previousMapping.JobID
+		} else {
+			ownershipMapping = nil
+		}
+		if err := h.recordMappingAndTransferOwnership(jobID, "watch", externalID, issue.Key, itemID, metadata, ownershipMapping); err != nil {
+			return fmt.Errorf("record Jira watch mapping: %w", err)
+		}
+	}
+	return nil
+}
+
+func (h *JiraImportHandler) updateImportedJiraItem(
+	itemID int,
+	params services.ItemCreationParams,
+) (int64, error) {
+	return h.imports.UpdateImportedItem(itemID, params)
 }
 
 // ================================================================
@@ -1166,70 +1593,40 @@ func (h *JiraImportHandler) importIssue(ctx context.Context, jobID string, works
 // Must be called after all issues for a project are imported so that both
 // parent and child exist in jira_import_id_mappings.
 func (h *JiraImportHandler) linkParents(jobID string) {
-	// Find all item mappings that have a parent_key in metadata
-	rows, err := h.db.Query(`
-		SELECT windshift_id, metadata_json
-		FROM jira_import_id_mappings
-		WHERE job_id = ? AND entity_type = 'item'
-	`, jobID)
+	links, err := h.imports.ParentLinks(jobID)
 	if err != nil {
 		slog.Error("Failed to query item mappings for parent linking", slog.String("component", "jira"), slog.Any("error", err))
-		return
-	}
-	defer func() { _ = rows.Close() }()
-
-	type parentLink struct {
-		childID   int
-		parentKey string
-	}
-	var links []parentLink
-
-	for rows.Next() {
-		var windshiftID int
-		var metadataJSON sql.NullString
-		if err := rows.Scan(&windshiftID, &metadataJSON); err != nil {
-			slog.Warn("failed to scan item mapping row", slog.String("component", "jira"), slog.Any("error", err))
-			continue
-		}
-		if !metadataJSON.Valid {
-			continue
-		}
-		var meta map[string]interface{}
-		if err := json.Unmarshal([]byte(metadataJSON.String), &meta); err != nil {
-			continue
-		}
-		if parentKey, ok := meta["parent_key"].(string); ok && parentKey != "" {
-			links = append(links, parentLink{childID: windshiftID, parentKey: parentKey})
-		}
-	}
-	if err := rows.Err(); err != nil {
-		slog.Error("error iterating item mapping rows for parent linking", slog.String("component", "jira"), slog.Any("error", err))
 		return
 	}
 
 	for _, link := range links {
 		// Look up parent's Windshift ID from mappings
-		var parentID int
-		err := h.db.QueryRow(`
-			SELECT windshift_id FROM jira_import_id_mappings
-			WHERE job_id = ? AND entity_type = 'item' AND jira_key = ?
-		`, jobID, link.parentKey).Scan(&parentID)
+		parentID, err := h.imports.LookupMappedEntityByKey(jobID, "item", link.ParentKey)
 		if err != nil {
 			slog.Debug("Parent not found in import mappings",
 				slog.String("component", "jira"),
-				slog.String("parentKey", link.parentKey),
-				slog.Int("childID", link.childID))
+				slog.String("parentKey", link.ParentKey),
+				slog.Int("childID", link.ChildID))
+			continue
+		}
+
+		if err := h.imports.ValidateParentLink(link.ChildID, parentID); err != nil {
+			slog.Error("Rejected invalid Jira parent link",
+				slog.String("component", "jira"),
+				slog.Int("childID", link.ChildID),
+				slog.Int("parentID", parentID),
+				slog.Any("error", err))
 			continue
 		}
 
 		// Update the child item's parent_id directly.
 		// We cannot use ItemUpdateService here because it requires a valid user ID
 		// for history tracking, and the import runs without a user context.
-		err = repository.NewItemRepository(h.db).SetParentDirect(link.childID, parentID)
+		err = repository.NewItemRepository(h.db).SetParentDirect(link.ChildID, parentID)
 		if err != nil {
 			slog.Error("Failed to set parent_id",
 				slog.String("component", "jira"),
-				slog.Int("childID", link.childID),
+				slog.Int("childID", link.ChildID),
 				slog.Int("parentID", parentID),
 				slog.Any("error", err))
 		}
@@ -1241,9 +1638,9 @@ func (h *JiraImportHandler) linkParents(jobID string) {
 // ================================================================
 
 // importComments imports comments from a Jira issue into Windshift
-func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira.JiraIssue, userMap map[string]int, mentionResolver jira.MentionResolver, mediaResolver jira.MediaResolver, progress *ImportProgress) {
+func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira.JiraIssue, userMap, portalCustomerMap map[string]int, mentionResolver jira.MentionResolver, mediaResolver jira.MediaResolver, progress *ImportProgress, forked bool) error {
 	if issue.Fields.Comment == nil || len(issue.Fields.Comment.Comments) == 0 {
-		return
+		return nil
 	}
 
 	// Create a CommentService without notification/webhook/mention services
@@ -1253,10 +1650,13 @@ func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira
 	// dummyID is fetched lazily — most issues have only resolvable authors,
 	// and we don't want to create the row unless we actually need it.
 	dummyID := 0
-	resolveAuthor := func(c *jira.JiraComment) int {
+	resolveAuthor := func(c *jira.JiraComment) (int, *int) {
 		if c.Author != nil && c.Author.GetIdentifier() != "" {
 			if uid, ok := userMap[c.Author.GetIdentifier()]; ok {
-				return uid
+				return uid, nil
+			}
+			if customerID, ok := portalCustomerMap[c.Author.GetIdentifier()]; ok {
+				return 0, &customerID
 			}
 		}
 		if dummyID == 0 {
@@ -1266,11 +1666,11 @@ func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira
 					slog.String("component", "jira"),
 					slog.String("issue", issue.Key),
 					slog.Any("error", err))
-				return 0
+				return 0, nil
 			}
 			dummyID = id
 		}
-		return dummyID
+		return dummyID, nil
 	}
 
 	for _, comment := range issue.Fields.Comment.Comments {
@@ -1282,8 +1682,8 @@ func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira
 			continue
 		}
 
-		authorID := resolveAuthor(&comment)
-		if authorID == 0 {
+		authorID, portalCustomerID := resolveAuthor(&comment)
+		if authorID == 0 && portalCustomerID == nil {
 			// Dummy-user creation failed; skip rather than violate the FK.
 			continue
 		}
@@ -1295,38 +1695,81 @@ func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira
 		// comments via its visibility field. Windshift models only a
 		// private/internal toggle, so any restricted comment is imported as
 		// private and the original role/group scope is preserved in metadata.
-		isPrivate := comment.Visibility != nil && (comment.Visibility.Type != "" || comment.Visibility.Value != "")
+		isPrivate := (comment.ServiceDeskPublic != nil && !*comment.ServiceDeskPublic) ||
+			(comment.Visibility != nil && (comment.Visibility.Type != "" || comment.Visibility.Value != ""))
 
-		result, err := commentSvc.Create(services.CreateCommentParams{
-			ItemID:      itemID,
-			AuthorID:    authorID,
-			Content:     content,
-			ActorUserID: authorID,
-			IsPrivate:   isPrivate,
-			CreatedAt:   createdAt,
-			UpdatedAt:   updatedAt, // preserve Jira's original updated timestamp
-		})
-		if err != nil {
+		var commentID int
+		var importErr error
+		var previousMapping *previousJiraImportMapping
+		if comment.ID != "" {
+			previousMapping, _ = h.previousSubresourceMapping(jobID, "comment", comment.ID, itemID, forked)
+		}
+		if previousMapping != nil {
+			if !h.imports.CommentExists(previousMapping.WindshiftID) {
+				previousMapping = nil
+			}
+		}
+		if previousMapping != nil {
+			importErr = commentSvc.UpdateImported(services.UpdateImportedCommentParams{
+				CommentID:        previousMapping.WindshiftID,
+				ItemID:           itemID,
+				AuthorID:         authorID,
+				PortalCustomerID: portalCustomerID,
+				Content:          content,
+				IsPrivate:        isPrivate,
+				CreatedAt:        createdAt,
+				UpdatedAt:        updatedAt,
+			})
+			commentID = previousMapping.WindshiftID
+		} else {
+			var result *services.CreateCommentResult
+			result, importErr = commentSvc.CreateImported(services.CreateCommentParams{
+				ItemID:           itemID,
+				AuthorID:         authorID,
+				PortalCustomerID: portalCustomerID,
+				Content:          content,
+				ActorUserID:      authorID,
+				IsPrivate:        isPrivate,
+				CreatedAt:        createdAt,
+				UpdatedAt:        updatedAt, // preserve Jira's original updated timestamp
+				EventMetadata:    itemevents.Import(jobID),
+			})
+			if importErr == nil {
+				commentID = int(result.CommentID)
+			}
+		}
+		if importErr != nil {
 			slog.Error("Failed to import comment",
 				slog.String("component", "jira"),
 				slog.String("issue", issue.Key),
 				slog.String("commentID", comment.ID),
-				slog.Any("error", err))
+				slog.Any("error", importErr))
+			if progress != nil {
+				progress.FailedComments++
+			}
 			continue
 		}
 
-		commentMeta := map[string]interface{}{}
+		commentMeta := map[string]any{}
 		if updatedAt != nil {
 			commentMeta["updated"] = updatedAt.UTC().Format(time.RFC3339)
 		}
 		if createdAt != nil {
 			commentMeta["created"] = createdAt.UTC().Format(time.RFC3339)
 		}
-		if comment.Author != nil && comment.Author.GetIdentifier() != "" {
-			commentMeta["author_account_id"] = comment.Author.GetIdentifier()
+		if author := jiraUserIdentityMetadata(comment.Author); len(author) > 0 {
+			commentMeta["author"] = author
+			if accountID := comment.Author.GetIdentifier(); accountID != "" {
+				commentMeta["author_account_id"] = accountID
+			}
+		} else {
+			commentMeta["author_resolution"] = "anonymous_import_fallback"
 		}
-		if comment.UpdateAuthor != nil && comment.UpdateAuthor.GetIdentifier() != "" {
-			commentMeta["update_author_account_id"] = comment.UpdateAuthor.GetIdentifier()
+		if updateAuthor := jiraUserIdentityMetadata(comment.UpdateAuthor); len(updateAuthor) > 0 {
+			commentMeta["update_author"] = updateAuthor
+			if accountID := comment.UpdateAuthor.GetIdentifier(); accountID != "" {
+				commentMeta["update_author_account_id"] = accountID
+			}
 		}
 		if isPrivate {
 			commentMeta["is_private"] = true
@@ -1335,12 +1778,23 @@ func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira
 				commentMeta["visibility_value"] = comment.Visibility.Value
 			}
 		}
+		if comment.ServiceDeskPublic != nil {
+			commentMeta["jira_service_desk_public"] = *comment.ServiceDeskPublic
+		}
 
-		h.recordMapping(jobID, "comment", comment.ID, issue.Key, int(result.CommentID), commentMeta)
+		if previousMapping != nil {
+			commentMeta["action"] = "update_existing"
+			commentMeta["was_created"] = jiraImportMappingWasCreated(previousMapping.Metadata)
+			commentMeta["reimported_from_job_id"] = previousMapping.JobID
+		}
+		if err := h.recordMappingAndTransferOwnership(jobID, "comment", comment.ID, issue.Key, commentID, commentMeta, previousMapping); err != nil {
+			return fmt.Errorf("record Jira comment mapping: %w", err)
+		}
 		if progress != nil {
 			progress.ImportedComments++
 		}
 	}
+	return nil
 }
 
 // ================================================================
@@ -1349,76 +1803,24 @@ func (h *JiraImportHandler) importComments(jobID string, itemID int, issue *jira
 
 // importIssueLinks creates item_links from Jira issue links stored in mapping metadata.
 // Must be called after all issues for a project are imported.
-func (h *JiraImportHandler) importIssueLinks(jobID string) {
-	// Query all item mappings with issue_links metadata
-	rows, err := h.db.Query(`
-		SELECT windshift_id, jira_key, metadata_json
-		FROM jira_import_id_mappings
-		WHERE job_id = ? AND entity_type = 'item'
-	`, jobID)
+func (h *JiraImportHandler) importIssueLinks(jobID string) error {
+	allLinks, err := h.imports.IssueLinks(jobID)
 	if err != nil {
 		slog.Error("Failed to query item mappings for link import", slog.String("component", "jira"), slog.Any("error", err))
-		return
-	}
-	defer func() { _ = rows.Close() }()
-
-	type issueLinkInfo struct {
-		sourceID  int
-		sourceKey string
-		links     []map[string]interface{}
-	}
-	var allLinks []issueLinkInfo
-
-	for rows.Next() {
-		var windshiftID int
-		var jiraKey string
-		var metadataJSON sql.NullString
-		if err := rows.Scan(&windshiftID, &jiraKey, &metadataJSON); err != nil {
-			slog.Warn("failed to scan item mapping row for link import", slog.String("component", "jira"), slog.Any("error", err))
-			continue
-		}
-		if !metadataJSON.Valid {
-			continue
-		}
-		var meta map[string]interface{}
-		if err := json.Unmarshal([]byte(metadataJSON.String), &meta); err != nil {
-			continue
-		}
-		linksRaw, ok := meta["issue_links"].([]interface{})
-		if !ok || len(linksRaw) == 0 {
-			continue
-		}
-		var links []map[string]interface{}
-		for _, l := range linksRaw {
-			if m, ok := l.(map[string]interface{}); ok {
-				links = append(links, m)
-			}
-		}
-		if len(links) > 0 {
-			allLinks = append(allLinks, issueLinkInfo{sourceID: windshiftID, sourceKey: jiraKey, links: links})
-		}
-	}
-	if err := rows.Err(); err != nil {
-		slog.Error("error iterating item mapping rows for link import", slog.String("component", "jira"), slog.Any("error", err))
-		return
+		return fmt.Errorf("query Jira item mappings for links: %w", err)
 	}
 
-	// Cache link type lookups
 	linkTypeCache := make(map[string]int) // link type name -> ID
 	linkSvc := services.NewItemLinkService(h.db)
 
 	for _, info := range allLinks {
-		for _, link := range info.links {
+		for _, link := range info.Links {
 			typeName, _ := link["type_name"].(string)
 			if typeName == "" {
 				continue
 			}
 
-			// Determine source and target.
-			// Outward link: this issue is the source, outward_key is the target.
-			// Inward link:  inward_key is the source, this issue is the target.
-			// We only build the link from the outward side so an A→B relationship
-			// imported from both ends doesn't produce two rows.
+			// Build each relationship from its outward side to avoid duplicates.
 			outwardKey, _ := link["outward_key"].(string)
 			if outwardKey == "" {
 				// Inward-only entry. If the source is in this import we'll catch
@@ -1430,17 +1832,16 @@ func (h *JiraImportHandler) importIssueLinks(jobID string) {
 				if inwardKey == "" {
 					continue
 				}
-				var sourceID int
-				err := h.db.QueryRow(`
-					SELECT windshift_id FROM jira_import_id_mappings
-					WHERE job_id = ? AND entity_type = 'item' AND jira_key = ?
-				`, jobID, inwardKey).Scan(&sourceID)
+				_, err := h.imports.LookupMappedEntityByKey(jobID, "item", inwardKey)
 				if errors.Is(err, sql.ErrNoRows) {
-					slog.Warn("Dropping inward link from non-imported issue",
-						slog.String("component", "jira"),
-						slog.String("source", inwardKey),
-						slog.String("target", info.sourceKey),
-						slog.String("typeName", typeName))
+					if externalErr := h.importExternalJiraIssueLink(jobID, info.SourceID, info.SourceKey, inwardKey, typeName, "inward", link); externalErr != nil {
+						if mappingErr := h.mappingFailure(jobID); mappingErr != nil {
+							return mappingErr
+						}
+						slog.Warn("Failed to preserve inward link from non-imported issue",
+							slog.String("component", "jira"), slog.String("source", inwardKey),
+							slog.String("target", info.SourceKey), slog.String("typeName", typeName), slog.Any("error", externalErr))
+					}
 				} else if err != nil {
 					slog.Warn("Failed to look up inward link source",
 						slog.String("component", "jira"),
@@ -1451,25 +1852,21 @@ func (h *JiraImportHandler) importIssueLinks(jobID string) {
 			}
 
 			// Look up target Windshift ID
-			var targetID int
-			err := h.db.QueryRow(`
-				SELECT windshift_id FROM jira_import_id_mappings
-				WHERE job_id = ? AND entity_type = 'item' AND jira_key = ?
-			`, jobID, outwardKey).Scan(&targetID)
+			targetID, err := h.imports.LookupMappedEntityByKey(jobID, "item", outwardKey)
 			if errors.Is(err, sql.ErrNoRows) {
-				// Target wasn't part of this import. Same external-reference
-				// limitation as above — log so the drop is observable.
-				slog.Warn("Dropping outward link to non-imported issue",
-					slog.String("component", "jira"),
-					slog.String("source", info.sourceKey),
-					slog.String("target", outwardKey),
-					slog.String("typeName", typeName))
+				if externalErr := h.importExternalJiraIssueLink(jobID, info.SourceID, info.SourceKey, outwardKey, typeName, "outward", link); externalErr != nil {
+					if mappingErr := h.mappingFailure(jobID); mappingErr != nil {
+						return mappingErr
+					}
+					slog.Warn("Failed to preserve outward link to non-imported issue",
+						slog.String("component", "jira"), slog.String("source", info.SourceKey),
+						slog.String("target", outwardKey), slog.String("typeName", typeName), slog.Any("error", externalErr))
+				}
 				continue
 			} else if err != nil {
 				continue
 			}
 
-			// Ensure link type exists
 			linkTypeID, ok := linkTypeCache[typeName]
 			if !ok {
 				linkTypeID, err = h.ensureLinkType(typeName, link)
@@ -1483,40 +1880,64 @@ func (h *JiraImportHandler) importIssueLinks(jobID string) {
 				linkTypeCache[typeName] = linkTypeID
 			}
 
-			// Create item link via service (handles duplicate check)
-			linkID, err := linkSvc.CreateLink(services.CreateItemLinkParams{
+			mappingID := fmt.Sprintf("%s-%s-%s", info.SourceKey, typeName, outwardKey)
+			previousMapping, previousErr := h.findPreviousJiraImportMapping(jobID, "link", mappingID)
+			if previousErr != nil {
+				slog.Warn("Failed to find prior Jira item-link mapping",
+					slog.String("component", "jira"),
+					slog.String("mappingID", mappingID),
+					slog.Any("error", previousErr))
+				previousMapping = nil
+			}
+			linkID, err := linkSvc.CreateLinkWithMetadata(services.CreateItemLinkParams{
 				LinkTypeID: linkTypeID,
 				SourceType: "item",
-				SourceID:   info.sourceID,
+				SourceID:   info.SourceID,
 				TargetType: "item",
 				TargetID:   targetID,
-			})
+			}, itemevents.Import(jobID))
 			if err != nil {
 				slog.Error("Failed to create item link",
 					slog.String("component", "jira"),
-					slog.String("source", info.sourceKey),
+					slog.String("source", info.SourceKey),
 					slog.String("target", outwardKey),
 					slog.Any("error", err))
 				continue
 			}
 
 			if linkID > 0 {
-				h.recordMapping(jobID, "link", fmt.Sprintf("%s-%s-%s", info.sourceKey, typeName, outwardKey), "", int(linkID), nil)
+				if err := h.recordMapping(jobID, "link", mappingID, "", int(linkID), map[string]any{"action": "create"}); err != nil {
+					return fmt.Errorf("record Jira item link mapping: %w", err)
+				}
+				continue
+			}
+			if previousMapping != nil && h.imports.ItemLinkExists(previousMapping.WindshiftID) {
+				if err := h.recordMappingAndTransferOwnership(jobID, "link", mappingID, "", previousMapping.WindshiftID, map[string]any{
+					"action":                 "reuse_existing_mapping",
+					"was_created":            jiraImportMappingWasCreated(previousMapping.Metadata),
+					"reimported_from_job_id": previousMapping.JobID,
+				}, previousMapping); err != nil {
+					return fmt.Errorf("record Jira item link mapping: %w", err)
+				}
 			}
 		}
 	}
+	return nil
+}
+
+func (h *JiraImportHandler) importExternalJiraIssueLink(
+	jobID string,
+	itemID int,
+	itemKey, externalKey, typeName, direction string,
+	sourceMetadata map[string]any,
+) error {
+	return h.imports.UpsertExternalIssueLink(
+		jobID, itemID, itemKey, externalKey, typeName, direction, sourceMetadata,
+	)
 }
 
 // ensureLinkType finds or creates a link type matching the Jira link type
-func (h *JiraImportHandler) ensureLinkType(typeName string, linkData map[string]interface{}) (int, error) {
-	// Try to find existing by name
-	var existingID int
-	err := h.db.QueryRow(`SELECT id FROM link_types WHERE name = ?`, typeName).Scan(&existingID)
-	if err == nil {
-		return existingID, nil
-	}
-
-	// Create new link type
+func (h *JiraImportHandler) ensureLinkType(typeName string, linkData map[string]any) (int, error) {
 	forwardLabel, _ := linkData["outward"].(string)
 	reverseLabel, _ := linkData["inward"].(string)
 	if forwardLabel == "" {
@@ -1526,28 +1947,20 @@ func (h *JiraImportHandler) ensureLinkType(typeName string, linkData map[string]
 		reverseLabel = typeName
 	}
 
-	linkTypeSvc := services.NewEnumService(h.db, services.NewLinkTypeConfig())
-	linkType := &models.LinkType{
-		Name:         typeName,
-		ForwardLabel: forwardLabel,
-		ReverseLabel: reverseLabel,
-		Color:        "#6B7280",
-		Active:       true,
-	}
-	entity, err := linkTypeSvc.Create(linkType, nil)
+	id, err := h.imports.EnsureLinkType(typeName, forwardLabel, reverseLabel)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create link type: %w", err)
 	}
-	return entity.GetID(), nil
+	return id, nil
 }
 
 // ================================================================
 // Phase 6: Worklog Import
 // ================================================================
 
-func (h *JiraImportHandler) importWorklogs(jobID string, itemID int, issue *jira.JiraIssue, userMap map[string]int, mentionResolver jira.MentionResolver, timeProjectID *int, progress *ImportProgress) {
+func (h *JiraImportHandler) importWorklogs(jobID string, itemID int, issue *jira.JiraIssue, userMap map[string]int, mentionResolver jira.MentionResolver, timeProjectID *int, progress *ImportProgress, forked bool) error {
 	if issue.Fields.Worklog == nil || len(issue.Fields.Worklog.Worklogs) == 0 || timeProjectID == nil {
-		return
+		return nil
 	}
 	if issue.Fields.Worklog.Total > len(issue.Fields.Worklog.Worklogs) {
 		slog.Warn("Jira issue worklog payload is paginated; importing visible worklogs only",
@@ -1557,14 +1970,14 @@ func (h *JiraImportHandler) importWorklogs(jobID string, itemID int, issue *jira
 			slog.Int("total", issue.Fields.Worklog.Total))
 	}
 
-	var customerID int
-	if err := h.db.QueryRow(`SELECT customer_id FROM time_projects WHERE id = ?`, *timeProjectID).Scan(&customerID); err != nil {
+	customerID, err := h.imports.TimeProjectCustomerID(*timeProjectID)
+	if err != nil {
 		slog.Error("Failed to resolve time project customer for Jira worklogs",
 			slog.String("component", "jira"),
 			slog.String("issue", issue.Key),
 			slog.Int("timeProjectID", *timeProjectID),
 			slog.Any("error", err))
-		return
+		return nil
 	}
 
 	for _, worklog := range issue.Fields.Worklog.Worklogs {
@@ -1615,50 +2028,119 @@ func (h *JiraImportHandler) importWorklogs(jobID string, itemID int, issue *jira
 			updatedAt = updated.Unix()
 		}
 
-		var worklogID int64
-		err := h.db.QueryRow(`
-			INSERT INTO time_worklogs (project_id, customer_id, user_id, item_id, description, date, start_time, end_time, duration_minutes, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
-		`, *timeProjectID, customerID, userID, itemID, description, date.Unix(), started.Unix(), end.Unix(), durationMinutes, createdAt, updatedAt).Scan(&worklogID)
+		previousMapping, lookupErr := h.previousSubresourceMapping(jobID, "worklog", worklog.ID, itemID, forked)
+		if lookupErr != nil {
+			slog.Warn("Failed to find prior Jira worklog mapping",
+				slog.String("component", "jira"),
+				slog.String("worklogID", worklog.ID),
+				slog.Any("error", lookupErr))
+			previousMapping = nil
+		}
+		worklogID, err := h.imports.UpsertImportedWorklog(repository.ImportedWorklog{
+			ProjectID:       *timeProjectID,
+			CustomerID:      customerID,
+			UserID:          userID,
+			ItemID:          itemID,
+			Description:     description,
+			DateUnix:        date.Unix(),
+			StartTimeUnix:   started.Unix(),
+			EndTimeUnix:     end.Unix(),
+			DurationMinutes: durationMinutes,
+			CreatedAtUnix:   createdAt,
+			UpdatedAtUnix:   updatedAt,
+		}, previousMapping)
 		if err != nil {
 			slog.Error("Failed to import Jira worklog",
 				slog.String("component", "jira"),
 				slog.String("issue", issue.Key),
 				slog.String("worklogID", worklog.ID),
 				slog.Any("error", err))
+			if progress != nil {
+				progress.FailedWorklogs++
+			}
 			continue
 		}
 
-		h.recordMapping(jobID, "worklog", worklog.ID, issue.Key, int(worklogID), map[string]any{
+		worklogMeta := map[string]any{
 			"time_spent_seconds": worklog.TimeSpentSeconds,
 			"started":            started.UTC().Format(time.RFC3339),
-		})
+		}
+		if author := jiraUserIdentityMetadata(worklog.Author); len(author) > 0 {
+			worklogMeta["author"] = author
+		} else {
+			worklogMeta["author_resolution"] = "anonymous"
+		}
+		if previousMapping != nil {
+			worklogMeta["action"] = "update_existing"
+			worklogMeta["was_created"] = jiraImportMappingWasCreated(previousMapping.Metadata)
+			worklogMeta["reimported_from_job_id"] = previousMapping.JobID
+		}
+		if err := h.recordMappingAndTransferOwnership(jobID, "worklog", worklog.ID, issue.Key, int(worklogID), worklogMeta, previousMapping); err != nil {
+			return fmt.Errorf("record Jira worklog mapping: %w", err)
+		}
 		if progress != nil {
 			progress.ImportedWorklogs++
 		}
 	}
+	return nil
 }
 
 // ================================================================
 // Phase 7: Attachment Import
 // ================================================================
 
+// jiraInternalAttachmentIDs returns the Jira attachment ids that must be
+// hidden from portal customers. JSM lets agents attach files to internal
+// notes, but the issue payload carries no visibility flag on the file itself,
+// so an attachment is treated as customer-visible only when it is referenced
+// from a body the customer can see: the request description or a public
+// comment. Non-JSM imports have no portal exposure and stay visible.
+func jiraInternalAttachmentIDs(issue *jira.JiraIssue, rawDescription any, serviceDeskImport bool) map[string]bool {
+	if !serviceDeskImport || issue == nil {
+		return nil
+	}
+	visible := jira.CollectADFMediaIDs(rawDescription)
+	if issue.Fields.Comment != nil {
+		for _, comment := range issue.Fields.Comment.Comments {
+			if comment.ServiceDeskPublic != nil && !*comment.ServiceDeskPublic {
+				continue
+			}
+			for id := range jira.CollectADFMediaIDs(comment.Body) {
+				visible[id] = true
+			}
+		}
+	}
+	internal := make(map[string]bool)
+	for _, attachment := range issue.Fields.Attachment {
+		if attachment.ID != "" && !visible[attachment.ID] {
+			internal[attachment.ID] = true
+		}
+	}
+	return internal
+}
+
 // importAttachments downloads and stores attachments from a Jira issue. It
 // returns a map from Jira attachment id → the Windshift attachment reference
 // (id, mime type, original filename) so ADF media nodes can be linked to the
-// imported attachment instead of left as a placeholder.
-func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string, itemID int, issue *jira.JiraIssue, userMap map[string]int, client jira.Client, progress *ImportProgress) map[string]jira.MediaAttachment {
+// imported attachment instead of left as a placeholder. Attachments listed in
+// internalIDs are stored as internal so portal customers cannot list or
+// download them.
+func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string, itemID int, issue *jira.JiraIssue, userMap map[string]int, client jira.Client, internalIDs map[string]bool, progress *ImportProgress, forked bool) (map[string]jira.MediaAttachment, error) {
 	if len(issue.Fields.Attachment) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// Get attachment storage path from settings
-	var attachmentPath string
-	err := h.db.QueryRow(`SELECT attachment_path FROM attachment_settings WHERE enabled = true LIMIT 1`).Scan(&attachmentPath)
-	if err != nil || attachmentPath == "" {
+	// Get attachment storage path from settings.
+	attachmentPath, ok := h.imports.AttachmentPath()
+	if !ok {
 		slog.Warn("Attachment settings not configured, skipping attachment import",
 			slog.String("component", "jira"), slog.String("issue", issue.Key))
-		return nil
+		return jiraNoAttachmentMediaRefs()
+	}
+	if err := ensureJiraAttachmentStorage(attachmentPath); err != nil {
+		slog.Error("Failed to prepare attachment storage",
+			slog.String("component", "jira"), slog.String("issue", issue.Key), slog.Any("error", err))
+		return map[string]jira.MediaAttachment{}, nil
 	}
 
 	mediaRefs := make(map[string]jira.MediaAttachment)
@@ -1669,7 +2151,39 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 
 		progress.TotalAttachments++
 
-		// Download the attachment
+		previousMapping, lookupErr := h.previousSubresourceMapping(jobID, "attachment", attachment.ID, itemID, forked)
+		if lookupErr != nil {
+			slog.Warn("Failed to find prior Jira attachment mapping",
+				slog.String("component", "jira"),
+				slog.String("attachmentID", attachment.ID),
+				slog.Any("error", lookupErr))
+			previousMapping = nil
+		}
+		if previousMapping != nil {
+			mimeType, originalFilename, exists := h.imports.ReassignAttachment(previousMapping.WindshiftID, itemID, internalIDs[attachment.ID])
+			if !exists {
+				previousMapping = nil
+			} else {
+				metadata := jiraImportMappingMetadata(previousMapping.Metadata)
+				if metadata == nil {
+					metadata = make(map[string]any)
+				}
+				metadata["action"] = "reuse_existing_mapping"
+				metadata["was_created"] = jiraImportMappingWasCreated(previousMapping.Metadata)
+				metadata["reimported_from_job_id"] = previousMapping.JobID
+				if mappingErr := h.recordMappingAndTransferOwnership(jobID, "attachment", attachment.ID, issue.Key, previousMapping.WindshiftID, metadata, previousMapping); mappingErr == nil {
+					mediaRefs[attachment.ID] = jira.MediaAttachment{
+						ID:               previousMapping.WindshiftID,
+						MimeType:         mimeType,
+						OriginalFilename: originalFilename,
+					}
+					progress.ImportedAttachments++
+					continue
+				}
+				return nil, fmt.Errorf("record Jira attachment mapping: %w", h.mappingFailure(jobID))
+			}
+		}
+
 		reader, _, err := client.DownloadAttachment(ctx, attachment.Content)
 		if err != nil {
 			slog.Error("Failed to download attachment",
@@ -1680,11 +2194,9 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			continue
 		}
 
-		// Generate a unique filename to avoid collisions
 		storedFilename := fmt.Sprintf("%s_%s", uuid.New().String(), filepath.Base(attachment.Filename))
 		filePath := filepath.Join(attachmentPath, storedFilename)
 
-		// Save to disk
 		file, err := os.Create(filePath) //nolint:gosec // G304 — filePath from attachmentPath + UUID + filename
 		if err != nil {
 			_ = reader.Close()
@@ -1713,7 +2225,6 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			fileSize = written
 		}
 
-		// Map uploader
 		var uploadedBy *int
 		if attachment.Author != nil && attachment.Author.GetIdentifier() != "" {
 			if uid, ok := userMap[attachment.Author.GetIdentifier()]; ok {
@@ -1721,12 +2232,16 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			}
 		}
 
-		mimeType := attachment.MimeType
+		// SECURITY: do not trust the remote-declared Content-Type. A malicious
+		// or compromised Jira source controls attachment.MimeType, and the
+		// download handler uses the stored MIME to decide inline rendering.
+		// Detect the type from the actual bytes so a remote source cannot get a
+		// script-capable document served inline in the app origin (stored XSS).
+		mimeType := detectStoredMimeType(filePath)
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
 		}
 
-		// Insert attachment record via service
 		attachmentSvc := services.NewAttachmentService(h.db)
 		attachmentID, err := attachmentSvc.CreateRecord(services.CreateAttachmentParams{
 			ItemID:           itemID,
@@ -1737,6 +2252,7 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			MimeType:         mimeType,
 			FileSize:         fileSize,
 			UploadedBy:       uploadedBy,
+			IsInternal:       internalIDs[attachment.ID],
 		})
 		if err != nil {
 			slog.Error("Failed to insert attachment record",
@@ -1747,7 +2263,7 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			continue
 		}
 
-		attachmentMeta := map[string]interface{}{
+		attachmentMeta := map[string]any{
 			"filename":  attachment.Filename,
 			"content":   attachment.Content,
 			"mime_type": mimeType,
@@ -1756,11 +2272,11 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 		if attachment.Thumbnail != "" {
 			attachmentMeta["thumbnail"] = attachment.Thumbnail
 		}
-		if attachment.Author != nil && attachment.Author.GetIdentifier() != "" {
-			attachmentMeta["author_account_id"] = attachment.Author.GetIdentifier()
+		if author := jiraUserIdentityMetadata(attachment.Author); len(author) > 0 {
+			attachmentMeta["author"] = author
 		}
 		if createdAt := jira.ParseJiraTimestamp(attachment.Created); createdAt != nil {
-			if _, err := h.db.ExecWrite(`UPDATE attachments SET created_at = ? WHERE id = ?`, *createdAt, attachmentID); err != nil {
+			if err := h.imports.PreserveAttachmentCreatedAt(attachmentID, *createdAt); err != nil {
 				slog.Warn("Failed to preserve Jira attachment created timestamp",
 					slog.String("component", "jira"),
 					slog.String("issue", issue.Key),
@@ -1771,7 +2287,9 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			}
 		}
 
-		h.recordMapping(jobID, "attachment", attachment.ID, issue.Key, int(attachmentID), attachmentMeta)
+		if err := h.recordMapping(jobID, "attachment", attachment.ID, issue.Key, int(attachmentID), attachmentMeta); err != nil {
+			return nil, fmt.Errorf("record Jira attachment mapping: %w", err)
+		}
 		progress.ImportedAttachments++
 
 		// Record the Jira→Windshift attachment reference so ADF media nodes
@@ -1784,5 +2302,35 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			}
 		}
 	}
-	return mediaRefs
+	return mediaRefs, nil
+}
+
+func jiraNoAttachmentMediaRefs() (map[string]jira.MediaAttachment, error) {
+	return nil, nil
+}
+
+func ensureJiraAttachmentStorage(attachmentPath string) error {
+	if err := os.MkdirAll(attachmentPath, 0o750); err != nil {
+		return fmt.Errorf("create attachment directory: %w", err)
+	}
+	return nil
+}
+
+// detectStoredMimeType sniffs the Content-Type of an already-written file from
+// its leading bytes via http.DetectContentType, so the stored MIME reflects the
+// actual content rather than a remote-declared value. Returns "" if the file
+// cannot be read (caller falls back to application/octet-stream).
+func detectStoredMimeType(path string) string {
+	f, err := os.Open(path) //nolint:gosec // G304 — path is attachmentPath + UUID + filepath.Base(filename)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && n == 0 {
+		return ""
+	}
+	return http.DetectContentType(buf[:n])
 }

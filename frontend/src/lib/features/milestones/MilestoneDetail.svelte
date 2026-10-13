@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
   import { t } from '../../stores/i18n.svelte.js';
   import { confirm } from '../../composables/useConfirm.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
@@ -11,23 +12,19 @@
   import Modal from '../../dialogs/Modal.svelte';
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
   import DropdownMenu from '../../layout/DropdownMenu.svelte';
-  import Textarea from '../../components/Textarea.svelte';
   import Label from '../../components/Label.svelte';
   import { milestonesStore } from '../../stores/milestones.js';
   import { formatDateShort, daysUntil } from '../../utils/dateFormatter.js';
   import { safeHref } from '../../utils/sanitize';
-  import {
-    PROGRESS_CHART_CIRCUMFERENCE,
-    PROGRESS_CHART_RADIUS,
-    buildProgressSegments,
-    formatPercent,
-  } from '../../utils/progressChart.js';
+  import ProgressSummary from '../../components/ProgressSummary.svelte';
   import ItemsByStatusCategory from '../../components/ItemsByStatusCategory.svelte';
   import { permissionStore, isSystemAdmin } from '../../stores/permissions.svelte.js';
   import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
   import BasePicker from '../../pickers/BasePicker.svelte';
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
   import MilestoneReleaseModal from './MilestoneReleaseModal.svelte';
+	import TextField from '../../components/TextField.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
 
   let { milestoneId, workspaceId = null } = $props();
 
@@ -67,8 +64,6 @@
     { value: 'cancelled', label: t('milestones.status.cancelled'), lozengeColor: 'red' }
   ]);
 
-  const radius = PROGRESS_CHART_RADIUS;
-  const circumference = PROGRESS_CHART_CIRCUMFERENCE;
 
   onMount(async () => {
     await loadProgress();
@@ -107,8 +102,6 @@
   function getStatusInfo(status) {
     return statusOptions.find(s => s.value === status) || statusOptions[0];
   }
-
-  const buildSegments = buildProgressSegments;
 
   function toggleCategory(categoryName) {
     expandedCategories[categoryName] = !expandedCategories[categoryName];
@@ -164,7 +157,6 @@
     }
   }
 
-  const segments = $derived(progress ? buildSegments(progress.status_breakdown, progress.total_items) : []);
   const daysInfo = $derived(progress?.target_date ? daysUntil(progress.target_date, {
     overdue: (n) => t('milestones.daysOverdue', { count: n }),
     today: t('milestones.dueToday'),
@@ -237,31 +229,21 @@
     </div>
 
     {#if loading}
-      <div class="flex items-center justify-center py-20">
-        <div class="animate-spin rounded-full h-8 w-8 border-b-2" style="border-color: var(--ds-text-subtle);"></div>
-      </div>
+      <StateDisplay type="loading" />
     {:else if error}
       <div class="text-center py-20">
-        <p class="text-red-500">{error}</p>
+        <p class="text-ds-text-danger">{error}</p>
         <Button onclick={loadProgress} class="mt-4">{t('common.retry')}</Button>
       </div>
     {:else if progress}
       <!-- Milestone Header Card -->
       <div class="rounded-xl border p-6 mb-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
         <div class="flex items-start justify-between mb-4">
-          <div class="flex items-center gap-3">
-            <div
-              class="w-12 h-12 rounded-full flex items-center justify-center"
-              style="background-color: {progress.category_color ? progress.category_color + '20' : 'rgba(37,99,235,0.12)'};"
-            >
-              <Flag class="w-6 h-6" style="color: {progress.category_color || '#2563eb'};" />
-            </div>
-            <div>
-              <h1 class="text-2xl font-semibold" style="color: var(--ds-text);">{progress.milestone_name}</h1>
-              {#if progress.description}
-                <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">{progress.description}</p>
-              {/if}
-            </div>
+          <div>
+            <h1 class="text-2xl font-semibold" style="color: var(--ds-text);">{progress.milestone_name}</h1>
+            {#if progress.description}
+              <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">{progress.description}</p>
+            {/if}
           </div>
           {#if progress.status}
             {@const statusInfo = getStatusInfo(progress.status)}
@@ -283,7 +265,7 @@
         {/if}
         {#if milestone?.releases?.length > 0}
           <div class="flex flex-col gap-1.5 mt-2">
-            {#each milestone.releases as release}
+            {#each milestone.releases as release (release.id)}
               <div class="flex items-center gap-2 text-sm">
                 <Tag class="w-4 h-4 shrink-0" style="color: var(--ds-text-subtle);" />
                 <span class="font-mono text-xs" style="color: var(--ds-text);">{release.tag_name}</span>
@@ -297,9 +279,14 @@
                 {#if release.is_prerelease}
                   <Lozenge color="yellow" size="sm">Pre-release</Lozenge>
                 {/if}
-                {#if release.scm_release_url}
+                {#if release.release_status && release.release_status !== 'released'}
+                  <Lozenge color={release.release_status === 'missing' ? 'red' : 'blue'} size="sm">
+                    {release.release_status.replaceAll('_', ' ')}
+                  </Lozenge>
+                {/if}
+                {#if release.scm_release_url || release.tag_url}
                   <a
-                    href={safeHref(release.scm_release_url)}
+                    href={safeHref(release.scm_release_url || release.tag_url)}
                     target="_blank"
                     rel="noopener noreferrer"
                     class="hover:underline inline-flex items-center gap-1"
@@ -308,7 +295,10 @@
                     <ExternalLink class="w-3 h-3" />
                   </a>
                 {/if}
-                <span class="text-xs" style="color: var(--ds-text-subtlest);">{formatDateShort(release.created_at)}</span>
+                {#if release.assets?.length}
+                  <span class="text-xs" style="color: var(--ds-text-subtlest);">{release.assets.length} assets</span>
+                {/if}
+                <span class="text-xs" style="color: var(--ds-text-subtlest);">{formatDateShort(release.released_at || release.created_at)}</span>
               </div>
             {/each}
           </div>
@@ -328,92 +318,18 @@
         {/if}
       </div>
 
-      <!-- Progress Section -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-        <!-- Circular Progress Chart -->
-        <div class="rounded-xl border p-6 flex flex-col items-center" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <div class="relative">
-            {#if progress.total_items > 0}
-              <svg viewBox="0 0 140 140" class="w-36 h-36" role="img" aria-label="Milestone progress">
-                <circle
-                  cx="70"
-                  cy="70"
-                  r={radius}
-                  fill="transparent"
-                  stroke="var(--ds-border)"
-                  stroke-width="16"
-                />
-                {#each segments as segment (segment.category_name)}
-                  <circle
-                    cx="70"
-                    cy="70"
-                    r={radius}
-                    fill="transparent"
-                    stroke={segment.color}
-                    stroke-width="16"
-                    stroke-linecap="butt"
-                    stroke-dasharray={segment.dasharray}
-                    stroke-dashoffset={segment.offset}
-                    transform="rotate(-90 70 70)"
-                  />
-                {/each}
-                <text class="text-2xl font-bold" x="70" y="68" text-anchor="middle" fill="var(--ds-text)">
-                  {formatPercent(progress.percent_complete)}%
-                </text>
-                <text class="text-xs uppercase" x="70" y="86" text-anchor="middle" fill="var(--ds-text-subtle)">
-                  {t('milestones.complete')}
-                </text>
-              </svg>
-            {:else}
-              <div class="w-36 h-36 rounded-full border-2 border-dashed flex items-center justify-center" style="border-color: var(--ds-border);">
-                <span class="text-sm" style="color: var(--ds-text-subtlest);">{t('milestones.noItems')}</span>
-              </div>
-            {/if}
-          </div>
-        </div>
-
-        <!-- Summary Stats -->
-        <div class="rounded-xl border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <h3 class="text-sm font-medium mb-4" style="color: var(--ds-text-subtle);">{t('common.summary')}</h3>
-          <div class="space-y-3">
-            <div class="flex justify-between items-center">
-              <span style="color: var(--ds-text-subtle);">{t('common.total')}</span>
-              <span class="font-semibold" style="color: var(--ds-text);">{progress.total_items}</span>
-            </div>
-            <div class="flex justify-between items-center">
-              <span style="color: var(--ds-text-subtle);">{t('common.done')}</span>
-              <span class="font-semibold" style="color: var(--ds-text-success);">{progress.completed_items}</span>
-            </div>
-            <div class="flex justify-between items-center">
-              <span style="color: var(--ds-text-subtle);">{t('time.remaining')}</span>
-              <span class="font-semibold" style="color: var(--ds-text);">{progress.total_items - progress.completed_items}</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Status Breakdown Legend -->
-        <div class="rounded-xl border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <h3 class="text-sm font-medium mb-4" style="color: var(--ds-text-subtle);">{t('milestones.byStatusCategory')}</h3>
-          <div class="space-y-2">
-            {#if progress.status_breakdown && progress.status_breakdown.length > 0}
-              {#each progress.status_breakdown as breakdown}
-                <div class="flex items-center justify-between">
-                  <div class="flex items-center gap-2">
-                    <div
-                      class="w-3 h-3 rounded-full"
-                      style="background-color: {breakdown.category_color || '#9ca3af'};"
-                    ></div>
-                    <span class="text-sm" style="color: var(--ds-text);">{breakdown.category_name}</span>
-                  </div>
-                  <span class="text-sm font-medium" style="color: var(--ds-text-subtle);">{breakdown.item_count}</span>
-                </div>
-              {/each}
-            {:else}
-              <p class="text-sm" style="color: var(--ds-text-subtlest);">{t('milestones.noStatusData')}</p>
-            {/if}
-          </div>
-        </div>
-      </div>
+      <ProgressSummary
+        {progress}
+        ariaLabel="Milestone progress"
+        completeLabel={t('milestones.complete')}
+        noItemsLabel={t('milestones.noItems')}
+        summaryLabel={t('common.summary')}
+        totalLabel={t('common.total')}
+        completedLabel={t('common.done')}
+        remainingLabel={t('time.remaining')}
+        statusLabel={t('milestones.byStatusCategory')}
+        noStatusDataLabel={t('milestones.noStatusData')}
+      />
 
       <!-- Items Grouped by Category -->
       <ItemsByStatusCategory
@@ -463,26 +379,22 @@
     <form onsubmit={(e) => { e.preventDefault(); saveMilestone(); }}>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
-          <Label for="milestone-name" required class="mb-2">{t('milestones.milestoneName')}</Label>
-          <input
+          <TextField
+            label={t('milestones.milestoneName')}
             id="milestone-name"
-            type="text"
-            bind:value={formData.name}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            placeholder={t('milestones.milestoneNamePlaceholder')}
             required
+            type="text"
+            placeholder={t('milestones.milestoneNamePlaceholder')}
+            bind:value={formData.name}
           />
         </div>
 
         <div>
-          <Label for="milestone-target-date" class="mb-2">{t('milestones.targetDate')}</Label>
-          <input
+          <TextField
+            label={t('milestones.targetDate')}
             id="milestone-target-date"
             type="date"
             bind:value={formData.target_date}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
           />
         </div>
 
@@ -498,12 +410,12 @@
         </div>
 
         <div class="md:col-span-2">
-          <Label for="milestone-description" class="mb-2">{t('common.description')}</Label>
-          <Textarea
+          <TextareaField
+            label={t('common.description')}
             id="milestone-description"
-            bind:value={formData.description}
             rows={3}
             placeholder={t('milestones.descriptionPlaceholder')}
+            bind:value={formData.description}
           />
         </div>
       </div>
@@ -520,4 +432,3 @@
   />
   {/snippet}
 </Modal>
-

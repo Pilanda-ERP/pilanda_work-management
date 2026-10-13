@@ -1,5 +1,6 @@
 -- SSO (Single Sign-On) tables for OIDC and future SAML support (PostgreSQL)
 -- Uses github.com/zitadel/oidc library for OIDC implementation
+-- migration: 20260710_sso_state_request_id
 
 -- SSO Identity Providers configuration
 -- Supports multiple providers (MVP limits to one OIDC)
@@ -17,9 +18,9 @@ CREATE TABLE IF NOT EXISTS sso_providers (
 	scopes TEXT DEFAULT 'openid email profile', -- Space-separated scopes
 	-- Common settings
 	auto_provision_users BOOLEAN DEFAULT FALSE, -- Create users on first SSO login
-	require_verified_email BOOLEAN DEFAULT TRUE, -- Require email_verified=true from IdP (security)
+	require_verified_email BOOLEAN DEFAULT TRUE, -- Trust provider-managed email when verification status is absent
 	-- Claim/attribute mappings (JSON for flexibility)
-	attribute_mapping TEXT DEFAULT '{"email":"email","name":"name","given_name":"given_name","family_name":"family_name","username":"preferred_username"}',
+	attribute_mapping TEXT DEFAULT '{"email":"email","name":"name","given_name":"given_name","family_name":"family_name","username":"preferred_username","email_verified":"email_verified"}',
 	-- SAML-specific fields
 	saml_idp_metadata_url TEXT,  -- IdP metadata URL for auto-configuration
 	saml_idp_sso_url TEXT,       -- IdP Single Sign-On URL
@@ -42,10 +43,11 @@ CREATE TABLE IF NOT EXISTS sso_state_tokens (
 	provider_id INTEGER NOT NULL,
 	state TEXT UNIQUE NOT NULL, -- Cryptographically random state parameter
 	nonce TEXT, -- OIDC nonce (NULL for SAML)
+	request_id TEXT, -- SAML SP-issued AuthnRequest ID for InResponseTo binding (NULL for OIDC)
 	redirect_uri TEXT NOT NULL, -- Callback URL
 	remember_me BOOLEAN DEFAULT FALSE, -- Extended session flag
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-	expires_at TIMESTAMPTZ NOT NULL, -- 5-minute expiry
+	expires_at TIMESTAMPTZ NOT NULL, -- 15-minute expiry
 	FOREIGN KEY (provider_id) REFERENCES sso_providers(id) ON DELETE CASCADE
 );
 

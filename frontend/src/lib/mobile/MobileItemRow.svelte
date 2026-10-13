@@ -1,7 +1,8 @@
 <script>
   import { navigate } from '../router.js';
-  import { formatDueDate, getDueBadgeClass } from '../utils/dateFormatter.js';
+  import DueMark from '../widgets/dashboard/DueMark.svelte';
   import StatusPill from '../components/StatusPill.svelte';
+  import { t } from '../stores/i18n.svelte.js';
 
   /**
    * Touch-sized work-item row for the mobile lists. Derived from
@@ -36,6 +37,7 @@
 </script>
 
 <button
+  id={`mobile-item-row-${itemId}`}
   class="row"
   data-testid="mobile-item-row"
   onclick={() => navigate(`/m/items/${itemId}`)}
@@ -43,11 +45,11 @@
 >
   <div class="main">
     {#if priorityColor}
-      <span class="prio" style={`background-color: ${priorityColor};`} title={priorityName} aria-label={priorityName ? `Priority: ${priorityName}` : undefined}></span>
+      <span class="prio" style={`background-color: ${priorityColor};`} title={priorityName} aria-label={priorityName ? t('mobile.item.priorityLabel', { name: priorityName }) : undefined}></span>
     {/if}
     <span class="title">{title}</span>
     {#if unread}
-      <span class="unread" data-testid="mobile-item-unread" aria-label="Unread"></span>
+      <span class="unread" data-testid="mobile-item-unread" aria-label={t('mobile.common.unread')}></span>
     {/if}
   </div>
   <div class="meta">
@@ -58,9 +60,7 @@
     {#if timestamp}
       <span class="ts">{timestamp}</span>
     {/if}
-    {#if dueDate}
-      <span class={`due ${getDueBadgeClass(dueDate)}`}>{formatDueDate(dueDate)}</span>
-    {/if}
+    <DueMark {dueDate} />
   </div>
 </button>
 
@@ -131,12 +131,4 @@
     font-family: var(--font-mono, ui-monospace, monospace);
   }
 
-  .due {
-    display: inline-flex;
-    align-items: center;
-    border-radius: var(--radius-full, 9999px);
-    padding: 1px 8px;
-    font-size: 0.6875rem;
-    font-weight: var(--font-semibold, 600);
-  }
 </style>

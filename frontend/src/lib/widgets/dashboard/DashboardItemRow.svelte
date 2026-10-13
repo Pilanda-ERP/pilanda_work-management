@@ -1,29 +1,38 @@
 <script>
-  import { formatDueDate, getDueBadgeClass } from '../../utils/dateFormatter.js';
+  import DueMark from './DueMark.svelte';
+  import { t } from '../../stores/i18n.svelte.js';
+  import { objectDisplayName } from '../../utils/systemLabels.js';
 
   let {
     title,
-    itemKey,
+    itemKey = null,
+    unread = false,
     statusName = null,
+    statusBuiltinKey = null,
     statusColor = null,
     priorityName = null,
+    priorityBuiltinKey = null,
     priorityColor = null,
     dueDate = null,
     timestamp = null,
+    density = 'comfortable',
+    dataTestid = 'dashboard-item-row',
     onclick,
   } = $props();
 
   const hasPriority = $derived(!!(priorityName && priorityColor));
   const hasStatus = $derived(!!statusName);
+  const localizedPriorityName = $derived(objectDisplayName({ name: priorityName, builtin_key: priorityBuiltinKey }, 'priority'));
+  const localizedStatusName = $derived(objectDisplayName({ name: statusName, builtin_key: statusBuiltinKey }, 'status'));
+  const rowPadding = $derived(density === 'compact' ? 'p-1.5' : 'p-2');
 </script>
 
 <button
-  data-testid="dashboard-item-row"
-  data-item-key={itemKey}
-  class="w-full flex items-center justify-between gap-3 p-2 rounded border text-left transition-colors"
-  style="border-color: var(--ds-border); background-color: var(--ds-surface);"
-  onmouseenter={(e) => (e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)')}
-  onmouseleave={(e) => (e.currentTarget.style.backgroundColor = 'var(--ds-surface)')}
+  data-testid={dataTestid}
+  data-item-key={itemKey ?? undefined}
+  data-density={density}
+  class="dashboard-item-row w-full flex items-center justify-between gap-3 {rowPadding} rounded border text-left transition-colors"
+  style="border-color: var(--ds-border);"
   {onclick}
 >
   <div class="flex items-center gap-1.5 min-w-0 flex-1">
@@ -31,34 +40,59 @@
       <span
         class="inline-block w-2 h-2 rounded-full flex-shrink-0"
         style={`background-color: ${priorityColor};`}
-        title={priorityName}
-        aria-label={`Priority: ${priorityName}`}
+        title={localizedPriorityName}
+        aria-label={t('dashboard.states.priorityLabel', { priority: localizedPriorityName })}
       ></span>
     {/if}
-    <span class="text-sm truncate" style="color: var(--ds-text);">{title}</span>
+    <span
+      class="text-sm truncate"
+      style={unread ? 'color: var(--ds-text); font-weight: 500;' : 'color: var(--ds-text);'}
+      >{title}</span
+    >
   </div>
 
-  <div class="flex items-center gap-2 flex-shrink-0 text-[0.7rem]" style="color: var(--ds-text-subtle);">
-    <span class="font-mono">{itemKey}</span>
+  <div class="dashboard-item-meta flex items-center gap-2 flex-shrink-0 text-[0.7rem]" style="color: var(--ds-text-subtle);">
+    {#if itemKey}
+      <span class="dashboard-item-key font-mono" data-testid="dashboard-item-key">{itemKey}</span>
+    {/if}
     {#if hasStatus}
       <span
-        class="inline-flex items-center rounded px-1.5 py-[1px] font-medium"
+        class="dashboard-item-status inline-flex items-center rounded px-1.5 py-[1px] font-medium"
         style={statusColor
           ? `background-color: ${statusColor}1f; color: ${statusColor};`
           : 'background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);'}
       >
-        {statusName}
+        {localizedStatusName}
       </span>
     {/if}
     {#if timestamp}
-      <span>{timestamp}</span>
+      <span class="dashboard-item-timestamp">{timestamp}</span>
     {/if}
-    {#if dueDate}
-      <span
-        class={`inline-flex items-center rounded-full px-2 py-0.5 text-[0.65rem] font-semibold ${getDueBadgeClass(dueDate)}`}
-      >
-        {formatDueDate(dueDate)}
-      </span>
-    {/if}
+    <DueMark {dueDate} />
   </div>
 </button>
+
+<style>
+  .dashboard-item-row {
+    background-color: var(--ds-surface);
+  }
+
+  .dashboard-item-row:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+
+  /* Container-query drop order: the widget body (WidgetWrapper .widget-content)
+     establishes the `widget` container. Less valuable columns drop first so the
+     title is the last thing to truncate. */
+  @container widget (max-width: 400px) {
+    .dashboard-item-status {
+      display: none;
+    }
+  }
+
+  @container widget (max-width: 300px) {
+    .dashboard-item-key {
+      display: none;
+    }
+  }
+</style>

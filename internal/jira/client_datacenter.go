@@ -1,7 +1,6 @@
 package jira
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,96 +8,32 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/time/rate"
 )
 
 // dataCenterClient implements the Client interface for Jira Data Center/Server
 type dataCenterClient struct {
-	baseURL    string // Uses /rest/api/2 for Data Center
-	agileURL   string
-	authHeader string
-	httpClient *http.Client
-	limiter    *rate.Limiter
+	baseURL        string // Uses /rest/api/2 for Data Center
+	agileURL       string
+	serviceDeskURL string
+	xrayURL        string
+	authHeader     string
+	httpClient     *http.Client
+	limiter        *rate.Limiter
+	retryWait      func(context.Context, time.Duration) error
+	retryAttempts  int
 }
 
 // do performs an HTTP request with rate limiting
 //
 //nolint:unparam // method is always "GET" currently but kept for future flexibility
-func (c *dataCenterClient) do(ctx context.Context, method, reqURL string, body interface{}) (*http.Response, error) {
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	var bodyReader io.Reader
-	if body != nil {
-		bodyBytes, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		bodyReader = bytes.NewReader(bodyBytes)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
-	if err != nil {
-		return nil, err
-	}
-
-	c.setHeaders(req)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	return c.httpClient.Do(req) //nolint:gosec // G704: intentional HTTP client for admin-configured Jira URLs
-}
-
-// setHeaders sets common headers for Jira API requests
-func (c *dataCenterClient) setHeaders(req *http.Request) {
-	req.Header.Set("Authorization", c.authHeader)
-	req.Header.Set("Accept", "application/json")
-}
-
-// handleErrorResponse handles non-2xx responses. Jira's response body is
-// preserved on every branch — see the matching comment in client.go for why
-// (DC's own auth quirks are even more varied: PAT vs Basic, reverse proxies
-// stripping headers, captcha lockouts).
-func (c *dataCenterClient) handleErrorResponse(resp *http.Response) error {
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return fmt.Errorf("failed to read Jira error response body: %w", readErr)
-	}
-	snippet := truncateBody(body)
-
-	switch resp.StatusCode {
-	case http.StatusUnauthorized:
-		return fmt.Errorf("%w (jira said: %s)", ErrInvalidCredentials, snippet)
-	case http.StatusForbidden:
-		if strings.Contains(string(body), "rate limit") {
-			return ErrRateLimited
-		}
-		return fmt.Errorf("%w (jira said: %s)", ErrForbidden, snippet)
-	case http.StatusNotFound:
-		return fmt.Errorf("%w (jira said: %s)", ErrNotFound, snippet)
-	case http.StatusTooManyRequests:
-		return ErrRateLimited
-	default:
-		return fmt.Errorf("%w: status %d - %s", ErrAPIError, resp.StatusCode, snippet)
-	}
-}
-
-// doJSON performs an HTTP request, checks for errors, and decodes the JSON response into result.
-func (c *dataCenterClient) doJSON(ctx context.Context, method, reqURL string, body, result interface{}) error { //nolint:unparam // method kept for REST flexibility
-	resp, err := c.do(ctx, method, reqURL, body)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return c.handleErrorResponse(resp)
-	}
-
-	return json.NewDecoder(resp.Body).Decode(result)
+func (c *dataCenterClient) do(ctx context.Context, method, reqURL string, body any) (*http.Response, error) {
+	return doReadOnlyJiraRequest(
+		ctx, c.httpClient, c.limiter, c.authHeader, method, reqURL, body,
+		c.retryAttempts, c.retryWait,
+	)
 }
 
 // ================================================================
@@ -107,11 +42,25 @@ func (c *dataCenterClient) doJSON(ctx context.Context, method, reqURL string, bo
 
 // TestConnection tests if the credentials are valid.
 //
-// See the matching comment in client.go: probe /serverInfo first so a
-// scope-limited PAT (which may not have read:me but still has read:project
-// and friends) is accepted, and treat /myself as best-effort enrichment for
-// the display name only.
+// Jira Data Center's /serverInfo endpoint may be available anonymously, so it
+// cannot prove that a PAT is valid. Require /myself first, then use
+// /serverInfo for instance metadata.
 func (c *dataCenterClient) TestConnection(ctx context.Context) (*JiraInstanceInfo, error) {
+	userResp, err := c.do(ctx, "GET", c.baseURL+"/myself", nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrConnectionFailed, err)
+	}
+	defer func() { _ = userResp.Body.Close() }()
+
+	if userResp.StatusCode != http.StatusOK {
+		return nil, jiraErrorFromResponse(userResp)
+	}
+
+	var user JiraUser
+	if err := json.NewDecoder(userResp.Body).Decode(&user); err != nil {
+		return nil, fmt.Errorf("decode myself: %w", err)
+	}
+
 	serverResp, err := c.do(ctx, "GET", c.baseURL+"/serverInfo", nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrConnectionFailed, err)
@@ -119,7 +68,7 @@ func (c *dataCenterClient) TestConnection(ctx context.Context) (*JiraInstanceInf
 	defer func() { _ = serverResp.Body.Close() }()
 
 	if serverResp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(serverResp)
+		return nil, jiraErrorFromResponse(serverResp)
 	}
 
 	var serverInfo struct {
@@ -139,15 +88,8 @@ func (c *dataCenterClient) TestConnection(ctx context.Context) (*JiraInstanceInf
 	if info.URL == "" {
 		info.URL = c.baseURL
 	}
-
-	if userResp, userErr := c.do(ctx, "GET", c.baseURL+"/myself", nil); userErr == nil {
-		defer func() { _ = userResp.Body.Close() }()
-		if userResp.StatusCode == http.StatusOK {
-			var user JiraUser
-			if decodeErr := json.NewDecoder(userResp.Body).Decode(&user); decodeErr == nil && user.DisplayName != "" {
-				info.DisplayName = user.DisplayName
-			}
-		}
+	if user.DisplayName != "" {
+		info.DisplayName = user.DisplayName
 	}
 
 	if info.DisplayName == "" {
@@ -163,7 +105,7 @@ func (c *dataCenterClient) TestConnection(ctx context.Context) (*JiraInstanceInf
 // ListProjects lists all projects accessible to the user
 func (c *dataCenterClient) ListProjects(ctx context.Context) ([]JiraProject, error) {
 	var projects []JiraProject
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/project?expand=description", nil, &projects); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/project?expand=description", &projects); err != nil {
 		return nil, err
 	}
 	return projects, nil
@@ -171,11 +113,41 @@ func (c *dataCenterClient) ListProjects(ctx context.Context) ([]JiraProject, err
 
 // GetProject gets details about a specific project
 func (c *dataCenterClient) GetProject(ctx context.Context, projectKey string) (*JiraProject, error) {
-	var project JiraProject
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey), nil, &project); err != nil {
-		return nil, err
-	}
-	return &project, nil
+	return jiraGetProject(ctx, c, c.baseURL, projectKey)
+}
+
+func (c *dataCenterClient) ListServiceDesks(ctx context.Context) ([]JiraServiceDesk, error) {
+	return jiraServiceDeskValues[JiraServiceDesk](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/servicedesk?start=%d&limit=100", c.serviceDeskURL, start)
+	})
+}
+
+func (c *dataCenterClient) ListServiceDeskRequestTypes(ctx context.Context, serviceDeskID string) ([]JiraServiceDeskRequestType, error) {
+	return jiraServiceDeskValues[JiraServiceDeskRequestType](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/servicedesk/%s/requesttype?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(serviceDeskID), start)
+	})
+}
+
+func (c *dataCenterClient) ListServiceDeskRequestComments(ctx context.Context, issueKey string) ([]JiraServiceDeskComment, error) {
+	return jiraServiceDeskValues[JiraServiceDeskComment](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/request/%s/comment?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(issueKey), start)
+	})
+}
+
+func (c *dataCenterClient) ListServiceDeskOrganizations(ctx context.Context, serviceDeskID string) ([]JiraServiceDeskOrganization, error) {
+	return jiraServiceDeskValues[JiraServiceDeskOrganization](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/servicedesk/%s/organization?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(serviceDeskID), start)
+	})
+}
+
+func (c *dataCenterClient) ListServiceDeskOrganizationUsers(ctx context.Context, organizationID string) ([]JiraUser, error) {
+	return jiraServiceDeskValues[JiraUser](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/organization/%s/user?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(organizationID), start)
+	})
 }
 
 // ================================================================
@@ -185,7 +157,7 @@ func (c *dataCenterClient) GetProject(ctx context.Context, projectKey string) (*
 // ListIssueTypes lists all issue types in the instance
 func (c *dataCenterClient) ListIssueTypes(ctx context.Context) ([]JiraIssueType, error) {
 	var issueTypes []JiraIssueType
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/issuetype", nil, &issueTypes); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/issuetype", &issueTypes); err != nil {
 		return nil, err
 	}
 	return issueTypes, nil
@@ -193,13 +165,8 @@ func (c *dataCenterClient) ListIssueTypes(ctx context.Context) ([]JiraIssueType,
 
 // GetProjectIssueTypes gets issue types available in a project
 func (c *dataCenterClient) GetProjectIssueTypes(ctx context.Context, projectKey string) ([]JiraIssueType, error) {
-	var issueTypeStatuses []struct {
-		ID       string       `json:"id"`
-		Name     string       `json:"name"`
-		Subtask  bool         `json:"subtask"`
-		Statuses []JiraStatus `json:"statuses"`
-	}
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/statuses", nil, &issueTypeStatuses); err != nil {
+	issueTypeStatuses, err := jiraFetchProjectIssueTypeStatuses(ctx, c, c.baseURL, projectKey)
+	if err != nil {
 		return nil, err
 	}
 
@@ -221,7 +188,7 @@ func (c *dataCenterClient) GetProjectIssueTypes(ctx context.Context, projectKey 
 // ListCustomFields lists all custom field definitions
 func (c *dataCenterClient) ListCustomFields(ctx context.Context) ([]JiraCustomField, error) {
 	var fields []JiraCustomField
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/field", nil, &fields); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/field", &fields); err != nil {
 		return nil, err
 	}
 
@@ -250,7 +217,7 @@ func (c *dataCenterClient) GetProjectFields(ctx context.Context, projectIDs []st
 // ListStatuses lists all statuses in the instance
 func (c *dataCenterClient) ListStatuses(ctx context.Context) ([]JiraStatus, error) {
 	var statuses []JiraStatus
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/status", nil, &statuses); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/status", &statuses); err != nil {
 		return nil, err
 	}
 	return statuses, nil
@@ -259,7 +226,7 @@ func (c *dataCenterClient) ListStatuses(ctx context.Context) ([]JiraStatus, erro
 // GetStatusCategories gets all status categories
 func (c *dataCenterClient) GetStatusCategories(ctx context.Context) ([]JiraStatusCategory, error) {
 	var categories []JiraStatusCategory
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/statuscategory", nil, &categories); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/statuscategory", &categories); err != nil {
 		return nil, err
 	}
 	return categories, nil
@@ -267,130 +234,74 @@ func (c *dataCenterClient) GetStatusCategories(ctx context.Context) ([]JiraStatu
 
 // GetProjectWorkflowScheme gets the workflow scheme for a project
 func (c *dataCenterClient) GetProjectWorkflowScheme(ctx context.Context, projectKey string) (*JiraWorkflow, error) {
-	var issueTypeStatuses []struct {
-		ID       string       `json:"id"`
-		Name     string       `json:"name"`
-		Statuses []JiraStatus `json:"statuses"`
-	}
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/statuses", nil, &issueTypeStatuses); err != nil {
+	issueTypeStatuses, err := jiraFetchProjectIssueTypeStatuses(ctx, c, c.baseURL, projectKey)
+	if err != nil {
 		return nil, err
 	}
+	return jiraProjectWorkflowFromStatuses(projectKey, issueTypeStatuses), nil
+}
 
-	statusMap := make(map[string]JiraStatus)
-	for _, its := range issueTypeStatuses {
-		for _, s := range its.Statuses {
-			statusMap[s.ID] = s
-		}
-	}
+// GetProjectWorkflowConfiguration reports that Jira Data Center's standard
+// REST API does not expose the configured workflow graph used by this importer.
+// Status membership remains available through GetProjectIssueTypeStatuses.
+func (c *dataCenterClient) GetProjectWorkflowConfiguration(
+	context.Context,
+	string,
+	[]string,
+) (*JiraProjectWorkflowConfiguration, error) {
+	return nil, ErrWorkflowConfigurationNotAvailable
+}
 
-	statuses := make([]JiraStatus, 0, len(statusMap))
-	for _, s := range statusMap {
-		statuses = append(statuses, s)
-	}
-
-	return &JiraWorkflow{
-		Name:     projectKey + " Workflow",
-		Statuses: statuses,
-	}, nil
+func (c *dataCenterClient) GetProjectScreenConfiguration(
+	context.Context,
+	string,
+	string,
+	[]string,
+) (*JiraProjectScreenConfiguration, error) {
+	return nil, ErrScreenConfigurationNotAvailable
 }
 
 // GetProjectIssueTypeStatuses gets issue types with their available statuses for a project
 func (c *dataCenterClient) GetProjectIssueTypeStatuses(ctx context.Context, projectKey string) ([]JiraIssueTypeWithStatuses, error) {
-	var result []JiraIssueTypeWithStatuses
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/statuses", nil, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return jiraGetProjectIssueTypeStatuses(ctx, c, c.baseURL, projectKey)
 }
 
 // ================================================================
 // Issue Methods - Data Center uses GET /search with startAt/maxResults
 // ================================================================
 
-// SearchIssues searches for issues using JQL (legacy GET endpoint)
-func (c *dataCenterClient) SearchIssues(ctx context.Context, opts SearchOptions) (*SearchResult, error) {
-	params := url.Values{}
-	if opts.JQL != "" {
-		params.Set("jql", opts.JQL)
-	}
-	params.Set("startAt", fmt.Sprintf("%d", opts.StartAt))
-	if opts.MaxResults > 0 {
-		params.Set("maxResults", fmt.Sprintf("%d", opts.MaxResults))
-	} else {
-		params.Set("maxResults", "50")
-	}
-	if len(opts.Fields) > 0 {
-		params.Set("fields", strings.Join(opts.Fields, ","))
-	}
-	if len(opts.Expand) > 0 {
-		params.Set("expand", strings.Join(opts.Expand, ","))
-	}
-
-	var result SearchResult
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/search?"+params.Encode(), nil, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+// searchIssues runs JQL against the Data Center legacy GET /search endpoint,
+// which remains the supported search API for Data Center deployments.
+func (c *dataCenterClient) searchIssues(ctx context.Context, opts SearchOptions) (*SearchResult, error) {
+	return jiraSearchIssuesLegacy(ctx, c, c.baseURL, opts)
 }
 
 // GetIssue gets a single issue by key
 func (c *dataCenterClient) GetIssue(ctx context.Context, issueKey string, expand []string) (*JiraIssue, error) {
-	params := url.Values{}
-	if len(expand) > 0 {
-		params.Set("expand", strings.Join(expand, ","))
-	}
+	return jiraGetIssue(ctx, c, c.baseURL, issueKey, expand)
+}
 
-	urlStr := c.baseURL + "/issue/" + url.PathEscape(issueKey)
-	if len(params) > 0 {
-		urlStr += "?" + params.Encode()
-	}
-
-	var issue JiraIssue
-	if err := c.doJSON(ctx, "GET", urlStr, nil, &issue); err != nil {
-		return nil, err
-	}
-	return &issue, nil
+func (c *dataCenterClient) GetIssueWatchers(ctx context.Context, issueKey string) (*JiraIssueWatchers, error) {
+	return jiraGetIssueWatchers(ctx, c, c.baseURL, issueKey)
 }
 
 func (c *dataCenterClient) GetIssueComments(ctx context.Context, issueKey string, startAt, maxResults int) (*JiraCommentContainer, error) {
-	params := url.Values{}
-	params.Set("startAt", fmt.Sprintf("%d", startAt))
-	if maxResults <= 0 {
-		maxResults = 100
-	}
-	params.Set("maxResults", fmt.Sprintf("%d", maxResults))
-
-	var result JiraCommentContainer
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/issue/"+url.PathEscape(issueKey)+"/comment?"+params.Encode(), nil, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return jiraGetIssueComments(ctx, c, c.baseURL, issueKey, startAt, maxResults)
 }
 
 func (c *dataCenterClient) GetIssueWorklogs(ctx context.Context, issueKey string, startAt, maxResults int) (*JiraWorklogContainer, error) {
-	params := url.Values{}
-	params.Set("startAt", fmt.Sprintf("%d", startAt))
-	if maxResults <= 0 {
-		maxResults = 100
-	}
-	params.Set("maxResults", fmt.Sprintf("%d", maxResults))
-
-	var result JiraWorklogContainer
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/issue/"+url.PathEscape(issueKey)+"/worklog?"+params.Encode(), nil, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return jiraGetIssueWorklogs(ctx, c, c.baseURL, issueKey, startAt, maxResults)
 }
 
 // GetIssueCount gets the total number of issues in a project
 func (c *dataCenterClient) GetIssueCount(ctx context.Context, projectKey string, openOnly bool) (int, error) {
-	jql := fmt.Sprintf("project = %s", projectKey)
+	jql := `project = "` + escapeJQLString(projectKey) + `"`
 	if openOnly {
 		jql += " AND statusCategory != Done"
 	}
 
 	// Use search with maxResults=0 to get just the total count
-	result, err := c.SearchIssues(ctx, SearchOptions{
+	result, err := c.searchIssues(ctx, SearchOptions{
 		JQL:        jql,
 		MaxResults: 1,
 		Fields:     []string{"key"},
@@ -427,7 +338,7 @@ func (c *dataCenterClient) SearchIssuesJQL(ctx context.Context, req JQLSearchReq
 	params.Set("startAt", fmt.Sprintf("%d", startAt))
 
 	var searchResult SearchResult
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/search?"+params.Encode(), nil, &searchResult); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/search?"+params.Encode(), &searchResult); err != nil {
 		return nil, err
 	}
 
@@ -446,8 +357,13 @@ func (c *dataCenterClient) SearchIssuesJQL(ctx context.Context, req JQLSearchReq
 	return response, nil
 }
 
-// BulkFetchIssues fetches multiple issues by their IDs or keys
-// Data Center doesn't have /issue/bulkfetch, so we use search with key in (...) JQL
+// BulkFetchIssues fetches multiple issues by their IDs or keys.
+// Data Center doesn't have /issue/bulkfetch, so we use search with key in (...)
+// JQL. The legacy search endpoint can cap a page below the requested
+// maxResults (jira.search.views.default.max and the server's own limit), so a
+// single request would silently drop the rest of the batch. Walk every page
+// using the returned startAt/len offsets and let the caller reconcile any key
+// the server never returned.
 func (c *dataCenterClient) BulkFetchIssues(ctx context.Context, req BulkFetchRequest) (*BulkFetchResponse, error) {
 	if len(req.IssueIdsOrKeys) == 0 {
 		return &BulkFetchResponse{Issues: []JiraIssue{}}, nil
@@ -461,19 +377,36 @@ func (c *dataCenterClient) BulkFetchIssues(ctx context.Context, req BulkFetchReq
 	}
 	jql := "key in (" + strings.Join(quotedKeys, ",") + ")"
 
-	// Fetch in a single request if possible (Data Center typically allows large JQL)
-	result, err := c.SearchIssues(ctx, SearchOptions{
-		JQL:        jql,
-		MaxResults: len(req.IssueIdsOrKeys),
-		Fields:     req.Fields,
-		Expand:     req.Expand,
-	})
-	if err != nil {
-		return nil, err
+	requested := len(req.IssueIdsOrKeys)
+	issues := make([]JiraIssue, 0, requested)
+	for startAt := 0; ; {
+		page, err := c.searchIssues(ctx, SearchOptions{
+			JQL:        jql,
+			StartAt:    startAt,
+			MaxResults: requested,
+			Fields:     req.Fields,
+			Expand:     req.Expand,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if page == nil || len(page.Issues) == 0 {
+			break
+		}
+		issues = append(issues, page.Issues...)
+		next := page.StartAt + len(page.Issues)
+		if next <= startAt {
+			// The server did not advance its offset; stop instead of looping.
+			break
+		}
+		if next >= requested || (page.Total > 0 && next >= page.Total) {
+			break
+		}
+		startAt = next
 	}
 
 	return &BulkFetchResponse{
-		Issues: result.Issues,
+		Issues: issues,
 	}, nil
 }
 
@@ -484,7 +417,7 @@ func (c *dataCenterClient) GetAllIssueKeys(ctx context.Context, jql string) ([]s
 	maxResults := 100
 
 	for {
-		result, err := c.SearchIssues(ctx, SearchOptions{
+		result, err := c.searchIssues(ctx, SearchOptions{
 			JQL:        jql,
 			StartAt:    startAt,
 			MaxResults: maxResults,
@@ -513,11 +446,7 @@ func (c *dataCenterClient) GetAllIssueKeys(ctx context.Context, jql string) ([]s
 
 // GetProjectVersions gets all versions for a project
 func (c *dataCenterClient) GetProjectVersions(ctx context.Context, projectKey string) ([]JiraVersion, error) {
-	var versions []JiraVersion
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/versions", nil, &versions); err != nil {
-		return nil, err
-	}
-	return versions, nil
+	return jiraGetProjectVersions(ctx, c, c.baseURL, projectKey)
 }
 
 // ListBoards lists all Agile boards for a project.
@@ -526,97 +455,22 @@ func (c *dataCenterClient) GetProjectVersions(ctx context.Context, projectKey st
 // miss boards on larger projects, which in turn drops every sprint that lives on
 // later boards from the Windshift iteration import.
 func (c *dataCenterClient) ListBoards(ctx context.Context, projectKey string) (*BoardListResult, error) {
-	const defaultMaxResults = 50
-
-	aggregate := &BoardListResult{MaxResults: defaultMaxResults, IsLast: true}
-	for startAt := 0; ; {
-		params := url.Values{}
-		params.Set("startAt", fmt.Sprintf("%d", startAt))
-		params.Set("maxResults", fmt.Sprintf("%d", defaultMaxResults))
-		if projectKey != "" {
-			params.Set("projectKeyOrId", projectKey)
-		}
-
-		var page BoardListResult
-		if err := c.doJSON(ctx, "GET", c.agileURL+"/board?"+params.Encode(), nil, &page); err != nil {
-			return nil, err
-		}
-
-		aggregate.Values = append(aggregate.Values, page.Values...)
-		aggregate.Total = page.Total
-		aggregate.IsLast = page.IsLast
-		if page.MaxResults > 0 {
-			aggregate.MaxResults = page.MaxResults
-		}
-		if page.IsLast || len(page.Values) == 0 || (page.Total > 0 && len(aggregate.Values) >= page.Total) {
-			break
-		}
-		if page.StartAt+len(page.Values) > startAt {
-			startAt = page.StartAt + len(page.Values)
-		} else {
-			startAt += defaultMaxResults
-		}
-	}
-	return aggregate, nil
+	return jiraListBoards(ctx, c, c.agileURL, projectKey)
 }
 
 // GetBoardConfiguration gets Agile board columns, status mappings, and backing filter metadata.
 func (c *dataCenterClient) GetBoardConfiguration(ctx context.Context, boardID int) (*JiraBoardConfiguration, error) {
-	var config JiraBoardConfiguration
-	if err := c.doJSON(ctx, "GET", fmt.Sprintf("%s/board/%d/configuration", c.agileURL, boardID), nil, &config); err != nil {
-		return nil, err
-	}
-	return &config, nil
+	return jiraGetBoardConfiguration(ctx, c, c.agileURL, boardID)
 }
 
 // ListFilters lists saved filters associated with a project.
 func (c *dataCenterClient) ListFilters(ctx context.Context, projectKey string) (*FilterSearchResult, error) {
-	project, err := c.GetProject(ctx, projectKey)
-	if err != nil {
-		return nil, err
-	}
-	const defaultMaxResults = 50
-	aggregate := &FilterSearchResult{MaxResults: defaultMaxResults, IsLast: true}
-	for startAt := 0; ; {
-		params := url.Values{}
-		params.Set("startAt", fmt.Sprintf("%d", startAt))
-		params.Set("maxResults", fmt.Sprintf("%d", defaultMaxResults))
-		params.Set("expand", "jql,description,owner,viewUrl")
-		if project != nil && strings.TrimSpace(project.ID) != "" {
-			params.Set("projectId", project.ID)
-		}
-
-		var page FilterSearchResult
-		if err := c.doJSON(ctx, "GET", c.baseURL+"/filter/search?"+params.Encode(), nil, &page); err != nil {
-			return nil, err
-		}
-		aggregate.Values = append(aggregate.Values, page.Values...)
-		aggregate.Total = page.Total
-		aggregate.IsLast = page.IsLast
-		if page.MaxResults > 0 {
-			aggregate.MaxResults = page.MaxResults
-		}
-		if page.IsLast || len(page.Values) == 0 || (page.Total > 0 && len(aggregate.Values) >= page.Total) {
-			break
-		}
-		if page.StartAt+len(page.Values) > startAt {
-			startAt = page.StartAt + len(page.Values)
-		} else {
-			startAt += defaultMaxResults
-		}
-	}
-	return aggregate, nil
+	return jiraListFilters(ctx, c, c.baseURL, projectKey)
 }
 
 // GetFilter gets a saved filter with expanded JQL where available.
 func (c *dataCenterClient) GetFilter(ctx context.Context, filterID string) (*JiraFilter, error) {
-	params := url.Values{}
-	params.Set("expand", "jql,description,owner,viewUrl")
-	var filter JiraFilter
-	if err := c.doJSON(ctx, "GET", c.baseURL+"/filter/"+url.PathEscape(filterID)+"?"+params.Encode(), nil, &filter); err != nil {
-		return nil, err
-	}
-	return &filter, nil
+	return jiraGetFilter(ctx, c, c.baseURL, filterID)
 }
 
 // GetBoardSprints gets all sprints for a board.
@@ -624,35 +478,7 @@ func (c *dataCenterClient) GetFilter(ctx context.Context, filterID string) (*Jir
 // Jira embeds sprint results in pages too; importers need the full set so issue
 // sprint custom fields can always resolve to a Windshift iteration.
 func (c *dataCenterClient) GetBoardSprints(ctx context.Context, boardID int) (*SprintListResult, error) {
-	const defaultMaxResults = 50
-
-	aggregate := &SprintListResult{MaxResults: defaultMaxResults, IsLast: true}
-	for startAt := 0; ; {
-		params := url.Values{}
-		params.Set("startAt", fmt.Sprintf("%d", startAt))
-		params.Set("maxResults", fmt.Sprintf("%d", defaultMaxResults))
-
-		var page SprintListResult
-		if err := c.doJSON(ctx, "GET", fmt.Sprintf("%s/board/%d/sprint?%s", c.agileURL, boardID, params.Encode()), nil, &page); err != nil {
-			return nil, err
-		}
-
-		aggregate.Values = append(aggregate.Values, page.Values...)
-		aggregate.Total = page.Total
-		aggregate.IsLast = page.IsLast
-		if page.MaxResults > 0 {
-			aggregate.MaxResults = page.MaxResults
-		}
-		if page.IsLast || len(page.Values) == 0 || (page.Total > 0 && len(aggregate.Values) >= page.Total) {
-			break
-		}
-		if page.StartAt+len(page.Values) > startAt {
-			startAt = page.StartAt + len(page.Values)
-		} else {
-			startAt += defaultMaxResults
-		}
-	}
-	return aggregate, nil
+	return jiraListBoardSprints(ctx, c, c.agileURL, boardID)
 }
 
 // ================================================================
@@ -661,28 +487,7 @@ func (c *dataCenterClient) GetBoardSprints(ctx context.Context, boardID int) (*S
 
 // DownloadAttachment downloads an attachment and returns the reader and content type
 func (c *dataCenterClient) DownloadAttachment(ctx context.Context, attachmentURL string) (io.ReadCloser, string, error) {
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", attachmentURL, http.NoBody)
-	if err != nil {
-		return nil, "", err
-	}
-	c.setHeaders(req)
-
-	resp, err := c.httpClient.Do(req) //nolint:gosec // G704: intentional HTTP client for admin-configured Jira URLs
-	if err != nil {
-		return nil, "", err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
-		return nil, "", c.handleErrorResponse(resp)
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-	return resp.Body, contentType, nil
+	return jiraDownloadAttachment(ctx, c.httpClient, c.limiter, c.authHeader, attachmentURL)
 }
 
 // ================================================================

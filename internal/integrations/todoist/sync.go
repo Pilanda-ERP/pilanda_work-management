@@ -8,7 +8,9 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/google/uuid"
+	"windshift/internal/utils"
+
+	"uuid"
 )
 
 // syncBaseURL is the base of the Todoist Sync API (v1). The data client batches
@@ -35,7 +37,7 @@ type Client struct {
 func NewClient(accessToken string) *Client {
 	return &Client{
 		accessToken: accessToken,
-		httpClient:  &http.Client{Timeout: requestTimeout},
+		httpClient:  utils.NewHTTPClient(requestTimeout),
 		baseURL:     syncBaseURL,
 	}
 }

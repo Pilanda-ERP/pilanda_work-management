@@ -46,7 +46,7 @@ func (r *ApprovalSetRepository) FindAll(ctx context.Context, workflowID *int) ([
 		SELECT a.id, a.name, a.description, a.workflow_id, a.created_at, a.updated_at, w.name AS workflow_name
 		FROM approval_sets a
 		JOIN workflows w ON a.workflow_id = w.id`
-	var args []interface{}
+	var args []any
 	if workflowID != nil {
 		query += " WHERE a.workflow_id = ?"
 		args = append(args, *workflowID)
@@ -143,7 +143,7 @@ func (r *ApprovalSetRepository) FindGatedStatusesForSets(ctx context.Context, se
 		return out, nil
 	}
 	placeholders := make([]string, len(setIDs))
-	args := make([]interface{}, len(setIDs))
+	args := make([]any, len(setIDs))
 	for i, id := range setIDs {
 		placeholders[i] = "?"
 		args[i] = id
@@ -181,7 +181,7 @@ func (r *ApprovalSetRepository) FindGatedStatusesForSets(ctx context.Context, se
 
 // FindActiveStatusBySetAndStatus returns the active approval_set_status row
 // for a (approvalSetID, statusID) pair, or (nil, nil) if no row matches.
-// is_active=1 is the partial-unique guarantee enforcing one current row.
+// is_active=TRUE is the partial-unique guarantee enforcing one current row.
 func (r *ApprovalSetRepository) FindActiveStatusBySetAndStatus(ctx context.Context, approvalSetID, statusID int) (*models.ApprovalSetStatus, error) {
 	var ass models.ApprovalSetStatus
 	err := r.db.QueryRowContext(ctx, `
@@ -204,7 +204,7 @@ func (r *ApprovalSetRepository) FindActiveStatusBySetAndStatus(ctx context.Conte
 
 // FindStatusByIDInTx loads a single approval_set_status by id inside a
 // transaction. Used by the runtime engine when finalizing a request — the
-// snapshot row may be is_active=0, so this query does NOT filter on is_active.
+// snapshot row may be is_active=FALSE, so this query does NOT filter on is_active.
 func (r *ApprovalSetRepository) FindStatusByIDInTx(ctx context.Context, tx database.Tx, id int) (*models.ApprovalSetStatus, error) {
 	var ass models.ApprovalSetStatus
 	err := tx.QueryRowContext(ctx, `
@@ -346,7 +346,8 @@ func (r *ApprovalSetRepository) TransitionExistsFromStatus(ctx context.Context, 
 	err := r.db.QueryRowContext(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM workflow_transitions
-			WHERE id = ? AND workflow_id = ? AND from_status_id = ?
+			WHERE id = ? AND workflow_id = ?
+			  AND (from_status_id = ? OR from_all_statuses = TRUE)
 		)
 	`, transitionID, workflowID, fromStatusID).Scan(&ok)
 	if err != nil {
@@ -393,69 +394,29 @@ func (r *ApprovalSetRepository) FindDriversForTransition(ctx context.Context, tr
 // IsWorkspacePersonal reports whether a workspace is the user's personal
 // space. Personal workspaces never get an approval set.
 func (r *ApprovalSetRepository) IsWorkspacePersonal(ctx context.Context, workspaceID int) (bool, error) {
-	var isPersonal bool
-	err := r.db.QueryRowContext(ctx, `SELECT is_personal FROM workspaces WHERE id = ?`, workspaceID).Scan(&isPersonal)
-	if errors.Is(err, sql.ErrNoRows) {
+	resolved, err := NewConfigurationSetRepository(r.db).ResolveForWorkspace(ctx, workspaceID, nil)
+	if err != nil {
+		return false, err
+	}
+	if resolved == nil {
 		return false, nil
 	}
-	if err != nil {
-		return false, fmt.Errorf("load workspace is_personal: %w", err)
-	}
-	return isPersonal, nil
+	return resolved.IsPersonal, nil
 }
 
-// ResolveForWorkspace mirrors the resolution order in
-// ApprovalService.GetApprovalSetIDForItem: item-type override on the
-// workspace's bound config-set → workspace-level default → global default.
+// ResolveForWorkspace returns the effective approval set for a workspace and
+// optional item type via the canonical configuration resolution: item-type
+// override on the assigned config set (else the global default config set).
 // Returns (nil, nil) when no approval set is configured.
 func (r *ApprovalSetRepository) ResolveForWorkspace(ctx context.Context, workspaceID int, itemTypeID *int) (*int, error) {
-	var approvalSetID *int
-
-	if itemTypeID != nil {
-		err := r.db.QueryRowContext(ctx, `
-			SELECT COALESCE(csit.approval_set_id, cs.approval_set_id) AS approval_set_id
-			FROM workspace_configuration_sets wcs
-			JOIN configuration_sets cs ON wcs.configuration_set_id = cs.id
-			LEFT JOIN configuration_set_item_types csit
-				ON cs.id = csit.configuration_set_id AND csit.item_type_id = ?
-			WHERE wcs.workspace_id = ?
-		`, *itemTypeID, workspaceID).Scan(&approvalSetID)
-		if err == nil && approvalSetID != nil {
-			return approvalSetID, nil
-		}
+	resolved, err := NewConfigurationSetRepository(r.db).ResolveEffective(ctx, workspaceID, itemTypeID)
+	if err != nil || resolved == nil {
+		return nil, err
 	}
-
-	err := r.db.QueryRowContext(ctx, `
-		SELECT cs.approval_set_id
-		FROM workspace_configuration_sets wcs
-		JOIN configuration_sets cs ON wcs.configuration_set_id = cs.id
-		WHERE wcs.workspace_id = ?
-	`, workspaceID).Scan(&approvalSetID)
-	if err == nil && approvalSetID != nil {
-		return approvalSetID, nil
+	if resolved.IsPersonal {
+		return nil, nil
 	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("load workspace config-set approval: %w", err)
-	}
-
-	if itemTypeID != nil {
-		err = r.db.QueryRowContext(ctx, `
-			SELECT COALESCE(csit.approval_set_id, cs.approval_set_id) AS approval_set_id
-			FROM configuration_sets cs
-			LEFT JOIN configuration_set_item_types csit
-				ON cs.id = csit.configuration_set_id AND csit.item_type_id = ?
-			WHERE cs.is_default = true
-		`, *itemTypeID).Scan(&approvalSetID)
-		if err == nil && approvalSetID != nil {
-			return approvalSetID, nil
-		}
-	}
-
-	err = r.db.QueryRowContext(ctx, `SELECT approval_set_id FROM configuration_sets WHERE is_default = true`).Scan(&approvalSetID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("load global default approval set: %w", err)
-	}
-	return approvalSetID, nil
+	return resolved.ApprovalSetID, nil
 }
 
 // ============================================================================
@@ -521,7 +482,7 @@ func (r *ApprovalSetRepository) DeleteUnreferencedStatuses(ctx context.Context, 
 	return nil
 }
 
-// DeactivateActiveStatuses flips is_active=1 rows to is_active=0 for the
+// DeactivateActiveStatuses flips is_active=TRUE rows to is_active=FALSE for the
 // given approval set. Soft-archive: keeps the snapshot for in-flight requests.
 func (r *ApprovalSetRepository) DeactivateActiveStatuses(ctx context.Context, tx database.Tx, approvalSetID int) error {
 	if _, err := tx.ExecContext(ctx, `
@@ -569,10 +530,6 @@ func (r *ApprovalSetRepository) CreateStep(ctx context.Context, tx database.Tx, 
 	if onLeave == "" {
 		onLeave = models.ApprovalOnLeaveUseSubstitute
 	}
-	allowSelf := 0
-	if step.AllowSelfApproval {
-		allowSelf = 1
-	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO approval_steps
 			(approval_set_status_id, display_order, name,
@@ -589,7 +546,7 @@ func (r *ApprovalSetRepository) CreateStep(ctx context.Context, tx database.Tx, 
 		approvalSetStatusID, step.DisplayOrder, step.Name,
 		quorumMode, step.QuorumCount, step.QuorumPercent, rejectionPolicy,
 		step.ApproverSource, nullStringIfEmpty(step.ApproverFieldIdentifier), step.ApproverFieldID,
-		step.ApproverRoleID, step.ApproverGroupID, step.ApproverUserID, allowSelf,
+		step.ApproverRoleID, step.ApproverGroupID, step.ApproverUserID, step.AllowSelfApproval,
 		onLeave,
 		step.EscalationAfterHours, nullStringIfEmpty(step.EscalationAction), nullStringIfEmpty(step.EscalationTargetSource),
 		nullStringIfEmpty(step.EscalationTargetFieldIdentifier), step.EscalationTargetFieldID,
@@ -624,7 +581,7 @@ func scanApprovalSetRows(rows *sql.Rows) ([]models.ApprovalSet, error) {
 // approvalStepScanner is satisfied by both *sql.Row and *sql.Rows so the
 // shared scanner can populate an ApprovalStep from either source.
 type approvalStepScanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }
 
 func scanApprovalStepCols(sc approvalStepScanner) (*models.ApprovalStep, error) {
@@ -664,7 +621,7 @@ func scanApprovalStepRow(row *sql.Row) (*models.ApprovalStep, error) {
 
 // nullStringIfEmpty returns nil for empty strings so the column scans/inserts
 // as SQL NULL rather than the empty string.
-func nullStringIfEmpty(s string) interface{} {
+func nullStringIfEmpty(s string) any {
 	if s == "" {
 		return nil
 	}

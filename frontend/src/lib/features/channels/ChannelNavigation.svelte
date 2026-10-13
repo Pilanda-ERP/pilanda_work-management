@@ -6,8 +6,9 @@
   import Button from '../../components/Button.svelte';
   import { getHexFromColorName } from '../../utils/colors.js';
   import { t } from '../../stores/i18n.svelte.js';
-  import SidebarHeader from '../../layout/SidebarHeader.svelte';
+  import NavigationSidebar from '../../layout/NavigationSidebar.svelte';
   import { channelTypes as channelTypeDefs, allTypesEntry } from './channelTypes.js';
+  import { isSystemAdmin } from '../../stores/permissions.svelte.js';
 
   // Get active filters from URL params
   let activeCategoryId = $derived($currentRoute.params?.categoryId || null);
@@ -29,17 +30,17 @@
 
   function handleTypeClick(typeId) {
     if (typeId === null) {
-      navigate('/channels');
+      navigate('/admin/channels');
     } else {
-      navigate(`/channels/type/${typeId}`);
+      navigate(`/admin/channels/type/${typeId}`);
     }
   }
 
   function handleCategoryClick(categoryId) {
     if (categoryId === null) {
-      navigate('/channels');
+      navigate('/admin/channels');
     } else {
-      navigate(`/channels/category/${categoryId}`);
+      navigate(`/admin/channels/category/${categoryId}`);
     }
   }
 
@@ -50,11 +51,23 @@
   }
 </script>
 
-<!-- Channel Navigation Sidebar -->
-<div class="w-64 border-r flex flex-col p-6" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-  <!-- Header -->
-  <SidebarHeader title={t('channels.title')} description={t('channels.subtitle')} noBorder />
+{#snippet sidebarFooter()}
+  {#if $isSystemAdmin}
+    <div class="px-6 pb-6 pt-4 border-t" style="border-color: var(--ds-border);">
+      <Button
+        variant="default"
+        icon={IconTag}
+        onclick={handleManageCategories}
+        class="w-full justify-center"
+      >
+        {t('channels.manageCategories')}
+      </Button>
+    </div>
+  {/if}
+{/snippet}
 
+<!-- Channel Navigation Sidebar -->
+<NavigationSidebar title={t('channels.title')} description={t('channels.subtitle')} footer={sidebarFooter}>
   <!-- Navigation -->
   <nav class="flex-1 space-y-4">
     <!-- Channel Types Section -->
@@ -66,10 +79,8 @@
         {@const isTypeActive = activeTypeFilter === type.id}
         <button
           onclick={() => handleTypeClick(type.id)}
-          class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3"
-          style={isTypeActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-          onmouseenter={(e) => { if (!isTypeActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-          onmouseleave={(e) => { if (!isTypeActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+          class="nav-link w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3"
+          class:active={isTypeActive}
         >
           <div class="w-4 h-4 rounded bg-gradient-to-br {type.navColor} flex-shrink-0 flex items-center justify-center">
             <type.icon class="w-2.5 h-2.5 text-white" />
@@ -87,12 +98,10 @@
       <!-- All Channels -->
       <button
         onclick={() => handleCategoryClick(null)}
-        class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3"
-        style={isAllCategoriesActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-        onmouseenter={(e) => { if (!isAllCategoriesActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-        onmouseleave={(e) => { if (!isAllCategoriesActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+        class="nav-link w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3"
+        class:active={isAllCategoriesActive}
       >
-        <div class="w-4 h-4 rounded bg-gradient-to-br from-blue-400 to-blue-600 flex-shrink-0"></div>
+        <div class="w-4 h-4 rounded bg-gradient-to-br from-ds-nav-blue-from to-ds-nav-blue-to flex-shrink-0"></div>
         <span>{t('channels.allChannels')}</span>
       </button>
 
@@ -101,10 +110,8 @@
         {@const isCatActive = activeCategoryId === category.id.toString()}
         <button
           onclick={() => handleCategoryClick(category.id)}
-          class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3"
-          style={isCatActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-          onmouseenter={(e) => { if (!isCatActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-          onmouseleave={(e) => { if (!isCatActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+          class="nav-link w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3"
+          class:active={isCatActive}
           title={category.description || category.name}
         >
           <div
@@ -117,15 +124,21 @@
     </div>
   </nav>
 
-  <!-- Footer - Manage Categories -->
-  <div class="pt-4 border-t" style="border-color: var(--ds-border);">
-    <Button
-      variant="default"
-      icon={IconTag}
-      onclick={handleManageCategories}
-      class="w-full justify-center"
-    >
-      {t('channels.manageCategories')}
-    </Button>
-  </div>
-</div>
+</NavigationSidebar>
+
+
+<style>
+  .nav-link {
+    color: var(--ds-text-subtle);
+  }
+
+  .nav-link:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .nav-link.active {
+    background: var(--ds-surface-selected);
+    color: var(--ds-text);
+  }
+</style>

@@ -4,20 +4,22 @@ import (
 	"time"
 )
 
-// ItemResponse is the public API representation of an Item
+// ItemResponse is the public API representation of an Item. DescriptionHTML
+// is populated for single-item and mutation responses, not collections.
 type ItemResponse struct {
-	ID                  int                    `json:"id"`
-	WorkspaceID         int                    `json:"workspace_id"`
-	WorkspaceKey        string                 `json:"workspace_key"`
-	Key                 string                 `json:"key"` // e.g., "PROJ-123"
-	WorkspaceItemNumber int                    `json:"workspace_item_number"`
-	Title               string                 `json:"title"`
-	Description         string                 `json:"description,omitempty"`
-	IsTask              bool                   `json:"is_task"`
-	DueDate             *time.Time             `json:"due_date,omitempty"`
-	StartDate           *time.Time             `json:"start_date,omitempty"`
-	EndDate             *time.Time             `json:"end_date,omitempty"`
-	CustomFields        map[string]interface{} `json:"custom_fields,omitempty"`
+	ID                  int            `json:"id"`
+	WorkspaceID         int            `json:"workspace_id"`
+	WorkspaceKey        string         `json:"workspace_key"`
+	Key                 string         `json:"key"` // e.g., "PROJ-123"
+	WorkspaceItemNumber int            `json:"workspace_item_number"`
+	Title               string         `json:"title"`
+	Description         string         `json:"description,omitempty"`
+	DescriptionHTML     string         `json:"description_html,omitempty"`
+	IsTask              bool           `json:"is_task"`
+	DueDate             *time.Time     `json:"due_date,omitempty"`
+	StartDate           *time.Time     `json:"start_date,omitempty"`
+	EndDate             *time.Time     `json:"end_date,omitempty"`
+	CustomFields        map[string]any `json:"custom_fields,omitempty"`
 
 	// Hierarchy. ParentID is the raw DB id. ParentKey is the parent's
 	// ready-to-display key (e.g. "WI-120"), computed server-side from the
@@ -88,22 +90,25 @@ type ItemLinks struct {
 
 // ItemCreateRequest is the request body for creating a new item
 type ItemCreateRequest struct {
-	WorkspaceID  int                    `json:"workspace_id" validate:"required"`
-	Title        string                 `json:"title" validate:"required,max=255"`
-	Description  string                 `json:"description,omitempty"`
-	StatusID     *int                   `json:"status_id,omitempty"`
-	PriorityID   *int                   `json:"priority_id,omitempty"`
-	ItemTypeID   *int                   `json:"item_type_id,omitempty"`
-	AssigneeID   *int                   `json:"assignee_id,omitempty"`
-	ParentID     *int                   `json:"parent_id,omitempty"`
-	MilestoneIDs []int                  `json:"milestone_ids,omitempty"`
-	IterationID  *int                   `json:"iteration_id,omitempty"`
-	ProjectID    *int                   `json:"project_id,omitempty"`
-	DueDate      *time.Time             `json:"due_date,omitempty"`
-	StartDate    *time.Time             `json:"start_date,omitempty"`
-	EndDate      *time.Time             `json:"end_date,omitempty"`
-	IsTask       bool                   `json:"is_task,omitempty"`
-	CustomFields map[string]interface{} `json:"custom_fields,omitempty"`
+	WorkspaceID int    `json:"workspace_id" validate:"required"`
+	Title       string `json:"title" validate:"required,max=255"`
+	Description string `json:"description,omitempty"`
+	// Optional create-time placement. If omitted, the item uses the workflow initial status.
+	// If provided, it must be the initial status or directly reachable from the initial status
+	// without workflow conditions, validators, or approval gates.
+	StatusID     *int           `json:"status_id,omitempty"`
+	PriorityID   *int           `json:"priority_id,omitempty"`
+	ItemTypeID   *int           `json:"item_type_id,omitempty"`
+	AssigneeID   *int           `json:"assignee_id,omitempty"`
+	ParentID     *int           `json:"parent_id,omitempty"`
+	MilestoneIDs []int          `json:"milestone_ids,omitempty"`
+	IterationID  *int           `json:"iteration_id,omitempty"`
+	ProjectID    *int           `json:"project_id,omitempty"`
+	DueDate      *time.Time     `json:"due_date,omitempty"`
+	StartDate    *time.Time     `json:"start_date,omitempty"`
+	EndDate      *time.Time     `json:"end_date,omitempty"`
+	IsTask       bool           `json:"is_task,omitempty"`
+	CustomFields map[string]any `json:"custom_fields,omitempty"`
 }
 
 // ItemUpdateRequest is the request body for updating an item.
@@ -111,20 +116,20 @@ type ItemCreateRequest struct {
 // POST /rest/api/v1/items/{id}/transition to change workflow status so
 // validator-mode and condition-mode workflow rules are enforced.
 type ItemUpdateRequest struct {
-	Title        *string                `json:"title,omitempty" validate:"omitempty,max=255"`
-	Description  *string                `json:"description,omitempty"`
-	PriorityID   *int                   `json:"priority_id,omitempty"`
-	ItemTypeID   *int                   `json:"item_type_id,omitempty"`
-	AssigneeID   *int                   `json:"assignee_id,omitempty"`
-	ParentID     *int                   `json:"parent_id,omitempty"`
-	MilestoneIDs *[]int                 `json:"milestone_ids,omitempty"`
-	IterationID  *int                   `json:"iteration_id,omitempty"`
-	ProjectID    *int                   `json:"project_id,omitempty"`
-	DueDate      *time.Time             `json:"due_date,omitempty"`
-	StartDate    *time.Time             `json:"start_date,omitempty"`
-	EndDate      *time.Time             `json:"end_date,omitempty"`
-	IsTask       *bool                  `json:"is_task,omitempty"`
-	CustomFields map[string]interface{} `json:"custom_fields,omitempty"`
+	Title        *string        `json:"title,omitempty" validate:"omitempty,max=255"`
+	Description  *string        `json:"description,omitempty"`
+	PriorityID   *int           `json:"priority_id,omitempty"`
+	ItemTypeID   *int           `json:"item_type_id,omitempty"`
+	AssigneeID   *int           `json:"assignee_id,omitempty"`
+	ParentID     *int           `json:"parent_id,omitempty"`
+	MilestoneIDs *[]int         `json:"milestone_ids,omitempty"`
+	IterationID  *int           `json:"iteration_id,omitempty"`
+	ProjectID    *int           `json:"project_id,omitempty"`
+	DueDate      *time.Time     `json:"due_date,omitempty"`
+	StartDate    *time.Time     `json:"start_date,omitempty"`
+	EndDate      *time.Time     `json:"end_date,omitempty"`
+	IsTask       *bool          `json:"is_task,omitempty"`
+	CustomFields map[string]any `json:"custom_fields,omitempty"`
 }
 
 // CommentResponse is the public API representation of a Comment.
@@ -132,13 +137,14 @@ type ItemUpdateRequest struct {
 // frontend can toast them at info severity. omitempty when nothing
 // was modified.
 type CommentResponse struct {
-	ID        int          `json:"id"`
-	ItemID    int          `json:"item_id"`
-	Content   string       `json:"content"`
-	Author    *UserSummary `json:"author,omitempty"`
-	CreatedAt time.Time    `json:"created_at"`
-	UpdatedAt time.Time    `json:"updated_at"`
-	Warnings  []string     `json:"warnings,omitempty"`
+	ID          int          `json:"id"`
+	ItemID      int          `json:"item_id"`
+	Content     string       `json:"content"`
+	ContentHTML string       `json:"content_html,omitempty"`
+	Author      *UserSummary `json:"author,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+	UpdatedAt   time.Time    `json:"updated_at"`
+	Warnings    []string     `json:"warnings,omitempty"`
 }
 
 // CommentCreateRequest is the request body for creating a comment
@@ -161,7 +167,12 @@ type HistoryResponse struct {
 	ResolvedOldValue *string      `json:"resolved_old_value,omitempty"`
 	ResolvedNewValue *string      `json:"resolved_new_value,omitempty"`
 	User             *UserSummary `json:"user,omitempty"`
-	ChangedAt        time.Time    `json:"changed_at"`
+	// ActorKind is "user" (also when absent, for legacy rows),
+	// "portal_customer", or "system". PortalCustomer carries the acting
+	// portal customer for portal_customer entries.
+	ActorKind      string                 `json:"actor_kind,omitempty"`
+	PortalCustomer *PortalCustomerSummary `json:"portal_customer,omitempty"`
+	ChangedAt      time.Time              `json:"changed_at"`
 }
 
 // AttachmentResponse is the public API representation of an Attachment
@@ -174,18 +185,22 @@ type AttachmentResponse struct {
 	FileSize         int64        `json:"file_size"`
 	HasThumbnail     bool         `json:"has_thumbnail"`
 	Uploader         *UserSummary `json:"uploader,omitempty"`
-	CreatedAt        time.Time    `json:"created_at"`
-	DownloadURL      string       `json:"download_url,omitempty"`
-	ThumbnailURL     string       `json:"thumbnail_url,omitempty"`
+	// UploaderPortalCustomer carries the portal-customer uploader when the
+	// file was submitted through a portal or public form.
+	UploaderPortalCustomer *PortalCustomerSummary `json:"uploader_portal_customer,omitempty"`
+	CreatedAt              time.Time              `json:"created_at"`
+	DownloadURL            string                 `json:"download_url,omitempty"`
+	ThumbnailURL           string                 `json:"thumbnail_url,omitempty"`
 }
 
 // TransitionResponse represents an available workflow transition
 type TransitionResponse struct {
-	ID           int            `json:"id"`
-	FromStatusID *int           `json:"from_status_id,omitempty"`
-	ToStatusID   int            `json:"to_status_id"`
-	FromStatus   *StatusSummary `json:"from_status,omitempty"`
-	ToStatus     *StatusSummary `json:"to_status,omitempty"`
+	ID              int            `json:"id"`
+	FromStatusID    *int           `json:"from_status_id,omitempty"`
+	FromAllStatuses bool           `json:"from_all_statuses"`
+	ToStatusID      int            `json:"to_status_id"`
+	FromStatus      *StatusSummary `json:"from_status,omitempty"`
+	ToStatus        *StatusSummary `json:"to_status,omitempty"`
 }
 
 // TransitionRequest is the body for POST /rest/api/v1/items/{id}/transition

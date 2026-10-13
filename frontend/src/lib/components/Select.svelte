@@ -1,8 +1,8 @@
 <script>
   import { createPopover, melt } from '@melt-ui/svelte';
+  import { controlSizeClasses } from '../utils/controlSizes.js';
   import { ChevronDown, Check } from '@lucide/svelte';
-  import { tick } from 'svelte';
-  import { fly } from 'svelte/transition';
+  import { tick, untrack } from 'svelte';
 
   /**
    * @type {{
@@ -13,7 +13,10 @@
    *   size?: string,
    *   id?: string,
    *   class?: string,
+   *   menuWidth?: string,
+   *   portalOwner?: string,
    *   placeholder?: string,
+   *   ariaLabel?: string,
    *   onchange?: (e?: any) => void,
    *   onfocus?: (e?: any) => void,
    *   onblur?: (e?: any) => void,
@@ -27,7 +30,10 @@
     size = 'medium',
     id = undefined,
     class: className = '',
+    menuWidth = '',
+    portalOwner = undefined,
     placeholder = '',
+    ariaLabel = undefined,
     onchange = undefined,
     onfocus = undefined,
     onblur = undefined
@@ -40,8 +46,9 @@
     forceVisible: true,
     positioning: {
       strategy: 'fixed',
+      fitViewport: true,
       placement: 'bottom-start',
-      sameWidth: true,
+      sameWidth: untrack(() => !menuWidth),
       gutter: 4
     },
     portal: 'body'
@@ -56,10 +63,7 @@
   const displayText = $derived(selectedOption?.label || placeholder || '');
 
   // Size variants
-  const sizeClasses = $derived({
-    small: 'px-3 py-1.5 text-sm',
-    medium: 'px-3 py-2 text-sm'
-  }[size] || 'px-3 py-2 text-sm');
+  const sizeClasses = $derived(controlSizeClasses(size));
 
   // Open dropdown and focus selected/first item
   function openDropdown() {
@@ -85,12 +89,30 @@
     tick().then(() => triggerElement?.focus());
   }
 
+  function optionId(opt, index) {
+    if (!id) return `select-option-${index}`;
+    const safeValue = String(opt.value).replace(/[^A-Za-z0-9_-]/g, '-');
+    return `${id}-option-${safeValue}`;
+  }
+
   function scrollToHighlighted() {
     tick().then(() => {
       if (!listboxElement) return;
       const items = listboxElement.querySelectorAll('[role="option"]');
       const item = items[highlightedIndex];
-      if (item) item.scrollIntoView({ block: 'nearest' });
+      if (!item) return;
+      // Scroll only the dropdown's own list. scrollIntoView() walks every
+      // scrollable ancestor, so opening the menu could scroll the surrounding
+      // modal and leave the trigger (and the fixed popover) off-screen.
+      const scroller = item.closest('[data-select-scroller]');
+      if (!scroller) return;
+      const scrollerRect = scroller.getBoundingClientRect();
+      const itemRect = item.getBoundingClientRect();
+      if (itemRect.top < scrollerRect.top) {
+        scroller.scrollTop += itemRect.top - scrollerRect.top;
+      } else if (itemRect.bottom > scrollerRect.bottom) {
+        scroller.scrollTop += itemRect.bottom - scrollerRect.bottom;
+      }
     });
   }
 
@@ -168,8 +190,9 @@
     aria-required={required || undefined}
     aria-haspopup="listbox"
     aria-expanded={$open}
+    aria-label={ariaLabel}
     class="w-full rounded border transition-all duration-200 flex items-center justify-between gap-2
-           focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50
+           focus:outline-none focus:ring-2 focus:ring-ds-border-focused
            disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer text-left {sizeClasses}"
     style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
     onkeydown={handleTriggerKeydown}
@@ -190,21 +213,24 @@
   <div
     use:melt={$content}
     bind:this={listboxElement}
+    data-testid={id ? `${id}-listbox` : undefined}
+    data-popover-owner={portalOwner}
     role="listbox"
     tabindex="-1"
-    aria-activedescendant={highlightedIndex >= 0 ? `select-option-${highlightedIndex}` : undefined}
+    aria-activedescendant={highlightedIndex >= 0 ? optionId(options[highlightedIndex], highlightedIndex) : undefined}
     onkeydown={handleListboxKeydown}
-    class="rounded border shadow-lg max-h-60 overflow-y-auto z-[60] focus:outline-none"
-    style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);
+    class="rounded border shadow-lg flex flex-col overflow-hidden z-[60] focus:outline-none"
+    style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); width: {menuWidth || undefined};
            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.25), 0 10px 10px -5px rgba(0, 0, 0, 0.15);"
-    transition:fly={{ duration: 150, y: -5 }}
   >
+    <div data-select-scroller class="min-h-0 max-h-60 overflow-y-auto overscroll-contain">
     {#each options as opt, index (opt.value ?? `opt-${index}`)}
       {@const isSelected = String(opt.value) === String(value)}
       {@const isHighlighted = highlightedIndex === index}
       <div
-        id="select-option-{index}"
-        data-option-id={opt.value}
+        id={optionId(opt, index)}
+        data-testid={id ? `${id}-option` : undefined}
+        data-option-id={opt.value ?? ''}
         role="option"
         tabindex="-1"
         aria-selected={isSelected}
@@ -225,5 +251,6 @@
         {/if}
       </div>
     {/each}
+    </div>
   </div>
 {/if}

@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { api } from '../api.js';
   import { Plus, Edit, Trash2, Palette, Check, X } from '@lucide/svelte';
   import AlertBox from '../components/AlertBox.svelte';
@@ -9,12 +10,14 @@
   import Modal from '../dialogs/Modal.svelte';
   import ModalHeader from '../dialogs/ModalHeader.svelte';
   import DialogFooter from '../dialogs/DialogFooter.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import IconSelector from '../pickers/IconSelector.svelte';
-  import Label from '../components/Label.svelte';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
   import { t } from '../stores/i18n.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
+  import { objectDisplayValue } from '../utils/systemLabels.js';
+  import LocalizedObjectFields from './LocalizedObjectFields.svelte';
+  import LogoUploader from '../components/LogoUploader.svelte';
+	import TextField from '../components/TextField.svelte';
 
   // State management
   let themes = $state([]);
@@ -23,6 +26,11 @@
   let error = $state(null);
   let showCreateForm = $state(false);
   let editingTheme = $state(null);
+  let translationEditor = $state(null);
+
+  function getThemeDisplayValue(theme, field) {
+    return objectDisplayValue(theme, field);
+  }
 
   // Form data
   let newTheme = $state({
@@ -31,8 +39,11 @@
     nav_background_color_light: '#ffffff',
     nav_text_color_light: '#374151',
     nav_background_color_dark: '#1f2937',
-    nav_text_color_dark: '#f3f4f6'
+    nav_text_color_dark: '#f3f4f6',
+    logo_url: '',
+    logo_url_dark: ''
   });
+  let uploadingLogo = $state(false);
 
   // Load themes and active theme
   onMount(async () => {
@@ -46,7 +57,7 @@
       error = null;
       themes = await api.themes.getAll();
     } catch (err) {
-      error = 'Failed to load themes: ' + err.message;
+      error = t('settings.themeManager.failedToLoad');
       console.error('Error loading themes:', err);
     } finally {
       loading = false;
@@ -66,7 +77,7 @@
       error = null;
       const created = await api.themes.create(newTheme);
       themes = [...themes, created];
-      
+
       // Reset form
       newTheme = {
         name: '',
@@ -74,12 +85,41 @@
         nav_background_color_light: '#ffffff',
         nav_text_color_light: '#374151',
         nav_background_color_dark: '#1f2937',
-        nav_text_color_dark: '#f3f4f6'
+        nav_text_color_dark: '#f3f4f6',
+        logo_url: '',
+        logo_url_dark: ''
       };
       showCreateForm = false;
     } catch (err) {
-      error = 'Failed to create theme: ' + err.message;
+      error = t('settings.themeManager.failedToCreate');
       console.error('Error creating theme:', err);
+    }
+  }
+
+  /**
+   * Upload a logo attachment and bind its URL to the theme being created or
+   * edited. The attachment is stored independently; the URL is persisted with
+   * the theme on the next save, mirroring the hub-logo flow. The field selects
+   * which logo slot (light/default or dark) receives the uploaded URL.
+   */
+  async function uploadThemeLogo(files, target, field = 'logo_url') {
+    const file = files?.[0];
+    if (!file) return;
+
+    uploadingLogo = true;
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('entity_type', 'theme_logo');
+      const result = await api.attachments.upload(formData);
+      if (result?.success && result.logo_url) {
+        target[field] = result.logo_url;
+      }
+    } catch (err) {
+      error = t('settings.themeManager.failedToUploadLogo');
+      console.error('Error uploading theme logo:', err);
+    } finally {
+      uploadingLogo = false;
     }
   }
 
@@ -88,15 +128,14 @@
       error = null;
       const updated = await api.themes.update(id, data);
       themes = themes.map(t => t.id === id ? updated : t);
-      editingTheme = null;
-      
       // If this theme is active, update active theme
       if (updated.is_active) {
         activeTheme = updated;
       }
     } catch (err) {
-      error = 'Failed to update theme: ' + err.message;
+      error = t('settings.themeManager.failedToUpdate');
       console.error('Error updating theme:', err);
+      throw err;
     }
   }
 
@@ -115,7 +154,7 @@
       await api.themes.delete(id);
       themes = themes.filter(t => t.id !== id);
     } catch (err) {
-      error = 'Failed to delete theme: ' + err.message;
+      error = t('settings.themeManager.failedToDelete');
       console.error('Error deleting theme:', err);
     }
   }
@@ -132,7 +171,7 @@
       // Apply theme immediately
       applyTheme(activeTheme);
     } catch (err) {
-      error = 'Failed to activate theme: ' + err.message;
+      error = t('settings.themeManager.failedToActivate');
       console.error('Error activating theme:', err);
     }
   }
@@ -166,17 +205,23 @@
     createTheme();
   }
 
-  function handleEditSubmit(e) {
+  async function handleEditSubmit(e) {
     e.preventDefault();
-    updateTheme(editingTheme.id, {
+    translationEditor?.validate();
+    await updateTheme(editingTheme.id, {
       name: editingTheme.name,
       description: editingTheme.description,
       nav_background_color_light: editingTheme.nav_background_color_light,
       nav_text_color_light: editingTheme.nav_text_color_light,
       nav_background_color_dark: editingTheme.nav_background_color_dark,
       nav_text_color_dark: editingTheme.nav_text_color_dark,
+      logo_url: editingTheme.logo_url || '',
+      logo_url_dark: editingTheme.logo_url_dark || '',
       is_active: editingTheme.is_active
     });
+    await translationEditor?.save();
+    await Promise.all([loadThemes(), loadActiveTheme()]);
+    editingTheme = null;
   }
 </script>
 
@@ -187,12 +232,14 @@
     description={t('settings.appearance')}
   >
     {#snippet actions()}
+      <!-- shortcut-guard-exempt: button has keyboardHint + hotkeyConfig; the guard mis-parses the arrow function inside hotkeyConfig -->
       <Button
         variant="primary"
         icon={Plus}
         onclick={() => showCreateForm = !showCreateForm}
         keyboardHint="A"
         hotkeyConfig={{ key: toHotkeyString('themes', 'add'), guard: () => !showCreateForm }}
+        dataTestid="theme-add"
       >
         {t('common.create')}
       </Button>
@@ -202,7 +249,7 @@
   {#if activeTheme}
     <div class="mb-6 flex items-center space-x-2 text-sm" style="color: var(--ds-text-subtle);">
       <Palette class="w-4 h-4" />
-      <span>{t('common.active')}: <strong style="color: var(--ds-text);">{activeTheme.name}</strong></span>
+      <span>{t('common.active')}: <strong style="color: var(--ds-text);">{getThemeDisplayValue(activeTheme, 'name')}</strong></span>
     </div>
   {/if}
 
@@ -221,43 +268,69 @@
     <form onsubmit={(e) => { e.preventDefault(); createTheme(); }}>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
         <div>
-          <Label for="name" color="default" class="mb-2">{t('common.name')}</Label>
-          <input
-            type="text"
+          <TextField
+            label={t('common.name')}
             id="name"
-            bind:value={newTheme.name}
-            placeholder={t('common.name')}
             required
-            class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2" style="border: 1px solid var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+            labelColor="default"
+            type="text"
+            placeholder={t('common.name')}
+            size="small"
+            bind:value={newTheme.name}
           />
         </div>
 
         <div>
-          <Label for="description" color="default" class="mb-2">{t('common.description')}</Label>
-          <input
-            type="text"
+          <TextField
+            label={t('common.description')}
             id="description"
-            bind:value={newTheme.description}
+            labelColor="default"
+            type="text"
             placeholder={t('placeholders.optionalDescription')}
-            class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2" style="border: 1px solid var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+            size="small"
+            bind:value={newTheme.description}
           />
         </div>
+      </div>
+
+      <!-- Logos -->
+      <div class="mb-4">
+        <LogoUploader
+          currentLogoUrl={newTheme.logo_url || null}
+          onUpload={(files) => uploadThemeLogo(files, newTheme, 'logo_url')}
+          onRemove={() => (newTheme.logo_url = '')}
+          uploading={uploadingLogo}
+          maxHeight="40px"
+          label={t('lookAndFeel.lightLogo', 'Light Mode Logo')}
+        />
+      </div>
+
+      <div class="mb-4">
+        <LogoUploader
+          currentLogoUrl={newTheme.logo_url_dark || null}
+          onUpload={(files) => uploadThemeLogo(files, newTheme, 'logo_url_dark')}
+          onRemove={() => (newTheme.logo_url_dark = '')}
+          uploading={uploadingLogo}
+          maxHeight="40px"
+          label={t('lookAndFeel.darkLogo', 'Dark Mode Logo')}
+          helpText={t('lookAndFeel.darkLogoFallback', 'Shown in dark mode. Falls back to the light mode logo when left empty.')}
+        />
       </div>
 
       <!-- Light Mode Colors -->
       <div class="mb-4">
         <h4 class="text-sm font-semibold mb-3 flex items-center gap-2" style="color: var(--ds-text);">
-          <span class="w-3 h-3 rounded-full bg-yellow-400"></span>
+          <span class="w-3 h-3 rounded-full bg-ds-warning"></span>
           {t('settings.lightMode')}
         </h4>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('common.color')}</span>
+            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('settings.themeManager.background')}</span>
             <IconSelector bind:selectedColor={newTheme.nav_background_color_light} colorOnly compact />
           </div>
 
           <div>
-            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('common.color')}</span>
+            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('settings.themeManager.text')}</span>
             <IconSelector bind:selectedColor={newTheme.nav_text_color_light} colorOnly compact />
           </div>
         </div>
@@ -266,17 +339,17 @@
       <!-- Dark Mode Colors -->
       <div class="mb-4">
         <h4 class="text-sm font-semibold mb-3 flex items-center gap-2" style="color: var(--ds-text);">
-          <span class="w-3 h-3 rounded-full bg-gray-700"></span>
+          <span class="w-3 h-3 rounded-full bg-ds-text"></span>
           {t('settings.darkMode')}
         </h4>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('common.color')}</span>
+            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('settings.themeManager.background')}</span>
             <IconSelector bind:selectedColor={newTheme.nav_background_color_dark} colorOnly compact />
           </div>
 
           <div>
-            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('common.color')}</span>
+            <span class="text-xs font-medium" style="color: var(--ds-text);">{t('settings.themeManager.text')}</span>
             <IconSelector bind:selectedColor={newTheme.nav_text_color_dark} colorOnly compact />
           </div>
         </div>
@@ -294,13 +367,11 @@
 
   <!-- Themes List -->
   {#if loading}
-    <div class="flex justify-center py-8">
-      <Spinner />
-    </div>
+    <StateDisplay type="loading" />
   {:else}
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
       {#each themes as theme (theme.id)}
-        <div class="rounded overflow-hidden" style="background-color: var(--ds-surface); border: 1px solid var(--ds-border);">
+        <div class="rounded overflow-hidden" style="background-color: var(--ds-surface); border: 1px solid var(--ds-border);" data-testid={`theme-card-${theme.id}`}>
           <!-- Theme Previews (Light and Dark side by side) -->
           <div class="flex">
             <div
@@ -308,8 +379,12 @@
               style="background-color: {theme.nav_background_color_light}; color: {theme.nav_text_color_light};"
             >
               <div class="flex items-center space-x-2">
-                <Palette class="w-4 h-4" />
-                <span class="font-medium text-sm">Light</span>
+                {#if theme.logo_url}
+                  <img src={theme.logo_url} alt="" class="w-6 h-6 object-contain flex-shrink-0" />
+                {:else}
+                  <Palette class="w-4 h-4" />
+                {/if}
+                <span class="font-medium text-sm">{t('settings.lightMode')}</span>
               </div>
             </div>
             <div
@@ -317,8 +392,12 @@
               style="background-color: {theme.nav_background_color_dark}; color: {theme.nav_text_color_dark};"
             >
               <div class="flex items-center space-x-2">
-                <Palette class="w-4 h-4" />
-                <span class="font-medium text-sm">Dark</span>
+                {#if theme.logo_url_dark || theme.logo_url}
+                  <img src={theme.logo_url_dark || theme.logo_url} alt="" class="w-6 h-6 object-contain flex-shrink-0" />
+                {:else}
+                  <Palette class="w-4 h-4" />
+                {/if}
+                <span class="font-medium text-sm">{t('settings.darkMode')}</span>
               </div>
             </div>
           </div>
@@ -328,40 +407,55 @@
             {#if editingTheme && editingTheme.id === theme.id}
               <!-- Edit Form -->
               <form onsubmit={handleEditSubmit} class="space-y-4">
-                <div>
-                  <Label for="edit-theme-name" color="default" class="mb-1">Name</Label>
-                  <input
-                    type="text"
-                    id="edit-theme-name"
-                    bind:value={editingTheme.name}
-                    required
-                    class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2" style="border: 1px solid var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+                {#key editingTheme.id}
+                  <LocalizedObjectFields
+                    bind:this={translationEditor}
+                    objectType="theme"
+                    objectId={editingTheme.id}
+                    bind:canonicalName={editingTheme.name}
+                    bind:canonicalDescription={editingTheme.description}
+                    displayName={editingTheme.display_name || editingTheme.name}
+                    displayDescription={editingTheme.display_description || editingTheme.description}
+                  />
+                {/key}
+
+                <!-- Logos -->
+                <div class="mb-3">
+                  <LogoUploader
+                    currentLogoUrl={editingTheme.logo_url || null}
+                    onUpload={(files) => uploadThemeLogo(files, editingTheme, 'logo_url')}
+                    onRemove={() => (editingTheme.logo_url = '')}
+                    uploading={uploadingLogo}
+                    maxHeight="40px"
+                    label={t('lookAndFeel.lightLogo', 'Light Mode Logo')}
                   />
                 </div>
 
-                <div>
-                  <Label for="edit-theme-description" color="default" class="mb-1">Description</Label>
-                  <input
-                    type="text"
-                    id="edit-theme-description"
-                    bind:value={editingTheme.description}
-                    class="w-full px-3 py-2 rounded-md focus:outline-none focus:ring-2" style="border: 1px solid var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+                <div class="mb-3">
+                  <LogoUploader
+                    currentLogoUrl={editingTheme.logo_url_dark || null}
+                    onUpload={(files) => uploadThemeLogo(files, editingTheme, 'logo_url_dark')}
+                    onRemove={() => (editingTheme.logo_url_dark = '')}
+                    uploading={uploadingLogo}
+                    maxHeight="40px"
+                    label={t('lookAndFeel.darkLogo', 'Dark Mode Logo')}
+                    helpText={t('lookAndFeel.darkLogoFallback', 'Shown in dark mode. Falls back to the light mode logo when left empty.')}
                   />
                 </div>
 
                 <!-- Light Mode Colors -->
                 <div class="mb-3">
                   <h5 class="text-xs font-semibold mb-2 flex items-center gap-1" style="color: var(--ds-text-subtle);">
-                    <span class="w-2 h-2 rounded-full bg-yellow-400"></span>
-                    Light Mode
+                    <span class="w-2 h-2 rounded-full bg-ds-warning"></span>
+                    {t('settings.lightMode')}
                   </h5>
                   <div class="grid grid-cols-2 gap-3">
                     <div>
-                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">Background</span>
+                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">{t('settings.themeManager.background')}</span>
                       <IconSelector bind:selectedColor={editingTheme.nav_background_color_light} colorOnly compact />
                     </div>
                     <div>
-                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">Text</span>
+                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">{t('settings.themeManager.text')}</span>
                       <IconSelector bind:selectedColor={editingTheme.nav_text_color_light} colorOnly compact />
                     </div>
                   </div>
@@ -370,16 +464,16 @@
                 <!-- Dark Mode Colors -->
                 <div>
                   <h5 class="text-xs font-semibold mb-2 flex items-center gap-1" style="color: var(--ds-text-subtle);">
-                    <span class="w-2 h-2 rounded-full bg-gray-700"></span>
-                    Dark Mode
+                    <span class="w-2 h-2 rounded-full bg-ds-text"></span>
+                    {t('settings.darkMode')}
                   </h5>
                   <div class="grid grid-cols-2 gap-3">
                     <div>
-                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">Background</span>
+                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">{t('settings.themeManager.background')}</span>
                       <IconSelector bind:selectedColor={editingTheme.nav_background_color_dark} colorOnly compact />
                     </div>
                     <div>
-                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">Text</span>
+                      <span class="block text-xs mb-1" style="color: var(--ds-text-subtle);">{t('settings.themeManager.text')}</span>
                       <IconSelector bind:selectedColor={editingTheme.nav_text_color_dark} colorOnly compact />
                     </div>
                   </div>
@@ -410,7 +504,7 @@
               <div class="flex justify-between items-start mb-4">
                 <div>
                   <h3 class="text-lg font-semibold flex items-center space-x-2" style="color: var(--ds-text);">
-                    <span>{theme.name}</span>
+                    <span>{getThemeDisplayValue(theme, 'name')}</span>
                     {#if theme.is_default}
                       <span class="px-2 py-1 text-xs rounded" style="background-color: var(--ds-surface-secondary); color: var(--ds-text-subtle);">{t('common.default')}</span>
                     {/if}
@@ -418,8 +512,8 @@
                       <span class="px-2 py-1 text-xs rounded" style="background-color: var(--ds-surface-success); color: var(--ds-text-success);">{t('common.active')}</span>
                     {/if}
                   </h3>
-                  {#if theme.description}
-                    <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">{theme.description}</p>
+                  {#if getThemeDisplayValue(theme, 'description')}
+                    <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">{getThemeDisplayValue(theme, 'description')}</p>
                   {/if}
                 </div>
               </div>
@@ -428,16 +522,16 @@
                 <!-- Light Mode Info -->
                 <div class="text-sm">
                   <h5 class="text-xs font-semibold mb-1 flex items-center gap-1" style="color: var(--ds-text-subtle);">
-                    <span class="w-2 h-2 rounded-full bg-yellow-400"></span>
-                    Light
+                    <span class="w-2 h-2 rounded-full bg-ds-warning"></span>
+                    {t('settings.lightMode')}
                   </h5>
                   <div class="space-y-1">
                     <div>
-                      <span style="color: var(--ds-text-subtle);">Bg:</span>
+                      <span style="color: var(--ds-text-subtle);">{t('settings.themeManager.background')}:</span>
                       <span class="font-mono" style="color: var(--ds-text);">{theme.nav_background_color_light}</span>
                     </div>
                     <div>
-                      <span style="color: var(--ds-text-subtle);">Text:</span>
+                      <span style="color: var(--ds-text-subtle);">{t('settings.themeManager.text')}:</span>
                       <span class="font-mono" style="color: var(--ds-text);">{theme.nav_text_color_light}</span>
                     </div>
                   </div>
@@ -445,16 +539,16 @@
                 <!-- Dark Mode Info -->
                 <div class="text-sm">
                   <h5 class="text-xs font-semibold mb-1 flex items-center gap-1" style="color: var(--ds-text-subtle);">
-                    <span class="w-2 h-2 rounded-full bg-gray-700"></span>
-                    Dark
+                    <span class="w-2 h-2 rounded-full bg-ds-text"></span>
+                    {t('settings.darkMode')}
                   </h5>
                   <div class="space-y-1">
                     <div>
-                      <span style="color: var(--ds-text-subtle);">Bg:</span>
+                      <span style="color: var(--ds-text-subtle);">{t('settings.themeManager.background')}:</span>
                       <span class="font-mono" style="color: var(--ds-text);">{theme.nav_background_color_dark}</span>
                     </div>
                     <div>
-                      <span style="color: var(--ds-text-subtle);">Text:</span>
+                      <span style="color: var(--ds-text-subtle);">{t('settings.themeManager.text')}:</span>
                       <span class="font-mono" style="color: var(--ds-text);">{theme.nav_text_color_dark}</span>
                     </div>
                   </div>
@@ -469,6 +563,7 @@
                       size="sm"
                       icon={Check}
                       onclick={() => activateTheme(theme.id)}
+                      dataTestid={`theme-activate-${theme.id}`}
                     >
                       {t('common.enable')}
                     </Button>
@@ -479,6 +574,7 @@
                       onclick={() => startEdit(theme)}
                       class="flex items-center space-x-1 px-3 py-1 text-sm rounded transition-colors hover-edit-btn"
                       style="color: var(--ds-text-subtle); background-color: var(--ds-surface-secondary);"
+                      data-testid={`theme-edit-${theme.id}`}
                     >
                       <Edit class="w-3 h-3" />
                       <span>{t('common.edit')}</span>
@@ -491,6 +587,7 @@
                     onclick={() => deleteTheme(theme.id)}
                     class="flex items-center space-x-1 px-3 py-1 text-sm rounded transition-colors"
                     style="color: var(--ds-text-danger); background-color: var(--ds-danger-subtle);"
+                    data-testid={`theme-delete-${theme.id}`}
                   >
                     <Trash2 class="w-3 h-3" />
                     <span>{t('common.delete')}</span>
@@ -506,6 +603,7 @@
     {#if themes.length === 0}
       <EmptyState icon={Palette} title={t('common.noData')} description={t('settings.appearance')}>
         {#snippet action()}
+          <!-- shortcut-guard-exempt: duplicate of the header Create button, which owns the A shortcut -->
           <Button variant="primary" icon={Plus} onclick={() => showCreateForm = true}>
             {t('common.create')}
           </Button>

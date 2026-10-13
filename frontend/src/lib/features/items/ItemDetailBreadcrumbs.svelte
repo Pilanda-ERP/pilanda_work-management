@@ -1,10 +1,17 @@
 <script>
-  import { FileText, Edit3, X, Search } from '@lucide/svelte';
+  import { AlertTriangle, Check, Edit3, X, Search } from '@lucide/svelte';
   import Tooltip from '../../components/Tooltip.svelte';
-  import ItemKey from '../items/ItemKey.svelte';
+  import Input from '../../components/Input.svelte';
+  import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
+  import ItemDetailBreadcrumbLevel from './ItemDetailBreadcrumbLevel.svelte';
+  import ItemKey from '../../components/ItemKey.svelte';
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
+  import {
+    canItemTypeBeChildOf,
+    isGenericSubtaskType,
+  } from '../../utils/hierarchy.js';
 
   let {
   workspace,
@@ -12,7 +19,6 @@
   currentItemType,
   currentHierarchyLevel,
   item,
-  iconMap,
   workspaceId,
   itemTypes: providedItemTypes = [],
   onnavigate = null,
@@ -39,6 +45,34 @@
   }
 
   let effectiveItemTypes = $derived(providedItemTypes?.length ? providedItemTypes : itemTypes);
+  let directParent = $derived(parentHierarchy.length > 0 ? parentHierarchy[parentHierarchy.length - 1] : null);
+  let currentItemHierarchyLevel = $derived(currentItemType?.hierarchy_level ?? currentHierarchyLevel?.level ?? null);
+  let parentHierarchyLevel = $derived(directParent?.itemType?.hierarchy_level ?? null);
+  let currentItemIsGenericSubtask = $derived(isGenericSubtaskType(currentItemType));
+  let canEditParent = $derived(
+    parentHierarchy.length > 0 || currentItemIsGenericSubtask || currentItemHierarchyLevel > 0
+  );
+  let hasHierarchyMismatch = $derived(
+    currentItemHierarchyLevel !== null &&
+    parentHierarchyLevel !== null &&
+    (currentItemIsGenericSubtask
+      ? isGenericSubtaskType(directParent?.itemType)
+      : parentHierarchyLevel !== currentItemHierarchyLevel - 1)
+  );
+  let compatibleHierarchyLevel = $derived(parentHierarchyLevel !== null ? parentHierarchyLevel + 1 : null);
+  let displayedItemTypes = $derived.by(() => {
+    const types = effectiveItemTypes.filter(type => directParent || !isGenericSubtaskType(type));
+    if (!hasHierarchyMismatch || compatibleHierarchyLevel === null) return types;
+
+    return types.sort((a, b) => {
+      const compatibilityOrder =
+        Number(canItemTypeBeChildOf(b, directParent?.itemType)) -
+        Number(canItemTypeBeChildOf(a, directParent?.itemType));
+      if (compatibilityOrder !== 0) return compatibilityOrder;
+      if (a.hierarchy_level !== b.hierarchy_level) return a.hierarchy_level - b.hierarchy_level;
+      return (a.sort_order ?? 0) - (b.sort_order ?? 0);
+    });
+  });
 
   function getItemTypeInfo(itemTypeId) {
     if (!itemTypeId || !effectiveItemTypes.length) return null;
@@ -68,17 +102,28 @@
     onitemtypechange?.(type);
   }
 
+  async function openCompatibleItemTypes() {
+    closeParentSelector();
+    await openItemTypeSelector();
+  }
+
   async function openParentSelector() {
     showParentSelector = true;
     searchQuery = '';
     searchResults = [];
+    validParentHierarchyLevel = null;
     
     // Load item types and calculate valid parent hierarchy level
     try {
       itemTypes = await api.itemTypes.getAll();
       
       // Calculate the valid parent hierarchy level (current level - 1)
-      if (currentItemType && currentHierarchyLevel) {
+      if (
+        currentItemType &&
+        currentHierarchyLevel &&
+        currentItemHierarchyLevel > 0 &&
+        !currentItemIsGenericSubtask
+      ) {
         validParentHierarchyLevel = currentHierarchyLevel.level - 1;
       }
     } catch (error) {
@@ -113,8 +158,16 @@
         
         let filteredResults = (results || []).filter(result => !parentIds.has(result.id));
         
-        // Further filter by hierarchy level if we have the information
-       if (validParentHierarchyLevel !== null && itemTypes.length > 0) {
+        // Generic subtasks accept a parent at any regular level. Fixed types
+        // retain the adjacent-level rule.
+        if (currentItemIsGenericSubtask && itemTypes.length > 0) {
+          filteredResults = filteredResults.filter(result => {
+            const resultItemType = itemTypes.find(type => type.id === result.item_type_id);
+            return resultItemType && !isGenericSubtaskType(resultItemType);
+          });
+        } else if (currentItemHierarchyLevel === 0) {
+          filteredResults = [];
+        } else if (validParentHierarchyLevel !== null && itemTypes.length > 0) {
           filteredResults = filteredResults.filter(result => {
             if (!result.item_type_id) return false;
             
@@ -179,7 +232,11 @@
 </script>
 
 <!-- Breadcrumb Navigation -->
-<div class="group flex items-center gap-2 text-sm mb-6 min-w-0 overflow-visible flex-nowrap" style="color: var(--ds-text-subtle);">
+<div
+  data-testid="item-detail-breadcrumbs"
+  class="group flex items-center gap-2 text-sm {hasHierarchyMismatch ? 'mb-3' : 'mb-6'} min-w-0 overflow-visible flex-nowrap"
+  style="color: var(--ds-text-subtle);"
+>
   <a
     href={workspace?.is_personal ? '/personal' : `/workspaces/${workspaceId}`}
     class="transition-colors hover:underline flex-shrink-0 no-underline"
@@ -209,21 +266,13 @@
   <!-- Parent Hierarchy in breadcrumb -->
   {#if parentHierarchy.length > 0}
     {#each parentHierarchy as parent}
-      <div class="flex items-center gap-2 min-w-0">
-        {#if parent.itemType}
-          <Tooltip content={parent.itemType.name}>
-            {#snippet children()}
-              {@const ParentIcon = iconMap[parent.itemType.icon] || FileText}
-              <div
-                class="w-4 h-4 rounded flex items-center justify-center text-white text-xs cursor-help"
-                style="background-color: {parent.itemType.color};"
-              >
-                <ParentIcon class="w-3 h-3" />
-              </div>
-            {/snippet}
-          </Tooltip>
-        {/if}
+      <ItemDetailBreadcrumbLevel
+        itemType={parent.itemType}
+        iconSlotTestId={`item-parent-type-icon-slot-${parent.id}`}
+        iconTestId={`item-parent-type-icon-${parent.id}`}
+      >
         <a
+          data-testid={`item-parent-breadcrumb-${parent.id}`}
           href={`/workspaces/${parent.workspace_id}/items/${parent.id}`}
           class="transition-colors hover:underline truncate max-w-24 no-underline"
           style="color: inherit;"
@@ -231,27 +280,32 @@
         >
           {parent.title}
         </a>
-      </div>
+      </ItemDetailBreadcrumbLevel>
       <span class="flex-shrink-0">/</span>
     {/each}
   {:else if !item.parent_id && !(workspace?.is_personal && item.related_work_item_id)}
     <!-- Show placeholder for "no parent" scenario (not shown for personal tasks with linked work items) -->
-    <button
-      onclick={openParentSelector}
-      class="italic transition-colors hover:underline"
-      style="color: var(--ds-text-subtlest);"
-      title={t('items.setParent')}
-    >
-      {t('items.noParent')}
-    </button>
+    {#if canEditParent}
+      <button
+        onclick={openParentSelector}
+        class="italic transition-colors hover:underline"
+        style="color: var(--ds-text-subtlest);"
+        title={t('items.setParent')}
+      >
+        {t('items.noParent')}
+      </button>
+    {:else}
+      <span class="italic" style="color: var(--ds-text-subtlest);">{t('items.noParent')}</span>
+    {/if}
     <span class="flex-shrink-0">/</span>
   {/if}
 
   <!-- Edit Parent Button (hidden for personal tasks with linked work items) -->
-  {#if !(workspace?.is_personal && item.related_work_item_id)}
+  {#if canEditParent && !(workspace?.is_personal && item.related_work_item_id)}
   <div class="relative">
     <div class="overflow-hidden transition-all duration-200 w-0 group-hover:w-4">
       <button
+        data-testid="item-parent-edit"
         onclick={openParentSelector}
         class="w-4 h-4 rounded transition-colors flex items-center justify-center"
         style="color: var(--ds-text-subtlest);"
@@ -265,7 +319,8 @@
     <!-- Parent Selector Popover -->
     {#if showParentSelector}
       <div
-        class="absolute left-0 top-6 w-80 rounded shadow-lg border z-50"
+        data-testid="item-parent-selector"
+        class="absolute left-0 top-6 w-96 rounded shadow-lg border z-50"
         style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); backdrop-filter: blur(8px);"
       >
         <!-- Header -->
@@ -274,6 +329,7 @@
             {parentHierarchy.length > 0 ? t('items.changeParent') : t('items.setParent')}
           </h3>
           <button
+            data-testid="item-parent-selector-close"
             onclick={closeParentSelector}
             class="w-6 h-6 rounded transition-colors flex items-center justify-center"
             style="color: var(--ds-text-subtle);"
@@ -286,16 +342,31 @@
         <div class="p-3 border-b" style="border-color: var(--ds-border);">
           <div class="relative">
             <Search class="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4" style="color: var(--ds-text-subtlest);" />
-            <input
+            <Input
+              dataTestid="item-parent-search"
               type="text"
               bind:value={searchQuery}
               placeholder={t('items.searchForParentItem')}
-              class="w-full pl-9 pr-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              class="w-full pl-9 pr-3 py-2 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-ds-border-focused focus:border-transparent"
               style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+              size="small"
             />
           </div>
-          {#if validParentHierarchyLevel !== null}
-            <div class="mt-2 text-xs" style="color: var(--ds-text-subtle);">
+          {#if currentItemIsGenericSubtask}
+            <div
+              data-testid="item-parent-generic-subtask-hint"
+              class="mt-2 text-xs"
+              style="color: var(--ds-text-subtle);"
+            >
+              {t('items.genericSubtaskParentHint')}
+            </div>
+          {:else if validParentHierarchyLevel !== null}
+            <div
+              data-testid="item-parent-level-hint"
+              data-parent-level={validParentHierarchyLevel}
+              class="mt-2 text-xs"
+              style="color: var(--ds-text-subtle);"
+            >
               {t('items.showingItemsFromLevel', { level: validParentHierarchyLevel })}
               {#if currentHierarchyLevel}
                 ({t('items.oneLevelAbove', { name: currentHierarchyLevel.name })})
@@ -306,16 +377,49 @@
               {t('items.searchParentAcrossWorkspaces')}
             </div>
           {/if}
+          {#if hasHierarchyMismatch}
+            <div
+              data-testid="item-parent-hierarchy-mismatch"
+              class="mt-3 rounded-md border p-3"
+              style="border-color: var(--ds-border-warning); background: var(--ds-background-warning-subtle, var(--ds-surface));"
+            >
+              <div class="flex items-start gap-2">
+                <AlertTriangle class="mt-0.5 h-4 w-4 flex-shrink-0" style="color: var(--ds-icon-warning);" />
+                <div class="min-w-0">
+                  <p class="text-xs font-medium" style="color: var(--ds-text);">
+                    {t('items.parentPickerMismatchTitle')}
+                  </p>
+                  <p class="mt-1 text-xs" style="color: var(--ds-text-subtle);">
+                    {t('items.parentPickerMismatchDescription', {
+                      type: currentItemType?.name,
+                      requiredLevel: validParentHierarchyLevel,
+                      currentParentLevel: parentHierarchyLevel,
+                      compatibleLevel: compatibleHierarchyLevel
+                    })}
+                  </p>
+                  <button
+                    type="button"
+                    data-testid="item-parent-change-type"
+                    onclick={openCompatibleItemTypes}
+                    class="mt-2 text-xs font-medium underline underline-offset-2"
+                    style="color: var(--ds-link);"
+                  >
+                    {t('items.chooseCompatibleType')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          {/if}
         </div>
 
         <!-- Results -->
         <div class="max-h-60 overflow-y-auto">
-          {#if parentHierarchy.length > 0}
+          {#if parentHierarchy.length > 0 && !currentItemIsGenericSubtask}
             <!-- Remove parent option -->
             <button
               onclick={removeParent}
               disabled={saving}
-              class="w-full px-3 py-2 text-left border-b text-red-600 hover:text-red-700 disabled:opacity-50"
+              class="w-full px-3 py-2 text-left border-b text-ds-text-danger hover:opacity-80 disabled:opacity-50"
               style="border-color: var(--ds-border);"
             >
               <div class="flex items-center gap-2">
@@ -330,7 +434,7 @@
               {t('common.searching')}
             </div>
           {:else if searchQuery.length >= 2 && searchResults.length === 0}
-            <div class="p-3 text-center text-sm" style="color: var(--ds-text-subtle);">
+            <div data-testid="item-parent-no-results" class="p-3 text-center text-sm" style="color: var(--ds-text-subtle);">
               {#if validParentHierarchyLevel !== null}
                 {t('items.noItemsAtLevel', { level: validParentHierarchyLevel })}
               {:else}
@@ -345,6 +449,7 @@
             {#each searchResults as result}
               {@const resultItemType = getItemTypeInfo(result.item_type_id)}
               <button
+                data-testid={`item-parent-result-${result.id}`}
                 onclick={() => selectParent(result)}
                 disabled={saving}
                 class="w-full px-3 py-2 text-left border-b last:border-b-0 disabled:opacity-50"
@@ -353,19 +458,12 @@
                 <div class="flex items-center gap-2">
                   <!-- Item Type Icon -->
                   {#if resultItemType}
-                    {@const ResultIcon = iconMap[resultItemType.icon] || FileText}
-                    <div
-                      class="w-4 h-4 rounded flex items-center justify-center text-white text-xs flex-shrink-0"
-                      style="background-color: {resultItemType.color};"
-                      title={resultItemType.name}
-                    >
-                      <ResultIcon class="w-3 h-3" />
-                    </div>
+                    <ItemTypeIcon itemType={resultItemType} />
                   {/if}
 
                   <!-- Item Key -->
                   <div class="flex-shrink-0">
-                    <ItemKey item={result} workspace={result.workspace_key ? { key: result.workspace_key } : workspace} />
+                    <ItemKey item={result} workspace={result.workspace_key ? { key: result.workspace_key } : workspace} clickable={false} />
                   </div>
 
                   <!-- Title -->
@@ -381,27 +479,23 @@
     {/if}
   </div>
   {/if}
-  <div class="flex items-center gap-2 min-w-0 flex-1" style="color: var(--ds-text);">
-    {#if currentItemType}
-      <div class="relative flex-shrink-0">
-        <Tooltip content="{currentItemType.name} ({currentHierarchyLevel?.name || 'Unknown level'}) — click to change">
-          {#snippet children()}
-            {@const CurrentIcon = iconMap[currentItemType.icon] || FileText}
-            <button
-              type="button"
-              onclick={openItemTypeSelector}
-              class="w-4 h-4 rounded flex items-center justify-center text-white text-xs cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-500"
-              style="background-color: {currentItemType.color};"
-              title="Change item type"
-            >
-              <CurrentIcon class="w-3 h-3" />
-            </button>
-          {/snippet}
-        </Tooltip>
-
+  <ItemDetailBreadcrumbLevel
+    itemType={currentItemType}
+    iconTooltip={currentItemType ? `${currentItemType.name} (${currentHierarchyLevel?.name || 'Unknown level'}) — click to change` : undefined}
+    iconTitle="Change item type"
+    iconSlotTestId="item-type-icon-slot"
+    iconTriggerTestId="item-type-change-trigger"
+    iconTestId="item-type-change-icon"
+    oniconclick={openItemTypeSelector}
+    class="flex-1"
+    style="color: var(--ds-text);"
+  >
+    {#snippet iconOverlay()}
+      {#if currentItemType}
         {#if showItemTypeSelector}
           <div
-            class="absolute left-0 top-6 w-64 rounded shadow-lg border z-50"
+            data-testid="item-type-selector"
+            class="absolute left-0 top-6 w-96 rounded shadow-lg border z-50"
             style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); backdrop-filter: blur(8px);"
           >
             <div class="flex items-center justify-between p-3 border-b" style="border-color: var(--ds-border);">
@@ -415,29 +509,61 @@
                 <X class="w-4 h-4" />
               </button>
             </div>
+            {#if hasHierarchyMismatch}
+              <div
+                data-testid="item-type-compatibility-hint"
+                data-compatible-level={compatibleHierarchyLevel}
+                class="border-b px-3 py-2 text-xs"
+                style="border-color: var(--ds-border); color: var(--ds-text-subtle); background: var(--ds-background-warning-subtle, var(--ds-surface));"
+              >
+                {t('items.compatibleTypeHint', {
+                  parentLevel: parentHierarchyLevel,
+                  compatibleLevel: compatibleHierarchyLevel
+                })}
+              </div>
+            {/if}
             <div class="max-h-72 overflow-y-auto py-1">
-              {#each effectiveItemTypes as type (type.id)}
-                {@const TypeIcon = iconMap[type.icon] || FileText}
+              {#each displayedItemTypes as type (type.id)}
+                {@const fitsCurrentParent = directParent?.itemType && canItemTypeBeChildOf(type, directParent.itemType)}
                 <button
                   type="button"
+                  data-testid={`item-type-option-${type.id}`}
+                  data-parent-compatible={fitsCurrentParent}
                   onclick={() => selectItemType(type)}
                   disabled={type.id === item.item_type_id}
                   class="w-full px-3 py-2 text-left flex items-center gap-2 disabled:opacity-50"
+                  style:background={hasHierarchyMismatch && fitsCurrentParent ? 'var(--ds-background-success-subtle, var(--ds-surface))' : undefined}
                 >
-                  <span
-                    class="w-4 h-4 rounded flex items-center justify-center text-white text-xs flex-shrink-0"
-                    style="background-color: {type.color};"
-                  >
-                    <TypeIcon class="w-3 h-3" />
+                  <ItemTypeIcon itemType={type} />
+                  <span class="min-w-0 flex-1">
+                    <span class="block truncate text-sm" style="color: var(--ds-text);">{type.name}</span>
+                    <span
+                      data-testid={`item-type-level-${type.id}`}
+                      class="block text-xs"
+                      style="color: var(--ds-text-subtle);"
+                    >
+                      {isGenericSubtaskType(type)
+                        ? t('items.genericSubtaskLevelLabel')
+                        : t('items.hierarchyLevelLabel', { level: type.hierarchy_level })}
+                    </span>
                   </span>
-                  <span class="text-sm truncate" style="color: var(--ds-text);">{type.name}</span>
+                  {#if hasHierarchyMismatch && fitsCurrentParent}
+                    <span
+                      data-testid={`item-type-compatible-${type.id}`}
+                      class="flex flex-shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium"
+                      style="background: var(--ds-background-success); color: var(--ds-text-success);"
+                    >
+                      <Check class="h-3 w-3" />
+                      {t('items.fitsCurrentParent')}
+                    </span>
+                  {/if}
                 </button>
               {/each}
             </div>
           </div>
         {/if}
-      </div>
-    {/if}
+      {/if}
+    {/snippet}
     <Tooltip content={t('items.clickToCopyKey')}>
       {#snippet children()}
         <button
@@ -451,5 +577,40 @@
       {/snippet}
     </Tooltip>
     <span class="truncate">{item.title}</span>
-  </div>
+  </ItemDetailBreadcrumbLevel>
 </div>
+
+{#if hasHierarchyMismatch}
+  <div
+    data-testid="item-hierarchy-mismatch"
+    data-current-level={currentItemHierarchyLevel}
+    data-parent-level={parentHierarchyLevel}
+    class="mb-6 flex items-start gap-3 rounded-md border px-4 py-3"
+    style="border-color: var(--ds-border-warning); background: var(--ds-background-warning-subtle, var(--ds-surface-raised));"
+  >
+    <AlertTriangle class="mt-0.5 h-5 w-5 flex-shrink-0" style="color: var(--ds-icon-warning);" />
+    <div class="min-w-0 flex-1">
+      <p class="text-sm font-medium" style="color: var(--ds-text);">
+        {t('items.hierarchyMismatchTitle')}
+      </p>
+      <p class="mt-1 text-sm" style="color: var(--ds-text-subtle);">
+        {t('items.hierarchyMismatchDescription', {
+          type: currentItemType?.name,
+          currentLevel: currentItemHierarchyLevel,
+          parentLevel: parentHierarchyLevel,
+          requiredLevel: currentItemHierarchyLevel - 1,
+          compatibleLevel: compatibleHierarchyLevel
+        })}
+      </p>
+    </div>
+    <button
+      type="button"
+      data-testid="item-hierarchy-change-type"
+      onclick={openCompatibleItemTypes}
+      class="flex-shrink-0 rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
+      style="background: var(--ds-background-neutral); color: var(--ds-text);"
+    >
+      {t('items.chooseCompatibleType')}
+    </button>
+  </div>
+{/if}

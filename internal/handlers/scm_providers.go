@@ -41,8 +41,6 @@ type SCMProviderResponse struct {
 	HasGitHubAppPrivateKey   bool                   `json:"has_github_app_private_key"`
 	GitHubAppInstallationID  string                 `json:"github_app_installation_id,omitempty"`
 	GitHubOrgID              *int64                 `json:"github_org_id,omitempty"`
-	HasOAuthToken            bool                   `json:"has_oauth_token"`
-	OAuthTokenExpiresAt      *time.Time             `json:"oauth_token_expires_at,omitempty"`
 	Scopes                   string                 `json:"scopes"`
 	WorkspaceRestrictionMode string                 `json:"workspace_restriction_mode"` // 'unrestricted' or 'restricted'
 	CreatedAt                time.Time              `json:"created_at"`
@@ -121,32 +119,27 @@ func (h *SCMProviderHandler) CreateProvider(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	// Name + Slug are user-facing labels on the provider admin surface
-	// and routing keys. Secrets (OAuthClientSecret, PersonalAccessToken,
-	// GitHubAppPrivateKey) and ProviderType / AuthMethod enums are
-	// deliberately untouched.
+	// Sanitize display labels and routing keys; leave secrets and enum fields raw.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField, Label: "Name"},
 		sanitize.Pair{Target: &req.Slug, Policy: sanitize.ShortIdentifier, Label: "Slug"},
 	)
 
-	// Validate required fields
 	if req.Slug == "" || req.Name == "" || req.ProviderType == "" || req.AuthMethod == "" {
 		respondValidationError(w, r, "Missing required fields: slug, name, provider_type, auth_method")
 		return
 	}
 
-	// Validate provider type (only GitHub and Gitea supported)
 	validTypes := map[models.SCMProviderType]bool{
 		models.SCMProviderTypeGitHub: true,
+		models.SCMProviderTypeGitLab: true,
 		models.SCMProviderTypeGitea:  true,
 	}
 	if !validTypes[req.ProviderType] {
-		respondBadRequest(w, r, "Invalid provider type. Supported: github, gitea")
+		respondBadRequest(w, r, "Invalid provider type. Supported: github, gitlab, gitea")
 		return
 	}
 
-	// Validate auth method
 	validMethods := map[models.SCMAuthMethod]bool{
 		models.SCMAuthMethodOAuth:     true,
 		models.SCMAuthMethodPAT:       true,
@@ -157,13 +150,12 @@ func (h *SCMProviderHandler) CreateProvider(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// GitHub App auth method is only valid for GitHub providers
 	if req.AuthMethod == models.SCMAuthMethodGitHubApp && req.ProviderType != models.SCMProviderTypeGitHub {
 		respondBadRequest(w, r, "GitHub App auth method is only valid for GitHub providers")
 		return
 	}
 
-	// Encrypt secrets
+	// Encrypt credentials before persisting them.
 	var oauthSecretEnc, patEnc, ghAppKeyEnc string
 	var err error
 
@@ -191,13 +183,11 @@ func (h *SCMProviderHandler) CreateProvider(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Default workspace restriction mode
 	workspaceRestrictionMode := req.WorkspaceRestrictionMode
 	if workspaceRestrictionMode == "" {
 		workspaceRestrictionMode = "unrestricted"
 	}
 
-	// If this is set as default, unset other defaults
 	if req.IsDefault {
 		_, err = h.db.ExecWrite("UPDATE scm_providers SET is_default = false WHERE is_default = true")
 		if err != nil {
@@ -206,7 +196,6 @@ func (h *SCMProviderHandler) CreateProvider(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Insert the provider
 	var id int64
 	err = h.db.QueryRow(`
 		INSERT INTO scm_providers (
@@ -264,7 +253,6 @@ func (h *SCMProviderHandler) UpdateProvider(w http.ResponseWriter, r *http.Reque
 		sanitize.Pair{Target: &req.Slug, Policy: sanitize.ShortIdentifier, Label: "Slug"},
 	)
 
-	// Check if provider exists
 	_, err = h.getProviderByID(id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -275,17 +263,16 @@ func (h *SCMProviderHandler) UpdateProvider(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Validate provider type (only GitHub and Gitea supported)
 	validTypes := map[models.SCMProviderType]bool{
 		models.SCMProviderTypeGitHub: true,
+		models.SCMProviderTypeGitLab: true,
 		models.SCMProviderTypeGitea:  true,
 	}
 	if req.ProviderType != "" && !validTypes[req.ProviderType] {
-		respondBadRequest(w, r, "Invalid provider type. Supported: github, gitea")
+		respondBadRequest(w, r, "Invalid provider type. Supported: github, gitlab, gitea")
 		return
 	}
 
-	// Validate auth method
 	validMethods := map[models.SCMAuthMethod]bool{
 		models.SCMAuthMethodOAuth:     true,
 		models.SCMAuthMethodPAT:       true,
@@ -296,13 +283,12 @@ func (h *SCMProviderHandler) UpdateProvider(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// GitHub App auth method is only valid for GitHub providers
 	if req.AuthMethod == models.SCMAuthMethodGitHubApp && req.ProviderType != models.SCMProviderTypeGitHub {
 		respondBadRequest(w, r, "GitHub App auth method is only valid for GitHub providers")
 		return
 	}
 
-	// Encrypt secrets if provided
+	// Replace encrypted credentials only when new values are supplied.
 	var oauthSecretEnc, patEnc, ghAppKeyEnc *string
 
 	if req.OAuthClientSecret != "" {
@@ -335,13 +321,11 @@ func (h *SCMProviderHandler) UpdateProvider(w http.ResponseWriter, r *http.Reque
 		ghAppKeyEnc = &enc
 	}
 
-	// Default workspace restriction mode if not provided
 	workspaceRestrictionMode := req.WorkspaceRestrictionMode
 	if workspaceRestrictionMode == "" {
 		workspaceRestrictionMode = "unrestricted"
 	}
 
-	// If this is set as default, unset other defaults
 	if req.IsDefault {
 		_, err = h.db.ExecWrite("UPDATE scm_providers SET is_default = false WHERE is_default = true AND id != ?", id)
 		if err != nil {
@@ -350,20 +334,18 @@ func (h *SCMProviderHandler) UpdateProvider(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Build update query dynamically
 	query := `UPDATE scm_providers SET
 		slug = ?, name = ?, provider_type = ?, auth_method = ?,
 		enabled = ?, is_default = ?, base_url = ?, oauth_client_id = ?,
 		github_app_id = ?, github_app_installation_id = ?, github_org_id = ?,
 		scopes = ?, workspace_restriction_mode = ?, updated_at = CURRENT_TIMESTAMP`
-	args := []interface{}{
+	args := []any{
 		req.Slug, req.Name, req.ProviderType, req.AuthMethod,
 		req.Enabled, req.IsDefault, nullString(req.BaseURL), nullString(req.OAuthClientID),
 		nullString(req.GitHubAppID), nullString(req.GitHubAppInstallationID), nullInt64(req.GitHubOrgID),
 		req.Scopes, workspaceRestrictionMode,
 	}
 
-	// Only update secrets if provided
 	if oauthSecretEnc != nil {
 		query += ", oauth_client_secret_encrypted = ?"
 		args = append(args, *oauthSecretEnc)
@@ -483,7 +465,7 @@ func (h *SCMProviderHandler) TestProvider(w http.ResponseWriter, r *http.Request
 	// Decrypt and set credentials based on auth method
 	switch p.AuthMethod {
 	case models.SCMAuthMethodOAuth:
-		respondJSONOK(w, map[string]interface{}{
+		respondJSONOK(w, map[string]any{
 			"success": false,
 			"error":   "OAuth providers cannot be tested at the provider level. Test by completing the OAuth flow as a user.",
 		})
@@ -498,30 +480,30 @@ func (h *SCMProviderHandler) TestProvider(w http.ResponseWriter, r *http.Request
 			}
 			cfg.PersonalAccessToken = token
 		} else {
-			respondJSONOK(w, map[string]interface{}{
+			respondJSONOK(w, map[string]any{
 				"success": false,
-				"error":   "Personal Access Token not configured",
+				"error":   "Access token not configured",
 			})
 			return
 		}
 	case models.SCMAuthMethodGitHubApp:
 		// Check required fields
 		if !ghAppID.Valid || ghAppID.String == "" {
-			respondJSONOK(w, map[string]interface{}{
+			respondJSONOK(w, map[string]any{
 				"success": false,
 				"error":   "GitHub App ID not configured",
 			})
 			return
 		}
 		if !ghAppKeyEnc.Valid || ghAppKeyEnc.String == "" {
-			respondJSONOK(w, map[string]interface{}{
+			respondJSONOK(w, map[string]any{
 				"success": false,
 				"error":   "GitHub App private key not configured",
 			})
 			return
 		}
 		if !ghAppInstallID.Valid || ghAppInstallID.String == "" {
-			respondJSONOK(w, map[string]interface{}{
+			respondJSONOK(w, map[string]any{
 				"success": false,
 				"error":   "GitHub App installation ID not configured. Use 'Discover Installations' to select an organization.",
 			})
@@ -544,7 +526,7 @@ func (h *SCMProviderHandler) TestProvider(w http.ResponseWriter, r *http.Request
 	// Create provider instance and test connection
 	provider, err := scm.NewProvider(cfg)
 	if err != nil {
-		respondJSONOK(w, map[string]interface{}{
+		respondJSONOK(w, map[string]any{
 			"success": false,
 			"error":   err.Error(),
 		})
@@ -556,26 +538,20 @@ func (h *SCMProviderHandler) TestProvider(w http.ResponseWriter, r *http.Request
 
 	err = provider.TestConnection(ctx)
 	if err != nil {
-		respondJSONOK(w, map[string]interface{}{
+		respondJSONOK(w, map[string]any{
 			"success": false,
 			"error":   err.Error(),
 		})
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"message": "Connection successful",
 	})
 }
 
 // providerRowScanResult holds scanned values from a provider database row.
-//
-// Note: provider-level OAuth tokens are no longer surfaced. The legacy
-// scm_providers.oauth_access_token_encrypted column is left in the schema
-// for rollback safety but the API responses always report HasOAuthToken
-// as false; callers wanting to know whether a provider can be used must
-// check workspace_scm_connections or user_scm_oauth_tokens instead.
 type providerRowScanResult struct {
 	Provider                 models.SCMProvider
 	BaseURL                  sql.NullString
@@ -590,8 +566,8 @@ type providerRowScanResult struct {
 }
 
 // scanDestinations returns the scan destinations for a provider query row
-func (r *providerRowScanResult) scanDestinations() []interface{} {
-	return []interface{}{
+func (r *providerRowScanResult) scanDestinations() []any {
+	return []any{
 		&r.Provider.ID, &r.Provider.Slug, &r.Provider.Name, &r.Provider.ProviderType, &r.Provider.AuthMethod,
 		&r.Provider.Enabled, &r.Provider.IsDefault, &r.BaseURL, &r.OAuthClientID, &r.OAuthClientSecretEnc,
 		&r.PATEnc, &r.GHAppID, &r.GHAppKeyEnc, &r.GHAppInstallID, &r.GHOrgID,
@@ -622,7 +598,6 @@ func (r *providerRowScanResult) toResponse() SCMProviderResponse {
 		GitHubAppID:              r.GHAppID.String,
 		HasGitHubAppPrivateKey:   r.GHAppKeyEnc.Valid && r.GHAppKeyEnc.String != "",
 		GitHubAppInstallationID:  r.GHAppInstallID.String,
-		HasOAuthToken:            false, // provider-level OAuth tokens are no longer used; see providerRowScanResult comment
 		Scopes:                   r.Provider.Scopes,
 		WorkspaceRestrictionMode: restrictionMode,
 		CreatedAt:                r.Provider.CreatedAt,
@@ -656,14 +631,14 @@ func (h *SCMProviderHandler) getProviderByID(id int) (*SCMProviderResponse, erro
 	return &resp, nil
 }
 
-func nullString(s string) interface{} {
+func nullString(s string) any {
 	if s == "" {
 		return nil
 	}
 	return s
 }
 
-func nullInt64(i *int64) interface{} {
+func nullInt64(i *int64) any {
 	if i == nil {
 		return nil
 	}

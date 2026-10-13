@@ -14,38 +14,19 @@ import (
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/models"
 	"windshift/internal/repository"
 )
 
-// Job types stored in pending_custom_field_cleanups.job_type. The queue
-// started life handling only field_scrub; option_removal (WI-419) and
-// index_build (WI-416) were added to move other heavy custom-field maintenance
-// off the admin request thread. A legacy row with an empty job_type is treated
-// as field_scrub.
+// Job types for deferred custom-field maintenance; empty legacy values scrub fields.
 const (
 	jobFieldScrub    = "field_scrub"    // strip a deleted field's key from cfv JSON
 	jobOptionRemoval = "option_removal" // strip removed select/multiselect option ids
 	jobIndexBuild    = "index_build"    // build a Postgres cf index CONCURRENTLY
 )
 
-// CFVCleanupScheduler drains the pending_custom_field_cleanups queue — the
-// async worker for heavy custom-field maintenance that would otherwise block
-// an admin request for as long as the workspace has items/assets (potentially
-// millions of rows). Each row's job_type selects the work:
-//   - field_scrub: a deleted field's key is removed from cfv JSON.
-//   - option_removal: removed select/multiselect option ids are stripped from
-//     items, assets, and portal custom_field_values.
-//   - index_build: a Postgres custom-field index is built CONCURRENTLY.
-//
-// The scheduler:
-//   - Ticks every minute (cheap query when the queue is empty).
-//   - Picks the oldest pending job, marks it 'running'.
-//   - Processes it in batches keyed by row id (bounded memory).
-//   - Marks the job 'done' (or 'failed' on error) with row counts.
-//
-// Best-effort semantics: a crashed process leaves the job in 'running';
-// the next tick re-claims any row stuck in 'running' for longer than
-// staleThreshold so cleanup eventually completes.
+// CFVCleanupScheduler batches deferred field scrubs, option removal, and
+// Postgres index builds. It reclaims stale running jobs after a process crash.
 type CFVCleanupScheduler struct {
 	db      database.Database
 	runRepo *repository.SchedulerRunRepository
@@ -126,6 +107,8 @@ func (s *CFVCleanupScheduler) loop(ticker *time.Ticker, stopChan <-chan struct{}
 // to keep a stuck queue from monopolizing scheduler resources.
 const claimMaxJobsPerTick = 20
 
+const maxCleanupJobAttempts = 3
+
 func (s *CFVCleanupScheduler) tick() {
 	start := time.Now()
 	totalItems := 0
@@ -150,8 +133,12 @@ func (s *CFVCleanupScheduler) tick() {
 		}
 		processed, err := s.processClaimedJob(job)
 		if err != nil {
-			s.markFailed(job.id, err.Error())
-			runErr = err
+			permanent := s.recordJobFailure(job, err.Error())
+			if permanent {
+				runErr = fmt.Errorf("custom field maintenance job %d failed permanently after %d attempts: %w", job.id, maxCleanupJobAttempts, err)
+			} else {
+				runErr = fmt.Errorf("custom field maintenance job %d attempt %d failed: %w", job.id, job.attemptCount+1, err)
+			}
 			continue
 		}
 		s.markDone(job.id, processed)
@@ -161,10 +148,11 @@ func (s *CFVCleanupScheduler) tick() {
 
 // claimedJob is one row claimed from the queue, ready to dispatch.
 type claimedJob struct {
-	id      int
-	fieldID int
-	jobType string
-	payload string
+	id           int
+	fieldID      int
+	jobType      string
+	payload      string
+	attemptCount int
 }
 
 // processClaimedJob dispatches a claimed row to its job-type handler. An empty
@@ -194,24 +182,19 @@ func (s *CFVCleanupScheduler) requeueStaleRunning() error {
 	return err
 }
 
-// claimNextJob picks the oldest pending row and flips it to 'running'.
-// The (status, created_at) index makes this a constant-time lookup.
-// Returns claimed=false when the queue is empty.
-//
-// On SQLite there are no row locks, so a separate process generation could
-// theoretically claim the same row. We use a UPDATE ... WHERE status=
-// 'pending' guard so only one transition succeeds; second caller sees
-// 'no row updated' and tries the next one.
+// claimNextJob claims the oldest pending row. Its status-guarded update makes
+// SQLite and Postgres claims safe without row locks.
 func (s *CFVCleanupScheduler) claimNextJob() (job claimedJob, claimed bool, err error) {
 	var jobType sql.NullString
 	var payload sql.NullString
 	row := s.db.QueryRow(
-		`SELECT id, field_id, job_type, payload FROM pending_custom_field_cleanups
-		  WHERE status = 'pending'
+		`SELECT id, field_id, job_type, payload, attempt_count FROM pending_custom_field_cleanups
+		  WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
 		  ORDER BY created_at ASC
 		  LIMIT 1`,
+		time.Now(),
 	)
-	if err = row.Scan(&job.id, &job.fieldID, &jobType, &payload); err != nil {
+	if err = row.Scan(&job.id, &job.fieldID, &jobType, &payload, &job.attemptCount); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Empty queue — caller exits the drain loop normally.
 			return claimedJob{}, false, nil
@@ -224,7 +207,7 @@ func (s *CFVCleanupScheduler) claimNextJob() (job claimedJob, claimed bool, err 
 	now := time.Now()
 	res, err := s.db.ExecWrite(
 		`UPDATE pending_custom_field_cleanups
-		    SET status = 'running', started_at = ?
+		    SET status = 'running', started_at = ?, next_attempt_at = NULL
 		  WHERE id = ? AND status = 'pending'`,
 		now, job.id,
 	)
@@ -240,44 +223,84 @@ func (s *CFVCleanupScheduler) claimNextJob() (job claimedJob, claimed bool, err 
 	return job, true, nil
 }
 
-// processJob scrubs every item whose cfv JSON contains the deleted
-// field's key. Iterates in batches keyed by item id; bounded memory.
+// processJob scrubs the deleted field from item, asset, and legacy portal
+// storage in bounded keyset-paginated batches.
 func (s *CFVCleanupScheduler) processJob(fieldID int) (int, error) {
 	fieldKey := strconv.Itoa(fieldID)
-	totalProcessed := 0
-	lastID := 0
-	itemRepo := repository.NewItemRepository(s.db)
-
-	for {
-		batch, err := itemRepo.ListCustomFieldValuesPageByKey(lastID, fieldKey, s.batchSize)
+	cfRepo := repository.NewCustomFieldRepository(s.db)
+	total := 0
+	for _, table := range []string{"items", "assets"} {
+		processed, err := s.scrubTableField(cfRepo, table, fieldKey)
+		total += processed
 		if err != nil {
-			return totalProcessed, err
+			return total, err
+		}
+	}
+	processed, err := s.scrubPortalField(cfRepo, fieldID)
+	total += processed
+	if err != nil {
+		slog.Warn("cfv_cleanup: portal field scrub skipped", "field_id", fieldID, "error", err)
+	}
+	return total, nil
+}
+
+func (s *CFVCleanupScheduler) scrubTableField(cfRepo *repository.CustomFieldRepository, table, fieldKey string) (int, error) {
+	processed := 0
+	lastID := 0
+	for {
+		batch, err := cfRepo.ListRowsWithCustomFieldsPageByKey(table, lastID, fieldKey, s.batchSize)
+		if err != nil {
+			return processed, err
 		}
 		if len(batch) == 0 {
-			return totalProcessed, nil
+			return processed, nil
 		}
-
-		for _, ir := range batch {
-			lastID = ir.ID
-			cleaned, changed, err := stripCFVKey(ir.CFV, fieldKey)
+		for _, row := range batch {
+			lastID = row.ID
+			changed, malformed, err := applyTableCFVCleanup(cfRepo, table, row.ID, row.Value, func(current string) (string, bool, error) {
+				return stripCFVKey(current, fieldKey)
+			})
 			if err != nil {
-				// Malformed JSON in cfv — log and skip the row rather
-				// than failing the whole job.
-				slog.Warn("cfv_cleanup: skip malformed cfv", "item_id", ir.ID, "error", err)
-				continue
+				if malformed {
+					slog.Warn("cfv_cleanup: skip malformed cfv", "table", table, "id", row.ID, "error", err)
+					continue
+				}
+				return processed, err
 			}
 			if !changed {
 				continue
 			}
-			if err := itemRepo.SetCustomFieldValuesRaw(context.Background(), ir.ID, cleaned); err != nil {
-				return totalProcessed, err
+			processed++
+			if table == "items" {
+				s.enqueueSLARecalc(row.ID)
 			}
-			totalProcessed++
 		}
-
-		// If we read fewer than batchSize rows, we're done.
 		if len(batch) < s.batchSize {
-			return totalProcessed, nil
+			return processed, nil
+		}
+	}
+}
+
+func (s *CFVCleanupScheduler) scrubPortalField(cfRepo *repository.CustomFieldRepository, fieldID int) (int, error) {
+	processed := 0
+	lastID := 0
+	for {
+		batch, err := cfRepo.ListPortalCFVsPageByField(fieldID, lastID, s.batchSize)
+		if err != nil {
+			return processed, err
+		}
+		if len(batch) == 0 {
+			return processed, nil
+		}
+		for _, row := range batch {
+			lastID = row.ID
+			if err := cfRepo.DeletePortalCFV(row.ID); err != nil {
+				return processed, err
+			}
+			processed++
+		}
+		if len(batch) < s.batchSize {
+			return processed, nil
 		}
 	}
 }
@@ -287,7 +310,7 @@ func (s *CFVCleanupScheduler) processJob(fieldID int) (int, error) {
 // If the resulting object would be empty, returns "" (the items.cfv
 // column treats empty/NULL identically).
 func stripCFVKey(cfvJSON, key string) (newJSON string, changed bool, err error) {
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal([]byte(cfvJSON), &m); err != nil {
 		return "", false, err
 	}
@@ -315,10 +338,7 @@ type optionRemovalPayload struct {
 	RemovedIDs []int  `json:"removed_ids"`
 }
 
-// processOptionRemoval strips the given removed select/multiselect option ids
-// from items, assets, and portal custom_field_values. Each surface is iterated
-// in keyset-paginated batches (bounded memory). Re-running is idempotent —
-// removing an already-absent id is a no-op — so at-least-once delivery is safe.
+// processOptionRemoval strips deleted options in idempotent, keyset-paginated batches.
 func (s *CFVCleanupScheduler) processOptionRemoval(payload string) (int, error) {
 	var p optionRemovalPayload
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
@@ -373,23 +393,82 @@ func (s *CFVCleanupScheduler) scrubTableOptions(cfRepo *repository.CustomFieldRe
 		}
 		for _, row := range batch {
 			lastID = row.ID
-			cleaned, changed, err := stripCFVOptionIDs(row.Value, fieldKey, fieldType, removed)
+			changed, malformed, err := applyTableCFVCleanup(cfRepo, table, row.ID, row.Value, func(current string) (string, bool, error) {
+				return stripCFVOptionIDs(current, fieldKey, fieldType, removed)
+			})
 			if err != nil {
-				slog.Warn("cfv_cleanup: skip malformed cfv", "table", table, "id", row.ID, "error", err)
-				continue
+				if malformed {
+					slog.Warn("cfv_cleanup: skip malformed cfv", "table", table, "id", row.ID, "error", err)
+					continue
+				}
+				return processed, err
 			}
 			if !changed {
 				continue
 			}
-			if err := cfRepo.UpdateRowCustomFields(table, row.ID, cleaned); err != nil {
-				return processed, err
-			}
 			processed++
+			if table == "items" {
+				s.enqueueSLARecalc(row.ID)
+			}
 		}
 		if len(batch) < s.batchSize {
 			return processed, nil
 		}
 	}
+}
+
+// enqueueSLARecalc schedules an SLA recalculation for an item whose custom
+// field values changed outside the recorder. It only enqueues when the item's
+// workspace has SLA configuration; the due-work loop notices the job within its
+// safety interval.
+func (s *CFVCleanupScheduler) enqueueSLARecalc(itemID int) {
+	repo := repository.NewSLARepository(s.db)
+	ctx := context.Background()
+	var workspaceID int
+	if err := s.db.QueryRowContext(ctx, `SELECT workspace_id FROM items WHERE id = ?`, itemID).Scan(&workspaceID); err != nil {
+		return
+	}
+	generation, err := repo.WorkspaceGeneration(ctx, workspaceID)
+	if err != nil || generation == 0 {
+		return
+	}
+	item := itemID
+	err = database.WithTx(s.db, func(tx database.Tx) error {
+		return repo.UpsertJob(ctx, tx, &models.SLAJob{Kind: models.SLAJobRecalcItem, ItemID: &item, DueAt: time.Now().UTC()})
+	})
+	if err != nil {
+		slog.Warn("cfv_cleanup: enqueue SLA recalc failed", "item_id", itemID, "error", err)
+	}
+}
+
+const cleanupCompareAndSwapAttempts = 3
+
+type tableCFVCleanup func(current string) (cleaned string, changed bool, err error)
+
+func applyTableCFVCleanup(cfRepo *repository.CustomFieldRepository, table string, rowID int, initial string, cleanup tableCFVCleanup) (changed, malformed bool, err error) {
+	current := initial
+	for range cleanupCompareAndSwapAttempts {
+		cleaned, changed, err := cleanup(current)
+		if err != nil {
+			return false, true, err
+		}
+		if !changed {
+			return false, false, nil
+		}
+		swapped, err := cfRepo.CompareAndSwapRowCustomFields(table, rowID, current, cleaned)
+		if err != nil {
+			return false, false, err
+		}
+		if swapped {
+			return true, false, nil
+		}
+		latest, found, err := cfRepo.FindRowCustomFields(table, rowID)
+		if err != nil || !found || latest == "" {
+			return false, false, err
+		}
+		current = latest
+	}
+	return false, false, nil
 }
 
 // scrubPortalOptions removes deleted option ids from the portal
@@ -462,7 +541,7 @@ func (s *CFVCleanupScheduler) scrubPortalOptions(cfRepo *repository.CustomFieldR
 // dropped if the array empties). Returns the new JSON, whether anything
 // changed, and any parse error.
 func stripCFVOptionIDs(cfvJSON, fieldKey, fieldType string, removed map[int]bool) (newJSON string, changed bool, err error) {
-	var cfv map[string]interface{}
+	var cfv map[string]any
 	if err := json.Unmarshal([]byte(cfvJSON), &cfv); err != nil {
 		return "", false, err
 	}
@@ -473,15 +552,15 @@ func stripCFVOptionIDs(cfvJSON, fieldKey, fieldType string, removed map[int]bool
 
 	switch fieldType {
 	case "select":
-		if num, ok := val.(float64); ok && removed[int(num)] {
+		if optionID, ok := cleanupOptionID(val); ok && removed[optionID] {
 			delete(cfv, fieldKey)
 			changed = true
 		}
 	case "multiselect":
-		if arr, ok := val.([]interface{}); ok {
-			var filtered []interface{}
+		if arr, ok := val.([]any); ok {
+			var filtered []any
 			for _, item := range arr {
-				if num, ok := item.(float64); ok && removed[int(num)] {
+				if optionID, ok := cleanupOptionID(item); ok && removed[optionID] {
 					changed = true
 					continue
 				}
@@ -507,6 +586,18 @@ func stripCFVOptionIDs(cfvJSON, fieldKey, fieldType string, removed map[int]bool
 	return string(b), true, nil
 }
 
+func cleanupOptionID(value any) (int, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), true
+	case string:
+		optionID, err := strconv.Atoi(typed)
+		return optionID, err == nil
+	default:
+		return 0, false
+	}
+}
+
 // indexBuildPayload is the JSON stored in pending_custom_field_cleanups.payload
 // for an index_build job (Postgres only).
 type indexBuildPayload struct {
@@ -516,11 +607,8 @@ type indexBuildPayload struct {
 	IndexName   string `json:"index_name"`
 }
 
-// processIndexBuild builds a Postgres custom-field index CONCURRENTLY off the
-// request thread. It first drops any leftover index of the same name — a failed
-// or interrupted CREATE INDEX CONCURRENTLY leaves an INVALID index behind, so
-// the unconditional DROP makes a retry self-healing. The job is skipped if the
-// field's index record is gone (the field was deleted between enqueue and now).
+// processIndexBuild concurrently builds a Postgres index and drops invalid
+// leftovers first, making retries self-healing.
 func (s *CFVCleanupScheduler) processIndexBuild(payload string) (int, error) {
 	var p indexBuildPayload
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
@@ -555,7 +643,7 @@ func (s *CFVCleanupScheduler) markDone(jobID, processed int) {
 	now := time.Now()
 	if _, err := s.db.ExecWrite(
 		`UPDATE pending_custom_field_cleanups
-		    SET status = 'done', completed_at = ?, items_processed = ?
+		    SET status = 'done', completed_at = ?, items_processed = ?, next_attempt_at = NULL, error_message = NULL
 		  WHERE id = ?`,
 		now, processed, jobID,
 	); err != nil {
@@ -563,16 +651,31 @@ func (s *CFVCleanupScheduler) markDone(jobID, processed int) {
 	}
 }
 
-func (s *CFVCleanupScheduler) markFailed(jobID int, msg string) {
+func (s *CFVCleanupScheduler) recordJobFailure(job claimedJob, msg string) bool {
 	now := time.Now()
+	nextAttempt := job.attemptCount + 1
+	if nextAttempt < maxCleanupJobAttempts {
+		retryAt := now.Add(time.Minute * time.Duration(1<<(nextAttempt-1)))
+		if _, err := s.db.ExecWrite(
+			`UPDATE pending_custom_field_cleanups
+			    SET status = 'pending', started_at = NULL, completed_at = NULL,
+			        attempt_count = ?, next_attempt_at = ?, error_message = ?
+			  WHERE id = ?`,
+			nextAttempt, retryAt, msg, job.id,
+		); err != nil {
+			slog.Warn("cfv_cleanup: failed to schedule job retry", "job_id", job.id, "error", err)
+		}
+		return false
+	}
 	if _, err := s.db.ExecWrite(
 		`UPDATE pending_custom_field_cleanups
-		    SET status = 'failed', completed_at = ?, error_message = ?
+		    SET status = 'failed', completed_at = ?, attempt_count = ?, next_attempt_at = NULL, error_message = ?
 		  WHERE id = ?`,
-		now, msg, jobID,
+		now, nextAttempt, msg, job.id,
 	); err != nil {
-		slog.Warn("cfv_cleanup: failed to mark job failed", "job_id", jobID, "error", err)
+		slog.Warn("cfv_cleanup: failed to mark job failed", "job_id", job.id, "error", err)
 	}
+	return true
 }
 
 // EnqueueFieldCleanup inserts a pending job for the given deleted field.
@@ -616,6 +719,18 @@ func EnqueueOptionRemoval(db database.Database, fieldID int, fieldType string, r
 	if len(removedIDs) == 0 {
 		return nil
 	}
+	return database.WithTx(db, func(tx database.Tx) error {
+		return EnqueueOptionRemovalTx(tx, fieldID, fieldType, removedIDs)
+	})
+}
+
+// EnqueueOptionRemovalTx is EnqueueOptionRemoval inside the caller's
+// transaction, so a repair that rewrites an option set commits its scrubbing
+// job atomically (WI-1529).
+func EnqueueOptionRemovalTx(tx database.Tx, fieldID int, fieldType string, removedIDs []int) error {
+	if len(removedIDs) == 0 {
+		return nil
+	}
 	payload, err := json.Marshal(optionRemovalPayload{
 		FieldID:    fieldID,
 		FieldType:  fieldType,
@@ -625,7 +740,7 @@ func EnqueueOptionRemoval(db database.Database, fieldID int, fieldType string, r
 		return fmt.Errorf("marshal option_removal payload: %w", err)
 	}
 	now := time.Now()
-	_, err = db.ExecWrite(
+	_, err = tx.ExecContext(context.Background(),
 		`INSERT INTO pending_custom_field_cleanups (field_id, job_type, payload, status, created_at)
 		 VALUES (?, 'option_removal', ?, 'pending', ?)`,
 		fieldID, string(payload), now,

@@ -1,32 +1,44 @@
 package services
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
 	"windshift/internal/cql"
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/validation"
+)
+
+var (
+	ErrCollectionNotFound               = errors.New("collection not found")
+	ErrQLQuery                          = errors.New("QL query error")
+	ErrItemHasProtectedIntegrationLinks = errors.New("item has provider-managed integration links")
 )
 
 // ItemCRUDService handles item CRUD operations
 type ItemCRUDService struct {
-	db            database.Database
-	repo          *repository.ItemRepository
-	workspaceRepo *repository.WorkspaceRepository
+	db                    database.Database
+	repo                  *repository.ItemRepository
+	workspaceRepo         *repository.WorkspaceRepository
+	integrationLinkGuards *IntegrationLinkGuards
 }
 
 // NewItemCRUDService creates a new item CRUD service
 func NewItemCRUDService(db database.Database) *ItemCRUDService {
 	return &ItemCRUDService{
-		db:            db,
-		repo:          repository.NewItemRepository(db),
-		workspaceRepo: repository.NewWorkspaceRepository(db),
+		db:                    db,
+		repo:                  repository.NewItemRepository(db),
+		workspaceRepo:         repository.NewWorkspaceRepository(db),
+		integrationLinkGuards: NewIntegrationLinkGuards(db),
 	}
 }
 
@@ -64,100 +76,230 @@ type DeleteResult struct {
 	AffectedParent *int
 }
 
-// DeleteSingle removes only the requested item and shared related rows. It
-// preserves the legacy non-cascade delete endpoint semantics; use Delete for
-// item + descendants cleanup.
+// DeleteSingle removes the requested item and preserves its descendants.
 func (s *ItemCRUDService) DeleteSingle(itemID int) error {
-	// Capture the parent BEFORE the destructive write so we can refresh the
-	// parent's child list after commit (WI-483). Best-effort: a lookup failure
-	// just means no parent refresh.
-	parentID, _ := s.repo.GetParentID(itemID)
-	if err := database.WithTx(s.db, func(tx database.Tx) error {
-		if err := s.repo.DeleteItemLinks(tx, itemID); err != nil {
+	return s.DeleteSingleWithMetadata(itemID, itemevents.System("application"))
+}
+
+// DeleteSingleWithMetadata detaches direct children before removing the parent.
+func (s *ItemCRUDService) DeleteSingleWithMetadata(itemID int, metadata itemevents.Metadata) error {
+	_, err := s.deleteSingleWithAuthorization(itemID, metadata, nil)
+	return err
+}
+
+func (s *ItemCRUDService) deleteSingleWithAuthorization(itemID int, metadata itemevents.Metadata, authorize func([]*models.Item) error) ([]int, error) {
+	var root *models.Item
+	var children []*models.Item
+	err := database.WithTx(s.db, func(tx database.Tx) error {
+		ctx := context.Background()
+		var err error
+		root, err = s.repo.FindByIDForUpdate(tx, itemID)
+		if err != nil {
 			return err
 		}
-		if err := s.repo.ClearWorklogItemReferences(tx, itemID); err != nil {
+		if authorize != nil {
+			if err := authorize([]*models.Item{root}); err != nil {
+				return err
+			}
+		}
+		children, err = s.repo.FindChildrenForUpdateContext(ctx, tx, []int{itemID})
+		if err != nil {
+			return err
+		}
+		hasProtectedLinks, err := s.integrationLinkGuards.HasLinksForItemsTx(tx, []int{itemID})
+		if err != nil {
+			return err
+		}
+		if hasProtectedLinks {
+			return ErrItemHasProtectedIntegrationLinks
+		}
+		if metadata.OccurredAt.IsZero() {
+			metadata.OccurredAt = time.Now()
+		}
+		recorder := itemevents.NewRecorder(s.db)
+		for _, child := range children {
+			if err := s.repo.UpdateParent(tx, child.ID, nil); err != nil {
+				return err
+			}
+			updated := *child
+			updated.ParentID = nil
+			// Detaching a child changes its parent_id; record it so history
+			// reflects the structural change even though the parent is gone.
+			if err := s.repo.RecordHistory(tx, historyEntryForChange(
+				child.ID, "parent_id", intPtrToString(child.ParentID), "",
+				metadata.OccurredAt, metadata,
+			)); err != nil {
+				return err
+			}
+			if _, err := recorder.Updated(ctx, tx, &updated, itemevents.Changes(child, &updated), metadata); err != nil {
+				return err
+			}
+		}
+		if err := recordRemovedItemLinks(ctx, s.db, tx, []int{itemID}, metadata); err != nil {
+			return err
+		}
+		if _, err := recorder.Deleted(ctx, tx, root, 0, metadata); err != nil {
+			return err
+		}
+		if err := s.stampEmailTrackingCompletedTx(tx, []int{itemID}); err != nil {
+			return err
+		}
+		if err := s.deleteItemRelationsTx(tx, itemID); err != nil {
 			return err
 		}
 		return s.repo.Delete(tx, itemID)
-	}); err != nil {
-		return err
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// Live-update publish (WI-483): the delete has committed.
-	PublishItemChange(itemID, ItemChangeDeleted)
-	if parentID != nil {
-		PublishItemChange(*parentID, ItemChangeUpdated)
+	s.finishItemDeletion(root.WorkspaceID, []int{itemID}, root.ParentID)
+	childIDs := make([]int, 0, len(children))
+	for _, child := range children {
+		childIDs = append(childIDs, child.ID)
+		repository.InvalidateItemListCountCache(s.db, child.WorkspaceID)
+		PublishItemChange(child.ID)
 	}
-	return nil
+	return childIDs, nil
 }
 
 // Delete removes an item and all its descendants
 func (s *ItemCRUDService) Delete(itemID int) (*DeleteResult, error) {
-	// Get parent ID before deleting
-	parentID, err := s.repo.GetParentID(itemID)
-	if err != nil {
-		if err == repository.ErrNotFound {
-			return nil, fmt.Errorf("item not found")
+	return s.DeleteWithMetadata(itemID, itemevents.System("application"))
+}
+
+// DeleteWithMetadata deletes an item subtree and records every removed item.
+func (s *ItemCRUDService) DeleteWithMetadata(itemID int, metadata itemevents.Metadata) (*DeleteResult, error) {
+	return s.deleteWithAuthorization(itemID, metadata, nil)
+}
+
+func (s *ItemCRUDService) deleteWithAuthorization(itemID int, metadata itemevents.Metadata, authorize func([]*models.Item) error) (*DeleteResult, error) {
+	var items []*models.Item
+	var result DeleteResult
+	err := database.WithTx(s.db, func(tx database.Tx) error {
+		ctx := context.Background()
+		var err error
+		items, err = s.repo.FindSubtreeForUpdateContext(ctx, tx, itemID)
+		if err != nil {
+			return err
 		}
-		return nil, err
-	}
-
-	// Get all descendant IDs for cascade operations
-	descendantIDs, err := s.repo.GetDescendantIDs(itemID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get descendants: %w", err)
-	}
-
-	// Delete all related data for item and descendants
-	allIDs := append([]int{itemID}, descendantIDs...)
-	if err := database.WithTx(s.db, func(tx database.Tx) error {
-		for _, id := range allIDs {
-			// Delete watches
-			if err := s.repo.DeleteItemWatches(tx, id); err != nil {
+		if authorize != nil {
+			if err := authorize(items); err != nil {
 				return err
 			}
-
-			// Delete history
-			if err := s.repo.DeleteItemHistory(tx, id); err != nil {
+		}
+		root := items[0]
+		result.AffectedParent = root.ParentID
+		result.DeletedCount = len(items)
+		itemIDs := make([]int, 0, len(items))
+		for _, item := range items {
+			itemIDs = append(itemIDs, item.ID)
+			if item.ID != itemID {
+				result.DescendantIDs = append(result.DescendantIDs, item.ID)
+			}
+		}
+		hasProtectedLinks, err := s.integrationLinkGuards.HasLinksForItemsTx(tx, itemIDs)
+		if err != nil {
+			return err
+		}
+		if hasProtectedLinks {
+			return ErrItemHasProtectedIntegrationLinks
+		}
+		if metadata.OccurredAt.IsZero() {
+			metadata.OccurredAt = time.Now()
+		}
+		recorder := itemevents.NewRecorder(s.db)
+		if err := recordRemovedItemLinks(ctx, s.db, tx, itemIDs, metadata); err != nil {
+			return err
+		}
+		for _, item := range items {
+			removedDescendants := 0
+			if item.ID == itemID {
+				removedDescendants = len(result.DescendantIDs)
+			}
+			if _, err := recorder.Deleted(ctx, tx, item, removedDescendants, metadata); err != nil {
 				return err
 			}
-
-			// Delete links
-			if err := s.repo.DeleteItemLinks(tx, id); err != nil {
+		}
+		if err := s.stampEmailTrackingCompletedTx(tx, itemIDs); err != nil {
+			return err
+		}
+		// Remove children first so the foreign key cannot bypass their cleanup.
+		for i := len(items) - 1; i >= 0; i-- {
+			id := items[i].ID
+			if err := s.deleteItemRelationsTx(tx, id); err != nil {
 				return err
 			}
-
-			// Clear worklog references
-			if err := s.repo.ClearWorklogItemReferences(tx, id); err != nil {
-				return err
-			}
-
-			// Delete the item itself
 			if err := s.repo.Delete(tx, id); err != nil {
 				return err
 			}
 		}
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
+	for _, item := range items {
+		s.finishItemDeletion(item.WorkspaceID, []int{item.ID}, nil)
+	}
+	if result.AffectedParent != nil {
+		PublishItemChange(*result.AffectedParent)
+	}
+	return &result, nil
+}
 
-	// Live-update publish (WI-483): the cascade delete committed. Announce every
-	// removed item (so anyone viewing a descendant reconciles) and refresh the
-	// affected parent's child list.
-	for _, id := range allIDs {
-		PublishItemChange(id, ItemChangeDeleted)
+// stampEmailTrackingCompletedTx marks the inbound-email tracking rows tied to
+// the items about to be deleted. The item/comment FKs null their references
+// during the delete, but completed_at is the durable tombstone that keeps the
+// message deduplicated, so a mailbox refetch cannot recreate the deleted
+// ticket. Rows for reply comments are matched through the comment's item.
+func (s *ItemCRUDService) stampEmailTrackingCompletedTx(tx database.Tx, itemIDs []int) error {
+	if len(itemIDs) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(itemIDs)), ",")
+	args := make([]any, 0, len(itemIDs)*2)
+	for _, id := range itemIDs {
+		args = append(args, id)
+	}
+	for _, id := range itemIDs {
+		args = append(args, id)
+	}
+	if _, err := tx.Exec(`
+		UPDATE email_message_tracking
+		SET completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+		WHERE item_id IN (`+placeholders+`)
+		   OR comment_id IN (SELECT id FROM comments WHERE item_id IN (`+placeholders+`))
+	`, args...); err != nil {
+		return fmt.Errorf("stamp email tracking completed for deleted items: %w", err)
+	}
+	return nil
+}
+
+func (s *ItemCRUDService) deleteItemRelationsTx(tx database.Tx, itemID int) error {
+	if err := s.repo.DeleteItemWatches(tx, itemID); err != nil {
+		return err
+	}
+	if err := repository.NewItemParticipantRepository(s.db).DeleteForItem(tx, itemID); err != nil {
+		return err
+	}
+	if err := s.repo.DeleteItemHistory(tx, itemID); err != nil {
+		return err
+	}
+	if err := s.repo.DeleteItemLinks(tx, itemID); err != nil {
+		return err
+	}
+	return s.repo.ClearWorklogItemReferences(tx, itemID)
+}
+
+func (s *ItemCRUDService) finishItemDeletion(workspaceID int, itemIDs []int, parentID *int) {
+	repository.InvalidateItemListCountCache(s.db, workspaceID)
+	PublishWorkspaceChange(workspaceID)
+	for _, id := range itemIDs {
+		PublishItemDeletion(id, workspaceID)
 	}
 	if parentID != nil {
-		PublishItemChange(*parentID, ItemChangeUpdated)
+		PublishItemChange(*parentID)
 	}
-
-	return &DeleteResult{
-		DeletedCount:   len(allIDs),
-		DescendantIDs:  descendantIDs,
-		AffectedParent: parentID,
-	}, nil
 }
 
 // CopyOptions contains options for copying an item
@@ -182,100 +324,80 @@ func (s *ItemCRUDService) Copy(itemID int, opts CopyOptions) (*CopyResult, error
 		return nil, fmt.Errorf("source item not found: %w", err)
 	}
 
-	const maxRetries = 5
-	var newID int
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		newID, lastErr = database.WithTxResult(s.db, func(tx database.Tx) (int, error) {
-			fracIndex, err := repository.GenerateFracIndexForNewItem(tx)
-			if err != nil {
-				return 0, err
-			}
-			nextNum, err := s.repo.GetNextWorkspaceItemNumber(tx, source.WorkspaceID)
-			if err != nil {
-				return 0, err
-			}
-
-			parentID := opts.NewParentID
-			if parentID == nil {
-				parentID = source.ParentID
-			}
-			newItem := &models.Item{
-				WorkspaceID:         source.WorkspaceID,
-				WorkspaceItemNumber: nextNum,
-				ItemTypeID:          source.ItemTypeID,
-				Title:               opts.NewTitle,
-				Description:         source.Description,
-				StatusID:            source.StatusID,
-				PriorityID:          source.PriorityID,
-				DueDate:             source.DueDate,
-				StartDate:           source.StartDate,
-				EndDate:             source.EndDate,
-				IsTask:              source.IsTask,
-				IterationID:         source.IterationID,
-				ProjectID:           source.ProjectID,
-				InheritProject:      source.InheritProject,
-				AssigneeID:          source.AssigneeID,
-				CreatorID:           &opts.CreatorID,
-				CustomFieldValues:   source.CustomFieldValues,
-				ParentID:            parentID,
-				RelatedWorkItemID:   source.RelatedWorkItemID,
-				StoryPoints:         source.StoryPoints,
-				FracIndex:           &fracIndex,
-			}
-
-			id, err := s.repo.Create(tx, newItem)
-			if err != nil {
-				return 0, fmt.Errorf("failed to create copy: %w", err)
-			}
-
-			now := time.Now()
-			if _, err := tx.Exec(`
-				INSERT INTO item_milestones (item_id, milestone_id, created_at)
-				SELECT ?, milestone_id, ? FROM item_milestones WHERE item_id = ?
-			`, id, now, source.ID); err != nil {
-				return 0, fmt.Errorf("failed to copy milestones: %w", err)
-			}
-
-			return id, nil
-		})
-		if lastErr == nil {
-			break
-		}
-		if !repository.IsFracIndexUniqueViolation(lastErr) {
-			return nil, lastErr
-		}
-		slog.Warn("frac_index unique violation on copy, retrying",
-			slog.Int("attempt", attempt+1),
-			slog.Int("source_item_id", source.ID),
-			slog.String("component", "fracindex"))
-		if attempt == maxRetries-1 {
-			return nil, fmt.Errorf("copy item %d failed after %d frac_index retries: %w", source.ID, maxRetries, lastErr)
-		}
+	parentID := opts.NewParentID
+	if parentID == nil {
+		parentID = source.ParentID
+	}
+	if err := validation.ValidateTaskState(s.db, source.WorkspaceID, opts.CreatorID, source.IsTask, source.StatusID); err != nil {
+		return nil, err
 	}
 
-	updateService := NewItemUpdateService(s.db)
-	if err := updateService.recordItemCreationHistory(s.db, newID, opts.CreatorID); err != nil {
-		slog.Warn("failed to record item creation history", "error", err, "item_id", newID)
+	milestoneIDs, err := s.repo.GetMilestoneIDs(source.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load source milestones: %w", err)
+	}
+	customFieldValuesJSON := ""
+	if len(source.CustomFieldValues) > 0 {
+		encoded, err := json.Marshal(source.CustomFieldValues)
+		if err != nil {
+			return nil, fmt.Errorf("encode source custom fields: %w", err)
+		}
+		customFieldValuesJSON = string(encoded)
+	}
+
+	newID, err := CreateItem(s.db, ItemCreationParams{
+		WorkspaceID:           source.WorkspaceID,
+		ItemTypeID:            source.ItemTypeID,
+		ValidatingUserID:      opts.CreatorID,
+		Title:                 opts.NewTitle,
+		Description:           source.Description,
+		StatusID:              source.StatusID,
+		PriorityID:            source.PriorityID,
+		DueDate:               source.DueDate,
+		StartDate:             source.StartDate,
+		EndDate:               source.EndDate,
+		IsTask:                source.IsTask,
+		IterationID:           source.IterationID,
+		ProjectID:             source.ProjectID,
+		InheritProject:        source.InheritProject,
+		AssigneeID:            source.AssigneeID,
+		CreatorID:             &opts.CreatorID,
+		CustomFieldValuesJSON: customFieldValuesJSON,
+		ParentID:              parentID,
+		RelatedWorkItemID:     source.RelatedWorkItemID,
+		StoryPoints:           source.StoryPoints,
+		MilestoneIDs:          milestoneIDs,
+		SkipMandatoryTemplate: true,
+		SkipAssigneeTrigger:   true,
+		SkipPublish:           true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("copy item %d: %w", source.ID, err)
 	}
 
 	// Live-update publish (WI-483): the copy committed. Announce the new item and
 	// refresh the destination parent's child list.
-	PublishItemChange(newID, ItemChangeCreated)
+	PublishItemChange(int(newID))
 	effectiveParent := opts.NewParentID
 	if effectiveParent == nil {
 		effectiveParent = source.ParentID
 	}
 	if effectiveParent != nil {
-		PublishItemChange(*effectiveParent, ItemChangeUpdated)
+		PublishItemChange(*effectiveParent)
 	}
 
-	return &CopyResult{NewItemID: newID, CopyCount: 1}, nil
+	return &CopyResult{NewItemID: int(newID), CopyCount: 1}, nil
 }
 
 // GetChildren returns direct children of an item
 func (s *ItemCRUDService) GetChildren(parentID int) ([]*models.Item, error) {
 	return s.repo.GetChildren(parentID)
+}
+
+// GetChildrenInWorkspacesContext returns direct children restricted to the
+// given accessible workspaces.
+func (s *ItemCRUDService) GetChildrenInWorkspacesContext(ctx context.Context, parentID int, workspaceIDs []int) ([]*models.Item, error) {
+	return s.repo.GetChildrenInWorkspacesContext(ctx, parentID, workspaceIDs)
 }
 
 // GetDescendants returns all descendants of an item
@@ -310,67 +432,64 @@ func (s *ItemCRUDService) List(params ItemListParams) ([]models.Item, int, error
 	return s.repo.FindAllWithDetails(params)
 }
 
+// ListContext is the request-aware form of List. HTTP handlers should use it
+// so disconnected clients do not leave SQL work occupying pool connections.
+func (s *ItemCRUDService) ListContext(ctx context.Context, params ItemListParams) ([]models.Item, int, error) {
+	return s.repo.FindAllWithDetailsContext(ctx, params)
+}
+
+// ListByIDsContext loads item summaries through the canonical workspace-scoped
+// list query. IDs outside the supplied workspace scope are silently omitted.
+func (s *ItemCRUDService) ListByIDsContext(ctx context.Context, itemIDs, workspaceIDs []int) ([]models.Item, error) {
+	if len(itemIDs) == 0 || len(workspaceIDs) == 0 {
+		return []models.Item{}, nil
+	}
+
+	const batchSize = 500
+	items := make([]models.Item, 0, len(itemIDs))
+	for start := 0; start < len(itemIDs); start += batchSize {
+		end := min(start+batchSize, len(itemIDs))
+		batch, _, err := s.ListContext(ctx, ItemListParams{
+			WorkspaceIDs: workspaceIDs,
+			Filters: ItemFilters{
+				ItemIDs: itemIDs[start:end],
+			},
+			Pagination:       PaginationParams{Limit: end - start},
+			OmitDescriptions: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, batch...)
+	}
+
+	if err := repository.NewMilestoneAttachRepository(s.db).LoadForItemsContext(ctx, items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 // Search searches items by title and description
 func (s *ItemCRUDService) Search(query string, workspaceIDs []int, pagination PaginationParams) ([]models.Item, int, error) {
 	return s.repo.Search(query, workspaceIDs, pagination)
 }
 
-// SearchParams contains parameters for the advanced Search handler
-type SearchParams struct {
-	TextQuery    string
-	WorkspaceIDs []int
-	StatusIDs    []int
-	PriorityIDs  []int
-	Pagination   PaginationParams
+// SearchContext is the request-aware form of Search.
+func (s *ItemCRUDService) SearchContext(ctx context.Context, query string, workspaceIDs []int, pagination PaginationParams) ([]models.Item, int, error) {
+	return s.repo.SearchContext(ctx, query, workspaceIDs, pagination)
 }
 
-// SearchWithFilters searches items with multiple filter criteria
-func (s *ItemCRUDService) SearchWithFilters(params SearchParams) ([]models.Item, int, error) {
-	if len(params.WorkspaceIDs) == 0 {
-		return []models.Item{}, 0, nil
-	}
-
-	filters := ItemFilters{
-		StatusIDs:   params.StatusIDs,
-		PriorityIDs: params.PriorityIDs,
-	}
-
-	// Detect workspace key pattern (e.g. "OK-40")
-	if params.TextQuery != "" {
-		parts := strings.Split(strings.ToUpper(params.TextQuery), "-")
-		isKeyPattern := len(parts) == 2 && parts[0] != "" && parts[1] != ""
-		if isKeyPattern {
-			if _, err := strconv.Atoi(parts[1]); err == nil {
-				filters.ItemKeyQuery = params.TextQuery
-			} else {
-				filters.TextQuery = params.TextQuery
-			}
-		} else {
-			filters.TextQuery = params.TextQuery
-		}
-	}
-
-	return s.repo.FindAllWithDetails(ItemListParams{
-		WorkspaceIDs: params.WorkspaceIDs,
-		Filters:      filters,
-		Pagination:   params.Pagination,
-		SortBy:       "updated_at",
-	})
-}
-
-// resolveCollectionQL resolves a QL query string from either a direct QL parameter
-// or a collection ID. Returns the resolved QL string and whether a collection was used.
-func (s *ItemCRUDService) resolveCollectionQL(qlQuery string, collectionID int) (resolvedQL string, isCollection bool, err error) {
+func (s *ItemCRUDService) resolveCollectionQLContext(ctx context.Context, qlQuery string, collectionID int) (resolvedQL string, isCollection bool, err error) {
 	if qlQuery != "" {
 		return qlQuery, false, nil
 	}
 	if collectionID <= 0 {
 		return "", false, nil
 	}
-	_, collectionQL, err := s.workspaceRepo.GetCollectionQuery(collectionID)
+	_, collectionQL, err := s.workspaceRepo.GetCollectionQueryContext(ctx, collectionID)
 	if err != nil {
-		if err == repository.ErrNotFound {
-			return "", false, fmt.Errorf("collection not found")
+		if errors.Is(err, repository.ErrNotFound) {
+			return "", false, fmt.Errorf("%w: %d", ErrCollectionNotFound, collectionID)
 		}
 		return "", false, fmt.Errorf("failed to get collection query: %w", err)
 	}
@@ -380,27 +499,50 @@ func (s *ItemCRUDService) resolveCollectionQL(qlQuery string, collectionID int) 
 	return "", true, nil
 }
 
-// evaluateQL compiles a QL query string into SQL WHERE clause and arguments.
-// Returns empty qlSQL when the input query is empty.
-func (s *ItemCRUDService) evaluateQL(qlQuery string, ctx cql.FunctionContext) (qlSQL string, qlArgs []interface{}, err error) {
+func (s *ItemCRUDService) evaluateQLContext(requestCtx context.Context, qlQuery string, functionCtx cql.FunctionContext) (qlSQL string, qlArgs []any, err error) {
 	if qlQuery == "" {
 		return "", nil, nil
 	}
-	qlQuery = cql.SubstituteFunctions(qlQuery, ctx)
-	workspaceMap, err := s.workspaceRepo.BuildWorkspaceMap()
+	qlQuery = cql.SubstituteFunctions(qlQuery, functionCtx)
+	workspaceMap, err := s.workspaceRepo.BuildWorkspaceMapContext(requestCtx)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to build workspace map: %w", err)
 	}
-	customFieldMap, err := s.repo.GetCQLCustomFieldMap()
+	customFieldMap, err := s.repo.GetCQLCustomFieldMapContext(requestCtx)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to build custom field map: %w", err)
 	}
 	evaluator := cql.NewEvaluator(workspaceMap, customFieldMap, s.db.GetDriverName())
 	qlSQL, qlArgs, err = evaluator.EvaluateToSQL(qlQuery)
 	if err != nil {
-		return "", nil, fmt.Errorf("QL query error: %w", err)
+		return "", nil, fmt.Errorf("%w: %v", ErrQLQuery, err)
 	}
 	return qlSQL, qlArgs, nil
+}
+
+type resolvedItemListQL struct {
+	sql                string
+	args               []any
+	collectionResolved bool
+}
+
+func (s *ItemCRUDService) resolveItemListQLContext(ctx context.Context, qlQuery string, collectionID int, subQL string, userID int) (resolvedItemListQL, error) {
+	qlQuery, collectionResolved, err := s.resolveCollectionQLContext(ctx, qlQuery, collectionID)
+	if err != nil {
+		return resolvedItemListQL{}, err
+	}
+	if subQL = strings.TrimSpace(subQL); subQL != "" {
+		if qlQuery == "" {
+			qlQuery = subQL
+		} else {
+			qlQuery = "(" + qlQuery + ") AND (" + subQL + ")"
+		}
+	}
+	qlSQL, qlArgs, err := s.evaluateQLContext(ctx, qlQuery, cql.UserContext(userID))
+	if err != nil {
+		return resolvedItemListQL{}, err
+	}
+	return resolvedItemListQL{sql: qlSQL, args: qlArgs, collectionResolved: collectionResolved}, nil
 }
 
 // BacklogParams contains parameters for retrieving backlog items
@@ -417,12 +559,17 @@ type BacklogParams struct {
 
 // GetBacklogItems retrieves items with non-completed statuses for a workspace/collection
 func (s *ItemCRUDService) GetBacklogItems(params BacklogParams) ([]models.Item, int, error) {
+	return s.GetBacklogItemsContext(context.Background(), params)
+}
+
+// GetBacklogItemsContext is the request-aware form of GetBacklogItems.
+func (s *ItemCRUDService) GetBacklogItemsContext(ctx context.Context, params BacklogParams) ([]models.Item, int, error) {
 	if len(params.WorkspaceIDs) == 0 {
 		return []models.Item{}, 0, nil
 	}
 
 	// Resolve backlog status IDs
-	backlogStatusIDs, err := s.repo.GetBacklogStatusIDs(params.WorkspaceID)
+	backlogStatusIDs, err := s.repo.GetBacklogStatusIDsContext(ctx, params.WorkspaceID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to get backlog statuses: %w", err)
 	}
@@ -434,37 +581,21 @@ func (s *ItemCRUDService) GetBacklogItems(params BacklogParams) ([]models.Item, 
 		StatusIDs: backlogStatusIDs,
 	}
 
-	// Resolve QL query from collection or direct parameter
-	qlQuery, collectionResolved, err := s.resolveCollectionQL(params.QLQuery, params.CollectionID)
+	resolvedQL, err := s.resolveItemListQLContext(ctx, params.QLQuery, params.CollectionID, params.SubQLQuery, params.UserID)
 	if err != nil {
 		return nil, 0, err
 	}
-
-	// Combine with sub-filter QL if provided
-	if subQL := strings.TrimSpace(params.SubQLQuery); subQL != "" {
-		if qlQuery != "" {
-			qlQuery = "(" + qlQuery + ") AND (" + subQL + ")"
-		} else {
-			qlQuery = subQL
-		}
-	}
-
-	// Evaluate QL query into SQL
-	qlSQL, qlArgs, err := s.evaluateQL(qlQuery, cql.UserContext(params.UserID))
-	if err != nil {
-		return nil, 0, err
-	}
-	if qlSQL != "" {
-		filters.QLQuery = qlSQL
-		filters.QLArgs = qlArgs
+	if resolvedQL.sql != "" {
+		filters.QLQuery = resolvedQL.sql
+		filters.QLArgs = resolvedQL.args
 	}
 
 	// Apply workspace_id filter only when no collection was resolved
-	if !collectionResolved && params.WorkspaceID > 0 {
+	if !resolvedQL.collectionResolved && params.WorkspaceID > 0 {
 		filters.WorkspaceID = &params.WorkspaceID
 	}
 
-	return s.repo.FindAllWithDetails(ItemListParams{
+	return s.repo.FindAllWithDetailsContext(ctx, ItemListParams{
 		WorkspaceIDs:     params.WorkspaceIDs,
 		Filters:          filters,
 		Pagination:       params.Pagination,
@@ -489,55 +620,103 @@ type ListWithQLParams struct {
 
 // ListWithQL retrieves items with QL evaluation and collection resolution
 func (s *ItemCRUDService) ListWithQL(params ListWithQLParams) ([]models.Item, int, error) {
+	return s.ListWithQLContext(context.Background(), params)
+}
+
+// ListWithQLContext is the request-aware form of ListWithQL.
+func (s *ItemCRUDService) ListWithQLContext(ctx context.Context, params ListWithQLParams) ([]models.Item, int, error) {
+	page, err := s.ListWithQLPageContext(ctx, params)
+	return page.Items, page.Total, err
+}
+
+// ListWithQLPageContext preserves the shared collection/workspace resolution
+// path while exposing the optional cursor continuation produced by the
+// repository. Existing callers should keep using ListWithQLContext unless
+// they need cursor metadata.
+func (s *ItemCRUDService) ListWithQLPageContext(ctx context.Context, params ListWithQLParams) (repository.ItemListPage, error) {
 	if len(params.WorkspaceIDs) == 0 {
-		return []models.Item{}, 0, nil
+		return repository.ItemListPage{Items: []models.Item{}}, nil
 	}
 
 	filters := params.Filters
 
-	// Resolve QL query from collection or direct parameter
-	qlQuery, collectionResolved, err := s.resolveCollectionQL(params.QLQuery, params.CollectionID)
+	resolvedQL, err := s.resolveItemListQLContext(ctx, params.QLQuery, params.CollectionID, params.SubQLQuery, params.UserID)
 	if err != nil {
-		return nil, 0, err
+		return repository.ItemListPage{}, err
 	}
-
-	// Combine with sub-filter QL if provided
-	if subQL := strings.TrimSpace(params.SubQLQuery); subQL != "" {
-		if qlQuery != "" {
-			qlQuery = "(" + qlQuery + ") AND (" + subQL + ")"
-		} else {
-			qlQuery = subQL
-		}
-	}
-
-	// Evaluate QL query into SQL
-	qlSQL, qlArgs, err := s.evaluateQL(qlQuery, cql.UserContext(params.UserID))
-	if err != nil {
-		return nil, 0, err
-	}
-	if qlSQL != "" {
-		filters.QLQuery = qlSQL
-		filters.QLArgs = qlArgs
-	}
-
-	// If collection was resolved but produced no effective query, return empty results.
-	// A collection with no filter means "nothing to show yet."
-	if collectionResolved && filters.QLQuery == "" {
-		return []models.Item{}, 0, nil
+	if resolvedQL.sql != "" {
+		filters.QLQuery = resolvedQL.sql
+		filters.QLArgs = resolvedQL.args
 	}
 
 	// Apply workspace_id filter only when no collection was resolved
-	if !collectionResolved && params.WorkspaceID > 0 {
+	if !resolvedQL.collectionResolved && params.WorkspaceID > 0 {
 		filters.WorkspaceID = &params.WorkspaceID
 	}
 
-	return s.repo.FindAllWithDetails(ItemListParams{
+	return s.repo.FindAllWithDetailsPageContext(ctx, ItemListParams{
 		WorkspaceIDs:     params.WorkspaceIDs,
 		Filters:          filters,
 		Pagination:       params.Pagination,
 		SortBy:           params.SortBy,
 		SortAsc:          params.SortAsc,
 		OmitDescriptions: params.OmitDescriptions,
+	})
+}
+
+// ListIDsWithQLPageContext evaluates CQL and returns only the matching item-ID
+// page. It is intended for set-oriented enrichment such as batched link reads.
+func (s *ItemCRUDService) ListIDsWithQLPageContext(ctx context.Context, params ListWithQLParams) (repository.ItemIDPage, error) {
+	if len(params.WorkspaceIDs) == 0 {
+		return repository.ItemIDPage{IDs: []int{}}, nil
+	}
+
+	qlQuery := strings.TrimSpace(params.QLQuery)
+	qlSQL, qlArgs, err := s.evaluateQLContext(ctx, qlQuery, cql.UserContext(params.UserID))
+	if err != nil {
+		return repository.ItemIDPage{}, err
+	}
+
+	filters := params.Filters
+	filters.QLQuery = qlSQL
+	filters.QLArgs = qlArgs
+	if params.WorkspaceID > 0 {
+		filters.WorkspaceID = &params.WorkspaceID
+	}
+
+	return s.repo.FindIDPageContext(ctx, ItemListParams{
+		WorkspaceIDs: params.WorkspaceIDs,
+		Filters:      filters,
+		Pagination:   params.Pagination,
+		SortBy:       params.SortBy,
+		SortAsc:      params.SortAsc,
+	})
+}
+
+// ListDistinctWorkspaceIDsWithQLContext evaluates a CQL expression against
+// the caller's accessible workspaces and returns only the workspace IDs that
+// have matching items. This supports metadata views that need workspace-scoped
+// catalogs without transferring every matching item first.
+func (s *ItemCRUDService) ListDistinctWorkspaceIDsWithQLContext(
+	ctx context.Context,
+	qlQuery string,
+	workspaceIDs []int,
+	userID int,
+) ([]int, error) {
+	if len(workspaceIDs) == 0 {
+		return []int{}, nil
+	}
+
+	qlSQL, qlArgs, err := s.evaluateQLContext(ctx, strings.TrimSpace(qlQuery), cql.UserContext(userID))
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.FindDistinctWorkspaceIDsContext(ctx, ItemListParams{
+		WorkspaceIDs: workspaceIDs,
+		Filters: ItemFilters{
+			QLQuery: qlSQL,
+			QLArgs:  qlArgs,
+		},
 	})
 }
 
@@ -587,47 +766,16 @@ func (s *ItemCRUDService) GetWithEffectiveProject(id int) (*models.Item, error) 
 	return item, nil
 }
 
-// GetHistory retrieves the change history for an item
+// GetHistory retrieves the change history for an item, with actor names
+// resolved for internal users and portal customers.
 func (s *ItemCRUDService) GetHistory(itemID int) ([]models.ItemHistory, error) {
-	rows, err := s.db.Query(`
-		SELECT h.id, h.item_id, h.user_id, h.changed_at, h.field_name, h.old_value, h.new_value,
-		       u.first_name || ' ' || u.last_name as user_name, u.email as user_email
-		FROM item_history h
-		LEFT JOIN users u ON h.user_id = u.id
-		WHERE h.item_id = ?
-		ORDER BY h.changed_at DESC
-	`, itemID)
+	history, err := repository.NewItemRepository(s.db).GetHistoryWithDetails(itemID, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch item history: %w", err)
 	}
-	defer rows.Close()
-
-	var history []models.ItemHistory
-	for rows.Next() {
-		var h models.ItemHistory
-		var userName, userEmail sql.NullString
-		err := rows.Scan(&h.ID, &h.ItemID, &h.UserID, &h.ChangedAt, &h.FieldName, &h.OldValue, &h.NewValue,
-			&userName, &userEmail)
-		if err != nil {
-			slog.Error("failed to scan item history row", slog.Int("item_id", itemID), slog.Any("error", err))
-			continue
-		}
-		if userName.Valid {
-			h.UserName = userName.String
-		}
-		if userEmail.Valid {
-			h.UserEmail = userEmail.String
-		}
-		history = append(history, h)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate item history: %w", err)
-	}
-
 	if history == nil {
 		history = []models.ItemHistory{}
 	}
-
 	return history, nil
 }
 

@@ -67,6 +67,7 @@ func (h *SetupHandler) CompleteInitialSetup(w http.ResponseWriter, r *http.Reque
 		sanitize.Pair{Target: &req.AdminUser.LastName, Policy: sanitize.PlainTextField},
 		sanitize.Pair{Target: &req.AdminUser.Username, Policy: sanitize.ShortIdentifier},
 		sanitize.Pair{Target: &req.AdminUser.Email, Policy: sanitize.ShortIdentifier},
+		sanitize.Pair{Target: &req.AdminUser.Language, Policy: sanitize.ShortIdentifier},
 	)
 
 	// Validate the setup request
@@ -96,6 +97,10 @@ func (h *SetupHandler) CompleteInitialSetup(w http.ResponseWriter, r *http.Reque
 
 	// Create admin user
 	adminUser := req.AdminUser
+	language := adminUser.Language
+	if language == "" {
+		language = "en"
+	}
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(adminUser.Password), bcrypt.DefaultCost)
 	if err != nil {
 		respondInternalError(w, r, err)
@@ -105,10 +110,10 @@ func (h *SetupHandler) CompleteInitialSetup(w http.ResponseWriter, r *http.Reque
 	// Insert user and get ID using RETURNING clause (supported by both SQLite 3.35+ and PostgreSQL)
 	var userID int64
 	err = tx.QueryRow(`
-		INSERT INTO users (email, username, first_name, last_name, password_hash, is_active)
-		VALUES (?, ?, ?, ?, ?, true)
+		INSERT INTO users (email, username, first_name, last_name, language, password_hash, is_active)
+		VALUES (?, ?, ?, ?, ?, ?, true)
 		RETURNING id
-	`, adminUser.Email, adminUser.Username, adminUser.FirstName, adminUser.LastName, string(hashedPassword)).Scan(&userID)
+	`, adminUser.Email, adminUser.Username, adminUser.FirstName, adminUser.LastName, language, string(hashedPassword)).Scan(&userID)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
@@ -205,7 +210,7 @@ func (h *SetupHandler) CompleteInitialSetup(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"message": "Initial setup completed successfully",
 		"status":  status,
@@ -214,24 +219,37 @@ func (h *SetupHandler) CompleteInitialSetup(w http.ResponseWriter, r *http.Reque
 
 // GetModuleSettings returns the current module visibility settings
 func (h *SetupHandler) GetModuleSettings(w http.ResponseWriter, r *http.Request) {
-	timeTracking, err := h.getSettingBool("time_tracking_enabled")
+	settings, err := h.ModuleSettings()
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
+	}
+
+	respondJSONOK(w, settings)
+}
+
+// ModuleSettings returns module visibility data for composed API responses.
+func (h *SetupHandler) ModuleSettings() (models.ModuleSettings, error) {
+	timeTracking, err := h.getSettingBool("time_tracking_enabled")
+	if err != nil {
+		return models.ModuleSettings{}, err
 	}
 
 	testManagement, err := h.getSettingBool("test_management_enabled")
 	if err != nil {
-		respondInternalError(w, r, err)
-		return
+		return models.ModuleSettings{}, err
 	}
 
-	settings := models.ModuleSettings{
-		TimeTrackingEnabled:   timeTracking,
-		TestManagementEnabled: testManagement,
+	workspaceManagedAgents, err := h.getSettingBool("workspace_managed_agents")
+	if err != nil {
+		return models.ModuleSettings{}, err
 	}
 
-	respondJSONOK(w, settings)
+	return models.ModuleSettings{
+		TimeTrackingEnabled:    timeTracking,
+		TestManagementEnabled:  testManagement,
+		WorkspaceManagedAgents: workspaceManagedAgents,
+	}, nil
 }
 
 // UpdateModuleSettings updates module visibility settings
@@ -254,6 +272,7 @@ func (h *SetupHandler) UpdateModuleSettings(w http.ResponseWriter, r *http.Reque
 	}{
 		{"time_tracking_enabled", true}, // Always enabled
 		{"test_management_enabled", settings.TestManagementEnabled},
+		{"workspace_managed_agents", settings.WorkspaceManagedAgents},
 	}
 
 	tx, err := h.DB.Begin()
@@ -286,17 +305,18 @@ func (h *SetupHandler) UpdateModuleSettings(w http.ResponseWriter, r *http.Reque
 		Username:     user.Username,
 		IPAddress:    h.getClientIP(r),
 		UserAgent:    r.UserAgent(),
-		ActionType:   logger.ActionModuleEnable, // Using existing constant
-		ResourceType: logger.ResourceModule,     // Using existing constant
+		ActionType:   logger.ActionModuleSettingsUpdate,
+		ResourceType: logger.ResourceModule,
 		ResourceName: "Module Settings",
-		Details: map[string]interface{}{
-			"time_tracking_enabled":   settings.TimeTrackingEnabled,
-			"test_management_enabled": settings.TestManagementEnabled,
+		Details: map[string]any{
+			"time_tracking_enabled":    settings.TimeTrackingEnabled,
+			"test_management_enabled":  settings.TestManagementEnabled,
+			"workspace_managed_agents": settings.WorkspaceManagedAgents,
 		},
 		Success: true,
 	})
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success":  true,
 		"message":  "Module settings updated successfully",
 		"settings": settings,
@@ -335,7 +355,7 @@ func (h *SetupHandler) GetAIFeaturesConfig(w http.ResponseWriter, r *http.Reques
 		connections = []connInfo{}
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"config":      cfg,
 		"connections": connections,
 	})
@@ -410,14 +430,14 @@ func (h *SetupHandler) UpdateAIFeaturesConfig(w http.ResponseWriter, r *http.Req
 			ActionType:   logger.ActionAIFeaturesConfigUpdate,
 			ResourceType: logger.ResourceAIFeaturesConfig,
 			ResourceName: "AI Features Config",
-			Details: map[string]interface{}{
+			Details: map[string]any{
 				"feature_count": len(cfg),
 			},
 			Success: true,
 		})
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"config":  cfg,
 	})

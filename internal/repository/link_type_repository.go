@@ -38,6 +38,19 @@ func (r *LinkTypeRepository) FindActiveIDByName(name string) (int, error) {
 	return id, nil
 }
 
+// FindIDByName returns the ID of a link type regardless of active state.
+func (r *LinkTypeRepository) FindIDByName(name string) (int, error) {
+	var id int
+	err := r.db.QueryRow("SELECT id FROM link_types WHERE name = ?", name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("find link type %q: %w", name, err)
+	}
+	return id, nil
+}
+
 // LinkTypeBasic carries the subset of link_type fields needed by validators.
 // AllowedEntityTypes is the raw JSON string as stored in the column; callers
 // parse it as needed.
@@ -82,7 +95,7 @@ func (r *LinkTypeRepository) FindNameByID(id int) (string, error) {
 	return name, nil
 }
 
-const linkTypeColumns = "id, name, description, forward_label, reverse_label, color, is_system, active, allowed_entity_types, created_at, updated_at"
+const linkTypeColumns = "id, COALESCE(builtin_key, ''), name, description, forward_label, reverse_label, color, is_system, active, allowed_entity_types, created_at, updated_at"
 
 // scanLinkType scans a *sql.Rows or *sql.Row into a models.LinkType, decoding
 // the allowed_entity_types JSON column.
@@ -92,7 +105,7 @@ func scanLinkType(scanner interface {
 	var lt models.LinkType
 	var aetRaw sql.NullString
 	if err := scanner.Scan(
-		&lt.ID, &lt.Name, &lt.Description, &lt.ForwardLabel, &lt.ReverseLabel,
+		&lt.ID, &lt.BuiltinKey, &lt.Name, &lt.Description, &lt.ForwardLabel, &lt.ReverseLabel,
 		&lt.Color, &lt.IsSystem, &lt.Active, &aetRaw, &lt.CreatedAt, &lt.UpdatedAt,
 	); err != nil {
 		return lt, err

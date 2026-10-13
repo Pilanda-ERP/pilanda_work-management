@@ -1,11 +1,6 @@
 <script>
-	// /oauth/authorize?... — the consent screen for the generic OAuth 2.0
-	// server. A third-party app redirected the browser here; on Allow we POST
-	// to /api/oauth/authorize/approve, get back a redirect_to URL with a
-	// fresh `code`, and bounce the browser to it. On Deny we POST /deny and
-	// bounce with `error=access_denied`.
-	//
-	// Pairs with internal/handlers/oauth.go.
+	// Generic OAuth consent: approve redirects with a fresh code; denial returns
+	// error=access_denied.
 
 	import { onMount } from 'svelte';
 	import { Lock, AlertTriangle } from '@lucide/svelte';
@@ -14,17 +9,15 @@
 	import { currentRoute } from '../router.js';
 	import ConsentCard from '../components/ConsentCard.svelte';
 	import Spinner from '../components/Spinner.svelte';
+	import { scopeCatalogStore } from '../stores/scopeCatalog.svelte.js';
 
-	const SCOPE_DESCRIPTIONS = {
-		'items:read': 'Read work items and comments',
-		'items:write': 'Create and update work items',
-		'items:delete': 'Delete work items',
-		'workspaces:read': 'Read workspaces and configuration',
-		'workspaces:write': 'Modify workspaces and configuration',
-		'workspaces:delete': 'Delete workspaces',
-		'collections:read': 'Read collections and reports',
-		'users:read': 'Read user directory',
-	};
+	// Scope descriptions come from the server catalog (auth.ScopeCatalog) so the
+	// consent screen can explain every scope a client might request. The previous
+	// hand-written map covered 8 of them and silently fell back to showing the
+	// raw scope string for the rest.
+	let scopeDescriptions = $derived(
+		Object.fromEntries(scopeCatalogStore.catalog.map((s) => [s.scope, s.description]))
+	);
 
 	// Parse the query string the third-party app sent the browser with.
 	const params = $derived($currentRoute.query || {});
@@ -37,6 +30,7 @@
 		state: string,
 		code_challenge?: string,
 		code_challenge_method?: string,
+		resource?: string,
 	}} */ (null));
 	let infoLoading = $state(true);
 	let infoError = $state('');
@@ -44,6 +38,7 @@
 	let actionError = $state('');
 
 	onMount(async () => {
+		scopeCatalogStore.load();
 		try {
 			info = await api.oauth.authorizeInfo({
 				client_id: params.client_id || '',
@@ -53,6 +48,7 @@
 				state: params.state || '',
 				code_challenge: params.code_challenge || '',
 				code_challenge_method: params.code_challenge_method || '',
+				resource: params.resource || '',
 			});
 		} catch (err) {
 			console.error('OAuth /info failed', err);
@@ -71,6 +67,7 @@
 			state: info.state,
 			code_challenge: info.code_challenge || '',
 			code_challenge_method: info.code_challenge_method || '',
+			resource: info.resource || '',
 		};
 	}
 
@@ -122,6 +119,7 @@
 	<div
 		class="min-h-screen flex items-center justify-center px-4 py-10"
 		style="background-color: var(--ds-surface);"
+		data-testid="oauth-authorize-error"
 	>
 		<div
 			class="w-full max-w-lg rounded-lg border p-6 shadow-sm"
@@ -144,7 +142,7 @@
 		icon={Lock}
 		title="Authorize {info.client_display_name}"
 		scopes={info.granted_scopes}
-		scopeDescriptions={SCOPE_DESCRIPTIONS}
+		{scopeDescriptions}
 		error={actionError}
 		onAllow={approve}
 		onDeny={deny}

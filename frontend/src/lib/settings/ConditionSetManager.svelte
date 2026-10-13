@@ -12,7 +12,9 @@
   import Panel from '../components/Panel.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import Lozenge from '../components/Lozenge.svelte';
+  import SearchInput from '../components/SearchInput.svelte';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+  import { transitionFromLabel } from './transitionLabels.js';
 
   let conditionSets = $state([]);
   let loading = $state(true);
@@ -85,6 +87,7 @@
     onclick={startCreating}
     keyboardHint="A"
     hotkeyConfig={{ key: toHotkeyString('conditionSets', 'add') }}
+    dataTestid="condition-set-add"
   >
     {t('conditionSets.add')}
   </Button>
@@ -99,16 +102,7 @@
 
 <!-- Search Bar -->
 <div class="mb-6">
-  <div class="relative max-w-md">
-    <Search class="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4" style="color: var(--ds-icon-subtle);" />
-    <input
-      type="text"
-      placeholder={t('conditionSets.searchPlaceholder')}
-      bind:value={searchQuery}
-      class="w-full pl-9 pr-4 py-2 border rounded text-sm focus:outline-none focus:ring-2"
-      style="border-color: var(--ds-border); background-color: var(--ds-surface-raised); color: var(--ds-text);"
-    />
-  </div>
+  <SearchInput bind:value={searchQuery} placeholder={t('conditionSets.searchPlaceholder')} class="max-w-md" dataTestid="condition-set-search" />
 </div>
 
 {#if loading}
@@ -141,7 +135,7 @@
   <div class="space-y-3">
     {#each filteredConditionSets as cs (cs.id)}
       <Panel padding="spacious" hoverable>
-        <div class="flex items-center justify-between">
+        <div class="flex items-center justify-between" data-testid={`condition-set-row-${cs.id}`}>
           <div class="flex-1 min-w-0">
             <div class="flex items-center gap-3 mb-2">
               <h3 class="text-lg font-medium" style="color: var(--ds-text);">{cs.name}</h3>
@@ -162,7 +156,7 @@
                 <div class="flex items-center gap-1.5 flex-wrap">
                   <span style="color: var(--ds-text-subtle);">{t('conditionSets.transitions')}:</span>
                   {#each getGatedTransitions(cs) as gt (gt.transition_id)}
-                    <Lozenge color="blue" text={`${gt.from_status_name || 'Initial'} → ${gt.to_status_name}`} />
+                    <Lozenge color="blue" text={`${transitionFromLabel(gt)} → ${gt.to_status_name}`} />
                   {/each}
                 </div>
               {/if}
@@ -175,6 +169,7 @@
               size="small"
               icon={Edit}
               onclick={() => startEditing(cs)}
+              dataTestid={`condition-set-edit-${cs.id}`}
             >
               {t('common.edit')}
             </Button>
@@ -183,6 +178,7 @@
               size="small"
               icon={Trash2}
               onclick={() => deleteConditionSet(cs)}
+              dataTestid={`condition-set-delete-${cs.id}`}
             >
               {t('common.delete')}
             </Button>

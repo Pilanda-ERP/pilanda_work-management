@@ -3,13 +3,17 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"windshift/internal/aitooladapter"
 	"windshift/internal/aitools"
+	"windshift/internal/auth"
+	"windshift/internal/itemevents"
 	"windshift/internal/llm"
 	"windshift/internal/models"
 	"windshift/internal/repository"
@@ -101,7 +105,7 @@ func (h *AIHandler) AnalyzeDependencies(w http.ResponseWriter, r *http.Request) 
 	// Parse optional request body
 	var req AnalyzeDependenciesRequest
 	if r.Body != nil && r.ContentLength > 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 			respondBadRequest(w, r, "Invalid request body")
 			return
 		}
@@ -117,7 +121,7 @@ func (h *AIHandler) AnalyzeDependencies(w http.ResponseWriter, r *http.Request) 
 	planningService := services.NewPlanningService(h.db)
 	iteration, err := planningService.GetIteration(iterationID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, repository.ErrNotFound) {
 			respondNotFound(w, r, "iteration")
 			return
 		}
@@ -325,7 +329,7 @@ func (h *AIHandler) AnalyzeDependencies(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), llm.DefaultRequestTimeout)
 	defer cancel()
 
-	result, err := llm.ChatCompletionStructured[llmDependencyResult](ctx, llmClient, llm.ChatCompletionRequest{
+	result, err := llm.CompleteStructured[llmDependencyResult](ctx, llmClient, llm.CompletionRequest{
 		Messages: []llm.Message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
@@ -485,14 +489,14 @@ func (h *AIHandler) AcceptDependencies(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		linkID, err := linkService.CreateLink(services.CreateItemLinkParams{
+		linkID, err := linkService.CreateLinkWithMetadata(services.CreateItemLinkParams{
 			LinkTypeID: s.LinkTypeID,
 			SourceType: "item",
 			SourceID:   s.SourceItemID,
 			TargetType: "item",
 			TargetID:   s.TargetItemID,
 			CreatedBy:  &user.ID,
-		})
+		}, itemevents.User(user.ID, "agent"))
 		if err != nil {
 			skipped++
 			continue
@@ -529,10 +533,16 @@ type ChatContext struct {
 
 // ChatRequest is the request body for the agentic chat endpoint.
 type ChatRequest struct {
-	Message      string        `json:"message"`
-	ConnectionID int           `json:"connection_id,omitempty"`
-	History      []ChatMessage `json:"history,omitempty"`
-	Context      *ChatContext  `json:"context,omitempty"`
+	Message      string `json:"message"`
+	ConnectionID int    `json:"connection_id,omitempty"`
+	SessionID    int    `json:"session_id,omitempty"`
+	// HistoryAfterMessageID starts a fresh client conversation within the
+	// durable General session without deleting its transcript.
+	HistoryAfterMessageID int `json:"history_after_message_id,omitempty"`
+	// History is accepted for one compatibility release but ignored. The
+	// server-owned session transcript is authoritative.
+	History []ChatMessage `json:"history,omitempty"`
+	Context *ChatContext  `json:"context,omitempty"`
 }
 
 // buildChatContextHint returns the extra system-prompt text for the caller's
@@ -626,6 +636,10 @@ func chatTerminalTools() map[string]bool {
 
 // ChatResponse is the response from the agentic chat endpoint.
 type ChatResponse struct {
+	SessionID     int                  `json:"session_id"`
+	UserMessageID int                  `json:"user_message_id"`
+	MessageID     int                  `json:"message_id"`
+	RunID         int                  `json:"run_id"`
 	Answer        string               `json:"answer"`
 	ToolCalls     []llm.ToolCallRecord `json:"tool_calls,omitempty"`
 	Iterations    int                  `json:"iterations"`
@@ -637,6 +651,14 @@ type ChatResponse struct {
 	// not a claim that the answer is wrong. ReviewReasons explains why.
 	NeedsReview   bool     `json:"needs_review,omitempty"`
 	ReviewReasons []string `json:"review_reasons,omitempty"`
+	// Model is the model id that actually answered, which is not always the one
+	// the connection currently points at. Empty for the env-var fallback client,
+	// which has no configured model to name.
+	Model string `json:"model,omitempty"`
+	// Usage is the metered token/cost total for this turn. Nil when metering
+	// failed or nothing was recorded, so the UI omits the meter rather than
+	// showing a confident zero.
+	Usage *repository.RunUsageTotals `json:"usage,omitempty"`
 }
 
 // reviewVerdictForToolCalls computes the recovery-aware review flag for a chat
@@ -662,47 +684,103 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	sanitize.Apply(&req.Message, sanitize.Comment)
-	for i := range req.History {
-		sanitize.Apply(&req.History[i].Content, sanitize.Comment)
+	if len(req.Message) > 256*1024 {
+		respondBadRequest(w, r, "message is too long")
+		return
 	}
+	persistedMessage := req.Message
+	promptMessage := req.Message
+	sanitize.Apply(&promptMessage, sanitize.Comment)
 	if req.Context != nil {
 		sanitize.Apply(&req.Context.View, sanitize.ShortIdentifier)
 		sanitize.Apply(&req.Context.ItemKey, sanitize.ShortIdentifier)
 	}
-	if strings.TrimSpace(req.Message) == "" {
+	if strings.TrimSpace(promptMessage) == "" {
 		respondBadRequest(w, r, "message is required")
 		return
 	}
 
-	// Resolve LLM client (Chat allows user to override connection via the UI selector)
-	llmClient := requireLLMClientForFeature(w, r, h.llmManager, "ai_chat", req.ConnectionID)
-	if llmClient == nil {
+	session, err := h.resolveChatSession(r.Context(), user.ID, req.SessionID)
+	if err != nil {
+		switch {
+		case errors.Is(err, repository.ErrAgentSessionNotFound):
+			respondNotFound(w, r, "agent session")
+		case errors.Is(err, repository.ErrAgentSessionArchived):
+			respondConflict(w, r, "agent session is archived")
+		default:
+			respondInternalError(w, r, err)
+		}
 		return
 	}
 
-	// Pre-compute accessible workspace IDs (immutable for the duration of this request)
 	accessibleWSIDs, err := GetAccessibleWorkspaceIDs(user, h.db, h.permService)
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to get accessible workspaces: %w", err))
 		return
 	}
+	if len(accessibleWSIDs) == 0 {
+		respondForbidden(w, r)
+		return
+	}
 
-	// Build tool executor
-	executor := NewToolExecutor(&aitools.Env{
-		DB:                     h.db,
-		UserID:                 user.ID,
-		Username:               user.FullName,
-		Source:                 aitools.SourceAIChat,
-		AccessibleWorkspaceIDs: accessibleWSIDs,
-		PermService:            h.permService,
-		TimePermService:        h.timePermService,
-		TimerService:           h.timerService,
-		CommentService:         services.NewCommentService(h.db),
-		ActionService:          h.actionService,
+	mode, err := h.prepareChatMode(r.Context(), user, session, accessibleWSIDs, req.Context)
+	if err != nil {
+		switch {
+		case errors.Is(err, errChatPermissionDenied):
+			respondForbidden(w, r)
+		case errors.Is(err, services.ErrBindingUnavailable):
+			respondConflict(w, r, "the selected Standard agent is not Ready")
+		default:
+			respondInternalError(w, r, err)
+		}
+		return
+	}
+	contextJSON := ""
+	if req.Context != nil {
+		if body, err := json.Marshal(req.Context); err == nil {
+			contextJSON = string(body)
+		}
+	}
+	begun, err := h.conversations.BeginTurn(r.Context(), repository.BeginAgentTurnInput{
+		SessionID:           session.ID,
+		SenderUserID:        user.ID,
+		SenderUsername:      user.Username,
+		ActingUserID:        mode.actingUserID,
+		WorkspaceID:         mode.runWorkspaceID,
+		BindingID:           mode.bindingID,
+		JobKind:             mode.jobKind,
+		ProfileVersion:      mode.profileVersion,
+		ProfileSnapshotJSON: mode.profileSnapshotJSON,
+		GrantsJSON:          mode.grantsJSON,
+		Content:             persistedMessage,
+		ContextJSON:         contextJSON,
 	})
+	if errors.Is(err, repository.ErrAgentSessionBusy) {
+		respondConflict(w, r, "agent session already has an active turn")
+		return
+	}
+	if errors.Is(err, repository.ErrAgentSessionNotFound) {
+		respondNotFound(w, r, "agent session")
+		return
+	}
+	if errors.Is(err, repository.ErrAgentSessionArchived) {
+		respondConflict(w, r, "agent session is archived")
+		return
+	}
+	if err != nil {
+		// Fail closed: no LLM request occurs if message/run/audit correlation
+		// could not be committed atomically.
+		respondInternalError(w, r, fmt.Errorf("persist agent turn: %w", err))
+		return
+	}
+	runRepo := repository.NewAgentRunRepository(h.db)
+	if transitioned, err := runRepo.MarkRunningIfQueued(r.Context(), begun.RunID, "", time.Now().UTC()); err != nil || !transitioned {
+		_ = runRepo.Finalize(r.Context(), begun.RunID, models.AgentRunStatusFailed,
+			"Agent chat could not start", time.Now().UTC())
+		respondInternalError(w, r, errors.New("agent chat run could not start"))
+		return
+	}
 
-	// Determine current date in user's timezone
 	chatTimezone := user.Timezone
 	if chatTimezone == "" {
 		chatTimezone = "UTC"
@@ -712,16 +790,37 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		chatNow = chatNow.In(chatLoc)
 	}
 
-	systemPrompt := fmt.Sprintf(h.promptStore.Get(llm.PromptAIChat),
-		chatNow.Format("2006-01-02"), user.FullName, user.ID, user.ID,
-	) + buildChatContextHint(req.Context)
-
-	// Convert client history to LLM messages (only user/assistant roles allowed)
+	systemPrompt := mode.systemPrompt
+	if session.SessionType == models.AgentSessionGeneral {
+		systemPrompt = fmt.Sprintf(h.promptStore.Get(llm.PromptAIChat),
+			chatNow.Format("2006-01-02"), user.FullName, user.ID, user.ID,
+		) + buildChatContextHint(req.Context)
+	}
+	historyAfterMessageID := 0
+	if session.SessionType == models.AgentSessionGeneral {
+		historyAfterMessageID = req.HistoryAfterMessageID
+	}
+	priorMessages, err := h.conversations.ListMessagesForParticipantAfter(
+		r.Context(), session.ID, user.ID, historyAfterMessageID, begun.MessageID, 200)
+	if err != nil {
+		_ = runRepo.Finalize(r.Context(), begun.RunID, models.AgentRunStatusFailed,
+			"Agent chat history could not be loaded", time.Now().UTC())
+		respondInternalError(w, r, err)
+		return
+	}
 	var history []llm.Message
-	for _, h := range req.History {
-		if h.Role == "user" || h.Role == "assistant" {
-			history = append(history, llm.Message{Role: h.Role, Content: h.Content})
-		}
+	for _, message := range priorMessages {
+		content := message.Content
+		sanitize.Apply(&content, sanitize.Comment)
+		history = append(history, llm.Message{Role: message.Role, Content: content})
+	}
+
+	llmClient, llmDescriptor, err := mode.resolveLLM(h.chatLLMs, req.ConnectionID)
+	if err != nil {
+		_ = runRepo.Finalize(r.Context(), begun.RunID, models.AgentRunStatusFailed,
+			"Configured LLM is unavailable", time.Now().UTC())
+		respondLLMError(w, r, err)
+		return
 	}
 
 	// The agentic loop (up to MaxIterations of LLM round-trips + tool calls) is
@@ -731,16 +830,56 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 	extendWriteDeadline(w)
 	ctx, cancel := context.WithTimeout(r.Context(), llm.DefaultRequestTimeout)
 	defer cancel()
+	actingTimezone, err := services.LookupUserTimezone(h.db, mode.actingUserID)
+	if err != nil {
+		_ = runRepo.Finalize(r.Context(), begun.RunID, models.AgentRunStatusFailed,
+			"Acting user timezone is invalid", time.Now().UTC())
+		respondInternalError(w, r, err)
+		return
+	}
+	systemPrompt += fmt.Sprintf("\n\nThe acting user's authoritative IANA timezone is %s. Interpret relative dates and unqualified wall-clock times in that timezone; never pre-offset values passed to time tools.", actingTimezone)
 
+	env := &aitools.Env{
+		DB:                     h.db,
+		UserID:                 mode.actingUserID,
+		Username:               mode.actingName,
+		Timezone:               actingTimezone,
+		Source:                 mode.source,
+		RunID:                  begun.RunID,
+		AccessibleWorkspaceIDs: mode.accessibleWorkspaceIDs,
+		AuditDetails: map[string]any{
+			"agent_session_id":          session.ID,
+			"agent_message_id":          begun.MessageID,
+			"agent_run_id":              begun.RunID,
+			"root_initiator_user_id":    user.ID,
+			"immediate_trigger_user_id": user.ID,
+			"acting_user_id":            mode.actingUserID,
+			"workspace_id":              mode.runWorkspaceID,
+		},
+		PermService:            h.permService,
+		TimePermService:        h.timePermService,
+		TimerService:           h.timerService,
+		CommentService:         h.commentService,
+		ApprovalService:        h.approvalService,
+		ActionService:          h.actionService,
+		PageApplicationService: h.pageApplicationService,
+		PageDiagramService:     h.pageDiagramService,
+	}
+	if env.CommentService == nil {
+		env.CommentService = services.NewCommentService(h.db)
+	}
+	executor := aitooladapter.NewExecutor(env, mode.entries)
 	result, err := llm.RunAgent(ctx, llmClient, llm.AgentConfig{
 		SystemPrompt:  systemPrompt,
-		Tools:         BuildLLMTools(),
+		Tools:         aitooladapter.BuildTools(mode.entries),
 		MaxTokens:     2048,
 		Temperature:   0.1,
 		MaxIterations: 12,
-		TerminalTools: chatTerminalTools(),
-	}, req.Message, executor.Execute, history)
+		TerminalTools: mode.terminalTools,
+	}, promptMessage, executor.Execute, history)
 	if err != nil {
+		_ = runRepo.Finalize(context.Background(), begun.RunID, models.AgentRunStatusFailed,
+			"Agent chat execution failed", time.Now().UTC())
 		slog.ErrorContext(r.Context(), "chat agent run failed",
 			slog.Int("user_id", user.ID),
 			slog.String("ctx_view", chatContextView(req.Context)),
@@ -749,7 +888,7 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 			slog.Int("ctx_page_id", chatContextPageID(req.Context)),
 			slog.Int("ctx_item_id", chatContextItemID(req.Context)),
 			slog.String("ctx_item_key", chatContextItemKey(req.Context)),
-			slog.String("error", err.Error()),
+			slog.String("error_type", fmt.Sprintf("%T", err)),
 		)
 		respondLLMError(w, r, err)
 		return
@@ -770,11 +909,62 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Recovery-aware review flag over the run's tool calls (same classifier the
-	// coding agent uses). Computed inline — chat is ephemeral, so the verdict
-	// rides along on the response rather than being persisted.
+	// coding agent uses). Persist only the verdict and sanitized tool summaries;
+	// exact user and assistant content belongs exclusively to the transcript.
 	verdict := reviewVerdictForToolCalls(result.ToolCalls)
+	toolSummaries := make([]map[string]string, 0, len(result.ToolCalls))
+	for _, call := range result.ToolCalls {
+		status := "succeeded"
+		var body map[string]any
+		if json.Unmarshal([]byte(call.Result), &body) == nil && body["error"] != nil {
+			status = "failed"
+		}
+		toolSummaries = append(toolSummaries, map[string]string{"name": call.Name, "status": status})
+		_ = runRepo.AppendEvent(context.Background(), begun.RunID, "tool",
+			marshalChatMetadata(map[string]any{"name": call.Name, "status": status}))
+	}
+	// Meter the turn against its own agent_runs row so the model's identity and
+	// spend survive a reload. Best-effort: the answer is already produced, and a
+	// bookkeeping miss must not fail a turn the user is waiting on.
+	usage, meterErr := services.RecordLLMCall(r.Context(), h.llmUsage, begun.RunID, llmDescriptor, services.MeteredCall{
+		Usage:  result.Usage,
+		Images: result.Images,
+		Calls:  result.Calls,
+	})
+	if meterErr != nil {
+		slog.WarnContext(context.Background(), "meter ai chat turn",
+			slog.Int("run_id", begun.RunID),
+			slog.String("model", llmDescriptor.Model),
+			slog.Any("error", meterErr),
+		)
+	}
+
+	metadata := marshalChatMetadata(map[string]any{
+		"stop_reason":    result.StopReason,
+		"iterations":     result.Iterations,
+		"tool_summaries": toolSummaries,
+		"needs_review":   verdict.Flagged,
+		"review_reasons": verdict.Reasons,
+		"model":          llmDescriptor.Model,
+		"usage":          usage,
+	})
+	assistantMessageID, err := h.conversations.CompleteTurn(
+		context.Background(), session.ID, begun.RunID, mode.actingUserID,
+		result.Answer, metadata)
+	if err != nil {
+		_ = runRepo.Finalize(context.Background(), begun.RunID, models.AgentRunStatusFailed,
+			"Agent response could not be persisted", time.Now().UTC())
+		respondInternalError(w, r, err)
+		return
+	}
+	_ = runRepo.AppendEvent(context.Background(), begun.RunID, "succeeded",
+		marshalChatMetadata(map[string]any{"message_id": assistantMessageID}))
 
 	respondJSONOK(w, ChatResponse{
+		SessionID:     session.ID,
+		UserMessageID: begun.MessageID,
+		MessageID:     assistantMessageID,
+		RunID:         begun.RunID,
 		Answer:        result.Answer,
 		ToolCalls:     result.ToolCalls,
 		Iterations:    result.Iterations,
@@ -782,7 +972,208 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		StopReason:    string(result.StopReason),
 		NeedsReview:   verdict.Flagged,
 		ReviewReasons: verdict.Reasons,
+		Model:         llmDescriptor.Model,
+		Usage:         chatUsageOrNil(usage, meterErr),
 	})
+}
+
+// chatUsageOrNil reports the metered totals, or nil when metering failed or
+// nothing was recorded. A nil Usage tells the UI to omit the meter rather than
+// render a confident zero.
+func chatUsageOrNil(usage repository.RunUsageTotals, err error) *repository.RunUsageTotals {
+	if err != nil || usage.Calls == 0 {
+		return nil
+	}
+	return &usage
+}
+
+var errChatPermissionDenied = errors.New("agent chat permission denied")
+
+type chatExecutionMode struct {
+	actingUserID           int
+	actingName             string
+	runWorkspaceID         int
+	bindingID              *int
+	jobKind                string
+	profileVersion         int
+	profileSnapshotJSON    string
+	grantsJSON             string
+	source                 string
+	accessibleWorkspaceIDs []int
+	entries                []aitools.Entry
+	terminalTools          map[string]bool
+	systemPrompt           string
+	llmConnectionID        int
+	standard               bool
+}
+
+type chatLLMResolver interface {
+	Resolve(connectionID int) (llm.Client, error)
+	ResolveForFeatureWithOverride(featureKey string, userOverrideConnectionID int) (llm.Client, error)
+	// ResolveWithIdentity / ResolveForFeatureWithIdentity return the descriptor
+	// for the connection the matching Resolve would have picked. The chat needs
+	// the model name and catalog pricing to report and meter the turn, and it
+	// must come from the same resolution the client did — resolving twice could
+	// straddle an admin changing the default connection and attribute one
+	// model's cost to another.
+	ResolveWithIdentity(connectionID int) (llm.Client, llm.ConnectionDescriptor, error)
+	ResolveForFeatureWithIdentity(featureKey string, userOverrideConnectionID int) (llm.Client, llm.ConnectionDescriptor, error)
+}
+
+func (m chatExecutionMode) resolveLLM(manager chatLLMResolver, overrideID int) (llm.Client, llm.ConnectionDescriptor, error) {
+	if m.standard {
+		return manager.ResolveWithIdentity(m.llmConnectionID)
+	}
+	return manager.ResolveForFeatureWithIdentity("ai_chat", overrideID)
+}
+
+func (h *AIHandler) resolveChatSession(ctx context.Context, userID, requestedSessionID int) (*models.AgentSession, error) {
+	if requestedSessionID <= 0 {
+		return h.conversations.EnsureGeneralSession(ctx, userID)
+	}
+	session, err := h.conversations.GetForParticipant(ctx, requestedSessionID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if session.ArchivedAt != nil {
+		return nil, repository.ErrAgentSessionArchived
+	}
+	return session, nil
+}
+
+func (h *AIHandler) prepareChatMode(ctx context.Context, user *models.User, session *models.AgentSession, accessibleWSIDs []int, chatCtx *ChatContext) (chatExecutionMode, error) {
+	containsWorkspace := func(id int) bool {
+		for _, allowed := range accessibleWSIDs {
+			if allowed == id {
+				return true
+			}
+		}
+		return false
+	}
+	if session.SessionType == models.AgentSessionGeneral {
+		runWorkspaceID := accessibleWSIDs[0]
+		if chatCtx != nil && chatCtx.WorkspaceID > 0 {
+			if !containsWorkspace(chatCtx.WorkspaceID) {
+				return chatExecutionMode{}, errChatPermissionDenied
+			}
+			runWorkspaceID = chatCtx.WorkspaceID
+		}
+		// The chat runs on the caller's cookie session, not an API token, so
+		// there is no scope set to read off a credential. Gate it on
+		// DefaultAgentScopes anyway (WI-962) so one agent surface can't quietly
+		// do more than another: what chat can reach now matches what a `ws` CLI
+		// or MCP token reaches by default. Per-workspace permission checks
+		// inside each tool still apply on top.
+		entries := aitooladapter.EntriesForScopes(aitools.Default, auth.DefaultAgentScopes)
+		toolNames := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			toolNames = append(toolNames, entry.Name)
+		}
+		grantsJSON := marshalChatMetadata(map[string]any{
+			"workspace_ids": accessibleWSIDs,
+			"tools":         toolNames,
+		})
+		return chatExecutionMode{
+			actingUserID:           user.ID,
+			actingName:             user.FullName,
+			runWorkspaceID:         runWorkspaceID,
+			jobKind:                models.JobKindGeneralAgent,
+			profileSnapshotJSON:    `{"session_type":"general"}`,
+			grantsJSON:             grantsJSON,
+			source:                 aitools.SourceAIChat,
+			accessibleWorkspaceIDs: append([]int(nil), accessibleWSIDs...),
+			entries:                entries,
+			terminalTools:          chatTerminalTools(),
+		}, nil
+	}
+	if session.SessionType != models.AgentSessionStandard ||
+		session.WorkspaceID == nil || session.AgentProfileID == nil {
+		return chatExecutionMode{}, repository.ErrAgentSessionNotFound
+	}
+	if !containsWorkspace(*session.WorkspaceID) ||
+		(chatCtx != nil && chatCtx.WorkspaceID > 0 && chatCtx.WorkspaceID != *session.WorkspaceID) {
+		return chatExecutionMode{}, errChatPermissionDenied
+	}
+	canInvoke, err := h.permService.HasWorkspacePermission(user.ID, *session.WorkspaceID, models.PermissionItemEdit)
+	if err != nil {
+		return chatExecutionMode{}, err
+	}
+	if !canInvoke {
+		return chatExecutionMode{}, errChatPermissionDenied
+	}
+	profile, err := h.agentBindings.Get(ctx, *session.AgentProfileID)
+	if err != nil {
+		return chatExecutionMode{}, err
+	}
+	if profile.WorkspaceID != *session.WorkspaceID ||
+		profile.ProfileType != models.AgentProfileStandard ||
+		profile.Lifecycle != models.AgentLifecycleReady ||
+		profile.LLMConnectionID == nil {
+		return chatExecutionMode{}, services.ErrBindingUnavailable
+	}
+	actingPermissions, err := h.permService.HasWorkspacePermissions(profile.ActingUserID, profile.WorkspaceID,
+		[]string{models.PermissionItemView, models.PermissionItemComment})
+	if err != nil {
+		return chatExecutionMode{}, err
+	}
+	if !actingPermissions[models.PermissionItemView] || !actingPermissions[models.PermissionItemComment] {
+		return chatExecutionMode{}, errChatPermissionDenied
+	}
+	entries := aitooladapter.EntriesForStandard(aitools.Default, profile.CapabilityGroups)
+	toolNames := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		toolNames = append(toolNames, entry.Name)
+	}
+	profileSnapshotJSON := marshalChatMetadata(map[string]any{
+		"binding_id":        profile.ID,
+		"profile_version":   profile.ProfileVersion,
+		"acting_user_id":    profile.ActingUserID,
+		"acting_name":       profile.DisplayName,
+		"llm_connection_id": *profile.LLMConnectionID,
+		"instructions":      profile.Instructions,
+		"purpose":           profile.Purpose,
+		"capability_groups": profile.CapabilityGroups,
+		"tool_names":        toolNames,
+	})
+	grantsJSON := marshalChatMetadata(map[string]any{
+		"workspace_ids": []int{profile.WorkspaceID},
+		"tools":         toolNames,
+	})
+	bindingID := profile.ID
+	return chatExecutionMode{
+		actingUserID:           profile.ActingUserID,
+		actingName:             profile.DisplayName,
+		runWorkspaceID:         profile.WorkspaceID,
+		bindingID:              &bindingID,
+		jobKind:                models.JobKindStandardAgent,
+		profileVersion:         profile.ProfileVersion,
+		profileSnapshotJSON:    profileSnapshotJSON,
+		grantsJSON:             grantsJSON,
+		source:                 aitools.SourceStandardAgent,
+		accessibleWorkspaceIDs: []int{profile.WorkspaceID},
+		entries:                entries,
+		terminalTools:          aitooladapter.TerminalTools(entries),
+		systemPrompt: fmt.Sprintf(`You are %s, a Standard workspace agent.
+Act only through the provided tools and only within workspace %d.
+Your response is part of a private participant conversation. Never claim a
+mutation succeeded unless its tool call succeeded.
+
+Purpose: %s
+
+Profile instructions:
+%s`, profile.DisplayName, profile.WorkspaceID,
+			strings.TrimSpace(profile.Purpose), strings.TrimSpace(profile.Instructions)),
+		llmConnectionID: *profile.LLMConnectionID,
+		standard:        true,
+	}, nil
+}
+
+func marshalChatMetadata(value any) string {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(body)
 }
 
 // chatContextView / WorkspaceID / ActionID / PageID / Item safely read fields off a

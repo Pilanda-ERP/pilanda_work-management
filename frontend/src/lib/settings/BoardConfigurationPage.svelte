@@ -1,16 +1,21 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
+  import ColorDot from '../components/ColorDot.svelte';
+  import TabStrip from '../components/TabStrip.svelte';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
   import { attachClosestEdge, extractClosestEdge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
   import { navigate } from '../router.js';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast } from '../stores/toasts.svelte.js';
-  import { CARD_SELECTABLE_FIELDS, getSystemFieldName } from '../stores/fieldConfig.js';
+  import { CARD_SELECTABLE_FIELDS } from '../stores/fieldConfig.js';
   import { confirm } from '../composables/useConfirm.js';
   import { workspacePermissions } from '../stores/workspacePermissions.svelte.js';
-  import { getCollection } from '../features/collections/collectionService.js';
-  import { Plus, GripVertical, X, Grip } from '@lucide/svelte';
+  import { collectionStore } from '../stores/collectionContext.svelte.js';
+  import { workspaceDataStore } from '../stores/workspaceDataStore.svelte.js';
+  import { loadBoardConfigurationPageData } from './boardConfigurationData.js';
+  import { Plus, GripVertical, X, Grip, Settings, ListChecks, Columns3 } from '@lucide/svelte';
+  import IconSelector from '../pickers/IconSelector.svelte';
   import { useGradientStyles, loadWorkspaceGradient } from '../stores/workspaceGradient.svelte.js';
   import ViewHeader from '../layout/ViewHeader.svelte';
   import StaticViewBackground from '../layout/StaticViewBackground.svelte';
@@ -18,13 +23,20 @@
   import Panel from '../components/Panel.svelte';
   import EmptyState from '../components/EmptyState.svelte';
   import SearchInput from '../components/SearchInput.svelte';
+  import Input from '../components/Input.svelte';
+  import Checkbox from '../components/Checkbox.svelte';
   import DropIndicator from '../layout/DropIndicator.svelte';
+  import DragHandleDots from '../components/DragHandleDots.svelte';
   import CollectionViewSwitcher from '../features/collections/CollectionViewSwitcher.svelte';
+  import { COLLECTION_VIEW_IDS, workspaceViewItems } from '../navigation/workspaceNavigation.js';
+  import { viewSettingsStore } from '../stores/viewSettings.svelte.js';
+  import { objectDisplayName } from '../utils/systemLabels.js';
 
   let { workspaceId, collectionId = null } = $props();
 
   let workspace = $state(null);
   let currentCollectionName = $state('Default');
+  let isPublicCollection = $state(false);
   let publicSlug = $state(null);
   let loading = $state(true);
   let saving = $state(false);
@@ -36,11 +48,38 @@
   let backlogStatusIDs = $state([]);
   let cardFields = $state([]);
   let showRightmostColumnLast50 = $state(false);
+  let trimCompletedItemsByAge = $state(false);
+  let completedItemRetentionDays = $state(30);
+  let completedItemRetentionError = $state('');
   let customFieldDefinitions = $state([]);
+  let enabledViews = $state([]);
+  // Collection scopes may only toggle collection-scoped views; the workspace
+  // scope also offers the workspace-scoped views-group entry (the queue).
+  let scopeViewItems = $derived(
+    collectionId
+      ? workspaceViewItems.filter((view) => COLLECTION_VIEW_IDS.has(view.id))
+      : workspaceViewItems
+  );
+  let viewsInherited = $state(true);
+  let viewsDirty = $state(false);
+  let viewsResetPending = $state(false);
+
+  const PUBLIC_BOARD_CARD_FIELDS = new Set([
+    'key',
+    'title',
+    'status',
+    'priority',
+    'assignee',
+    'item_type',
+    'story_points',
+    'due_date',
+    'labels',
+  ]);
 
   // DnD state
   let statusDragState = $state(new Map());
   let columnDragState = $state(new Map());
+  let cardFieldDragState = $state(new Map());
   let statusSearchQuery = $state('');
   let setupCleanups = [];
   let setupTimeout;
@@ -56,6 +95,40 @@
     collectionId != null || workspacePermissions.canAdminWorkspace(workspaceId)
   );
 
+  // Custom-field administration is global and system-administrator-only. A
+  // workspace administrator who is not a system administrator must not be
+  // shown an unusable privileged action.
+  let isSystemAdmin = $derived(
+    /** @type {any} */ (workspacePermissions).isSystemAdmin === true
+  );
+  let isNonSystemWorkspaceAdmin = $derived(
+    !isSystemAdmin && workspacePermissions.canAdminWorkspace(workspaceId)
+  );
+  let hasCustomFields = $derived(customFieldDefinitions.length > 0);
+  let boardConfigReturnTo = $derived(
+    collectionId != null && workspaceId != null
+      ? `/workspaces/${workspaceId}/collections/${collectionId}/board/configure`
+      : collectionId != null
+        ? `/collections/${collectionId}/board/configure`
+        : workspaceId != null
+          ? `/workspaces/${workspaceId}/board/configure`
+          : '/'
+  );
+
+  async function goCustomFields(create) {
+    if (hasChanges) {
+      const confirmed = await confirm({
+        title: t('common.discardChanges'),
+        message: t('dialogs.confirmations.discardChanges'),
+        confirmText: t('common.discard'),
+        cancelText: t('common.cancel'),
+      });
+      if (!confirmed) return;
+    }
+    const returnTo = encodeURIComponent(boardConfigReturnTo);
+    navigate(`/admin/custom-fields?returnTo=${returnTo}${create ? '&action=create' : ''}`);
+  }
+
   // Derived: set of all assigned status IDs
   let assignedStatusIds = $derived(new Set(columns.flatMap(c => c.status_ids)));
 
@@ -69,10 +142,10 @@
   });
 
   onMount(async () => {
-    if (workspaceId) {
-      await loadWorkspaceGradient(workspaceId);
-    }
-    await loadData();
+    await Promise.all([
+      workspaceId ? loadWorkspaceGradient(workspaceId) : Promise.resolve(),
+      loadData()
+    ]);
     loading = false;
   });
 
@@ -85,6 +158,9 @@
     // Track dependencies
     columns;
     statuses;
+    cardFields;
+    activeTab;
+    canConfigure;
     statusSearchQuery;
     if (!loading && typeof document !== 'undefined') {
       if (setupTimeout) clearTimeout(setupTimeout);
@@ -94,66 +170,38 @@
 
   async function loadData() {
     try {
-      if (workspaceId) {
-        workspace = await api.workspaces.get(workspaceId);
-      }
+      const data = await loadBoardConfigurationPageData(
+        api,
+        workspaceDataStore,
+        workspaceId,
+        collectionId
+      );
+      workspace = data.workspace;
+      statuses = data.statuses;
+      customFieldDefinitions = data.customFieldDefinitions;
+      currentCollectionName = data.collection?.name || 'Default';
+      isPublicCollection = data.collection?.is_public === true;
+      publicSlug = isPublicCollection && data.collection?.public_slug
+        ? data.collection.public_slug
+        : null;
+      boardConfig = data.boardConfiguration;
 
+      // Effective enabled views: the scope's override, or the inherited
+      // workspace default when the payload marks it inherited.
+      const effectiveViews = boardConfig?.view_settings?.enabled_views;
+      enabledViews = Array.isArray(effectiveViews) && effectiveViews.length > 0
+        ? [...effectiveViews]
+        : workspaceViewItems.map((view) => view.id);
       if (collectionId) {
-        const collection = await getCollection(collectionId);
-        if (collection) {
-          currentCollectionName = collection.name;
-          publicSlug = (collection.is_public && collection.public_slug) ? collection.public_slug : null;
-        }
-      } else {
-        currentCollectionName = 'Default';
+        // The collection effective set inherits workspace-only tools ids;
+        // this scope only reads and persists collection views.
+        enabledViews = enabledViews.filter((id) => COLLECTION_VIEW_IDS.has(id));
       }
+      viewsInherited = Boolean(boardConfig?.view_settings_inherited) || !boardConfig?.view_settings;
+      viewsDirty = false;
+      viewsResetPending = false;
 
-      const statusMap = new Map();
-
-      if (collectionId) {
-        const collection = await getCollection(collectionId);
-
-        if (collection && collection.ql_query) {
-          try {
-            const items = await api.items.getAll({ ql: collection.ql_query });
-            const workspaceIds = [...new Set(items.map(item => item.workspace_id).filter(id => id))];
-
-            for (const wsId of workspaceIds) {
-              const wsStatuses = await api.workspaces.getStatuses(wsId);
-              wsStatuses.forEach(status => statusMap.set(status.id, status));
-            }
-
-            if (workspaceIds.length === 0) {
-              const allStatuses = workspaceId
-                ? await api.workspaces.getStatuses(workspaceId)
-                : await api.statuses.getAll();
-              allStatuses.forEach(status => statusMap.set(status.id, status));
-            }
-          } catch (error) {
-            console.error('Failed to load items for collection:', error);
-            const allStatuses = workspaceId
-              ? await api.workspaces.getStatuses(workspaceId)
-              : await api.statuses.getAll();
-            allStatuses.forEach(status => statusMap.set(status.id, status));
-          }
-        } else {
-          const allStatuses = workspaceId
-            ? await api.workspaces.getStatuses(workspaceId)
-            : await api.statuses.getAll();
-          allStatuses.forEach(status => statusMap.set(status.id, status));
-        }
-      } else if (workspaceId) {
-        const wsStatuses = await api.workspaces.getStatuses(workspaceId);
-        wsStatuses.forEach(status => statusMap.set(status.id, status));
-      } else {
-        const allStatuses = await api.statuses.getAll();
-        allStatuses.forEach(status => statusMap.set(status.id, status));
-      }
-
-      statuses = Array.from(statusMap.values());
-
-      try {
-        boardConfig = await api.collections.getBoardConfiguration(collectionId, workspaceId);
+      if (boardConfig) {
         columns = (boardConfig.columns || []).map(col => ({
           ...col,
           status_ids: col.status_ids || []
@@ -161,25 +209,24 @@
         backlogStatusIDs = boardConfig.backlog_status_ids?.length > 0
           ? boardConfig.backlog_status_ids
           : statuses.filter(s => !s.is_default && !s.is_completed).map(s => s.id);
-        cardFields = boardConfig.card_fields || [];
+        cardFields = (boardConfig.card_fields || []).filter(
+          field => !isPublicCollection ||
+            (field.field_type === 'system' && PUBLIC_BOARD_CARD_FIELDS.has(field.field_identifier))
+        );
         showRightmostColumnLast50 = Boolean(boardConfig.show_rightmost_column_last_50);
-      } catch (error) {
-        if (error.status !== 404) {
-          console.error('Failed to load board configuration:', error);
-        }
+        const savedRetentionDays = Number(boardConfig.completed_item_retention_days);
+        trimCompletedItemsByAge = !showRightmostColumnLast50 && Number.isInteger(savedRetentionDays) && savedRetentionDays > 0;
+        completedItemRetentionDays = trimCompletedItemsByAge ? savedRetentionDays : 30;
+        completedItemRetentionError = '';
+      } else {
         columns = [];
         backlogStatusIDs = statuses.filter(s => !s.is_default && !s.is_completed).map(s => s.id);
         cardFields = [];
         showRightmostColumnLast50 = false;
+        trimCompletedItemsByAge = false;
+        completedItemRetentionDays = 30;
+        completedItemRetentionError = '';
       }
-
-      try {
-        const cfData = await api.customFields.getAll(workspaceId ? { workspace_id: workspaceId } : {});
-        customFieldDefinitions = (cfData?.data || cfData || []);
-      } catch (e) {
-        customFieldDefinitions = [];
-      }
-
     } catch (error) {
       console.error('Failed to load data:', error);
     }
@@ -193,6 +240,7 @@
     setupCleanups = [];
     statusDragState = new Map();
     columnDragState = new Map();
+    cardFieldDragState = new Map();
   }
 
   function setupDragAndDrop() {
@@ -358,6 +406,64 @@
         dropTargetCleanup();
       });
     });
+
+    // --- Card fields (for card-field reordering) ---
+    /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-card-field]')).forEach(element => {
+      if (!canConfigure) return;
+
+      const fieldIndex = parseInt(element.dataset.cardFieldIndex);
+      const fieldIdentifier = element.dataset.cardFieldIdentifier;
+      if (!fieldIdentifier || Number.isNaN(fieldIndex)) return;
+
+      cardFieldDragState.set(fieldIdentifier, { closestEdge: null });
+
+      const dragHandle = element.querySelector('[data-card-field-drag-handle]');
+      const draggableCleanup = draggable({
+        element,
+        dragHandle: dragHandle || element,
+        getInitialData: () => ({ fieldIndex, fieldIdentifier, type: 'card-field' }),
+        onDragStart: () => { element.style.opacity = '0.5'; },
+        onDrop: () => {
+          element.style.opacity = '';
+          cardFieldDragState.forEach((_, key) => {
+            cardFieldDragState.set(key, { closestEdge: null });
+          });
+          cardFieldDragState = new Map(cardFieldDragState);
+        }
+      });
+
+      const dropTargetCleanup = dropTargetForElements({
+        element,
+        canDrop: ({ source }) => {
+          const data = source.data;
+          if (data.type === 'card-field' && data.fieldIndex === fieldIndex) return false;
+          return data.type === 'card-field';
+        },
+        getData: ({ input, element }) => {
+          return attachClosestEdge({}, { input, element, allowedEdges: ['top', 'bottom'] });
+        },
+        onDragEnter: ({ self }) => {
+          cardFieldDragState.set(fieldIdentifier, { closestEdge: extractClosestEdge(self.data) });
+          cardFieldDragState = new Map(cardFieldDragState);
+        },
+        onDragLeave: () => {
+          cardFieldDragState.set(fieldIdentifier, { closestEdge: null });
+          cardFieldDragState = new Map(cardFieldDragState);
+        },
+        onDrop: ({ self, source }) => {
+          if (source.data.type === 'card-field') {
+            reorderCardFields(source.data.fieldIndex, fieldIndex, extractClosestEdge(self.data));
+          }
+          cardFieldDragState.set(fieldIdentifier, { closestEdge: null });
+          cardFieldDragState = new Map(cardFieldDragState);
+        }
+      });
+
+      setupCleanups.push(() => {
+        draggableCleanup();
+        dropTargetCleanup();
+      });
+    });
   }
 
   // --- Status manipulation functions ---
@@ -462,9 +568,15 @@
     hasChanges = true;
   }
 
+  function updateColumnColor(index, color) {
+    columns[index].color = color;
+    columns = [...columns];
+    hasChanges = true;
+  }
+
   function getStatusName(statusId) {
     const s = statuses.find(s => s.id === statusId);
-    return s ? s.name : statusId;
+    return s ? objectDisplayName(s, 'status') : statusId;
   }
 
   function getStatusColor(statusId) {
@@ -488,15 +600,36 @@
 
   function setShowRightmostColumnLast50(value) {
     showRightmostColumnLast50 = value;
+    if (value) {
+      trimCompletedItemsByAge = false;
+      completedItemRetentionError = '';
+    }
+    hasChanges = true;
+  }
+
+  function setTrimCompletedItemsByAge(value) {
+    trimCompletedItemsByAge = value;
+    if (value) showRightmostColumnLast50 = false;
+    completedItemRetentionError = '';
+    hasChanges = true;
+  }
+
+  function updateCompletedItemRetentionDays(value) {
+    completedItemRetentionDays = value;
+    completedItemRetentionError = '';
     hasChanges = true;
   }
 
   // --- Card Fields ---
 
-  const systemFieldOptions = CARD_SELECTABLE_FIELDS.map(f => ({
-    identifier: f.identifier,
-    label: f.name
-  }));
+  let systemFieldOptions = $derived(
+    CARD_SELECTABLE_FIELDS
+      .filter(f => !isPublicCollection || PUBLIC_BOARD_CARD_FIELDS.has(f.identifier))
+      .map(f => ({
+        identifier: f.identifier,
+        label: t(`settings.boardConfig.systemFieldNames.${f.identifier}`)
+      }))
+  );
 
   let selectedCardFieldIds = $derived(new Set(cardFields.map(f => f.field_identifier)));
 
@@ -505,7 +638,9 @@
   );
 
   let availableCustomFields = $derived(
-    (customFieldDefinitions || []).filter(f => !selectedCardFieldIds.has(`custom_field_${f.id}`))
+    isPublicCollection
+      ? []
+      : (customFieldDefinitions || []).filter(f => !selectedCardFieldIds.has(`custom_field_${f.id}`))
   );
 
   function addCardField(identifier, fieldType) {
@@ -523,18 +658,32 @@
     hasChanges = true;
   }
 
-  function reorderCardFields(fromIndex, toIndex) {
+  function reorderCardFields(fromIndex, toIndex, closestEdge) {
     if (fromIndex === toIndex) return;
+    const insertIndex = closestEdge === 'bottom' ? toIndex + 1 : toIndex;
+    const adjustedIndex = fromIndex < insertIndex ? insertIndex - 1 : insertIndex;
+    if (fromIndex === adjustedIndex) return;
+
     const newFields = [...cardFields];
     const [moved] = newFields.splice(fromIndex, 1);
-    newFields.splice(toIndex, 0, moved);
+    newFields.splice(adjustedIndex, 0, moved);
     cardFields = newFields.map((f, i) => ({ ...f, display_order: i }));
     hasChanges = true;
   }
 
+  function handleCardFieldReorderKeydown(event, index) {
+    if (event.key === 'ArrowUp' && index > 0) {
+      event.preventDefault();
+      reorderCardFields(index, index - 1, 'top');
+    } else if (event.key === 'ArrowDown' && index < cardFields.length - 1) {
+      event.preventDefault();
+      reorderCardFields(index, index + 1, 'bottom');
+    }
+  }
+
   function getCardFieldLabel(field) {
     if (field.field_type === 'system') {
-      return getSystemFieldName(field.field_identifier);
+      return t(`settings.boardConfig.systemFieldNames.${field.field_identifier}`);
     }
     // Custom field
     const cfId = field.field_identifier.replace('custom_field_', '');
@@ -544,7 +693,34 @@
 
   // --- Save / Reset / Cancel ---
 
+  function toggleView(viewId) {
+    if (enabledViews.includes(viewId)) {
+      if (enabledViews.length <= 1) return; // at least one view stays enabled
+      enabledViews = enabledViews.filter((id) => id !== viewId);
+    } else {
+      enabledViews = [...enabledViews, viewId];
+    }
+    viewsDirty = true;
+    viewsResetPending = false;
+    hasChanges = true;
+  }
+
+  function resetViewsToInherited() {
+    viewsDirty = true;
+    viewsResetPending = true;
+    hasChanges = true;
+  }
+
   async function saveConfiguration() {
+    const retentionDays = Number(completedItemRetentionDays);
+    if (
+      trimCompletedItemsByAge &&
+      (!Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650)
+    ) {
+      completedItemRetentionError = t('settings.boardConfig.retentionRangeError');
+      return;
+    }
+
     saving = true;
     try {
       const payload = {
@@ -565,14 +741,32 @@
           display_order: i,
           width: 0
         })),
-        show_rightmost_column_last_50: showRightmostColumnLast50
+        show_rightmost_column_last_50: showRightmostColumnLast50,
+        completed_item_retention_days: trimCompletedItemsByAge ? retentionDays : null
       };
 
+      // Only carry view settings when this scope owns an override, the user
+      // changed the selection, or an explicit reset was requested — otherwise
+      // inheritance stays untouched.
+      if (viewsResetPending) {
+        payload.view_settings = { enabled_views: null };
+      } else if (viewsDirty || boardConfig?.view_settings) {
+        payload.view_settings = { enabled_views: [...enabledViews] };
+      }
+
       if (boardConfig && boardConfig.id) {
-        await api.collections.updateBoardConfiguration(collectionId, boardConfig.id, payload);
+        await api.collections.updateBoardConfiguration(collectionId, boardConfig.id, payload, workspaceId);
       } else {
         const newConfig = await api.collections.createBoardConfiguration(collectionId, workspaceId, payload);
         boardConfig = newConfig;
+      }
+      collectionStore.invalidateBoardConfiguration(workspaceId, collectionId);
+      // Saved view settings change nav rendering for this scope; a
+      // workspace-scope save also changes every inheriting collection.
+      if (collectionId) {
+        viewSettingsStore.invalidate(workspaceId, collectionId);
+      } else {
+        viewSettingsStore.invalidateWorkspace(workspaceId);
       }
 
       hasChanges = false;
@@ -597,12 +791,15 @@
 
     if (boardConfig) {
       try {
-        await api.collections.deleteBoardConfiguration(collectionId, boardConfig.id);
+        await api.collections.deleteBoardConfiguration(collectionId, boardConfig.id, workspaceId);
         boardConfig = null;
         columns = [];
         backlogStatusIDs = [];
         cardFields = [];
         showRightmostColumnLast50 = false;
+        trimCompletedItemsByAge = false;
+        completedItemRetentionDays = 30;
+        completedItemRetentionError = '';
         hasChanges = false;
         goToBoard();
       } catch (error) {
@@ -614,6 +811,9 @@
       backlogStatusIDs = [];
       cardFields = [];
       showRightmostColumnLast50 = false;
+      trimCompletedItemsByAge = false;
+      completedItemRetentionDays = 30;
+      completedItemRetentionError = '';
       hasChanges = false;
     }
   }
@@ -654,8 +854,8 @@
         <!-- Header with view tabs -->
         <ViewHeader
           workspaceName={workspace?.name || ''}
-          collection={currentCollectionName}
-          viewName="Configure Board"
+          collection={currentCollectionName === 'Default' ? t('common.default') : currentCollectionName}
+          viewName={t('settings.boardConfig.configureBoard')}
           itemCount={columns.length}
         >
           {#snippet actions()}
@@ -671,65 +871,97 @@
         <!-- Configuration content in raised box -->
         <Panel padding="spacious" class="w-full" style="border-color: {styles.hasCustomBackground ? 'transparent' : 'var(--ds-border)'};">
         <!-- Tab Navigation -->
-        <div class="border-b" style="border-color: var(--ds-border);">
-          <div class="flex gap-4">
-            <button
-              class="px-4 py-2 text-sm font-medium border-b-2 transition-colors"
-              class:border-transparent={activeTab !== 'columns'}
-              style:color={activeTab === 'columns' ? 'var(--ds-interactive)' : 'var(--ds-text-subtle)'}
-              style:border-color={activeTab === 'columns' ? 'var(--ds-interactive)' : 'transparent'}
-              onclick={() => activeTab = 'columns'}
-            >
-              {t('settings.boardConfig.columns')}
-            </button>
-            <button
-              class="px-4 py-2 text-sm font-medium border-b-2 transition-colors"
-              class:border-transparent={activeTab !== 'backlog'}
-              style:color={activeTab === 'backlog' ? 'var(--ds-interactive)' : 'var(--ds-text-subtle)'}
-              style:border-color={activeTab === 'backlog' ? 'var(--ds-interactive)' : 'transparent'}
-              onclick={() => activeTab = 'backlog'}
-            >
-              {t('settings.boardConfig.backlog')}
-            </button>
-            <button
-              class="px-4 py-2 text-sm font-medium border-b-2 transition-colors"
-              class:border-transparent={activeTab !== 'cardFields'}
-              style:color={activeTab === 'cardFields' ? 'var(--ds-interactive)' : 'var(--ds-text-subtle)'}
-              style:border-color={activeTab === 'cardFields' ? 'var(--ds-interactive)' : 'transparent'}
-              onclick={() => activeTab = 'cardFields'}
-            >
-              {t('settings.boardConfig.cardFields')}
-            </button>
-          </div>
-        </div>
+        <TabStrip
+          tabs={[
+            { id: 'columns', label: t('settings.boardConfig.columns') },
+            { id: 'backlog', label: t('settings.boardConfig.backlog') },
+            { id: 'cardFields', label: t('settings.boardConfig.cardFields'), testid: 'board-config-card-fields-tab' },
+            { id: 'views', label: t('settings.boardConfig.views'), testid: 'board-config-views-tab' }
+          ]}
+          bind:activeTab
+        />
 
         <!-- Columns Tab -->
         {#if activeTab === 'columns'}
-        <div class="mt-4 rounded border p-4" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <label class="flex items-start gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              class="mt-1 h-4 w-4 rounded"
-              checked={showRightmostColumnLast50}
-              onchange={(e) => setShowRightmostColumnLast50(e.currentTarget.checked)}
-              disabled={!canConfigure}
-            />
-            <span>
-              <span class="block text-sm font-medium" style="color: var(--ds-text);">Show only the latest 50 items in the rightmost column</span>
-              <span class="block text-xs mt-1" style="color: var(--ds-text-subtle);">Useful for high-volume Done columns while keeping the rest of the board complete.</span>
-            </span>
-          </label>
+        <div class="mt-5 flex flex-col gap-4 rounded-xl border p-5" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
+          <div>
+            <h4 class="text-sm font-semibold" style="color: var(--ds-text);">{t('settings.boardConfig.displayOptions')}</h4>
+            <p class="text-xs mt-0.5" style="color: var(--ds-text-subtle);">{t('settings.boardConfig.displayOptionsHint')}</p>
+          </div>
+          <Checkbox
+            bind:checked={showRightmostColumnLast50}
+            onchange={setShowRightmostColumnLast50}
+            disabled={!canConfigure}
+            dataTestid="board-rightmost-limit-enabled"
+            label={t('settings.boardConfig.latestFiftyRightmost')}
+            hint={t('settings.boardConfig.latestFiftyRightmostHint')}
+            size="small"
+          />
+          {#if !showRightmostColumnLast50}
+            <div class="border-t pt-4" style="border-color: var(--ds-border);">
+              <Checkbox
+                bind:checked={trimCompletedItemsByAge}
+                onchange={setTrimCompletedItemsByAge}
+                disabled={!canConfigure}
+                dataTestid="board-completed-age-enabled"
+                label={t('settings.boardConfig.hideCompletedByAge')}
+                hint={t('settings.boardConfig.hideCompletedByAgeHint')}
+                size="small"
+              />
+              {#if trimCompletedItemsByAge}
+                <div class="ml-6 mt-3 max-w-xs">
+                  <label
+                    for="board-completed-retention-days"
+                    class="mb-1.5 block text-xs font-medium"
+                    style="color: var(--ds-text-subtle);"
+                  >
+                    {t('settings.boardConfig.recentActivityWindow')}
+                  </label>
+                  <div class="flex items-center gap-2">
+                    <Input
+                      id="board-completed-retention-days"
+                      type="number"
+                      value={completedItemRetentionDays}
+                      oninput={(event) => updateCompletedItemRetentionDays(event.currentTarget.value)}
+                      min={1}
+                      max={3650}
+                      step={1}
+                      size="small"
+                      dataTestid="board-completed-retention-days"
+                      ariaDescribedby="board-completed-retention-help"
+                      class="w-24"
+                    />
+                    <span class="text-xs" style="color: var(--ds-text-subtle);">{t('settings.boardConfig.days')}</span>
+                  </div>
+                  <p
+                    id="board-completed-retention-help"
+                    class="mt-1.5 text-xs"
+                    style="color: {completedItemRetentionError ? 'var(--ds-text-danger)' : 'var(--ds-text-subtlest)'};"
+                  >
+                    {completedItemRetentionError || t('settings.boardConfig.retentionWindowHint')}
+                  </p>
+                </div>
+              {/if}
+            </div>
+          {/if}
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-6 gap-3 mt-4 mb-6">
+        <div class="grid grid-cols-1 lg:grid-cols-6 gap-5 mt-5 mb-8">
           <!-- Left Panel: Available Statuses -->
-          <div class="lg:col-span-2 rounded-xl p-3 border" style="background-color: var(--ds-surface); border-color: var(--ds-border);">
-            <h4 class="text-sm font-semibold mb-1" style="color: var(--ds-text);">
-              {t('settings.boardConfig.availableStatuses')} ({availableStatuses.length})
-            </h4>
-            <p class="text-xs mb-3" style="color: var(--ds-text-subtle);">
-              {t('settings.boardConfig.dragStatusesToColumns')}
-            </p>
+          <div class="lg:col-span-2 rounded-xl p-4 border flex flex-col" style="background-color: var(--ds-surface); border-color: var(--ds-border);">
+            <div class="flex items-start gap-3 mb-3">
+              <span class="flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center" style="background-color: var(--ds-interactive-subtle, var(--ds-background-neutral-hovered)); color: var(--ds-interactive);">
+                <ListChecks class="w-4 h-4" />
+              </span>
+              <div class="min-w-0">
+                <h4 class="text-sm font-semibold" style="color: var(--ds-text);">
+                  {t('settings.boardConfig.availableStatuses')} ({availableStatuses.length})
+                </h4>
+                <p class="text-xs mt-0.5" style="color: var(--ds-text-subtle);">
+                  {t('settings.boardConfig.dragStatusesToColumns')}
+                </p>
+              </div>
+            </div>
 
             <SearchInput
               bind:value={statusSearchQuery}
@@ -743,26 +975,16 @@
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
                 <div
                   data-available-status={JSON.stringify({ id: status.id, name: status.name, color: status.category_color })}
-                  class="group flex items-center gap-2 px-2 py-1.5 rounded border transition-all duration-200 cursor-grab hover:border-blue-300 active:cursor-grabbing"
-                  style="border-color: var(--ds-border); background-color: var(--ds-background-input); user-select: none; -webkit-user-select: none;"
-                  onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-                  onmouseleave={(e) => e.currentTarget.style.background = 'var(--ds-background-input)'}
+                  class="available-status-row group flex items-center gap-2.5 px-2.5 py-2 rounded-lg border transition-all duration-200 cursor-grab hover:border-ds-border-focused active:cursor-grabbing"
                 >
                   <!-- 6-dot drag handle -->
                   <div class="flex-shrink-0">
-                    <svg class="w-4 h-4 group-hover:text-blue-500" style="color: var(--ds-text-subtlest);" fill="currentColor" viewBox="0 0 24 24">
-                      <circle cx="9" cy="6" r="1.5"/>
-                      <circle cx="15" cy="6" r="1.5"/>
-                      <circle cx="9" cy="12" r="1.5"/>
-                      <circle cx="15" cy="12" r="1.5"/>
-                      <circle cx="9" cy="18" r="1.5"/>
-                      <circle cx="15" cy="18" r="1.5"/>
-                    </svg>
+                    <DragHandleDots class="w-4 h-4 group-hover:text-ds-interactive" />
                   </div>
                   <!-- Color dot -->
-                  <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background-color: {status.category_color || '#6b7280'};"></span>
+                  <ColorDot size="md" color={status.category_color || '#6b7280'} class="flex-shrink-0" />
                   <!-- Status name -->
-                  <span class="text-sm truncate" style="color: var(--ds-text);">{status.name}</span>
+                  <span class="text-sm truncate" style="color: var(--ds-text);">{objectDisplayName(status, 'status')}</span>
                 </div>
               {/each}
 
@@ -781,24 +1003,34 @@
           </div>
 
           <!-- Right Panel: Board Columns -->
-          <div class="lg:col-span-4 rounded-xl p-3 border" style="background-color: var(--ds-surface); border-color: var(--ds-border);">
-            <div class="flex items-center justify-between mb-3">
-              <h4 class="text-sm font-semibold" style="color: var(--ds-text);">
-                {t('settings.boardConfig.boardColumns')}
-              </h4>
+          <div class="lg:col-span-4 rounded-xl p-4 border" style="background-color: var(--ds-surface); border-color: var(--ds-border);">
+            <div class="flex items-center justify-between gap-3 mb-4">
+              <div class="flex items-start gap-3 min-w-0">
+                <span class="flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center" style="background-color: var(--ds-interactive-subtle, var(--ds-background-neutral-hovered)); color: var(--ds-interactive);">
+                  <Columns3 class="w-4 h-4" />
+                </span>
+                <div class="min-w-0">
+                  <h4 class="text-sm font-semibold" style="color: var(--ds-text);">
+                    {t('settings.boardConfig.boardColumns')}
+                  </h4>
+                  <p class="text-xs mt-0.5" style="color: var(--ds-text-subtle);">
+                    {t('settings.boardConfig.dragToReorder')}
+                  </p>
+                </div>
+              </div>
               <Button variant="default" size="small" onclick={addColumn}>
                 <Plus class="w-4 h-4 mr-1" />
                 {t('settings.boardConfig.addColumn')}
               </Button>
             </div>
 
-            <div class="flex gap-2 min-h-48 max-h-[70vh] overflow-x-auto overflow-y-hidden pb-1" style="overscroll-behavior: contain;">
+            <div class="flex gap-3 min-h-56 max-h-[70vh] overflow-x-auto overflow-y-hidden pb-1" style="overscroll-behavior: contain;">
               {#each columns as column, colIndex (colIndex)}
                 <!-- Column section -->
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
                 <div
                   data-board-column={colIndex}
-                  class="relative rounded-lg border transition-all w-[212px] flex-shrink-0 flex flex-col"
+                  class="relative rounded-xl border transition-all w-60 flex-shrink-0 flex flex-col overflow-hidden"
                   style="border-color: {column.status_ids.length === 0 ? 'var(--ds-border-warning, #ca8a04)' : 'var(--ds-border)'}; border-style: {column.status_ids.length === 0 ? 'dashed' : 'solid'}; background-color: var(--ds-surface-raised);"
                 >
                   <!-- Column reorder DropIndicator -->
@@ -806,8 +1038,11 @@
                     <DropIndicator edge={columnDragState.get(colIndex)?.closestEdge} gap={8} />
                   {/if}
 
-                  <!-- Column Header: single row with grip, name, WIP, delete -->
-                  <div class="flex items-center gap-1 px-2 py-1.5 border-b" style="border-color: var(--ds-border);">
+                  <!-- Column color accent -->
+                  <div class="h-1.5 flex-shrink-0" style="background-color: {column.color || 'var(--ds-border)'};"></div>
+
+                  <!-- Column name and actions -->
+                  <div class="flex items-center gap-1.5 px-2.5 py-2">
                     <!-- svelte-ignore a11y_no_static_element_interactions -->
                     <div
                       data-column-drag-handle
@@ -817,40 +1052,65 @@
                       <GripVertical class="w-4 h-4" />
                     </div>
 
-                    <input
+                    <Input
                       type="text"
                       value={column.name}
                       oninput={(e) => updateColumnName(colIndex, e.currentTarget.value)}
-                      class="flex-1 px-1.5 py-1 border rounded text-sm font-semibold min-w-0"
-                      style="border-color: var(--ds-border); color: var(--ds-text); background-color: var(--ds-surface);"
+                      dataTestid={`board-column-name-${colIndex}`}
+                      class="flex-1 font-semibold min-w-0"
                       placeholder={t('placeholders.columnName')}
-                    />
-
-                    <input
-                      type="number"
-                      value={column.wip_limit || ''}
-                      oninput={(e) => updateWIPLimit(colIndex, e.currentTarget.value)}
-                      class="w-14 px-1 py-1 border rounded text-sm text-center flex-shrink-0"
-                      style="border-color: var(--ds-border); color: var(--ds-text); background-color: var(--ds-surface);"
-                      placeholder="WIP"
-                      title={t('settings.boardConfig.wipLimit')}
-                      min="1"
+                      size="small"
                     />
 
                     <button
                       onclick={() => removeColumn(colIndex)}
-                      class="p-1 rounded transition-colors flex-shrink-0"
-                      style="color: var(--ds-text-danger);"
-                      onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-danger-subtle)'}
-                      onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+                      class="danger-ghost-btn p-1 rounded transition-colors flex-shrink-0"
                       title={t('common.delete')}
                     >
                       <X class="w-4 h-4" />
                     </button>
                   </div>
 
+                  <!-- Column color -->
+                  <div class="flex items-center justify-between gap-3 px-2.5 py-2 border-b" style="border-color: var(--ds-border);">
+                    <span class="text-xs font-medium" style="color: var(--ds-text-subtle);">
+                      {t('settings.boardConfig.columnColor')}
+                    </span>
+                    <IconSelector
+                      selectedColor={column.color}
+                      onchange={(event) => updateColumnColor(colIndex, event.detail.color)}
+                      colorOnly
+                      compact
+                      dataTestid={`board-column-color-${colIndex}`}
+                    />
+                  </div>
+
+                  <!-- WIP limit -->
+                  <div class="flex items-center justify-between gap-3 px-2.5 py-2 border-b" style="border-color: var(--ds-border);">
+                    <label
+                      for={`board-column-wip-${colIndex}`}
+                      class="text-xs font-medium"
+                      style="color: var(--ds-text-subtle);"
+                    >
+                      {t('settings.boardConfig.wipLimit')}
+                    </label>
+                    <Input
+                      id={`board-column-wip-${colIndex}`}
+                      type="number"
+                      value={column.wip_limit || ''}
+                      oninput={(e) => updateWIPLimit(colIndex, e.currentTarget.value)}
+                      dataTestid={`board-column-wip-${colIndex}`}
+                      class="text-center flex-shrink-0"
+                      style="width: 3.75rem;"
+                      placeholder="—"
+                      title={t('settings.boardConfig.wipLimit')}
+                      min={1}
+                      size="small"
+                    />
+                  </div>
+
                   <!-- Column Body -->
-                  <div class="p-1.5 flex flex-col gap-1 flex-1 overflow-y-auto">
+                  <div class="p-2 flex flex-col gap-1.5 flex-1 overflow-y-auto">
                     {#each column.status_ids as statusId, statusIndex (statusId)}
                       <!-- svelte-ignore a11y_no_static_element_interactions -->
                       <div
@@ -858,7 +1118,7 @@
                         data-status-id={statusId}
                         data-col-index={colIndex}
                         data-status-index={statusIndex}
-                        class="relative group flex items-center gap-2 px-2 py-1.5 rounded border transition-all duration-200"
+                        class="relative group flex items-center gap-2.5 px-2.5 py-2 rounded-lg border transition-all duration-200"
                         style="background: var(--ds-background-input); border-color: var(--ds-border); user-select: none;"
                       >
                         <!-- DropIndicator for status insertion -->
@@ -868,14 +1128,7 @@
 
                         <!-- Drag handle -->
                         <div class="cursor-grab active:cursor-grabbing flex-shrink-0" style="touch-action: none;">
-                          <svg class="w-3.5 h-3.5 group-hover:text-blue-500" style="color: var(--ds-text-subtlest);" fill="currentColor" viewBox="0 0 24 24">
-                            <circle cx="9" cy="6" r="1.5"/>
-                            <circle cx="15" cy="6" r="1.5"/>
-                            <circle cx="9" cy="12" r="1.5"/>
-                            <circle cx="15" cy="12" r="1.5"/>
-                            <circle cx="9" cy="18" r="1.5"/>
-                            <circle cx="15" cy="18" r="1.5"/>
-                          </svg>
+                          <DragHandleDots class="w-3.5 h-3.5 group-hover:text-ds-interactive" />
                         </div>
                         <!-- Color dot -->
                         <span class="w-2 h-2 rounded-full flex-shrink-0" style="background-color: {getStatusColor(statusId)};"></span>
@@ -884,10 +1137,7 @@
                         <!-- Remove button -->
                         <button
                           onclick={() => removeStatusFromColumn(colIndex, statusId)}
-                          class="opacity-0 group-hover:opacity-100 p-0.5 rounded transition-all flex-shrink-0"
-                          style="color: var(--ds-text-subtle);"
-                          onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text-danger)'}
-                          onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
+                          class="remove-btn opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 p-0.5 rounded transition-all flex-shrink-0"
                           title={t('common.remove')}
                         >
                           <X class="w-3.5 h-3.5" />
@@ -946,7 +1196,7 @@
                       <span style="color: var(--ds-interactive);">✓</span>
                     {/if}
                   </span>
-                  <span class="flex-1">{status.name}</span>
+                  <span class="flex-1">{objectDisplayName(status, 'status')}</span>
                 </button>
               {/each}
             </div>
@@ -957,8 +1207,55 @@
               </p>
             {:else}
               <p class="text-sm mt-4" style="color: var(--ds-text-subtle);">
-                {backlogStatusIDs.length} {backlogStatusIDs.length === 1 ? 'status' : 'statuses'} selected for backlog
+                {t('settings.boardConfig.backlogSelected', { count: backlogStatusIDs.length })}
               </p>
+            {/if}
+          </div>
+        </div>
+
+        {:else if activeTab === 'views'}
+        <!-- Views Tab -->
+        <div class="mt-6 mb-6" data-testid="board-config-views">
+          <div class="rounded border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
+            <h3 class="text-lg font-semibold mb-2" style="color: var(--ds-text);">{t('settings.boardConfig.views')}</h3>
+            <p class="text-sm mb-4" style="color: var(--ds-text-subtle);">
+              {t('settings.boardConfig.viewsHelp')}
+            </p>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+              {#each scopeViewItems as view (view.id)}
+                <Checkbox
+                  checked={enabledViews.includes(view.id)}
+                  onchange={() => toggleView(view.id)}
+                  disabled={!canConfigure || (enabledViews.includes(view.id) && enabledViews.length <= 1)}
+                  dataTestid={`view-toggle-${view.id}`}
+                  label={t(view.labelKey)}
+                  size="small"
+                />
+              {/each}
+            </div>
+
+            {#if collectionId && viewsInherited && !viewsDirty}
+              <div class="mt-4 flex items-center justify-between gap-4">
+                <p class="text-sm" style="color: var(--ds-text-subtle);">
+                  {t('settings.boardConfig.viewsInheritedHint')}
+                </p>
+                <!-- Nothing to reset while inheriting. -->
+              </div>
+            {:else if collectionId && !viewsResetPending}
+              <div class="mt-4 flex items-center justify-between gap-4">
+                <p class="text-sm" style="color: var(--ds-text-subtle);">
+                  {t('settings.boardConfig.viewsOverrideHint')}
+                </p>
+                <Button
+                  variant="secondary"
+                  size="small"
+                  dataTestid="board-config-views-reset"
+                  onclick={resetViewsToInherited}
+                >
+                  {t('settings.boardConfig.resetViews')}
+                </Button>
+              </div>
             {/if}
           </div>
         </div>
@@ -974,17 +1271,31 @@
 
             <!-- Selected card fields -->
             {#if cardFields.length > 0}
-              <div class="space-y-1 mb-6">
+              <div class="space-y-1 mb-6" data-testid="board-card-fields-list">
                 {#each cardFields as field, index (field.field_identifier)}
-                  <div class="flex items-center gap-2 px-3 py-2 rounded border transition-all"
-                       style="background: var(--ds-background-input); border-color: var(--ds-border);">
+                  <div
+                       data-testid={`board-card-field-row-${field.field_identifier}`}
+                       data-field-identifier={field.field_identifier}
+                       data-card-field
+                       data-card-field-index={index}
+                       data-card-field-identifier={field.field_identifier}
+                       class="relative flex items-center gap-2 px-3 py-2 rounded border transition-all"
+                       style="background: var(--ds-background-input); border-color: var(--ds-border); user-select: none;">
+                    {#if cardFieldDragState.get(field.field_identifier)?.closestEdge}
+                      <DropIndicator edge={cardFieldDragState.get(field.field_identifier)?.closestEdge} gap={4} />
+                    {/if}
                     <!-- Drag handles for reorder -->
                     <button
-                      class="flex-shrink-0 cursor-pointer"
-                      style="color: var(--ds-text-subtlest);"
-                      disabled={index === 0}
-                      onclick={() => reorderCardFields(index, index - 1)}
-                      title="Move up"
+                      type="button"
+                      data-card-field-drag-handle
+                      data-testid="board-card-field-drag-handle"
+                      class="flex-shrink-0 cursor-grab active:cursor-grabbing p-0.5 rounded"
+                      style="color: var(--ds-text-subtlest); touch-action: none;"
+                      disabled={!canConfigure}
+                      onkeydown={(event) => handleCardFieldReorderKeydown(event, index)}
+                      aria-label={`${t('settings.boardConfig.dragToReorder')}: ${getCardFieldLabel(field)}`}
+                      aria-keyshortcuts="ArrowUp ArrowDown"
+                      title={t('settings.boardConfig.dragToReorder')}
                     >
                       <GripVertical class="w-4 h-4" />
                     </button>
@@ -992,10 +1303,7 @@
                     <span class="text-xs px-1.5 py-0.5 rounded" style="background: var(--ds-surface); color: var(--ds-text-subtle);">{field.field_type}</span>
                     <button
                       onclick={() => removeCardField(field.field_identifier)}
-                      class="p-0.5 rounded transition-colors flex-shrink-0"
-                      style="color: var(--ds-text-subtle);"
-                      onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text-danger)'}
-                      onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
+                      class="remove-btn p-0.5 rounded transition-colors flex-shrink-0"
                       title={t('common.remove')}
                     >
                       <X class="w-4 h-4" />
@@ -1011,42 +1319,91 @@
 
             <!-- Add field section -->
             <div>
-              <h4 class="text-sm font-semibold mb-2" style="color: var(--ds-text);">{t('settings.boardConfig.addField')}</h4>
+              <h4 class="text-base font-semibold mb-4" style="color: var(--ds-text);">{t('settings.boardConfig.addField')}</h4>
 
               <!-- System fields -->
               {#if availableSystemFields.length > 0}
-                <p class="text-xs mb-2" style="color: var(--ds-text-subtle);">{t('settings.boardConfig.systemFields')}</p>
-                <div class="flex flex-wrap gap-2 mb-4">
-                  {#each availableSystemFields as sf}
-                    <button
-                      onclick={() => addCardField(sf.identifier, 'system')}
-                      class="px-3 py-1.5 text-xs rounded-full border transition-colors"
-                      style="border-color: var(--ds-border); color: var(--ds-text); background: var(--ds-surface);"
-                      onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--ds-interactive)'; e.currentTarget.style.color = 'var(--ds-interactive)'; }}
-                      onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--ds-border)'; e.currentTarget.style.color = 'var(--ds-text)'; }}
-                    >
-                      <Plus class="w-3 h-3 inline mr-1" />{sf.label}
-                    </button>
-                  {/each}
-                </div>
+                <section class="mb-5" aria-labelledby="board-card-fields-system-heading">
+                  <h5
+                    id="board-card-fields-system-heading"
+                    class="text-sm font-medium mb-2"
+                    style="color: var(--ds-text-subtle);"
+                  >
+                    {t('settings.boardConfig.systemFields')}
+                  </h5>
+                  <div class="flex flex-wrap gap-2">
+                    {#each availableSystemFields as sf}
+                      <button
+                        onclick={() => addCardField(sf.identifier, 'system')}
+                        class="add-field-chip px-3 py-1.5 text-xs rounded-full border transition-colors"
+                      >
+                        <Plus class="w-3 h-3 inline mr-1" />{sf.label}
+                      </button>
+                    {/each}
+                  </div>
+                </section>
               {/if}
 
               <!-- Custom fields -->
-              {#if availableCustomFields.length > 0}
-                <p class="text-xs mb-2" style="color: var(--ds-text-subtle);">{t('settings.boardConfig.customFields')}</p>
-                <div class="flex flex-wrap gap-2">
-                  {#each availableCustomFields as cf}
-                    <button
-                      onclick={() => addCardField(`custom_field_${cf.id}`, 'custom')}
-                      class="px-3 py-1.5 text-xs rounded-full border transition-colors"
-                      style="border-color: var(--ds-border); color: var(--ds-text); background: var(--ds-surface);"
-                      onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--ds-interactive)'; e.currentTarget.style.color = 'var(--ds-interactive)'; }}
-                      onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--ds-border)'; e.currentTarget.style.color = 'var(--ds-text)'; }}
+              {#if availableCustomFields.length > 0 || isSystemAdmin || isNonSystemWorkspaceAdmin}
+                <section
+                  data-testid="board-card-fields-custom-section"
+                  aria-labelledby="board-card-fields-custom-heading"
+                  class={availableSystemFields.length > 0 ? 'pt-5 border-t' : ''}
+                  style={availableSystemFields.length > 0 ? 'border-color: var(--ds-border);' : undefined}
+                >
+                  <div class="flex flex-wrap items-center gap-3 mb-3">
+                    <h5
+                      id="board-card-fields-custom-heading"
+                      data-testid="board-card-fields-custom-heading"
+                      class="text-sm font-medium"
+                      style="color: var(--ds-text-subtle);"
                     >
-                      <Plus class="w-3 h-3 inline mr-1" />{cf.name}
-                    </button>
-                  {/each}
-                </div>
+                      {t('settings.boardConfig.customFields')}
+                    </h5>
+
+                    {#if isSystemAdmin}
+                      <button
+                        data-testid="board-custom-fields-action"
+                        type="button"
+                        onclick={() => goCustomFields(!hasCustomFields)}
+                        class="inline-flex items-center px-3 py-1.5 text-xs rounded-full border transition-colors"
+                        style="border-color: var(--ds-border); color: var(--ds-interactive); background: var(--ds-surface);"
+                      >
+                        {#if hasCustomFields}
+                          <Settings class="w-3 h-3 mr-1" />
+                        {:else}
+                          <Plus class="w-3 h-3 mr-1" />
+                        {/if}
+                        {hasCustomFields ? t('settings.boardConfig.manageCustomFields') : t('settings.boardConfig.createCustomField')}
+                      </button>
+                    {/if}
+                  </div>
+
+                  {#if isNonSystemWorkspaceAdmin}
+                    <p
+                      data-testid="board-custom-fields-admin-note"
+                      class="text-xs mb-3 p-2 rounded"
+                      style="color: var(--ds-text-subtle); background: var(--ds-surface); border: 1px solid var(--ds-border);"
+                    >
+                      {t('settings.boardConfig.customFieldsGlobalNote')}
+                    </p>
+                  {/if}
+
+                  {#if availableCustomFields.length > 0}
+                    <div class="flex flex-wrap gap-2">
+                      {#each availableCustomFields as cf}
+                        <button
+                          data-testid={`board-card-field-add-custom-${cf.id}`}
+                          onclick={() => addCardField(`custom_field_${cf.id}`, 'custom')}
+                          class="add-field-chip px-3 py-1.5 text-xs rounded-full border transition-colors"
+                        >
+                          <Plus class="w-3 h-3 inline mr-1" />{cf.name}
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+                </section>
               {/if}
             </div>
           </div>
@@ -1057,12 +1414,9 @@
         <div class="flex items-center justify-between border-t pt-6" style="border-color: var(--ds-border);">
           <button
             onclick={resetToDefault}
-            class="px-4 py-2 text-sm rounded transition-colors"
-            style="color: var(--ds-text-danger);"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-danger-subtle)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+            class="danger-ghost-btn px-4 py-2 text-sm rounded transition-colors"
             disabled={!canConfigure || (!boardConfig && columns.length === 0)}
-            title={!canConfigure ? t('workspace.accessDeniedDescription') : ''}
+            title={!canConfigure ? t('workspaceSettings.accessDeniedDescription') : ''}
           >
             {t('settings.boardConfig.resetToDefault')}
           </button>
@@ -1073,10 +1427,11 @@
             </Button>
             <Button
               variant="primary"
+              dataTestid="board-config-save"
               onclick={saveConfiguration}
               disabled={!canConfigure || saving}
               loading={saving}
-              title={!canConfigure ? t('workspace.accessDeniedDescription') : ''}
+              title={!canConfigure ? t('workspaceSettings.accessDeniedDescription') : ''}
             >
               {saving ? t('common.saving') : t('common.saveChanges')}
             </Button>
@@ -1093,3 +1448,43 @@
   </div>
 {/if}
 
+<style>
+  .available-status-row {
+    border-color: var(--ds-border);
+    background-color: var(--ds-background-input);
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .available-status-row:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+
+  /* Danger-texted button that tints its background on hover. */
+  .danger-ghost-btn {
+    color: var(--ds-text-danger);
+  }
+
+  .danger-ghost-btn:hover:not(:disabled) {
+    background-color: var(--ds-danger-subtle);
+  }
+
+  .remove-btn {
+    color: var(--ds-text-subtle);
+  }
+
+  .remove-btn:hover {
+    color: var(--ds-text-danger);
+  }
+
+  .add-field-chip {
+    border-color: var(--ds-border);
+    color: var(--ds-text);
+    background: var(--ds-surface);
+  }
+
+  .add-field-chip:hover {
+    border-color: var(--ds-interactive);
+    color: var(--ds-interactive);
+  }
+</style>

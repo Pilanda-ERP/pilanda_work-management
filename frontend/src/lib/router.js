@@ -31,9 +31,11 @@ const routes = {
   '/workspaces/:id/settings/members': 'workspace-settings-members',
   '/workspaces/:id/settings/configuration': 'workspace-settings-configuration',
   '/workspaces/:id/settings/source-control': 'workspace-settings-source-control',
-  '/workspaces/:id/settings/coding-agents': 'workspace-settings-coding-agents',
   '/workspaces/:id/settings/issue-sync': 'workspace-settings-issue-sync',
+  '/workspaces/:id/settings/action-credentials': 'workspace-settings-action-credentials',
   '/workspaces/:id/settings/templates': 'workspace-settings-templates',
+  '/workspaces/:id/settings/canned-responses': 'workspace-settings-canned-responses',
+  '/workspaces/:id/settings/service-levels': 'workspace-settings-service-levels',
   '/workspaces/:id/settings/danger': 'workspace-settings-danger',
   '/workspaces/:id/actions': 'workspace-actions',
   '/workspaces/:id/actions/:actionId': 'workspace-actions',
@@ -42,7 +44,10 @@ const routes = {
   // Stable key routes used by CLI/browser deep links.
   '/workspace/:workspaceKey/item/:itemNumber': 'item-detail',
   '/item/:itemKey': 'item-detail',
+  '/zammad/:correlationKey': 'zammad-resolve',
   // Routes without collection (show all workspace items)
+  '/workspaces/:id/queue': 'workspace-queue',
+  '/workspaces/:id/nav-config': 'workspace-nav-config',
   '/workspaces/:id/board': 'workspace-board',
   '/workspaces/:id/board/configure': 'workspace-board-config',
   '/workspaces/:id/backlog': 'workspace-backlog',
@@ -53,6 +58,9 @@ const routes = {
   '/workspaces/:id/iterations': 'workspace-iterations',
   '/workspaces/:id/milestones': 'workspace-milestones',
   '/workspaces/:id/analytics': 'workspace-analytics',
+  '/workspaces/:id/agents': 'workspace-agents',
+  '/workspaces/:id/agents/new': 'workspace-agent-create',
+  '/workspaces/:id/agents/:agentId': 'workspace-agent-profile',
   // Knowledge pages (workspace wiki)
   // archived must precede :pageId so the literal segment wins the
   // sequential-iteration match in updateRoute().
@@ -62,8 +70,10 @@ const routes = {
   // Chrome-free print/PDF view for a single page (opened in a new tab).
   '/workspaces/:id/pages/:pageId/print': 'page-print',
   // Routes with collection ID filtering
+  '/workspaces/:id/collections/:collectionId/queue': 'workspace-queue',
   '/workspaces/:id/collections/:collectionId/board': 'workspace-board',
   '/workspaces/:id/collections/:collectionId/board/configure': 'workspace-board-config',
+  '/workspaces/:id/collections/:collectionId/nav-config': 'workspace-nav-config',
   '/workspaces/:id/collections/:collectionId/backlog': 'workspace-backlog',
   '/workspaces/:id/collections/:collectionId/list': 'workspace-list',
   '/workspaces/:id/collections/:collectionId/tree': 'workspace-tree',
@@ -77,6 +87,7 @@ const routes = {
   // Global collection views (no workspace)
   '/collections/:id/board': 'collection-board',
   '/collections/:id/board/configure': 'collection-board-config',
+  '/collections/:id/nav-config': 'collection-nav-config',
   '/collections/:id/backlog': 'collection-backlog',
   '/collections/:id/list': 'collection-list',
   '/collections/:id/tree': 'collection-tree',
@@ -85,6 +96,8 @@ const routes = {
   '/collections/:id': 'collections-edit',
   '/notifications': 'notifications',
   '/search': 'search',
+  '/manage': 'delegated-admin',
+  '/manage/:tab': 'delegated-admin',
   '/channels': 'hub',
   '/channels/inbox': 'hub-inbox',
   '/admin/channels': 'admin',
@@ -100,6 +113,7 @@ const routes = {
   '/time/projects': 'time',
   '/time/timesheet': 'time',
   '/time/worklogs': 'time',
+  '/time/worklogs/print': 'time-report-print',
   // Workspace-scoped test management routes
   '/workspaces/:id/tests': 'test-cases',
   '/workspaces/:id/tests/cases': 'test-cases',
@@ -111,6 +125,7 @@ const routes = {
   '/workspaces/:id/tests/templates/:templateId': 'test-template-detail',
   '/workspaces/:id/tests/runs': 'test-runs',
   '/workspaces/:id/tests/runs/:runId': 'test-run-detail',
+  '/workspaces/:id/tests/runs/:runId/print': 'test-run-summary-print',
   '/workspaces/:id/tests/runs/:runId/execute': 'test-execution',
   '/workspaces/:id/tests/reports': 'test-reports',
   '/milestones': 'milestones',
@@ -140,24 +155,35 @@ const routes = {
   '/admin/:tab': 'admin',
   '/profile': 'profile',
   '/security': 'security',
+  '/login': 'homepage',
   '/workflows/:id/design': 'workflow-designer',
   '/board/:slug': 'public-board',
   '/portal/:slug': 'portal',
   '/portal/:slug/verify': 'portal',
   '/portal/:slug/profile': 'portal',
+  '/portal/:slug/kb': 'portal',
+  '/portal/:slug/kb/:pageId': 'portal',
+  '/portal/:slug/request/:requestTypeId': 'portal',
+  '/forms/:slug/:formId': 'public-form',
   '/forms/:slug': 'public-form',
   '/set-password/:token': 'set-password',
   '/about': 'about',
+  '/licenses': 'licenses',
   // Mobile PWA surface (phone-focused shell, see lib/mobile/). The literal
   // '/m/personal' etc. must precede '/m/items/:id' so they win the
   // sequential-iteration match in updateRoute().
   '/m': 'mobile-my-work',
   '/m/personal': 'mobile-personal',
+  '/m/pages': 'mobile-pages',
+  '/m/pages/:workspaceId/:pageId': 'mobile-page-detail',
   '/m/timer': 'mobile-timer',
   '/m/notifications': 'mobile-notifications',
   '/m/search': 'mobile-search',
   '/m/chat': 'mobile-chat',
+  '/m/new': 'mobile-create',
   '/m/items/:id': 'mobile-item-detail',
+  '/m/items/:id/edit': 'mobile-item-edit',
+  '/m/settings': 'mobile-settings',
   '/api-docs': 'api-docs',
   '/cli/authorize': 'cli-authorize',
   '/oauth/authorize': 'oauth-authorize',
@@ -196,15 +222,46 @@ function parseQuery(search) {
 export function navigate(path, { replace = false } = {}) {
   const logicalPath = toLogical(path);
   const externalPath = toExternal(logicalPath);
-  if (externalPath === window.location.pathname + window.location.search) {
+  const currentURL = window.location.pathname + window.location.search;
+  if (externalPath === currentURL) {
+    // The URL already matches, but the route store can drift (for example after
+    // a direct history write). Republish so the view catches up, without
+    // adding a duplicate history entry.
+    if (currentLocationKey !== currentURL) updateRoute();
     return;
   }
-  if (replace) {
-    window.history.replaceState({}, '', externalPath);
-  } else {
-    window.history.pushState({}, '', externalPath);
+  withMobileViewTransition('push', () => {
+    if (replace) {
+      window.history.replaceState({}, '', externalPath);
+    } else {
+      window.history.pushState({}, '', externalPath);
+    }
+    updateRoute();
+  });
+}
+
+// View-transition wrapper for the phone surface: animates push/pop between /m
+// routes when the browser supports the View Transitions API (Chrome 111+,
+// Safari 18+). Progressive enhancement everywhere else — the update just runs
+// directly, exactly as before. Direction is recorded on <html data-nav> so the
+// CSS can slide the old view out and the new one in from the correct side.
+function withMobileViewTransition(direction, update) {
+  const root = document.documentElement;
+  const canAnimate =
+    typeof document.startViewTransition === 'function' &&
+    root.classList.contains('mobile-shell-active') &&
+    !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  if (!canAnimate) {
+    update();
+    return;
   }
-  updateRoute();
+  root.dataset.nav = direction;
+  const before = window.location.pathname + window.location.search + window.location.hash;
+  const transition = document.startViewTransition(() => update());
+  // Sheet dismissals pop a sentinel entry without changing the route — nothing
+  // visually changed, so skip the crossfade to keep the sheet's own exit snappy.
+  const after = window.location.pathname + window.location.search + window.location.hash;
+  if (before === after) transition.skipTransition();
 }
 
 // Update query params without full navigation. Uses replaceState by default.
@@ -231,8 +288,16 @@ export function updateQueryParams(updates, { push = false } = {}) {
 
 // Update current route from URL
 function updateRoute() {
-  const path = toLogical(window.location.pathname);
+  let path = toLogical(window.location.pathname);
   const search = window.location.search;
+
+  // Agent Studio permanently owns the former Coding Agents destination.
+  // Preserve old bookmarks while keeping the legacy editor unreachable.
+  const legacyAgentSettings = path.match(/^\/workspaces\/([^/]+)\/settings\/coding-agents$/);
+  if (legacyAgentSettings) {
+    path = `/workspaces/${legacyAgentSettings[1]}/agents`;
+    window.history.replaceState({}, '', toExternal(path + search));
+  }
 
   // Find matching route
   let matchedRoute = routes[path];
@@ -265,6 +330,8 @@ function updateRoute() {
       query: parseQuery(search),
     })
   );
+  currentLocationKey = window.location.pathname + window.location.search;
+  currentHistoryState = window.history.state;
 }
 
 // Guards against double-binding of the global popstate and click listeners
@@ -272,6 +339,26 @@ function updateRoute() {
 // Without this, every re-init stacked another listener that would never be
 // removed and would re-trigger updateRoute / navigate for every event.
 let routerInitialized = false;
+
+// Track the current history entry (URL key + state) so a popstate handler can
+// tell same-document pops (sheet sentinels, hash changes) from real route
+// changes, and can veto one. Updated at the end of every updateRoute().
+let currentLocationKey = '';
+let currentHistoryState = null;
+
+// Navigation interceptor for editor pages: when set, a popstate that would
+// change the route consults it first. Returning true vetoes the pop — the
+// router restores the current entry (e.g. to show an unsaved-changes confirm
+// on the Android back gesture); returning false lets the navigation proceed.
+let navigationInterceptor = null;
+
+/**
+ * Register/unregister the popstate veto callback. Pass null to clear.
+ * @param {(() => boolean) | null} fn
+ */
+export function setNavigationInterceptor(fn) {
+  navigationInterceptor = fn;
+}
 
 // Initialize router
 export function initRouter() {
@@ -282,7 +369,18 @@ export function initRouter() {
   routerInitialized = true;
 
   // Handle browser back/forward buttons
-  window.addEventListener('popstate', updateRoute);
+  window.addEventListener('popstate', (_e) => {
+    const beforeUrl = currentLocationKey;
+    const beforeState = currentHistoryState;
+    const afterUrl = window.location.pathname + window.location.search;
+    if (beforeUrl !== afterUrl && navigationInterceptor?.()) {
+      // Vetoed: push the entry we just left back on top so the URL and stack
+      // match the vetoed navigation (the page shows its confirm instead).
+      window.history.pushState(beforeState ?? {}, '', beforeUrl);
+      return;
+    }
+    withMobileViewTransition('pop', updateRoute);
+  });
 
   // Handle link clicks
   document.addEventListener('click', (e) => {
@@ -294,14 +392,23 @@ export function initRouter() {
     // Use closest() to find the anchor tag even when clicking nested elements
     const anchor = /** @type {HTMLElement} */ (e.target).closest('a');
     if (!anchor?.href) return;
-    if (!anchor.href.startsWith(window.location.origin)) return;
     // Respect explicit opt-outs: new-tab targets, downloads, non-http protocols.
     const target = anchor.getAttribute('target');
     if (target && target !== '_self') return;
     if (anchor.hasAttribute('download')) return;
-    e.preventDefault();
     const url = new URL(anchor.href);
-    navigate(toLogical(url.pathname) + url.search);
+    if (url.origin !== window.location.origin) return;
+    // Native fragment navigation updates the hash and scrolls to the target.
+    // pushState cannot reproduce that scroll behavior for same-document links.
+    if (
+      url.hash &&
+      url.pathname === window.location.pathname &&
+      url.search === window.location.search
+    ) {
+      return;
+    }
+    e.preventDefault();
+    navigate(toLogical(url.pathname) + url.search + url.hash);
   });
 }
 

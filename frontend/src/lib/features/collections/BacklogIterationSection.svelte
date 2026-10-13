@@ -6,6 +6,7 @@
   import WorkItemRow from '../items/WorkItemRow.svelte';
   import DropIndicator from '../../layout/DropIndicator.svelte';
   import LazyRender from '../../components/LazyRender.svelte';
+  import BacklogItemActions from './BacklogItemActions.svelte';
 
   let {
     iteration = null,
@@ -20,11 +21,20 @@
     backlogRowGap = 2,
     isGlobalAdded = false,
     sectionHighlight = false,
+    assignableIterations = [],
+    pendingActionItemIds = new Set(),
     onToggleCollapse,
     onOpenItem,
+    onMoveItemToBoundary = null,
+    onAssignItemToIteration = null,
     onStartIteration = null,
     onCompleteIteration = null,
     onRemoveGlobal = null,
+    storyPointsConfiguredForItem = null,
+    storyPointsPendingItemIds = new Set(),
+    onUpdateStoryPoints = null,
+    itemDndAction = () => {},
+    sectionDndAction = () => {},
   } = $props();
 
   const statusColors = {
@@ -60,11 +70,13 @@
 
 <div
   class="mb-4"
+  data-testid={`backlog-iteration-section-${sectionId}`}
   data-iteration-section
   data-iteration-id={sectionId}
 >
   <!-- Section Header -->
   <div
+    use:sectionDndAction={sectionId}
     role="button"
     tabindex="0"
     class={headerClass}
@@ -150,6 +162,7 @@
     <div class="mt-1">
       {#if items.length === 0}
         <div
+          use:sectionDndAction={sectionId}
           class={dropZoneClass}
           style="color: var(--ctx-text-subtle, var(--ds-text-subtle));"
           data-section-drop-zone
@@ -163,7 +176,9 @@
         <div class="flex flex-col" style={`row-gap: ${backlogRowGap}px;`}>
           {#each items as item (item.id)}
             <div
+              use:itemDndAction={item.id}
               class="relative"
+              data-testid="backlog-item"
               data-item-card
               data-item-id={item.id}
               data-section-id={sectionId}
@@ -182,11 +197,23 @@
                     {statusCategories}
                     onclick={(e) => onOpenItem?.(item.id, e)}
                     showStatus={true}
+                    showStoryPoints={storyPointsConfiguredForItem?.(item) ?? false}
+                    storyPointsSaving={storyPointsPendingItemIds.has(item.id)}
+                    onStoryPointsChange={(value) => onUpdateStoryPoints?.(item, value)}
                   >
                     {#snippet leading()}
                       <div class="cursor-grab active:cursor-grabbing" style="{styles.dragHandleStyle}">
                         <GripVertical class="w-4 h-4" />
                       </div>
+                    {/snippet}
+                    {#snippet trailing()}
+                      <BacklogItemActions
+                        {item}
+                        iterations={assignableIterations}
+                        disabled={pendingActionItemIds.has(item.id)}
+                        onMoveToBoundary={onMoveItemToBoundary}
+                        onAssignIteration={onAssignItemToIteration}
+                      />
                     {/snippet}
                   </WorkItemRow>
                 {/snippet}

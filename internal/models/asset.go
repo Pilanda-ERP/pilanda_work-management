@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // AssetManagementSet represents a system-wide asset management container
 type AssetManagementSet struct {
@@ -17,6 +20,19 @@ type AssetManagementSet struct {
 	AssetCount     int    `json:"asset_count,omitempty"`
 	// User's permission on this set (populated per-request)
 	UserPermission string `json:"user_permission,omitempty"` // view, edit, admin, or empty
+	// PortalAccess is populated when the set is exposed to portals.
+	PortalAccess *AssetSetPortalAccess `json:"portal_access,omitempty"`
+}
+
+// AssetSetPortalAccess marks an asset set as available on portals. The row's
+// presence enables the set; a portal visitor still needs a portal that exposes
+// the set through an active, visible asset report before reading its assets.
+// Internal asset roles are unaffected by this grant.
+type AssetSetPortalAccess struct {
+	SetID         int       `json:"set_id"`
+	GrantedBy     *int      `json:"granted_by,omitempty"`
+	GrantedAt     time.Time `json:"granted_at"`
+	GrantedByName string    `json:"granted_by_name,omitempty"`
 }
 
 // AssetManagementSetPermission represents user-level permission for an asset set
@@ -115,19 +131,19 @@ type AssetStatus struct {
 
 // Asset represents an individual asset instance
 type Asset struct {
-	ID                int                    `json:"id"`
-	SetID             int                    `json:"set_id"`
-	AssetTypeID       int                    `json:"asset_type_id"`
-	CategoryID        *int                   `json:"category_id,omitempty"`
-	StatusID          *int                   `json:"status_id,omitempty"`
-	Title             string                 `json:"title"`
-	Description       string                 `json:"description"`
-	AssetTag          string                 `json:"asset_tag,omitempty"`
-	CustomFieldValues map[string]interface{} `json:"custom_field_values,omitempty"`
-	FracIndex         *string                `json:"frac_index,omitempty"`
-	CreatedBy         *int                   `json:"created_by,omitempty"`
-	CreatedAt         time.Time              `json:"created_at"`
-	UpdatedAt         time.Time              `json:"updated_at"`
+	ID                int            `json:"id"`
+	SetID             int            `json:"set_id"`
+	AssetTypeID       int            `json:"asset_type_id"`
+	CategoryID        *int           `json:"category_id,omitempty"`
+	StatusID          *int           `json:"status_id,omitempty"`
+	Title             string         `json:"title"`
+	Description       string         `json:"description"`
+	AssetTag          string         `json:"asset_tag,omitempty"`
+	CustomFieldValues map[string]any `json:"custom_field_values,omitempty"`
+	FracIndex         *string        `json:"frac_index,omitempty"`
+	CreatedBy         *int           `json:"created_by,omitempty"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
 	// Joined fields
 	SetName        string `json:"set_name,omitempty"`
 	AssetTypeName  string `json:"asset_type_name,omitempty"`
@@ -143,6 +159,16 @@ type Asset struct {
 	LinkedItemCount int `json:"linked_item_count,omitempty"`
 	// Non-fatal warnings surfaced to the client (e.g. corrupt custom_field_values JSON)
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// AssetSummary is the compact, display-only shape returned by the batch
+// hydration endpoint. It deliberately omits descriptions, custom fields, and
+// other data collection cells do not need.
+type AssetSummary struct {
+	ID       int    `json:"id"`
+	SetID    int    `json:"set_id"`
+	Title    string `json:"title"`
+	AssetTag string `json:"asset_tag,omitempty"`
 }
 
 // UserAssetSetPreference stores user's primary asset set preference
@@ -275,11 +301,19 @@ type AssetActionNode struct {
 
 func (n AssetActionNode) GetID() int { return n.ID }
 
+// GetNodeType returns the node type for the shared action-flow runner.
+func (n AssetActionNode) GetNodeType() string { return string(n.NodeType) }
+
 // FlowNodeID returns the node's ID for generic action-flow helpers.
 func (n AssetActionNode) FlowNodeID() int { return n.ID }
 
 // SetFlowActionID sets the node's action ID for generic action-flow helpers.
 func (n *AssetActionNode) SetFlowActionID(id int) { n.ActionID = id }
+
+// FlowNodeData returns the node fields for storage-level flow conversion.
+func (n AssetActionNode) FlowNodeData() (actionID int, nodeType, config string, x, y float64) {
+	return n.ActionID, string(n.NodeType), n.NodeConfig, n.PositionX, n.PositionY
+}
 
 // AssetActionEdge represents a connection between nodes in an asset action flow
 type AssetActionEdge struct {
@@ -312,17 +346,26 @@ func (e *AssetActionEdge) SetFlowSourceNodeID(id int) { e.SourceNodeID = id }
 // SetFlowTargetNodeID sets the edge's target node ID for generic action-flow helpers.
 func (e *AssetActionEdge) SetFlowTargetNodeID(id int) { e.TargetNodeID = id }
 
+// FlowEdgeID returns the edge's ID for storage-level flow conversion.
+func (e AssetActionEdge) FlowEdgeID() int { return e.ID }
+
+// FlowEdgeData returns the edge fields for storage-level flow conversion.
+func (e AssetActionEdge) FlowEdgeData() (actionID int, edgeType, sourceHandle, targetHandle string) {
+	return e.ActionID, e.EdgeType, e.SourceHandle, e.TargetHandle
+}
+
 // AssetActionExecutionLog represents the audit trail for asset action executions
 type AssetActionExecutionLog struct {
-	ID             int                   `json:"id"`
-	ActionID       int                   `json:"action_id"`
-	AssetID        *int                  `json:"asset_id,omitempty"`
-	TriggerEvent   string                `json:"trigger_event"`
-	Status         ActionExecutionStatus `json:"status"`
-	StartedAt      time.Time             `json:"started_at"`
-	CompletedAt    *time.Time            `json:"completed_at,omitempty"`
-	ErrorMessage   string                `json:"error_message,omitempty"`
-	ExecutionTrace string                `json:"execution_trace,omitempty"`
+	ID              int                   `json:"id"`
+	ActionID        int                   `json:"action_id"`
+	AssetID         *int                  `json:"asset_id,omitempty"`
+	TriggerEvent    string                `json:"trigger_event"`
+	Status          ActionExecutionStatus `json:"status"`
+	StartedAt       time.Time             `json:"started_at"`
+	CompletedAt     *time.Time            `json:"completed_at,omitempty"`
+	ErrorMessage    string                `json:"error_message,omitempty"`
+	ExecutionTrace  string                `json:"execution_trace,omitempty"`
+	DurableEventKey string                `json:"durable_event_key,omitempty"`
 	// Joined fields
 	ActionName string `json:"action_name,omitempty"`
 	AssetTitle string `json:"asset_title,omitempty"`
@@ -334,13 +377,14 @@ type AssetActionEvent struct {
 	SetID       int                    `json:"set_id"`
 	AssetID     int                    `json:"asset_id"`
 	ActorUserID int                    `json:"actor_user_id"`
-	OldValues   map[string]interface{} `json:"old_values,omitempty"`
-	NewValues   map[string]interface{} `json:"new_values,omitempty"`
+	OldValues   map[string]any         `json:"old_values,omitempty"`
+	NewValues   map[string]any         `json:"new_values,omitempty"`
 	// Loop prevention
 	TriggeredByAction bool   `json:"triggered_by_action,omitempty"`
 	ExecutionChainID  string `json:"execution_chain_id,omitempty"`
 	CascadeDepth      int    `json:"cascade_depth,omitempty"`
 	SourceApplication string `json:"source_application,omitempty"`
+	CausationEventKey string `json:"causation_event_key,omitempty"`
 }
 
 // AssetTriggerConfig represents trigger-specific configuration for asset actions
@@ -377,9 +421,10 @@ type UpdateAssetActionRequest struct {
 
 // AssetActionExecutionContext holds context during asset action execution
 type AssetActionExecutionContext struct {
-	Action      *AssetAction           `json:"action"`
-	Event       *AssetActionEvent      `json:"event"`
-	Variables   map[string]interface{} `json:"variables,omitempty"`
-	StepResults []StepResult           `json:"step_results,omitempty"`
-	ChainID     string                 `json:"-"`
+	Context     context.Context   `json:"-"`
+	Action      *AssetAction      `json:"action"`
+	Event       *AssetActionEvent `json:"event"`
+	Variables   map[string]any    `json:"variables,omitempty"`
+	StepResults []StepResult      `json:"step_results,omitempty"`
+	ChainID     string            `json:"-"`
 }

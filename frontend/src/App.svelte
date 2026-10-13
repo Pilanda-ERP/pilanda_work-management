@@ -6,59 +6,178 @@
   import { api } from './lib/api.js';
   import { APP_NAME } from './lib/constants.js';
   import { themeStore } from './lib/stores/theme.svelte.js';
-  import { i18n, SUPPORTED_LOCALES } from './lib/stores/i18n.svelte.js';
-  import LoginDialog from './lib/dialogs/LoginDialog.svelte';
-  import WelcomeAssistant from './lib/pages/WelcomeAssistant.svelte';
-  import Portal from './lib/layout/Portal.svelte';
-  import PublicFormPage from './lib/features/forms/PublicFormPage.svelte';
-  import SetPassword from './lib/pages/SetPassword.svelte';
-  import MainApp from './lib/pages/MainApp.svelte';
-  import MobileShell from './lib/mobile/MobileShell.svelte';
-  import PublicBoard from './lib/pages/PublicBoard.svelte';
-  import PagePrintView from './lib/features/pages/PagePrintView.svelte';
+  import { i18n, SUPPORTED_LOCALES, t } from './lib/stores/i18n.svelte.js';
+  import { safeLoginReturnPath } from './lib/utils/loginReturnPath.js';
+  import { consumeOAuthReturnURL } from './lib/utils/oauthReturn.js';
+  import { getStartupCopy } from './lib/utils/startupCopy.js';
+  import { toMobileUrl } from './lib/mobile/mobileUrls.js';
+  import {
+    loadAuthenticatedShellUI,
+    resetAuthenticatedShellUILoad,
+  } from './lib/services/authenticatedShellUI.js';
+  import BrandedLoader from './lib/components/BrandedLoader.svelte';
+  import Button from './lib/components/Button.svelte';
+  import LazyRootDialog from './lib/components/LazyRootDialog.svelte';
+  import LazyRootView from './lib/components/LazyRootView.svelte';
+
+  // Root surfaces are intentionally loaded only after startup has resolved the
+  // route/auth boundary. Keep these as direct import() calls so Vite can split
+  // public, login/setup, mobile, print, and desktop code into separate chunks.
+  const ROOT_VIEW_LOADERS = {
+    login: () => import('./lib/dialogs/LoginDialog.svelte'),
+    welcome: () => import('./lib/pages/WelcomeAssistant.svelte'),
+    portal: () => import('./lib/layout/Portal.svelte'),
+    publicForm: () => import('./lib/features/forms/PublicFormPage.svelte'),
+    setPassword: () => import('./lib/pages/SetPassword.svelte'),
+    desktop: () => import('./lib/pages/MainApp.svelte'),
+    mobile: () => import('./lib/mobile/MobileShell.svelte'),
+    publicBoard: () => import('./lib/pages/PublicBoard.svelte'),
+    pagePrint: () => import('./lib/features/pages/PagePrintView.svelte'),
+    timeReportPrint: () => import('./lib/features/time/TimeReportPrintView.svelte'),
+    testRunSummaryPrint: () => import('./lib/features/testing/TestRunSummaryPrintView.svelte'),
+  };
 
   let showLoginDialog = $state(false);
   let setupCompleted = $state(false);
   let setupLoading = $state(true);
   let appInitialized = $state(false);
   let showWelcomeAssistant = $state(false);
+  let startupError = $state('');
+  let startupSlow = $state(false);
+  let i18nReady = $state(false);
+  let authenticatedShellUIReady = $state(false);
+  let authenticatedShellUILoading = $state(false);
+  let authenticatedShellUIError = $state(false);
+  let authenticatedShellUIAudience = $state(null);
+  let authenticatedShellUILoadGeneration = 0;
+  let startupAttempt = 0;
+  let themeAudience = null;
+  let themeLoadGeneration = 0;
 
-  onMount(async () => {
+  const BOOTSTRAP_TIMEOUT_MS = 10_000;
+  const SLOW_START_MS = 4_000;
+
+  async function withBootstrapDeadline(promise) {
+    let timeout;
+    const deadline = new Promise((_, reject) => {
+      timeout = window.setTimeout(() => {
+        reject(
+          Object.assign(new Error('The server took too long to respond.'), {
+            code: 'REQUEST_TIMEOUT',
+          })
+        );
+      }, BOOTSTRAP_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([promise, deadline]);
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
+  onMount(() => {
     initRouter();
-
-    // Initialize i18n (loads user's preferred locale)
-    await i18n.init();
-
-    // Check setup status first
-    await checkSetupStatus();
-    setupLoading = false;
-
-    // Only initialize auth if setup is completed
-    if (setupCompleted) {
-      await authStore.init();
-    }
-
-    // Load theme early (works with or without authentication)
-    await loadAndApplyTheme();
-
-    // Only load data if setup is not completed OR user is authenticated
-    if (!setupCompleted) {
-      // Load basic data for setup flow
-      moduleSettings.load();
-      appInitialized = true;
-    } else if ($authStore.isAuthenticated) {
-      // For authenticated users, let MainApp handle the data loading
-      appInitialized = true;
-      // Phone viewport landing on the desktop root → mobile surface. Runs here
-      // (not only on the login-dialog callback) so it also fires for SSO
-      // returns, full-page-reload logins, and existing sessions — the cases
-      // that bypass the in-SPA onsuccess handler.
-      maybeRedirectToMobile();
-    } else {
-      // Setup completed but not authenticated - app is ready for login
-      appInitialized = true;
-    }
+    themeStore.init();
+    void initializeApp();
   });
+
+  async function initializeApp() {
+    const attempt = ++startupAttempt;
+    setupLoading = true;
+    appInitialized = false;
+    startupError = '';
+    startupSlow = false;
+    showLoginDialog = false;
+
+    const slowTimer = window.setTimeout(() => {
+      if (attempt === startupAttempt) startupSlow = true;
+    }, SLOW_START_MS);
+
+    try {
+      // Initialize i18n (loads user's preferred locale)
+      await withBootstrapDeadline(i18n.init());
+      i18nReady = true;
+
+      // Check setup status first
+      await checkSetupStatus();
+      if (attempt !== startupAttempt) return;
+
+      // Only initialize auth if setup is completed. A transport error is not a
+      // logout: authStore returns it so the startup UI can offer a retry.
+      if (setupCompleted) {
+        const authResult = await authStore.init({ timeout: BOOTSTRAP_TIMEOUT_MS });
+        if (authResult?.status === 'error') throw authResult.error;
+      }
+      if (attempt !== startupAttempt) return;
+
+      setupLoading = false;
+
+      // The shell is ready once setup and session state are known. MainApp and
+      // MobileShell own their subsequent data loading.
+      appInitialized = true;
+      if (!setupCompleted) {
+        moduleSettings.load();
+      } else if ($authStore.isAuthenticated) {
+        // An OAuth callback just landed here: send the user back to the
+        // page that started the flow (replaces the callback redirect entry).
+        const oauthReturn = consumeOAuthReturnURL(window.location.search);
+        if (oauthReturn) {
+          navigate(oauthReturn, { replace: true });
+        }
+        // Phone viewport landing on the desktop root → mobile surface. Runs here
+        // for SSO returns, reload logins, and existing sessions too.
+        maybeRedirectToMobile();
+      }
+    } catch (error) {
+      if (attempt !== startupAttempt) return;
+      console.error('Failed to initialize Windshift:', error);
+      setupLoading = false;
+      appInitialized = false;
+      startupError =
+        error?.code === 'REQUEST_TIMEOUT' ? 'errors.TIMEOUT' : 'errors.NETWORK_ERROR';
+    } finally {
+      window.clearTimeout(slowTimer);
+    }
+  }
+
+  async function prepareAuthenticatedShellUI(userId, { force = false } = {}) {
+    const audience = `user:${userId ?? 'authenticated'}`;
+    if (
+      !force &&
+      authenticatedShellUIAudience === audience &&
+      (authenticatedShellUIReady || authenticatedShellUILoading || authenticatedShellUIError)
+    ) {
+      return;
+    }
+
+    const generation = ++authenticatedShellUILoadGeneration;
+    authenticatedShellUIAudience = audience;
+    authenticatedShellUIReady = false;
+    authenticatedShellUILoading = true;
+    authenticatedShellUIError = false;
+    // Bound the shell deadline: a stalled request must not leave the desktop
+    // shell on an infinite spinner.
+    const hydrated = await loadAuthenticatedShellUI(userId, {
+      force,
+      timeout: BOOTSTRAP_TIMEOUT_MS,
+    });
+
+    if (generation !== authenticatedShellUILoadGeneration) return;
+    if (!$authStore.isAuthenticated || authStore.currentUser?.id !== userId) return;
+
+    authenticatedShellUILoading = false;
+    if (hydrated) {
+      authenticatedShellUIReady = true;
+    } else {
+      // Keep the desktop shell unmounted and offer an in-place retry instead of
+      // silently mounting degraded navigation.
+      authenticatedShellUIError = true;
+    }
+  }
+
+  function retryAuthenticatedShellUI() {
+    void prepareAuthenticatedShellUI(authStore.currentUser?.id, { force: true });
+  }
 
   // Show login dialog when setup is completed but user is not authenticated and app is initialized
   // But NOT for portal routes (they are public)
@@ -84,7 +203,36 @@
     if ($authStore.isAuthenticated && setupCompleted) {
       showLoginDialog = false;
       appInitialized = true;
+      void prepareAuthenticatedShellUI(authStore.currentUser?.id);
+    } else if (
+      authenticatedShellUIAudience !== null ||
+      authenticatedShellUIReady ||
+      authenticatedShellUILoading ||
+      authenticatedShellUIError
+    ) {
+      authenticatedShellUILoadGeneration += 1;
+      authenticatedShellUIAudience = null;
+      authenticatedShellUIReady = false;
+      authenticatedShellUILoading = false;
+      authenticatedShellUIError = false;
+      resetAuthenticatedShellUILoad();
     }
+  });
+
+  // Theme loading follows the authenticated audience rather than only the
+  // initial bootstrap. This covers interactive login/logout without delaying
+  // shell rendering or requiring a page reload to pick up the active theme.
+  $effect(() => {
+    if (!appInitialized) return;
+
+    const nextAudience = $authStore.isAuthenticated
+      ? `user:${$authStore.currentUser?.id ?? 'authenticated'}`
+      : 'public';
+    if (nextAudience === themeAudience) return;
+
+    themeAudience = nextAudience;
+    const generation = ++themeLoadGeneration;
+    void loadAndApplyTheme($authStore.isAuthenticated, generation);
   });
 
   // Sync i18n locale with user's saved language preference
@@ -136,6 +284,42 @@
     }
   }
 
+  // WI-1322: a phone following a deep link (AI-chat link, push notification,
+  // shared URL) must not land on the desktop shell. Whenever the route
+  // resolves to a desktop view that has a mobile equivalent, and the viewport
+  // is a phone and the user hasn't opted into desktop, redirect to /m. URLs
+  // without a mobile equivalent (settings, boards, …) stay on the desktop
+  // surface — those only exist there today. Public/auth/print surfaces are
+  // never redirected.
+  const MOBILE_REDIRECT_SKIP_VIEWS = new Set([
+    '404',
+    'portal',
+    'public-form',
+    'public-board',
+    'set-password',
+    'page-print',
+    'time-report-print',
+    'test-run-summary-print',
+    'oauth-authorize',
+    'cli-authorize',
+    'zammad-resolve',
+  ]);
+  $effect(() => {
+    const route = $currentRoute;
+    if (!route.view || isMobileRoute(route.view)) return;
+    if (MOBILE_REDIRECT_SKIP_VIEWS.has(route.view)) return;
+    try {
+      if (localStorage.getItem('windshift-prefer-desktop') === 'true') return;
+    } catch {
+      // localStorage unavailable — fall through to the viewport check.
+    }
+    if (!window.matchMedia?.('(max-width: 768px)').matches) return;
+    const target = toMobileUrl(route.path + window.location.search);
+    if (target !== route.path + window.location.search) {
+      navigate(target, { replace: true });
+    }
+  });
+
   async function checkSetupStatus() {
     // Always ask the backend. setup_completed is cheap to fetch and the
     // /setup/status rate-limit burst comfortably covers normal reloads. We
@@ -143,40 +327,44 @@
     // flag survives backend/DB swaps under the same origin (e.g. dev worktrees
     // behind the vite proxy), making a fresh, unconfigured instance look
     // already set up and silently skipping the setup wizard.
-    try {
-      const status = await api.setup.getStatus();
-      setupCompleted = status.setup_completed;
-      if (!status.setup_completed) {
-        showWelcomeAssistant = true;
-      }
-    } catch (error) {
-      console.error('Failed to check setup status:', error);
-      // Assume setup is completed if we can't check
-      setupCompleted = true;
+    const status = await api.setup.getStatus({ timeout: BOOTSTRAP_TIMEOUT_MS });
+    setupCompleted = status.setup_completed;
+    if (!status.setup_completed) {
+      showWelcomeAssistant = true;
     }
   }
 
-  async function loadAndApplyTheme() {
-    // Initialize theme store (sets up system preference detection)
-    themeStore.init();
+  async function loadAndApplyTheme(isAuthenticated, generation) {
+    const defaultTheme = {
+      nav_background_color_light: '#ffffff',
+      nav_text_color_light: '#374151',
+      nav_background_color_dark: '#1f2937',
+      nav_text_color_dark: '#f3f4f6'
+    };
+
+    // Public pages have no authenticated theme to load. Applying defaults
+    // locally avoids a guaranteed 401 request on portals, public forms, and
+    // the login shell.
+    if (!isAuthenticated) {
+      if (generation !== themeLoadGeneration) return;
+      themeStore.setActiveTheme(defaultTheme);
+      applyNavColors(defaultTheme);
+      return;
+    }
 
     try {
-      const activeTheme = await api.themes.getActive();
+      const activeTheme = await api.themes.getActive({ timeout: BOOTSTRAP_TIMEOUT_MS });
+      if (generation !== themeLoadGeneration) return;
       // Store the active theme in the theme store
       themeStore.setActiveTheme(activeTheme);
       applyNavColors(activeTheme);
     } catch (error) {
+      if (generation !== themeLoadGeneration) return;
       // 401 is expected when not logged in - don't spam console
       if (error.status !== 401) {
         console.error('Failed to load active theme:', error);
       }
       // Apply default theme if loading fails
-      const defaultTheme = {
-        nav_background_color_light: '#ffffff',
-        nav_text_color_light: '#374151',
-        nav_background_color_dark: '#1f2937',
-        nav_text_color_dark: '#f3f4f6'
-      };
       themeStore.setActiveTheme(defaultTheme);
       applyNavColors(defaultTheme);
     }
@@ -199,83 +387,178 @@
   }
 </script>
 
+<a class="skip-link" href="#app-main">
+  {getStartupCopy('common.skipToMainContent', i18nReady, t)}
+</a>
 <div
+  id="app-main"
+  tabindex="-1"
   class="flex flex-col {isMobileRoute($currentRoute.view) ? 'h-dvh overflow-hidden' : 'min-h-screen'}"
   style="background-color: var(--ds-surface);"
 >
-  <!-- Show loading screen during initial setup check -->
-  {#if setupLoading}
-    <div class="min-h-screen flex items-center justify-center w-full">
-      <div class="text-center">
-        <div class="w-16 h-16 mx-auto mb-4">
-          <img src="windshift-3.svg" alt={APP_NAME} class="w-16 h-16 animate-pulse" />
-        </div>
-        <p class="text-gray-600">Loading...</p>
+  {#if startupError}
+    <div class="min-h-screen flex items-center justify-center w-full px-6" data-testid="startup-error">
+      <div class="text-center max-w-sm">
+        <img src="windshift-3.svg" alt={APP_NAME} width="64" height="64" class="w-16 h-16 mx-auto mb-4 opacity-75" />
+        <h1 class="text-xl font-semibold mb-2">
+          {getStartupCopy('errors.failedToLoad', i18nReady, t)} Windshift
+        </h1>
+        <p class="text-ds-text-subtle mb-5">{getStartupCopy(startupError, i18nReady, t)}</p>
+        <Button variant="primary" size="large" class="min-h-11" onclick={() => initializeApp()} dataTestid="startup-retry">
+          {getStartupCopy('common.retry', i18nReady, t)}
+        </Button>
       </div>
     </div>
+  <!-- Show loading screen during initial setup/session checks -->
+  {:else if setupLoading}
+    <BrandedLoader
+      label={getStartupCopy('common.loading', i18nReady, t)}
+      detail={startupSlow ? getStartupCopy('common.loadingSlow', i18nReady, t) : ''}
+    />
   <!-- Public board route - no authentication required -->
   {:else if $currentRoute.view === 'public-board'}
-    <PublicBoard slug={$currentRoute.params.slug} />
+    <LazyRootView
+      loader={ROOT_VIEW_LOADERS.publicBoard}
+      label="public board"
+      componentProps={{ slug: $currentRoute.params.slug }}
+    />
   <!-- Portal route - public, no authentication required -->
   {:else if $currentRoute.view === 'portal'}
-    <Portal />
+    <LazyRootView loader={ROOT_VIEW_LOADERS.portal} label="portal" />
   <!-- Public form route - no authentication required -->
   {:else if $currentRoute.view === 'public-form'}
-    <PublicFormPage />
+    <LazyRootView loader={ROOT_VIEW_LOADERS.publicForm} label="form" />
   <!-- Set password route - public with token -->
   {:else if $currentRoute.view === 'set-password'}
-    <SetPassword />
+    <LazyRootView loader={ROOT_VIEW_LOADERS.setPassword} label="password setup" />
   <!-- Empty background during setup - WelcomeAssistant modal will show on top -->
   {:else if !setupCompleted && appInitialized}
     <div class="flex-1"></div>
   <!-- Chrome-free print/PDF view for a single page (authenticated, no app shell) -->
   {:else if $authStore.isAuthenticated && appInitialized && $currentRoute.view === 'page-print'}
-    <PagePrintView
-      workspaceId={Number($currentRoute.params.id)}
-      pageId={Number($currentRoute.params.pageId)}
+    <LazyRootView
+      loader={ROOT_VIEW_LOADERS.pagePrint}
+      label="print view"
+      componentProps={{
+        workspaceId: Number($currentRoute.params.id),
+        pageId: Number($currentRoute.params.pageId),
+      }}
+    />
+  {:else if $authStore.isAuthenticated && appInitialized && $currentRoute.view === 'time-report-print'}
+    <LazyRootView loader={ROOT_VIEW_LOADERS.timeReportPrint} label="time report print view" />
+  {:else if $authStore.isAuthenticated && appInitialized && $currentRoute.view === 'test-run-summary-print'}
+    <LazyRootView
+      loader={ROOT_VIEW_LOADERS.testRunSummaryPrint}
+      label="test run summary print view"
+      componentProps={{
+        workspaceId: Number($currentRoute.params.id),
+        runId: Number($currentRoute.params.runId),
+      }}
     />
   <!-- Mobile PWA surface (phone-focused shell, bypasses desktop MainApp chrome) -->
   {:else if $authStore.isAuthenticated && appInitialized && isMobileRoute($currentRoute.view)}
-    <MobileShell />
+    <LazyRootView loader={ROOT_VIEW_LOADERS.mobile} label="mobile workspace" />
+  <!-- Shell capability bootstrap failed: recover in place instead of spinning. -->
+  {:else if $authStore.isAuthenticated && appInitialized && authenticatedShellUIError}
+    <div
+      class="min-h-screen flex items-center justify-center w-full px-6"
+      data-testid="shell-bootstrap-error"
+    >
+      <div class="text-center max-w-sm">
+        <h1 class="text-xl font-semibold mb-2">
+          {getStartupCopy('errors.failedToLoad', i18nReady, t)}
+        </h1>
+        <p class="text-ds-text-subtle mb-5">
+          {getStartupCopy('errors.NETWORK_ERROR', i18nReady, t)}
+        </p>
+        <Button
+          variant="primary"
+          size="large"
+          class="min-h-11"
+          onclick={retryAuthenticatedShellUI}
+          dataTestid="shell-bootstrap-retry"
+        >
+          {getStartupCopy('common.retry', i18nReady, t)}
+        </Button>
+      </div>
+    </div>
+  <!-- Mount desktop navigation only after its permission/capability snapshot is stable. -->
+  {:else if $authStore.isAuthenticated && appInitialized && !authenticatedShellUIReady}
+    <BrandedLoader
+      label={getStartupCopy('common.loading', i18nReady, t)}
+      fullViewport={false}
+    />
   <!-- Show main app when user is authenticated -->
   {:else if $authStore.isAuthenticated && appInitialized}
-    <MainApp />
+    <LazyRootView loader={ROOT_VIEW_LOADERS.desktop} label="workspace" />
   {:else}
     <!-- Show loading or login screen while waiting for auth -->
     <div class="flex-1 flex items-center justify-center">
       {#if $authStore.loading}
-        <div class="text-center">
-          <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p class="text-gray-600">Loading...</p>
-        </div>
+        <BrandedLoader
+          label={getStartupCopy('common.loading', i18nReady, t)}
+          fullViewport={false}
+        />
       {:else if showLoginDialog}
         <!-- Login dialog will show, but we can show a minimal background -->
         <div class="text-center">
-          <img src="windshift-3.svg" alt="Windshift" class="w-16 h-16 mx-auto mb-4 opacity-50" />
-          <h1 class="text-2xl font-bold text-gray-400 mb-2">Windshift</h1>
-          <p class="text-gray-500">Work Management</p>
+          <img src="windshift-3.svg" alt="Windshift" width="64" height="64" class="w-16 h-16 mx-auto mb-4 opacity-50" />
+          <h1 class="text-2xl font-bold text-ds-text-subtlest mb-2">Windshift</h1>
+          <p class="text-ds-text-subtle">{t('footer.platformName')}</p>
         </div>
       {/if}
     </div>
   {/if}
 </div>
 
-<!-- Welcome Assistant -->
-<WelcomeAssistant
-  bind:isOpen={showWelcomeAssistant}
-  onsetup-completed={() => moduleSettings.reload()}
-/>
+<!-- Setup and login dialogs are split too; public routes never fetch them. -->
+{#if showWelcomeAssistant}
+  <LazyRootDialog
+    loader={ROOT_VIEW_LOADERS.welcome}
+    label="setup assistant"
+    bind:isOpen={showWelcomeAssistant}
+    componentProps={{ 'onsetup-completed': () => moduleSettings.reload() }}
+  />
+{/if}
 
-<!-- Login Dialog -->
-<LoginDialog
-  bind:isOpen={showLoginDialog}
-  onsuccess={() => {
-    showLoginDialog = false;
-    maybeRedirectToMobile();
-  }}
-/>
+{#if showLoginDialog}
+  <LazyRootDialog
+    loader={ROOT_VIEW_LOADERS.login}
+    label="sign in"
+    bind:isOpen={showLoginDialog}
+    componentProps={{
+      onsuccess: () => {
+        showLoginDialog = false;
+        const returnTo = safeLoginReturnPath(window.location.search);
+        if (returnTo) {
+          navigate(returnTo);
+        } else {
+          maybeRedirectToMobile();
+        }
+      },
+    }}
+  />
+{/if}
 
 <style>
+  .skip-link {
+    position: fixed;
+    top: 0.75rem;
+    left: 0.75rem;
+    z-index: 1000;
+    padding: 0.625rem 0.875rem;
+    border-radius: 0.375rem;
+    background: var(--ds-surface-raised);
+    color: var(--ds-text);
+    box-shadow: 0 4px 12px rgb(0 0 0 / 20%);
+    transform: translateY(-200%);
+    transition: transform 120ms ease;
+  }
+
+  .skip-link:focus-visible {
+    transform: translateY(0);
+  }
+
   /* Global CSS custom properties for theming - uses design tokens */
   :global(html) {
     --nav-bg-color: var(--ds-surface-raised);
@@ -307,10 +590,6 @@
 
   :global(.themed-nav .nav-button:hover) {
     background-color: var(--ds-background-neutral-hovered);
-  }
-
-  :global(.themed-nav .nav-button.nav-button-emphasized) {
-    background-color: color-mix(in srgb, var(--ds-interactive) 8%, transparent);
   }
 
   /* Exception: Primary buttons should keep their original colors and hover behavior */

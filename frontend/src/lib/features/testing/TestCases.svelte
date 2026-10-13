@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { IconFolder, IconPlus, IconEdit, IconTrash, IconTags, IconX, IconGripVertical, IconFileCheck, IconChevronDown, IconChevronRight, IconDots, IconListCheck } from '@tabler/icons-svelte-runes';
+  import { IconFolder, IconPlus, IconEdit, IconTrash, IconTags, IconGripVertical, IconFileCheck, IconChevronDown, IconChevronRight, IconDots, IconListCheck } from '@tabler/icons-svelte-runes';
   import DropdownMenu from '../../layout/DropdownMenu.svelte';
   import { api } from '../../api.js';
   import EmptyState from '../../components/EmptyState.svelte';
@@ -12,17 +12,31 @@
   import { confirm } from '../../composables/useConfirm.js';
   import Button from '../../components/Button.svelte';
   import Label from '../../components/Label.svelte';
+  import FormField from '../../components/FormField.svelte';
+  import GherkinField from './GherkinField.svelte';
+  import Card from '../../components/Card.svelte';
+  import Panel from '../../components/Panel.svelte';
+  import Lozenge from '../../components/Lozenge.svelte';
   import Modal from '../../dialogs/Modal.svelte';
+  import ModalHeader from '../../dialogs/ModalHeader.svelte';
+  import DialogFooter from '../../dialogs/DialogFooter.svelte';
   import PageHeader from '../../layout/PageHeader.svelte';
   import Tooltip from '../../components/Tooltip.svelte';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
   import { toHotkeyString, getShortcutDisplay, matchesShortcut, isTypingInField } from '../../utils/keyboardShortcuts.js';
   import { currentRoute, navigate } from '../../router.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { workspacePermissions } from '../../stores/index.js';
   import DescriptionText from '../../components/DescriptionText.svelte';
+  import SearchInput from '../../components/SearchInput.svelte';
   import { useEventListener } from 'runed';
+  import { createStepsShortcutCodes, STEPS_SHORTCUT_ALPHABET } from './testCaseShortcuts.js';
 
   let { workspaceId = null } = $props();
+
+  // Case, folder, and label mutations all require the test.manage tier
+  // (server returns 404 otherwise), so every write affordance is gated on it.
+  let canManageTests = $derived(workspacePermissions.canManageTests(workspaceId));
 
   const testFolders = writable([]);
   const testCases = writable([]);
@@ -43,9 +57,23 @@
   const derivedFolderTree = $derived.by(() => buildFolderTree($testFolders));
   let collapsedFolders = $state(new Set());
 
-  // Two-key shortcut mode for steps navigation (S + 1-9)
+  // Shortcut mode for steps navigation (S + the code displayed on each row)
   let stepsShortcutMode = $state(false);
+  let stepsShortcutInput = $state('');
   let stepsShortcutTimeout = null;
+  const TEST_CASE_BATCH_SIZE = 100;
+  // DOM cap (WI-1450): mounted rows are bounded; "Load more" first reveals
+  // already-fetched rows, then fetches the next batch from the server.
+  const RENDER_WINDOW_STEP = 300;
+  let renderedTestCaseLimit = $state(RENDER_WINDOW_STEP);
+  let testCaseSearchQuery = $state('');
+  let testCaseSearchTimeout = null;
+  let hasMoreTestCases = $state(false);
+  let loadingMoreTestCases = $state(false);
+  let testCaseLoadRequest = 0;
+  const visibleTestCases = $derived($testCases.slice(0, renderedTestCaseLimit));
+  const hiddenTestCaseCount = $derived($testCases.length - visibleTestCases.length);
+  const stepsShortcutCodes = $derived(createStepsShortcutCodes(visibleTestCases.length));
 
   // Focus management
   let titleInputRef = null;
@@ -64,8 +92,11 @@
     priority: 'medium',
     status: 'active',
     estimated_hours: 0,
-    estimated_minutes: 0
+    estimated_minutes: 0,
+    format: 'steps',
+    gherkin: ''
   });
+  let caseFormError = $state(null);
 
   // Priority options for test cases
   const priorityOptions = $derived([
@@ -120,6 +151,7 @@
     const route = $currentRoute;
     const folderId = getFolderIdFromRoute(route);
     if (folderId !== selectedFolder) {
+      testCaseSearchQuery = '';
       selectedFolder = folderId;
       loadTestCases(folderId);
     }
@@ -133,6 +165,7 @@
     })();
     return () => {
       clearTimeout(stepsShortcutTimeout);
+      clearTimeout(testCaseSearchTimeout);
     };
   });
 
@@ -141,25 +174,51 @@
 
   async function loadFolders() {
     try {
-      const folders = await api.tests.testFolders.getAll(workspaceId);
+      const folders = await api.tests.testFolders.getAll(workspaceId, { page_size: 200 });
       testFolders.set(folders || []);
-      
-      // Count every test case in the workspace (for the "All tests" entry).
-      const allCases = await api.tests.testCases.getAll(workspaceId, { all: true });
-      allCount = (allCases || []).length;
+
+      const countResult = await api.tests.testCases.count(workspaceId);
+      allCount = countResult?.count || 0;
     } catch (error) {
       console.error('Failed to load test folders:', error);
     }
   }
 
-  async function loadTestCases(folderId = null) {
+  // "Load more": reveal already-fetched rows first (bounded render window),
+  // then fetch the next batch from the server.
+  function showMoreTestCases() {
+    if (hiddenTestCaseCount > 0) {
+      renderedTestCaseLimit += RENDER_WINDOW_STEP;
+      return;
+    }
+    loadTestCases(selectedFolder, { append: true });
+  }
+
+  async function loadTestCases(folderId = null, { append = false } = {}) {
+    const requestId = append ? testCaseLoadRequest : ++testCaseLoadRequest;
+    if (append) loadingMoreTestCases = true;
     try {
       const params = folderId === null ? { all: true } : { folder_id: folderId };
+      params.limit = TEST_CASE_BATCH_SIZE;
+      params.offset = append ? $testCases.length : 0;
+      params.q = testCaseSearchQuery.trim();
+      params.label_id = selectedLabelFilterId;
       const cases = await api.tests.testCases.getAll(workspaceId, params);
-      testCases.set(cases || []);
+      if (requestId !== testCaseLoadRequest) return;
+      const nextCases = cases || [];
+      testCases.set(append ? [...$testCases, ...nextCases] : nextCases);
+      hasMoreTestCases = nextCases.length === TEST_CASE_BATCH_SIZE;
+      if (!append) renderedTestCaseLimit = RENDER_WINDOW_STEP;
     } catch (error) {
       console.error('Failed to load test cases:', error);
+    } finally {
+      if (requestId === testCaseLoadRequest) loadingMoreTestCases = false;
     }
+  }
+
+  function handleTestCaseSearchInput() {
+    clearTimeout(testCaseSearchTimeout);
+    testCaseSearchTimeout = setTimeout(() => loadTestCases(selectedFolder), 300);
   }
 
   async function loadLabels() {
@@ -172,6 +231,7 @@
   }
 
   function showAddFolderForm() {
+    if (!canManageTests) return;
     showFolderForm = true;
     editingFolder = null;
     folderFormData = {
@@ -189,6 +249,7 @@
   }
 
   function showEditFolderForm(folder) {
+    if (!canManageTests) return;
     showFolderForm = true;
     editingFolder = folder;
     folderFormData = {
@@ -217,15 +278,19 @@
   }
 
   function showAddCaseForm() {
+    if (!canManageTests) return;
     showCaseForm = true;
     editingCase = null;
+    caseFormError = null;
     caseFormData = {
       title: '',
       preconditions: '',
       priority: 'medium',
       status: 'active',
       estimated_hours: 0,
-      estimated_minutes: 0
+      estimated_minutes: 0,
+      format: 'steps',
+      gherkin: ''
     };
 
     // Auto-focus the title field after the modal renders
@@ -236,9 +301,21 @@
     }, 100);
   }
 
-  function showEditCaseForm(testCase) {
+  async function showEditCaseForm(testCase) {
+    if (!canManageTests) return;
     showCaseForm = true;
     editingCase = testCase;
+    caseFormError = null;
+    // The list payload omits BDD content; fetch the detail for the source.
+    let bdd = testCase.bdd || null;
+    if (testCase.format === 'bdd' && !bdd) {
+      try {
+        const detail = await api.tests.testCases.get(workspaceId, testCase.id);
+        bdd = detail?.bdd || null;
+      } catch (err) {
+        console.error('Failed to load BDD content:', err);
+      }
+    }
     const { hours, minutes } = secondsToHoursMinutes(testCase.estimated_duration || 0);
     caseFormData = {
       title: testCase.title,
@@ -246,7 +323,9 @@
       priority: testCase.priority || 'medium',
       status: testCase.status || 'active',
       estimated_hours: hours,
-      estimated_minutes: minutes
+      estimated_minutes: minutes,
+      format: testCase.format || 'steps',
+      gherkin: bdd?.gherkin || ''
     };
 
     // Auto-focus the title field after the modal renders
@@ -280,6 +359,12 @@
   }
 
   async function handleCaseSubmit() {
+    caseFormError = null;
+    const isBdd = caseFormData.format === 'bdd';
+    if (isBdd && !caseFormData.gherkin.trim()) {
+      caseFormError = t('testing.gherkinRequired');
+      return;
+    }
     try {
       const payload = {
         title: caseFormData.title,
@@ -293,6 +378,19 @@
         folder_id: selectedFolder
       };
 
+      if (isBdd) {
+        // The scenario name is the title's source of truth: send Gherkin and
+        // let the backend derive (create) or re-sync (edit) the title.
+        if (!editingCase) {
+          payload.format = 'bdd';
+          payload.gherkin = caseFormData.gherkin;
+          delete payload.title;
+        } else {
+          payload.gherkin = caseFormData.gherkin;
+          delete payload.title;
+        }
+      }
+
       if (editingCase) {
         await api.tests.testCases.update(workspaceId, editingCase.id, payload);
       } else {
@@ -305,10 +403,12 @@
       showCaseForm = false;
     } catch (error) {
       console.error('Failed to save test case:', error);
+      caseFormError = error?.message || t('testing.failedToSaveCase');
     }
   }
 
   async function deleteFolder(id) {
+    if (!canManageTests) return;
     const ok = await confirm({
       title: t('testing.deleteFolder'),
       message: t('testing.deleteFolderConfirm'),
@@ -329,6 +429,7 @@
   }
 
   async function deleteTestCase(id) {
+    if (!canManageTests) return;
     const ok = await confirm({
       title: t('testing.deleteTestCase'),
       message: t('testing.deleteTestCaseConfirm'),
@@ -350,6 +451,7 @@
       updateFolderQueryParam(folderId);
       return;
     }
+    testCaseSearchQuery = '';
     selectedFolder = folderId;
     updateFolderQueryParam(folderId);
     await loadTestCases(folderId);
@@ -358,6 +460,7 @@
 
   // Label Management
   async function openLabelsModal(testCase) {
+    if (!canManageTests) return;
     selectedTestCase = testCase;
     try {
       const labels = await api.tests.testCases.labels.getAll(workspaceId, testCase.id);
@@ -441,16 +544,9 @@
     );
   }
 
-  // Filter test cases by selected label ID
-  function filteredTestCases(testCases, selectedLabelId) {
-    if (!selectedLabelId) return testCases;
-    return testCases.filter(testCase =>
-      testCase.labels && testCase.labels.some(label => label.id === selectedLabelId)
-    );
-  }
-
   // Build dropdown menu items for test case actions
   function buildTestCaseActions(testCase) {
+    if (!canManageTests) return [];
     return [
       {
         id: 'labels',
@@ -475,36 +571,57 @@
     ];
   }
 
-  // Custom keyboard handler for two-key steps navigation (S + 1-9)
+  function exitStepsShortcutMode() {
+    stepsShortcutMode = false;
+    stepsShortcutInput = '';
+    clearTimeout(stepsShortcutTimeout);
+  }
+
+  function scheduleStepsShortcutTimeout() {
+    clearTimeout(stepsShortcutTimeout);
+    stepsShortcutTimeout = setTimeout(exitStepsShortcutMode, 2000);
+  }
+
+  // Custom keyboard handler for steps navigation (S + the displayed code)
   function handleStepsKeyboard(event) {
     // Ignore if typing in input field (INPUT, TEXTAREA, SELECT, or contenteditable)
     if (isTypingInField(event)) {
       return;
     }
 
-    const filteredCases = filteredTestCases($testCases, selectedLabelFilterId);
-
     if (stepsShortcutMode) {
-      // In steps mode - waiting for number key
-      const num = parseInt(event.key);
-      if (num >= 1 && num <= 9 && num <= filteredCases.length) {
-        event.preventDefault();
-        const testCase = filteredCases[num - 1];
-        navigate(`/workspaces/${workspaceId}/tests/cases/${testCase.id}/steps`);
+      const key = event.key.toUpperCase();
+      if (key.length !== 1 || !STEPS_SHORTCUT_ALPHABET.includes(key)) {
+        exitStepsShortcutMode();
+        return;
       }
-      // Exit mode on any key
-      stepsShortcutMode = false;
-      clearTimeout(stepsShortcutTimeout);
+
+      event.preventDefault();
+      const input = stepsShortcutInput + key;
+      const matchIndex = stepsShortcutCodes.indexOf(input);
+
+      if (matchIndex !== -1) {
+        const testCase = visibleTestCases[matchIndex];
+        exitStepsShortcutMode();
+        navigate(`/workspaces/${workspaceId}/tests/cases/${testCase.id}/steps`);
+        return;
+      }
+
+      if (stepsShortcutCodes.some((code) => code.startsWith(input))) {
+        stepsShortcutInput = input;
+        scheduleStepsShortcutTimeout();
+        return;
+      }
+
+      exitStepsShortcutMode();
       return;
     }
 
     if (matchesShortcut(event, { key: 's' })) {
       event.preventDefault();
       stepsShortcutMode = true;
-      // Auto-exit after 2 seconds
-      stepsShortcutTimeout = setTimeout(() => {
-        stepsShortcutMode = false;
-      }, 2000);
+      stepsShortcutInput = '';
+      scheduleStepsShortcutTimeout();
     }
   }
 
@@ -618,6 +735,7 @@
   }
 
   async function applyFolderSelectionFromRoute(folderId) {
+    testCaseSearchQuery = '';
     selectedFolder = folderId;
     await loadTestCases(folderId);
   }
@@ -753,7 +871,7 @@
   }
 </script>
 
-<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface-raised);">
+<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface);">
   <PageHeader
     title={t('testing.testCases')}
     subtitle={folderSubtitle}
@@ -765,18 +883,25 @@
             bind:value={selectedLabelFilterId}
             placeholder={t('testing.allLabels')}
             {workspaceId}
+            onSelect={({ value }) => {
+              selectedLabelFilterId = value;
+              loadTestCases(selectedFolder);
+            }}
           />
         </div>
-        <Button
-          onclick={showAddCaseForm}
-          variant="primary"
-          icon={IconPlus}
-          size="medium"
-          keyboardHint={getShortcutDisplay('testCases', 'addTestCase')}
-          hotkeyConfig={{ key: toHotkeyString('testCases', 'addTestCase'), guard: () => !showCaseForm && !showFolderForm }}
-        >
-          {t('testing.addTestCase')}
-        </Button>
+        {#if canManageTests}
+          <Button
+            onclick={showAddCaseForm}
+            variant="primary"
+            icon={IconPlus}
+            size="medium"
+            keyboardHint={getShortcutDisplay('testCases', 'addTestCase')}
+            hotkeyConfig={{ key: toHotkeyString('testCases', 'addTestCase'), guard: () => !showCaseForm && !showFolderForm }}
+            dataTestid="test-case-create-button"
+          >
+            {t('testing.addTestCase')}
+          </Button>
+        {/if}
       </div>
     {/snippet}
   </PageHeader>
@@ -790,10 +915,9 @@
           <button
             data-testid="test-folder-all"
             onclick={() => selectFolder(null)}
-            class="w-full flex items-center py-2 pr-3 text-sm font-medium transition-all cursor-pointer rounded-lg"
-            style={selectedFolder === null ? 'background: var(--ds-background-selected); color: var(--ds-text); padding-left: 12px;' : 'color: var(--ds-text-subtle); padding-left: 12px;'}
-            onmouseenter={(e) => { if (selectedFolder !== null) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text); padding-left: 12px;'; }}
-            onmouseleave={(e) => { if (selectedFolder !== null) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle); padding-left: 12px;'; }}
+            class="folder-btn w-full flex items-center py-2 pr-3 text-sm font-medium transition-all cursor-pointer rounded-lg"
+            class:active={selectedFolder === null}
+            style="padding-left: 12px;"
           >
             <span class="inline-block w-5 mr-1"></span>
             <IconListCheck size="16" class="mr-2 flex-shrink-0" data-testid="test-folder-all-icon" />
@@ -811,10 +935,9 @@
             <button
               data-testid={`test-folder-${folder.id}`}
               onclick={() => selectFolder(folder.id)}
-              class="w-full flex items-center py-2 pr-3 text-sm font-medium transition-all cursor-pointer rounded-lg"
-              style={isFolderActive ? `background: var(--ds-background-selected); color: var(--ds-text); padding-left: ${getFolderIndent(depth)};` : `color: var(--ds-text-subtle); padding-left: ${getFolderIndent(depth)};`}
-              onmouseenter={(e) => { if (!isFolderActive) e.currentTarget.style.cssText = `background: var(--ds-background-neutral-hovered); color: var(--ds-text); padding-left: ${getFolderIndent(depth)};`; }}
-              onmouseleave={(e) => { if (!isFolderActive) e.currentTarget.style.cssText = `color: var(--ds-text-subtle); padding-left: ${getFolderIndent(depth)};`; }}
+              class="folder-btn w-full flex items-center py-2 pr-3 text-sm font-medium transition-all cursor-pointer rounded-lg"
+              class:active={isFolderActive}
+              style={`padding-left: ${getFolderIndent(depth)};`}
               use:makeDropTarget={{ folderId: folder.id }}
             >
               {#if folder.children && folder.children.length > 0}
@@ -849,28 +972,22 @@
                 {/snippet}
               </Tooltip>
               <div class="flex items-center gap-1">
-                {#if selectedFolder === folder.id}
+                {#if canManageTests && selectedFolder === folder.id}
                   <div
                     onclick={(e) => { e.stopPropagation(); showEditFolderForm(folder); }}
-                    class="p-1 cursor-pointer rounded"
-                    style="color: var(--ds-icon-subtle);"
+                    class="folder-action-edit p-1 cursor-pointer rounded"
                     role="button"
                     tabindex="0"
                     onkeydown={(e) => e.key === 'Enter' && showEditFolderForm(folder)}
-                    onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-interactive)'}
-                    onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-icon-subtle)'}
                   >
                     <IconEdit size="12" />
                   </div>
                   <div
                     onclick={(e) => { e.stopPropagation(); deleteFolder(folder.id); }}
-                    class="p-1 cursor-pointer rounded"
-                    style="color: var(--ds-icon-subtle);"
+                    class="folder-action-danger p-1 cursor-pointer rounded"
                     role="button"
                     tabindex="0"
                     onkeydown={(e) => e.key === 'Enter' && deleteFolder(folder.id)}
-                    onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-danger)'}
-                    onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-icon-subtle)'}
                   >
                     <IconTrash size="12" />
                   </div>
@@ -885,23 +1002,38 @@
         
         <!-- Add Folder Button -->
         <div class="pt-2">
-          <Button
-            onclick={showAddFolderForm}
-            variant="ghost"
-            icon={IconPlus}
-            size="small"
-            keyboardHint={getShortcutDisplay('testCases', 'addFolder')}
-            hotkeyConfig={{ key: toHotkeyString('testCases', 'addFolder'), guard: () => !showCaseForm && !showFolderForm }}
-            class="w-full justify-start"
-          >
-            {t('testing.addFolder')}
-          </Button>
+          {#if canManageTests}
+            <Button
+              onclick={showAddFolderForm}
+              variant="ghost"
+              icon={IconPlus}
+              size="small"
+              keyboardHint={getShortcutDisplay('testCases', 'addFolder')}
+              hotkeyConfig={{ key: toHotkeyString('testCases', 'addFolder'), guard: () => !showCaseForm && !showFolderForm }}
+              class="w-full justify-start"
+            >
+              {t('testing.addFolder')}
+            </Button>
+          {/if}
         </div>
       </div>
     </div>
 
   <!-- Right Content - Test Cases -->
   <div class="flex-1 min-w-0 px-10 py-6">
+    <div class="mb-4 max-w-md">
+      <SearchInput
+        bind:value={testCaseSearchQuery}
+        placeholder={t('testing.searchTestCases')}
+        on_input={handleTestCaseSearchInput}
+      />
+    </div>
+    {#if $testCases.length > 0 && ($testCases.length !== visibleTestCases.length || testCaseSearchQuery.trim())}
+      <div class="px-4 py-2 text-xs" style="color: var(--ds-text-subtle);" data-testid="test-case-count">
+        {t('common.showingOfTotal', { count: visibleTestCases.length, total: $testCases.length })}
+      </div>
+    {/if}
+    <Card variant="flat" padding="none" class="overflow-hidden">
     <table class="min-w-full text-sm">
       <thead style="border-bottom: 1px solid var(--ds-border);">
             <tr>
@@ -912,11 +1044,12 @@
             </tr>
           </thead>
           <tbody>
-            {#each filteredTestCases($testCases, selectedLabelFilterId) as testCase, index}
+            {#each visibleTestCases as testCase, index}
               <tr
-                class="hover:bg-[var(--ds-surface)] transition-colors draggable-test-case"
+                class="hover:bg-[var(--ds-surface-raised-hovered)] transition-colors draggable-test-case"
                 style="border-top: 1px solid var(--ds-border);"
                 data-test-case-id={testCase.id}
+                data-testid={`test-case-row-${testCase.id}`}
                 use:makeDraggable={{ testCase }}
                 ondblclick={() => showEditCaseForm(testCase)}
               >
@@ -928,17 +1061,10 @@
                 <td class="px-4 py-3 text-sm font-medium" style="color: {testCase.status === 'inactive' ? 'var(--ds-text-disabled)' : 'var(--ds-text)'};">
                   <div class="flex items-center gap-2">
                     <!-- Priority badge -->
-                    <span
-                      class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded text-white capitalize"
-                      style="background-color: {getPriorityColor(testCase.priority || 'medium')};"
-                    >
-                      {testCase.priority || 'medium'}
-                    </span>
+                    <Lozenge customBg={getPriorityColor(testCase.priority || 'medium')} text={testCase.priority || 'medium'} />
                     <!-- Status badge for draft -->
                     {#if testCase.status === 'draft'}
-                      <span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
-                        {t('testing.draft')}
-                      </span>
+                      <Lozenge color="gray" text={t('testing.draft')} />
                     {/if}
                     <span class={testCase.status === 'inactive' ? 'line-through' : ''}>{testCase.title}</span>
                     <!-- Duration badge -->
@@ -958,12 +1084,7 @@
                   <div class="flex flex-wrap gap-1">
                     {#if testCase.labels && testCase.labels.length > 0}
                       {#each testCase.labels as label}
-                        <span
-                          class="inline-flex items-center px-2 py-1 text-xs font-medium rounded-full text-white"
-                          style="background-color: {label.color};"
-                        >
-                          {label.name}
-                        </span>
+                        <Lozenge customBg={label.color} text={label.name} rounded="rounded-full" />
                       {/each}
                     {:else}
                       <span class="text-xs" style="color: var(--ds-text-subtle);">{t('testing.noLabels')}</span>
@@ -974,25 +1095,31 @@
                   <div class="flex gap-2 items-center justify-end">
                     <a
                       href={`/workspaces/${workspaceId}/tests/cases/${testCase.id}/steps`}
-                      class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors"
-                      style="background-color: var(--ds-background-neutral); color: var(--ds-text);"
-                      onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                      onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral)'}
+                      data-testid={`test-case-steps-${testCase.id}`}
+                      class="steps-chip inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors"
                     >
                       {t('testing.steps')}
-                      <kbd class="px-1 py-0.5 text-[10px] rounded" style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border); color: var(--ds-text-subtle);">
-                        {stepsShortcutMode && index < 9 ? index + 1 : 'S'}
+                      <kbd
+                        data-testid={`test-case-steps-shortcut-${testCase.id}`}
+                        class="px-1 py-0.5 text-[10px] rounded"
+                        style={stepsShortcutMode
+                          ? 'background-color: var(--ds-interactive); border: 1px solid var(--ds-interactive); color: var(--ds-text-inverse); font-weight: 600;'
+                          : 'background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border); color: var(--ds-text-subtle);'}
+                      >
+                        {stepsShortcutMode ? stepsShortcutCodes[index] : 'S'}
                       </kbd>
                     </a>
-                    <DropdownMenu
-                      triggerIcon={IconDots}
-                      showChevron={false}
-                      iconOnly={true}
-                      triggerClass="p-1.5 rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)]"
-                      triggerStyle="color: var(--ds-text-subtle);"
-                      placement="bottom"
-                      items={buildTestCaseActions(testCase)}
-                    />
+                    {#if canManageTests}
+                      <DropdownMenu
+                        triggerIcon={IconDots}
+                        showChevron={false}
+                        iconOnly={true}
+                        triggerClass="p-1.5 rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)]"
+                        triggerStyle="color: var(--ds-text-subtle);"
+                        placement="bottom"
+                        items={buildTestCaseActions(testCase)}
+                      />
+                    {/if}
                   </div>
                 </td>
               </tr>
@@ -1002,15 +1129,30 @@
                   <EmptyState
                     icon={IconFileCheck}
                     title={t('testing.noTestCasesFound')}
-                    description={selectedLabelFilterId
-                      ? t('testing.noTestCasesWithLabel')
-                      : t('testing.createFirstTestCase')}
+                    description={testCaseSearchQuery
+                      ? t('common.noResults')
+                      : selectedLabelFilterId
+                        ? t('testing.noTestCasesWithLabel')
+                        : t('testing.createFirstTestCase')}
                   />
                 </td>
               </tr>
             {/each}
       </tbody>
     </table>
+    </Card>
+    {#if hasMoreTestCases || hiddenTestCaseCount > 0}
+      <div class="flex justify-center py-6">
+        <Button
+          variant="default"
+          size="small"
+          disabled={loadingMoreTestCases}
+          onclick={showMoreTestCases}
+        >
+          {loadingMoreTestCases ? t('common.loadingMore') : t('common.loadMore')}
+        </Button>
+      </div>
+    {/if}
   </div>
   </div>
 </div>
@@ -1028,55 +1170,42 @@
   isOpen={showFolderForm}
   onclose={() => showFolderForm = false}
   maxWidth="max-w-md"
+  closeOnBackdropClick={false}
 >
-  <div class="p-6">
-    <h3 class="text-lg font-semibold mb-4" style="color: var(--ds-text);">
-      {editingFolder ? t('testing.editFolder') : t('testing.addFolder')}
-    </h3>
-    <form onsubmit={(e) => { e.preventDefault(); handleFolderSubmit(); }}>
-      <div class="mb-4">
-        <Label color="default" class="mb-2">{t('common.name')}</Label>
+  <ModalHeader
+    title={editingFolder ? t('testing.editFolder') : t('testing.addFolder')}
+    showCloseButton={false}
+  />
+  <form onsubmit={(e) => { e.preventDefault(); handleFolderSubmit(); }}>
+    <div class="p-6 pb-2">
+      <FormField label={t('common.name')} required>
         <Input
           bind:value={folderFormData.name}
           required
           size="small"
         />
-      </div>
-      <div class="mb-4">
-        <Label color="default" class="mb-2">{t('testing.parentFolderOptional')}</Label>
+      </FormField>
+      <FormField label={t('testing.parentFolderOptional')} helper={t('testing.subfoldersNestingNote')}>
         <Select bind:value={folderFormData.parent_id} size="small" options={[{ value: '', label: t('testing.topLevelFolder') }, ...rootFolderOptions.map(option => ({ value: option.id, label: option.name, disabled: editingFolder && option.id === editingFolder.id }))]} />
-        <DescriptionText>
-          {t('testing.subfoldersNestingNote')}
-        </DescriptionText>
-      </div>
-      <div class="mb-6">
-        <Label color="default" class="mb-2">{t('common.description')}</Label>
+      </FormField>
+      <FormField label={t('common.description')}>
         <Textarea
           bind:value={folderFormData.description}
           rows={3}
           size="small"
         />
-      </div>
-      <div class="flex gap-2 justify-end">
-        <Button
-          type="button"
-          onclick={() => showFolderForm = false}
-          variant="default"
-          keyboardHint={getShortcutDisplay('testCases', 'cancelForm')}
-        >
-          {t('common.cancel')}
-        </Button>
-        <Button
-          type="submit"
-          variant="primary"
-          size="medium"
-          keyboardHint={getShortcutDisplay('testCases', 'submitForm')}
-        >
-          {t('common.save')}
-        </Button>
-      </div>
-    </form>
-  </div>
+      </FormField>
+    </div>
+    <DialogFooter
+      cancelLabel={t('common.cancel')}
+      confirmLabel={t('common.save')}
+      onCancel={() => showFolderForm = false}
+      onConfirm={handleFolderSubmit}
+      showKeyboardHint={true}
+      cancelKeyboardHint={getShortcutDisplay('testCases', 'cancelForm')}
+      confirmKeyboardHint={getShortcutDisplay('testCases', 'submitForm')}
+    />
+  </form>
 </Modal>
 
 <!-- Test Case Form Modal -->
@@ -1086,32 +1215,41 @@
   onSubmit={handleCaseSubmit}
   onclose={() => showCaseForm = false}
 >
-  <div class="p-6">
-    <h3 class="text-lg font-semibold mb-4" style="color: var(--ds-text);">
-      {editingCase ? t('testing.editTestCase') : t('testing.addTestCase')}
-    </h3>
-    <form onsubmit={(e) => { e.preventDefault(); handleCaseSubmit(); }}>
-      <div class="mb-4">
-        <Label color="default" class="mb-2">{t('common.title')}</Label>
+  <ModalHeader
+    title={editingCase ? t('testing.editTestCase') : t('testing.addTestCase')}
+    showCloseButton={false}
+  />
+  <form onsubmit={(e) => { e.preventDefault(); handleCaseSubmit(); }}>
+    <div class="p-6 pb-2">
+      {#if editingCase?.format === 'bdd'}
+        <div class="mb-4 flex items-center gap-2">
+          <Lozenge text={t('testing.formatBDD')} />
+          <span class="text-xs" style="color: var(--ds-text-subtle);">{t('testing.formatImmutableNote')}</span>
+        </div>
+      {/if}
+
+      <FormField label={t('common.title')} required={caseFormData.format !== 'bdd'}>
         <Input
           bind:value={caseFormData.title}
-          required
+          required={caseFormData.format !== 'bdd'}
+          disabled={caseFormData.format === 'bdd'}
           size="small"
+          dataTestid="test-case-title"
         />
-      </div>
+        {#if caseFormData.format === 'bdd'}
+          <p class="text-xs mt-1" style="color: var(--ds-text-subtle);">{t('testing.titleFromScenarioNote')}</p>
+        {/if}
+      </FormField>
 
       <!-- Priority, Status, and Duration row -->
       <div class="grid grid-cols-3 gap-4 mb-4">
-        <div>
-          <Label color="default" class="mb-2">{t('common.priority')}</Label>
+        <FormField label={t('common.priority')} class="mb-0">
           <Select bind:value={caseFormData.priority} size="small" options={priorityOptions} />
-        </div>
-        <div>
-          <Label color="default" class="mb-2">{t('common.status')}</Label>
+        </FormField>
+        <FormField label={t('common.status')} class="mb-0">
           <Select bind:value={caseFormData.status} size="small" options={statusOptions} />
-        </div>
-        <div>
-          <Label color="default" class="mb-2">{t('testing.estimatedDuration')}</Label>
+        </FormField>
+        <FormField label={t('testing.estimatedDuration')} class="mb-0">
           <div class="flex items-center gap-2">
             <Input
               type="number"
@@ -1131,46 +1269,63 @@
             />
             <span class="text-sm" style="color: var(--ds-text-subtle);">m</span>
           </div>
-        </div>
+        </FormField>
       </div>
 
-      <div class="mb-6">
-        <Label color="default" class="mb-2">{t('testing.preconditions')}</Label>
+      <!-- Format picker (creation only — the backend has no format conversion) -->
+      {#if !editingCase}
+        <FormField label={t('testing.caseFormat')}>
+          <Select
+            bind:value={caseFormData.format}
+            size="small"
+            options={[
+              { value: 'steps', label: t('testing.formatSteps') },
+              { value: 'bdd', label: t('testing.formatBDD') }
+            ]}
+          />
+        </FormField>
+      {/if}
+
+      {#if caseFormData.format === 'bdd'}
+        <FormField label={t('testing.gherkinLabel')} required>
+          <GherkinField bind:value={caseFormData.gherkin} {workspaceId} />
+        </FormField>
+      {/if}
+
+      <FormField label={t('testing.preconditions')}>
         <Textarea
           bind:value={caseFormData.preconditions}
           rows={3}
           placeholder={t('testing.preconditionsPlaceholder')}
           size="small"
+          data-testid="test-case-preconditions"
         />
-      </div>
+      </FormField>
 
       <!-- Information for new test cases -->
-      {#if !editingCase}
+      {#if !editingCase && caseFormData.format !== 'bdd'}
         <div class="mb-6">
           <p class="text-sm" style="color: var(--ds-text-subtle);">
             {t('testing.testCaseStepsInfo')}
           </p>
         </div>
       {/if}
-      <div class="flex gap-2 justify-end">
-        <Button
-          type="button"
-          variant="outline"
-          onclick={() => showCaseForm = false}
-          keyboardHint="Esc"
-        >
-          {t('common.cancel')}
-        </Button>
-        <Button
-          type="submit"
-          variant="primary"
-          keyboardHint="↵"
-        >
-          {editingCase ? t('common.save') : t('common.create')}
-        </Button>
-      </div>
-    </form>
-  </div>
+
+      {#if caseFormError}
+        <p class="mb-4 text-sm" style="color: var(--ds-text-danger);" data-testid="test-case-form-error">
+          {caseFormError}
+        </p>
+      {/if}
+    </div>
+    <DialogFooter
+      cancelLabel={t('common.cancel')}
+      confirmLabel={editingCase ? t('common.save') : t('common.create')}
+      onCancel={() => showCaseForm = false}
+      onConfirm={handleCaseSubmit}
+      showKeyboardHint={true}
+      confirmTestid="test-case-submit"
+    />
+  </form>
 </Modal>
 
 
@@ -1183,23 +1338,11 @@
 >
   <div class="max-h-[80vh] flex flex-col">
     <!-- Header -->
-    <div class="flex items-center justify-between p-6 border-b shrink-0" style="border-color: var(--ds-border);">
-      <div>
-        <h3 class="text-xl font-semibold" style="color: var(--ds-text);">
-          {t('testing.manageLabels')}: {selectedTestCase?.title}
-        </h3>
-        <div class="text-sm mt-1" style="color: var(--ds-text-subtle);">
-          {t('testing.clickLabelsToAssign')}
-        </div>
-      </div>
-      <button
-        onclick={closeLabelsModal}
-        class="p-2 hover:bg-[var(--ds-background-neutral-hovered)] rounded-full transition-colors"
-        aria-label={t('testing.closeLabelsModal')}
-      >
-        <IconX class="w-6 h-6" style="color: var(--ds-text-subtle);" />
-      </button>
-    </div>
+    <ModalHeader
+      title={`${t('testing.manageLabels')}: ${selectedTestCase?.title || ''}`}
+      subtitle={t('testing.clickLabelsToAssign')}
+      onClose={closeLabelsModal}
+    />
 
       <!-- Content -->
       <div class="flex-1 overflow-y-auto p-6">
@@ -1230,7 +1373,7 @@
 
           <!-- Create New Label Form -->
           {#if showCreateLabelForm}
-            <div class="bg-gray-50 rounded p-4 border" style="background-color: var(--ds-background-neutral); border-color: var(--ds-border);">
+            <Panel padding="default" rounded="md">
               <h4 class="font-medium mb-3" style="color: var(--ds-text);">{t('testing.createNewLabel')}</h4>
               <form onsubmit={(e) => { e.preventDefault(); handleCreateLabel(); }} class="space-y-3">
                 <div>
@@ -1307,7 +1450,7 @@
                   </Button>
                 </div>
               </form>
-            </div>
+            </Panel>
           {/if}
 
           <!-- Labels List -->
@@ -1319,7 +1462,7 @@
                   {@const isAssigned = isLabelAssigned(label.id)}
                   <button
                     onclick={() => isAssigned ? removeLabelFromTestCase(label.id) : addLabelToTestCase(label.id)}
-                    class="flex items-center gap-3 p-3 border rounded transition-all hover:shadow-sm {isAssigned ? 'ring-2 ring-opacity-50' : 'hover:border-gray-300'}"
+                    class="flex items-center gap-3 p-3 border rounded transition-all hover:shadow-sm {isAssigned ? 'ring-2 ring-opacity-50' : 'hover:border-ds-border-bold'}"
                     style="
                       border-color: {isAssigned ? label.color : 'var(--ds-border)'};
                       ring-color: {isAssigned ? label.color : 'transparent'};
@@ -1366,19 +1509,57 @@
       </div>
 
     <!-- Footer -->
-    <div class="border-t p-4 shrink-0" style="border-color: var(--ds-border); background-color: var(--ds-background-neutral);">
-      <div class="flex justify-between items-center">
+    <DialogFooter
+      cancelLabel={t('common.done')}
+      onCancel={closeLabelsModal}
+      class="shrink-0"
+    >
+      {#snippet extra()}
         <div class="text-sm" style="color: var(--ds-text-subtle);">
           {t('testing.labelsAssigned', { count: selectedTestCaseLabels.length })}
         </div>
-        <Button
-          onclick={closeLabelsModal}
-          variant="primary"
-          size="medium"
-        >
-          {t('common.done')}
-        </Button>
-      </div>
-    </div>
+      {/snippet}
+    </DialogFooter>
   </div>
 </Modal>
+
+<style>
+  .folder-btn {
+    color: var(--ds-text-subtle);
+  }
+
+  .folder-btn:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .folder-btn.active {
+    background: var(--ds-background-selected);
+    color: var(--ds-text);
+  }
+
+  .folder-action-edit {
+    color: var(--ds-icon-subtle);
+  }
+
+  .folder-action-edit:hover {
+    color: var(--ds-interactive);
+  }
+
+  .folder-action-danger {
+    color: var(--ds-icon-subtle);
+  }
+
+  .folder-action-danger:hover {
+    color: var(--ds-danger);
+  }
+
+  .steps-chip {
+    background-color: var(--ds-background-neutral);
+    color: var(--ds-text);
+  }
+
+  .steps-chip:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+</style>

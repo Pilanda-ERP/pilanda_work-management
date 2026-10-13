@@ -1,6 +1,8 @@
 <script>
   import { api } from '../api.js';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import BasePicker from '../pickers/BasePicker.svelte';
   import IconSelector from '../pickers/IconSelector.svelte';
   import Textarea from '../components/Textarea.svelte';
@@ -25,6 +27,7 @@
   let error = $state(null);
   let success = $state(false);
   let availableWorkspaces = $state([]);
+  let resolvingWorkspaces = $state(false);
 
   // Form data
   let formData = $state({
@@ -41,20 +44,58 @@
   let isFormInitialized = $state(false);
   let lastOpenState = $state(false);
 
-  // Load workspaces filtered to channel's configured IDs
+  // workspace_id and item_type_id are fixed once a request type exists: the
+  // configured fields are resolved from both. The system Email intake type is
+  // the exception — it carries no fields and its item type stays editable.
+  const isSystemEmail = $derived(requestType?.kind === 'email');
+  const bindingLocked = $derived(mode === 'edit');
+
+  // Load workspaces filtered to channel's configured IDs. The directory
+  // store caches only the first server page, so a restricted channel
+  // resolves each configured id it names explicitly — the allowed set is the
+  // channel's own small list, not whatever the cache happens to hold
+  // (WI-1585). Unrestricted channels keep the cached page and gain
+  // server-backed search over the rest of the directory.
+  let workspaceSearchResults = $state(null);
+
   async function loadWorkspaces() {
     try {
-      const allWorkspaces = await api.workspaces.getAll();
-      if (channelWorkspaceIds && channelWorkspaceIds.length > 0) {
-        availableWorkspaces = allWorkspaces.filter(ws => channelWorkspaceIds.includes(ws.id));
-      } else {
-        availableWorkspaces = allWorkspaces;
+      const cached = (await workspacesStore.load()) || [];
+      const byId = new Map(cached.map(ws => [ws.id, ws]));
+      const configured = channelWorkspaceIds || [];
+      const missing = configured.filter(id => !byId.has(id));
+      const fetched = await Promise.allSettled(missing.map(id => api.workspaces.get(id)));
+      for (const result of fetched) {
+        if (result.status === 'fulfilled' && result.value?.id) {
+          byId.set(result.value.id, result.value);
+        } else if (result.status === 'rejected') {
+          console.error('Failed to resolve configured workspace:', result.reason);
+        }
       }
+      availableWorkspaces = configured.length > 0
+        ? configured.map(id => byId.get(id)).filter(Boolean)
+        : [...byId.values()];
     } catch (err) {
       console.error('Failed to load workspaces:', err);
       availableWorkspaces = [];
     }
   }
+
+  // Server-backed directory search for unrestricted channels.
+  async function onWorkspaceSearch(query) {
+    const trimmed = (query || '').trim();
+    if (!trimmed) {
+      workspaceSearchResults = null;
+      return;
+    }
+    const { workspaces } = await workspacesStore.searchWorkspaces(trimmed, { limit: 25 });
+    workspaceSearchResults = workspaces;
+  }
+
+  const workspacePickerItems = $derived.by(() => {
+    if (channelWorkspaceIds && channelWorkspaceIds.length > 0) return availableWorkspaces;
+    return workspaceSearchResults ?? availableWorkspaces;
+  });
 
   // Consolidated reactive statement to handle modal state changes
   $effect(() => {
@@ -125,6 +166,11 @@
         return;
       }
 
+      if (mode === 'create' && !formData.workspace_id) {
+        error = t('channel.targetWorkspaceRequired');
+        return;
+      }
+
       submitting = true;
       error = null;
 
@@ -140,6 +186,8 @@
           is_active: true
         });
       } else {
+        // is_active is omitted on edit so saving the form does not reactivate
+        // a request type that was deliberately disabled.
         await api.requestTypes.update(channelId, requestType.id, {
           name: formData.name.trim(),
           description: formData.description.trim(),
@@ -147,8 +195,7 @@
           color: formData.color,
           item_type_id: formData.item_type_id,
           workspace_id: formData.workspace_id || null,
-          title_template: formData.title_template.trim(),
-          is_active: true
+          title_template: formData.title_template.trim()
         });
       }
 
@@ -190,16 +237,15 @@
       <div class="space-y-4">
         <div>
           <label for="rt-name" class="block text-sm font-medium mb-2" style="color: {isDarkMode ? '#9ca3af' : '#374151'};">
-            {t('common.name')} <span class="text-red-500">*</span>
+            {t('common.name')} <span class="text-ds-text-danger">*</span>
           </label>
-          <input
+          <Input
             id="rt-name"
             bind:value={formData.name}
             type="text"
-            class="w-full px-4 py-3 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-            style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
             placeholder={t('portal.requestTypeNamePlaceholder')}
             required
+            size="medium"
           />
         </div>
 
@@ -225,7 +271,7 @@
 
         <div>
           <label for="rt-itemtype" class="block text-sm font-medium mb-2" style="color: {isDarkMode ? '#9ca3af' : '#374151'};">
-            {t('portal.createsItemType')} <span class="text-red-500">*</span>
+            {t('portal.createsItemType')} <span class="text-ds-text-danger">*</span>
           </label>
           <BasePicker
             bind:value={formData.item_type_id}
@@ -233,26 +279,39 @@
             placeholder={t('portal.selectItemType')}
             getValue={(item) => item.id}
             getLabel={(item) => item.name}
+            disabled={bindingLocked && !isSystemEmail}
           />
           <p class="text-xs mt-1" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
-            {t('portal.submissionsCreateItemType')}
+            {#if bindingLocked && !isSystemEmail}
+              {t('portal.bindingLocked', 'Fixed after creation. Delete and recreate the request type to change it.')}
+            {:else}
+              {t('portal.submissionsCreateItemType')}
+            {/if}
           </p>
         </div>
 
         <div>
           <label for="rt-workspace" class="block text-sm font-medium mb-2" style="color: {isDarkMode ? '#9ca3af' : '#374151'};">
-            {t('common.workspace')}
+            {t('common.workspace')} {#if mode === 'create'}<span class="text-ds-text-danger">*</span>{/if}
           </label>
           <BasePicker
             bind:value={formData.workspace_id}
-            items={availableWorkspaces}
+            items={workspacePickerItems}
+            serverSearch={!(channelWorkspaceIds && channelWorkspaceIds.length > 0)}
+            onSearchChange={onWorkspaceSearch}
+            loading={resolvingWorkspaces}
             placeholder={t('portal.selectWorkspace', 'Select workspace')}
             getValue={(item) => item.id}
             getLabel={(item) => item.name}
-            allowClear={true}
+            allowClear={mode === 'create'}
+            disabled={bindingLocked}
           />
           <p class="text-xs mt-1" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
-            {t('portal.workspaceFieldResolution', 'Used to resolve available custom fields from the workspace configuration.')}
+            {#if bindingLocked}
+              {t('portal.bindingLocked', 'Fixed after creation. Delete and recreate the request type to change it.')}
+            {:else}
+              {t('portal.workspaceFieldResolution', 'Used to resolve available custom fields from the workspace configuration.')}
+            {/if}
           </p>
         </div>
       </div>

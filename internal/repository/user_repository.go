@@ -25,13 +25,14 @@ func NewUserRepository(db database.Database) *UserRepository {
 	return &UserRepository{db: db}
 }
 
-// Exists reports whether a user row with the given id exists. Used by the
-// leave-period handler's substitute-user check (and any other "is this user
-// real?" gate).
-func (r *UserRepository) Exists(id int) (bool, error) {
+// ActiveExists reports whether an active user row with the given id exists.
+// It is intentionally separate from Exists: administrative workflows may
+// need to reference inactive users, while assigning an inactive user as a
+// channel manager would leave the channel without an effective manager.
+func (r *UserRepository) ActiveExists(id int) (bool, error) {
 	var ok bool
-	if err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)", id).Scan(&ok); err != nil {
-		return false, fmt.Errorf("check user %d: %w", id, err)
+	if err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE id = ? AND is_active = true)", id).Scan(&ok); err != nil {
+		return false, fmt.Errorf("check active user %d: %w", id, err)
 	}
 	return ok, nil
 }
@@ -44,6 +45,36 @@ func (r *UserRepository) GetIDByEmail(email string) (int, error) {
 		return 0, ErrNotFound
 	}
 	return id, err
+}
+
+// FindByEmailCaseInsensitive returns the small identity projection used when
+// matching users from external systems.
+func (r *UserRepository) FindByEmailCaseInsensitive(email string) (id int, username string, err error) {
+	err = r.db.QueryRow(
+		"SELECT id, username FROM users WHERE LOWER(email) = LOWER(?)",
+		email,
+	).Scan(&id, &username)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", ErrNotFound
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("find user by email: %w", err)
+	}
+	return id, username, nil
+}
+
+// UsernameExistsCaseInsensitive reports whether a username is already in use
+// without relying on database collation.
+func (r *UserRepository) UsernameExistsCaseInsensitive(username string) (bool, error) {
+	var exists bool
+	err := r.db.QueryRow(
+		"SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(username) = LOWER(?))",
+		username,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check imported username %q: %w", username, err)
+	}
+	return exists, nil
 }
 
 // GetFullName returns "first_name last_name" for a user. Used to enrich
@@ -166,11 +197,12 @@ func (r *UserRepository) GetByID(id int) (*models.User, error) {
 	var u models.User
 	var avatarURL, timezone, language sql.NullString
 	var requiresPasswordReset sql.NullBool
+	var agentOwnerUserID sql.NullInt64
 	err := r.db.QueryRow(`
-		SELECT id, email, username, first_name, last_name, is_active, avatar_url, requires_password_reset, timezone, language, COALESCE(is_agent, false), created_at, updated_at
+		SELECT id, email, username, first_name, last_name, is_active, avatar_url, requires_password_reset, timezone, language, COALESCE(is_agent, false), agent_owner_user_id, created_at, updated_at
 		FROM users WHERE id = ?
 	`, id).Scan(&u.ID, &u.Email, &u.Username, &u.FirstName, &u.LastName,
-		&u.IsActive, &avatarURL, &requiresPasswordReset, &timezone, &language, &u.IsAgent, &u.CreatedAt, &u.UpdatedAt)
+		&u.IsActive, &avatarURL, &requiresPasswordReset, &timezone, &language, &u.IsAgent, &agentOwnerUserID, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, notFoundOrWrap(err, fmt.Sprintf("get user %d", id))
 	}
@@ -183,6 +215,10 @@ func (r *UserRepository) GetByID(id int) (*models.User, error) {
 	u.Language = "en"
 	if language.Valid {
 		u.Language = language.String
+	}
+	if agentOwnerUserID.Valid {
+		ownerID := int(agentOwnerUserID.Int64)
+		u.AgentOwnerUserID = &ownerID
 	}
 	u.FullName = strings.TrimSpace(u.FirstName + " " + u.LastName)
 	return &u, nil
@@ -270,19 +306,237 @@ type CreateUserParams struct {
 	IsActive              bool
 	IsAgent               bool
 	EmailVerified         bool
+	// Agent provisioning columns; zero values insert NULL.
+	AgentOwnerUserID *int
+	AgentProvenance  string
+	OAuthClientID    *int
+}
+
+// WorkspaceManagedAgentIdentityParams contains the identity fields created
+// atomically with a workspace-managed agent profile.
+type WorkspaceManagedAgentIdentityParams struct {
+	Email           string
+	Username        string
+	Name            string
+	AvatarURL       string
+	WorkspaceID     int
+	GrantedByUserID int
+}
+
+// CreateWorkspaceManagedAgentIdentity creates the agent user and grants Editor
+// only when Everyone does not already inherit Editor access in the workspace.
+func CreateWorkspaceManagedAgentIdentity(ctx context.Context, tx database.Tx, p WorkspaceManagedAgentIdentityParams) (int, error) {
+	var id int
+	err := tx.QueryRowContext(ctx, `
+		INSERT INTO users
+			(email, username, first_name, last_name, is_active, password_hash,
+			 requires_password_reset, is_agent, agent_owner_user_id,
+			 agent_provenance, avatar_url, email_verified)
+		VALUES (?, ?, ?, '', true, NULL, false, true, NULL, 'user', ?, true)
+		RETURNING id
+	`, p.Email, p.Username, p.Name, nullableUserString(p.AvatarURL)).Scan(&id)
+	if err != nil {
+		if database.IsUniqueConstraintError(err) {
+			return 0, ErrDuplicateEntry
+		}
+		return 0, fmt.Errorf("create workspace-managed agent identity: %w", err)
+	}
+
+	var editorRoleID int
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM workspace_roles WHERE builtin_key = ?`, models.RoleBuiltinEditor).Scan(&editorRoleID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("load workspace-managed agent role %q: %w", models.RoleEditor, ErrNotFound)
+		}
+		return 0, fmt.Errorf("load workspace-managed agent role %q: %w", models.RoleEditor, err)
+	}
+
+	// Everyone inherits Editor while both Viewer and Editor have no explicit
+	// user or group assignments. Preserve that open state by adding no row.
+	var editorRestricted bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM user_workspace_roles uwr
+			JOIN workspace_roles wr ON wr.id = uwr.role_id
+			WHERE uwr.workspace_id = ? AND wr.builtin_key IN (?, ?)
+			UNION ALL
+			SELECT 1
+			FROM group_workspace_roles gwr
+			JOIN workspace_roles wr ON wr.id = gwr.role_id
+			WHERE gwr.workspace_id = ? AND wr.builtin_key IN (?, ?)
+		)
+	`, p.WorkspaceID, models.RoleBuiltinViewer, models.RoleBuiltinEditor,
+		p.WorkspaceID, models.RoleBuiltinViewer, models.RoleBuiltinEditor).Scan(&editorRestricted)
+	if err != nil {
+		return 0, fmt.Errorf("check workspace Editor restrictions: %w", err)
+	}
+	if !editorRestricted {
+		return id, nil
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO user_workspace_roles
+			(user_id, workspace_id, role_id, granted_by, granted_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+	`, id, p.WorkspaceID, editorRoleID, p.GrantedByUserID)
+	if err != nil {
+		return 0, fmt.Errorf("grant workspace-managed agent Editor role: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return 0, fmt.Errorf("grant workspace-managed agent role %q: %w", models.RoleEditor, ErrNotFound)
+	}
+	return id, nil
+}
+
+// CountOwnedAgents returns the number of agent users owned by ownerID.
+func (r *UserRepository) CountOwnedAgents(ownerID int) (int, error) {
+	var count int
+	if err := r.db.QueryRow("SELECT COUNT(*) FROM users WHERE agent_owner_user_id = ?", ownerID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count agents owned by user %d: %w", ownerID, err)
+	}
+	return count, nil
+}
+
+func scanOwnedAgent(scanner interface{ Scan(...any) error }, ownerID int) (*models.User, error) {
+	var user models.User
+	var avatarURL sql.NullString
+	if err := scanner.Scan(&user.ID, &user.Email, &user.Username, &user.FirstName, &user.LastName,
+		&user.IsActive, &avatarURL, &user.CreatedAt, &user.UpdatedAt); err != nil {
+		return nil, err
+	}
+	user.IsAgent = true
+	user.AgentOwnerUserID = &ownerID
+	user.AvatarURL = avatarURL.String
+	user.FullName = strings.TrimSpace(user.FirstName + " " + user.LastName)
+	return &user, nil
+}
+
+const ownedAgentColumns = "id, email, username, first_name, last_name, is_active, avatar_url, created_at, updated_at"
+
+// FindOwnedAgentByUsername returns nil when no owned agent matches.
+func (r *UserRepository) FindOwnedAgentByUsername(ownerID int, username string) (*models.User, error) {
+	user, err := scanOwnedAgent(r.db.QueryRow(`SELECT `+ownedAgentColumns+`
+		FROM users WHERE username = ? AND agent_owner_user_id = ? AND COALESCE(is_agent, false) = true`, username, ownerID), ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find owned agent %q: %w", username, err)
+	}
+	return user, nil
+}
+
+// ListOwnedAgents returns newest agents first.
+func (r *UserRepository) ListOwnedAgents(ownerID int) ([]models.User, error) {
+	rows, err := r.db.Query(`SELECT `+ownedAgentColumns+`
+		FROM users WHERE agent_owner_user_id = ? ORDER BY created_at DESC`, ownerID)
+	if err != nil {
+		return nil, fmt.Errorf("list agents owned by user %d: %w", ownerID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]models.User, 0)
+	for rows.Next() {
+		user, err := scanOwnedAgent(rows, ownerID)
+		if err != nil {
+			return nil, fmt.Errorf("scan owned agent: %w", err)
+		}
+		out = append(out, *user)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate owned agents: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateOwnedAgentName updates and returns an owned agent or ErrNotFound.
+func (r *UserRepository) UpdateOwnedAgentName(agentID, ownerID int, name string) (*models.User, error) {
+	result, err := r.db.ExecWrite(`UPDATE users SET first_name = ?, last_name = '', updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND agent_owner_user_id = ? AND COALESCE(is_agent, false) = true`, name, agentID, ownerID)
+	if err != nil {
+		return nil, fmt.Errorf("update owned agent %d: %w", agentID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("count updated owned agent rows: %w", err)
+	}
+	if rows == 0 {
+		return nil, ErrNotFound
+	}
+	user, err := scanOwnedAgent(r.db.QueryRow("SELECT "+ownedAgentColumns+" FROM users WHERE id = ?", agentID), ownerID)
+	if err != nil {
+		return nil, fmt.Errorf("reload owned agent %d: %w", agentID, err)
+	}
+	return user, nil
+}
+
+// OwnedAgentTarget returns the owner and username used by the delete policy.
+func (r *UserRepository) OwnedAgentTarget(agentID int) (ownerID *int, username string, err error) {
+	var owner sql.NullInt64
+	err = r.db.QueryRow("SELECT agent_owner_user_id, username FROM users WHERE id = ?", agentID).Scan(&owner, &username)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", ErrNotFound
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("get owned agent target %d: %w", agentID, err)
+	}
+	if owner.Valid {
+		value := int(owner.Int64)
+		ownerID = &value
+	}
+	return ownerID, username, nil
+}
+
+// Delete removes a user row.
+func (r *UserRepository) Delete(id int) error {
+	if _, err := r.db.ExecWrite("DELETE FROM users WHERE id = ?", id); err != nil {
+		return fmt.Errorf("delete user %d: %w", id, err)
+	}
+	return nil
+}
+
+type UserNameMatch struct {
+	ID       int
+	FullName string
+}
+
+// FindIDsByFullName returns exact case-insensitive full-name matches.
+func (r *UserRepository) FindIDsByFullName(name string) ([]UserNameMatch, error) {
+	rows, err := r.db.Query(`SELECT id, first_name || ' ' || last_name
+		FROM users WHERE LOWER(first_name || ' ' || last_name) = LOWER(?) ORDER BY id`, name)
+	if err != nil {
+		return nil, fmt.Errorf("find users by full name: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]UserNameMatch, 0)
+	for rows.Next() {
+		var match UserNameMatch
+		if err := rows.Scan(&match.ID, &match.FullName); err != nil {
+			return nil, fmt.Errorf("scan user full-name match: %w", err)
+		}
+		out = append(out, match)
+	}
+	return out, rows.Err()
 }
 
 // Create inserts a new user with the supplied is_active value. Returns
 // ErrDuplicateEntry when the unique (email/username) constraint trips.
 func (r *UserRepository) Create(p CreateUserParams) (int64, error) {
 	now := time.Now()
+	// Non-agent rows carry the column default provenance ("user"); agent rows
+	// supply their own (e.g. "oauth").
+	provenance := p.AgentProvenance
+	if provenance == "" {
+		provenance = "user"
+	}
 	var id int64
 	err := r.db.QueryRow(`
-		INSERT INTO users (email, username, first_name, last_name, is_active, avatar_url, password_hash, requires_password_reset, is_agent, email_verified, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+		INSERT INTO users (email, username, first_name, last_name, is_active, avatar_url, password_hash, requires_password_reset, is_agent, email_verified, agent_owner_user_id, agent_provenance, oauth_client_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
 	`, p.Email, p.Username, p.FirstName, p.LastName, p.IsActive,
 		nullableUserString(p.AvatarURL), nullableUserPtrString(p.PasswordHash),
-		p.RequiresPasswordReset, p.IsAgent, p.EmailVerified, now, now,
+		p.RequiresPasswordReset, p.IsAgent, p.EmailVerified,
+		nullableUserPtrInt(p.AgentOwnerUserID), provenance, nullableUserPtrInt(p.OAuthClientID),
+		now, now,
 	).Scan(&id)
 	if err != nil {
 		if database.IsUniqueConstraintError(err) {
@@ -422,8 +676,9 @@ func (r *UserRepository) GetDeleteSnapshot(id int) (*DeleteSnapshot, error) {
 
 // PasswordResetTarget is the small subset the password-reset audit needs.
 type PasswordResetTarget struct {
-	Username string
-	Email    string
+	Username   string
+	Email      string
+	Offboarded bool
 }
 
 // GetPasswordResetTarget returns username+email for the reset audit.
@@ -431,9 +686,9 @@ type PasswordResetTarget struct {
 func (r *UserRepository) GetPasswordResetTarget(id int) (*PasswordResetTarget, error) {
 	var t PasswordResetTarget
 	err := r.db.QueryRow(
-		"SELECT username, email FROM users WHERE id = ?",
+		"SELECT username, email, offboarded_at IS NOT NULL FROM users WHERE id = ?",
 		id,
-	).Scan(&t.Username, &t.Email)
+	).Scan(&t.Username, &t.Email, &t.Offboarded)
 	if err != nil {
 		return nil, notFoundOrWrap(err, fmt.Sprintf("get user %d for password reset", id))
 	}
@@ -451,11 +706,12 @@ func (r *UserRepository) SetPassword(id int, passwordHash string, requiresReset 
 }
 
 // ActivationTarget carries username/email/is_active for the activate/deactivate
-// audit + idempotence check.
+// audit + idempotence check, plus the irreversible offboarding state.
 type ActivationTarget struct {
-	Username string
-	Email    string
-	IsActive bool
+	Username   string
+	Email      string
+	IsActive   bool
+	Offboarded bool
 }
 
 // GetActivationTarget reads the activate/deactivate audit fields.
@@ -463,9 +719,9 @@ type ActivationTarget struct {
 func (r *UserRepository) GetActivationTarget(id int) (*ActivationTarget, error) {
 	var t ActivationTarget
 	err := r.db.QueryRow(
-		"SELECT username, email, is_active FROM users WHERE id = ?",
+		"SELECT username, email, is_active, offboarded_at IS NOT NULL FROM users WHERE id = ?",
 		id,
-	).Scan(&t.Username, &t.Email, &t.IsActive)
+	).Scan(&t.Username, &t.Email, &t.IsActive, &t.Offboarded)
 	if err != nil {
 		return nil, notFoundOrWrap(err, fmt.Sprintf("get user %d activation target", id))
 	}
@@ -491,6 +747,13 @@ func nullableUserString(s string) any {
 }
 
 func nullableUserPtrString(p *string) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func nullableUserPtrInt(p *int) any {
 	if p == nil {
 		return nil
 	}

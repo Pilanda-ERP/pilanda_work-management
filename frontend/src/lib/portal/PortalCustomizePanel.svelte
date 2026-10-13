@@ -1,5 +1,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import Lozenge from '../components/Lozenge.svelte';
   import { draggable } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
   import {
     Palette, Navigation, X, TextCursorInput, BookOpen, Check,
@@ -7,7 +9,6 @@
     Package, Shield, Table2, Edit3, Info
   } from '@lucide/svelte';
   import Tooltip from '../components/Tooltip.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import DropdownMenu from '../layout/DropdownMenu.svelte';
   import RequestTypeVisibilityModal from '../dialogs/RequestTypeVisibilityModal.svelte';
   import AssetReportVisibilityModal from '../dialogs/RequestTypeVisibilityModal.svelte';
@@ -15,14 +16,23 @@
   import BackgroundImageSelector from '../components/BackgroundImageSelector.svelte';
   import LogoUploader from '../components/LogoUploader.svelte';
   import Label from '../components/Label.svelte';
-  import { portalStore, gradients, iconMap } from '../stores/portal.svelte.js';
+  import Input from '../components/Input.svelte';
+  import {
+    portalCatalogStore,
+    portalCustomizationStore as portalStore,
+  } from '../stores/portal.svelte.js';
+  import { gradients, iconMap } from '../stores/portalPresentation.js';
   import ModalBackdrop from '../components/ModalBackdrop.svelte';
   import { api } from '../api.js';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
+  import { portalAuthStore } from '../stores/portalAuth.svelte.js';
+  import { authStore } from '../stores';
+  import { loadPermissionProfile } from '../stores/permissionProfile.js';
   import { t } from '../stores/i18n.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
   import DescriptionText from '../components/DescriptionText.svelte';
   import RequestTypeFieldsBuilder from '../dialogs/RequestTypeFieldsBuilder.svelte';
-  import { fly } from 'svelte/transition';
+  import PagePicker from '../pickers/PagePicker.svelte';
 
   let {
     onOpenRequestTypeModal = () => {},
@@ -48,6 +58,127 @@
   let showVisibilityModal = $state(false);
   let selectedRequestTypeForVisibility = $state(null);
 
+  // Knowledge-base workspace-pages wiring state (see the knowledge-base
+  // customize section). Workspaces and page titles load lazily when the
+  // section opens; the wiring itself lives in the portal store so both
+  // persistence paths serialize identically. Start pages are picked through
+  // the searchable PagePicker, so no page tree is held here.
+  let kbWorkspaceId = $state('');
+  let kbScope = $state('entire');
+  let kbRootPageId = $state(null);
+  let kbWorkspaces = $state([]);
+  let kbPageTitles = $state({});
+  // Workspace administration rights of the current manager, resolved from
+  // their permission profile. Null until loaded; the customize panel lives in
+  // the portal shell, which does not populate the main app's permission store.
+  let kbAdminWorkspaceIds = $state(null);
+  let kbIsSystemAdmin = $state(false);
+
+  let kbAddReady = $derived(Boolean(kbWorkspaceId) && (kbScope !== 'subtree' || kbRootPageId));
+
+  // The picker only offers workspaces connected to this portal channel that
+  // the current manager administers — mirroring the backend validation in
+  // ChannelConfigUpdateService.validateKnowledgeBasePageSources so every
+  // selectable option can actually be saved.
+  let kbSelectableWorkspaces = $derived(
+    kbAdminWorkspaceIds === null
+      ? []
+      : kbWorkspaces.filter(
+          (workspace) =>
+            (portalStore.portalData?.workspace_ids ?? []).includes(workspace.id) &&
+            (kbIsSystemAdmin || kbAdminWorkspaceIds.has(workspace.id))
+        )
+  );
+
+  async function loadKbWorkspaces() {
+    try {
+      kbWorkspaces = (await workspacesStore.load()) ?? [];
+    } catch (err) {
+      console.error('Failed to load workspaces for knowledge base wiring:', err);
+      kbWorkspaces = [];
+    }
+  }
+
+  async function loadKbWorkspaceEligibility() {
+    if (kbAdminWorkspaceIds !== null) return;
+    const userId = $portalAuthStore.user?.id ?? $authStore.currentUser?.id;
+    if (!userId) return;
+    try {
+      const profile = await loadPermissionProfile(userId);
+      kbIsSystemAdmin = profile.has_system_admin === true;
+      const adminIds = new Set();
+      for (const [wsId, keys] of Object.entries(profile.workspace_permissions || {})) {
+        if (keys.includes('workspace.admin')) {
+          adminIds.add(Number(wsId));
+        }
+      }
+      kbAdminWorkspaceIds = adminIds;
+    } catch (err) {
+      console.error('Failed to load workspace permissions for knowledge base wiring:', err);
+      kbAdminWorkspaceIds = new Set();
+    }
+  }
+
+  async function loadKbPageTitles() {
+    const sources = portalStore.knowledgeBasePageSources || [];
+    const workspaceIds = [...new Set(sources.map((s) => s.workspace_id))]
+      .filter((id) => kbPageTitles[`ws:${id}`] !== true);
+    if (workspaceIds.length === 0) return;
+    try {
+      const rows = await api.pages.getTitles(workspaceIds);
+      const titles = { ...kbPageTitles };
+      for (const row of Array.isArray(rows) ? rows : []) {
+        titles[row.page_id] = row.title;
+      }
+      for (const workspaceId of workspaceIds) titles[`ws:${workspaceId}`] = true;
+      kbPageTitles = titles;
+    } catch (err) {
+      console.error('Failed to load page titles for knowledge base wiring:', err);
+    }
+  }
+
+  function onKbWorkspaceChange() {
+    kbRootPageId = null;
+    kbScope = 'entire';
+  }
+
+  function addKbPageSource() {
+    const workspaceId = Number(kbWorkspaceId);
+    if (!workspaceId) return;
+    const source =
+      kbScope === 'subtree' && kbRootPageId
+        ? { workspace_id: workspaceId, root_page_id: kbRootPageId }
+        : { workspace_id: workspaceId };
+    portalStore.addKnowledgeBasePageSource(source);
+    kbWorkspaceId = '';
+    kbScope = 'entire';
+    kbRootPageId = null;
+  }
+
+  function kbSourceLabel(source) {
+    const workspace = kbWorkspaces.find((ws) => ws.id === source.workspace_id);
+    const workspaceName = workspace?.name || `#${source.workspace_id}`;
+    if (source.root_page_id == null) {
+      return t('portal.customize.workspacePagesEntryEntire', { workspace: workspaceName });
+    }
+    const pageTitle = kbPageTitles[source.root_page_id] || `#${source.root_page_id}`;
+    return t('portal.customize.workspacePagesEntrySubtree', {
+      workspace: workspaceName,
+      page: pageTitle,
+    });
+  }
+
+  $effect(() => {
+    if (
+      portalStore.activeSection === 'knowledge-base' &&
+      portalStore.showCustomizePanel
+    ) {
+      if (kbWorkspaces.length === 0) void loadKbWorkspaces();
+      void loadKbWorkspaceEligibility();
+      void loadKbPageTitles();
+    }
+  });
+
   function openVisibilityModal(requestType) {
     selectedRequestTypeForVisibility = requestType;
     showVisibilityModal = true;
@@ -59,7 +190,7 @@
   }
 
   async function handleVisibilitySaved() {
-    await portalStore.loadRequestTypes();
+    await portalCatalogStore.loadRequestTypes();
   }
 
   function hasVisibilityRestrictions(requestType) {
@@ -81,7 +212,7 @@
   }
 
   async function handleAssetReportVisibilitySaved() {
-    await portalStore.loadAssetReports();
+    await portalCatalogStore.loadAssetReports();
   }
 
   function hasAssetReportVisibilityRestrictions(report) {
@@ -100,7 +231,7 @@
 
     try {
       await api.assetReports.delete(portalStore.portalData?.channel_id, id);
-      await portalStore.loadAssetReports();
+      await portalCatalogStore.loadAssetReports();
     } catch (err) {
       console.error('Failed to delete asset report:', err);
     }
@@ -120,7 +251,7 @@
 
     try {
       await api.requestTypes.delete(portalStore.portalData?.channel_id, id);
-      await portalStore.loadRequestTypes();
+      await portalCatalogStore.loadRequestTypes();
     } catch (err) {
       console.error('Failed to delete request type:', err);
     }
@@ -138,7 +269,7 @@
       cards.forEach(/** @param {HTMLElement} card */ (card) => {
         const dragHandle = card.querySelector('[data-drag-handle]');
         const requestTypeId = card.dataset.requestTypeId;
-        const requestType = portalStore.requestTypes.find(rt => String(rt.id) === String(requestTypeId));
+        const requestType = portalCatalogStore.requestTypes.find(rt => String(rt.id) === String(requestTypeId));
 
         if (!requestType || !dragHandle) return;
 
@@ -150,11 +281,11 @@
             requestType
           }),
           onDragStart: () => {
-            portalStore.draggedRequestType = requestType;
+            portalCatalogStore.draggedRequestType = requestType;
             card.style.opacity = '0.5';
           },
           onDrop: () => {
-            portalStore.draggedRequestType = null;
+            portalCatalogStore.draggedRequestType = null;
             card.style.opacity = '';
           }
         });
@@ -168,7 +299,7 @@
       cards.forEach(/** @param {HTMLElement} card */ (card) => {
         const dragHandle = card.querySelector('[data-drag-handle]');
         const reportId = card.dataset.assetReportId;
-        const report = portalStore.assetReports.find(ar => String(ar.id) === String(reportId));
+        const report = portalCatalogStore.assetReports.find(ar => String(ar.id) === String(reportId));
 
         if (!report || !dragHandle) return;
 
@@ -180,11 +311,11 @@
             assetReport: report
           }),
           onDragStart: () => {
-            portalStore.draggedAssetReport = report;
+            portalCatalogStore.draggedAssetReport = report;
             card.style.opacity = '0.5';
           },
           onDrop: () => {
-            portalStore.draggedAssetReport = null;
+            portalCatalogStore.draggedAssetReport = null;
             card.style.opacity = '';
           }
         });
@@ -206,8 +337,8 @@
   // Re-setup when request types or asset reports change or section changes
   $effect(() => {
     // Track dependencies
-    const currentRequestTypeIds = portalStore.requestTypes.map(rt => rt.id).join(',');
-    const currentAssetReportIds = portalStore.assetReports.map(ar => ar.id).join(',');
+    const currentRequestTypeIds = portalCatalogStore.requestTypes.map(rt => rt.id).join(',');
+    const currentAssetReportIds = portalCatalogStore.assetReports.map(ar => ar.id).join(',');
     const isRequestTypesSection = portalStore.activeSection === 'request-types';
     const isAssetReportsSection = portalStore.activeSection === 'asset-reports';
 
@@ -226,9 +357,45 @@
   });
 </script>
 
-<!-- Customization Panel Overlay (hide when editing request types so sections are visible) -->
+<!-- Customization Panel Overlay (hidden while the request-types or
+     asset-reports section is active so section drop zones stay reachable) -->
+
+<!-- Shared card fragments for the request-type and asset-report lists. -->
+{#snippet cardIconBadge(color, Icon)}
+  <div class="flex-shrink-0">
+    <div class="w-8 h-8 rounded flex items-center justify-center" style="background-color: {color || '#6b7280'};">
+      <Icon size={16} color="white" />
+    </div>
+  </div>
+{/snippet}
+
+{#snippet dragHandle(testId)}
+  <div class="cursor-grab active:cursor-grabbing pt-1" style="color: {portalStore.isDarkMode ? '#64748b' : '#9ca3af'};" data-drag-handle data-testid={testId}>
+    <GripVertical class="w-4 h-4" />
+  </div>
+{/snippet}
+
+{#snippet visibilityShield(restricted, onConfigure)}
+  <div class="flex-shrink-0">
+    <Tooltip content={restricted ? t('portal.visibility.hasRestrictions') : t('portal.visibility.noRestrictions')} placement="top">
+      {#snippet children()}
+        <button
+          onclick={onConfigure}
+          class="p-1.5 rounded transition-all hover:bg-black/5"
+          title={t('portal.visibility.configureVisibility')}
+        >
+          <Shield
+            class="w-4 h-4"
+            style="color: {restricted ? '#f59e0b' : (portalStore.isDarkMode ? '#94a3b8' : '#6b7280')};"
+          />
+        </button>
+      {/snippet}
+    </Tooltip>
+  </div>
+{/snippet}
+
 <ModalBackdrop
-  show={portalStore.showCustomizePanel && portalStore.activeSection !== 'request-types' && !portalStore.isEditing}
+  show={portalStore.showCustomizePanel && portalStore.activeSection !== 'request-types' && portalStore.activeSection !== 'asset-reports'}
   opacity={0.3}
   blur={0}
   align="none"
@@ -236,13 +403,20 @@
 />
 
 <!-- Customization Panel - Slides from Left.
+     In edit mode, leave room for Portal's edit bar above the fixed panels.
      The full-bleed shadow is only applied when the inline fields builder
      is closed, otherwise it casts a visible seam between the two panels. -->
 <div
-  class="fixed top-0 left-0 h-full flex z-50 transform transition-transform duration-300 ease-in-out"
-  style="background-color: var(--ds-surface-card); box-shadow: {expandedRequestTypeForFields ? 'none' : '0 25px 50px -12px rgba(0, 0, 0, 0.25)'};"
+  class="fixed left-0 flex z-50 transform transition-transform duration-300 ease-in-out"
+  style="
+    top: {portalStore.isEditing ? '2.5rem' : '0'};
+    height: {portalStore.isEditing ? 'calc(100% - 2.5rem)' : '100%'};
+    background-color: var(--ds-surface-card);
+    box-shadow: {expandedRequestTypeForFields ? 'none' : '0 25px 50px -12px rgba(0, 0, 0, 0.25)'};
+  "
   class:translate-x-0={portalStore.showCustomizePanel}
   class:-translate-x-full={!portalStore.showCustomizePanel}
+  data-testid="portal-customize-panel"
 >
   <!-- Vertical Navigation Sidebar -->
   <div class="w-16 border-r flex flex-col items-center py-4" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
@@ -253,6 +427,7 @@
           onclick={() => portalStore.toggleEditing()}
           class="w-10 h-10 rounded flex items-center justify-center cursor-pointer transition-all"
           style="background-color: {portalStore.isEditing ? 'var(--ds-background-neutral)' : 'transparent'};"
+          data-testid="portal-edit-mode-toggle"
         >
           <Edit3 class="w-5 h-5" style="color: {portalStore.isEditing ? 'var(--ds-interactive, #2563eb)' : 'var(--ds-text-subtle)'};" />
         </button>
@@ -302,11 +477,12 @@
     </Tooltip>
 
     <!-- Asset Reports Section (only show if asset sets exist) -->
-    {#if portalStore.hasAssetSets}
+    {#if portalCatalogStore.hasAssetSets}
       <Tooltip content={t('portal.customize.assetReports')} placement="right">
         {#snippet children()}
           <button
             onclick={() => portalStore.activeSection = 'asset-reports'}
+            data-testid="portal-customize-asset-reports-section"
             class="w-10 h-10 rounded flex items-center justify-center cursor-pointer transition-all mb-1"
             style="background-color: {portalStore.activeSection === 'asset-reports' ? 'var(--ds-background-neutral)' : 'transparent'};"
           >
@@ -321,6 +497,7 @@
       {#snippet children()}
         <button
           onclick={() => portalStore.activeSection = 'knowledge-base'}
+          data-testid="portal-customize-kb-section"
           class="w-10 h-10 rounded flex items-center justify-center cursor-pointer transition-all"
           style="background-color: {portalStore.activeSection === 'knowledge-base' ? 'var(--ds-background-neutral)' : 'transparent'};"
         >
@@ -400,7 +577,6 @@
           onRemoveImage={() => portalStore.removeBackgroundImage()}
           onUploadImage={(files) => portalStore.handleBackgroundUpload(files)}
           uploading={portalStore.uploadingBackground}
-          uploadCategory="portal_background"
         />
 
         <!-- Logo Upload -->
@@ -427,16 +603,15 @@
           </p>
         </div>
 
-        {#if portalStore.loadingRequestTypes}
-          <div class="flex items-center justify-center py-8">
-            <Spinner />
-          </div>
+        {#if portalCatalogStore.loadingRequestTypes}
+          <StateDisplay type="loading" />
         {:else}
           <!-- Request Types List -->
           <div class="space-y-2 mb-4">
-            {#each portalStore.requestTypes as requestType}
+            {#each portalCatalogStore.requestTypes as requestType}
               {@const hasNoFields = requestType.field_count === 0}
               {@const isExpanded = expandedRequestTypeForFields?.id === requestType.id}
+              {@const isSystemRequestType = requestType.kind === 'email'}
               {@const RequestTypeIcon = iconMap[requestType.icon] || Package}
               <div
                 class="p-3 rounded border transition-all"
@@ -453,21 +628,20 @@
               >
                 <div class="flex items-start gap-3">
                   <!-- Icon Preview -->
-                  <div class="flex-shrink-0">
-                    <div class="w-8 h-8 rounded flex items-center justify-center" style="background-color: {requestType.color || '#6b7280'};">
-                      <RequestTypeIcon size={16} color="white" />
-                    </div>
-                  </div>
+                  {@render cardIconBadge(requestType.color, RequestTypeIcon)}
 
                   <!-- Drag Handle -->
-                  <div class="cursor-grab active:cursor-grabbing pt-1" style="color: {portalStore.isDarkMode ? '#64748b' : '#9ca3af'};" data-drag-handle>
-                    <GripVertical class="w-4 h-4" />
-                  </div>
+                  {@render dragHandle('portal-request-type-drag-handle')}
 
                   <!-- Content -->
                   <div class="flex-1 min-w-0">
-                    <div class="font-medium text-sm mb-1" style="color: {portalStore.isDarkMode ? '#e2e8f0' : '#111827'};">
-                      {requestType.name}
+                    <div class="font-medium text-sm mb-1 flex items-center gap-2" style="color: {portalStore.isDarkMode ? '#e2e8f0' : '#111827'};">
+                      <span>{requestType.name}</span>
+                      {#if isSystemRequestType}
+                        <Lozenge color="gray" dataTestid="request-type-system-badge-{requestType.id}">
+                          {t('portal.customize.systemRequestType')}
+                        </Lozenge>
+                      {/if}
                     </div>
                     {#if requestType.description}
                       <div class="text-xs mb-2" style="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};">
@@ -477,38 +651,34 @@
                     <div>
                       <div class="text-xs" style="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};">
                         <div class="font-medium" style="color: {portalStore.isDarkMode ? '#e2e8f0' : '#374151'};">{requestType.item_type_name || t('common.unknown')}</div>
-                      </div>
-                      <button
-                        onclick={() => expandedRequestTypeForFields = isExpanded ? null : requestType}
-                        class="text-xs hover:underline text-right"
-                        style="color: {hasNoFields ? '#f59e0b' : 'var(--ds-text-link)'};"
-                      >
-                        {#if hasNoFields}
-                          <div class="font-medium">{t('portal.customize.addFields')}</div>
-                        {:else}
-                          <div>{t('portal.customize.fields')} ({requestType.field_count})</div>
+                        {#if requestType.workspace_name}
+                          <div>{requestType.workspace_name}{#if requestType.workspace_key}&nbsp;({requestType.workspace_key}){/if}</div>
                         {/if}
-                      </button>
+                      </div>
+                      {#if isSystemRequestType}
+                        <div class="text-xs" style="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};">
+                          {t('portal.customize.systemRequestTypeHelp')}
+                        </div>
+                      {:else}
+                        <button
+                          onclick={() => expandedRequestTypeForFields = isExpanded ? null : requestType}
+                          class="text-xs hover:underline text-right"
+                          style="color: {hasNoFields ? '#f59e0b' : 'var(--ds-text-link)'};"
+                        >
+                          {#if hasNoFields}
+                            <div class="font-medium">{t('portal.customize.addFields')}</div>
+                          {:else}
+                            <div>{t('portal.customize.fields')} ({requestType.field_count})</div>
+                          {/if}
+                        </button>
+                      {/if}
                     </div>
                   </div>
 
-                  <!-- Visibility Button -->
-                  <div class="flex-shrink-0">
-                    <Tooltip content={hasVisibilityRestrictions(requestType) ? t('portal.visibility.hasRestrictions') : t('portal.visibility.noRestrictions')} placement="top">
-                      {#snippet children()}
-                        <button
-                          onclick={() => openVisibilityModal(requestType)}
-                          class="p-1.5 rounded transition-all hover:bg-black/5"
-                          title={t('portal.visibility.configureVisibility')}
-                        >
-                          <Shield
-                            class="w-4 h-4"
-                            style="color: {hasVisibilityRestrictions(requestType) ? '#f59e0b' : (portalStore.isDarkMode ? '#94a3b8' : '#6b7280')};"
-                          />
-                        </button>
-                      {/snippet}
-                    </Tooltip>
-                  </div>
+                  <!-- Visibility Button (system rows are internal, never public) -->
+                  {#if !isSystemRequestType}
+                    {@render visibilityShield(hasVisibilityRestrictions(requestType), () => openVisibilityModal(requestType))}
+                  {/if}
 
                   <!-- Actions Dropdown -->
                   <div class="flex-shrink-0">
@@ -518,28 +688,38 @@
                       triggerStyle="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};"
                       showChevron={false}
                       iconOnly={true}
+                      triggerTestid="request-type-actions-{requestType.id}"
+                      triggerLabel={requestType.name}
                       placement="bottom-end"
-                      items={[
-                        {
-                          title: t('common.edit'),
-                          icon: Edit,
-                          onClick: () => onOpenRequestTypeModal('edit', requestType)
-                        },
-                        { type: 'divider' },
-                        {
-                          title: t('common.delete'),
-                          icon: Trash2,
-                          color: 'var(--ds-text-danger)',
-                          onClick: () => deleteRequestType(requestType.id)
-                        }
-                      ]}
+                      items={isSystemRequestType
+                        ? [
+                            {
+                              title: t('common.edit'),
+                              icon: Edit,
+                              onClick: () => onOpenRequestTypeModal('edit', requestType)
+                            }
+                          ]
+                        : [
+                            {
+                              title: t('common.edit'),
+                              icon: Edit,
+                              onClick: () => onOpenRequestTypeModal('edit', requestType)
+                            },
+                            { type: 'divider' },
+                            {
+                              title: t('common.delete'),
+                              icon: Trash2,
+                              color: 'var(--ds-text-danger)',
+                              onClick: () => deleteRequestType(requestType.id)
+                            }
+                          ]}
                     />
                   </div>
                 </div>
               </div>
             {/each}
 
-            {#if portalStore.requestTypes.length === 0}
+            {#if portalCatalogStore.requestTypes.length === 0}
               <div class="text-center py-8">
                 <p class="text-sm mb-4" style="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};">
                   {t('portal.customize.noRequestTypes')}
@@ -567,33 +747,26 @@
           </p>
         </div>
 
-        {#if portalStore.loadingAssetReports}
-          <div class="flex items-center justify-center py-8">
-            <Spinner />
-          </div>
+        {#if portalCatalogStore.loadingAssetReports}
+          <StateDisplay type="loading" />
         {:else}
           <!-- Asset Reports List -->
           <div class="space-y-2 mb-4">
-            {#each portalStore.assetReports as report}
+            {#each portalCatalogStore.assetReports as report}
               {@const ReportIcon = iconMap[report.icon] || Table2}
               <div
                 class="p-3 rounded border"
                 style="background-color: {portalStore.isDarkMode ? '#334155' : '#f9fafb'}; border-color: {portalStore.isDarkMode ? '#475569' : '#e5e7eb'};"
                 data-asset-report-card
                 data-asset-report-id={report.id}
+                data-testid="portal-customize-asset-report-card"
               >
                 <div class="flex items-start gap-3">
                   <!-- Icon Preview -->
-                  <div class="flex-shrink-0">
-                    <div class="w-8 h-8 rounded flex items-center justify-center" style="background-color: {report.color || '#6b7280'};">
-                      <ReportIcon size={16} color="white" />
-                    </div>
-                  </div>
+                  {@render cardIconBadge(report.color, ReportIcon)}
 
                   <!-- Drag Handle -->
-                  <div class="cursor-grab active:cursor-grabbing pt-1" style="color: {portalStore.isDarkMode ? '#64748b' : '#9ca3af'};" data-drag-handle>
-                    <GripVertical class="w-4 h-4" />
-                  </div>
+                  {@render dragHandle('portal-asset-report-drag-handle')}
 
                   <!-- Content -->
                   <div class="flex-1 min-w-0">
@@ -619,22 +792,7 @@
                   </div>
 
                   <!-- Visibility Button -->
-                  <div class="flex-shrink-0">
-                    <Tooltip content={hasAssetReportVisibilityRestrictions(report) ? t('portal.visibility.hasRestrictions') : t('portal.visibility.noRestrictions')} placement="top">
-                      {#snippet children()}
-                        <button
-                          onclick={() => openAssetReportVisibilityModal(report)}
-                          class="p-1.5 rounded transition-all hover:bg-black/5"
-                          title={t('portal.visibility.configureVisibility')}
-                        >
-                          <Shield
-                            class="w-4 h-4"
-                            style="color: {hasAssetReportVisibilityRestrictions(report) ? '#f59e0b' : (portalStore.isDarkMode ? '#94a3b8' : '#6b7280')};"
-                          />
-                        </button>
-                      {/snippet}
-                    </Tooltip>
-                  </div>
+                  {@render visibilityShield(hasAssetReportVisibilityRestrictions(report), () => openAssetReportVisibilityModal(report))}
 
                   <!-- Actions Dropdown -->
                   <div class="flex-shrink-0">
@@ -670,7 +828,7 @@
               </div>
             {/each}
 
-            {#if portalStore.assetReports.length === 0}
+            {#if portalCatalogStore.assetReports.length === 0}
               <div class="text-center py-8">
                 <p class="text-sm mb-4" style="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};">
                   {t('portal.customize.noAssetReports')}
@@ -703,15 +861,14 @@
             <label for="docmost-share-link" class="block text-xs font-medium mb-2" style="color: var(--ds-text);">
               {t('portal.customize.docmostShareLink')}
             </label>
-            <input
+            <Input
               id="docmost-share-link"
               type="text"
               value={portalStore.knowledgeBaseShareLink}
               oninput={(e) => portalStore.knowledgeBaseShareLink = /** @type {HTMLInputElement} */ (e.target).value}
               onblur={() => portalStore.saveKnowledgeBaseConfig()}
-              class="w-full px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
-              style="background-color: var(--ds-surface); color: var(--ds-text); border-color: var(--ds-border);"
               placeholder={t('portal.customize.docmostShareLinkPlaceholder')}
+              size="small"
             />
             <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
               {t('portal.customize.docmostShareLinkHelp')}
@@ -765,6 +922,124 @@
               <li>{t('portal.customize.docmostStep5')}</li>
             </ol>
           </div>
+
+          <!-- Workspace pages wiring -->
+          <div class="pt-4 border-t" style="border-color: var(--ds-border);" data-testid="kb-pages-wiring">
+            <h4 class="text-xs font-medium mb-2" style="color: var(--ds-text);">
+              {t('portal.customize.workspacePagesTitle')}
+            </h4>
+            <p class="text-xs mb-3" style="color: var(--ds-text-subtle);">
+              {t('portal.customize.workspacePagesDescription')}
+            </p>
+
+            {#if portalStore.knowledgeBasePageSources.length > 0}
+              <!-- Clear marker: this knowledge base exposes workspace pages -->
+              <div
+                class="p-3 rounded mb-3"
+                style="background-color: var(--ds-background-neutral); border-left: 3px solid #10b981;"
+                data-testid="kb-pages-wiring-notice"
+              >
+                <div class="flex items-start gap-2 text-xs font-medium" style="color: var(--ds-text);">
+                  <BookOpen class="w-4 h-4 flex-shrink-0" style="color: #10b981;" />
+                  <span>{t('portal.customize.workspacePagesNotice', { count: portalStore.knowledgeBasePageSources.length })}</span>
+                </div>
+              </div>
+              <div class="space-y-2 mb-3">
+                {#each portalStore.knowledgeBasePageSources as source, index}
+                  <div
+                    class="flex items-center justify-between p-2 rounded text-xs"
+                    style="background-color: var(--ds-surface-raised);"
+                    data-testid="kb-page-source-entry"
+                  >
+                    <span style="color: var(--ds-text);">
+                      {kbSourceLabel(source)}
+                    </span>
+                    <button
+                      type="button"
+                      class="p-1 rounded hover:opacity-70"
+                      aria-label={t('portal.customize.workspacePagesRemove')}
+                      data-testid="kb-remove-page-source"
+                      onclick={() => portalStore.removeKnowledgeBasePageSource(index)}
+                    >
+                      <Trash2 class="w-3.5 h-3.5" style="color: var(--ds-text-danger);" />
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            {:else}
+              <p class="text-xs mb-3" style="color: var(--ds-text-subtle);" data-testid="kb-pages-wiring-empty">
+                {t('portal.customize.workspacePagesEmpty')}
+              </p>
+            {/if}
+
+            <div class="space-y-2">
+              <div>
+                <label for="kb-add-workspace" class="block text-xs font-medium mb-1" style="color: var(--ds-text);">
+                  {t('portal.customize.workspacePagesPickWorkspace')}
+                </label>
+                <select
+                  id="kb-add-workspace"
+                  class="w-full text-xs rounded p-2"
+                  style="background-color: var(--ds-surface-raised); color: var(--ds-text); border-color: var(--ds-border);"
+                  bind:value={kbWorkspaceId}
+                  onchange={() => onKbWorkspaceChange()}
+                  data-testid="kb-add-workspace"
+                >
+                  <option value="">{t('portal.customize.workspacePagesPickWorkspacePlaceholder')}</option>
+                  {#each kbSelectableWorkspaces as workspace}
+                    <option value={String(workspace.id)}>{workspace.name}</option>
+                  {/each}
+                </select>
+                {#if kbAdminWorkspaceIds !== null && kbSelectableWorkspaces.length === 0}
+                  <p class="text-xs mt-1" style="color: var(--ds-text-subtle);" data-testid="kb-add-workspace-none">
+                    {t('portal.customize.workspacePagesNoEligible')}
+                  </p>
+                {/if}
+              </div>
+              {#if kbWorkspaceId}
+                <div>
+                  <label for="kb-add-scope" class="block text-xs font-medium mb-1" style="color: var(--ds-text);">
+                    {t('portal.customize.workspacePagesScope')}
+                  </label>
+                  <select
+                    id="kb-add-scope"
+                    class="w-full text-xs rounded p-2"
+                    style="background-color: var(--ds-surface-raised); color: var(--ds-text); border-color: var(--ds-border);"
+                    bind:value={kbScope}
+                    data-testid="kb-add-scope"
+                  >
+                    <option value="entire">{t('portal.customize.workspacePagesEntire')}</option>
+                    <option value="subtree">{t('portal.customize.workspacePagesSubtree')}</option>
+                  </select>
+                </div>
+                {#if kbScope === 'subtree'}
+                  <div>
+                    <label for="kb-add-page" class="block text-xs font-medium mb-1" style="color: var(--ds-text);">
+                      {t('portal.customize.workspacePagesPickPage')}
+                    </label>
+                    <PagePicker
+                      id="kb-add-page"
+                      workspaceId={Number(kbWorkspaceId)}
+                      bind:value={kbRootPageId}
+                      placeholder={t('portal.customize.workspacePagesPickPagePlaceholder')}
+                      inputTestid="kb-add-page"
+                      optionTestid={(opt) => `kb-add-page-option-${opt.item?.id}`}
+                    />
+                  </div>
+                {/if}
+                <button
+                  type="button"
+                  class="w-full p-2 rounded text-xs font-medium"
+                  style="background-color: var(--ds-interactive, #2563eb); color: #ffffff;"
+                  disabled={!kbAddReady}
+                  data-testid="kb-add-page-source"
+                  onclick={addKbPageSource}
+                >
+                  {t('portal.customize.workspacePagesAdd')}
+                </button>
+              {/if}
+            </div>
+          </div>
         </div>
       {/if}
     </div>
@@ -777,16 +1052,22 @@
      clean. -->
 {#if portalStore.showCustomizePanel && expandedRequestTypeForFields}
   <div
-    class="fixed top-0 left-[28rem] h-full w-[30rem] z-40 flex flex-col border-l"
-    style="background-color: var(--ds-surface-card); border-color: var(--ds-border); box-shadow: 24px 0 48px -12px rgba(0, 0, 0, 0.25);"
-    transition:fly={{ x: -240, duration: 220 }}
+    class="fixed left-[28rem] w-[30rem] z-40 flex flex-col border-l"
+    style="
+      top: {portalStore.isEditing ? '2.5rem' : '0'};
+      height: {portalStore.isEditing ? 'calc(100% - 2.5rem)' : '100%'};
+      background-color: var(--ds-surface-card);
+      border-color: var(--ds-border);
+      box-shadow: 24px 0 48px -12px rgba(0, 0, 0, 0.25);
+    "
+    data-testid="portal-fields-builder"
   >
     <RequestTypeFieldsBuilder
       requestTypeId={expandedRequestTypeForFields.id}
       requestTypeName={expandedRequestTypeForFields.name}
       channelId={portalStore.portalData?.channel_id}
       isDarkMode={portalStore.isDarkMode}
-      onsaved={() => portalStore.loadRequestTypes()}
+      onsaved={() => portalCatalogStore.loadRequestTypes()}
       onclose={() => expandedRequestTypeForFields = null}
     />
   </div>
@@ -797,7 +1078,6 @@
   isOpen={showVisibilityModal}
   requestType={selectedRequestTypeForVisibility}
   channelId={portalStore.portalData?.channel_id}
-  isDarkMode={portalStore.isDarkMode}
   onSaved={handleVisibilitySaved}
   onclose={closeVisibilityModal}
 />
@@ -807,7 +1087,6 @@
   isOpen={showAssetReportVisibilityModal}
   requestType={selectedAssetReportForVisibility}
   channelId={portalStore.portalData?.channel_id}
-  isDarkMode={portalStore.isDarkMode}
   onSaved={handleAssetReportVisibilitySaved}
   onclose={closeAssetReportVisibilityModal}
 />

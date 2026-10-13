@@ -1,10 +1,10 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { jiraImport } from './JiraImportStore.svelte.js';
   import { toHotkeyString, getShortcutDisplay } from '../utils/keyboardShortcuts.js';
   import JiraImportWizard from './JiraImportWizard.svelte';
   import Button from '../components/Button.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import Input from '../components/Input.svelte';
   import Modal from '../dialogs/Modal.svelte';
@@ -17,7 +17,7 @@
   import PageHeader from '../layout/PageHeader.svelte';
   import { addToast } from '../stores/toasts.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
-  import { formatDateTimeLocale } from '../utils/dateFormatter.js';
+  import { formatAuthenticatedDateTime as formatDateTimeLocale } from '../utils/authenticatedDateFormatter.js';
   import { confirm } from '../composables/useConfirm.js';
   import { safeHref } from '../utils/sanitize';
 
@@ -61,7 +61,7 @@
   async function deleteConnection(connectionId) {
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: 'Are you sure you want to delete this connection? This action cannot be undone.',
+      message: t('systemImport.deleteConnectionMessage'),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger'
@@ -69,7 +69,7 @@
     if (!confirmed) return;
     const result = await jiraImport.deleteSavedConnection(connectionId);
     if (result.success) {
-      addToast({ message: 'Connection deleted', variant: 'success' });
+      addToast({ message: t('systemImport.connectionDeleted'), variant: 'success' });
     } else {
       addToast({ message: result.error, variant: 'error' });
     }
@@ -83,6 +83,7 @@
   function getStatusColor(status) {
     switch (status) {
       case 'completed': return 'var(--ds-text-success)';
+      case 'completed_with_errors': return 'var(--ds-text-warning)';
       case 'running': return 'var(--ds-text-accent-blue)';
       case 'failed': return 'var(--ds-text-danger)';
       case 'data_deleted': return 'var(--ds-text-subtle)';
@@ -94,12 +95,27 @@
   function getStatusIcon(status) {
     switch (status) {
       case 'completed': return CheckCircle;
+      case 'completed_with_errors': return AlertTriangle;
       case 'running': return Loader;
       case 'failed': return XCircle;
       case 'data_deleted': return Trash2;
       case 'queued': return Clock;
       default: return Clock;
     }
+  }
+
+  function statusLabel(status) {
+    const known = new Set(['completed', 'running', 'failed', 'data_deleted', 'queued']);
+    return known.has(status) ? t(`systemImport.statuses.${status}`) : status?.replaceAll('_', ' ');
+  }
+
+  function phaseLabel(phase) {
+    const known = new Set(['initializing', 'importing_project', 'completed', 'running']);
+    return known.has(phase) ? t(`systemImport.phases.${phase}`) : phase?.replaceAll('_', ' ');
+  }
+
+  function scopeLabel(scope) {
+    return scope === 'work_items' ? t('systemImport.scopes.workItems') : scope?.replaceAll('_', ' ');
   }
 
   function canDeleteImportedData(job) {
@@ -127,7 +143,7 @@
     });
     isDeletingImportedData = false;
     if (result.success) {
-      addToast({ message: 'Imported Jira data deleted. You can re-run this import now.', variant: 'success' });
+      addToast({ message: t('systemImport.dataDeleted'), variant: 'success' });
       closeDeleteImportedData();
     } else {
       addToast({ message: result.error, variant: 'error' });
@@ -137,45 +153,44 @@
 
 <div class="space-y-8">
   <!-- Page Header -->
-  <PageHeader title="System Import" subtitle="Import data from Jira Cloud and other external systems" icon={Cloud}>
+  <PageHeader title={t('systemImport.title')} subtitle={t('systemImport.subtitle')} icon={Cloud}>
     {#snippet actions()}
-      <Button variant="primary" onclick={() => openWizard()} keyboardHint={getShortcutDisplay('systemImport', 'add')} hotkeyConfig={{ key: toHotkeyString('systemImport', 'add'), guard: () => !showWizard }}>
+      <!-- shortcut-guard-exempt: the configured systemImport.add hotkey and its visible hint are declared on this button -->
+      <Button dataTestid="jira-import-new" variant="primary" onclick={() => openWizard()} keyboardHint={getShortcutDisplay('systemImport', 'add')} hotkeyConfig={{ key: toHotkeyString('systemImport', 'add'), guard: () => !showWizard }}>
         <Plus size={16} class="mr-2" />
-        New Import
+        {t('systemImport.newImport')}
       </Button>
     {/snippet}
   </PageHeader>
 
   <!-- Saved Connections Section -->
-  <div class="rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
+  <div data-testid="jira-import-connections" class="rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
     <div class="px-6 py-4 border-b" style="border-color: var(--ds-border);">
       <div class="flex items-center gap-2">
         <Link size={18} style="color: var(--ds-text-subtle);" />
-        <h2 class="text-lg font-medium" style="color: var(--ds-text);">Saved Connections</h2>
+        <h2 class="text-lg font-medium" style="color: var(--ds-text);">{t('systemImport.savedConnections')}</h2>
       </div>
       <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
-        Manage your Jira Cloud connections for importing data
+        {t('systemImport.savedConnectionsDescription')}
       </p>
     </div>
 
     <div class="p-6">
       {#if savedConnections.isLoading}
-        <div class="flex items-center justify-center py-8">
-          <Spinner size="md" />
-        </div>
+        <StateDisplay type="loading" />
       {:else if savedConnections.error}
         <AlertBox variant="error" message={savedConnections.error} />
       {:else if savedConnections.items.length === 0}
         <div class="text-center py-8">
           <Cloud class="w-12 h-12 mx-auto opacity-50" style="color: var(--ds-text-subtle);" />
           <p class="mt-4 text-sm" style="color: var(--ds-text-subtle);">
-            No saved connections yet. Start a new import to connect to Jira Cloud.
+            {t('systemImport.noConnections')}
           </p>
         </div>
       {:else}
         <div class="space-y-3">
           {#each savedConnections.items as connection}
-            <div class="p-4 rounded-lg border flex items-center justify-between"
+            <div data-testid={`jira-import-connection-${connection.id}`} class="p-4 rounded-lg border flex items-center justify-between"
                  style="border-color: var(--ds-border); background: var(--ds-surface);">
               <div class="flex items-center gap-4">
                 <div class="w-10 h-10 rounded-lg flex items-center justify-center"
@@ -200,18 +215,18 @@
                     </span>
                     {#if connection.last_used_at}
                       <span class="text-xs" style="color: var(--ds-text-subtle);">
-                        Last used: {formatDate(connection.last_used_at)}
+                        {t('systemImport.lastUsed')}: {formatDate(connection.last_used_at)}
                       </span>
                     {/if}
                   </div>
                 </div>
               </div>
               <div class="flex items-center gap-2">
-                <Button variant="secondary" size="small" onclick={() => openWizard(connection.id)}>
+                <Button dataTestid="jira-import-connection-start" variant="secondary" size="small" onclick={() => openWizard(connection.id)}>
                   <PlayCircle size={14} class="mr-1" />
-                  Start Import
+                  {t('jiraImport.buttons.startImport')}
                 </Button>
-                <Button variant="danger-ghost" size="small" icon={Trash2} title="Delete connection" onclick={() => deleteConnection(connection.id)}></Button>
+                <Button variant="danger-ghost" size="small" icon={Trash2} title={t('systemImport.deleteConnection')} onclick={() => deleteConnection(connection.id)}></Button>
               </div>
             </div>
           {/each}
@@ -221,29 +236,27 @@
   </div>
 
   <!-- Import History Section -->
-  <div class="rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
+  <div data-testid="jira-import-history" class="rounded-lg border" style="border-color: var(--ds-border); background: var(--ds-surface-raised);">
     <div class="px-6 py-4 border-b" style="border-color: var(--ds-border);">
       <div class="flex items-center gap-2">
         <Clock size={18} style="color: var(--ds-text-subtle);" />
-        <h2 class="text-lg font-medium" style="color: var(--ds-text);">Import History</h2>
+        <h2 class="text-lg font-medium" style="color: var(--ds-text);">{t('systemImport.importHistory')}</h2>
       </div>
       <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
-        View the status and results of previous imports
+        {t('systemImport.importHistoryDescription')}
       </p>
     </div>
 
     <div class="p-6">
       {#if importJobs.isLoading}
-        <div class="flex items-center justify-center py-8">
-          <Spinner size="md" />
-        </div>
+        <StateDisplay type="loading" />
       {:else if importJobs.error}
         <AlertBox variant="error" message={importJobs.error} />
       {:else if importJobs.items.length === 0}
         <div class="text-center py-8">
           <Clock class="w-12 h-12 mx-auto opacity-50" style="color: var(--ds-text-subtle);" />
           <p class="mt-4 text-sm" style="color: var(--ds-text-subtle);">
-            No imports yet. Start a new import to see the history here.
+            {t('systemImport.noImports')}
           </p>
         </div>
       {:else}
@@ -252,34 +265,40 @@
             <thead>
               <tr style="border-bottom: 1px solid var(--ds-border);">
                 <th class="text-left py-3 px-4 text-xs font-semibold tracking-wide"
-                    style="color: var(--ds-text);">Status</th>
+                    style="color: var(--ds-text);">{t('common.status')}</th>
                 <th class="text-left py-3 px-4 text-xs font-semibold tracking-wide"
-                    style="color: var(--ds-text);">Instance</th>
+                    style="color: var(--ds-text);">{t('systemImport.instance')}</th>
                 <th class="text-left py-3 px-4 text-xs font-semibold tracking-wide"
-                    style="color: var(--ds-text);">Scope</th>
+                    style="color: var(--ds-text);">{t('systemImport.scope')}</th>
                 <th class="text-left py-3 px-4 text-xs font-semibold tracking-wide"
-                    style="color: var(--ds-text);">Started</th>
+                    style="color: var(--ds-text);">{t('systemImport.started')}</th>
                 <th class="text-left py-3 px-4 text-xs font-semibold tracking-wide"
-                    style="color: var(--ds-text);">Completed</th>
+                    style="color: var(--ds-text);">{t('systemImport.completed')}</th>
                 <th class="text-left py-3 px-4 text-xs font-semibold tracking-wide"
-                    style="color: var(--ds-text);">Actions</th>
+                    style="color: var(--ds-text);">{t('common.actions')}</th>
               </tr>
             </thead>
             <tbody>
               {#each importJobs.items as job}
                 {@const StatusIcon = getStatusIcon(job.status)}
-                <tr style="border-bottom: 1px solid var(--ds-border);">
+                <tr
+                  data-testid="jira-import-history-row"
+                  data-job-id={job.id}
+                  data-imported-comments={job.progress?.imported_comments || 0}
+                  data-imported-attachments={job.progress?.imported_attachments || 0}
+                  style="border-bottom: 1px solid var(--ds-border);"
+                >
                   <td class="py-3 px-4">
                     <div class="flex items-center gap-2">
                       <StatusIcon size={16} style="color: {getStatusColor(job.status)};"
                                   class={job.status === 'running' ? 'animate-spin' : ''} />
-                      <span class="text-sm capitalize" style="color: {getStatusColor(job.status)};">
-                        {job.status.replace('_', ' ')}
+                      <span data-testid="jira-import-history-status" class="text-sm capitalize" style="color: {getStatusColor(job.status)};">
+                        {statusLabel(job.status)}
                       </span>
                     </div>
                     {#if job.phase && job.status === 'running'}
                       <span class="text-xs mt-1 block" style="color: var(--ds-text-subtle);">
-                        {job.phase}
+                        {phaseLabel(job.phase)}
                       </span>
                     {/if}
                     {#if job.error_message}
@@ -297,15 +316,16 @@
                     <div class="flex flex-col gap-1">
                       <span class="text-xs px-2 py-1 rounded capitalize w-fit"
                             style="background: var(--ds-background-neutral); color: var(--ds-text-subtle);">
-                        {job.scope.replace('_', ' ')}
+                        {scopeLabel(job.scope)}
                       </span>
                       {#if job.project_keys?.length}
                         <span class="text-xs" style="color: var(--ds-text-subtle);">
-                          Projects: {job.project_keys.join(', ')}
+                          {t('systemImport.projects')}: {job.project_keys.join(', ')}
                         </span>
                       {/if}
-                      <span class="text-xs" style="color: var(--ds-text-subtle);">
-                        {job.imported_workspace_count || 0} workspace(s), {job.imported_item_count || 0} item(s)
+                      <span data-testid="jira-import-history-counts" class="text-xs" style="color: var(--ds-text-subtle);">
+                        {t('systemImport.workspaceCount', { count: job.imported_workspace_count || 0 })},
+                        {t('systemImport.itemCount', { count: job.imported_item_count || 0 })}
                       </span>
                     </div>
                   </td>
@@ -322,12 +342,12 @@
                   <td class="py-3 px-4">
                     {#if canDeleteImportedData(job)}
                       <Button variant="danger-ghost" size="small" icon={Trash2} onclick={() => openDeleteImportedData(job)}>
-                        Delete data
+                        {t('systemImport.deleteData')}
                       </Button>
                     {:else if job.status === 'data_deleted'}
-                      <span class="text-xs" style="color: var(--ds-text-subtle);">Deleted</span>
+                      <span class="text-xs" style="color: var(--ds-text-subtle);">{t('common.deleted')}</span>
                     {:else}
-                      <span class="text-xs" style="color: var(--ds-text-subtle);">Unavailable</span>
+                      <span class="text-xs" style="color: var(--ds-text-subtle);">{t('systemImport.unavailable')}</span>
                     {/if}
                   </td>
                 </tr>
@@ -349,14 +369,14 @@
     onSubmit={deleteImportedData}
     submitDisabled={!canConfirmDeleteImportData || isDeletingImportedData}
   >
-    <ModalHeader title="Delete imported Jira data" showCloseButton={!isDeletingImportedData} />
+    <ModalHeader title={t('systemImport.deleteImportedTitle')} showCloseButton={!isDeletingImportedData} />
     <div class="px-6 py-5 space-y-4">
       <div class="flex gap-3 rounded-lg border p-4" style="border-color: var(--ds-border-warning); background: var(--ds-background-warning-subtle);">
         <AlertTriangle class="w-5 h-5 flex-shrink-0" style="color: var(--ds-text-warning);" />
         <div class="space-y-2">
-          <p class="font-medium" style="color: var(--ds-text);">This can delete multiple Windshift workspaces.</p>
+          <p class="font-medium" style="color: var(--ds-text);">{t('systemImport.deleteWarningTitle')}</p>
           <p class="text-sm" style="color: var(--ds-text-subtle);">
-            Windshift will delete all entities recorded in this Jira import job, including mapped workspaces, items, comments, attachments, links, milestones, and related import data. This cannot be undone.
+            {t('systemImport.deleteWarningDescription')}
           </p>
         </div>
       </div>
@@ -364,18 +384,21 @@
       <div class="rounded-lg border p-4 space-y-3" style="border-color: var(--ds-border); background: var(--ds-surface);">
         <div class="grid grid-cols-2 gap-4 text-sm">
           <div>
-            <p class="text-xs font-medium uppercase" style="color: var(--ds-text-subtle);">Job ID</p>
+            <p class="text-xs font-medium uppercase" style="color: var(--ds-text-subtle);">{t('systemImport.jobId')}</p>
             <p class="font-mono" style="color: var(--ds-text);">{deleteJob.id}</p>
           </div>
           <div>
-            <p class="text-xs font-medium uppercase" style="color: var(--ds-text-subtle);">Imported scope</p>
-            <p style="color: var(--ds-text);">{deleteJob.imported_workspace_count || 0} workspace(s), {deleteJob.imported_item_count || 0} item(s)</p>
+            <p class="text-xs font-medium uppercase" style="color: var(--ds-text-subtle);">{t('systemImport.importedScope')}</p>
+            <p style="color: var(--ds-text);">
+              {t('systemImport.workspaceCount', { count: deleteJob.imported_workspace_count || 0 })},
+              {t('systemImport.itemCount', { count: deleteJob.imported_item_count || 0 })}
+            </p>
           </div>
         </div>
 
         {#if deleteJob.imported_workspaces?.length}
           <div>
-            <p class="text-xs font-medium uppercase mb-2" style="color: var(--ds-text-subtle);">Workspaces that may be removed</p>
+            <p class="text-xs font-medium uppercase mb-2" style="color: var(--ds-text-subtle);">{t('systemImport.workspacesToRemove')}</p>
             <div class="flex flex-wrap gap-2">
               {#each deleteJob.imported_workspaces as workspace}
                 <span class="text-xs px-2 py-1 rounded border" style="border-color: var(--ds-border); color: var(--ds-text); background: var(--ds-surface-raised);">
@@ -389,7 +412,7 @@
 
       <div class="space-y-2">
         <label for="delete-import-confirmation" class="text-sm font-medium" style="color: var(--ds-text);">
-          Type the job ID to confirm deletion
+          {t('systemImport.typeJobId')}
         </label>
         <Input
           id="delete-import-confirmation"
@@ -402,7 +425,7 @@
     <DialogFooter
       onCancel={closeDeleteImportedData}
       onConfirm={deleteImportedData}
-      confirmLabel="Delete imported data"
+      confirmLabel={t('systemImport.deleteImportedData')}
       variant="danger"
       loading={isDeletingImportedData}
       confirmDisabled={!canConfirmDeleteImportData}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
@@ -180,8 +181,9 @@ func runProjectInit() error {
 	}
 	workspace := wsCtx.Workspace
 	statuses := wsCtx.Statuses
+	statusAliases := generateDefaultAliases(statuses)
 
-	if err := writeWindshiftMD(client, wsCtx, "WINDSHIFT.md"); err != nil {
+	if err := writeWindshiftMD(client, wsCtx, statusAliases, "WINDSHIFT.md"); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintln(stdout, "Created WINDSHIFT.md")
@@ -197,15 +199,14 @@ func runProjectInit() error {
 		Defaults: DefaultsConfig{
 			WorkspaceKey: workspace.Key,
 		},
-		StatusAliases: generateDefaultAliases(statuses),
+		StatusAliases: statusAliases,
 	}
 	if err := saveProjectConfig(projectConfig, "./ws.toml"); err != nil {
 		return fmt.Errorf("failed to save ws.toml: %w", err)
 	}
 	_, _ = fmt.Fprintln(stdout, "Updated ws.toml")
 
-	updateAgentsFile("AGENTS.md")
-	updateAgentsFile("CLAUDE.md")
+	updateAgentsFiles()
 
 	_, _ = fmt.Fprintf(stdout, "\nProject initialized for workspace %s (%s)\n", workspace.Key, workspace.Name)
 	if projectAgentName != "" {
@@ -297,6 +298,8 @@ type windshiftMDData struct {
 	HasTransitions  bool
 	InitialStatuses string // pre-joined ", "
 	Transitions     []windshiftTransitionRow
+	CLIVersion      string
+	GeneratedAt     string
 }
 
 type windshiftStatusRow struct {
@@ -312,12 +315,14 @@ type windshiftTransitionRow struct {
 	To   string // pre-joined ", "
 }
 
-func generateWindshiftMD(ws *Workspace, statuses []Status, itemTypes []ItemType, transitions []Transition) string {
+func generateWindshiftMD(ws *Workspace, statuses []Status, itemTypes []ItemType, transitions []Transition, statusAliases map[string]string, generatedAt time.Time) string {
 	data := windshiftMDData{
 		Workspace:     ws,
-		StatusAliases: cfg.StatusAliases,
+		StatusAliases: statusAliases,
 		ItemTypes:     itemTypes,
 		Statuses:      make([]windshiftStatusRow, 0, len(statuses)),
+		CLIVersion:    version,
+		GeneratedAt:   generatedAt.UTC().Format(time.RFC3339),
 	}
 	for _, s := range statuses {
 		data.Statuses = append(data.Statuses, windshiftStatusRow{
@@ -378,10 +383,9 @@ func yesIf(b bool) string {
 
 // writeWindshiftMD renders WINDSHIFT.md from the workspace context and
 // writes it to path. Used by both `ws init` (during project setup) and
-// `ws config docs` (refresh-only). Transitions are best-effort: if the
-// workflow lookup fails, we still emit the file without the transitions
-// table rather than aborting the whole render.
-func writeWindshiftMD(client *Client, wsCtx *WorkspaceContext, path string) error {
+// `ws config docs` (refresh-only). A transition lookup failure aborts the
+// refresh so an unavailable workflow cannot be rendered as an empty one.
+func writeWindshiftMD(client *Client, wsCtx *WorkspaceContext, statusAliases map[string]string, path string) error {
 	var defaultWorkflow *Workflow
 	for i := range wsCtx.Workflows {
 		if wsCtx.Workflows[i].IsDefault {
@@ -391,10 +395,14 @@ func writeWindshiftMD(client *Client, wsCtx *WorkspaceContext, path string) erro
 	}
 	var transitions []Transition
 	if defaultWorkflow != nil {
-		transitions, _ = client.GetWorkflowTransitions(defaultWorkflow.ID)
+		var err error
+		transitions, err = client.GetWorkflowTransitions(defaultWorkflow.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get transitions for default workflow %q: %w", defaultWorkflow.Name, err)
+		}
 	}
 
-	content := generateWindshiftMD(wsCtx.Workspace, wsCtx.Statuses, wsCtx.ItemTypes, transitions)
+	content := generateWindshiftMD(wsCtx.Workspace, wsCtx.Statuses, wsCtx.ItemTypes, transitions, statusAliases, time.Now())
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil { //nolint:gosec // G306: project doc, group-readable is fine
 		return fmt.Errorf("failed to write %s: %w", path, err)
 	}
@@ -449,27 +457,62 @@ func generateDefaultAliases(statuses []Status) map[string]string {
 	return aliases
 }
 
-func updateAgentsFile(filename string) {
-	content, err := os.ReadFile(filename) //nolint:gosec // G304 — filename is a hardcoded literal
-	if err != nil {
-		// File doesn't exist, skip
-		return
+func updateAgentsFiles() {
+	files := []struct {
+		name   string
+		update func(string) (string, bool)
+	}{
+		{
+			name: "AGENTS.md",
+			update: func(content string) (string, bool) {
+				if strings.Contains(content, "WINDSHIFT.md") {
+					return content, false
+				}
+				return content + "\n\n## Windshift Integration\n\nRead [WINDSHIFT.md](./WINDSHIFT.md) before using the `ws` CLI.\n", true
+			},
+		},
+		{
+			name: "CLAUDE.md",
+			update: func(content string) (string, bool) {
+				imports := make([]string, 0, 2)
+				if !containsLine(content, "@AGENTS.md") {
+					imports = append(imports, "@AGENTS.md")
+				}
+				if !containsLine(content, "@WINDSHIFT.md") {
+					imports = append(imports, "@WINDSHIFT.md")
+				}
+				if len(imports) == 0 {
+					return content, false
+				}
+				return content + "\n\n" + strings.Join(imports, "\n") + "\n", true
+			},
+		},
 	}
 
-	// Check if already has Windshift reference
-	if strings.Contains(string(content), "WINDSHIFT.md") {
-		return
+	for _, file := range files {
+		content, err := os.ReadFile(file.name)
+		if err != nil {
+			continue
+		}
+		updated, changed := file.update(string(content))
+		if !changed {
+			continue
+		}
+		if err := os.WriteFile(file.name, []byte(updated), 0o600); err != nil {
+			_, _ = fmt.Fprintf(stdout, "Warning: Could not update %s: %s\n", file.name, err)
+			continue
+		}
+		_, _ = fmt.Fprintf(stdout, "Updated %s with agent context\n", file.name)
 	}
+}
 
-	// Append Windshift section
-	addition := "\n\n## Windshift Integration\n\nSee [WINDSHIFT.md](./WINDSHIFT.md) for task management commands.\n"
-
-	if err := os.WriteFile(filename, append(content, []byte(addition)...), 0o600); err != nil { //nolint:gosec // G703: filename is hardcoded at call site
-		_, _ = fmt.Fprintf(stdout, "Warning: Could not update %s: %s\n", filename, err)
-		return
+func containsLine(content, want string) bool {
+	for line := range strings.SplitSeq(content, "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
 	}
-
-	_, _ = fmt.Fprintf(stdout, "Updated %s with Windshift reference\n", filename)
+	return false
 }
 
 func init() {

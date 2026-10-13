@@ -32,8 +32,6 @@ import (
 	"golang.org/x/image/draw"
 )
 
-var errAttachmentPathOutsideRoot = errors.New("attachment path is outside configured storage root")
-
 type AttachmentHandler struct {
 	db                    database.Database
 	attachmentPath        string
@@ -43,6 +41,10 @@ type AttachmentHandler struct {
 	approvalService       *services.ApprovalService       // for approver-derived item.view fallback (optional, may be nil)
 	pagePermissionService *services.PagePermissionService // for entity_type='page' uploads (optional)
 }
+
+const maxThumbnailSourcePixels = 25_000_000
+
+var errThumbnailSourceTooLarge = errors.New("thumbnail source dimensions exceed the pixel limit")
 
 func NewAttachmentHandler(db database.Database, attachmentPath string, permissionService *services.PermissionService) *AttachmentHandler {
 	return &AttachmentHandler{
@@ -81,13 +83,8 @@ func (h *AttachmentHandler) SetChannelService(cs *services.ChannelService) {
 // its workspace). Mirrors the 404-not-403 invariant used for item attachments
 // to avoid disclosing existence of resources outside the caller's reach.
 func (h *AttachmentHandler) authorizeTestCaseAttachmentAccess(w http.ResponseWriter, r *http.Request, testCaseID int, permission string) bool {
-	var wsID int
-	err := h.db.QueryRow(`
-		SELECT workspace_id
-		FROM test_cases
-		WHERE id = ?
-	`, testCaseID).Scan(&wsID)
-	if errors.Is(err, sql.ErrNoRows) {
+	wsID, err := repository.NewTestCaseRepository(h.db).GetWorkspaceID(testCaseID)
+	if errors.Is(err, repository.ErrNotFound) {
 		respondNotFound(w, r, "attachment")
 		return false
 	}
@@ -122,14 +119,8 @@ func (h *AttachmentHandler) authorizeTestCaseAttachmentAccess(w http.ResponseWri
 // PermissionTestExecute so that the privilege required to remove a result
 // attachment matches the privilege required to upload it.
 func (h *AttachmentHandler) authorizeTestResultAttachmentAccess(w http.ResponseWriter, r *http.Request, testResultID int, permission string) bool {
-	var wsID int
-	err := h.db.QueryRow(`
-		SELECT run.workspace_id
-		FROM test_results tr
-		JOIN test_runs run ON tr.run_id = run.id
-		WHERE tr.id = ?
-	`, testResultID).Scan(&wsID)
-	if errors.Is(err, sql.ErrNoRows) {
+	wsID, err := repository.NewTestRunRepository(h.db).GetWorkspaceIDForResult(testResultID)
+	if errors.Is(err, repository.ErrNotFound) {
 		respondNotFound(w, r, "attachment")
 		return false
 	}
@@ -158,20 +149,6 @@ func (h *AttachmentHandler) authorizeTestResultAttachmentAccess(w http.ResponseW
 	return true
 }
 
-// checkItemAttachmentPermission checks if the user can modify attachments on an item.
-// Requires item.edit permission in the item's workspace. The route is gated by
-// AuthMiddleware.RequireAuth (internal users only), so portal customer sessions
-// never reach here; if portal-customer attachment access is ever enabled it must
-// land on a separate, portal-scoped surface rather than be threaded through this
-// polymorphic handler.
-func (h *AttachmentHandler) checkItemAttachmentPermission(r *http.Request, itemID int) (bool, error) {
-	user := utils.GetCurrentUser(r)
-	if user == nil {
-		return false, nil
-	}
-	return h.attachmentService.CanModifyItemAttachment(&user.ID, nil, itemID)
-}
-
 // IsEnabled checks if attachments are enabled (attachment path is set)
 func (h *AttachmentHandler) IsEnabled() bool {
 	return h.attachmentPath != ""
@@ -186,82 +163,13 @@ func (h *AttachmentHandler) IsEnabled() bool {
 // every branch can assume an authenticated session.
 func (h *AttachmentHandler) authorizeUploadEntity(w http.ResponseWriter, r *http.Request, entityType string, entityID int) bool {
 	switch entityType {
-	case "item":
-		exists, err := repository.NewItemRepository(h.db).Exists(entityID)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return false
-		}
-		if !exists {
-			respondNotFound(w, r, "item")
-			return false
-		}
-		canModify, err := h.checkItemAttachmentPermission(r, entityID)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return false
-		}
-		if !canModify {
-			respondNotFound(w, r, "item")
-			return false
-		}
-		return true
-
-	case "page":
-		// Resolve workspace via pages and gate on page-edit. When the
-		// page-permission evaluator is wired (production wiring in
-		// server.go), use it so per-page ACL grants are honored; otherwise
-		// fall back to a workspace page.edit check.
-		var wsID int
-		err := h.db.QueryRow(`SELECT workspace_id FROM pages WHERE id = ?`, entityID).Scan(&wsID)
-		if errors.Is(err, sql.ErrNoRows) {
-			respondNotFound(w, r, "page")
-			return false
-		}
-		if err != nil {
-			respondInternalError(w, r, err)
-			return false
-		}
-		user, ok := RequireAuth(w, r)
-		if !ok {
-			return false
-		}
-		if h.pagePermissionService != nil {
-			can, perr := h.pagePermissionService.Can(user.ID, wsID, entityID, services.PageOpEdit)
-			if perr != nil {
-				respondInternalError(w, r, perr)
-				return false
-			}
-			if !can {
-				respondNotFound(w, r, "page")
-				return false
-			}
-			return true
-		}
-		allowed, err := h.permissionService.HasWorkspacePermission(user.ID, wsID, models.PermissionPageEdit)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return false
-		}
-		if !allowed {
-			respondNotFound(w, r, "page")
-			return false
-		}
-		return true
-
 	case "test_case":
 		return h.authorizeTestCaseAttachmentAccess(w, r, entityID, models.PermissionTestManage)
 
 	case "test_result":
 		// Resolve workspace via test_results -> test_runs and gate on test.execute.
-		var wsID int
-		err := h.db.QueryRow(`
-			SELECT run.workspace_id
-			FROM test_results tr
-			JOIN test_runs run ON tr.run_id = run.id
-			WHERE tr.id = ?
-		`, entityID).Scan(&wsID)
-		if errors.Is(err, sql.ErrNoRows) {
+		wsID, err := repository.NewTestRunRepository(h.db).GetWorkspaceIDForResult(entityID)
+		if errors.Is(err, repository.ErrNotFound) {
 			respondNotFound(w, r, "test_result")
 			return false
 		}
@@ -313,13 +221,13 @@ func (h *AttachmentHandler) authorizeUploadEntity(w http.ResponseWriter, r *http
 	case "team_avatar":
 		// entity_id is the team id. Mirror canManageTeam in teams.go:
 		// teams.manage global perm OR team admin role on this team.
-		var exists bool
-		if err := h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM teams WHERE id = ?)", entityID).Scan(&exists); err != nil {
+		teamRepo := repository.NewTeamRepository(h.db)
+		if _, err := teamRepo.GetByID(entityID); err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				respondNotFound(w, r, "team")
+				return false
+			}
 			respondInternalError(w, r, err)
-			return false
-		}
-		if !exists {
-			respondNotFound(w, r, "team")
 			return false
 		}
 		user, ok := RequireAuth(w, r)
@@ -334,11 +242,8 @@ func (h *AttachmentHandler) authorizeUploadEntity(w http.ResponseWriter, r *http
 		if hasPerm {
 			return true
 		}
-		var isAdmin bool
-		if err := h.db.QueryRow(`
-			SELECT EXISTS(SELECT 1 FROM team_members
-			              WHERE team_id = ? AND user_id = ? AND role = 'admin')
-		`, entityID, user.ID).Scan(&isAdmin); err != nil {
+		isAdmin, err := teamRepo.IsTeamAdmin(entityID, user.ID)
+		if err != nil {
 			respondInternalError(w, r, err)
 			return false
 		}
@@ -413,9 +318,10 @@ func (h *AttachmentHandler) authorizeUploadEntity(w http.ResponseWriter, r *http
 		respondNotFound(w, r, "channel")
 		return false
 
-	case "hub_logo":
-		// Hub config is system-admin-only; keep its public logo upload aligned
-		// with PUT /api/hub/config.
+	case "hub_logo", "theme_logo":
+		// Hub and theme branding are system-admin surfaces (PUT /api/hub/config
+		// and the admin-only theme routes); keep their public logo uploads
+		// aligned with those authorization contracts.
 		user, ok := RequireAuth(w, r)
 		if !ok {
 			return false
@@ -450,9 +356,7 @@ func (h *AttachmentHandler) authorizeUploadEntity(w http.ResponseWriter, r *http
 
 // Upload handles file upload to an item
 func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
-	// FIXME(human-review): This handler mixes entity resolution, permissions, validation,
-	// filesystem writes, thumbnailing, DB writes, and response shaping in one very large
-	// method. Split by entity type / storage concern once the auth rules below are clarified.
+	// FIXME: split authorization from storage concerns.
 	slog.Debug("upload request received", slog.String("component", "attachments"))
 
 	if !h.IsEnabled() {
@@ -461,10 +365,9 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Limit request body size at the HTTP level before parsing
+	// Cap the request before parsing.
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 
-	// Parse form data (32MB max)
 	slog.Debug("parsing multipart form", slog.String("component", "attachments"))
 	// #nosec G120 -- the body is already capped by MaxBytesReader above; the int arg is the in-memory threshold, not the upper bound
 	err := r.ParseMultipartForm(32 << 20)
@@ -474,8 +377,7 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get entity info from form
-	// Support both old (item_id) and new (entity_type + entity_id) parameters
+	// Accept legacy item_id and current entity parameters.
 	entityIDStr := r.FormValue("entity_id")
 	if entityIDStr == "" {
 		entityIDStr = r.FormValue("item_id") // Backwards compatibility
@@ -483,7 +385,7 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	entityType := r.FormValue("entity_type")
 	category := r.FormValue("category")
 
-	// Determine entity type from category for backwards compatibility
+	// Derive a missing entity type for legacy clients.
 	if entityType == "" {
 		switch category {
 		case "avatar":
@@ -502,6 +404,8 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 			entityType = "portal_logo"
 		case "hub_logo":
 			entityType = "hub_logo"
+		case "theme_logo":
+			entityType = "theme_logo"
 		default:
 			entityType = "item" // Default to item for backwards compatibility
 		}
@@ -518,7 +422,8 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	isPortalBackground := entityType == "portal_background"
 	isPortalLogo := entityType == "portal_logo"
 	isHubLogo := entityType == "hub_logo"
-	isImageEntityType := isAvatar || isWorkspaceAvatar || isTeamAvatar || isCustomerAvatar || isWorkspaceBackground || isPortalBackground || isPortalLogo || isHubLogo
+	isThemeLogo := entityType == "theme_logo"
+	isImageEntityType := isAvatar || isWorkspaceAvatar || isTeamAvatar || isCustomerAvatar || isWorkspaceBackground || isPortalBackground || isPortalLogo || isHubLogo || isThemeLogo
 
 	// category is an older image-asset discriminator used by /api/portal-assets.
 	// Keep it in lockstep with entity_type so callers cannot make an item/test
@@ -535,9 +440,11 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	// (item, test_case, test_result, workspace/team/customer scoped image
 	// assets). Portal logo/background uploads use entity_id as the owning
 	// channel id so public URLs cannot be minted by arbitrary users. The truly
-	// global uploads — user avatar and hub logo — need no owner id here.
+	// global uploads — user avatar, hub logo, and theme logo — need no owner
+	// id here.
 	entityIDRequired := entityType != "avatar" &&
-		entityType != "hub_logo"
+		entityType != "hub_logo" &&
+		entityType != "theme_logo"
 	if entityIDStr == "" && entityIDRequired {
 		slog.Debug("missing entity_id in form", slog.String("component", "attachments"))
 		respondValidationError(w, r, "entity_id is required")
@@ -555,11 +462,15 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Debug("uploading to entity", slog.String("component", "attachments"), slog.String("entity_type", entityType), slog.Int("entity_id", entityID))
 
+	if entityType == "item" || entityType == "page" {
+		h.uploadDomainAttachment(w, r, entityType, entityID)
+		return
+	}
+
 	if !h.authorizeUploadEntity(w, r, entityType, entityID) {
 		return
 	}
 
-	// Get file from form
 	slog.Debug("getting file from form", slog.String("component", "attachments"))
 	file, fileHeader, err := r.FormFile("file")
 	if err != nil {
@@ -570,7 +481,6 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = file.Close() }()
 	slog.Debug("file received", slog.String("component", "attachments"), slog.String("filename", fileHeader.Filename), slog.Int64("size", fileHeader.Size), slog.String("content_type", fileHeader.Header.Get("Content-Type")))
 
-	// Read entire file into memory to avoid multipart.File seek issues
 	slog.Debug("reading file into memory", slog.String("component", "attachments"))
 	fileData, err := io.ReadAll(file)
 	if err != nil {
@@ -580,7 +490,7 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Debug("file data read", slog.String("component", "attachments"), slog.Int("bytes", len(fileData)))
 
-	// SECURITY: Validate file extension against dangerous extensions blacklist
+	// Validate both the filename and detected content before writing anything.
 	slog.Debug("validating file extension", slog.String("component", "attachments"))
 	if err = h.validateFileExtension(fileHeader.Filename); err != nil {
 		slog.Warn("extension validation failed", slog.String("component", "attachments"), slog.Any("error", err))
@@ -588,7 +498,6 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SECURITY: Verify actual file content matches extension
 	slog.Debug("verifying file content", slog.String("component", "attachments"))
 	detectedMimeType, err := h.verifyFileContentFromBytes(fileData, fileHeader.Filename)
 	if err != nil {
@@ -598,7 +507,6 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Debug("content verified", slog.String("component", "attachments"), slog.String("mime_type", detectedMimeType))
 
-	// SECURITY: For image-only entity types, restrict to known image extensions
 	if isImageEntityType {
 		if !isAllowedImageExtension(fileHeader.Filename) {
 			respondValidationError(w, r, fmt.Sprintf(
@@ -608,7 +516,6 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Get attachment settings for validation
 	slog.Debug("getting attachment settings", slog.String("component", "attachments"))
 	settings, err := h.getAttachmentSettings()
 	if err != nil {
@@ -623,7 +530,6 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate file size
 	if fileHeader.Size > settings.MaxFileSize {
 		respondValidationError(w, r, fmt.Sprintf("File too large. Maximum size: %d bytes", settings.MaxFileSize))
 		return
@@ -651,7 +557,7 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Generate unique filename
+	// Store files under an entity-specific directory with a generated name.
 	slog.Debug("generating unique filename", slog.String("component", "attachments"), slog.String("original_filename", fileHeader.Filename))
 	uniqueFilename, err := h.generateUniqueFilename(fileHeader.Filename)
 	if err != nil {
@@ -661,7 +567,6 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Debug("generated filename", slog.String("component", "attachments"), slog.String("unique_filename", uniqueFilename))
 
-	// Ensure attachment directory exists based on entity type
 	var itemDir string
 	switch entityType {
 	case "avatar":
@@ -680,6 +585,8 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		itemDir = filepath.Join(h.attachmentPath, "portal_logos")
 	case "hub_logo":
 		itemDir = filepath.Join(h.attachmentPath, "hub_logos")
+	case "theme_logo":
+		itemDir = filepath.Join(h.attachmentPath, "theme_logos")
 	case "test_case":
 		itemDir = filepath.Join(h.attachmentPath, "test_cases", strconv.Itoa(entityID))
 	case "test_result":
@@ -694,11 +601,9 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create file path
 	filePath := filepath.Join(itemDir, uniqueFilename)
 	slog.Debug("creating file", slog.String("component", "attachments"), slog.String("path", filePath))
 
-	// Write file data directly (already in memory from earlier read)
 	slog.Debug("writing file data", slog.String("component", "attachments"))
 	err = os.WriteFile(filePath, fileData, 0o600) //nolint:gosec // G703: path from hardcoded base + strconv.Itoa
 	if err != nil {
@@ -709,17 +614,14 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	fileSize := int64(len(fileData))
 	slog.Debug("file saved", slog.String("component", "attachments"), slog.Int64("bytes", fileSize))
 
-	// Get uploader ID from context/session
 	var uploaderID *int
 	if user := utils.GetCurrentUser(r); user != nil {
 		uploaderID = &user.ID
 	}
 
-	// Save attachment record to database
 	// Use the detected MIME type from content verification (not client header)
 	mimeType := detectedMimeType
 
-	// Generate thumbnail for images
 	hasThumbnail := false
 	var thumbnailPath string
 	if strings.HasPrefix(mimeType, "image/") {
@@ -737,10 +639,6 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	slog.Debug("saving attachment record to database", slog.String("component", "attachments"))
 
-	// entity_type and category columns are ensured at startup by the
-	// migrations array in internal/database/{database,postgres}.go.
-
-	// Insert attachment record via service
 	attachmentSvc := services.NewAttachmentService(h.db)
 	attachmentID, err := attachmentSvc.CreateRecord(services.CreateAttachmentParams{
 		ItemID:           entityID,
@@ -762,8 +660,7 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For avatar type checks below
-	var attachmentEntityID interface{}
+	var attachmentEntityID any
 	if isImageEntityType {
 		attachmentEntityID = nil
 	} else {
@@ -771,17 +668,15 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Debug("attachment saved", slog.String("component", "attachments"), slog.Int64("attachment_id", attachmentID))
 
-	// Record history for item attachments only (not test_case, avatars, etc.)
 	if entityType == "item" && attachmentEntityID != nil {
 		if entityIDInt, ok := attachmentEntityID.(int); ok {
-			if err = h.attachmentService.RecordItemHistory(entityIDInt, uploaderID, "attachment_uploaded", nil, attachmentID, fileHeader.Filename); err != nil {
+			if err = h.attachmentService.RecordItemHistory(entityIDInt, services.AttachmentHistoryActor{UserID: uploaderID}, "attachment_uploaded", nil, attachmentID, fileHeader.Filename); err != nil {
 				slog.Warn("failed to record attachment history", slog.String("component", "attachments"), slog.Any("error", err))
 				// Don't fail the whole operation if history recording fails
 			}
 		}
 	}
 
-	// For avatars, also update the user's avatar_url with the attachment download URL
 	if isAvatar && uploaderID != nil {
 		avatarURL := fmt.Sprintf("/api/attachments/%d/download", attachmentID)
 		slog.Debug("updating user avatar_url", slog.String("component", "attachments"), slog.Int("user_id", *uploaderID), slog.String("avatar_url", avatarURL))
@@ -795,12 +690,10 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Return success response
 	if isImageEntityType {
-		// For avatars, backgrounds, and logos, return the appropriate download URL
-		// Portal branding (logo, background, hub_logo) uses public endpoint, others use authenticated endpoint
+		// Image uploads use public or authenticated download URLs by entity type.
 		var downloadURL string
-		if isPortalBackground || isPortalLogo || isHubLogo {
+		if isPortalBackground || isPortalLogo || isHubLogo || isThemeLogo {
 			// Public endpoint for portal branding (no auth required)
 			downloadURL = fmt.Sprintf("/api/portal-assets/%d", attachmentID)
 		} else {
@@ -828,8 +721,11 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		case isHubLogo:
 			message = "Hub logo uploaded successfully"
 			urlKey = "logo_url"
+		case isThemeLogo:
+			message = "Theme logo uploaded successfully"
+			urlKey = "logo_url"
 		}
-		response := map[string]interface{}{
+		response := map[string]any{
 			"success":       true,
 			"message":       message,
 			urlKey:          downloadURL,
@@ -862,156 +758,63 @@ func (h *AttachmentHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GetByItem returns attachments for a specific item with pagination support
-func (h *AttachmentHandler) GetByItem(w http.ResponseWriter, r *http.Request) {
-	itemID, ok := requireIDParam(w, r, "itemId")
-	if !ok {
-		return
-	}
-
-	var err error
-
-	// Get user from context and check permissions
+func (h *AttachmentHandler) uploadDomainAttachment(w http.ResponseWriter, r *http.Request, entityType string, entityID int) {
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
 	}
-
-	// Look up the item to get its workspace_id for permission check
-	workspaceID, err := repository.NewItemRepository(h.db).GetWorkspaceID(itemID)
+	file, header, err := r.FormFile("file")
 	if err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
-			respondNotFound(w, r, "item")
-			return
-		}
-		respondInternalError(w, r, err)
+		respondBadRequest(w, r, "Failed to get file from form: "+err.Error())
 		return
 	}
-
-	// Check workspace view permission. Active approvers without workspace
-	// item.view are allowed through so they can browse attachments on the
-	// item they're reviewing.
-	if h.permissionService != nil {
-		var canView bool
-		canView, err = userCanViewItemAsActor(user.ID, itemID, workspaceID, h.permissionService, h.approvalService)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-		if !canView {
-			respondNotFound(w, r, "item")
-			return
-		}
-	}
-
-	// Parse pagination parameters
-	page := 1
-	limit := 50     // Default items per page
-	maxLimit := 100 // Maximum items that can be returned from API
-
-	if pageStr := r.URL.Query().Get("page"); pageStr != "" {
-		var p int
-		if p, err = strconv.Atoi(pageStr); err == nil && p > 0 {
-			page = p
-		}
-	}
-
-	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
-		var l int
-		if l, err = strconv.Atoi(limitStr); err == nil && l > 0 {
-			limit = l
-			if limit > maxLimit {
-				limit = maxLimit
-			}
-		}
-	}
-
-	offset := (page - 1) * limit
-
-	// Get total count first
-	var totalCount int
-	err = h.db.QueryRow(`
-		SELECT COUNT(*) FROM attachments WHERE item_id = ? AND entity_type = 'item'
-	`, itemID).Scan(&totalCount)
-
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(file)
 	if err != nil {
-		respondInternalError(w, r, err)
+		respondInternalError(w, r, fmt.Errorf("failed to read file data: %w", err))
 		return
 	}
 
-	// Query attachments with uploader info and pagination
-	rows, err := h.db.Query(`
-		SELECT a.id, a.item_id, a.filename, a.original_filename, a.mime_type, a.file_size,
-		       a.uploaded_by, a.has_thumbnail, a.created_at,
-		       u.first_name || ' ' || u.last_name as uploader_name, u.email as uploader_email
-		FROM attachments a
-		LEFT JOIN users u ON a.uploaded_by = u.id
-		WHERE a.item_id = ? AND a.entity_type = 'item'
-		ORDER BY a.created_at DESC
-		LIMIT ? OFFSET ?
-	`, itemID, limit, offset)
-
+	var response models.AttachmentUploadResponse
+	switch entityType {
+	case "item":
+		response, err = services.NewItemAttachmentService(h.db, h.attachmentPath, h.permissionService).UploadItemAttachment(services.ItemAttachmentUploadInput{
+			ItemID: entityID, UploaderID: user.ID, OriginalFilename: header.Filename,
+			FileData: data, FileSize: int64(len(data)),
+		})
+	case "page":
+		response, err = services.NewPageAttachmentUploadService(h.db, h.attachmentPath, h.permissionService, h.pagePermissionService).UploadPageAttachment(services.PageAttachmentUploadInput{
+			PageID: entityID, UploaderID: user.ID, OriginalFilename: header.Filename,
+			FileData: data, FileSize: int64(len(data)),
+		})
+	}
 	if err != nil {
-		respondInternalError(w, r, err)
+		h.respondDomainUploadError(w, r, entityType, err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-
-	var attachments []models.Attachment
-	for rows.Next() {
-		var attachment models.Attachment
-		var itemID sql.NullInt64
-		var uploaderName, uploaderEmail sql.NullString
-
-		err := rows.Scan(
-			&attachment.ID, &itemID, &attachment.Filename, &attachment.OriginalFilename,
-			&attachment.MimeType, &attachment.FileSize, &attachment.UploadedBy, &attachment.HasThumbnail, &attachment.CreatedAt,
-			&uploaderName, &uploaderEmail,
-		)
-		if err != nil {
-			respondInternalError(w, r, err)
-			return
-		}
-
-		if itemID.Valid {
-			id := int(itemID.Int64)
-			attachment.ItemID = &id
-		}
-		if uploaderName.Valid {
-			attachment.UploaderName = uploaderName.String
-		}
-		if uploaderEmail.Valid {
-			attachment.UploaderEmail = uploaderEmail.String
-		}
-
-		attachments = append(attachments, attachment)
-	}
-	if err := rows.Err(); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Create paginated response
-	response := models.PaginatedAttachmentsResponse{
-		Attachments: attachments,
-		Pagination: models.PaginationMeta{
-			Page:       page,
-			Limit:      limit,
-			Total:      totalCount,
-			TotalPages: (totalCount + limit - 1) / limit,
-		},
-	}
-
 	respondJSONOK(w, response)
 }
 
-// authorizeAttachmentRead gates read access to an attachment (Download and
-// Thumbnail) based on its entity_type. itemID is the attachment's item_id
-// column (nil when NULL). Returns true if the caller may serve the bytes;
-// otherwise it has already written the response and the caller must return.
-//
-// All denials respond 404 (no existence disclosure); genuine internal errors
-// respond 500. See WI-46 for why every entity_type is handled explicitly.
+func (h *AttachmentHandler) respondDomainUploadError(w http.ResponseWriter, r *http.Request, entityType string, err error) {
+	if errors.Is(err, services.ErrItemAttachmentDisabled) || errors.Is(err, services.ErrPageAttachmentUploadDisabled) {
+		respondServiceUnavailable(w, r, "Attachments are not enabled on this server")
+		return
+	}
+	if errors.Is(err, services.ErrItemAttachmentNotFound) || errors.Is(err, services.ErrPageAttachmentUploadNotFound) {
+		respondNotFound(w, r, entityType)
+		return
+	}
+	for _, sentinel := range []error{services.ErrItemAttachmentInvalid, services.ErrPageAttachmentUploadInvalid} {
+		if errors.Is(err, sentinel) {
+			respondValidationError(w, r, strings.TrimPrefix(err.Error(), sentinel.Error()+": "))
+			return
+		}
+	}
+	respondInternalError(w, r, err)
+}
+
+// authorizeAttachmentRead gates download/thumbnail access by entity type.
+// Denials return 404 to avoid disclosure; callers return after a false result.
 func (h *AttachmentHandler) authorizeAttachmentRead(w http.ResponseWriter, r *http.Request, entityType string, itemID *int) bool {
 	switch entityType {
 	case "test_case":
@@ -1027,19 +830,14 @@ func (h *AttachmentHandler) authorizeAttachmentRead(w http.ResponseWriter, r *ht
 		}
 		return h.authorizeTestResultAttachmentAccess(w, r, *itemID, models.PermissionTestView)
 	case "item", "":
-		// Empty entity_type covers legacy rows inserted before the column
-		// existed; they're all item attachments. Item-typed rows must have a
-		// non-NULL item_id per WI-46; a NULL here means a corrupt or
-		// invariant-violating row and must not be served.
+		// Empty legacy types are items; missing item IDs are corrupt and never served.
 		if itemID == nil {
 			respondNotFound(w, r, "attachment")
 			return false
 		}
 		return CheckItemPermissionAsActor(w, r, repository.NewItemRepository(h.db), h.permissionService, h.approvalService, *itemID, models.PermissionItemView)
 	case "page":
-		// Workspace knowledge pages: gate downloads on page.view via the
-		// PagePermissionService so per-page ACLs are honored. Falls back to
-		// workspace page.view if the service isn't wired (degraded mode).
+		// Honor per-page ACLs, falling back to workspace page.view in degraded mode.
 		if itemID == nil {
 			respondNotFound(w, r, "attachment")
 			return false
@@ -1168,25 +966,17 @@ func (h *AttachmentHandler) Download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", attachment.MimeType)
 	w.Header().Set("Content-Length", strconv.FormatInt(attachment.FileSize, 10))
 
-	// SECURITY: Add security headers to prevent attacks
-	// Prevent browsers from MIME-sniffing the response
+	// Prevent MIME sniffing and embedding.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	// Prevent embedding in iframes
 	w.Header().Set("X-Frame-Options", "DENY")
-	// Control how the file is displayed/downloaded
-	// Force download for potentially dangerous types (HTML, JS, SVG) to prevent XSS
-	if strings.HasPrefix(attachment.MimeType, "text/html") ||
-		strings.HasPrefix(attachment.MimeType, "application/javascript") ||
-		strings.HasPrefix(attachment.MimeType, "text/javascript") ||
-		strings.HasPrefix(attachment.MimeType, "image/svg+xml") ||
-		strings.Contains(attachment.MimeType, "script") {
-		// Force download for dangerous types
+	// Inline only allowlisted types; MIME may be remote-declared. Other files
+	// download with a restrictive CSP to prevent app-origin execution.
+	if isInlineSafeMimeType(attachment.MimeType) {
+		w.Header().Set("Content-Disposition", fileserve.ContentDisposition("inline", attachment.OriginalFilename))
+	} else {
 		w.Header().Set("Content-Disposition", fileserve.ContentDisposition("attachment", attachment.OriginalFilename))
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
-		slog.Debug("forcing download for potentially dangerous file type", slog.String("component", "attachments"), slog.String("mime_type", attachment.MimeType))
-	} else {
-		// Allow inline display for safe types (images, PDFs, etc.)
-		w.Header().Set("Content-Disposition", fileserve.ContentDisposition("inline", attachment.OriginalFilename))
+		slog.Debug("forcing download for non-allowlisted file type", slog.String("component", "attachments"), slog.String("mime_type", attachment.MimeType))
 	}
 
 	// Serve file
@@ -1206,10 +996,6 @@ func (h *AttachmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	// Get user from context for history tracking and audit context.
 	currentUser := utils.GetCurrentUser(r)
-	var userID *int
-	if currentUser != nil {
-		userID = &currentUser.ID
-	}
 
 	// Get attachment details before deletion (for history tracking and permission check)
 	details, err := h.attachmentService.GetAttachmentDetails(attachmentID)
@@ -1221,34 +1007,32 @@ func (h *AttachmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
-
-	// Authorize per entity_type. Every branch decides explicitly; a NULL
-	// item_id on an item-like row is treated as 404 (the WI-46 invariant
-	// should make this unreachable). Branding/avatar attachments are
-	// refused via this endpoint — their lifecycle is owned by the parent
-	// entity (workspace/team/customer/portal/hub update flows already
-	// orphan the old URL when a new asset is uploaded). The lone exception
-	// is "avatar" (user profile picture), which we allow the original
-	// uploader to delete since there's no parent record beyond the
-	// users.avatar_url string pointer.
-	switch details.EntityType {
-	case "item", "":
-		if details.ItemID == nil {
+	if details.EntityType == "item" || details.EntityType == "" {
+		if currentUser == nil || details.ItemID == nil {
 			respondNotFound(w, r, "attachment")
 			return
 		}
-		var canModify bool
-		canModify, err = h.checkItemAttachmentPermission(r, *details.ItemID)
-		if err != nil {
-			slog.Error("failed to check attachment permission", slog.String("component", "attachments"), slog.Any("error", err))
+		itemAttachments := services.NewItemAttachmentService(h.db, h.attachmentPath, h.permissionService)
+		if err := itemAttachments.DeleteItemAttachment(attachmentID, currentUser.ID); err != nil {
+			if errors.Is(err, services.ErrItemAttachmentNotFound) {
+				respondNotFound(w, r, "attachment")
+				return
+			}
 			respondInternalError(w, r, err)
 			return
 		}
-		if !canModify {
-			slog.Debug("user lacks permission to delete attachment from item", slog.String("component", "attachments"), slog.Int("item_id", *details.ItemID))
-			respondNotFound(w, r, "item")
-			return
-		}
+		logAuditWithDetails(h.db, r, currentUser, logger.ActionAttachmentDelete, logger.ResourceAttachment, &attachmentID, details.OriginalFilename, map[string]any{
+			"entity_type":       details.EntityType,
+			"item_id":           details.ItemID,
+			"original_filename": details.OriginalFilename,
+		})
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Authorize each entity type explicitly. Missing item IDs return 404;
+	// parent-owned branding avatars are refused, except uploader-owned profiles.
+	switch details.EntityType {
 	case "test_case":
 		if details.ItemID == nil {
 			respondNotFound(w, r, "attachment")
@@ -1304,20 +1088,12 @@ func (h *AttachmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		// workspace_avatar, workspace_background, team_avatar,
-		// customer_avatar, portal_background, portal_logo, hub_logo, and
-		// any unknown entity_type. Refuse — the parent entity owns the
-		// lifecycle. Unknown types likewise default-deny so a future
-		// entity_type can't accidentally land in a permissive branch.
+		// customer_avatar, portal_background, portal_logo, hub_logo,
+		// theme_logo, and any unknown entity_type. Refuse — the parent
+		// entity owns the lifecycle. Unknown types likewise default-deny so a
+		// future entity_type can't accidentally land in a permissive branch.
 		respondNotFound(w, r, "attachment")
 		return
-	}
-
-	// Record history if attachment is associated with a work item.
-	if details.ItemID != nil && userID != nil && (details.EntityType == "item" || details.EntityType == "") {
-		if err = h.attachmentService.RecordItemHistory(*details.ItemID, userID, "attachment_deleted", &details.OriginalFilename, 0, details.OriginalFilename); err != nil {
-			slog.Warn("failed to record attachment deletion history", slog.String("component", "attachments"), slog.Any("error", err))
-			// Don't fail the whole operation if history recording fails
-		}
 	}
 
 	// Delete from database
@@ -1333,7 +1109,7 @@ func (h *AttachmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if currentUser != nil {
-		logAuditWithDetails(h.db, r, currentUser, logger.ActionAttachmentDelete, logger.ResourceAttachment, &attachmentID, details.OriginalFilename, map[string]interface{}{
+		logAuditWithDetails(h.db, r, currentUser, logger.ActionAttachmentDelete, logger.ResourceAttachment, &attachmentID, details.OriginalFilename, map[string]any{
 			"entity_type":       details.EntityType,
 			"item_id":           details.ItemID,
 			"original_filename": details.OriginalFilename,
@@ -1363,7 +1139,6 @@ func (h *AttachmentHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 
-	// Get attachment info
 	var hasThumbnail bool
 	var thumbnailPath string
 	var mimeType string
@@ -1416,38 +1191,31 @@ func (h *AttachmentHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = file.Close() }()
 
-	// Get file info for size
 	fileInfo, err := file.Stat()
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to get file info: %w", err))
 		return
 	}
 
-	// Set headers for thumbnail (always JPEG)
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 	w.Header().Set("Cache-Control", "public, max-age=31536000") // Cache for 1 year
 
-	// Serve thumbnail
 	_, _ = io.Copy(w, file)
 }
 
 // verifyFileContentFromBytes detects actual file content from bytes and validates it matches the extension
 func (h *AttachmentHandler) verifyFileContentFromBytes(fileData []byte, filename string) (string, error) {
-	// Use first 512 bytes for content detection (or less if file is smaller)
 	detectSize := 512
 	if len(fileData) < detectSize {
 		detectSize = len(fileData)
 	}
 
-	// Detect actual content type from file content
 	detectedType := http.DetectContentType(fileData[:detectSize])
 
-	// Get expected type from file extension
 	ext := filepath.Ext(filename)
 	expectedType := mime.TypeByExtension(ext)
 
-	// Validate content matches extension (if we have an expected type)
 	if expectedType != "" {
 		// Extract base type (before semicolon and parameters)
 		detectedBase := strings.Split(detectedType, ";")[0]
@@ -1479,6 +1247,43 @@ func (h *AttachmentHandler) verifyFileContentFromBytes(fileData []byte, filename
 	return detectedType, nil
 }
 
+// inlineSafeMimeTypes is the allowlist of Content-Types that may be served with
+// an inline Content-Disposition. Every entry is a non-executable media type that
+// a browser renders without running embedded script. Anything outside this set —
+// including HTML/XHTML/SVG/MathML and any unknown type — is forced to download.
+var inlineSafeMimeTypes = map[string]struct{}{
+	"image/png":                {},
+	"image/jpeg":               {},
+	"image/gif":                {},
+	"image/webp":               {},
+	"image/bmp":                {},
+	"image/x-icon":             {},
+	"image/vnd.microsoft.icon": {},
+	"application/pdf":          {},
+	"text/plain":               {},
+	"audio/mpeg":               {},
+	"audio/ogg":                {},
+	"audio/wav":                {},
+	"audio/x-wav":              {},
+	"audio/webm":               {},
+	"video/mp4":                {},
+	"video/webm":               {},
+	"video/ogg":                {},
+}
+
+// isInlineSafeMimeType reports whether a stored Content-Type may be served
+// inline. The declared type (before any parameters such as "; charset=") is
+// matched case-insensitively against the allowlist; SVG is deliberately absent
+// because it can carry script.
+func isInlineSafeMimeType(mimeType string) bool {
+	base := strings.ToLower(strings.TrimSpace(mimeType))
+	if i := strings.IndexByte(base, ';'); i >= 0 {
+		base = strings.TrimSpace(base[:i])
+	}
+	_, ok := inlineSafeMimeTypes[base]
+	return ok
+}
+
 // isZipBasedMimeType returns true if the MIME type is a known ZIP-based container format.
 // These formats use ZIP as their container (PK magic bytes), so http.DetectContentType
 // will report them as application/zip.
@@ -1504,7 +1309,6 @@ func looksLikeJSON(data []byte) bool {
 
 // validateFileExtension checks if the file extension is allowed (not in dangerous list)
 func (h *AttachmentHandler) validateFileExtension(filename string) error {
-	// List of dangerous extensions that could be used for attacks
 	dangerousExtensions := []string{
 		".exe", ".bat", ".cmd", ".com", ".pif", ".scr", ".msi", // Windows executables
 		".js", ".jsx", ".ts", ".tsx", // JavaScript/TypeScript (XSS risk)
@@ -1519,14 +1323,12 @@ func (h *AttachmentHandler) validateFileExtension(filename string) error {
 
 	ext := strings.ToLower(filepath.Ext(filename))
 
-	// Check if extension is in the dangerous list
 	for _, dangerous := range dangerousExtensions {
 		if ext == dangerous {
 			return fmt.Errorf("file extension %s is not allowed for security reasons", ext)
 		}
 	}
 
-	// Additional check: reject files with no extension
 	if ext == "" || ext == "." {
 		return fmt.Errorf("files without extensions are not allowed")
 	}
@@ -1549,13 +1351,11 @@ func isAllowedImageExtension(filename string) bool {
 func (h *AttachmentHandler) generateUniqueFilename(originalFilename string) (string, error) {
 	ext := filepath.Ext(originalFilename)
 
-	// Generate random bytes for filename
 	randomBytes := make([]byte, 16)
 	if _, err := rand.Read(randomBytes); err != nil {
 		return "", err
 	}
 
-	// Create hex string from random bytes
 	randomStr := fmt.Sprintf("%x", randomBytes)
 
 	return randomStr + ext, nil
@@ -1599,7 +1399,19 @@ func (h *AttachmentHandler) generateThumbnail(originalPath, filename string) (st
 	}
 	defer func() { _ = file.Close() }()
 
-	// Decode image
+	config, _, err := image.DecodeConfig(file)
+	if err != nil {
+		slog.Error("failed to read image dimensions", slog.String("component", "attachments"), slog.Any("error", err))
+		return "", err
+	}
+	if config.Width <= 0 || config.Height <= 0 || config.Width > maxThumbnailSourcePixels/config.Height {
+		return "", fmt.Errorf("%w: %dx%d exceeds %d pixels", errThumbnailSourceTooLarge, config.Width, config.Height, maxThumbnailSourcePixels)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind image after dimension check: %w", err)
+	}
+
+	// Decode image after its declared dimensions pass the allocation bound.
 	slog.Debug("decoding image", slog.String("component", "attachments"))
 	img, format, err := image.Decode(file)
 	if err != nil {

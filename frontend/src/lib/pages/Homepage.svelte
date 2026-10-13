@@ -1,16 +1,28 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import { authStore, homepageStore, permissionStore, isSystemAdmin, workspacesStore } from '../stores';
   import { t } from '../stores/i18n.svelte.js';
   import DashboardOnboarding from './DashboardOnboarding.svelte';
   import Text from '../components/Text.svelte';
   import Button from '../components/Button.svelte';
-  import { Edit3, LayoutGrid, Plus, Pencil, Trash2, X } from '@lucide/svelte';
+  import Input from '../components/Input.svelte';
+  import {
+    ChevronDown,
+    ChevronUp,
+    Edit3,
+    LayoutGrid,
+    Plus,
+    Pencil,
+    Trash2,
+    X,
+  } from '@lucide/svelte';
   import { useEventListener } from 'runed';
   import { confirm } from '../composables/useConfirm.js';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 
   import {
+    getDashboardSectionDisplay,
+    getDashboardSectionSaveValues,
     getDashboardWidgetMetadata,
   } from '../services/dashboardWidgetRegistry.js';
 
@@ -27,8 +39,19 @@
   import RecentWorkspacesWidget from '../widgets/dashboard/RecentWorkspacesWidget.svelte';
   import AssignedToMeWidget from '../widgets/dashboard/AssignedToMeWidget.svelte';
   import PersonalTasksWidget from '../widgets/dashboard/PersonalTasksWidget.svelte';
+  import SupportOverviewWidget from '../widgets/SupportOverviewWidget.svelte';
+  import SavedSearchWidget from '../widgets/dashboard/SavedSearchWidget.svelte';
 
   let greeting = $derived(homepageStore.greeting);
+  let greetingText = $derived(greeting ? t(greeting) : '');
+  let userName = $derived(authStore.currentUser?.first_name || '');
+  let personalizedGreeting = $derived(
+    greetingText
+      ? userName
+        ? t('dashboard.salutation.withName', { salutation: greetingText, name: userName })
+        : t('dashboard.salutation.withoutName', { salutation: greetingText })
+      : ''
+  );
   let currentDate = $derived(homepageStore.currentDate);
   let totalWorkspaceCount = $derived(homepageStore.totalWorkspaceCount);
   let totalItemCount = $derived(homepageStore.totalItemCount);
@@ -102,27 +125,44 @@
     homepageStore.toggleCustomizeMode();
   }
 
-  function addSection() {
-    const created = homepageStore.addSection('New Section', '');
+  async function addSection() {
+    const created = homepageStore.addSection(t('dashboard.editor.newSection'), '');
     editingSectionId = created.id;
     editingSectionTitle = created.title;
     editingSectionSubtitle = created.subtitle;
     isNewSection = true;
+
+    await tick();
+    const titleInput = /** @type {HTMLInputElement | null} */ (
+      document.getElementById(`dashboard-section-title-${created.id}`)
+    );
+    titleInput?.focus({ preventScroll: true });
+    titleInput?.select();
+    document.getElementById(`dashboard-section-${created.id}`)?.scrollIntoView({
+      behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+      block: 'center',
+    });
   }
 
   function startEditingSection(section) {
+    const display = getDashboardSectionDisplay(section, t);
     editingSectionId = section.id;
-    editingSectionTitle = section.title;
-    editingSectionSubtitle = section.subtitle || '';
+    editingSectionTitle = display.title;
+    editingSectionSubtitle = display.subtitle || '';
     isNewSection = false;
   }
 
   function saveSection() {
     if (!editingSectionId) return;
-    homepageStore.updateSection(editingSectionId, {
+    const draft = {
       title: editingSectionTitle,
       subtitle: editingSectionSubtitle,
-    });
+    };
+    const section = sections.find((candidate) => candidate.id === editingSectionId);
+    homepageStore.updateSection(
+      editingSectionId,
+      section ? getDashboardSectionSaveValues(section, draft, t) : draft
+    );
     editingSectionId = null;
     isNewSection = false;
   }
@@ -148,7 +188,7 @@
   async function handleDeleteSection(sectionId) {
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: 'Delete this section? All widgets in this section will be removed.',
+      message: t('dashboard.editor.deleteSectionConfirm'),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger',
@@ -162,7 +202,11 @@
   }
 
   function updateWidgetWidth(widgetId, newWidth) {
-    homepageStore.updateWidgetWidth(widgetId, newWidth);
+    return homepageStore.updateWidgetWidth(widgetId, newWidth);
+  }
+
+  function updateWidgetConfig(widgetId, configChanges) {
+    homepageStore.updateWidgetConfig(widgetId, configChanges);
   }
 
   // --- Drag and drop ---
@@ -237,7 +281,8 @@
   }
 
   function getWidgetTitle(type) {
-    return getDashboardWidgetMetadata(type)?.name || type;
+    const metadata = getDashboardWidgetMetadata(type);
+    return metadata ? t(metadata.nameKey) : type;
   }
 
   function getSectionWidgets(sectionId) {
@@ -250,13 +295,18 @@
   bind:activeCategory={customizationCategory}
 />
 
-<div class="min-h-screen max-w-7xl mx-auto px-6 pt-8 pb-6" style="background-color: var(--ds-surface);">
+<div
+  class="max-w-7xl mx-auto px-6 pt-8 pb-6"
+  style="background-color: var(--ds-surface);"
+  data-testid="homepage"
+  data-ready={layoutLoaded}
+>
   <!-- Greeting + action buttons -->
   {#if !isOnboarding}
     <div class="mb-6 flex items-start justify-between gap-4">
       <div>
         <Text as="h1" size="2xl" weight="semibold">
-          {greeting}, {authStore.currentUser?.first_name || 'there'}!
+          {personalizedGreeting}
         </Text>
         <Text as="p" size="sm" variant="subtle">{currentDate}</Text>
       </div>
@@ -265,15 +315,16 @@
           variant={isEditMode ? 'primary' : 'default'}
           icon={isEditMode ? X : Edit3}
           onclick={toggleEditMode}
+          dataTestid="dashboard-edit-toggle"
         >
-          {isEditMode ? 'Done Editing' : 'Edit'}
+          {isEditMode ? t('dashboard.editor.doneEditing') : t('common.edit')}
         </Button>
         <Button
           variant={isCustomizeMode ? 'primary' : 'default'}
           icon={isCustomizeMode ? X : LayoutGrid}
           onclick={toggleCustomizeMode}
         >
-          {isCustomizeMode ? 'Done' : 'Customize'}
+          {isCustomizeMode ? t('common.done') : t('dashboard.editor.customize')}
         </Button>
       </div>
     </div>
@@ -285,7 +336,7 @@
       <DashboardOnboarding
         workspaceCount={totalWorkspaceCount}
         itemCount={totalItemCount}
-        userName={authStore.currentUser?.first_name || 'there'}
+        {userName}
         ondismiss={handleOnboardingDismiss}
         {canCreateWorkspaces}
         {accessibleWorkspaces}
@@ -295,7 +346,7 @@
     <DashboardOnboarding
       workspaceCount={totalWorkspaceCount}
       itemCount={totalItemCount}
-      userName={authStore.currentUser?.first_name || 'there'}
+      {userName}
       ondismiss={handleOnboardingDismiss}
       {canCreateWorkspaces}
       {accessibleWorkspaces}
@@ -311,10 +362,17 @@
       >
         <div class="flex items-center gap-2 text-sm" style="color: var(--ds-status-info-text);">
           <Edit3 class="h-4 w-4" />
-          <span>Edit mode: add, rename, or delete sections and widgets</span>
+          <span>{t('dashboard.editor.editModeDescription')}</span>
         </div>
-        <Button variant="primary" size="small" icon={Plus} onclick={addSection}>
-          Add Section
+        <!-- shortcut-guard-exempt: contextual edit-mode action -->
+        <Button
+          variant="primary"
+          size="small"
+          icon={Plus}
+          onclick={addSection}
+          dataTestid="dashboard-add-section"
+        >
+          {t('dashboard.editor.addSection')}
         </Button>
       </div>
     {/if}
@@ -322,58 +380,95 @@
     <!-- Sections + widgets -->
     {#if layoutLoaded}
       <div class="space-y-10">
-        {#each sections as section (section.id)}
+        {#each sections as section, sectionIndex (section.id)}
           {@const sectionWidgets = getSectionWidgets(section.id)}
-          <section>
+          {@const sectionDisplay = getDashboardSectionDisplay(section, t)}
+          <section
+            id={`dashboard-section-${section.id}`}
+            data-testid="dashboard-section"
+            aria-label={sectionDisplay.title || t('dashboard.editor.sectionLabel')}
+          >
             <!-- Section header -->
             <div class="flex items-center justify-between mb-4">
               {#if editingSectionId === section.id}
                 <div class="flex-1 flex items-center gap-2 flex-wrap">
-                  <input
+                  <Input
+                    id={`dashboard-section-title-${section.id}`}
                     type="text"
                     bind:value={editingSectionTitle}
-                    class="px-3 py-2 border rounded text-lg font-semibold"
-                    style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-                    placeholder="Section title"
+                    class="text-lg font-semibold"
+                    placeholder={t('dashboard.editor.sectionTitlePlaceholder')}
                     onkeydown={handleSectionEditKeydown}
+                    dataTestid="dashboard-section-title-input"
                   />
-                  <input
+                  <Input
                     type="text"
                     bind:value={editingSectionSubtitle}
-                    class="px-3 py-2 border rounded text-sm"
-                    style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-                    placeholder="Subtitle (optional)"
+                    placeholder={t('dashboard.editor.sectionSubtitlePlaceholder')}
                     onkeydown={handleSectionEditKeydown}
+                    size="small"
                   />
                   <Button variant="primary" size="small" onclick={saveSection}>
-                    Save <span class="ml-1 opacity-60">⏎</span>
+                    {t('common.save')} <span class="ml-1 opacity-60">⏎</span>
                   </Button>
                   <Button variant="default" size="small" onclick={cancelEditingSection}>
-                    Cancel <span class="ml-1 opacity-60">Esc</span>
+                    {t('common.cancel')} <span class="ml-1 opacity-60">Esc</span>
                   </Button>
                 </div>
               {:else}
                 <div>
-                  <h2 class="text-lg font-semibold" style="color: var(--ds-text);">{section.title}</h2>
-                  {#if section.subtitle}
-                    <p class="text-sm mt-0.5" style="color: var(--ds-text-subtle);">{section.subtitle}</p>
+                  <h2
+                    id={`dashboard-section-heading-${section.id}`}
+                    class="text-lg font-semibold"
+                    style="color: var(--ds-text);"
+                  >{sectionDisplay.title}</h2>
+                  {#if sectionDisplay.subtitle}
+                    <p class="text-sm mt-0.5" style="color: var(--ds-text-subtle);">{sectionDisplay.subtitle}</p>
                   {/if}
                 </div>
                 {#if isEditMode}
-                  <div class="flex items-center gap-2">
+                  <div class="flex items-center gap-1">
                     <button
-                      class="p-2 rounded"
+                      type="button"
+                      class="p-2 rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)] disabled:cursor-not-allowed disabled:opacity-30"
+                      style="color: var(--ds-text-subtle);"
+                      onclick={() => homepageStore.moveSection(section.id, -1)}
+                      disabled={sectionIndex === 0}
+                      title={t('layout.moveUp')}
+                      aria-label={t('layout.moveUp')}
+                      data-testid="dashboard-section-move-up"
+                    >
+                      <ChevronUp class="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      class="p-2 rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)] disabled:cursor-not-allowed disabled:opacity-30"
+                      style="color: var(--ds-text-subtle);"
+                      onclick={() => homepageStore.moveSection(section.id, 1)}
+                      disabled={sectionIndex === sections.length - 1}
+                      title={t('layout.moveDown')}
+                      aria-label={t('layout.moveDown')}
+                      data-testid="dashboard-section-move-down"
+                    >
+                      <ChevronDown class="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      class="p-2 rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)]"
                       style="color: var(--ds-text-subtle);"
                       onclick={() => startEditingSection(section)}
-                      title="Rename section"
+                      title={t('dashboard.editor.renameSection')}
+                      aria-label={t('dashboard.editor.renameSection')}
                     >
                       <Pencil class="h-4 w-4" />
                     </button>
                     <button
-                      class="p-2 rounded"
+                      type="button"
+                      class="p-2 rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)]"
                       style="color: var(--ds-text-subtle);"
                       onclick={() => handleDeleteSection(section.id)}
-                      title="Delete section"
+                      title={t('dashboard.editor.deleteSection')}
+                      aria-label={t('dashboard.editor.deleteSection')}
                     >
                       <Trash2 class="h-4 w-4" />
                     </button>
@@ -390,22 +485,28 @@
               style="{draggedWidget && isCustomizeMode
                 ? `border-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-border-focused)' : 'var(--ds-border)'};
                    ${dropZoneStates.get(section.id)?.isOver ? 'box-shadow: 0 0 0 2px var(--ds-border-focused);' : ''}
-                   background-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-surface-hover)' : 'transparent'};
+                   background-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-surface-hovered)' : 'transparent'};
                    padding: 0.5rem;`
                 : ''}"
               data-dashboard-drop-zone
               data-section-id={section.id}
             >
               {#if sectionWidgets.length > 0}
-                <div class="grid grid-cols-3 gap-4">
+                <div class="grid grid-cols-12 gap-4">
                   {#each sectionWidgets as widget (widget.id)}
+                    {@const resizeBounds = homepageStore.getWidgetResizeBounds(widget.id)}
                     <WidgetWrapper
                       title={getWidgetTitle(widget.type)}
                       widgetId={widget.id}
+                      widgetType={widget.type}
                       width={widget.width}
+                      config={widget.config ?? {}}
+                      resizeMinWidth={resizeBounds?.minWidth}
+                      resizeMaxWidth={resizeBounds?.maxWidth}
                       isEditing={isCustomizeMode || isEditMode}
                       onremove={() => removeWidget(widget.id)}
                       onwidthchange={(newWidth) => updateWidgetWidth(widget.id, newWidth)}
+                      onconfigchange={(changes) => updateWidgetConfig(widget.id, changes)}
                     >
                       {#if widget.type === 'daily-briefing'}
                         <DailyBriefingWidget />
@@ -422,12 +523,22 @@
                       {:else if widget.type === 'recent-workspaces'}
                         <RecentWorkspacesWidget />
                       {:else if widget.type === 'assigned-to-me'}
-                        <AssignedToMeWidget />
+                        <AssignedToMeWidget config={widget.config ?? {}} />
                       {:else if widget.type === 'personal-tasks'}
-                        <PersonalTasksWidget />
+                        <PersonalTasksWidget config={widget.config ?? {}} />
+                      {:else if widget.type === 'support-overview'}
+                        <SupportOverviewWidget
+                          config={widget.config ?? {}}
+                          onconfigchange={(changes) => updateWidgetConfig(widget.id, changes)}
+                        />
+                      {:else if widget.type === 'saved-search'}
+                        <SavedSearchWidget
+                          config={widget.config ?? {}}
+                          onconfigchange={(changes) => updateWidgetConfig(widget.id, changes)}
+                        />
                       {:else}
                         <div class="text-center py-8 text-sm" style="color: var(--ds-text-subtle);">
-                          Unknown widget type: {widget.type}
+                          {t('dashboard.editor.unknownWidgetType', { type: widget.type })}
                         </div>
                       {/if}
                     </WidgetWrapper>
@@ -435,8 +546,8 @@
                 </div>
               {:else}
                 <div class="text-center py-8" style="color: var(--ds-text-subtle);">
-                  <p class="text-sm">No widgets in this section yet</p>
-                  <p class="text-xs mt-1">Click "Customize" to add widgets</p>
+                  <p class="text-sm">{t('dashboard.editor.noWidgets')}</p>
+                  <p class="text-xs mt-1">{t('dashboard.editor.addWidgetsHint')}</p>
                 </div>
               {/if}
             </div>
@@ -446,8 +557,8 @@
         {#if sections.length === 0}
           <div class="flex flex-col items-center justify-center py-16" style="color: var(--ds-text-subtle);">
             <LayoutGrid class="h-16 w-16 mb-4 opacity-30" />
-            <p class="text-lg font-medium">No sections configured</p>
-            <p class="text-sm mt-2">Click "Edit" to add sections to your dashboard</p>
+            <p class="text-lg font-medium">{t('dashboard.editor.noSections')}</p>
+            <p class="text-sm mt-2">{t('dashboard.editor.addSectionsHint')}</p>
           </div>
         {/if}
       </div>

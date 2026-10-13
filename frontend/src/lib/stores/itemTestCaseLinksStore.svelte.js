@@ -2,7 +2,7 @@ import { api } from '../api.js';
 import { BaseCacheStore } from './BaseCacheStore.svelte.js';
 
 const TTL_MS = 10 * 60 * 1000; // 10 minutes
-const LINK_BATCH_CHUNK = 200; // item ids per /links/batch request (server cap 500)
+const LINK_BATCH_CHUNK = 100;
 
 /**
  * Caches test case links per item, surviving view switches (singleton store).
@@ -57,9 +57,12 @@ class ItemTestCaseLinksStore extends BaseCacheStore {
 
   /** @private Fetch + cache a chunk of item ids via the batch links endpoint. */
   _fetchChunk(chunk) {
+    const generation = this._generation;
+    const scopedWorkspaceId = this.workspaceId;
     const promise = (async () => {
       try {
         const groups = await api.links.getForItems(chunk);
+        if (generation !== this._generation || scopedWorkspaceId !== this.workspaceId) return;
         const now = Date.now();
         for (const itemId of chunk) {
           const group = groups[itemId] || {};
@@ -70,11 +73,14 @@ class ItemTestCaseLinksStore extends BaseCacheStore {
         }
       } catch (err) {
         console.error('ItemTestCaseLinksStore: failed to fetch links for items', chunk, err);
+        if (generation !== this._generation || scopedWorkspaceId !== this.workspaceId) return;
         // Cache empty results to avoid repeated failures.
         const now = Date.now();
         for (const itemId of chunk) this._cache.set(itemId, { testCases: [], fetchedAt: now });
       } finally {
-        for (const itemId of chunk) this._pending.delete(itemId);
+        for (const itemId of chunk) {
+          if (this._pending.get(itemId) === promise) this._pending.delete(itemId);
+        }
       }
     })();
 
@@ -90,8 +96,18 @@ class ItemTestCaseLinksStore extends BaseCacheStore {
       .map((link) => {
         const isSource = link.source_type === 'item' && link.source_id === itemId;
         const testCaseData = isSource
-          ? { id: link.target_id, title: link.target_title, type: link.target_type }
-          : { id: link.source_id, title: link.source_title, type: link.source_type };
+          ? {
+              id: link.target_id,
+              title: link.target_title,
+              type: link.target_type,
+              workspaceId: link.target_workspace_id,
+            }
+          : {
+              id: link.source_id,
+              title: link.source_title,
+              type: link.source_type,
+              workspaceId: link.source_workspace_id,
+            };
         return testCaseData.type === 'test_case' ? testCaseData : null;
       })
       .filter((tc) => tc !== null);

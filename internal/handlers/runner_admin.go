@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -9,6 +8,7 @@ import (
 
 	"windshift/internal/models"
 	"windshift/internal/sanitize"
+	"windshift/internal/services"
 )
 
 // Runner-pool admin lifecycle (WI-177). These endpoints hang off the
@@ -82,7 +82,7 @@ func (h *RunnerControlHandler) MintRunnerToken(w http.ResponseWriter, r *http.Re
 	var req mintRunnerTokenRequest
 	// Body is optional: a bare POST mints a non-expiring, undescribed token,
 	// so an empty body (io.EOF) is not an error.
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		respondBadRequest(w, r, "invalid request body")
 		return
 	}
@@ -100,6 +100,10 @@ func (h *RunnerControlHandler) MintRunnerToken(w http.ResponseWriter, r *http.Re
 	full, tok, err := h.registry.MintRegistrationToken(
 		r.Context(), poolID, &createdBy, req.Description, time.Duration(ttlHours)*time.Hour,
 	)
+	if errors.Is(err, services.ErrRunnerPoolUnavailable) {
+		respondConflict(w, r, "runner pool is disabled")
+		return
+	}
 	if err != nil {
 		respondInternalError(w, r, err)
 		return

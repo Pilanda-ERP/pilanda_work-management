@@ -5,6 +5,7 @@
   import MilkdownEditor from '../editors/LazyMilkdownEditor.svelte';
   import ChipPicker from '../pickers/ChipPicker.svelte';
   import { collectionCategoriesStore } from '../stores/collectionCategories.js';
+  import Input from '../components/Input.svelte';
 
   let {
     formData = $bindable({
@@ -13,12 +14,17 @@
       workspace_id: null
     }),
     categoryId = $bindable(null),
-    nameInputRef = $bindable(null)
+    nameInputRef = $bindable(null),
+    categories = null,
   } = $props();
 
   onMount(() => {
-    collectionCategoriesStore.init();
+    if (categories === null) {
+      collectionCategoriesStore.init();
+    }
   });
+
+  let availableCategories = $derived(categories ?? $collectionCategoriesStore);
 
   export function validate() {
     return formData.name.trim() !== '';
@@ -51,10 +57,12 @@
 
 <div class="space-y-3">
   <!-- Title Input -->
-  <input
-    bind:this={nameInputRef}
+  <Input
+    dataTestid="collection-create-name"
+    bind:inputRef={nameInputRef}
     bind:value={formData.name}
     type="text"
+    variant="ghost"
     class="w-full text-lg font-medium border-0 outline-none bg-transparent"
     style="color: var(--ds-text);"
     placeholder={t('createModal.workspaceName', { type: t('createModal.collection') })}
@@ -76,7 +84,7 @@
   <div class="flex flex-wrap items-center gap-2 pt-2 border-t" style="border-color: var(--ds-border);">
     <ChipPicker
       value={categoryId}
-      items={[{ id: null, name: t('createModal.noCategory') }, ...$collectionCategoriesStore]}
+      items={[{ id: null, name: t('createModal.noCategory') }, ...availableCategories]}
       getValue={(c) => c.id}
       getLabel={(c) => c.name}
       icon={FolderOpen}

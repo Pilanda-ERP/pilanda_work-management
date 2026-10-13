@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -45,6 +46,23 @@ func (s *TimePermissionService) HasProjectManagePermission(userID int) (bool, er
 	return hasPermission, nil
 }
 
+// HasProjectManagePermissionContext is the request-aware form used while
+// enriching item-list responses.
+func (s *TimePermissionService) HasProjectManagePermissionContext(ctx context.Context, userID int) (bool, error) {
+	isAdmin, err := s.permissionService.IsSystemAdminContext(ctx, userID)
+	if err != nil {
+		return false, fmt.Errorf("error checking system admin: %w", err)
+	}
+	if isAdmin {
+		return true, nil
+	}
+	hasPermission, err := s.permissionService.HasGlobalPermissionContext(ctx, userID, models.PermissionProjectManage)
+	if err != nil {
+		return false, fmt.Errorf("error checking project.manage permission: %w", err)
+	}
+	return hasPermission, nil
+}
+
 // HasCustomersManagePermission checks if user has the global customers.manage permission
 // Returns true if: system.admin OR customers.manage OR project.manage
 func (s *TimePermissionService) HasCustomersManagePermission(userID int) (bool, error) {
@@ -75,49 +93,18 @@ func (s *TimePermissionService) HasCustomersManagePermission(userID int) (bool, 
 	return hasPermission, nil
 }
 
-// IsTimeProjectManager checks if user can manage a specific project
-// True if: system.admin OR project.manage OR assigned as manager (user/group) OR no managers configured
+// IsTimeProjectManager requires an assignment or global management authority.
 func (s *TimePermissionService) IsTimeProjectManager(userID, projectID int) (bool, error) {
-	// 1. Check global full access
 	hasFullAccess, err := s.HasProjectManagePermission(userID)
-	if err != nil {
-		return false, err
+	if err != nil || hasFullAccess {
+		return hasFullAccess, err
 	}
-	if hasFullAccess {
-		return true, nil
-	}
-
-	// 2. Check if project has MANAGER restrictions configured
-	hasManagers, err := s.HasProjectManagers(projectID)
-	if err != nil {
-		return false, err
-	}
-	if !hasManagers {
-		return true, nil // No manager restrictions - management open to all
-	}
-
-	// 3. Managers exist - check if user is assigned as manager
 	return s.isProjectManager(userID, projectID)
 }
 
-// CanGrantProjectAccess checks if a user has real authority to add/remove project
-// managers or members. Unlike IsTimeProjectManager, it deliberately does NOT treat
-// the "no managers configured → open to all" default as authority: that default would
-// let any authenticated user seize control of a brand-new project by inserting
-// themselves as its first manager. Authority requires either the global project.manage
-// permission OR a direct/group manager assignment on this specific project.
+// CanGrantProjectAccess uses the same authority as project management.
 func (s *TimePermissionService) CanGrantProjectAccess(userID, projectID int) (bool, error) {
-	// 1. Global full access (system.admin OR project.manage)
-	hasFullAccess, err := s.HasProjectManagePermission(userID)
-	if err != nil {
-		return false, err
-	}
-	if hasFullAccess {
-		return true, nil
-	}
-
-	// 2. Must be an actually-assigned manager of this project (not the open-to-all default)
-	return s.isProjectManager(userID, projectID)
+	return s.IsTimeProjectManager(userID, projectID)
 }
 
 // CanBookTimeOnProject checks if user can create worklogs on a specific project
@@ -150,6 +137,40 @@ func (s *TimePermissionService) CanBookTimeOnProject(userID, projectID int) (boo
 func (s *TimePermissionService) CanViewProject(userID, projectID int) (bool, error) {
 	// Same as booking permission for now
 	return s.CanBookTimeOnProject(userID, projectID)
+}
+
+// AccessibleTimeProjectIDs resolves the projects whose worklogs a user may view.
+func (s *TimePermissionService) AccessibleTimeProjectIDs(userID int) ([]int, error) {
+	rows, err := s.db.Query("SELECT id FROM time_projects ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("list time projects for access: %w", err)
+	}
+	var candidates []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan time project for access: %w", err)
+		}
+		candidates = append(candidates, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close time project access rows: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read time projects for access: %w", err)
+	}
+	result := make([]int, 0, len(candidates))
+	for _, id := range candidates {
+		allowed, err := s.CanViewProject(userID, id)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			result = append(result, id)
+		}
+	}
+	return result, nil
 }
 
 // HasProjectManagers checks if a project has any manager restrictions configured
@@ -246,8 +267,13 @@ func (s *TimePermissionService) isProjectMember(userID, projectID int) (bool, er
 // For users with project.manage, returns nil (all projects)
 // For other users, returns projects where they are manager, member, or no restrictions exist
 func (s *TimePermissionService) GetAccessibleProjects(userID int) ([]int, error) {
+	return s.GetAccessibleProjectsContext(context.Background(), userID)
+}
+
+// GetAccessibleProjectsContext is the request-aware form of GetAccessibleProjects.
+func (s *TimePermissionService) GetAccessibleProjectsContext(ctx context.Context, userID int) ([]int, error) {
 	// Check if user has full access
-	hasFullAccess, err := s.HasProjectManagePermission(userID)
+	hasFullAccess, err := s.HasProjectManagePermissionContext(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -256,12 +282,11 @@ func (s *TimePermissionService) GetAccessibleProjects(userID int) ([]int, error)
 	}
 
 	// Get all projects with no restrictions or where user has access
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT p.id FROM time_projects p
 		WHERE
-			-- Projects with no manager AND no member restrictions (open access)
-			(NOT EXISTS (SELECT 1 FROM time_project_managers WHERE project_id = p.id)
-			 AND NOT EXISTS (SELECT 1 FROM time_project_members WHERE project_id = p.id))
+			-- Membership restrictions make a project private.
+			NOT EXISTS (SELECT 1 FROM time_project_members WHERE project_id = p.id)
 			-- OR user is direct manager
 			OR EXISTS (SELECT 1 FROM time_project_managers WHERE project_id = p.id AND manager_type = 'user' AND manager_id = ?)
 			-- OR user is in a manager group
@@ -309,7 +334,13 @@ func (s *TimePermissionService) GetAccessibleProjects(userID int) ([]int, error)
 // name); only the names are stripped. A user with full project access (the
 // GetAccessibleProjects nil sentinel) is never masked.
 func (s *TimePermissionService) MaskInaccessibleProjectNames(userID int, items []models.Item) {
-	accessible, err := s.GetAccessibleProjects(userID)
+	s.MaskInaccessibleProjectNamesContext(context.Background(), userID, items)
+}
+
+// MaskInaccessibleProjectNamesContext is the request-aware form used by item
+// list/search/backlog responses.
+func (s *TimePermissionService) MaskInaccessibleProjectNamesContext(ctx context.Context, userID int, items []models.Item) {
+	accessible, err := s.GetAccessibleProjectsContext(ctx, userID)
 	if err != nil {
 		slog.Warn("failed to load accessible projects for masking", slog.Int("user_id", userID), slog.Any("error", err))
 		// Fail closed: if we can't determine access, strip names rather than leak.
@@ -347,29 +378,59 @@ func (s *TimePermissionService) MaskInaccessibleProjectNames(userID int, items [
 	}
 }
 
-// CanEditWorklog checks if user can edit/delete a worklog
-// True if: IsTimeProjectManager for the project OR worklog.user_id matches userID
+// CanViewWorklog grants managers all entries and other project viewers their own.
+func (s *TimePermissionService) CanViewWorklog(userID, worklogID int) (bool, error) {
+	return s.canAccessWorklog(userID, worklogID)
+}
+
+// CanEditWorklog requires project visibility and ownership or management authority.
 func (s *TimePermissionService) CanEditWorklog(userID, worklogID int) (bool, error) {
-	// Get worklog info
+	return s.canAccessWorklog(userID, worklogID)
+}
+
+func (s *TimePermissionService) canAccessWorklog(userID, worklogID int) (bool, error) {
 	var projectID int
-	var worklogUserID sql.NullInt64
-	err := s.db.QueryRow(`
-		SELECT project_id, user_id FROM time_worklogs WHERE id = ?
-	`, worklogID).Scan(&projectID, &worklogUserID)
+	var owner sql.NullInt64
+	err := s.db.QueryRow("SELECT project_id, user_id FROM time_worklogs WHERE id = ?", worklogID).Scan(&projectID, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil // Worklog doesn't exist
+		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("error getting worklog: %w", err)
+		return false, fmt.Errorf("get worklog access: %w", err)
 	}
-
-	// Check if user owns the worklog
-	if worklogUserID.Valid && int(worklogUserID.Int64) == userID {
+	visible, err := s.CanViewProject(userID, projectID)
+	if err != nil || !visible {
+		return false, err
+	}
+	if owner.Valid && int(owner.Int64) == userID {
 		return true, nil
 	}
-
-	// Check if user is project manager
 	return s.IsTimeProjectManager(userID, projectID)
+}
+
+// GetManagedProjects returns assigned projects, or nil for global managers.
+func (s *TimePermissionService) GetManagedProjects(userID int) ([]int, error) {
+	full, err := s.HasProjectManagePermission(userID)
+	if err != nil || full {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT project_id FROM time_project_managers
+ WHERE (manager_type = 'user' AND manager_id = ?)
+ OR (manager_type = 'group' AND manager_id IN (SELECT group_id FROM group_members WHERE user_id = ?))
+ ORDER BY project_id`, userID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list managed projects: %w", err)
+	}
+	defer rows.Close()
+	ids := []int{}
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // GetProjectManagers returns all managers for a project

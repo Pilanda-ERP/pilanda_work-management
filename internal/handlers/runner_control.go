@@ -3,10 +3,14 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"windshift/internal/models"
 	"windshift/internal/repository"
@@ -24,11 +28,68 @@ import (
 // emit/report against a run it actually claimed (runner_id ownership check).
 const runnerControlMaxBodyBytes = 1 << 20
 
+const (
+	// Event delivery is synchronous but can burst while an agent streams output.
+	// Keep the steady limit generous and isolate it per registered runner.
+	runnerControlRequestsPerSecond = 20
+	runnerControlBurst             = 100
+	runnerLimiterEntryTTL          = 10 * time.Minute
+)
+
+type runnerRateLimitEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+type runnerInstanceRateLimiter struct {
+	mu        sync.Mutex
+	entries   map[int]*runnerRateLimitEntry
+	rate      rate.Limit
+	burst     int
+	now       func() time.Time
+	lastSweep time.Time
+}
+
+func newRunnerInstanceRateLimiter(r rate.Limit, burst int) *runnerInstanceRateLimiter {
+	now := time.Now
+	return &runnerInstanceRateLimiter{
+		entries: make(map[int]*runnerRateLimitEntry),
+		rate:    r,
+		burst:   burst,
+		now:     now,
+	}
+}
+
+func (l *runnerInstanceRateLimiter) Allow(instanceID int) bool {
+	if l == nil || l.burst <= 0 {
+		return true
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lastSweep.IsZero() || now.Sub(l.lastSweep) >= runnerLimiterEntryTTL {
+		for id, entry := range l.entries {
+			if now.Sub(entry.lastSeen) > runnerLimiterEntryTTL {
+				delete(l.entries, id)
+			}
+		}
+		l.lastSweep = now
+	}
+	entry := l.entries[instanceID]
+	if entry == nil {
+		entry = &runnerRateLimitEntry{limiter: rate.NewLimiter(l.rate, l.burst)}
+		l.entries[instanceID] = entry
+	}
+	entry.lastSeen = now
+	return entry.limiter.Allow()
+}
+
 type RunnerControlHandler struct {
 	registry *services.RunnerRegistryService
 	runs     *repository.AgentRunRepository
 	runSvc   *services.RunService
 	caps     *repository.ActionRepository
+	limiter  *runnerInstanceRateLimiter
 	now      func() time.Time
 	// baseURL is the resolved public base URL (without /api); used to render
 	// the copy-paste install command returned alongside a minted registration
@@ -43,25 +104,42 @@ func NewRunnerControlHandler(registry *services.RunnerRegistryService, runs *rep
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &RunnerControlHandler{registry: registry, runs: runs, runSvc: runSvc, caps: caps, now: now, baseURL: baseURL}
+	return &RunnerControlHandler{
+		registry: registry,
+		runs:     runs,
+		runSvc:   runSvc,
+		caps:     caps,
+		limiter:  newRunnerInstanceRateLimiter(runnerControlRequestsPerSecond, runnerControlBurst),
+		now:      now,
+		baseURL:  baseURL,
+	}
 }
 
-// poolMaxConcurrent reads the runner_pool capability's MaxConcurrentRuns quota
-// (0 = unlimited). Any resolution failure is treated as unlimited so a
-// transient lookup error never wedges claims.
-func (h *RunnerControlHandler) poolMaxConcurrent(poolID int) int {
+// poolMaxConcurrent reads an enabled runner_pool capability's quota. Pool
+// deletion/disable/type changes fail closed so a stale instance credential
+// cannot claim new work after its pool has been revoked.
+func (h *RunnerControlHandler) poolMaxConcurrent(poolID int) (int, error) {
 	if h.caps == nil {
-		return 0
+		return 0, fmt.Errorf("runner capability repository is not configured")
 	}
 	capRow, err := h.caps.GetCapabilityByID(poolID)
-	if err != nil || capRow == nil || capRow.CapabilityType != models.CapabilityRunnerPool {
-		return 0
+	if errors.Is(err, repository.ErrNotFound) || capRow == nil {
+		return 0, services.ErrRunnerPoolUnavailable
+	}
+	if err != nil {
+		return 0, fmt.Errorf("load runner pool capability: %w", err)
+	}
+	if capRow.CapabilityType != models.CapabilityRunnerPool || !capRow.IsEnabled {
+		return 0, services.ErrRunnerPoolUnavailable
 	}
 	var cfg models.RunnerPoolConfig
-	if json.Unmarshal([]byte(capRow.Config), &cfg) != nil {
-		return 0
+	if err := json.Unmarshal([]byte(capRow.Config), &cfg); err != nil {
+		return 0, fmt.Errorf("decode runner pool capability config: %w", err)
 	}
-	return cfg.MaxConcurrentRuns
+	if cfg.MaxConcurrentRuns < 0 {
+		return 0, fmt.Errorf("runner pool capability has negative max_concurrent_runs")
+	}
+	return cfg.MaxConcurrentRuns, nil
 }
 
 // Register exchanges a pool registration token for a per-instance runner
@@ -74,7 +152,7 @@ func (h *RunnerControlHandler) Register(w http.ResponseWriter, r *http.Request) 
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, runnerControlMaxBodyBytes)
 	var req services.RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "invalid request body")
 		return
 	}
@@ -102,6 +180,15 @@ func (h *RunnerControlHandler) Claim(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	maxRuns, err := h.poolMaxConcurrent(inst.PoolCapabilityID)
+	if errors.Is(err, services.ErrRunnerPoolUnavailable) {
+		respondForbidden(w, r)
+		return
+	}
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
 	// Treat a successful claim poll as liveness too (WI-545). This prevents a
 	// runner whose heartbeat loop was delayed by an idle/server outage window
 	// from claiming work with an old last_heartbeat_at and then having that work
@@ -110,11 +197,8 @@ func (h *RunnerControlHandler) Claim(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
-	// Enforce the pool's max-concurrency quota before handing out work
-	// (WI-147). Soft cap: count + claim aren't atomic, so a burst of
-	// concurrent claimers can overshoot by at most their count — acceptable
-	// for a fairness/back-pressure bound.
-	if maxRuns := h.poolMaxConcurrent(inst.PoolCapabilityID); maxRuns > 0 {
+	// Soft pool cap: concurrent count and claim can briefly overshoot.
+	if maxRuns > 0 {
 		running, err := h.runs.CountRunningForPool(r.Context(), inst.PoolCapabilityID)
 		if err != nil {
 			respondInternalError(w, r, err)
@@ -125,26 +209,12 @@ func (h *RunnerControlHandler) Claim(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Round-robin assignment (WI-514): the server, not the runner, decides
-	// which live runner gets the next run. The pull-based model let the
-	// most-recently-registered runner always win the poll, so the last runner
-	// added was effectively the only one used. NextRunner rotates through
-	// the pool's live runners so each gets a turn before any repeats. Only
-	// "fair" runs — those for which the round-robin picks THIS caller — are
-	// handed out; an out-of-turn runner gets nothing (200, job null) and the
-	// chosen runner picks the run up on its own next poll.
-	//
-	// Flow: nextRunner = the runner whose turn it is. If that is the caller,
-	// assign the next queued run to it and rotate. Otherwise (caller is
-	// out of turn) return job=null; if the chosen runner is offline by the
-	// next tick, NextRunner will have moved past it (offline runners aren't
-	// returned by ListLiveInstancesForPool), so the turn isn't stuck.
+	// Server-side round robin prevents a fast or newly registered poller from
+	// monopolizing work; out-of-turn runners receive job=null.
 	next, err := h.registry.NextRunner(r.Context(), inst.PoolCapabilityID)
 	if err != nil {
 		if errors.Is(err, services.ErrNoLiveRunner) {
-			// No live runner can take work (pool empty, or all stale).
-			// Fail closed: don't hand the run to a caller the reaper is
-			// about to revoke.
+			// Do not assign work to a runner the reaper may revoke.
 			respondJSONOK(w, services.ClaimResponse{Job: nil})
 			return
 		}
@@ -153,25 +223,18 @@ func (h *RunnerControlHandler) Claim(w http.ResponseWriter, r *http.Request) {
 	}
 	var run *models.AgentRun
 	if next.ID == inst.ID {
-		// This runner's turn: assign the next queued run to it. NextRunner
-		// already rotated, so a concurrent claimer is offered the next runner.
-		// A nil run means the queue was drained between NextRunner and the
-		// claim — the turn is consumed and the caller idles until more work.
+		// The turn is consumed even if another claimer drained the queue.
 		run, err = h.runs.ClaimQueuedForRunner(r.Context(), inst.PoolCapabilityID, inst.ID, h.now())
 		if err != nil {
 			respondInternalError(w, r, err)
 			return
 		}
 	}
-	// next.ID != inst.ID: not this runner's turn. The job is offered to the
-	// chosen runner on its own next poll; the caller idles this cycle.
 	if run == nil {
 		respondJSONOK(w, services.ClaimResponse{Job: nil})
 		return
 	}
-	// One log + one run event per claim: together with the "queued" event
-	// this makes the queued→running hop traceable from both the server log
-	// and the run's own event stream (a stalled run is one missing event).
+	// Log and event together make queued-to-running transitions traceable.
 	slog.Info("runner claimed agent run",
 		slog.Int("run_id", run.ID),
 		slog.Int("pool_id", inst.PoolCapabilityID),
@@ -220,7 +283,7 @@ func (h *RunnerControlHandler) Events(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, runnerControlMaxBodyBytes)
 	var req services.EmitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "invalid request body")
 		return
 	}
@@ -263,7 +326,7 @@ func (h *RunnerControlHandler) Result(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, runnerControlMaxBodyBytes)
 	var req services.ReportRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := newJSONDecoder(w, r).Decode(&req); err != nil {
 		respondBadRequest(w, r, "invalid request body")
 		return
 	}
@@ -278,8 +341,7 @@ func (h *RunnerControlHandler) Result(w http.ResponseWriter, r *http.Request) {
 		sanitize.Pair{Target: &req.Branch, Policy: sanitize.ShortIdentifier},
 		sanitize.Pair{Target: &req.BaseCommit, Policy: sanitize.ShortIdentifier},
 	)
-	// Per-repo results (WI-449) are identifier-shaped too; sanitize each before
-	// any reaches the PR hook as a branch ref / repo slug.
+	// Sanitize repository identifiers before the PR hook consumes them.
 	var resultRepos []services.RunnerRepoResult
 	for i := range req.Repos {
 		sanitize.ApplyAll(
@@ -298,10 +360,7 @@ func (h *RunnerControlHandler) Result(w http.ResponseWriter, r *http.Request) {
 		respondBadRequest(w, r, "status must be a terminal agent-run state")
 		return
 	}
-	// Prefer the RunService path: it finalizes, emits the terminal event, and
-	// fires the post-run hook (PR creation + ItemSCMLink writeback) with the
-	// branch/base-commit the runner reported — same as a local run. Fall back
-	// to a plain repo finalize when the harness's RunService isn't wired.
+	// RunService preserves normal finalization and post-run-hook behavior.
 	if h.runSvc != nil {
 		if err := h.runSvc.FinalizeRemote(r.Context(), runID, services.RunnerResult{
 			Status:      status,
@@ -324,10 +383,7 @@ func (h *RunnerControlHandler) Result(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Compare-and-swap finalize (WI-168): only stamp the terminal status if
-	// the run is still running, and only emit the terminal event when this
-	// call actually performed the transition — a replayed/late Result on an
-	// already-finalized run is a no-op, not a rewrite.
+	// Finalize only a running run so late results cannot rewrite history.
 	transitioned, err := h.runs.FinalizeRunning(r.Context(), runID, status, services.RedactString(req.Error), h.now())
 	if err != nil {
 		respondInternalError(w, r, err)
@@ -341,10 +397,7 @@ func (h *RunnerControlHandler) Result(w http.ResponseWriter, r *http.Request) {
 	respondJSONOK(w, map[string]any{"ok": true})
 }
 
-// Heartbeat renews the runner's lease and returns control signals: the run
-// ids the runner should abort (orchestrator-requested cancellations) and the
-// runner pool's current queue depth (the autoscaling signal).
-// POST /runner/heartbeat.
+// Heartbeat renews a runner lease and returns abort IDs and queue depth.
 func (h *RunnerControlHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	inst, ok := h.requireRunner(w, r)
 	if !ok {
@@ -367,8 +420,8 @@ func (h *RunnerControlHandler) Heartbeat(w http.ResponseWriter, r *http.Request)
 	respondJSONOK(w, services.HeartbeatResponse{Abort: abort, QueueDepth: depth})
 }
 
-// requireRunner authenticates the per-instance runner credential. Writes a
-// 401/503 and returns ok=false on failure.
+// requireRunner authenticates the per-instance runner credential and applies
+// its isolated request budget. It writes the error response on failure.
 func (h *RunnerControlHandler) requireRunner(w http.ResponseWriter, r *http.Request) (*models.RunnerInstance, bool) {
 	if h.registry == nil || h.runs == nil {
 		respondServiceUnavailable(w, r, "coding-agent harness is disabled on this server")
@@ -384,16 +437,16 @@ func (h *RunnerControlHandler) requireRunner(w http.ResponseWriter, r *http.Requ
 		respondUnauthorized(w, r)
 		return nil, false
 	}
+	if !h.limiter.Allow(inst.ID) {
+		w.Header().Set("Retry-After", "1")
+		respondTooManyRequests(w, r, "Runner request rate exceeded. Retry shortly.")
+		return nil, false
+	}
 	return inst, true
 }
 
-// ownsRun enforces that the run exists, was claimed by this runner, and is
-// still running. Returns false (after writing a response) otherwise.
-//
-// The running-state gate (WI-168) stops a runner credential from emitting
-// events or rewriting the verdict of a run that has already finalized (or was
-// canceled by the orchestrator): such a run is no longer the runner's to
-// mutate, so historical runs it once claimed can't be retriggered.
+// ownsRun requires a running run claimed by this runner, preventing historical
+// runs from receiving events or revised verdicts.
 func (h *RunnerControlHandler) ownsRun(w http.ResponseWriter, r *http.Request, inst *models.RunnerInstance, runID int) bool {
 	run, err := h.runs.Get(r.Context(), runID)
 	if err != nil {

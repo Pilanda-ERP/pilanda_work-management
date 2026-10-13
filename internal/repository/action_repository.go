@@ -38,6 +38,47 @@ func applyActionNulls(a *models.Action, description, triggerConfig sql.NullStrin
 	}
 }
 
+func (r *ActionRepository) loadAllowedRoleIDs(actionID int) ([]int, error) {
+	rows, err := r.db.Query(`
+		SELECT role_id
+		FROM action_allowed_roles
+		WHERE action_id = ?
+		ORDER BY role_id
+	`, actionID)
+	if err != nil {
+		return nil, fmt.Errorf("load allowed roles for action %d: %w", actionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	roleIDs := []int{}
+	for rows.Next() {
+		var roleID int
+		if err := rows.Scan(&roleID); err != nil {
+			return nil, fmt.Errorf("scan allowed role for action %d: %w", actionID, err)
+		}
+		roleIDs = append(roleIDs, roleID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate allowed roles for action %d: %w", actionID, err)
+	}
+	return roleIDs, nil
+}
+
+func replaceAllowedRoleIDs(tx database.Tx, actionID int, roleIDs []int) error {
+	if _, err := tx.Exec(`DELETE FROM action_allowed_roles WHERE action_id = ?`, actionID); err != nil {
+		return fmt.Errorf("clear allowed roles: %w", err)
+	}
+	for _, roleID := range roleIDs {
+		if _, err := tx.Exec(`
+			INSERT INTO action_allowed_roles (action_id, role_id)
+			VALUES (?, ?)
+		`, actionID, roleID); err != nil {
+			return fmt.Errorf("add allowed role %d: %w", roleID, err)
+		}
+	}
+	return nil
+}
+
 // GetByID retrieves an action by ID with its nodes and edges
 func (r *ActionRepository) GetByID(id int) (*models.Action, error) {
 	var action models.Action
@@ -75,6 +116,10 @@ func (r *ActionRepository) GetByID(id int) (*models.Action, error) {
 	}
 	if actorName.Valid {
 		action.ActorName = actorName.String
+	}
+	action.AllowedRoleIDs, err = r.loadAllowedRoleIDs(id)
+	if err != nil {
+		return nil, err
 	}
 
 	// Load nodes
@@ -137,14 +182,70 @@ func (r *ActionRepository) ListByWorkspace(workspaceID int) ([]*models.Action, e
 		if actorName.Valid {
 			action.ActorName = actorName.String
 		}
-
 		actions = append(actions, action)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate actions: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close action rows: %w", err)
+	}
+
+	// Load allowlists only after closing the action cursor. This keeps the
+	// repository safe with single-connection database configurations.
+	for _, action := range actions {
+		action.AllowedRoleIDs, err = r.loadAllowedRoleIDs(action.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	return actions, nil
+}
+
+// ListEnabledByTrigger returns every enabled action across all workspaces
+// with the given trigger type, with nodes and edges loaded. Used by
+// background sweepers that evaluate time-based triggers (WI-1132).
+func (r *ActionRepository) ListEnabledByTrigger(triggerType models.ActionTriggerType) ([]*models.Action, error) {
+	rows, err := r.db.Query(`
+		SELECT a.id, a.workspace_id, a.name, a.description, a.is_enabled,
+		       a.trigger_type, a.trigger_config, a.created_by, a.actor_user_id,
+		       a.created_at, a.updated_at
+		FROM actions a
+		WHERE a.is_enabled = true AND a.trigger_type = ?
+		ORDER BY a.id ASC
+	`, triggerType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query enabled actions by trigger: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var actions []*models.Action
+	for rows.Next() {
+		action := &models.Action{}
+		var description, triggerConfig sql.NullString
+		var createdBy, actorUserID sql.NullInt64
+		if err := rows.Scan(
+			&action.ID, &action.WorkspaceID, &action.Name, &description, &action.IsEnabled,
+			&action.TriggerType, &triggerConfig, &createdBy, &actorUserID,
+			&action.CreatedAt, &action.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan action: %w", err)
+		}
+		applyActionNulls(action, description, triggerConfig, createdBy, actorUserID)
+		nodes, err := r.GetNodesByActionID(action.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get action nodes: %w", err)
+		}
+		action.Nodes = nodes
+		edges, err := r.GetEdgesByActionID(action.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get action edges: %w", err)
+		}
+		action.Edges = edges
+		actions = append(actions, action)
+	}
+	return actions, rows.Err()
 }
 
 // ListEnabledByWorkspace lists all enabled actions for a workspace
@@ -204,39 +305,90 @@ func (r *ActionRepository) ListEnabledByWorkspace(workspaceID int) ([]*models.Ac
 
 // Create creates a new action
 func (r *ActionRepository) Create(action *models.Action) (int, error) {
-	var id int64
-	err := r.db.QueryRow(`
-		INSERT INTO actions (
-			workspace_id, name, description, is_enabled, trigger_type, trigger_config,
-			created_by, actor_user_id, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
-	`,
-		action.WorkspaceID, action.Name, action.Description, action.IsEnabled,
-		action.TriggerType, action.TriggerConfig, action.CreatedBy, action.ActorUserID,
-		time.Now(), time.Now(),
-	).Scan(&id)
+	var id int
+	err := database.WithTx(r.db, func(tx database.Tx) error {
+		now := time.Now()
+		if err := tx.QueryRow(`
+			INSERT INTO actions (
+				workspace_id, name, description, is_enabled, trigger_type, trigger_config,
+				created_by, actor_user_id, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+		`,
+			action.WorkspaceID, action.Name, action.Description, action.IsEnabled,
+			action.TriggerType, action.TriggerConfig, action.CreatedBy, action.ActorUserID,
+			now, now,
+		).Scan(&id); err != nil {
+			return err
+		}
+		return replaceAllowedRoleIDs(tx, id, action.AllowedRoleIDs)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("failed to create action: %w", err)
 	}
 
-	return int(id), nil
+	return id, nil
 }
 
 // Update updates an action (actor_user_id is patched separately via SetActor).
 func (r *ActionRepository) Update(action *models.Action) error {
-	_, err := r.db.ExecWrite(`
-		UPDATE actions SET
-			name = ?, description = ?, is_enabled = ?, trigger_type = ?,
-			trigger_config = ?, updated_at = ?
-		WHERE id = ?
-	`,
-		action.Name, action.Description, action.IsEnabled, action.TriggerType,
-		action.TriggerConfig, time.Now(), action.ID,
-	)
+	err := database.WithTx(r.db, func(tx database.Tx) error {
+		if _, err := tx.Exec(`
+			UPDATE actions SET
+				name = ?, description = ?, is_enabled = ?, trigger_type = ?,
+				trigger_config = ?, updated_at = ?
+			WHERE id = ?
+		`,
+			action.Name, action.Description, action.IsEnabled, action.TriggerType,
+			action.TriggerConfig, time.Now(), action.ID,
+		); err != nil {
+			return err
+		}
+		return replaceAllowedRoleIDs(tx, action.ID, action.AllowedRoleIDs)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to update action: %w", err)
 	}
 	return nil
+}
+
+// AllowedRoleIDsExist reports whether every role ID exists. An empty list is
+// valid and represents an unrestricted manual action.
+func (r *ActionRepository) AllowedRoleIDsExist(roleIDs []int) (bool, error) {
+	for _, roleID := range roleIDs {
+		var exists bool
+		if err := r.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM workspace_roles WHERE id = ?)`, roleID).Scan(&exists); err != nil {
+			return false, fmt.Errorf("check workspace role %d: %w", roleID, err)
+		}
+		if !exists {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// UserHasAllowedRole reports whether the user holds one of an action's
+// configured roles directly or through an active group in this workspace.
+func (r *ActionRepository) UserHasAllowedRole(actionID, userID, workspaceID int) (bool, error) {
+	var allowed bool
+	err := r.db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM action_allowed_roles aar
+			JOIN user_workspace_roles uwr ON uwr.role_id = aar.role_id
+			WHERE aar.action_id = ? AND uwr.user_id = ? AND uwr.workspace_id = ?
+			UNION
+			SELECT 1
+			FROM action_allowed_roles aar
+			JOIN group_workspace_roles gwr ON gwr.role_id = aar.role_id
+			JOIN group_members gm ON gm.group_id = gwr.group_id
+			JOIN groups g ON g.id = gwr.group_id AND g.is_active = TRUE
+			WHERE aar.action_id = ? AND gm.user_id = ? AND gwr.workspace_id = ?
+		)
+	`, actionID, userID, workspaceID, actionID, userID, workspaceID).Scan(&allowed)
+	if err != nil {
+		return false, fmt.Errorf("check allowed role for action %d and user %d: %w", actionID, userID, err)
+	}
+	return allowed, nil
 }
 
 // SetActor updates only the actor_user_id of an action. The handler is responsible
@@ -268,16 +420,6 @@ func (r *ActionRepository) Delete(id int) error {
 		return ErrNotFound
 	}
 
-	return nil
-}
-
-// SetEnabled enables or disables an action
-func (r *ActionRepository) SetEnabled(id int, enabled bool) error {
-	_, err := r.db.ExecWrite(`UPDATE actions SET is_enabled = ?, updated_at = ? WHERE id = ?`,
-		enabled, time.Now(), id)
-	if err != nil {
-		return fmt.Errorf("failed to set action enabled status: %w", err)
-	}
 	return nil
 }
 
@@ -423,18 +565,70 @@ func (r *ActionRepository) CreateExecutionLog(log *models.ActionExecutionLog) (i
 	err := r.db.QueryRow(`
 		INSERT INTO action_execution_logs (
 			action_id, item_id, trigger_event, status,
-			trigger_user_id, effective_actor_user_id, started_at
+			trigger_user_id, effective_actor_user_id, started_at, durable_event_key
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
 	`,
 		log.ActionID, log.ItemID, log.TriggerEvent, log.Status,
-		log.TriggerUserID, log.EffectiveActorUserID, time.Now(),
+		log.TriggerUserID, log.EffectiveActorUserID, time.Now(), durableEventKeyValue(log.DurableEventKey),
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create execution log: %w", err)
 	}
 
 	return int(id), nil
+}
+
+func durableEventKeyValue(key string) any {
+	if key == "" {
+		return nil
+	}
+	return key
+}
+
+// GetExecutionLogByDurableTarget returns the execution record that fences one
+// event/action pair. Manual and legacy logs have no durable key.
+func (r *ActionRepository) GetExecutionLogByDurableTarget(eventKey string, actionID int) (*models.ActionExecutionLog, error) {
+	log := &models.ActionExecutionLog{}
+	var itemID, triggerUserID, effectiveActorUserID sql.NullInt64
+	var completedAt sql.NullTime
+	var errorMessage, executionTrace sql.NullString
+	err := r.db.QueryRow(`
+		SELECT id, action_id, item_id, trigger_event, status,
+		       trigger_user_id, effective_actor_user_id, started_at,
+		       completed_at, error_message, execution_trace, durable_event_key
+		FROM action_execution_logs
+		WHERE durable_event_key = ? AND action_id = ?
+	`, eventKey, actionID).Scan(
+		&log.ID, &log.ActionID, &itemID, &log.TriggerEvent, &log.Status,
+		&triggerUserID, &effectiveActorUserID, &log.StartedAt,
+		&completedAt, &errorMessage, &executionTrace, &log.DurableEventKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if itemID.Valid {
+		value := int(itemID.Int64)
+		log.ItemID = &value
+	}
+	if triggerUserID.Valid {
+		value := int(triggerUserID.Int64)
+		log.TriggerUserID = &value
+	}
+	if effectiveActorUserID.Valid {
+		value := int(effectiveActorUserID.Int64)
+		log.EffectiveActorUserID = &value
+	}
+	if completedAt.Valid {
+		log.CompletedAt = &completedAt.Time
+	}
+	if errorMessage.Valid {
+		log.ErrorMessage = errorMessage.String
+	}
+	if executionTrace.Valid {
+		log.ExecutionTrace = executionTrace.String
+	}
+	return log, nil
 }
 
 // UpdateExecutionLog updates an execution log entry
@@ -765,7 +959,7 @@ func (r *ActionRepository) GetCapabilityByID(id int) (*models.ActionCapability, 
 // queryCapabilities runs a SELECT that returns capability rows and scans them
 // into a slice via scanCapability. Populates WorkspaceIDs in a single follow-up
 // query that joins all scoped capabilities at once.
-func (r *ActionRepository) queryCapabilities(errLabel, query string, args ...interface{}) ([]*models.ActionCapability, error) {
+func (r *ActionRepository) queryCapabilities(errLabel, query string, args ...any) ([]*models.ActionCapability, error) {
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", errLabel, err)
@@ -795,7 +989,7 @@ func (r *ActionRepository) queryCapabilities(errLabel, query string, args ...int
 // lookups to keep the list path O(1) DB calls.
 func (r *ActionRepository) populateWorkspaceIDs(caps []*models.ActionCapability) error {
 	scopedByID := map[int]*models.ActionCapability{}
-	ids := []interface{}{}
+	ids := []any{}
 	for _, c := range caps {
 		if !c.AppliesToAllWorkspaces {
 			scopedByID[c.ID] = c
@@ -852,7 +1046,7 @@ func (r *ActionRepository) ListEnabledCapabilities() ([]*models.ActionCapability
 // PLUS every enabled capability explicitly scoped to this workspace via the
 // join table. Optional capType filter narrows by capability_type.
 func (r *ActionRepository) ListCapabilitiesForWorkspace(workspaceID int, capType string) ([]*models.ActionCapability, error) {
-	args := []interface{}{}
+	args := []any{}
 	typeFilter := ""
 	if capType != "" {
 		typeFilter = " AND capability_type = ?"
@@ -921,11 +1115,20 @@ func (r *ActionRepository) GetCapabilityWorkspaceIDs(capabilityID int) ([]int, e
 // Pass an empty slice to clear (only meaningful when AppliesToAllWorkspaces is
 // false; the caller is responsible for that invariant).
 func (r *ActionRepository) SetCapabilityWorkspaces(capabilityID int, workspaceIDs []int) error {
-	if _, err := r.db.ExecWrite(`DELETE FROM action_capability_workspaces WHERE capability_id = ?`, capabilityID); err != nil {
+	return setCapabilityWorkspaces(r.db, capabilityID, workspaceIDs)
+}
+
+type capabilityWriter interface {
+	QueryRow(query string, args ...any) *sql.Row
+	ExecWrite(query string, args ...any) (sql.Result, error)
+}
+
+func setCapabilityWorkspaces(writer capabilityWriter, capabilityID int, workspaceIDs []int) error {
+	if _, err := writer.ExecWrite(`DELETE FROM action_capability_workspaces WHERE capability_id = ?`, capabilityID); err != nil {
 		return fmt.Errorf("failed to clear capability workspace scope: %w", err)
 	}
 	for _, wsID := range workspaceIDs {
-		if _, err := r.db.ExecWrite(`INSERT INTO action_capability_workspaces (capability_id, workspace_id) VALUES (?, ?)`, capabilityID, wsID); err != nil {
+		if _, err := writer.ExecWrite(`INSERT INTO action_capability_workspaces (capability_id, workspace_id) VALUES (?, ?)`, capabilityID, wsID); err != nil {
 			return fmt.Errorf("failed to add capability workspace scope (ws %d): %w", wsID, err)
 		}
 	}
@@ -934,32 +1137,77 @@ func (r *ActionRepository) SetCapabilityWorkspaces(capabilityID int, workspaceID
 
 // CreateCapability creates a new capability.
 func (r *ActionRepository) CreateCapability(c *models.ActionCapability) (int, error) {
+	return createCapability(r.db, c)
+}
+
+func createCapability(writer capabilityWriter, c *models.ActionCapability) (int, error) {
 	var id int64
-	err := r.db.QueryRow(`
+	now := time.Now()
+	err := writer.QueryRow(`
 		INSERT INTO action_capabilities (name, capability_type, config, is_enabled, applies_to_all_workspaces, created_by, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
 	`,
 		c.Name, c.CapabilityType, c.Config, c.IsEnabled, c.AppliesToAllWorkspaces,
-		c.CreatedBy, time.Now(), time.Now(),
+		c.CreatedBy, now, now,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create capability: %w", err)
 	}
-	return int(id), nil
+	c.ID = int(id)
+	c.CreatedAt = now
+	c.UpdatedAt = now
+	return c.ID, nil
+}
+
+// CreateCapabilityWithWorkspaces inserts a capability and its workspace
+// allowlist atomically. A failed allowlist insert (for example, a stale
+// workspace ID) must not leave behind an enabled but unreachable capability.
+func (r *ActionRepository) CreateCapabilityWithWorkspaces(c *models.ActionCapability, workspaceIDs []int) (int, error) {
+	var id int
+	err := database.WithTx(r.db, func(tx database.Tx) error {
+		createdID, err := createCapability(tx, c)
+		if err != nil {
+			return err
+		}
+		id = createdID
+		return setCapabilityWorkspaces(tx, id, workspaceIDs)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // UpdateCapability updates a capability.
 func (r *ActionRepository) UpdateCapability(c *models.ActionCapability) error {
-	_, err := r.db.ExecWrite(`
+	return updateCapability(r.db, c)
+}
+
+func updateCapability(writer capabilityWriter, c *models.ActionCapability) error {
+	c.UpdatedAt = time.Now()
+	_, err := writer.ExecWrite(`
 		UPDATE action_capabilities SET name = ?, config = ?, is_enabled = ?, applies_to_all_workspaces = ?, updated_at = ?
 		WHERE id = ?
 	`,
-		c.Name, c.Config, c.IsEnabled, c.AppliesToAllWorkspaces, time.Now(), c.ID,
+		c.Name, c.Config, c.IsEnabled, c.AppliesToAllWorkspaces, c.UpdatedAt, c.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update capability: %w", err)
 	}
 	return nil
+}
+
+// UpdateCapabilityWithWorkspaces updates capability metadata/config and
+// replaces its workspace allowlist in one transaction. This keeps the scope
+// bit and join rows from describing different authorization states after a
+// partial failure.
+func (r *ActionRepository) UpdateCapabilityWithWorkspaces(c *models.ActionCapability, workspaceIDs []int) error {
+	return database.WithTx(r.db, func(tx database.Tx) error {
+		if err := updateCapability(tx, c); err != nil {
+			return err
+		}
+		return setCapabilityWorkspaces(tx, c.ID, workspaceIDs)
+	})
 }
 
 // DeleteCapability deletes a capability by ID.
@@ -973,20 +1221,8 @@ func (r *ActionRepository) DeleteCapability(id int) error {
 
 // SaveActionWithNodesAndEdges saves an action along with its nodes and edges in a transaction
 func (r *ActionRepository) SaveActionWithNodesAndEdges(action *models.Action, nodes []models.ActionNode, edges []models.ActionEdge) error {
-	flowNodes := make([]actionutil.FlowNode, len(nodes))
-	for i, n := range nodes {
-		flowNodes[i] = actionutil.FlowNode{
-			ID: n.ID, ActionID: n.ActionID, NodeType: string(n.NodeType),
-			NodeConfig: n.NodeConfig, PositionX: n.PositionX, PositionY: n.PositionY,
-		}
-	}
-	flowEdges := make([]actionutil.FlowEdge, len(edges))
-	for i, e := range edges {
-		flowEdges[i] = actionutil.FlowEdge{
-			ID: e.ID, SourceNodeID: e.SourceNodeID, TargetNodeID: e.TargetNodeID,
-			EdgeType: e.EdgeType, SourceHandle: e.SourceHandle, TargetHandle: e.TargetHandle,
-		}
-	}
+	flowNodes := actionutil.ToFlowNodes(nodes)
+	flowEdges := actionutil.ToFlowEdges(edges)
 
 	const updateSQL = `
 		UPDATE actions SET
@@ -994,14 +1230,31 @@ func (r *ActionRepository) SaveActionWithNodesAndEdges(action *models.Action, no
 			trigger_config = ?, updated_at = ?
 		WHERE id = ?
 	`
-	args := []interface{}{
+	args := []any{
 		action.Name, action.Description, action.IsEnabled, action.TriggerType,
 		action.TriggerConfig, time.Now(), action.ID,
 	}
 
-	return actionutil.UpdateActionGraph(
-		r.db, updateSQL, args, action.ID,
-		flowNodes, flowEdges,
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(updateSQL, args...); err != nil {
+		return fmt.Errorf("failed to update action: %w", err)
+	}
+	if err := actionutil.SaveNodesAndEdges(
+		tx, action.ID, flowNodes, flowEdges,
 		actionutil.SQLiteStatements("action_nodes", "action_edges"),
-	)
+	); err != nil {
+		return fmt.Errorf("failed to save nodes and edges: %w", err)
+	}
+	if err := replaceAllowedRoleIDs(tx, action.ID, action.AllowedRoleIDs); err != nil {
+		return fmt.Errorf("failed to save allowed roles: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return nil
 }

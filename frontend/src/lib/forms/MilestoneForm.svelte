@@ -4,6 +4,7 @@
   import { formatDateWithOptions } from '../utils/dateFormatter.js';
   import MilkdownEditor from '../editors/LazyMilkdownEditor.svelte';
   import FieldChip from '../components/FieldChip.svelte';
+  import Input from '../components/Input.svelte';
   import ChipPicker from '../pickers/ChipPicker.svelte';
   import { useForm, validators } from '../composables/useForm.svelte.js';
 
@@ -20,10 +21,10 @@
   // Initialize form with useForm composable
   const form = useForm({
     initialValues: {
-      name: '',
-      description: '',
-      target_date: '',
-      status: 'planning'
+      name: formData.name || '',
+      description: formData.description || '',
+      target_date: formData.target_date || '',
+      status: formData.status || 'planning'
     },
     schema: {
       name: validators.required('Name is required'),
@@ -76,10 +77,11 @@
 
 <div class="space-y-3">
   <!-- Title Input -->
-  <input
-    bind:this={nameInputRef}
+  <Input
+    bind:inputRef={nameInputRef}
     bind:value={form.values.name}
     type="text"
+    variant="ghost"
     class="w-full text-lg font-medium border-0 outline-none bg-transparent"
     style="color: var(--ds-text);"
     placeholder={t('createModal.milestoneName')}
@@ -114,15 +116,14 @@
     >
       {#snippet children({ close: closePopover })}
         <div class="p-3">
-          <input
+          <Input
             type="date"
             bind:value={form.values.target_date}
-            class="w-full px-3 py-2 rounded border text-sm"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
             onchange={() => {
               form.touchField('target_date');
               closePopover();
             }}
+            size="small"
           />
         </div>
       {/snippet}

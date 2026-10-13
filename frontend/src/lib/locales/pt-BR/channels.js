@@ -1,15 +1,3 @@
-/**
- * Português Brasil (pt-BR) - Traduções de Canais, Notificações, Portal e Formulários de Solicitação
- *
- * Este módulo contém traduções para:
- * - notifications: Interface de notificações e verificação de e-mail
- * - channels: Gerenciamento de canais e configurações de integração
- * - channel: Configuração de canal (portal, webhook, e-mail)
- * - portal: Configurações do portal do cliente e tipos de solicitação
- * - requestForm: Formulário de envio de solicitação do portal
- * - requestTypeFields: Configuração de campos para tipos de solicitação
- */
-
 export default {
   notifications: {
     title: 'Notificações',
@@ -72,6 +60,18 @@ export default {
     channelDeleted: 'Canal excluído com sucesso',
     cannotDeleteDefault: 'Não é possível excluir o canal de notificação padrão',
     searchChannels: 'Pesquisar canais...',
+    manager: {
+      subtitle: 'Gerencie os canais sob sua responsabilidade',
+      purpose: 'Finalidade',
+      publishedAt: 'Publicado em {path}',
+      deliversTo: 'Entrega solicitações para {workspace}',
+      outboundNotifications: 'Envia notificações de saída',
+      outboundEvents: 'Entrega eventos de saída',
+      operational: 'Canal operacional',
+      noChannels: 'Nenhum canal gerenciado',
+      noChannelsDescription: 'Os canais atribuídos a você aparecerão aqui.',
+      loadFailed: 'Não foi possível carregar os canais',
+    },
     testWebhook: 'Testar Webhook',
     webhookSent: 'Webhook de teste enviado com sucesso!',
     webhookFailed: 'Falha no teste do webhook',
@@ -258,6 +258,9 @@ export default {
     smtpFromName: 'Nome de Origem',
     smtpFromNamePlaceholder: 'Nome de exibição para e-mails enviados',
     smtpEncryption: 'Criptografia',
+    smtpSkipTlsVerify: 'Ignorar verificação do certificado',
+    smtpSkipTlsVerifyDescription: 'Permite certificados autoassinados ou não confiáveis somente para este servidor SMTP. Isso reduz a segurança da conexão.',
+    smtpNoEncryptionWarning: 'O conteúdo do e-mail e os metadados de entrega serão enviados sem criptografia. Use esta opção apenas com um relay SMTP local confiável.',
     noEncryption: 'Nenhuma (não recomendado)',
     authentication: 'Autenticação',
     senderSettings: 'Configurações do Remetente',
@@ -586,6 +589,7 @@ export default {
     settings: {
       title: 'Form Settings',
       requireAuth: 'Require authentication',
+      allowAttachments: 'Permitir anexos',
       submitButton: 'Submit Button Text',
       successMessage: 'Success Message',
       successMessagePlaceholder: 'Thank you for your submission!',

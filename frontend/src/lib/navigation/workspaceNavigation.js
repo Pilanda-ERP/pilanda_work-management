@@ -1,21 +1,25 @@
 import { GanttChart } from '@lucide/svelte';
 import {
   IconAdjustments as Adjustments,
+  IconUserStar as AgentIcon,
   IconChartBar as BarChart3,
   IconBook as Book,
   IconCalendar as Calendar,
+  IconClock as Clock,
   IconFileCheck as FileCheck,
   IconFileStack as FileStack,
   IconGitBranch as GitBranch,
+  IconInbox,
+  IconKey as Key,
   IconList as List,
   IconListTree as ListTree,
   IconMapPin as MapPin,
+  IconMessageCircle2 as MessageSquareText,
   IconFlag as Milestone,
   IconPackage as Package,
   IconPlayerPlay as Play,
   IconRefresh as Refresh,
   IconRepeat as Repeat,
-  IconRobot as Robot,
   IconLayoutRows as Rows_3,
   IconSettings as SettingsCog,
   IconLayoutKanban as SquareKanban,
@@ -29,60 +33,114 @@ import {
 /**
  * @typedef {Object} WorkspaceView
  * @property {string} id
- * @property {string} label
+ * @property {string} labelKey
  * @property {any}    icon
- * @property {string} [tooltip]
+ * @property {string} [tooltipKey]
+ * @property {string} [testId]
  * @property {string[]} [activeViews]  Route view names that highlight this item.
  */
 
 /**
- * Collection-scoped workspace views (visible inside collections too).
+ * Collection-scoped workspace views (visible inside collections too). The
+ * queue trails the board views: its route follows the selected collection so
+ * collection-scoped queues are reachable, while its visibility toggle stays
+ * in the workspace nav set because queue definitions are workspace-owned.
  * @type {WorkspaceView[]}
  */
 export const workspaceViewItems = [
-  { id: 'backlog', label: 'Backlog', icon: Rows_3, tooltip: 'Backlog view for unfinished items' },
-  { id: 'board', label: 'Board', icon: SquareKanban, tooltip: 'Kanban board view with columns' },
-  { id: 'list', label: 'List', icon: List, tooltip: 'Detailed list view with all fields' },
-  { id: 'tree', label: 'Tree', icon: ListTree, tooltip: 'Hierarchical tree view for nested items' },
-  { id: 'map', label: 'Map', icon: MapPin, tooltip: 'Visual map view for spatial organization' },
+  {
+    id: 'backlog',
+    labelKey: 'workspaceSettings.views.backlog',
+    icon: Rows_3,
+    testId: 'workspace-nav-backlog',
+  },
+  {
+    id: 'board',
+    labelKey: 'workspaceSettings.views.board',
+    icon: SquareKanban,
+    testId: 'workspace-nav-board',
+  },
+  {
+    id: 'list',
+    labelKey: 'workspaceSettings.views.list',
+    icon: List,
+    testId: 'workspace-nav-list',
+  },
+  {
+    id: 'tree',
+    labelKey: 'workspaceSettings.views.tree',
+    icon: ListTree,
+    testId: 'workspace-nav-tree',
+  },
+  {
+    id: 'map',
+    labelKey: 'workspaceSettings.views.map',
+    icon: MapPin,
+    testId: 'workspace-nav-map',
+  },
   {
     id: 'roadmap',
-    label: 'Roadmap',
+    labelKey: 'collections.roadmap',
     icon: GanttChart,
-    tooltip: 'Timeline view with date ranges and dependencies',
+    testId: 'workspace-nav-roadmap',
+  },
+  {
+    id: 'queue',
+    labelKey: 'supportQueue.title',
+    tooltipKey: 'supportQueue.description',
+    icon: IconInbox,
+    testId: 'workspace-nav-queue',
+    activeViews: ['workspace-queue'],
   },
 ];
 
 /**
- * Workspace-only views (hidden inside collections).
+ * Collection-scoped view ids, the only entries a collection-scope navigation
+ * override may toggle; mirrors models.BoardViewIDs on the backend. The queue
+ * deliberately stays out: it renders in the views group but only the
+ * workspace scope can toggle it.
+ * @type {Set<string>}
+ */
+export const COLLECTION_VIEW_IDS = new Set(['backlog', 'board', 'list', 'tree', 'map', 'roadmap']);
+
+/**
+ * Workspace tools which are not scoped to a collection.
  * @type {WorkspaceView[]}
  */
 export const workspaceOnlyViews = [
   {
+    id: 'agents',
+    labelKey: 'users.agents.title',
+    tooltipKey: 'users.agents.description',
+    icon: AgentIcon,
+    testId: 'workspace-nav-agents',
+    activeViews: ['workspace-agents', 'workspace-agent-profile', 'workspace-agent-create'],
+  },
+  {
     id: 'iterations',
-    label: 'Iterations',
+    labelKey: 'commandPalette.commands.iterations.label',
+    tooltipKey: 'commandPalette.commands.iterations.description',
     icon: Calendar,
-    tooltip: 'Manage sprints, PIs, and other iteration cycles',
   },
   {
     id: 'milestones',
-    label: 'Milestones',
+    labelKey: 'commandPalette.commands.milestones.label',
+    tooltipKey: 'commandPalette.commands.milestones.description',
     icon: Milestone,
-    tooltip: 'Manage workspace milestones and releases',
   },
   {
     id: 'analytics',
-    label: 'Analytics',
+    labelKey: 'commandPalette.commands.analytics.label',
+    tooltipKey: 'commandPalette.commands.analytics.description',
     icon: TrendingUp,
-    tooltip: 'Velocity, cycle time, and forecasting',
   },
-  { id: 'actions', label: 'Actions', icon: Zap, tooltip: 'Automate workflows and triggers' },
+  { id: 'actions', labelKey: 'actions.title', icon: Zap, testId: 'workspace-nav-actions' },
   {
     id: 'pages',
-    label: 'Pages',
+    labelKey: 'pages.treeHeading',
     icon: Book,
-    tooltip: 'Workspace knowledge pages (wiki)',
     activeViews: ['workspace-pages'],
+    testId: 'workspace-nav-pages',
   },
 ];
 
@@ -94,37 +152,37 @@ export const workspaceOnlyViews = [
 export const testNavigationItems = [
   {
     id: 'test-cases',
-    label: 'Test Cases',
+    labelKey: 'commandPalette.commands.testCases.label',
+    tooltipKey: 'commandPalette.commands.testCases.description',
     icon: FileCheck,
-    tooltip: 'Manage test cases and steps',
     activeViews: ['test-cases', 'test-case-detail', 'test-steps'],
   },
   {
     id: 'test-sets',
-    label: 'Test Plans',
+    labelKey: 'commandPalette.commands.testPlans.label',
+    tooltipKey: 'commandPalette.commands.testPlans.description',
     icon: Package,
-    tooltip: 'Organize plans and suites',
     activeViews: ['test-sets', 'test-set-detail'],
   },
   {
     id: 'test-templates',
-    label: 'Templates',
+    labelKey: 'commandPalette.commands.testTemplates.label',
+    tooltipKey: 'commandPalette.commands.testTemplates.description',
     icon: FileStack,
-    tooltip: 'Template runs and shared steps',
     activeViews: ['test-templates', 'test-template-detail'],
   },
   {
     id: 'test-runs',
-    label: 'Test Runs',
+    labelKey: 'commandPalette.commands.testRuns.label',
+    tooltipKey: 'commandPalette.commands.testRuns.description',
     icon: Play,
-    tooltip: 'Schedule and execute runs',
     activeViews: ['test-runs', 'test-run-detail', 'test-execution'],
   },
   {
     id: 'test-reports',
-    label: 'Reports',
+    labelKey: 'commandPalette.commands.testReports.label',
+    tooltipKey: 'commandPalette.commands.testReports.description',
     icon: BarChart3,
-    tooltip: 'Review execution results',
     activeViews: ['test-reports'],
   },
 ];
@@ -136,6 +194,7 @@ export const testNavigationItems = [
  * @property {any}     icon      Icon component.
  * @property {string}  view      Route view name that highlights this item.
  * @property {boolean} [danger]  Styled as a destructive action when true.
+ * @property {string}  [permission] Workspace permission key required to see the module.
  */
 
 /**
@@ -176,16 +235,17 @@ export const workspaceSettingsItems = [
     view: 'workspace-settings-source-control',
   },
   {
-    id: 'coding-agents',
-    labelKey: 'workspaceSettings.tabs.codingAgents',
-    icon: Robot,
-    view: 'workspace-settings-coding-agents',
-  },
-  {
     id: 'issue-sync',
     labelKey: 'workspaceSettings.tabs.issueSync',
     icon: Refresh,
     view: 'workspace-settings-issue-sync',
+  },
+  {
+    id: 'action-credentials',
+    labelKey: 'workspaceSettings.tabs.actionCredentials',
+    icon: Key,
+    view: 'workspace-settings-action-credentials',
+    permission: 'action.credential.manage',
   },
   {
     id: 'recurrence',
@@ -198,6 +258,18 @@ export const workspaceSettingsItems = [
     labelKey: 'workspaceSettings.tabs.templates',
     icon: FileStack,
     view: 'workspace-settings-templates',
+  },
+  {
+    id: 'canned-responses',
+    labelKey: 'workspaceSettings.tabs.cannedResponses',
+    icon: MessageSquareText,
+    view: 'workspace-settings-canned-responses',
+  },
+  {
+    id: 'service-levels',
+    labelKey: 'workspaceSettings.tabs.serviceLevels',
+    icon: Clock,
+    view: 'workspace-settings-service-levels',
   },
   {
     id: 'danger',
@@ -214,7 +286,68 @@ export const workspaceSettingsViews = [
   ...workspaceSettingsItems.map((item) => item.view),
 ];
 
+/** Settings modules visible to the current user in a workspace. Modules with
+ * a `permission` require that workspace permission; the rest only need
+ * workspace.admin (the settings area's own gate). */
+export function visibleWorkspaceSettingsItems(workspaceId, hasPermission) {
+  return workspaceSettingsItems.filter(
+    (item) => !item.permission || hasPermission(workspaceId, item.permission)
+  );
+}
+
 /** Build the route for a settings module. */
 export function workspaceSettingsRoute(workspaceId, id) {
   return `/workspaces/${workspaceId}/settings/${id}`;
+}
+
+/**
+ * View names that have a collection-scoped route. Any other `workspace-*`
+ * view (settings, agents, pages, calendar, reviews, …) is workspace-only, so
+ * switching to a collection falls back to that collection's default view
+ * instead of inventing a collection URL that would 404.
+ * @type {Set<string>}
+ */
+export const COLLECTION_SCOPED_VIEWS = new Set([
+  'workspace-overview',
+  'workspace-detail',
+  'workspace-queue',
+  'workspace-board',
+  'workspace-backlog',
+  'workspace-list',
+  'workspace-tree',
+  'workspace-map',
+  'workspace-roadmap',
+  'workspace-board-config',
+  'workspace-nav-config',
+  'item-detail',
+]);
+
+/**
+ * Builds the URL for re-scoping the current view to another collection (or to
+ * "All items" when collectionId is null). It works from the current route path
+ * rather than the view name so compound paths such as `board/configure`,
+ * `settings/general`, and detail params survive the switch. Views without a
+ * collection-scoped route fall back to the collection's default view.
+ *
+ * @param {{path?: string, view?: string|null}} route
+ * @param {number|string} workspaceId
+ * @param {number|string|null} collectionId
+ * @param {string} defaultView
+ * @returns {string}
+ */
+export function collectionSwitchUrl(route, workspaceId, collectionId, defaultView = 'backlog') {
+  const workspaceBase = `/workspaces/${workspaceId}`;
+  const routePath = route?.path || workspaceBase;
+  // Strip an existing collection segment so the same view path can be rebuilt.
+  const withoutCollection = routePath.replace(
+    new RegExp(`^/workspaces/${workspaceId}/collections/[^/]+`),
+    workspaceBase
+  );
+  if (collectionId === null || collectionId === undefined) {
+    return withoutCollection;
+  }
+  if (COLLECTION_SCOPED_VIEWS.has(route?.view)) {
+    return `${workspaceBase}/collections/${collectionId}${withoutCollection.slice(workspaceBase.length)}`;
+  }
+  return `${workspaceBase}/collections/${collectionId}/${defaultView}`;
 }

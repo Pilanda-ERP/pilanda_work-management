@@ -4,12 +4,20 @@
   import { api } from '../api.js';
   import { navigate } from '../router.js';
   import { workspacePermissions, currentWorkspace, attachmentStatus, workspacesStore } from '../stores';
-  import { workspaceGradientIndex, applyToAllViews as applyToAllViewsStore, workspaceBackgroundImageUrl } from '../stores/workspaceGradient.svelte.js';
+  import { workspaceDataStore } from '../stores/workspaceDataStore.svelte.js';
+  import {
+    workspaceGradientIndex,
+    applyToAllViews as applyToAllViewsStore,
+    workspaceBackgroundImageUrl,
+    hydrateWorkspaceGradientLayout,
+    loadWorkspaceGradient,
+  } from '../stores/workspaceGradient.svelte.js';
   import { gradients } from '../utils/gradients.js';
-  import { backgroundCategories, getPresetsByCategory } from '../utils/backgroundImages.js';
   import { workspaceIconMap } from '../utils/icons.js';
-  import { Palette, Camera, Trash2, X, Shield, Package, Upload } from '@lucide/svelte';
+  import { Palette, Camera, Trash2, X, Shield, Package } from '@lucide/svelte';
   import IconSelector from '../pickers/IconSelector.svelte';
+  import BackgroundImageSelector from '../components/BackgroundImageSelector.svelte';
+  import FileInput from '../components/FileInput.svelte';
   import Button from '../components/Button.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import StaticViewBackground from '../layout/StaticViewBackground.svelte';
@@ -27,11 +35,7 @@
   let selectedGradient = $state(0);
   let backgroundImageUrl = $state(null);
   let currentLayout = $state(null);
-
-  // Background image upload state
   let uploadingBackground = $state(false);
-  let showBackgroundUpload = $state(false);
-  let selectedBackgroundCategory = $state('abstract');
 
   // Identity
   let icon = $state('Package');
@@ -46,6 +50,12 @@
   const canAdmin = $derived(workspacePermissions.canAdminWorkspace(workspaceId));
 
   const iconMap = workspaceIconMap;
+
+  function attachmentUnavailableMessage() {
+    return attachmentStatus.unavailableReason === 'unwritable'
+      ? t('settings.attachments.pathStatusUnknown')
+      : t('workspaceSettings.attachmentsRequired');
+  }
 
   // Background: image takes priority over gradient
   const hasBackgroundImage = $derived(backgroundImageUrl !== null && backgroundImageUrl !== '');
@@ -68,12 +78,12 @@
 
   onMount(async () => {
     try {
-      const [ws, layout] = await Promise.all([
-        api.workspaces.get(workspaceId),
-        api.workspaces.getHomepageLayout(workspaceId)
+      const [, layout] = await Promise.all([
+        workspaceDataStore.initialize(workspaceId),
+        loadWorkspaceGradient(workspaceId)
       ]);
 
-      workspace = ws;
+      workspace = workspaceDataStore.workspace;
       if (workspace) {
         icon = workspace.icon || 'Package';
         color = workspace.color || '#3b82f6';
@@ -104,12 +114,6 @@
 
       await Promise.all([
         api.workspaces.update(workspaceId, {
-          name: workspace.name,
-          key: workspace.key,
-          description: workspace.description || '',
-          active: workspace.active,
-          time_project_id: workspace.time_project_id || null,
-          default_view: workspace.default_view || 'board',
           icon,
           color,
           avatar_url: avatarUrl
@@ -135,6 +139,7 @@
       workspaceGradientIndex.set(selectedGradient);
       applyToAllViewsStore.set(true);
       workspaceBackgroundImageUrl.set(backgroundImageUrl);
+      hydrateWorkspaceGradientLayout(workspaceId, layoutPayload);
     } catch (error) {
       console.error('Failed to save:', error);
       errorToast(t('lookAndFeel.failedToSave', { error: error.message || error }));
@@ -145,7 +150,7 @@
     if (!files || files.length === 0) return;
 
     if (!attachmentStatus.enabled) {
-      errorToast(t('workspaceSettings.attachmentsRequired'));
+      errorToast(attachmentUnavailableMessage());
       return;
     }
 
@@ -227,14 +232,14 @@
   }
 
   async function handleBackgroundUpload(files) {
-    if (!files || files.length === 0) return;
+    if (!files?.length) return;
 
     if (!attachmentStatus.enabled) {
-      errorToast(t('workspaceSettings.attachmentsRequired'));
+      errorToast(attachmentUnavailableMessage());
       return;
     }
 
-    const file = files[0];
+    const [file] = files;
     if (!file.type.startsWith('image/')) {
       errorToast(t('workspaceSettings.pleaseSelectImage'));
       return;
@@ -249,10 +254,8 @@
       uploadFormData.append('category', 'workspace_background');
 
       const uploadResult = await api.attachments.upload(uploadFormData);
-
-      if (uploadResult && uploadResult.success && uploadResult.background_url) {
+      if (uploadResult?.success && uploadResult.background_url) {
         selectBackgroundImage(uploadResult.background_url);
-        showBackgroundUpload = false;
         successToast(t('lookAndFeel.backgroundUploadedSuccess'));
       }
     } catch (err) {
@@ -273,7 +276,7 @@
 {:else if !canAdmin}
   <Card rounded="xl" shadow padding="loose">
     <div class="text-center py-8">
-      <Shield class="w-12 h-12 mx-auto mb-4 text-amber-500" />
+      <Shield class="w-12 h-12 mx-auto mb-4 text-ds-icon-warning" />
       <h2 class="text-lg font-semibold mb-2" style="color: var(--ds-text);">{t('workspaceSettings.accessDenied')}</h2>
       <p class="text-sm mb-4" style="color: var(--ds-text-subtle);">{t('workspaceSettings.accessDeniedDescription')}</p>
       <Button href={`/workspaces/${workspaceId}`} variant="primary">
@@ -285,6 +288,7 @@
   <StaticViewBackground
     backgroundStyle={backgroundStyle()}
     class="look-and-feel-wrapper"
+    testid="workspace-look-and-feel"
   >
   <div class="space-y-6 max-w-4xl">
     <!-- Header -->
@@ -312,6 +316,7 @@
               style={selectedGradient === index && !hasBackgroundImage ? 'box-shadow: 0 0 0 2px var(--ds-border-focused); outline-offset: 2px;' : ''}
               title={gradient.name}
               data-testid={`gradient-swatch-${index}`}
+              aria-pressed={selectedGradient === index && !hasBackgroundImage}
             >
               {#if index === 0}
                 <div class="w-full h-full flex items-center justify-center" style="background-color: var(--ds-background-neutral);">
@@ -335,105 +340,14 @@
         </div>
       </div>
 
-      <!-- Background Images -->
-      <div class="border-t pt-6" style="border-color: var(--ds-border);">
-        <Label class="mb-3">{t('lookAndFeel.backgroundImages')}</Label>
-
-        <!-- Current background image preview -->
-        {#if hasBackgroundImage}
-          <div class="mb-4 p-3 rounded-lg border flex items-center gap-4" style="border-color: var(--ds-border-focused); background-color: var(--ds-surface);">
-            <div class="w-20 h-12 rounded overflow-hidden flex-shrink-0">
-              <img src={backgroundImageUrl} alt="Current background" class="w-full h-full object-cover" />
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-medium" style="color: var(--ds-text);">{t('lookAndFeel.currentBackground')}</div>
-              <div class="text-xs truncate" style="color: var(--ds-text-subtle);">{backgroundImageUrl}</div>
-            </div>
-            <Button
-              variant="default"
-              size="sm"
-              onclick={removeBackgroundImage}
-              icon={Trash2}
-            >
-              {t('workspaceSettings.remove')}
-            </Button>
-          </div>
-        {/if}
-
-        <!-- Category tabs -->
-        <div class="flex gap-2 mb-4">
-          {#each backgroundCategories as category}
-            <button
-              class="category-tab px-3 py-1.5 text-sm font-medium rounded-md transition-colors"
-              class:category-tab-selected={selectedBackgroundCategory === category.id}
-              onclick={() => selectedBackgroundCategory = category.id}
-            >
-              {category.name}
-            </button>
-          {/each}
-        </div>
-
-        <!-- Preset images grid -->
-        <div class="grid grid-cols-4 gap-3 mb-4">
-          {#each getPresetsByCategory(selectedBackgroundCategory) as preset}
-            <button
-              onclick={() => selectBackgroundImage(preset.url)}
-              class="group relative aspect-video rounded-lg overflow-hidden transition-all hover:scale-105"
-              style={backgroundImageUrl === preset.url ? 'box-shadow: 0 0 0 2px var(--ds-border-focused);' : ''}
-              title={preset.name}
-            >
-              <img
-                src={preset.thumbnail}
-                alt={preset.name}
-                class="w-full h-full object-cover"
-                loading="lazy"
-              />
-              <div class="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors"></div>
-              <div class="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black/60 to-transparent">
-                <span class="text-xs text-white font-medium">{preset.name}</span>
-              </div>
-            </button>
-          {/each}
-        </div>
-
-        <!-- Custom upload section -->
-        <div class="border-t pt-4" style="border-color: var(--ds-border);">
-          <div class="flex items-center gap-3">
-            <Button
-              variant="default"
-              size="sm"
-              onclick={() => showBackgroundUpload = !showBackgroundUpload}
-              icon={Upload}
-              disabled={!attachmentStatus.enabled}
-            >
-              {t('lookAndFeel.uploadCustomImage')}
-            </Button>
-            {#if !attachmentStatus.enabled}
-              <span class="text-xs" style="color: var(--ds-text-warning);">
-                {t('workspaceSettings.attachmentsRequired')}
-              </span>
-            {/if}
-          </div>
-
-          {#if showBackgroundUpload && attachmentStatus.enabled}
-            <div class="mt-3 p-4 rounded-lg border" style="border-color: var(--ds-border); background-color: var(--ds-surface);">
-              <input
-                type="file"
-                accept="image/*"
-                onchange={(e) => handleBackgroundUpload(e.currentTarget.files)}
-                disabled={uploadingBackground}
-                class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
-              />
-              {#if uploadingBackground}
-                <div class="mt-2 text-sm text-blue-600">{t('workspaceSettings.uploading')}</div>
-              {/if}
-              <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
-                {t('lookAndFeel.backgroundUploadRecommendation')}
-              </p>
-            </div>
-          {/if}
-        </div>
-      </div>
+      <BackgroundImageSelector
+        currentImageUrl={backgroundImageUrl}
+        onSelectImage={selectBackgroundImage}
+        onRemoveImage={removeBackgroundImage}
+        onUploadImage={handleBackgroundUpload}
+        uploading={uploadingBackground}
+        presetAspectRatio="16 / 9"
+      />
     </Card>
 
     <!-- Section 3: Workspace Identity -->
@@ -499,22 +413,21 @@
               </Button>
               {#if !attachmentStatus.enabled}
                 <p class="text-xs mt-1" style="color: var(--ds-text-warning);">
-                  {t('workspaceSettings.attachmentsRequired')}
+                  {attachmentUnavailableMessage()}
                 </p>
               {/if}
             </div>
 
             {#if showAvatarUpload && attachmentStatus.enabled}
               <div class="p-4 rounded border" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-                <input
-                  type="file"
+                <FileInput
                   accept="image/*"
                   onchange={(e) => handleAvatarUpload(e.currentTarget.files)}
                   disabled={uploadingAvatar}
-                  class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 disabled:opacity-50"
+                  class="block w-full text-sm text-ds-text-subtle file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-medium file:bg-ds-background-neutral file:text-ds-text-link hover:file:bg-ds-background-neutral-hovered disabled:opacity-50"
                 />
                 {#if uploadingAvatar}
-                  <div class="mt-2 text-sm text-blue-600">{t('workspaceSettings.uploading')}</div>
+                  <div class="mt-2 text-sm text-ds-interactive">{t('workspaceSettings.uploading')}</div>
                 {/if}
                 <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
                   {t('workspaceSettings.uploadRecommendation')}
@@ -543,31 +456,6 @@
     width: 100%;
     min-height: 100vh;
     position: relative;
-    background-size: 200% 200%;
-    animation: gradient-shift 15s ease infinite;
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    :global(.look-and-feel-wrapper) {
-      animation: none;
-    }
-  }
-
-  .category-tab {
-    background-color: var(--ds-surface);
-    color: var(--ds-text-subtle);
-    border: 1px solid var(--ds-border);
-  }
-
-  .category-tab:hover {
-    background-color: var(--ds-background-neutral-hovered);
-    color: var(--ds-text);
-  }
-
-  .category-tab-selected {
-    background-color: var(--ds-interactive) !important;
-    color: white !important;
-    border-color: var(--ds-interactive) !important;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-  }
 </style>

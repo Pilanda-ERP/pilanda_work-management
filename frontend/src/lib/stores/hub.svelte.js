@@ -8,8 +8,7 @@ import { authStore } from '../stores';
 import { createFooterLinkHelpers } from './footerLinks.js';
 
 export { WINDSHIFT_GRADIENT } from '../utils/gradients.js';
-// Import gradients from portal store for sharing
-export { gradients, iconMap } from './portal.svelte.js';
+export { gradients, iconMap } from './portalPresentation.js';
 
 // Core state
 let hubConfig = $state(null);
@@ -88,8 +87,15 @@ async function loadHub() {
     editableSearchHint = data.config.search_hint || '';
     logoUrl = data.config.logo_url || null;
 
-    // Load hub sections
-    hubSections = data.config.sections || [];
+    // Load hub sections. Normalize the shape the editor persists so a
+    // section saved before a field existed (or with a null assignment list)
+    // still renders instead of crashing on `portal_ids.map`.
+    hubSections = (data.config.sections || []).map((section, index) => ({
+      ...section,
+      subtitle: section.subtitle || '',
+      display_order: section.display_order ?? index,
+      portal_ids: Array.isArray(section.portal_ids) ? section.portal_ids : [],
+    }));
 
     // Load footer columns
     footerColumns = data.config.footer_columns || [
@@ -287,7 +293,7 @@ function removePortalFromSection(sectionId, portalId) {
  * Get portals for a section
  */
 function getSectionPortals(section) {
-  return section.portal_ids
+  return (section.portal_ids || [])
     .map((id) => portals.find((p) => p.id === id))
     .filter((p) => p !== undefined);
 }
@@ -296,7 +302,7 @@ function getSectionPortals(section) {
  * Get portals not assigned to any section
  */
 function getUnassignedPortals() {
-  const assignedIds = new Set(hubSections.flatMap((s) => s.portal_ids));
+  const assignedIds = new Set(hubSections.flatMap((s) => s.portal_ids || []));
   return portals.filter((p) => !assignedIds.has(p.id));
 }
 
@@ -353,6 +359,12 @@ async function toggleInbox() {
 
 // Reset store (for cleanup)
 function reset() {
+  // Cancel a pending debounced save so it cannot fire after navigation and
+  // overwrite the hub with default/empty state.
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
+    saveTimeout = null;
+  }
   hubConfig = null;
   portals = [];
   loading = true;

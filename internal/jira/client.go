@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +29,13 @@ type Client interface {
 	ListProjects(ctx context.Context) ([]JiraProject, error)
 	GetProject(ctx context.Context, projectKey string) (*JiraProject, error)
 
+	// Jira Service Management
+	ListServiceDesks(ctx context.Context) ([]JiraServiceDesk, error)
+	ListServiceDeskRequestTypes(ctx context.Context, serviceDeskID string) ([]JiraServiceDeskRequestType, error)
+	ListServiceDeskRequestComments(ctx context.Context, issueKey string) ([]JiraServiceDeskComment, error)
+	ListServiceDeskOrganizations(ctx context.Context, serviceDeskID string) ([]JiraServiceDeskOrganization, error)
+	ListServiceDeskOrganizationUsers(ctx context.Context, organizationID string) ([]JiraUser, error)
+
 	// Issue Types & Fields
 	ListIssueTypes(ctx context.Context) ([]JiraIssueType, error)
 	GetProjectIssueTypes(ctx context.Context, projectKey string) ([]JiraIssueType, error)
@@ -39,15 +48,17 @@ type Client interface {
 	GetProjectWorkflowScheme(ctx context.Context, projectKey string) (*JiraWorkflow, error)
 	GetProjectIssueTypeStatuses(ctx context.Context, projectKey string) ([]JiraIssueTypeWithStatuses, error)
 
-	// Issues (Legacy - uses deprecated GET /rest/api/3/search)
-	SearchIssues(ctx context.Context, opts SearchOptions) (*SearchResult, error)
+	// Issues. SearchIssuesJQL is the only issue search on the Client:
+	// Cloud serves it via POST /rest/api/3/search/jql (the legacy GET /search
+	// endpoint was removed by Atlassian), Data Center adapts it to its
+	// supported GET /rest/api/2/search.
+	SearchIssuesJQL(ctx context.Context, req JQLSearchRequest) (*JQLSearchResponse, error)
 	GetIssue(ctx context.Context, issueKey string, expand []string) (*JiraIssue, error)
 	GetIssueComments(ctx context.Context, issueKey string, startAt, maxResults int) (*JiraCommentContainer, error)
 	GetIssueWorklogs(ctx context.Context, issueKey string, startAt, maxResults int) (*JiraWorklogContainer, error)
 	GetIssueCount(ctx context.Context, projectKey string, openOnly bool) (int, error)
 
-	// Issues (Enhanced - uses POST /rest/api/3/search/jql)
-	SearchIssuesJQL(ctx context.Context, req JQLSearchRequest) (*JQLSearchResponse, error)
+	// Issues (Bulk - uses POST /rest/api/3/issue/bulkfetch)
 	BulkFetchIssues(ctx context.Context, req BulkFetchRequest) (*BulkFetchResponse, error)
 	GetAllIssueKeys(ctx context.Context, jql string) ([]string, error)
 
@@ -79,8 +90,8 @@ type Client interface {
 // Config contains configuration for the Jira client
 type Config struct {
 	InstanceURL     string         // e.g., https://company.atlassian.net or https://jira.company.com
-	Email           string         // User email (Cloud) or username (Data Center) for Basic auth
-	APIToken        string         // API token or password
+	Email           string         // User email for Jira Cloud Basic authentication
+	APIToken        string         // Cloud API token or Data Center personal access token
 	DeploymentType  DeploymentType // cloud or datacenter (default: cloud)
 	RateLimitPerSec int            // Rate limit (default: 10 requests/second)
 	Timeout         time.Duration  // HTTP timeout (default: 30 seconds)
@@ -88,12 +99,15 @@ type Config struct {
 
 // cloudClient implements the Client interface for Jira Cloud
 type cloudClient struct {
-	baseURL    string
-	assetsURL  string
-	agileURL   string
-	authHeader string
-	httpClient *http.Client
-	limiter    *rate.Limiter
+	baseURL        string
+	assetsURL      string
+	agileURL       string
+	serviceDeskURL string
+	authHeader     string
+	httpClient     *http.Client
+	limiter        *rate.Limiter
+	retryWait      func(context.Context, time.Duration) error
+	retryAttempts  int
 }
 
 // NewClient creates a new Jira API client.
@@ -105,13 +119,11 @@ type cloudClient struct {
 // base URL. See cloudRoutingProbe for the algorithm and Atlassian's
 // rationale.
 func NewClient(cfg Config) (Client, error) {
-	// Validate and normalize the instance URL
 	baseURL := strings.TrimSuffix(cfg.InstanceURL, "/")
 	if baseURL == "" {
 		return nil, ErrInvalidURL
 	}
 
-	// Parse URL to validate it
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidURL, err)
@@ -120,14 +132,11 @@ func NewClient(cfg Config) (Client, error) {
 		return nil, fmt.Errorf("%w: must use http or https", ErrInvalidURL)
 	}
 
-	// Create Basic auth header (email:token base64 encoded)
-	if cfg.Email == "" || cfg.APIToken == "" {
-		return nil, ErrInvalidCredentials
+	authHeader, err := jiraAuthHeader(cfg)
+	if err != nil {
+		return nil, err
 	}
-	authString := cfg.Email + ":" + cfg.APIToken
-	authHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(authString))
 
-	// Set defaults
 	timeout := cfg.Timeout
 	if timeout == 0 {
 		timeout = 30 * time.Second
@@ -140,77 +149,82 @@ func NewClient(cfg Config) (Client, error) {
 	// The instance URL is operator-supplied and used as the base for every
 	// request (plus the pre-auth tenant_info probe and attachment downloads).
 	// Dial through the SSRF-safe dialer so a base URL — or a redirect — that
-	// resolves to a private/internal host cannot receive the Basic-auth
+	// resolves to a private/internal host cannot receive the Jira
 	// credential. Redirect-following is preserved; each hop is re-checked.
 	httpClient := &http.Client{
 		Timeout:   timeout,
-		Transport: &http.Transport{DialContext: utils.SafeNetDialer(timeout).DialContext},
+		Transport: utils.ConfigureHTTPTransport(&http.Transport{DialContext: utils.SafeNetDialer(timeout).DialContext}),
 	}
 	limiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit)
 
-	// Return appropriate client based on deployment type
 	if cfg.DeploymentType == DeploymentDataCenter {
 		return &dataCenterClient{
-			baseURL:    baseURL + "/rest/api/2", // Data Center uses API v2
-			agileURL:   baseURL + "/rest/agile/1.0",
-			authHeader: authHeader,
-			httpClient: httpClient,
-			limiter:    limiter,
+			baseURL:        baseURL + "/rest/api/2", // Data Center uses API v2
+			agileURL:       baseURL + "/rest/agile/1.0",
+			serviceDeskURL: baseURL + "/rest/servicedeskapi",
+			xrayURL:        baseURL + "/rest/raven/2.0/api",
+			authHeader:     authHeader,
+			httpClient:     httpClient,
+			limiter:        limiter,
 		}, nil
 	}
 
-	// Cloud: probe to pick site URL vs api.atlassian.com gateway.
+	// Cloud routing is selected by the authentication probe.
 	routing := cloudRoutingProbe(baseURL, authHeader, httpClient)
 	return &cloudClient{
-		baseURL:    routing.platformBase, // /rest/api/3 already appended by probe
-		assetsURL:  routing.assetsBase,
-		agileURL:   routing.agileBase,
-		authHeader: authHeader,
-		httpClient: httpClient,
-		limiter:    limiter,
+		baseURL:        routing.platformBase, // /rest/api/3 already appended by probe
+		assetsURL:      routing.assetsBase,
+		agileURL:       routing.agileBase,
+		serviceDeskURL: routing.serviceDeskBase,
+		authHeader:     authHeader,
+		httpClient:     httpClient,
+		limiter:        limiter,
 	}, nil
 }
+
+// jiraAuthHeader returns the authentication contract for each Jira
+// deployment. Data Center is PAT-only; Cloud uses the account email and API
+// token as Basic credentials.
+func jiraAuthHeader(cfg Config) (string, error) {
+	if cfg.APIToken == "" {
+		return "", ErrInvalidCredentials
+	}
+	if cfg.DeploymentType == DeploymentDataCenter {
+		return "Bearer " + cfg.APIToken, nil
+	}
+	if cfg.Email == "" {
+		return "", ErrInvalidCredentials
+	}
+	authString := cfg.Email + ":" + cfg.APIToken
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(authString)), nil
+}
+
+// defaultCloudGatewayBase is the Atlassian gateway host prefix. The discovered
+// cloud ID is appended to form the per-tenant gateway base.
+const defaultCloudGatewayBase = "https://api.atlassian.com/ex/jira/"
 
 // cloudRouting holds the resolved base URLs for a Cloud client. All three
 // already include their respective REST path prefix so the caller can
 // concatenate sub-paths directly.
 type cloudRouting struct {
-	platformBase string // .../rest/api/3
-	agileBase    string // .../rest/agile/1.0
-	assetsBase   string // .../rest/assets/1.0  (always site URL; gateway path differs)
-	viaGateway   bool   // chosen routing, for logging only
+	platformBase    string // .../rest/api/3
+	agileBase       string // .../rest/agile/1.0
+	assetsBase      string // .../jsm/assets/workspace/{id}/v1; empty when unavailable
+	serviceDeskBase string // .../rest/servicedeskapi
+	viaGateway      bool   // chosen routing, for logging only
 }
 
-// cloudRoutingProbe decides whether to call Jira via the operator's site URL
-// (works for legacy unscoped API tokens) or via the api.atlassian.com gateway
-// (required for scoped Atlassian API tokens — see
-// https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/).
-//
-// Why the routing matters: a scoped token sent to <site>.atlassian.net is
-// silently downgraded to anonymous by Atlassian — endpoints that allow
-// anonymous reads return data, permission-filtered endpoints return empty
-// arrays, and only the /myself endpoint surfaces the 401. The wizard's
-// project list then looks empty with no actionable error. Routing via
-// api.atlassian.com/ex/jira/{cloudId}/ presents the token correctly.
-//
-// Algorithm: fetch the public /_edge/tenant_info to learn the cloudId, then
-// hit /rest/api/3/myself on the gateway. A 200 confirms scoped-token
-// routing works for this caller; anything else (including 401, which is
-// what a legacy token sees on the gateway) falls back to the site URL,
-// which works for legacy tokens.
-//
-// The probe is best-effort: if /_edge/tenant_info fails or returns an
-// unparseable response, we fall back to the site URL. That preserves the
-// pre-probe behavior for instances where the well-known endpoint isn't
-// reachable (private network, weird proxy, etc.).
+// cloudRoutingProbe selects the gateway for scoped tokens and the site URL for
+// legacy tokens. Scoped tokens sent to a site URL appear anonymous, so it probes
+// gateway /myself after discovering the cloud ID. Any discovery or probe failure
+// falls back to the site URL, preserving legacy and private-network behavior.
 func cloudRoutingProbe(siteURL, authHeader string, httpClient *http.Client) cloudRouting {
-	siteRouting := cloudRouting{
-		platformBase: siteURL + "/rest/api/3",
-		agileBase:    siteURL + "/rest/agile/1.0",
-		assetsBase:   siteURL + "/rest/assets/1.0",
-		viaGateway:   false,
-	}
+	return cloudRoutingProbeWithGateway(siteURL, authHeader, httpClient, defaultCloudGatewayBase)
+}
 
+// cloudRoutingProbeWithGateway is cloudRoutingProbe with the gateway prefix
+// injected so tests can point the probe at a local server.
+func cloudRoutingProbeWithGateway(siteURL, authHeader string, httpClient *http.Client, gatewayPrefix string) cloudRouting {
 	cloudID, err := discoverCloudID(siteURL, httpClient)
 	if err != nil || cloudID == "" {
 		slog.Debug("Jira cloud routing: tenant_info lookup failed, using site URL",
@@ -218,32 +232,108 @@ func cloudRoutingProbe(siteURL, authHeader string, httpClient *http.Client) clou
 			slog.String("site_url", siteURL),
 			slog.Any("error", err),
 		)
-		return siteRouting
+		return resolveSiteRouting(siteURL, authHeader, httpClient)
 	}
 
-	gatewayBase := "https://api.atlassian.com/ex/jira/" + cloudID
+	gatewayBase := gatewayPrefix + cloudID
 	if !gatewayAuthProbe(gatewayBase, authHeader, httpClient) {
 		slog.Info("Jira cloud routing: gateway probe declined, using site URL",
 			slog.String("component", "jira"),
 			slog.String("cloud_id", cloudID),
 		)
-		return siteRouting
+		return resolveSiteRouting(siteURL, authHeader, httpClient)
 	}
 
 	slog.Info("Jira cloud routing: using api.atlassian.com gateway (scoped token detected)",
 		slog.String("component", "jira"),
 		slog.String("cloud_id", cloudID),
 	)
-	return cloudRouting{
-		platformBase: gatewayBase + "/rest/api/3",
-		agileBase:    gatewayBase + "/rest/agile/1.0",
-		// Assets endpoint path on the gateway uses /jsm/assets/workspace/...
-		// rather than /rest/assets/1.0. Routing for Assets is intentionally
-		// left on the site URL until the importer actually consumes Assets
-		// data — touching it now without a test surface would be guesswork.
-		assetsBase: siteURL + "/rest/assets/1.0",
-		viaGateway: true,
+	assetsBase, assetsErr := discoverAssetsWorkspaceBase(gatewayBase, authHeader, httpClient)
+	if assetsErr != nil {
+		slog.Info("Jira cloud routing: Assets workspace is unavailable",
+			slog.String("component", "jira"),
+			slog.Any("error", assetsErr),
+		)
 	}
+	return cloudRouting{
+		platformBase:    gatewayBase + "/rest/api/3",
+		agileBase:       gatewayBase + "/rest/agile/1.0",
+		assetsBase:      assetsBase,
+		serviceDeskBase: gatewayBase + "/rest/servicedeskapi",
+		viaGateway:      true,
+	}
+}
+
+// resolveSiteRouting builds the site-URL routing and resolves the supported
+// Assets workspace API. The legacy /rest/assets/1.0 navlist API is deprecated,
+// so an unresolved workspace reports Assets as unavailable (empty assetsBase)
+// instead of falling back to it.
+func resolveSiteRouting(siteURL, authHeader string, httpClient *http.Client) cloudRouting {
+	assetsBase, assetsErr := discoverAssetsWorkspaceBase(siteURL, authHeader, httpClient)
+	if assetsErr != nil {
+		slog.Info("Jira cloud routing: Assets workspace is unavailable",
+			slog.String("component", "jira"),
+			slog.String("base_url", siteURL),
+			slog.Any("error", assetsErr),
+		)
+	}
+	return cloudRouting{
+		platformBase:    siteURL + "/rest/api/3",
+		agileBase:       siteURL + "/rest/agile/1.0",
+		assetsBase:      assetsBase,
+		serviceDeskBase: siteURL + "/rest/servicedeskapi",
+		viaGateway:      false,
+	}
+}
+
+// discoverAssetsWorkspaceBase resolves the site-scoped Assets API base used by
+// scoped Cloud tokens. Jira Service Management exposes the workspace identifier
+// through a read-only discovery endpoint before the Assets API can be called.
+func discoverAssetsWorkspaceBase(gatewayBase, authHeader string, httpClient *http.Client) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		gatewayBase+"/rest/servicedeskapi/assets/workspace?start=0&limit=100",
+		http.NoBody,
+	)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req) //nolint:gosec // gatewayBase is derived from Atlassian's cloud ID
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("assets workspace discovery HTTP %d", resp.StatusCode)
+	}
+
+	var page struct {
+		Values []struct {
+			WorkspaceID string `json:"workspaceId"`
+			ID          string `json:"id"`
+		} `json:"values"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return "", err
+	}
+	if len(page.Values) == 0 {
+		return "", ErrAssetsNotAvailable
+	}
+	workspaceID := page.Values[0].WorkspaceID
+	if workspaceID == "" {
+		workspaceID = page.Values[0].ID
+	}
+	if workspaceID == "" {
+		return "", fmt.Errorf("%w: workspace response has no identifier", ErrAssetsNotAvailable)
+	}
+	return gatewayBase + "/jsm/assets/workspace/" + url.PathEscape(workspaceID) + "/v1", nil
 }
 
 // discoverCloudID calls the public /_edge/tenant_info well-known endpoint,
@@ -300,82 +390,155 @@ func gatewayAuthProbe(gatewayBase, authHeader string, httpClient *http.Client) b
 }
 
 // do performs an HTTP request with rate limiting
-func (c *cloudClient) do(ctx context.Context, method, reqURL string, body interface{}) (*http.Response, error) {
-	// Wait for rate limiter
-	if err := c.limiter.Wait(ctx); err != nil {
+func (c *cloudClient) do(ctx context.Context, method, reqURL string, body any) (*http.Response, error) {
+	return doReadOnlyJiraRequest(
+		ctx, c.httpClient, c.limiter, c.authHeader, method, reqURL, body,
+		c.retryAttempts, c.retryWait,
+	)
+}
+
+const (
+	defaultJiraRetryAttempts = 3
+	jiraRetryBaseDelay       = 250 * time.Millisecond
+	jiraRetryMaxDelay        = 5 * time.Second
+)
+
+func doReadOnlyJiraRequest(
+	ctx context.Context,
+	httpClient *http.Client,
+	limiter *rate.Limiter,
+	authHeader string,
+	method string,
+	reqURL string,
+	body any,
+	retryAttempts int,
+	retryWait func(context.Context, time.Duration) error,
+) (*http.Response, error) {
+	if err := validateReadOnlyRequest(method, reqURL); err != nil {
 		return nil, err
 	}
-
-	var bodyReader io.Reader
+	var bodyBytes []byte
 	if body != nil {
-		bodyBytes, err := json.Marshal(body)
+		var err error
+		bodyBytes, err = json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		bodyReader = bytes.NewReader(bodyBytes)
+	}
+	if retryAttempts <= 0 {
+		retryAttempts = defaultJiraRetryAttempts
+	}
+	if retryWait == nil {
+		retryWait = waitForJiraRetry
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
-	if err != nil {
-		return nil, err
-	}
-
-	c.setHeaders(req)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	return c.httpClient.Do(req) //nolint:gosec // G704: URL constructed from configured Jira base URL
-}
-
-// setHeaders sets common headers for Jira API requests
-func (c *cloudClient) setHeaders(req *http.Request) {
-	req.Header.Set("Authorization", c.authHeader)
-	req.Header.Set("Accept", "application/json")
-}
-
-// handleErrorResponse handles non-2xx responses. Jira's response body is
-// preserved on every branch — operators debugging "my token should work"
-// need the upstream message (deprecated auth scheme, SSO required, account
-// locked, etc.) rather than a bare sentinel error.
-func (c *cloudClient) handleErrorResponse(resp *http.Response) error {
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return fmt.Errorf("failed to read Jira error response body: %w", readErr)
-	}
-	snippet := truncateBody(body)
-
-	switch resp.StatusCode {
-	case http.StatusUnauthorized:
-		return fmt.Errorf("%w (jira said: %s)", ErrInvalidCredentials, snippet)
-	case http.StatusForbidden:
-		// Check for rate limiting
-		if strings.Contains(string(body), "rate limit") {
-			return ErrRateLimited
+	for attempt := 0; ; attempt++ {
+		if err := limiter.Wait(ctx); err != nil {
+			return nil, err
 		}
-		return fmt.Errorf("%w (jira said: %s)", ErrForbidden, snippet)
-	case http.StatusNotFound:
-		return fmt.Errorf("%w (jira said: %s)", ErrNotFound, snippet)
-	case http.StatusTooManyRequests:
-		return ErrRateLimited
-	default:
-		return fmt.Errorf("%w: status %d - %s", ErrAPIError, resp.StatusCode, snippet)
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", authHeader)
+		req.Header.Set("Accept", "application/json")
+		if bodyBytes != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := httpClient.Do(req) //nolint:gosec // G704: URL constructed from configured Jira base URL
+		if err != nil {
+			return nil, err
+		}
+		if !jiraResponseIsRetryable(resp.StatusCode) || attempt >= retryAttempts {
+			return resp, nil
+		}
+
+		delay := jiraRetryDelay(resp.Header.Get("Retry-After"), attempt, time.Now())
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		if err := retryWait(ctx, delay); err != nil {
+			return nil, err
+		}
 	}
 }
 
-// truncateBody trims a Jira response body to a length safe for inclusion in
-// error strings and logs. Jira HTML error pages can be huge; the first ~512
-// bytes contain the diagnostic message in every case we've seen.
-func truncateBody(b []byte) string {
-	const maxLen = 512
-	s := strings.TrimSpace(string(b))
-	if s == "" {
-		return "(empty response body)"
+func jiraResponseIsRetryable(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable
+}
+
+func jiraRetryDelay(retryAfter string, attempt int, now time.Time) time.Duration {
+	retryAfter = strings.TrimSpace(retryAfter)
+	if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
 	}
-	if len(s) > maxLen {
-		return s[:maxLen] + "…(truncated)"
+	if retryAt, err := http.ParseTime(retryAfter); err == nil {
+		if delay := retryAt.Sub(now); delay > 0 {
+			return delay
+		}
+		return 0
 	}
-	return s
+	delay := jiraRetryBaseDelay * time.Duration(1<<min(attempt, 4))
+	if delay > jiraRetryMaxDelay {
+		return jiraRetryMaxDelay
+	}
+	return delay
+}
+
+func waitForJiraRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// validateReadOnlyRequest prevents the Jira importer from ever mutating the
+// source instance. Jira exposes a few query operations as POST endpoints, so
+// those exact paths are allowed while every other non-GET method is denied.
+func validateReadOnlyRequest(method, reqURL string) error {
+	switch method {
+	case http.MethodGet, http.MethodHead:
+		return nil
+	case http.MethodPost:
+		parsed, err := url.Parse(reqURL)
+		if err != nil {
+			return fmt.Errorf("%w: invalid request URL: %v", ErrReadOnlyViolation, err)
+		}
+		for _, suffix := range []string{
+			"/rest/api/3/search/jql",
+			"/rest/api/3/issue/bulkfetch",
+			"/rest/api/3/workflows",
+		} {
+			if strings.HasSuffix(parsed.Path, suffix) {
+				return nil
+			}
+		}
+		if isAssetsWorkspaceAQLPath(parsed.Path) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s %s", ErrReadOnlyViolation, method, reqURL)
+}
+
+func isAssetsWorkspaceAQLPath(path string) bool {
+	const marker = "/jsm/assets/workspace/"
+	index := strings.Index(path, marker)
+	if index < 0 {
+		return false
+	}
+	parts := strings.Split(strings.Trim(path[index+len(marker):], "/"), "/")
+	return len(parts) == 4 &&
+		parts[0] != "" &&
+		parts[1] == "v1" &&
+		parts[2] == "object" &&
+		parts[3] == "aql"
 }
 
 // ================================================================
@@ -399,7 +562,7 @@ func (c *cloudClient) TestConnection(ctx context.Context) (*JiraInstanceInfo, er
 	defer func() { _ = serverResp.Body.Close() }()
 
 	if serverResp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(serverResp)
+		return nil, jiraErrorFromResponse(serverResp)
 	}
 
 	var serverInfo struct {
@@ -443,42 +606,60 @@ func (c *cloudClient) TestConnection(ctx context.Context) (*JiraInstanceInfo, er
 // Project Methods
 // ================================================================
 
-// ListProjects lists all projects accessible to the user
+// ListProjects lists all projects accessible to the user. Jira Cloud removed
+// the legacy unpaginated GET /project endpoint, so walk the supported paginated
+// GET /project/search instead. Data Center keeps its deployment-specific call.
 func (c *cloudClient) ListProjects(ctx context.Context) ([]JiraProject, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/project?expand=description", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
-	var projects []JiraProject
-	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
-		return nil, err
-	}
-	return projects, nil
+	return cloudPageValues[JiraProject](ctx, c, c.baseURL+"/project/search?expand=description")
 }
 
 // GetProject gets details about a specific project
 func (c *cloudClient) GetProject(ctx context.Context, projectKey string) (*JiraProject, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
+	return jiraGetProject(ctx, c, c.baseURL, projectKey)
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
+// ListServiceDesks lists every Jira Service Management portal visible to the
+// importing account.
+func (c *cloudClient) ListServiceDesks(ctx context.Context) ([]JiraServiceDesk, error) {
+	return jiraServiceDeskValues[JiraServiceDesk](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/servicedesk?start=%d&limit=100", c.serviceDeskURL, start)
+	})
+}
 
-	var project JiraProject
-	if err := json.NewDecoder(resp.Body).Decode(&project); err != nil {
-		return nil, err
-	}
-	return &project, nil
+// ListServiceDeskRequestTypes returns the complete customer-facing request
+// type catalog for one service desk.
+func (c *cloudClient) ListServiceDeskRequestTypes(ctx context.Context, serviceDeskID string) ([]JiraServiceDeskRequestType, error) {
+	return jiraServiceDeskValues[JiraServiceDeskRequestType](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/servicedesk/%s/requesttype?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(serviceDeskID), start)
+	})
+}
+
+// ListServiceDeskRequestComments returns JSM's public/internal visibility
+// metadata for every comment on a customer request.
+func (c *cloudClient) ListServiceDeskRequestComments(ctx context.Context, issueKey string) ([]JiraServiceDeskComment, error) {
+	return jiraServiceDeskValues[JiraServiceDeskComment](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/request/%s/comment?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(issueKey), start)
+	})
+}
+
+// ListServiceDeskOrganizations returns organizations associated with one JSM
+// service desk.
+func (c *cloudClient) ListServiceDeskOrganizations(ctx context.Context, serviceDeskID string) ([]JiraServiceDeskOrganization, error) {
+	return jiraServiceDeskValues[JiraServiceDeskOrganization](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/servicedesk/%s/organization?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(serviceDeskID), start)
+	})
+}
+
+// ListServiceDeskOrganizationUsers returns every customer in a JSM
+// organization.
+func (c *cloudClient) ListServiceDeskOrganizationUsers(ctx context.Context, organizationID string) ([]JiraUser, error) {
+	return jiraServiceDeskValues[JiraUser](ctx, c, func(start int) string {
+		return fmt.Sprintf("%s/organization/%s/user?start=%d&limit=100",
+			c.serviceDeskURL, url.PathEscape(organizationID), start)
+	})
 }
 
 // ================================================================
@@ -487,18 +668,8 @@ func (c *cloudClient) GetProject(ctx context.Context, projectKey string) (*JiraP
 
 // ListIssueTypes lists all issue types in the instance
 func (c *cloudClient) ListIssueTypes(ctx context.Context) ([]JiraIssueType, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/issuetype", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var issueTypes []JiraIssueType
-	if err := json.NewDecoder(resp.Body).Decode(&issueTypes); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/issuetype", &issueTypes); err != nil {
 		return nil, err
 	}
 	return issueTypes, nil
@@ -506,24 +677,8 @@ func (c *cloudClient) ListIssueTypes(ctx context.Context) ([]JiraIssueType, erro
 
 // GetProjectIssueTypes gets issue types available in a project
 func (c *cloudClient) GetProjectIssueTypes(ctx context.Context, projectKey string) ([]JiraIssueType, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/statuses", nil)
+	issueTypeStatuses, err := jiraFetchProjectIssueTypeStatuses(ctx, c, c.baseURL, projectKey)
 	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
-	// The response is an array of issue types with their statuses
-	var issueTypeStatuses []struct {
-		ID       string       `json:"id"`
-		Name     string       `json:"name"`
-		Subtask  bool         `json:"subtask"`
-		Statuses []JiraStatus `json:"statuses"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&issueTypeStatuses); err != nil {
 		return nil, err
 	}
 
@@ -544,18 +699,8 @@ func (c *cloudClient) GetProjectIssueTypes(ctx context.Context, projectKey strin
 
 // ListCustomFields lists all custom field definitions
 func (c *cloudClient) ListCustomFields(ctx context.Context) ([]JiraCustomField, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/field", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var fields []JiraCustomField
-	if err := json.NewDecoder(resp.Body).Decode(&fields); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/field", &fields); err != nil {
 		return nil, err
 	}
 
@@ -581,57 +726,204 @@ func (c *cloudClient) GetProjectFields(ctx context.Context, projectIDs []string)
 
 	slog.Debug("GetProjectFields request", slog.String("component", "jira"), slog.String("url", endpoint))
 
-	var allFields []JiraCustomField
-	startAt := 0
-	maxResults := 50
+	const pageSize = 50
+	agg, err := jiraAccumulateStartAtValues[JiraCustomField](ctx, c, pageSize, func(startAt int) string {
+		return fmt.Sprintf("%s&startAt=%d&maxResults=%d", endpoint, startAt, pageSize)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return agg.Values, nil
+}
 
-	for {
-		paginatedEndpoint := fmt.Sprintf("%s&startAt=%d&maxResults=%d", endpoint, startAt, maxResults)
+type cloudFlexibleID string
 
-		resp, err := c.do(ctx, "GET", paginatedEndpoint, nil)
-		if err != nil {
-			return nil, fmt.Errorf("request failed: %w", err)
+func (id *cloudFlexibleID) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*id = cloudFlexibleID(text)
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(data, &number); err != nil {
+		return err
+	}
+	*id = cloudFlexibleID(number.String())
+	return nil
+}
+
+type cloudCustomFieldContext struct {
+	ID             cloudFlexibleID `json:"id"`
+	Name           string          `json:"name"`
+	Description    string          `json:"description"`
+	IsGlobal       bool            `json:"isGlobalContext"`
+	IsAnyIssueType bool            `json:"isAnyIssueType"`
+}
+
+type cloudCustomFieldProjectMapping struct {
+	ContextID       cloudFlexibleID `json:"contextId"`
+	ProjectID       string          `json:"projectId"`
+	IsGlobalContext bool            `json:"isGlobalContext"`
+}
+
+type cloudCustomFieldIssueTypeMapping struct {
+	ContextID      cloudFlexibleID `json:"contextId"`
+	IssueTypeID    string          `json:"issueTypeId"`
+	IsAnyIssueType bool            `json:"isAnyIssueType"`
+}
+
+type cloudCustomFieldOption struct {
+	ID       cloudFlexibleID `json:"id"`
+	Value    string          `json:"value"`
+	OptionID cloudFlexibleID `json:"optionId"`
+	Disabled bool            `json:"disabled"`
+}
+
+type cloudCustomFieldContextDefaults struct {
+	ContextID     cloudFlexibleID `json:"contextId"`
+	DefaultValues []struct {
+		IssueTypeID    string `json:"issueTypeId"`
+		IsAnyIssueType bool   `json:"isAnyIssueType"`
+		Value          any    `json:"value"`
+	} `json:"defaultValues"`
+}
+
+func cloudPageValues[T any](ctx context.Context, c *cloudClient, endpoint string) ([]T, error) {
+	agg, err := jiraAccumulateStartAtValues[T](ctx, c, 100, func(startAt int) string {
+		separator := "?"
+		if strings.Contains(endpoint, "?") {
+			separator = "&"
 		}
+		return fmt.Sprintf("%s%sstartAt=%d&maxResults=100", endpoint, separator, startAt)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return agg.Values, nil
+}
 
-		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response: %w", err)
-		}
-
-		slog.Debug("GetProjectFields response", slog.String("component", "jira"), slog.Int("status", resp.StatusCode), slog.Int("body_length", len(body)))
-
-		if resp.StatusCode != http.StatusOK {
-			bodyPreview := string(body)
-			if len(bodyPreview) > 500 {
-				bodyPreview = bodyPreview[:500] + "..."
-			}
-			slog.Debug("GetProjectFields error response", slog.String("component", "jira"), slog.String("body", bodyPreview))
-			return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, bodyPreview)
-		}
-
-		// Parse paginated response
-		var result struct {
-			Values     []JiraCustomField `json:"values"`
-			StartAt    int               `json:"startAt"`
-			MaxResults int               `json:"maxResults"`
-			Total      int               `json:"total"`
-			IsLast     bool              `json:"isLast"`
-		}
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("failed to parse response: %w", err)
-		}
-
-		allFields = append(allFields, result.Values...)
-
-		// Check if we've fetched all fields
-		if result.IsLast || len(result.Values) == 0 {
-			break
-		}
-		startAt += len(result.Values)
+// GetCustomFieldConfiguration reads every context, project/issue-type mapping,
+// default, and (for choice fields) option exposed by Jira Cloud. The endpoints
+// require Jira configuration permissions, so callers deliberately consume this
+// through the optional CustomFieldConfigurationClient capability.
+func (c *cloudClient) GetCustomFieldConfiguration(
+	ctx context.Context,
+	fieldID string,
+	includeOptions bool,
+) (*JiraCustomFieldConfiguration, error) {
+	fieldID = strings.TrimSpace(fieldID)
+	if fieldID == "" {
+		return nil, fmt.Errorf("%w: field ID is required", ErrCustomFieldConfigurationNotAvailable)
+	}
+	fieldPath := c.baseURL + "/field/" + url.PathEscape(fieldID) + "/context"
+	contexts, err := cloudPageValues[cloudCustomFieldContext](ctx, c, fieldPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: contexts for %s: %v", ErrCustomFieldConfigurationNotAvailable, fieldID, err)
+	}
+	projectMappings, err := cloudPageValues[cloudCustomFieldProjectMapping](ctx, c, fieldPath+"/projectmapping")
+	if err != nil {
+		return nil, fmt.Errorf("%w: project mappings for %s: %v", ErrCustomFieldConfigurationNotAvailable, fieldID, err)
+	}
+	issueTypeMappings, err := cloudPageValues[cloudCustomFieldIssueTypeMapping](ctx, c, fieldPath+"/issuetypemapping")
+	if err != nil {
+		return nil, fmt.Errorf("%w: issue-type mappings for %s: %v", ErrCustomFieldConfigurationNotAvailable, fieldID, err)
+	}
+	defaultGroups, err := cloudPageValues[cloudCustomFieldContextDefaults](ctx, c, fieldPath+"/defaultValues")
+	defaultsUnavailableReason := ""
+	if err != nil {
+		// Jira rejects this endpoint for several app-owned and picker fields.
+		// Context and applicability remain authoritative even when the field's
+		// default-value contract cannot be read.
+		defaultGroups = nil
+		defaultsUnavailableReason = err.Error()
 	}
 
-	return allFields, nil
+	result := &JiraCustomFieldConfiguration{
+		FieldID:                   fieldID,
+		Contexts:                  make([]JiraCustomFieldContext, 0, len(contexts)),
+		DefaultsUnavailableReason: defaultsUnavailableReason,
+	}
+	contextIndexes := make(map[string]int, len(contexts))
+	for _, source := range contexts {
+		contextID := string(source.ID)
+		contextIndexes[contextID] = len(result.Contexts)
+		result.Contexts = append(result.Contexts, JiraCustomFieldContext{
+			ID:             contextID,
+			Name:           source.Name,
+			Description:    source.Description,
+			IsGlobal:       source.IsGlobal,
+			IsAnyIssueType: source.IsAnyIssueType,
+		})
+	}
+	for _, mapping := range projectMappings {
+		index, ok := contextIndexes[string(mapping.ContextID)]
+		if !ok {
+			continue
+		}
+		if mapping.IsGlobalContext {
+			result.Contexts[index].IsGlobal = true
+		} else if mapping.ProjectID != "" {
+			result.Contexts[index].ProjectIDs = append(result.Contexts[index].ProjectIDs, mapping.ProjectID)
+		}
+	}
+	for _, mapping := range issueTypeMappings {
+		index, ok := contextIndexes[string(mapping.ContextID)]
+		if !ok {
+			continue
+		}
+		if mapping.IsAnyIssueType {
+			result.Contexts[index].IsAnyIssueType = true
+		} else if mapping.IssueTypeID != "" {
+			result.Contexts[index].IssueTypeIDs = append(result.Contexts[index].IssueTypeIDs, mapping.IssueTypeID)
+		}
+	}
+	for _, group := range defaultGroups {
+		index, ok := contextIndexes[string(group.ContextID)]
+		if !ok {
+			continue
+		}
+		for _, value := range group.DefaultValues {
+			result.Contexts[index].Defaults = append(result.Contexts[index].Defaults, JiraCustomFieldDefaultValue{
+				IssueTypeID:    value.IssueTypeID,
+				IsAnyIssueType: value.IsAnyIssueType,
+				Value:          value.Value,
+			})
+		}
+	}
+	if includeOptions {
+		for index := range result.Contexts {
+			contextID := result.Contexts[index].ID
+			options, optionErr := cloudPageValues[cloudCustomFieldOption](
+				ctx,
+				c,
+				fieldPath+"/"+url.PathEscape(contextID)+"/option",
+			)
+			if optionErr != nil {
+				// Not every field that Windshift represents as a select is backed
+				// by Jira's custom-field option model (group pickers are a common
+				// example). Keep the context/default/applicability contract and
+				// report only the option slice as unavailable.
+				result.Contexts[index].OptionsUnavailableReason = optionErr.Error()
+				continue
+			}
+			for _, option := range options {
+				result.Contexts[index].Options = append(result.Contexts[index].Options, JiraCustomFieldContextOption{
+					ID:             string(option.ID),
+					Value:          option.Value,
+					ParentOptionID: string(option.OptionID),
+					Disabled:       option.Disabled,
+				})
+			}
+		}
+	}
+	for index := range result.Contexts {
+		sort.Strings(result.Contexts[index].ProjectIDs)
+		sort.Strings(result.Contexts[index].IssueTypeIDs)
+	}
+	sort.SliceStable(result.Contexts, func(i, j int) bool {
+		return result.Contexts[i].ID < result.Contexts[j].ID
+	})
+	return result, nil
 }
 
 // ================================================================
@@ -640,18 +932,8 @@ func (c *cloudClient) GetProjectFields(ctx context.Context, projectIDs []string)
 
 // ListStatuses lists all statuses in the instance
 func (c *cloudClient) ListStatuses(ctx context.Context) ([]JiraStatus, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/status", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var statuses []JiraStatus
-	if err := json.NewDecoder(resp.Body).Decode(&statuses); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/status", &statuses); err != nil {
 		return nil, err
 	}
 	return statuses, nil
@@ -659,18 +941,8 @@ func (c *cloudClient) ListStatuses(ctx context.Context) ([]JiraStatus, error) {
 
 // GetStatusCategories gets all status categories
 func (c *cloudClient) GetStatusCategories(ctx context.Context) ([]JiraStatusCategory, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/statuscategory", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var categories []JiraStatusCategory
-	if err := json.NewDecoder(resp.Body).Decode(&categories); err != nil {
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/statuscategory", &categories); err != nil {
 		return nil, err
 	}
 	return categories, nil
@@ -678,183 +950,464 @@ func (c *cloudClient) GetStatusCategories(ctx context.Context) ([]JiraStatusCate
 
 // GetProjectWorkflowScheme gets the workflow scheme for a project
 func (c *cloudClient) GetProjectWorkflowScheme(ctx context.Context, projectKey string) (*JiraWorkflow, error) {
-	// Get project statuses which includes workflow information
-	resp, err := c.do(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/statuses", nil)
+	issueTypeStatuses, err := jiraFetchProjectIssueTypeStatuses(ctx, c, c.baseURL, projectKey)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	return jiraProjectWorkflowFromStatuses(projectKey, issueTypeStatuses), nil
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
+type cloudWorkflowReadRequest struct {
+	ProjectAndIssueTypes []cloudWorkflowProjectIssueType `json:"projectAndIssueTypes"`
+}
+
+type cloudWorkflowProjectIssueType struct {
+	ProjectID   string `json:"projectId"`
+	IssueTypeID string `json:"issueTypeId"`
+}
+
+type cloudWorkflowReadResponse struct {
+	Statuses  []cloudWorkflowStatus `json:"statuses"`
+	Workflows []cloudWorkflow       `json:"workflows"`
+}
+
+type cloudWorkflowStatus struct {
+	ID              string `json:"id"`
+	StatusReference string `json:"statusReference"`
+}
+
+type cloudWorkflow struct {
+	ID          string                    `json:"id"`
+	Name        string                    `json:"name"`
+	Description string                    `json:"description"`
+	Statuses    []cloudWorkflowStatusRef  `json:"statuses"`
+	Transitions []cloudWorkflowTransition `json:"transitions"`
+}
+
+type cloudWorkflowStatusRef struct {
+	StatusReference string `json:"statusReference"`
+}
+
+type cloudWorkflowTransition struct {
+	ID                string                        `json:"id"`
+	Name              string                        `json:"name"`
+	Description       string                        `json:"description"`
+	Type              string                        `json:"type"`
+	ToStatusReference string                        `json:"toStatusReference"`
+	Links             []cloudWorkflowTransitionLink `json:"links"`
+	Validators        []json.RawMessage             `json:"validators"`
+	Actions           []json.RawMessage             `json:"actions"`
+	Triggers          []json.RawMessage             `json:"triggers"`
+	Conditions        []json.RawMessage             `json:"conditions"`
+	Rules             json.RawMessage               `json:"rules"`
+}
+
+type cloudWorkflowTransitionLink struct {
+	FromStatusReference string `json:"fromStatusReference"`
+}
+
+// GetProjectWorkflowConfiguration reads the workflow selected for every
+// project/issue-type pair. Calls are intentionally made one issue type at a
+// time: the Jira response identifies workflows but does not echo the pair that
+// selected each workflow, so batching several pairs would make that mapping
+// ambiguous when a project uses multiple workflows.
+func (c *cloudClient) GetProjectWorkflowConfiguration(
+	ctx context.Context,
+	projectID string,
+	issueTypeIDs []string,
+) (*JiraProjectWorkflowConfiguration, error) {
+	result := &JiraProjectWorkflowConfiguration{
+		IssueTypeWorkflowIDs: make(map[string]string, len(issueTypeIDs)),
+	}
+	workflowsByID := make(map[string]JiraWorkflowConfiguration)
+
+	for _, issueTypeID := range issueTypeIDs {
+		req := cloudWorkflowReadRequest{
+			ProjectAndIssueTypes: []cloudWorkflowProjectIssueType{{
+				ProjectID:   projectID,
+				IssueTypeID: issueTypeID,
+			}},
+		}
+		resp, err := c.do(ctx, http.MethodPost, c.baseURL+"/workflows", req)
+		if err != nil {
+			return nil, err
+		}
+
+		var payload cloudWorkflowReadResponse
+		if resp.StatusCode != http.StatusOK {
+			err = jiraErrorFromResponse(resp)
+			_ = resp.Body.Close()
+			return nil, err
+		}
+		err = json.NewDecoder(resp.Body).Decode(&payload)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("decode Jira workflow configuration for issue type %s: %w", issueTypeID, err)
+		}
+		if len(payload.Workflows) != 1 {
+			return nil, fmt.Errorf(
+				"jira workflow configuration for issue type %s returned %d workflows",
+				issueTypeID,
+				len(payload.Workflows),
+			)
+		}
+
+		source := payload.Workflows[0]
+		statusIDsByReference := make(map[string]string, len(payload.Statuses))
+		for _, status := range payload.Statuses {
+			statusIDsByReference[status.StatusReference] = status.ID
+		}
+
+		workflow := JiraWorkflowConfiguration{
+			ID:          source.ID,
+			Name:        source.Name,
+			Description: source.Description,
+			StatusIDs:   make([]string, 0, len(source.Statuses)),
+			Transitions: make([]JiraConfiguredWorkflowTransition, 0, len(source.Transitions)),
+		}
+		for _, status := range source.Statuses {
+			statusID, ok := statusIDsByReference[status.StatusReference]
+			if !ok {
+				return nil, fmt.Errorf(
+					"jira workflow %q references unknown status %q",
+					source.Name,
+					status.StatusReference,
+				)
+			}
+			workflow.StatusIDs = append(workflow.StatusIDs, statusID)
+		}
+		for _, transition := range source.Transitions {
+			toStatusID, ok := statusIDsByReference[transition.ToStatusReference]
+			if !ok {
+				return nil, fmt.Errorf(
+					"jira workflow %q transition %q references unknown target status %q",
+					source.Name,
+					transition.Name,
+					transition.ToStatusReference,
+				)
+			}
+			configured := JiraConfiguredWorkflowTransition{
+				ID:             transition.ID,
+				Name:           transition.Name,
+				Description:    transition.Description,
+				Type:           JiraConfiguredWorkflowTransitionType(transition.Type),
+				ToStatusID:     toStatusID,
+				ValidatorCount: len(transition.Validators),
+				ActionCount:    len(transition.Actions),
+				TriggerCount:   len(transition.Triggers),
+				ConditionCount: len(transition.Conditions),
+			}
+			if len(transition.Rules) > 0 && string(transition.Rules) != "null" && string(transition.Rules) != "{}" {
+				configured.ConditionCount++
+			}
+			if configured.Type != JiraWorkflowTransitionInitial {
+				for _, link := range transition.Links {
+					fromStatusID, exists := statusIDsByReference[link.FromStatusReference]
+					if !exists {
+						return nil, fmt.Errorf(
+							"jira workflow %q transition %q references unknown source status %q",
+							source.Name,
+							transition.Name,
+							link.FromStatusReference,
+						)
+					}
+					configured.FromStatusIDs = append(configured.FromStatusIDs, fromStatusID)
+				}
+			}
+			workflow.Transitions = append(workflow.Transitions, configured)
+		}
+
+		result.IssueTypeWorkflowIDs[issueTypeID] = workflow.ID
+		workflowsByID[workflow.ID] = workflow
 	}
 
-	var issueTypeStatuses []struct {
-		ID       string       `json:"id"`
-		Name     string       `json:"name"`
-		Statuses []JiraStatus `json:"statuses"`
+	workflowIDs := make([]string, 0, len(workflowsByID))
+	for workflowID := range workflowsByID {
+		workflowIDs = append(workflowIDs, workflowID)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&issueTypeStatuses); err != nil {
+	sort.Strings(workflowIDs)
+	for _, workflowID := range workflowIDs {
+		result.Workflows = append(result.Workflows, workflowsByID[workflowID])
+	}
+	return result, nil
+}
+
+type cloudPage[T any] struct {
+	StartAt    int  `json:"startAt"`
+	MaxResults int  `json:"maxResults"`
+	Total      int  `json:"total"`
+	IsLast     bool `json:"isLast"`
+	Values     []T  `json:"values"`
+}
+
+type cloudIssueTypeScreenSchemeProject struct {
+	IssueTypeScreenScheme struct {
+		ID string `json:"id"`
+	} `json:"issueTypeScreenScheme"`
+	ProjectIDs []string `json:"projectIds"`
+}
+
+type cloudIssueTypeScreenSchemeMapping struct {
+	IssueTypeID             string `json:"issueTypeId"`
+	IssueTypeScreenSchemeID string `json:"issueTypeScreenSchemeId"`
+	ScreenSchemeID          string `json:"screenSchemeId"`
+}
+
+type cloudScreenScheme struct {
+	ID          json.Number      `json:"id"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	Screens     cloudScreenTypes `json:"screens"`
+}
+
+type cloudScreenTypes struct {
+	Default json.Number `json:"default"`
+	Create  json.Number `json:"create"`
+	Edit    json.Number `json:"edit"`
+	View    json.Number `json:"view"`
+}
+
+type cloudScreen struct {
+	ID          json.Number `json:"id"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+}
+
+type cloudScreenTab struct {
+	ID   json.Number `json:"id"`
+	Name string      `json:"name"`
+}
+
+type cloudScreenField struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func jiraNumberString(value json.Number) string {
+	if value == "" || value == "0" {
+		return ""
+	}
+	return value.String()
+}
+
+// GetProjectScreenConfiguration follows Jira's company-managed configuration
+// chain from project to issue-type screen scheme, screen schemes, screens,
+// tabs, and fields.
+func (c *cloudClient) GetProjectScreenConfiguration(
+	ctx context.Context,
+	projectID string,
+	projectKey string,
+	issueTypeIDs []string,
+) (*JiraProjectScreenConfiguration, error) {
+	projectQuery := url.Values{}
+	projectQuery.Add("projectId", projectID)
+	projectQuery.Set("maxResults", "100")
+	var projectSchemes cloudPage[cloudIssueTypeScreenSchemeProject]
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/issuetypescreenscheme/project?"+projectQuery.Encode(),
+		&projectSchemes,
+	); err != nil {
 		return nil, err
 	}
+	if len(projectSchemes.Values) != 1 || projectSchemes.Values[0].IssueTypeScreenScheme.ID == "" {
+		return nil, fmt.Errorf(
+			"%w: Jira project %s resolved to %d issue type screen schemes",
+			ErrScreenConfigurationNotAvailable,
+			projectKey,
+			len(projectSchemes.Values),
+		)
+	}
+	issueTypeScreenSchemeID := projectSchemes.Values[0].IssueTypeScreenScheme.ID
 
-	// Collect unique statuses across all issue types
-	statusMap := make(map[string]JiraStatus)
-	for _, its := range issueTypeStatuses {
-		for _, s := range its.Statuses {
-			statusMap[s.ID] = s
+	mappingQuery := url.Values{}
+	mappingQuery.Add("issueTypeScreenSchemeId", issueTypeScreenSchemeID)
+	mappingQuery.Set("maxResults", "100")
+	var mappingsPage cloudPage[cloudIssueTypeScreenSchemeMapping]
+	if err := jiraGetJSON(ctx, c, c.baseURL+"/issuetypescreenscheme/mapping?"+mappingQuery.Encode(),
+		&mappingsPage,
+	); err != nil {
+		return nil, err
+	}
+	if !mappingsPage.IsLast && mappingsPage.Total > len(mappingsPage.Values) {
+		return nil, fmt.Errorf(
+			"%w: issue type screen scheme %s has more than 100 mappings",
+			ErrScreenConfigurationNotAvailable,
+			issueTypeScreenSchemeID,
+		)
+	}
+
+	screenSchemeIDByIssueType := make(map[string]string)
+	defaultScreenSchemeID := ""
+	for _, mapping := range mappingsPage.Values {
+		if mapping.IssueTypeScreenSchemeID != issueTypeScreenSchemeID {
+			continue
 		}
+		if mapping.IssueTypeID == "default" {
+			defaultScreenSchemeID = mapping.ScreenSchemeID
+			continue
+		}
+		screenSchemeIDByIssueType[mapping.IssueTypeID] = mapping.ScreenSchemeID
 	}
 
-	statuses := make([]JiraStatus, 0, len(statusMap))
-	for _, s := range statusMap {
-		statuses = append(statuses, s)
+	screenSchemeIDs := make(map[string]bool)
+	for _, issueTypeID := range issueTypeIDs {
+		screenSchemeID := screenSchemeIDByIssueType[issueTypeID]
+		if screenSchemeID == "" {
+			screenSchemeID = defaultScreenSchemeID
+		}
+		if screenSchemeID == "" {
+			return nil, fmt.Errorf(
+				"%w: no screen scheme mapping for Jira issue type %s",
+				ErrScreenConfigurationNotAvailable,
+				issueTypeID,
+			)
+		}
+		screenSchemeIDByIssueType[issueTypeID] = screenSchemeID
+		screenSchemeIDs[screenSchemeID] = true
 	}
 
-	return &JiraWorkflow{
-		Name:     projectKey + " Workflow",
-		Statuses: statuses,
-	}, nil
+	screenSchemes := make(map[string]cloudScreenScheme, len(screenSchemeIDs))
+	for screenSchemeID := range screenSchemeIDs {
+		screenSchemeQuery := url.Values{}
+		screenSchemeQuery.Add("id", screenSchemeID)
+		screenSchemeQuery.Set("maxResults", "100")
+		var page cloudPage[cloudScreenScheme]
+		if err := jiraGetJSON(ctx, c, c.baseURL+"/screenscheme?"+screenSchemeQuery.Encode(), &page); err != nil {
+			return nil, err
+		}
+		if len(page.Values) != 1 {
+			return nil, fmt.Errorf(
+				"%w: Jira screen scheme %s returned %d definitions",
+				ErrScreenConfigurationNotAvailable,
+				screenSchemeID,
+				len(page.Values),
+			)
+		}
+		screenSchemes[screenSchemeID] = page.Values[0]
+	}
+
+	result := &JiraProjectScreenConfiguration{
+		IssueTypeScreens: make(map[string]JiraIssueTypeScreens, len(issueTypeIDs)),
+	}
+	screenIDs := make(map[string]bool)
+	for _, issueTypeID := range issueTypeIDs {
+		scheme := screenSchemes[screenSchemeIDByIssueType[issueTypeID]]
+		defaultID := jiraNumberString(scheme.Screens.Default)
+		effective := JiraIssueTypeScreens{
+			CreateScreenID: jiraNumberString(scheme.Screens.Create),
+			EditScreenID:   jiraNumberString(scheme.Screens.Edit),
+			ViewScreenID:   jiraNumberString(scheme.Screens.View),
+		}
+		if effective.CreateScreenID == "" {
+			effective.CreateScreenID = defaultID
+		}
+		if effective.EditScreenID == "" {
+			effective.EditScreenID = defaultID
+		}
+		if effective.ViewScreenID == "" {
+			effective.ViewScreenID = defaultID
+		}
+		if effective.CreateScreenID == "" || effective.EditScreenID == "" || effective.ViewScreenID == "" {
+			return nil, fmt.Errorf(
+				"%w: Jira screen scheme %s lacks an effective create/edit/view screen",
+				ErrScreenConfigurationNotAvailable,
+				screenSchemeIDByIssueType[issueTypeID],
+			)
+		}
+		result.IssueTypeScreens[issueTypeID] = effective
+		screenIDs[effective.CreateScreenID] = true
+		screenIDs[effective.EditScreenID] = true
+		screenIDs[effective.ViewScreenID] = true
+	}
+
+	sortedScreenIDs := make([]string, 0, len(screenIDs))
+	for screenID := range screenIDs {
+		sortedScreenIDs = append(sortedScreenIDs, screenID)
+	}
+	sort.Strings(sortedScreenIDs)
+	for _, screenID := range sortedScreenIDs {
+		screenQuery := url.Values{}
+		screenQuery.Add("id", screenID)
+		screenQuery.Set("maxResults", "100")
+		var screensPage cloudPage[cloudScreen]
+		if err := jiraGetJSON(ctx, c, c.baseURL+"/screens?"+screenQuery.Encode(), &screensPage); err != nil {
+			return nil, err
+		}
+		if len(screensPage.Values) != 1 {
+			return nil, fmt.Errorf(
+				"%w: Jira screen %s returned %d definitions",
+				ErrScreenConfigurationNotAvailable,
+				screenID,
+				len(screensPage.Values),
+			)
+		}
+		sourceScreen := screensPage.Values[0]
+		screen := JiraScreenConfiguration{
+			ID:          screenID,
+			Name:        sourceScreen.Name,
+			Description: sourceScreen.Description,
+		}
+
+		tabsQuery := url.Values{}
+		tabsQuery.Set("projectKey", projectKey)
+		var tabs []cloudScreenTab
+		if err := jiraGetJSON(ctx, c, c.baseURL+"/screens/"+url.PathEscape(screenID)+"/tabs?"+tabsQuery.Encode(),
+			&tabs,
+		); err != nil {
+			return nil, err
+		}
+		screen.TabCount = len(tabs)
+		for _, tab := range tabs {
+			fieldsQuery := url.Values{}
+			fieldsQuery.Set("projectKey", projectKey)
+			var fields []cloudScreenField
+			if err := jiraGetJSON(ctx, c, c.baseURL+"/screens/"+url.PathEscape(screenID)+"/tabs/"+
+				url.PathEscape(jiraNumberString(tab.ID))+"/fields?"+fieldsQuery.Encode(),
+				&fields,
+			); err != nil {
+				return nil, err
+			}
+			for _, field := range fields {
+				screen.Fields = append(screen.Fields, JiraScreenField(field))
+			}
+		}
+		result.Screens = append(result.Screens, screen)
+	}
+	return result, nil
 }
 
 // GetProjectIssueTypeStatuses gets issue types with their available statuses for a project
 func (c *cloudClient) GetProjectIssueTypeStatuses(ctx context.Context, projectKey string) ([]JiraIssueTypeWithStatuses, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/statuses", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
-	var result []JiraIssueTypeWithStatuses
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return jiraGetProjectIssueTypeStatuses(ctx, c, c.baseURL, projectKey)
 }
 
 // ================================================================
 // Issue Methods
 // ================================================================
 
-// SearchIssues searches for issues using JQL
-func (c *cloudClient) SearchIssues(ctx context.Context, opts SearchOptions) (*SearchResult, error) {
-	// Build URL with query parameters
-	params := url.Values{}
-	if opts.JQL != "" {
-		params.Set("jql", opts.JQL)
-	}
-	params.Set("startAt", fmt.Sprintf("%d", opts.StartAt))
-	if opts.MaxResults > 0 {
-		params.Set("maxResults", fmt.Sprintf("%d", opts.MaxResults))
-	} else {
-		params.Set("maxResults", "50")
-	}
-	if len(opts.Fields) > 0 {
-		params.Set("fields", strings.Join(opts.Fields, ","))
-	}
-	if len(opts.Expand) > 0 {
-		params.Set("expand", strings.Join(opts.Expand, ","))
-	}
-
-	resp, err := c.do(ctx, "GET", c.baseURL+"/search?"+params.Encode(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
-	var result SearchResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
 // GetIssue gets a single issue by key
 func (c *cloudClient) GetIssue(ctx context.Context, issueKey string, expand []string) (*JiraIssue, error) {
-	params := url.Values{}
-	if len(expand) > 0 {
-		params.Set("expand", strings.Join(expand, ","))
-	}
+	return jiraGetIssue(ctx, c, c.baseURL, issueKey, expand)
+}
 
-	urlStr := c.baseURL + "/issue/" + url.PathEscape(issueKey)
-	if len(params) > 0 {
-		urlStr += "?" + params.Encode()
-	}
-
-	resp, err := c.do(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
-	var issue JiraIssue
-	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
-		return nil, err
-	}
-	return &issue, nil
+// GetIssueWatchers returns the identities behind an issue's watcher count.
+// Jira can reject this request when the importing principal lacks the
+// "View Watchers and Voters" permission; callers preserve that distinction
+// instead of treating an unavailable list as an empty list.
+func (c *cloudClient) GetIssueWatchers(ctx context.Context, issueKey string) (*JiraIssueWatchers, error) {
+	return jiraGetIssueWatchers(ctx, c, c.baseURL, issueKey)
 }
 
 func (c *cloudClient) GetIssueComments(ctx context.Context, issueKey string, startAt, maxResults int) (*JiraCommentContainer, error) {
-	params := url.Values{}
-	params.Set("startAt", fmt.Sprintf("%d", startAt))
-	if maxResults <= 0 {
-		maxResults = 100
-	}
-	params.Set("maxResults", fmt.Sprintf("%d", maxResults))
-
-	resp, err := c.do(ctx, "GET", c.baseURL+"/issue/"+url.PathEscape(issueKey)+"/comment?"+params.Encode(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-	var result JiraCommentContainer
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return jiraGetIssueComments(ctx, c, c.baseURL, issueKey, startAt, maxResults)
 }
 
 func (c *cloudClient) GetIssueWorklogs(ctx context.Context, issueKey string, startAt, maxResults int) (*JiraWorklogContainer, error) {
-	params := url.Values{}
-	params.Set("startAt", fmt.Sprintf("%d", startAt))
-	if maxResults <= 0 {
-		maxResults = 100
-	}
-	params.Set("maxResults", fmt.Sprintf("%d", maxResults))
-
-	resp, err := c.do(ctx, "GET", c.baseURL+"/issue/"+url.PathEscape(issueKey)+"/worklog?"+params.Encode(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-	var result JiraWorklogContainer
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return &result, nil
+	return jiraGetIssueWorklogs(ctx, c, c.baseURL, issueKey, startAt, maxResults)
 }
 
 // GetIssueCount gets the total number of issues in a project using the new JQL search endpoint
 func (c *cloudClient) GetIssueCount(ctx context.Context, projectKey string, openOnly bool) (int, error) {
-	jql := fmt.Sprintf("project = %s", projectKey)
+	jql := `project = "` + escapeJQLString(projectKey) + `"`
 	if openOnly {
 		jql += " AND statusCategory != Done"
 	}
@@ -910,18 +1463,8 @@ func (c *cloudClient) countAllIssues(ctx context.Context, jql string) (int, erro
 
 // SearchIssuesJQL searches for issues using the new POST /rest/api/3/search/jql endpoint
 func (c *cloudClient) SearchIssuesJQL(ctx context.Context, req JQLSearchRequest) (*JQLSearchResponse, error) {
-	resp, err := c.do(ctx, "POST", c.baseURL+"/search/jql", req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var result JQLSearchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := jiraRequestJSON(ctx, c, http.MethodPost, c.baseURL+"/search/jql", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -930,18 +1473,8 @@ func (c *cloudClient) SearchIssuesJQL(ctx context.Context, req JQLSearchRequest)
 // BulkFetchIssues fetches multiple issues by their IDs or keys
 // Uses POST /rest/api/3/issue/bulkfetch
 func (c *cloudClient) BulkFetchIssues(ctx context.Context, req BulkFetchRequest) (*BulkFetchResponse, error) {
-	resp, err := c.do(ctx, "POST", c.baseURL+"/issue/bulkfetch", req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var result BulkFetchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := jiraRequestJSON(ctx, c, http.MethodPost, c.baseURL+"/issue/bulkfetch", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -983,21 +1516,7 @@ func (c *cloudClient) GetAllIssueKeys(ctx context.Context, jql string) ([]string
 
 // GetProjectVersions gets all versions for a project
 func (c *cloudClient) GetProjectVersions(ctx context.Context, projectKey string) ([]JiraVersion, error) {
-	resp, err := c.do(ctx, "GET", c.baseURL+"/project/"+url.PathEscape(projectKey)+"/versions", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
-	var versions []JiraVersion
-	if err := json.NewDecoder(resp.Body).Decode(&versions); err != nil {
-		return nil, err
-	}
-	return versions, nil
+	return jiraGetProjectVersions(ctx, c, c.baseURL, projectKey)
 }
 
 // ListBoards lists all Agile boards for a project.
@@ -1006,137 +1525,22 @@ func (c *cloudClient) GetProjectVersions(ctx context.Context, projectKey string)
 // miss boards on larger projects, which in turn drops every sprint that lives on
 // later boards from the Windshift iteration import.
 func (c *cloudClient) ListBoards(ctx context.Context, projectKey string) (*BoardListResult, error) {
-	const defaultMaxResults = 50
-
-	aggregate := &BoardListResult{MaxResults: defaultMaxResults, IsLast: true}
-	for startAt := 0; ; {
-		params := url.Values{}
-		params.Set("startAt", fmt.Sprintf("%d", startAt))
-		params.Set("maxResults", fmt.Sprintf("%d", defaultMaxResults))
-		if projectKey != "" {
-			params.Set("projectKeyOrId", projectKey)
-		}
-
-		resp, err := c.do(ctx, "GET", c.agileURL+"/board?"+params.Encode(), nil)
-		if err != nil {
-			return nil, err
-		}
-
-		var page BoardListResult
-		decodeErr := func() error {
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != http.StatusOK {
-				return c.handleErrorResponse(resp)
-			}
-			return json.NewDecoder(resp.Body).Decode(&page)
-		}()
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-
-		aggregate.Values = append(aggregate.Values, page.Values...)
-		aggregate.Total = page.Total
-		aggregate.IsLast = page.IsLast
-		if page.MaxResults > 0 {
-			aggregate.MaxResults = page.MaxResults
-		}
-		if page.IsLast || len(page.Values) == 0 || (page.Total > 0 && len(aggregate.Values) >= page.Total) {
-			break
-		}
-		if page.StartAt+len(page.Values) > startAt {
-			startAt = page.StartAt + len(page.Values)
-		} else {
-			startAt += defaultMaxResults
-		}
-	}
-	return aggregate, nil
+	return jiraListBoards(ctx, c, c.agileURL, projectKey)
 }
 
 // GetBoardConfiguration gets Agile board columns, status mappings, and backing filter metadata.
 func (c *cloudClient) GetBoardConfiguration(ctx context.Context, boardID int) (*JiraBoardConfiguration, error) {
-	resp, err := c.do(ctx, "GET", fmt.Sprintf("%s/board/%d/configuration", c.agileURL, boardID), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-	var config JiraBoardConfiguration
-	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
-		return nil, err
-	}
-	return &config, nil
+	return jiraGetBoardConfiguration(ctx, c, c.agileURL, boardID)
 }
 
 // ListFilters lists saved filters associated with a project.
 func (c *cloudClient) ListFilters(ctx context.Context, projectKey string) (*FilterSearchResult, error) {
-	project, err := c.GetProject(ctx, projectKey)
-	if err != nil {
-		return nil, err
-	}
-	const defaultMaxResults = 50
-	aggregate := &FilterSearchResult{MaxResults: defaultMaxResults, IsLast: true}
-	for startAt := 0; ; {
-		params := url.Values{}
-		params.Set("startAt", fmt.Sprintf("%d", startAt))
-		params.Set("maxResults", fmt.Sprintf("%d", defaultMaxResults))
-		params.Set("expand", "jql,description,owner,viewUrl")
-		if project != nil && strings.TrimSpace(project.ID) != "" {
-			params.Set("projectId", project.ID)
-		}
-
-		resp, err := c.do(ctx, "GET", c.baseURL+"/filter/search?"+params.Encode(), nil)
-		if err != nil {
-			return nil, err
-		}
-		var page FilterSearchResult
-		decodeErr := func() error {
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != http.StatusOK {
-				return c.handleErrorResponse(resp)
-			}
-			return json.NewDecoder(resp.Body).Decode(&page)
-		}()
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-
-		aggregate.Values = append(aggregate.Values, page.Values...)
-		aggregate.Total = page.Total
-		aggregate.IsLast = page.IsLast
-		if page.MaxResults > 0 {
-			aggregate.MaxResults = page.MaxResults
-		}
-		if page.IsLast || len(page.Values) == 0 || (page.Total > 0 && len(aggregate.Values) >= page.Total) {
-			break
-		}
-		if page.StartAt+len(page.Values) > startAt {
-			startAt = page.StartAt + len(page.Values)
-		} else {
-			startAt += defaultMaxResults
-		}
-	}
-	return aggregate, nil
+	return jiraListFilters(ctx, c, c.baseURL, projectKey)
 }
 
 // GetFilter gets a saved filter with expanded JQL where available.
 func (c *cloudClient) GetFilter(ctx context.Context, filterID string) (*JiraFilter, error) {
-	params := url.Values{}
-	params.Set("expand", "jql,description,owner,viewUrl")
-	resp, err := c.do(ctx, "GET", c.baseURL+"/filter/"+url.PathEscape(filterID)+"?"+params.Encode(), nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-	var filter JiraFilter
-	if err := json.NewDecoder(resp.Body).Decode(&filter); err != nil {
-		return nil, err
-	}
-	return &filter, nil
+	return jiraGetFilter(ctx, c, c.baseURL, filterID)
 }
 
 // GetBoardSprints gets all sprints for a board.
@@ -1144,47 +1548,7 @@ func (c *cloudClient) GetFilter(ctx context.Context, filterID string) (*JiraFilt
 // Jira embeds sprint results in pages too; importers need the full set so issue
 // sprint custom fields can always resolve to a Windshift iteration.
 func (c *cloudClient) GetBoardSprints(ctx context.Context, boardID int) (*SprintListResult, error) {
-	const defaultMaxResults = 50
-
-	aggregate := &SprintListResult{MaxResults: defaultMaxResults, IsLast: true}
-	for startAt := 0; ; {
-		params := url.Values{}
-		params.Set("startAt", fmt.Sprintf("%d", startAt))
-		params.Set("maxResults", fmt.Sprintf("%d", defaultMaxResults))
-
-		resp, err := c.do(ctx, "GET", fmt.Sprintf("%s/board/%d/sprint?%s", c.agileURL, boardID, params.Encode()), nil)
-		if err != nil {
-			return nil, err
-		}
-
-		var page SprintListResult
-		decodeErr := func() error {
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode != http.StatusOK {
-				return c.handleErrorResponse(resp)
-			}
-			return json.NewDecoder(resp.Body).Decode(&page)
-		}()
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-
-		aggregate.Values = append(aggregate.Values, page.Values...)
-		aggregate.Total = page.Total
-		aggregate.IsLast = page.IsLast
-		if page.MaxResults > 0 {
-			aggregate.MaxResults = page.MaxResults
-		}
-		if page.IsLast || len(page.Values) == 0 || (page.Total > 0 && len(aggregate.Values) >= page.Total) {
-			break
-		}
-		if page.StartAt+len(page.Values) > startAt {
-			startAt = page.StartAt + len(page.Values)
-		} else {
-			startAt += defaultMaxResults
-		}
-	}
-	return aggregate, nil
+	return jiraListBoardSprints(ctx, c, c.agileURL, boardID)
 }
 
 // ================================================================
@@ -1193,28 +1557,7 @@ func (c *cloudClient) GetBoardSprints(ctx context.Context, boardID int) (*Sprint
 
 // DownloadAttachment downloads an attachment and returns the reader and content type
 func (c *cloudClient) DownloadAttachment(ctx context.Context, attachmentURL string) (io.ReadCloser, string, error) {
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", attachmentURL, http.NoBody)
-	if err != nil {
-		return nil, "", err
-	}
-	c.setHeaders(req)
-
-	resp, err := c.httpClient.Do(req) //nolint:gosec // G704: attachment URL from trusted Jira API response
-	if err != nil {
-		return nil, "", err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
-		return nil, "", c.handleErrorResponse(resp)
-	}
-
-	contentType := resp.Header.Get("Content-Type")
-	return resp.Body, contentType, nil
+	return jiraDownloadAttachment(ctx, c.httpClient, c.limiter, c.authHeader, attachmentURL)
 }
 
 // ================================================================
@@ -1244,7 +1587,7 @@ func (c *cloudClient) GetUserEmail(ctx context.Context, accountID string) (strin
 		return "", nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", c.handleErrorResponse(resp)
+		return "", jiraErrorFromResponse(resp)
 	}
 
 	var result UserEmailResponse
@@ -1258,44 +1601,73 @@ func (c *cloudClient) GetUserEmail(ctx context.Context, accountID string) (strin
 // Jira Assets (Insight) Methods
 // ================================================================
 
-// ListObjectSchemas lists all object schemas in Assets
+// ListObjectSchemas lists all object schemas in Assets. Cloud uses the
+// workspace API exclusively; an unresolved workspace reports Assets as
+// unavailable rather than falling back to the deprecated legacy endpoint.
 func (c *cloudClient) ListObjectSchemas(ctx context.Context) ([]AssetObjectSchema, error) {
-	resp, err := c.do(ctx, "GET", c.assetsURL+"/objectschema/list", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
+	if c.assetsURL == "" {
 		return nil, ErrAssetsNotAvailable
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
+	return c.listCurrentObjectSchemas(ctx)
+}
 
-	var result struct {
-		ObjectSchemas []AssetObjectSchema `json:"objectschemas"`
+func (c *cloudClient) listCurrentObjectSchemas(ctx context.Context) ([]AssetObjectSchema, error) {
+	const pageSize = 100
+	var schemas []AssetObjectSchema
+	for startAt := 0; ; {
+		query := url.Values{}
+		query.Set("startAt", fmt.Sprintf("%d", startAt))
+		query.Set("maxResults", fmt.Sprintf("%d", pageSize))
+		query.Set("includeCounts", "true")
+		resp, err := c.do(
+			ctx,
+			http.MethodGet,
+			c.assetsURL+"/objectschema/list?"+query.Encode(),
+			nil,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode == http.StatusNotFound {
+			_ = resp.Body.Close()
+			return nil, ErrAssetsNotAvailable
+		}
+		if resp.StatusCode != http.StatusOK {
+			responseErr := jiraErrorFromResponse(resp)
+			_ = resp.Body.Close()
+			return nil, responseErr
+		}
+
+		var page struct {
+			Values     []AssetObjectSchema `json:"values"`
+			StartAt    int                 `json:"startAt"`
+			MaxResults int                 `json:"maxResults"`
+			Total      int                 `json:"total"`
+			IsLast     bool                `json:"isLast"`
+			Last       bool                `json:"last"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&page)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		schemas = append(schemas, page.Values...)
+		next := page.StartAt + len(page.Values)
+		if page.IsLast || page.Last || len(page.Values) == 0 || (page.Total > 0 && next >= page.Total) {
+			return schemas, nil
+		}
+		startAt = next
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return result.ObjectSchemas, nil
 }
 
 // GetObjectSchema gets a single object schema by ID
 func (c *cloudClient) GetObjectSchema(ctx context.Context, schemaID string) (*AssetObjectSchema, error) {
-	resp, err := c.do(ctx, "GET", c.assetsURL+"/objectschema/"+url.PathEscape(schemaID), nil)
-	if err != nil {
-		return nil, err
+	if c.assetsURL == "" {
+		return nil, ErrAssetsNotAvailable
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var schema AssetObjectSchema
-	if err := json.NewDecoder(resp.Body).Decode(&schema); err != nil {
+	if err := jiraGetJSON(ctx, c, c.assetsURL+"/objectschema/"+url.PathEscape(schemaID), &schema); err != nil {
 		return nil, err
 	}
 	return &schema, nil
@@ -1303,18 +1675,11 @@ func (c *cloudClient) GetObjectSchema(ctx context.Context, schemaID string) (*As
 
 // ListObjectTypes lists all object types in a schema
 func (c *cloudClient) ListObjectTypes(ctx context.Context, schemaID string) ([]AssetObjectType, error) {
-	resp, err := c.do(ctx, "GET", c.assetsURL+"/objectschema/"+url.PathEscape(schemaID)+"/objecttypes/flat", nil)
-	if err != nil {
-		return nil, err
+	if c.assetsURL == "" {
+		return nil, ErrAssetsNotAvailable
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var types []AssetObjectType
-	if err := json.NewDecoder(resp.Body).Decode(&types); err != nil {
+	if err := jiraGetJSON(ctx, c, c.assetsURL+"/objectschema/"+url.PathEscape(schemaID)+"/objecttypes/flat", &types); err != nil {
 		return nil, err
 	}
 	return types, nil
@@ -1322,54 +1687,108 @@ func (c *cloudClient) ListObjectTypes(ctx context.Context, schemaID string) ([]A
 
 // GetObjectTypeAttributes gets all attributes for an object type
 func (c *cloudClient) GetObjectTypeAttributes(ctx context.Context, objectTypeID string) ([]AssetObjectAttribute, error) {
-	resp, err := c.do(ctx, "GET", c.assetsURL+"/objecttype/"+url.PathEscape(objectTypeID)+"/attributes", nil)
-	if err != nil {
-		return nil, err
+	if c.assetsURL == "" {
+		return nil, ErrAssetsNotAvailable
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
-	}
-
 	var attrs []AssetObjectAttribute
-	if err := json.NewDecoder(resp.Body).Decode(&attrs); err != nil {
+	if err := jiraGetJSON(ctx, c, c.assetsURL+"/objecttype/"+url.PathEscape(objectTypeID)+"/attributes", &attrs); err != nil {
 		return nil, err
 	}
+	normalizeAssetDefaultTypes(attrs)
 	return attrs, nil
 }
 
-// SearchObjects searches for objects in a schema
+// SearchObjects searches for objects in a schema. Cloud uses the workspace
+// object/aql API exclusively; an unresolved workspace reports Assets as
+// unavailable rather than calling the deprecated legacy navlist endpoint.
 func (c *cloudClient) SearchObjects(ctx context.Context, opts ObjectSearchOptions) (*ObjectSearchResult, error) {
-	// Build the request body for object search
-	reqBody := map[string]interface{}{
-		"objectSchemaId":    opts.ObjectSchemaID,
-		"page":              opts.Page,
-		"resultsPerPage":    opts.PageSize,
-		"includeAttributes": opts.IncludeAttributes,
+	if c.assetsURL == "" {
+		return nil, ErrAssetsNotAvailable
+	}
+	return c.searchCurrentObjects(ctx, opts)
+}
+
+func (c *cloudClient) searchCurrentObjects(ctx context.Context, opts ObjectSearchOptions) (*ObjectSearchResult, error) {
+	page := opts.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := opts.PageSize
+	if pageSize < 1 {
+		pageSize = 100
+	}
+	startAt := (page - 1) * pageSize
+
+	clauses := []string{
+		"objectSchemaId = " + quoteAssetsAQLID(opts.ObjectSchemaID),
 	}
 	if opts.ObjectTypeID != "" {
-		reqBody["objectTypeId"] = opts.ObjectTypeID
+		clauses = append(clauses, "objectTypeId = "+quoteAssetsAQLID(opts.ObjectTypeID))
 	}
-	if opts.IQL != "" {
-		reqBody["iql"] = opts.IQL
+	if strings.TrimSpace(opts.IQL) != "" {
+		clauses = append(clauses, "("+strings.TrimSpace(opts.IQL)+")")
 	}
 
-	resp, err := c.do(ctx, "POST", c.assetsURL+"/object/navlist/aql", reqBody)
-	if err != nil {
+	query := url.Values{}
+	query.Set("startAt", fmt.Sprintf("%d", startAt))
+	query.Set("maxResults", fmt.Sprintf("%d", pageSize))
+	query.Set("includeAttributes", fmt.Sprintf("%t", opts.IncludeAttributes))
+	reqBody := map[string]string{"qlQuery": strings.Join(clauses, " AND ")}
+
+	var current struct {
+		Values               []AssetObject          `json:"values"`
+		ObjectTypeAttributes []AssetObjectAttribute `json:"objectTypeAttributes"`
+		MaxResults           int                    `json:"maxResults"`
+		StartAt              int                    `json:"startAt"`
+		Total                int                    `json:"total"`
+		IsLast               bool                   `json:"isLast"`
+		HasMoreResults       *bool                  `json:"hasMoreResults"`
+		Last                 bool                   `json:"last"`
+	}
+	if err := jiraRequestJSON(ctx, c, http.MethodPost, c.assetsURL+"/object/aql?"+query.Encode(), reqBody, &current); err != nil {
 		return nil, err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	normalizeAssetDefaultTypes(current.ObjectTypeAttributes)
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, c.handleErrorResponse(resp)
+	// hasMoreResults is optional in the Assets response. Treat an absent flag
+	// as unknown rather than "no more": negating a missing field previously
+	// forced IsLast and silently truncated imports after the first page.
+	isLast := current.IsLast || current.Last
+	if current.HasMoreResults != nil && !*current.HasMoreResults {
+		isLast = true
+	}
+	if current.Total > 0 && current.StartAt+len(current.Values) >= current.Total {
+		isLast = true
 	}
 
-	var result ObjectSearchResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	return &ObjectSearchResult{
+		ObjectEntries:        current.Values,
+		ObjectTypeAttributes: current.ObjectTypeAttributes,
+		PageNumber:           page,
+		PageSize:             current.MaxResults,
+		TotalFilterCount:     current.Total,
+		StartIndex:           current.StartAt,
+		ToIndex:              current.StartAt + len(current.Values),
+		IsLast:               isLast,
+	}, nil
+}
+
+func quoteAssetsAQLID(value string) string {
+	if value != "" && strings.IndexFunc(value, func(r rune) bool {
+		return r < '0' || r > '9'
+	}) == -1 {
+		return value
 	}
-	return &result, nil
+	escaped := strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`)
+	return `"` + escaped + `"`
+}
+
+func normalizeAssetDefaultTypes(attributes []AssetObjectAttribute) {
+	for index := range attributes {
+		if attributes[index].DefaultType != nil {
+			attributes[index].DefaultTypeID = attributes[index].DefaultType.ID
+		}
+	}
 }
 
 // GetObjectCount gets the total number of objects in a schema

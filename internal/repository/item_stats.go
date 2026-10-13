@@ -43,7 +43,7 @@ type WorkspaceItemStats struct {
 // distribution over `since`, project statistics over `since`, priority
 // breakdown over `since`). All five share the workspace-id filter and the
 // optional VQL-derived `filterSQL` + `filterArgs`.
-func (r *ItemRepository) ComputeWorkspaceItemStats(workspaceID int, filterSQL string, filterArgs []interface{}, since time.Time) (*WorkspaceItemStats, error) {
+func (r *ItemRepository) ComputeWorkspaceItemStats(workspaceID int, filterSQL string, filterArgs []any, since time.Time) (*WorkspaceItemStats, error) {
 	stats := &WorkspaceItemStats{
 		ItemsByStatusCategory:  make(map[string]int),
 		AssignmentDistribution: []WorkspaceStatsAssignment{},
@@ -54,10 +54,9 @@ func (r *ItemRepository) ComputeWorkspaceItemStats(workspaceID int, filterSQL st
 	// 1. Total items
 	totalQuery := `
 		SELECT COUNT(*)
-		FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
-		WHERE i.workspace_id = ?`
-	totalArgs := []interface{}{workspaceID}
+		` + ItemListFilterFromClause() + `
+		WHERE i.workspace_id = ? AND i.merged_into_item_id IS NULL`
+	totalArgs := []any{workspaceID}
 	if filterSQL != "" {
 		totalQuery += " AND (" + filterSQL + ")"
 		totalArgs = append(totalArgs, filterArgs...)
@@ -69,12 +68,9 @@ func (r *ItemRepository) ComputeWorkspaceItemStats(workspaceID int, filterSQL st
 	// 2. Items by status category
 	statusQuery := `
 		SELECT sc.name, COUNT(i.id) as item_count
-		FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
-		LEFT JOIN statuses s ON i.status_id = s.id
-		LEFT JOIN status_categories sc ON s.category_id = sc.id
-		WHERE i.workspace_id = ?`
-	statusArgs := []interface{}{workspaceID}
+		` + ItemListFilterFromClause() + `
+		WHERE i.workspace_id = ? AND i.merged_into_item_id IS NULL`
+	statusArgs := []any{workspaceID}
 	if filterSQL != "" {
 		statusQuery += " AND (" + filterSQL + ")"
 		statusArgs = append(statusArgs, filterArgs...)
@@ -109,12 +105,11 @@ func (r *ItemRepository) ComputeWorkspaceItemStats(workspaceID int, filterSQL st
 			COALESCE(u.first_name, '') as first_name,
 			COALESCE(u.last_name, '') as last_name,
 			COUNT(i.id) as item_count
-		FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
+		` + ItemListFilterFromClause() + `
 		LEFT JOIN users u ON i.assignee_id = u.id
-		WHERE i.workspace_id = ?
+		WHERE i.workspace_id = ? AND i.merged_into_item_id IS NULL
 		  AND i.created_at >= ?`
-	assignmentArgs := []interface{}{workspaceID, since}
+	assignmentArgs := []any{workspaceID, since}
 	if filterSQL != "" {
 		assignmentQuery += " AND (" + filterSQL + ")"
 		assignmentArgs = append(assignmentArgs, filterArgs...)
@@ -151,15 +146,11 @@ func (r *ItemRepository) ComputeWorkspaceItemStats(workspaceID int, filterSQL st
 			tp.color,
 			COUNT(i.id) as item_count,
 			SUM(CASE WHEN COALESCE(sc.is_completed, FALSE) = TRUE THEN 1 ELSE 0 END) as completed_count
-		FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
-		LEFT JOIN time_projects tp ON i.time_project_id = tp.id
-		LEFT JOIN statuses s ON i.status_id = s.id
-		LEFT JOIN status_categories sc ON s.category_id = sc.id
-		WHERE i.workspace_id = ?
+		` + ItemListFilterFromClause() + `
+		WHERE i.workspace_id = ? AND i.merged_into_item_id IS NULL
 		  AND i.created_at >= ?
 		  AND i.time_project_id IS NOT NULL`
-	projectArgs := []interface{}{workspaceID, since}
+	projectArgs := []any{workspaceID, since}
 	if filterSQL != "" {
 		projectQuery += " AND (" + filterSQL + ")"
 		projectArgs = append(projectArgs, filterArgs...)
@@ -195,12 +186,10 @@ func (r *ItemRepository) ComputeWorkspaceItemStats(workspaceID int, filterSQL st
 		SELECT
 			COALESCE(pri.name, 'None') as priority,
 			COUNT(i.id) as item_count
-		FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
-		LEFT JOIN priorities pri ON i.priority_id = pri.id
-		WHERE i.workspace_id = ?
+		` + ItemListFilterFromClause() + `
+		WHERE i.workspace_id = ? AND i.merged_into_item_id IS NULL
 		  AND i.created_at >= ?`
-	priorityArgs := []interface{}{workspaceID, since}
+	priorityArgs := []any{workspaceID, since}
 	if filterSQL != "" {
 		priorityQuery += " AND (" + filterSQL + ")"
 		priorityArgs = append(priorityArgs, filterArgs...)

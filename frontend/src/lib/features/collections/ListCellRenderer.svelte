@@ -1,30 +1,33 @@
 <script>
   import { t } from '../../stores/i18n.svelte.js';
+  import { collectionEditorOptions } from '../../stores/collectionEditorOptions.svelte.js';
+  import { collectionFieldLinks } from '../../stores/collectionFieldLinks.svelte.js';
   import { api } from '../../api.js';
+  import { updateCustomFieldValue } from '../../utils/customFieldValueUpdates.js';
   import InlineFieldEditor from '../../editors/InlineFieldEditor.svelte';
   import ItemPicker from '../../pickers/ItemPicker.svelte';
   import UserPicker from '../../pickers/UserPicker.svelte';
   import MilestoneCombobox from '../../pickers/MilestoneCombobox.svelte';
-  import ItemKey from '../items/ItemKey.svelte';
+  import ItemKey from '../../components/ItemKey.svelte';
   import ColorDot from '../../components/ColorDot.svelte';
-  import Lozenge from '../../components/Lozenge.svelte';
   import Checkbox from '../../components/Checkbox.svelte';
   import ListCustomFieldCell from './ListCustomFieldCell.svelte';
-  import { Calendar, User, Target, Globe, Building2, FolderKanban } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../../utils/icons.js';
-  import { formatDate } from '../../utils/dateFormatter.js';
+  import { Calendar, User, Target, FolderKanban } from '@lucide/svelte';
+  import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
+  import { formatDate, formatDateOnly, formatDateTimeLocale } from '../../utils/dateFormatter.js';
   import {
-    createStatusPickerConfig,
     priorityPickerConfig as priorityConfig,
-    iterationPickerConfig as iterationConfig,
     projectPickerConfig as projectConfig,
   } from '../../pickers/pickerConfigs.js';
+  import UserCellValue from './UserCellValue.svelte';
+  import IterationCellEditor from './IterationCellEditor.svelte';
+  import MilestoneCellValue from './MilestoneCellValue.svelte';
+  import ItemStatusPicker from '../../pickers/ItemStatusPicker.svelte';
 
   let {
     item,
     column,
     workspace,
-    collectionId = null,
     canEdit = true,
     statuses = [],
     statusCategories = [],
@@ -35,8 +38,8 @@
     projects = [],
     itemTypes = [],
     customFieldDefinitions = [],
-    onitemUpdated,
-    onupdateError,
+    onitemUpdated = undefined,
+    onupdateError = undefined,
   } = $props();
 
   // Get the field definition for custom fields
@@ -45,6 +48,20 @@
       ? customFieldDefinitions.find(f => String(f.id) === column.field_identifier)
       : null
   );
+
+  // Never use page-level editable options for a row in a mixed-workspace
+  // collection. The cache is keyed by the owning workspace and each family is
+  // loaded only when its picker first opens.
+  let editorOptions = $derived(collectionEditorOptions.get(item.workspace_id));
+  let fieldLinks = $derived(
+    fieldDefinition?.field_type === 'linking'
+      ? collectionFieldLinks.getFieldLinks(item.id, fieldDefinition.id, fieldDefinition.options)
+      : [],
+  );
+
+  async function reloadFieldLinks(change) {
+    await collectionFieldLinks.refreshForItems([item.id, ...(change?.itemIds || [])]);
+  }
 
   // Get custom field value from item
   function getCustomFieldValue(item, fieldIdentifier) {
@@ -64,68 +81,68 @@
     }
   }
 
-  // Handle custom field updates
+  // Custom field updates merge per field server-side; only the edited field
+  // is sent.
   async function handleCustomFieldUpdate(fieldIdentifier, value) {
     try {
-      const currentCustomValues = item.custom_field_values || {};
-      const updatedItem = await api.items.update(item.id, {
-        custom_field_values: {
-          ...currentCustomValues,
-          [fieldIdentifier]: value
-        }
-      });
+      const updatedItem = await updateCustomFieldValue(api, item.id, fieldIdentifier, value);
       onitemUpdated?.({ item: updatedItem, field: fieldIdentifier, value });
     } catch (error) {
       onupdateError?.({ error: error.message, field: fieldIdentifier, value });
     }
   }
 
-  // Handle task checkbox toggle
+  // Handle task checkbox toggle. Personal tasks are workflow-less, so the
+  // permitted transition endpoint toggles between the globally stable Open and
+  // Done statuses, matching the mobile and personal views.
   async function toggleTaskStatus(isCompleted) {
-    const newStatus = isCompleted ? 'completed' : 'open';
+    const PERSONAL_STATUS_OPEN = 1;
+    const PERSONAL_STATUS_DONE = 3;
     try {
-      await api.items.update(item.id, { status: newStatus });
-      item.status = newStatus;
-      onitemUpdated?.({ item, field: 'status', value: newStatus });
+      const updatedItem = await api.items.transition(item.id, isCompleted ? PERSONAL_STATUS_DONE : PERSONAL_STATUS_OPEN);
+      item = { ...item, status_id: updatedItem.status_id, status_name: updatedItem.status_name };
+      onitemUpdated?.({ item, field: 'status', value: updatedItem.status_id });
     } catch (error) {
-      onupdateError?.({ error: error.message, field: 'status', value: newStatus });
+      onupdateError?.({ error: error.message, field: 'status', value: isCompleted });
     }
   }
 
-  // Configs for pickers
-  const statusConfig = $derived(createStatusPickerConfig(statusCategories));
 </script>
 
-{#if column.field_type === 'system'}
+{#if column.field_type === 'workspace'}
+  <span class="block truncate text-sm" style="color: var(--ds-text);" title={workspace?.name || item.workspace_name || ''}>
+    {workspace?.name || item.workspace_name || '-'}
+  </span>
+
+{:else if column.field_type === 'system'}
   {#if column.field_identifier === 'key'}
     <!-- Item Key -->
     <div class="flex items-center gap-2 min-w-0">
       <ItemKey
         {item}
         {workspace}
-        href={collectionId && workspace
-          ? `/workspaces/${workspace.id}/collections/${collectionId}/items/${item.id}`
-          : `/workspaces/${workspace?.id || item.workspace_id}/items/${item.id}`}
+        dataTestid={`list-cell-key-${item.id}`}
       />
     </div>
 
   {:else if column.field_identifier === 'title'}
     <!-- Title with type icon -->
     <div class="flex items-center gap-2 min-w-0">
-      {#if item.item_type_id && itemTypes.length > 0}
-        {@const itemType = itemTypes.find(type => type.id === item.item_type_id)}
-        {#if itemType}
-          {@const CellTypeIcon = itemTypeIconMap[itemType.icon] || itemTypeIconMap.FileText}
-          <div
-            class="w-4 h-4 rounded flex items-center justify-center text-white text-xs flex-shrink-0"
-            style="background-color: {itemType.color};"
-            title={itemType.name}
-          >
-            <CellTypeIcon class="w-3 h-3" />
-          </div>
+      {#if item.item_type_icon || item.item_type_id}
+        {@const itemType = item.item_type_id
+          ? itemTypes.find((type) => type.id === item.item_type_id) ?? null
+          : null}
+        {#if item.item_type_icon || itemType}
+          <ItemTypeIcon
+            {itemType}
+            icon={item.item_type_icon}
+            color={item.item_type_color}
+            title={item.item_type_name || undefined}
+            testId={`list-cell-type-icon-${item.id}`}
+          />
         {/if}
       {/if}
-      <div class="flex-1 min-w-0">
+      <div class="flex-1 min-w-0" data-testid={`workspace-item-title-${item.id}`}>
         {#if canEdit}
           <InlineFieldEditor
             {item}
@@ -146,60 +163,40 @@
   {:else if column.field_identifier === 'status'}
     <!-- Status / Task Checkbox -->
     {#if item.is_task}
+      {@const taskDone = item.status_id === 3 || [...editorOptions.statuses, ...statuses].some((s) => s.id === item.status_id && s.is_completed)}
       <Checkbox
-        checked={item.status === 'completed'}
+        checked={taskDone}
         onchange={(checked) => toggleTaskStatus(checked)}
-        label={item.status === 'completed' ? 'Done' : 'Todo'}
+        label={taskDone ? 'Done' : 'Todo'}
         size="small"
         disabled={!canEdit}
       />
     {:else}
-      {@const selectedStatus = statuses.find(s => s.id === item.status_id)}
-      {@const statusCategory = selectedStatus ? statusCategories.find(sc => sc.id === selectedStatus.category_id) : null}
-      {#if canEdit}
-        <ItemPicker
-          value={item.status_id}
-          items={statuses}
-          config={statusConfig}
-          placeholder="Set status"
-          showUnassigned={false}
-          allowClear={false}
-          onSelect={async (selected) => {
-            const statusId = selected?.id;
-            if (statusId && statusId !== item.status_id) {
-              await handleItemUpdate('status_id', statusId);
-            }
-          }}
-        >
-          {#snippet children()}
-            <span class="cursor-pointer">
-              <Lozenge
-                text={selectedStatus ? selectedStatus.name : 'Set status'}
-                customBg={statusCategory?.color || '#6b7280'}
-              />
-            </span>
-          {/snippet}
-        </ItemPicker>
-      {:else}
-        <Lozenge
-          text={selectedStatus ? selectedStatus.name : '-'}
-          customBg={statusCategory?.color || '#6b7280'}
-        />
-      {/if}
+      <ItemStatusPicker
+        workspaceId={item.workspace_id}
+        statusId={item.status_id}
+        statusName={item.status_name}
+        {statuses}
+        {statusCategories}
+        {canEdit}
+        onselect={(statusId) => handleItemUpdate('status_id', statusId)}
+      />
     {/if}
 
   {:else if column.field_identifier === 'priority'}
     <!-- Priority -->
-    {@const selectedPriority = priorities.find(p => p.id === item.priority_id)}
+    {@const selectedPriority = [...editorOptions.priorities, ...priorities].find(p => p.id === item.priority_id) || (item.priority_name ? { name: item.priority_name, color: item.priority_color } : null)}
     {#if canEdit}
       <ItemPicker
         value={item.priority_id}
-        items={priorities}
+        items={editorOptions.priorities}
+        loading={editorOptions.loading.priorities}
         config={priorityConfig}
         placeholder="Select priority"
         showUnassigned={true}
         unassignedLabel="No priority"
         allowClear={true}
+        onOpen={() => collectionEditorOptions.load(item.workspace_id, 'priorities')}
         onSelect={async (selected) => {
           const priorityId = selected?.id || null;
           await handleItemUpdate('priority_id', priorityId);
@@ -237,13 +234,15 @@
 
   {:else if column.field_identifier === 'assignee'}
     <!-- Assignee -->
-    {@const assignee = users.find(u => u.id === item.assignee_id)}
+    {@const assignee = [...editorOptions.users, ...users].find(u => u.id === item.assignee_id)}
     {#if canEdit}
       <UserPicker
         value={item.assignee_id}
         placeholder="Assign"
         showUnassigned={true}
-        users={users}
+        users={editorOptions.users}
+        loading={editorOptions.loading.users}
+        onOpen={() => collectionEditorOptions.load(item.workspace_id, 'users')}
         onSelect={async (selectedUser) => {
           const userId = selectedUser?.id || null;
           await handleItemUpdate('assignee_id', userId);
@@ -251,14 +250,7 @@
       >
         {#snippet children()}
           {#if assignee}
-            <div class="flex items-center gap-2 cursor-pointer" data-testid={`list-cell-assignee-${item.id}`}>
-              <div class="w-5 h-5 rounded-full bg-blue-500 flex items-center justify-center text-white text-[10px] font-medium">
-                {(assignee.first_name?.[0] || '') + (assignee.last_name?.[0] || '') || assignee.username?.[0]?.toUpperCase() || '?'}
-              </div>
-              <span class="text-sm truncate" style="color: var(--ds-text);">
-                {assignee.first_name} {assignee.last_name}
-              </span>
-            </div>
+            <UserCellValue user={assignee} interactive testId={`list-cell-assignee-${item.id}`} />
           {:else}
             <span class="flex items-center gap-2 text-sm cursor-pointer" style="color: var(--ds-text-subtle);" data-testid={`list-cell-assignee-${item.id}`}>
               <User class="w-4 h-4" />
@@ -269,14 +261,9 @@
       </UserPicker>
     {:else}
       {#if assignee}
-        <div class="flex items-center gap-2">
-          <div class="w-5 h-5 rounded-full bg-blue-500 flex items-center justify-center text-white text-[10px] font-medium">
-            {(assignee.first_name?.[0] || '') + (assignee.last_name?.[0] || '') || assignee.username?.[0]?.toUpperCase() || '?'}
-          </div>
-          <span class="text-sm truncate" style="color: var(--ds-text);">
-            {assignee.first_name} {assignee.last_name}
-          </span>
-        </div>
+        <UserCellValue user={assignee} />
+      {:else if item.assignee_name}
+        <UserCellValue fallbackName={item.assignee_name} />
       {:else}
         <span class="text-sm" style="color: var(--ds-text-subtle);">-</span>
       {/if}
@@ -291,6 +278,9 @@
         multiple={true}
         value={itemMsIds}
         workspaceId={item.workspace_id}
+        milestones={editorOptions.milestones}
+        loading={editorOptions.loading.milestones}
+        onOpen={() => collectionEditorOptions.load(item.workspace_id, 'milestones')}
         placeholder={t('pickers.selectMilestones')}
         onSelect={async ({ ids }) => {
           await handleItemUpdate('milestone_ids', ids);
@@ -303,13 +293,7 @@
               {t('pickers.selectMilestones')}
             </span>
           {:else}
-            <span class="flex items-center gap-1 flex-wrap text-sm cursor-pointer" style="color: var(--ds-text);">
-              {#each itemMs as ms (ms.id)}
-                <span class="inline-flex items-center gap-1">
-                  <ColorDot color={ms.category_color || '#9CA3AF'} />{ms.name}
-                </span>
-              {/each}
-            </span>
+            <MilestoneCellValue milestones={itemMs} interactive />
           {/if}
         {/snippet}
       </MilestoneCombobox>
@@ -317,65 +301,26 @@
       {#if itemMs.length === 0}
         <span class="text-sm" style="color: var(--ds-text-subtle);">-</span>
       {:else}
-        <span class="flex items-center gap-1 flex-wrap text-sm" style="color: var(--ds-text);">
-          {#each itemMs as ms (ms.id)}
-            <span class="inline-flex items-center gap-1">
-              <ColorDot color={ms.category_color || '#9CA3AF'} />{ms.name}
-            </span>
-          {/each}
-        </span>
+        <MilestoneCellValue milestones={itemMs} />
       {/if}
     {/if}
 
   {:else if column.field_identifier === 'iteration'}
     <!-- Iteration -->
-    {@const iteration = iterations.find(i => i.id === item.iteration_id)}
-    {#if canEdit}
-      <ItemPicker
-        value={item.iteration_id}
-        items={iterations}
-        config={iterationConfig}
-        placeholder="Set iteration"
-        showUnassigned={true}
-        unassignedLabel="No iteration"
-        allowClear={true}
-        onSelect={async (selected) => {
-          const iterationId = selected?.id || null;
-          await handleItemUpdate('iteration_id', iterationId);
-        }}
-      >
-        {#snippet children()}
-          {#if iteration}
-            <span class="flex items-center gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-              {#if iteration.is_global}
-                <Globe class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              {:else}
-                <Building2 class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-              {/if}
-              {iteration.name}
-            </span>
-          {:else}
-            <span class="flex items-center gap-2 text-sm cursor-pointer" style="color: var(--ds-text-subtle);">
-              <Calendar class="w-4 h-4" />
-              {t('items.selectIteration')}
-            </span>
-          {/if}
-        {/snippet}
-      </ItemPicker>
-    {:else}
-      {#if iteration}
-        <span class="flex items-center gap-2 text-sm" style="color: var(--ds-text);">
-          {#if iteration.is_global}
-            <Globe class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-          {:else}
-            <Building2 class="w-4 h-4" style="color: var(--ds-text-subtle);" />
-          {/if}
-          {iteration.name}
-        </span>
-      {:else}
-        <span class="text-sm" style="color: var(--ds-text-subtle);">-</span>
-      {/if}
-    {/if}
+    {@const iteration = [...editorOptions.iterations, ...iterations].find(i => i.id === item.iteration_id) || (item.iteration_name ? { name: item.iteration_name, is_global: false } : null)}
+    <IterationCellEditor
+      {canEdit}
+      value={item.iteration_id}
+      {iteration}
+      items={editorOptions.iterations}
+      loading={editorOptions.loading.iterations}
+      selectPrompt={t('items.selectIteration')}
+      onOpen={() => collectionEditorOptions.load(item.workspace_id, 'iterations')}
+      onSelect={async (selected) => {
+        const iterationId = selected?.id || null;
+        await handleItemUpdate('iteration_id', iterationId);
+      }}
+    />
 
   {:else if column.field_identifier === 'due_date'}
     <!-- Due Date -->
@@ -391,7 +336,7 @@
     {:else}
       <div class="flex items-center gap-1 text-sm whitespace-nowrap" style="color: var(--ds-text-subtle);">
         <Calendar class="w-4 h-4 flex-shrink-0" />
-        {item.due_date ? formatDate(item.due_date) : '-'}
+        {item.due_date ? formatDateOnly(item.due_date) : '-'}
       </div>
     {/if}
 
@@ -402,18 +347,26 @@
       {formatDate(item.created_at) || '-'}
     </div>
 
+  {:else if column.field_identifier === 'updated_at'}
+    <!-- Updated timestamp (always read-only) -->
+    <div class="text-sm whitespace-nowrap" style="color: var(--ds-text-subtle);">
+      {formatDateTimeLocale(item.updated_at) || '-'}
+    </div>
+
   {:else if column.field_identifier === 'project'}
     <!-- Project -->
-    {@const project = projects.find(p => p.id === item.project_id)}
+    {@const project = [...editorOptions.projects, ...projects].find(p => p.id === item.project_id) || (item.project_name ? { name: item.project_name } : null)}
     {#if canEdit}
       <ItemPicker
         value={item.project_id}
-        items={projects}
+        items={editorOptions.projects}
+        loading={editorOptions.loading.projects}
         config={projectConfig}
         placeholder="Set project"
         showUnassigned={true}
         unassignedLabel="No project"
         allowClear={true}
+        onOpen={() => collectionEditorOptions.load(item.workspace_id, 'projects')}
         onSelect={async (selected) => {
           const projectId = selected?.id || null;
           await handleItemUpdate('project_id', projectId);
@@ -456,13 +409,17 @@
     field={fieldDefinition}
     value={customValue}
     {canEdit}
-    {milestones}
-    {iterations}
-    {users}
+    milestones={editorOptions.loaded.milestones ? editorOptions.milestones : milestones}
+    iterations={editorOptions.loaded.iterations ? editorOptions.iterations : iterations}
+    users={editorOptions.loaded.users ? editorOptions.users : users}
+    editorOptions={editorOptions}
+    workspaceId={item.workspace_id}
+    itemId={item.id}
+    {fieldLinks}
+    onFieldLinksChanged={reloadFieldLinks}
     onChange={(newValue) => handleCustomFieldUpdate(column.field_identifier, newValue)}
   />
 {:else}
   <!-- Unknown field type or missing definition -->
   <span class="text-sm" style="color: var(--ds-text-subtle);">-</span>
 {/if}
-

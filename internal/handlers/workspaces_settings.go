@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 
 	"windshift/internal/models"
@@ -44,6 +43,40 @@ func sanitizeHomepageLayout(layout *models.WorkspaceHomepageLayout) {
 	sanitize.Apply(&layout.BackgroundImageURL, sanitize.PlainTextField)
 }
 
+func (h *WorkspaceHandler) loadWorkspaceStatuses(workspaceID int, itemTypeID *int) ([]models.Status, error) {
+	if itemTypeID == nil {
+		return h.workspaceService.GetStatuses(workspaceID)
+	}
+
+	workflowService := services.NewWorkflowService(h.db)
+	workflowID, err := workflowService.GetWorkflowIDForItem(workspaceID, itemTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if workflowID == nil {
+		workflowID, err = workflowService.GetDefaultWorkflowID()
+		if err != nil || workflowID == nil {
+			return []models.Status{}, err
+		}
+	}
+
+	results, err := services.NewStatusService(h.db).ListWorkflowStatuses(*workflowID)
+	if err != nil {
+		return nil, err
+	}
+	statuses := make([]models.Status, 0, len(results))
+	for _, result := range results {
+		statuses = append(statuses, models.Status{
+			ID: result.ID, Name: result.Name, Description: result.Description,
+			CategoryID: result.CategoryID, IsDefault: result.IsDefault,
+			CreatedAt: result.CreatedAt, UpdatedAt: result.UpdatedAt,
+			CategoryName: result.CategoryName, CategoryColor: result.CategoryColor,
+			IsCompleted: result.IsCompleted,
+		})
+	}
+	return statuses, nil
+}
+
 // requireWorkspacePermission checks authentication and workspace-level permission in one step.
 // It writes the appropriate error response and returns nil, false when the check fails.
 func (h *WorkspaceHandler) requireWorkspacePermission(w http.ResponseWriter, r *http.Request, workspaceID int, perm string) bool {
@@ -77,7 +110,7 @@ func (h *WorkspaceHandler) GetHomepageLayout(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	homepageLayout, err := h.repo.GetHomepageLayoutJSON(workspaceID)
+	layout, err := h.loadHomepageLayout(workspaceID)
 	if errors.Is(err, repository.ErrNotFound) {
 		respondNotFound(w, r, "workspace")
 		return
@@ -88,23 +121,43 @@ func (h *WorkspaceHandler) GetHomepageLayout(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// If no layout exists, return empty structure
-	var layout models.WorkspaceHomepageLayout
-	if homepageLayout != "" {
-		if err := json.Unmarshal([]byte(homepageLayout), &layout); err != nil {
-			slog.Error("failed to parse homepage layout JSON", slog.String("component", "workspaces"), slog.Int("workspace_id", workspaceID), slog.Any("error", err))
-			respondInternalError(w, r, err)
-			return
-		}
-	} else {
-		// Return empty structure with empty arrays
-		layout = models.WorkspaceHomepageLayout{
-			Sections: []models.WorkspaceHomepageSection{},
-			Widgets:  []models.WorkspaceWidget{},
-		}
+	respondJSONOK(w, layout)
+}
+
+func (h *WorkspaceHandler) loadHomepageLayout(workspaceID int) (models.WorkspaceHomepageLayout, error) {
+	homepageLayout, err := h.repo.GetHomepageLayoutJSON(workspaceID)
+	if err != nil {
+		return models.WorkspaceHomepageLayout{}, err
 	}
 
-	respondJSONOK(w, layout)
+	layout := models.WorkspaceHomepageLayout{
+		Sections: []models.WorkspaceHomepageSection{},
+		Widgets:  []models.WorkspaceWidget{},
+	}
+	if homepageLayout == "" {
+		return layout, nil
+	}
+	if err := json.Unmarshal([]byte(homepageLayout), &layout); err != nil {
+		return models.WorkspaceHomepageLayout{}, err
+	}
+	return layout, nil
+}
+
+var validWorkspaceWidgetTypes = map[string]bool{
+	"stats":                    true,
+	"completion-chart":         true,
+	"created-chart":            true,
+	"milestone-progress":       true,
+	"story-points-by-assignee": true,
+	"recent-items":             true,
+	"my-tasks":                 true,
+	"overdue-items":            true,
+	"upcoming-deadlines":       true,
+	"iteration-timeline":       true,
+	"test-coverage":            true,
+	"saved-search":             true,
+	"support-metrics":          true,
+	"zammad-support-overview":  true,
 }
 
 // UpdateHomepageLayout handles PUT /api/workspaces/:id/homepage/layout
@@ -130,19 +183,6 @@ func (h *WorkspaceHandler) UpdateHomepageLayout(w http.ResponseWriter, r *http.R
 	// Validate widgets. Keep this list in sync with
 	// frontend/src/lib/services/widgetRegistry.js — types missing a frontend
 	// component would render as empty cards.
-	validTypes := map[string]bool{
-		"stats":              true,
-		"completion-chart":   true,
-		"created-chart":      true,
-		"milestone-progress": true,
-		"recent-items":       true,
-		"my-tasks":           true,
-		"overdue-items":      true,
-		"upcoming-deadlines": true,
-		"iteration-timeline": true,
-		"test-coverage":      true,
-	}
-
 	const (
 		maxSections = 20
 		maxWidgets  = 100
@@ -171,7 +211,7 @@ func (h *WorkspaceHandler) UpdateHomepageLayout(w http.ResponseWriter, r *http.R
 
 	widgetIDs := make(map[string]bool, len(layout.Widgets))
 	for _, widget := range layout.Widgets {
-		if !validTypes[widget.Type] {
+		if !validWorkspaceWidgetTypes[widget.Type] {
 			respondValidationError(w, r, fmt.Sprintf("Invalid widget type: %s", widget.Type))
 			return
 		}
@@ -210,70 +250,4 @@ func (h *WorkspaceHandler) UpdateHomepageLayout(w http.ResponseWriter, r *http.R
 	}
 
 	respondJSONOK(w, layout)
-}
-
-// GetStatuses returns statuses available for a workspace based on its configuration set workflow,
-// or the default workflow if none is assigned
-func (h *WorkspaceHandler) GetStatuses(w http.ResponseWriter, r *http.Request) {
-	workspaceID, ok := requireWorkspaceIDParam(w, r, h.keyCache, "id")
-	if !ok {
-		return
-	}
-
-	// Check authentication and workspace view permission
-	ok = h.requireWorkspacePermission(w, r, workspaceID, models.PermissionItemView)
-	if !ok {
-		return
-	}
-
-	// Parse optional item_type_id query parameter
-	var itemTypeIDPtr *int
-	if itStr := r.URL.Query().Get("item_type_id"); itStr != "" {
-		itID, err := strconv.Atoi(itStr)
-		if err != nil {
-			respondBadRequest(w, r, "invalid item_type_id")
-			return
-		}
-		itemTypeIDPtr = &itID
-	}
-
-	// Use WorkflowService for proper fallback chain (item type override → config set → global default)
-	workflowService := services.NewWorkflowService(h.db)
-	workflowID, err := workflowService.GetWorkflowIDForItem(workspaceID, itemTypeIDPtr)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Fall back to default workflow if service returned nil (e.g. personal workspace)
-	if workflowID == nil {
-		workflowID, err = workflowService.GetDefaultWorkflowID()
-		if err != nil || workflowID == nil {
-			respondJSONOK(w, []models.Status{})
-			return
-		}
-	}
-
-	statusResults, err := services.NewStatusService(h.db).ListWorkflowStatuses(*workflowID)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	statuses := make([]models.Status, 0, len(statusResults))
-	for _, st := range statusResults {
-		statuses = append(statuses, models.Status{
-			ID:            st.ID,
-			Name:          st.Name,
-			Description:   st.Description,
-			CategoryID:    st.CategoryID,
-			IsDefault:     st.IsDefault,
-			CreatedAt:     st.CreatedAt,
-			UpdatedAt:     st.UpdatedAt,
-			CategoryName:  st.CategoryName,
-			CategoryColor: st.CategoryColor,
-			IsCompleted:   st.IsCompleted,
-		})
-	}
-
-	respondJSONOK(w, statuses)
 }

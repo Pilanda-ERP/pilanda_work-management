@@ -1,10 +1,8 @@
 package handlers
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +11,7 @@ import (
 	"windshift/internal/database"
 	"windshift/internal/logger"
 	"windshift/internal/models"
+	"windshift/internal/repository"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
 	"windshift/internal/utils"
@@ -22,11 +21,12 @@ import (
 // handlers translate these to status codes; other callers (the CLI onboarding
 // flow, tests) can branch on them directly.
 var (
-	ErrAgentsDisabled     = errors.New("user-managed agents are disabled")
-	ErrAgentLimitReached  = errors.New("agent limit reached")
-	ErrAgentUsernameTaken = errors.New("username already exists")
-	ErrAgentEmailTaken    = errors.New("email already exists")
-	ErrAgentInactive      = errors.New("agent is inactive")
+	ErrAgentsDisabled      = errors.New("user-managed agents are disabled")
+	ErrAgentLimitReached   = errors.New("agent limit reached")
+	ErrAgentUsernameTaken  = errors.New("username already exists")
+	ErrAgentEmailTaken     = errors.New("email already exists")
+	ErrAgentInactive       = errors.New("agent is inactive")
+	ErrInvalidAgentRequest = errors.New("invalid agent request")
 )
 
 // AgentHandler handles profile-scoped CRUD for owned agent users.
@@ -49,11 +49,17 @@ type CreateAgentRequest struct {
 	Email     string `json:"email,omitempty" validate:"omitempty,email,max=255"`
 }
 
+// UpdateAgentRequest changes an owned agent's human-readable name. Username is
+// intentionally absent: ws init uses it as the stable per-machine identity.
+type UpdateAgentRequest struct {
+	Name string `json:"name" validate:"required,max=100"`
+}
+
 // allowUserManagedAgents reads the admin flag that unlocks self-serve agent
 // creation. Admins bypass the flag and can always manage agents.
 func (h *AgentHandler) allowUserManagedAgents() bool {
-	var value string
-	if err := h.db.QueryRow("SELECT value FROM system_settings WHERE key = 'allow_user_managed_agents'").Scan(&value); err == nil {
+	value, ok, err := repository.NewSystemSettingRepository(h.db).GetValue("allow_user_managed_agents")
+	if err == nil && ok {
 		return strings.EqualFold(value, "true")
 	}
 	return false
@@ -62,8 +68,8 @@ func (h *AgentHandler) allowUserManagedAgents() bool {
 // maxAgentsPerUser reads the configurable cap. Falls back to 5 when the
 // setting is missing or malformed.
 func (h *AgentHandler) maxAgentsPerUser() int {
-	var value string
-	if err := h.db.QueryRow("SELECT value FROM system_settings WHERE key = 'max_agents_per_user'").Scan(&value); err == nil {
+	value, ok, err := repository.NewSystemSettingRepository(h.db).GetValue("max_agents_per_user")
+	if err == nil && ok {
 		if n, perr := strconv.Atoi(value); perr == nil && n >= 0 {
 			return n
 		}
@@ -73,9 +79,7 @@ func (h *AgentHandler) maxAgentsPerUser() int {
 
 // countOwnedAgents returns the number of agents owned by the given user.
 func (h *AgentHandler) countOwnedAgents(ownerID int) (int, error) {
-	var count int
-	err := h.db.QueryRow("SELECT COUNT(*) FROM users WHERE agent_owner_user_id = ?", ownerID).Scan(&count)
-	return count, err
+	return repository.NewUserRepository(h.db).CountOwnedAgents(ownerID)
 }
 
 // CreateOwnedAgent provisions a new agent owned by ownerID after running the
@@ -89,7 +93,7 @@ func (h *AgentHandler) CreateOwnedAgent(ownerID int, isAdmin bool, req CreateAge
 		return nil, ErrAgentsDisabled
 	}
 	if err := utils.Validate(req); err != nil {
-		return nil, fmt.Errorf("invalid agent request: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidAgentRequest, err)
 	}
 	if !isAdmin {
 		maxAgents := h.maxAgentsPerUser()
@@ -110,15 +114,16 @@ func (h *AgentHandler) CreateOwnedAgent(ownerID int, isAdmin bool, req CreateAge
 		email = fmt.Sprintf("agent-%s-%d@agents.local", strings.ToLower(req.Username), time.Now().UnixNano())
 	}
 
-	var emailExists bool
-	if err := h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE email = ?)", email).Scan(&emailExists); err != nil {
+	userRepo := repository.NewUserRepository(h.db)
+	emailExists, err := userRepo.EmailExists(email, 0)
+	if err != nil {
 		return nil, err
 	}
 	if emailExists {
 		return nil, ErrAgentEmailTaken
 	}
-	var usernameExists bool
-	if err := h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE username = ?)", req.Username).Scan(&usernameExists); err != nil {
+	usernameExists, err := userRepo.UsernameExists(req.Username, 0)
+	if err != nil {
 		return nil, err
 	}
 	if usernameExists {
@@ -126,13 +131,20 @@ func (h *AgentHandler) CreateOwnedAgent(ownerID int, isAdmin bool, req CreateAge
 	}
 
 	now := time.Now()
-	var newID int64
-	err := h.db.QueryRow(`
-		INSERT INTO users (email, username, first_name, last_name, is_active, password_hash, requires_password_reset, is_agent, agent_owner_user_id, agent_provenance, email_verified, created_at, updated_at)
-		VALUES (?, ?, ?, ?, true, NULL, false, true, ?, 'user', true, ?, ?) RETURNING id
-	`, email, req.Username, req.FirstName, req.LastName, ownerID, now, now).Scan(&newID)
+	newID, err := userRepo.Create(repository.CreateUserParams{
+		Email:                 email,
+		Username:              req.Username,
+		FirstName:             req.FirstName,
+		LastName:              req.LastName,
+		IsActive:              true,
+		RequiresPasswordReset: false,
+		IsAgent:               true,
+		EmailVerified:         true,
+		AgentOwnerUserID:      &ownerID,
+		AgentProvenance:       "user",
+	})
 	if err != nil {
-		if database.IsUniqueConstraintError(err) {
+		if errors.Is(err, repository.ErrDuplicateEntry) {
 			return nil, ErrAgentUsernameTaken
 		}
 		return nil, err
@@ -162,34 +174,16 @@ func (h *AgentHandler) CreateOwnedAgent(ownerID int, isAdmin bool, req CreateAge
 // provisioning is non-zero.
 var ErrOAuthClientDisabledOrMissing = errors.New("oauth client is disabled or does not exist")
 
-// CreateOAuthAgent provisions an agent that's bound 1:1 to an OAuth client
-// for a given user. Distinct from CreateOwnedAgent because:
-//
-//   - It does NOT consult `allow_user_managed_agents` — that policy gates
-//     the human-facing "create agent" UI and CLI onboarding, neither of
-//     which the OAuth flow is. Conflating the two meant non-admin OAuth
-//     would fail entirely on instances where the policy was disabled, while
-//     admin OAuth bypassed the policy silently — privilege-dependent
-//     behavior that defeated the policy's intent.
-//   - It does NOT consult `max_agents_per_user`. OAuth agents are 1:1 per
-//     (client, user); the natural bound is enabled_oauth_clients × users,
-//     and a per-user cap would silently break the Nth OAuth integration.
-//   - It writes `agent_provenance = 'oauth'` and `oauth_client_id =
-//     oauthClientID`. Together with the schema CHECK constraints, this
-//     means the only way a user row can claim oauth-provenance is via this
-//     code path against a real, enabled client — direct SQL or future code
-//     paths can't forge the label.
+// CreateOAuthAgent provisions one OAuth-provenance agent per client and user.
+// It bypasses self-service limits but requires an enabled client.
 func (h *AgentHandler) CreateOAuthAgent(ownerID, oauthClientID int, req CreateAgentRequest) (*models.User, error) {
 	if err := utils.Validate(req); err != nil {
-		return nil, fmt.Errorf("invalid agent request: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidAgentRequest, err)
 	}
 
-	// Defense in depth: re-confirm the client exists and is enabled. The
-	// OAuth flow already verified this at code-exchange time but a
-	// disable-then-approve race is possible.
-	var enabled bool
-	err := h.db.QueryRow(`SELECT enabled FROM oauth_clients WHERE id = ?`, oauthClientID).Scan(&enabled)
-	if errors.Is(err, sql.ErrNoRows) {
+	// Recheck the client to close a disable-after-consent race.
+	enabled, err := repository.NewOAuthClientRepository(h.db).EnabledByID(oauthClientID)
+	if errors.Is(err, repository.ErrNotFound) {
 		return nil, ErrOAuthClientDisabledOrMissing
 	}
 	if err != nil {
@@ -204,15 +198,16 @@ func (h *AgentHandler) CreateOAuthAgent(ownerID, oauthClientID int, req CreateAg
 		email = fmt.Sprintf("agent-%s-%d@agents.local", strings.ToLower(req.Username), time.Now().UnixNano())
 	}
 
-	var emailExists bool
-	if err := h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE email = ?)", email).Scan(&emailExists); err != nil {
+	userRepo := repository.NewUserRepository(h.db)
+	emailExists, err := userRepo.EmailExists(email, 0)
+	if err != nil {
 		return nil, err
 	}
 	if emailExists {
 		return nil, ErrAgentEmailTaken
 	}
-	var usernameExists bool
-	if err := h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE username = ?)", req.Username).Scan(&usernameExists); err != nil {
+	usernameExists, err := userRepo.UsernameExists(req.Username, 0)
+	if err != nil {
 		return nil, err
 	}
 	if usernameExists {
@@ -220,13 +215,21 @@ func (h *AgentHandler) CreateOAuthAgent(ownerID, oauthClientID int, req CreateAg
 	}
 
 	now := time.Now()
-	var newID int64
-	err = h.db.QueryRow(`
-		INSERT INTO users (email, username, first_name, last_name, is_active, password_hash, requires_password_reset, is_agent, agent_owner_user_id, agent_provenance, oauth_client_id, email_verified, created_at, updated_at)
-		VALUES (?, ?, ?, ?, true, NULL, false, true, ?, 'oauth', ?, true, ?, ?) RETURNING id
-	`, email, req.Username, req.FirstName, req.LastName, ownerID, oauthClientID, now, now).Scan(&newID)
+	newID, err := userRepo.Create(repository.CreateUserParams{
+		Email:                 email,
+		Username:              req.Username,
+		FirstName:             req.FirstName,
+		LastName:              req.LastName,
+		IsActive:              true,
+		RequiresPasswordReset: false,
+		IsAgent:               true,
+		EmailVerified:         true,
+		AgentOwnerUserID:      &ownerID,
+		AgentProvenance:       "oauth",
+		OAuthClientID:         &oauthClientID,
+	})
 	if err != nil {
-		if database.IsUniqueConstraintError(err) {
+		if errors.Is(err, repository.ErrDuplicateEntry) {
 			return nil, ErrAgentUsernameTaken
 		}
 		return nil, err
@@ -254,26 +257,7 @@ func (h *AgentHandler) CreateOAuthAgent(ownerID, oauthClientID int, req CreateAg
 // by the CLI onboarding flow so repeat `ws init` runs on the same machine
 // reuse the same agent row (stable identity, revocable per-machine).
 func (h *AgentHandler) FindOwnedAgentByUsername(ownerID int, username string) (*models.User, error) {
-	var u models.User
-	var avatarURL sql.NullString
-	err := h.db.QueryRow(`
-		SELECT id, email, username, first_name, last_name, is_active, avatar_url, created_at, updated_at
-		FROM users
-		WHERE username = ? AND agent_owner_user_id = ? AND COALESCE(is_agent, false) = true
-	`, username, ownerID).Scan(&u.ID, &u.Email, &u.Username, &u.FirstName, &u.LastName, &u.IsActive, &avatarURL, &u.CreatedAt, &u.UpdatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	u.IsAgent = true
-	u.AgentOwnerUserID = &ownerID
-	if avatarURL.Valid {
-		u.AvatarURL = avatarURL.String
-	}
-	u.FullName = strings.TrimSpace(u.FirstName + " " + u.LastName)
-	return &u, nil
+	return repository.NewUserRepository(h.db).FindOwnedAgentByUsername(ownerID, username)
 }
 
 // Create handles POST /api/me/agents.
@@ -309,7 +293,7 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 				UserAgent:    r.UserAgent(),
 				ActionType:   logger.ActionAgentCreate,
 				ResourceType: logger.ResourceUser,
-				Details:      map[string]interface{}{"reason": "feature_disabled"},
+				Details:      map[string]any{"reason": "feature_disabled"},
 				Success:      false,
 				ErrorMessage: err.Error(),
 			})
@@ -322,7 +306,7 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 				UserAgent:    r.UserAgent(),
 				ActionType:   logger.ActionAgentCreate,
 				ResourceType: logger.ResourceUser,
-				Details:      map[string]interface{}{"reason": "max_agents_reached"},
+				Details:      map[string]any{"reason": "max_agents_reached"},
 				Success:      false,
 				ErrorMessage: err.Error(),
 			})
@@ -331,11 +315,9 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 			respondConflict(w, r, "Username already exists")
 		case errors.Is(err, ErrAgentEmailTaken):
 			respondConflict(w, r, "Email already exists")
+		case errors.Is(err, ErrInvalidAgentRequest):
+			respondValidationError(w, r, strings.TrimPrefix(err.Error(), ErrInvalidAgentRequest.Error()+": "))
 		default:
-			if strings.Contains(err.Error(), "invalid agent request") {
-				respondValidationError(w, r, strings.TrimPrefix(err.Error(), "invalid agent request: "))
-				return
-			}
 			respondInternalError(w, r, err)
 		}
 		return
@@ -350,7 +332,7 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		ResourceType: logger.ResourceUser,
 		ResourceID:   &agent.ID,
 		ResourceName: agent.Username,
-		Details: map[string]interface{}{
+		Details: map[string]any{
 			"agent_kind":    "owned",
 			"owner_user_id": currentUser.ID,
 			"email":         agent.Email,
@@ -368,41 +350,65 @@ func (h *AgentHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := h.db.Query(`
-		SELECT id, email, username, first_name, last_name, is_active, avatar_url, created_at, updated_at
-		FROM users
-		WHERE agent_owner_user_id = ?
-		ORDER BY created_at DESC
-	`, currentUser.ID)
+	agents, err := repository.NewUserRepository(h.db).ListOwnedAgents(currentUser.ID)
 	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	defer func() { _ = rows.Close() }()
-
-	agents := []models.User{}
-	for rows.Next() {
-		var u models.User
-		var avatarURL sql.NullString
-		if scanErr := rows.Scan(&u.ID, &u.Email, &u.Username, &u.FirstName, &u.LastName, &u.IsActive, &avatarURL, &u.CreatedAt, &u.UpdatedAt); scanErr != nil {
-			slog.Warn("agent list scan failed", slog.Any("error", scanErr))
-			continue
-		}
-		u.IsAgent = true
-		ownerID := currentUser.ID
-		u.AgentOwnerUserID = &ownerID
-		if avatarURL.Valid {
-			u.AvatarURL = avatarURL.String
-		}
-		u.FullName = strings.TrimSpace(u.FirstName + " " + u.LastName)
-		agents = append(agents, u)
-	}
-	if err := rows.Err(); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
 
 	respondJSONOK(w, agents)
+}
+
+// Update handles PATCH /api/me/agents/{id}.
+func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
+	currentUser, ok := RequireAuth(w, r)
+	if !ok {
+		return
+	}
+	agentID, ok := requireIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+
+	req, ok := decodeJSON[UpdateAgentRequest](w, r)
+	if !ok {
+		return
+	}
+	sanitize.ApplyAll(sanitize.Pair{Target: &req.Name, Policy: sanitize.PlainTextField})
+	req.Name = strings.TrimSpace(req.Name)
+	if err := utils.Validate(req); err != nil {
+		respondValidationError(w, r, err.Error())
+		return
+	}
+
+	agent, err := repository.NewUserRepository(h.db).UpdateOwnedAgentName(agentID, currentUser.ID, req.Name)
+	if errors.Is(err, repository.ErrNotFound) {
+		respondNotFound(w, r, "agent")
+		return
+	}
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+
+	_ = logger.LogAudit(h.db, logger.AuditEvent{
+		UserID:       currentUser.ID,
+		Username:     currentUser.Username,
+		IPAddress:    utils.GetClientIP(r),
+		UserAgent:    r.UserAgent(),
+		ActionType:   logger.ActionAgentUpdate,
+		ResourceType: logger.ResourceUser,
+		ResourceID:   &agentID,
+		ResourceName: agent.Username,
+		Details: map[string]any{
+			"agent_kind":    "owned",
+			"owner_user_id": currentUser.ID,
+			"name":          req.Name,
+		},
+		Success: true,
+	})
+
+	respondJSONOK(w, agent)
 }
 
 // Delete handles DELETE /api/me/agents/{id}.
@@ -417,10 +423,9 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify ownership before deletion to avoid disclosing whether the agent exists.
-	var ownerID sql.NullInt64
-	var username string
-	err := h.db.QueryRow("SELECT agent_owner_user_id, username FROM users WHERE id = ?", agentID).Scan(&ownerID, &username)
-	if errors.Is(err, sql.ErrNoRows) {
+	userRepo := repository.NewUserRepository(h.db)
+	ownerID, username, err := userRepo.OwnedAgentTarget(agentID)
+	if errors.Is(err, repository.ErrNotFound) {
 		respondNotFound(w, r, "agent")
 		return
 	}
@@ -428,7 +433,7 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		respondInternalError(w, r, err)
 		return
 	}
-	if !ownerID.Valid || int(ownerID.Int64) != currentUser.ID {
+	if ownerID == nil || *ownerID != currentUser.ID {
 		_ = logger.LogAudit(h.db, logger.AuditEvent{
 			UserID:       currentUser.ID,
 			Username:     currentUser.Username,
@@ -437,7 +442,7 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			ActionType:   logger.ActionAgentDelete,
 			ResourceType: logger.ResourceUser,
 			ResourceID:   &agentID,
-			Details:      map[string]interface{}{"reason": "not_agent_owner"},
+			Details:      map[string]any{"reason": "not_agent_owner"},
 			Success:      false,
 			ErrorMessage: "caller does not own target agent",
 		})
@@ -445,7 +450,7 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err = h.db.ExecWrite("DELETE FROM users WHERE id = ?", agentID); err != nil {
+	if err = userRepo.Delete(agentID); err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
@@ -461,7 +466,7 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		ResourceType: logger.ResourceUser,
 		ResourceID:   &agentID,
 		ResourceName: username,
-		Details: map[string]interface{}{
+		Details: map[string]any{
 			"agent_kind":    "owned",
 			"owner_user_id": currentUser.ID,
 		},

@@ -10,37 +10,41 @@
     IconBook as BookOpen,
     IconChevronDown as ChevronDown,
     IconChevronRight,
-    IconGripVertical as Grip,
     IconPalette as Palette,
     IconSparkles as Sparkles,
     IconPencil as Pencil,
   } from '@tabler/icons-svelte-runes';
-  import { workspaceIconMap } from '../utils/icons.js';
-  import { workspaceViewItems, workspaceOnlyViews, testNavigationItems, workspaceSettingsItems, workspaceSettingsViews, workspaceSettingsRoute } from '../navigation/workspaceNavigation.js';
-  import { navItemStyle, onNavMouseEnter, onNavMouseLeave } from '../navigation/navItemStyle.js';
+  import { workspaceViewItems, workspaceOnlyViews, testNavigationItems, visibleWorkspaceSettingsItems, workspaceSettingsViews, workspaceSettingsRoute, collectionSwitchUrl } from '../navigation/workspaceNavigation.js';
+  import { viewSettingsStore } from '../stores/viewSettings.svelte.js';
   import { navigate, currentRoute } from '../router.js';
-  import { currentWorkspace, workspacePermissions } from '../stores';
+  import { authStore, currentWorkspace, workspacePermissions } from '../stores';
   import { moduleSettings } from '../stores/moduleSettings.js';
   import { api } from '../api.js';
   import DropdownMenu from '../layout/DropdownMenu.svelte';
+  import ScrollableSidebar from '../layout/ScrollableSidebar.svelte';
+  import SidebarResizeHandle from '../layout/SidebarResizeHandle.svelte';
   import Tooltip from '../components/Tooltip.svelte';
   import PagesNavSidebar from '../features/pages/PagesNavSidebar.svelte';
   import WorkspaceAdminNav from './WorkspaceAdminNav.svelte';
-  import { t } from '../stores/i18n.svelte.js';
+  import { i18n, t } from '../stores/i18n.svelte.js';
   import { workspaceGradientIndex, applyToAllViews, loadWorkspaceGradient, getGradientStyle } from '../stores/workspaceGradient.svelte.js';
-  import { useEventListener } from 'runed';
-  import { uiStore } from '../stores/ui.svelte.js';
+  import {
+    uiStore,
+    WS_SIDEBAR_DEFAULT_WIDTH,
+    WS_SIDEBAR_MAX_WIDTH,
+    WS_SIDEBAR_MIN_WIDTH,
+  } from '../stores/ui.svelte.js';
 
-  const MIN_WIDTH = 180;
-  const MAX_WIDTH = 520;
+  const MIN_WIDTH = WS_SIDEBAR_MIN_WIDTH;
+  const MAX_WIDTH = WS_SIDEBAR_MAX_WIDTH;
   const COLLAPSE_THRESHOLD = 100;
   const COLLAPSED_WIDTH = 48;
 
   const PERSONAL_NAV_ITEMS = [
-    { icon: CheckSquare, label: 'My Tasks', route: '/personal', view: 'personal-workspace' },
-    { icon: BookOpen, label: 'Reviews', route: '/personal/reviews', view: 'workspace-reviews' },
-    { icon: Calendar, label: 'Weekly Calendar', route: '/personal/calendar', view: 'workspace-calendar' },
-    { icon: Sparkles, label: 'Plan My Day', route: '/personal/plan', view: 'personal-plan' },
+    { icon: CheckSquare, labelKey: 'personal.myTasks', route: '/personal', view: 'personal-workspace' },
+    { icon: BookOpen, labelKey: 'personal.reviews', route: '/personal/reviews', view: 'workspace-reviews' },
+    { icon: Calendar, labelKey: 'personal.weeklyCalendar', route: '/personal/calendar', view: 'workspace-calendar' },
+    { icon: Sparkles, labelKey: 'settings.aiFeatures.features.plan_my_day.name', route: '/personal/plan', view: 'personal-plan' },
   ];
 
   // Full list of workspace admin route views (registry-driven).
@@ -48,103 +52,93 @@
 
   let sidebarWidth = $derived($uiStore.wsSidebarWidth);
   let isCollapsed = $derived($uiStore.wsSidebarCollapsed);
-  let isResizing = $state(false);
-  let resizeStartX = $state(0);
-  let resizeStartWidth = $state(0);
-  let collapsedDuringDrag = $state(false);
-
-  function onResizeStart(e) {
-    e.preventDefault();
-    resizeStartX = e.clientX;
-    resizeStartWidth = isCollapsed ? COLLAPSED_WIDTH : sidebarWidth;
-    collapsedDuringDrag = false;
-    isResizing = true;
-  }
-
-  function handleResizeMove(e) {
-    const rawWidth = resizeStartWidth + (e.clientX - resizeStartX);
-    if (rawWidth < COLLAPSE_THRESHOLD) {
-      if (!isCollapsed) {
-        collapsedDuringDrag = true;
-        uiStore.wsSidebarCollapsed = true;
-      }
-    } else {
-      if (isCollapsed) {
-        uiStore.wsSidebarCollapsed = false;
-        collapsedDuringDrag = false;
-      }
-      const newWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, rawWidth));
-      uiStore.wsSidebarWidth = newWidth;
-    }
-  }
-
-  function handleResizeUp() {
-    isResizing = false;
-    collapsedDuringDrag = false;
-  }
-
-  useEventListener(() => isResizing ? window : undefined, 'mousemove', handleResizeMove);
-  useEventListener(() => isResizing ? window : undefined, 'mouseup', handleResizeUp);
-
-  function onResizeHandleDblClick() {
-    uiStore.wsSidebarCollapsed = false;
-    uiStore.resetWsSidebarWidth();
-  }
 
   let { workspaceId = null } = $props();
 
   let collections = $state([]);
   let allCollections = $state([]);
   let currentCollectionId = $state(null); // Track by ID instead of name
-  let currentCollectionName = $state('Default'); // For display
+  let currentCollectionName = $state(''); // For display
+  let collectionDisplayName = $derived(currentCollectionId ? currentCollectionName : t('collections.allItems'));
   let collectionDropdownItems = $state([]);
+  let testsExpanded = $state(true);
   let workspaceToolsExpanded = $state(true);
   let lastCollectionId = undefined; // Plain variable to prevent infinite loop in $effect
 
   // Workspace view registries live in navigation/workspaceNavigation.js
-  const workspaceOnlyViewIds = new Set(workspaceOnlyViews.map(view => view.id));
-  const workspaceTestViewIds = new Set([
-    'test-cases',
-    'test-case-detail',
-    'test-steps',
-    'test-sets',
-    'test-set-detail',
-    'test-templates',
-    'test-template-detail',
-    'test-runs',
-    'test-run-detail',
-    'test-execution',
-    'test-reports'
-  ]);
+  const workspaceOnlyViewIds = new Set(
+    workspaceOnlyViews.map(view => view.id)
+  );
   const activeTestNavId = $derived.by(() => getActiveTestNavId($currentRoute));
   const isSettingsView = $derived(SETTINGS_VIEWS.includes($currentRoute.view));
-  const defaultCollectionView = workspaceViewItems[0]?.id || 'backlog';
+  // Collection-scoped views filtered by the scope's enabled-views setting.
+  const visibleWorkspaceViews = $derived.by(() => {
+    const enabled = new Set(viewSettingsStore.enabledViewIds(workspaceId, currentCollectionId));
+    return workspaceViewItems.filter((view) => enabled.has(view.id));
+  });
+  // First enabled view — workspace-only views cannot be collection-scoped.
+  const defaultCollectionView = $derived(visibleWorkspaceViews[0]?.id || 'backlog');
+
+  // Workspace-scope nav visibility (views plus tools/test entries). Tools
+  // render in collection contexts too, so keep the workspace entry warm.
+  const enabledNavSet = $derived(new Set(viewSettingsStore.enabledNavIds(workspaceId)));
 
   // Permission-based visibility
   const canViewTests = $derived.by(() => workspacePermissions.canViewTests(workspaceId));
   const canManageActions = $derived.by(() => workspacePermissions.canManageActions(workspaceId));
   const canAdmin = $derived.by(() => workspacePermissions.canAdminWorkspace(workspaceId));
+  const visibleSettingsItems = $derived.by(() =>
+    visibleWorkspaceSettingsItems(workspaceId, (wsId, permission) =>
+      workspacePermissions.hasPermission(wsId, permission)
+    )
+  );
+  const canViewPages = $derived.by(() => workspacePermissions.hasPermission(workspaceId, 'page.view'));
 
-  // Filter workspace-only views based on permissions
+  // Filter workspace-only views based on nav visibility and permissions.
   const filteredWorkspaceOnlyViews = $derived.by(() => {
     return workspaceOnlyViews.filter(view => {
+      if (!enabledNavSet.has(view.id)) return false;
+      if (view.id === 'agents') return canAdmin;
       if (view.id === 'actions') return canManageActions;
+      if (view.id === 'pages') return canViewPages;
       return true;
     });
   });
+  const visibleTestNavItems = $derived.by(() => {
+    // Test entries are not nav-configurable; module and permission gating
+    // decide their visibility.
+    return testNavigationItems;
+  });
+  // Entry points mirror the backend's write gates: the workspace-default
+  // navigation is workspace-admin territory, while a collection's views
+  // belong to whoever can edit the collection (its creator, with the
+  // collections:write the HTTP layer also requires).
+  const canConfigureWorkspaceNav = $derived.by(() =>
+    workspacePermissions.canAdminWorkspace(workspaceId)
+  );
+  const currentCollectionObject = $derived.by(() =>
+    collections.find((c) => String(c.id) === String(currentCollectionId)) ?? null
+  );
+  const canConfigureCollectionNav = $derived.by(() =>
+    Boolean(
+      currentCollectionObject &&
+        authStore.currentUser?.id != null &&
+        String(currentCollectionObject.created_by) === String(authStore.currentUser.id) &&
+        workspacePermissions.hasPermission(workspaceId, 'collections:write')
+    )
+  );
 
   // Gradient detection
   const gradientStyle = $derived.by(() => ($applyToAllViews && $workspaceGradientIndex > 0) ? getGradientStyle($workspaceGradientIndex) : null);
   const hasGradient = $derived.by(() => gradientStyle !== null);
   const sidebarBgClass = $derived.by(() => hasGradient ? 'backdrop-blur-sm' : '');
   const sidebarBgStyle = $derived.by(() => hasGradient
-    ? 'background-color: color-mix(in srgb, var(--ds-surface) 95%, transparent); border-color: var(--ds-border);'
-    : 'background-color: var(--ds-surface); border-color: var(--ds-border);');
+    ? 'background-color: color-mix(in srgb, var(--ds-surface) 95%, transparent); border-color: var(--ds-border); --scrollable-sidebar-fade-color: var(--ds-surface);'
+    : 'background-color: var(--ds-surface); border-color: var(--ds-border); --scrollable-sidebar-fade-color: var(--ds-surface);');
 
   onMount(async () => {
     if (workspaceId) {
       await loadWorkspaceGradient(workspaceId);
-      await loadCollections();
     }
   });
 
@@ -155,9 +149,22 @@
     }
   });
 
+  // Keep the enabled-views lookup warm for the current scope, plus the
+  // workspace scope so tools entries filter correctly inside collections.
+  $effect(() => {
+    if (workspaceId) {
+      viewSettingsStore.load(workspaceId, currentCollectionId);
+      viewSettingsStore.load(workspaceId, null);
+    }
+  });
+
   // Reactive statement to sync collection with route changes
   $effect(() => {
     syncCollectionWithRoute($currentRoute.params.collectionId);
+  });
+  $effect(() => {
+    i18n.locale;
+    buildCollectionDropdownItems();
   });
   $effect(() => {
     if (currentCollectionId !== lastCollectionId) {
@@ -171,10 +178,10 @@
       currentCollectionId = routeCollectionId;
       // Update the display name based on ID
       const collection = collections.find(c => c.id == routeCollectionId);
-      currentCollectionName = collection ? collection.name : 'Default';
+      currentCollectionName = collection?.name || '';
     } else {
       currentCollectionId = null;
-      currentCollectionName = 'Default';
+      currentCollectionName = '';
     }
     buildCollectionDropdownItems();
   }
@@ -190,10 +197,11 @@
       // Sync with current route (reactive statement will handle this, but we need to rebuild dropdown)
       syncCollectionWithRoute($currentRoute.params.collectionId);
     } catch (error) {
+      if (error?.name === 'AbortError') return;
       console.error('Failed to load collections:', error);
       collections = [];
       currentCollectionId = null;
-      currentCollectionName = 'Default';
+      currentCollectionName = '';
       buildCollectionDropdownItems();
     }
   }
@@ -214,7 +222,7 @@
 
   // Helper function to truncate long workspace names
   function truncateWorkspaceName(name) {
-    if (!name) return 'Workspace';
+    if (!name) return t('common.workspace');
     // Truncate to ~20 characters to fit in 2 lines max
     if (name.length <= 20) return name;
     return name.substring(0, 17) + '...';
@@ -224,13 +232,13 @@
     // Build the items array first, then assign once to avoid multiple state updates
     const items = [];
 
-    // Always add Default collection first (shows all items)
+    // Always add the unfiltered workspace view first (shows all items)
     const workspaceName = truncateWorkspaceName($currentWorkspace?.name);
     items.push({
       id: 'default',
       type: 'regular',
-      title: `${workspaceName} - Default`,
-      subtitle: 'Show all items in workspace',
+      testid: 'workspace-collection-option-default',
+      title: `${workspaceName} — ${t('collections.allItems')}`,
       badge: currentCollectionId === null ? '✓' : null,
       badgeClass: currentCollectionId === null ? '' : '',
       badgeStyle: currentCollectionId === null ? 'color: var(--ds-text-link);' : 'color: var(--ds-text-subtlest);',
@@ -243,6 +251,7 @@
       const collectionItems = collections.map(collection => ({
         id: `collection-${collection.id}`,
         type: 'regular',
+        testid: `workspace-collection-option-${collection.id}`,
         title: collection.name,
         subtitle: collection.description || undefined,
         badge: currentCollectionId == collection.id ? '✓' : null,
@@ -262,7 +271,7 @@
         id: 'add-collection',
         type: 'regular',
         icon: Plus,
-        title: 'Add Collection',
+        title: t('collections.createCollection'),
         color: 'var(--ds-text-link)',
         onClick: () => {
           window.dispatchEvent(new CustomEvent('show-create-modal', {
@@ -283,53 +292,33 @@
     workspaceToolsExpanded = !workspaceToolsExpanded;
   }
 
+  function toggleTestsSection() {
+    testsExpanded = !testsExpanded;
+  }
+
+  function viewLabel(view) {
+    return t(view.labelKey);
+  }
+
+  function viewTooltip(view) {
+    return t(view.tooltipKey || view.labelKey);
+  }
+
   function selectCollection(collection) {
     if (collection === null) {
       currentCollectionId = null;
-      currentCollectionName = 'Default';
+      currentCollectionName = '';
     } else {
       currentCollectionId = collection.id;
       currentCollectionName = collection.name;
     }
     buildCollectionDropdownItems();
 
-    // Navigate to the new URL with the selected collection
-    // Determine current view from the route
-    let currentView = $currentRoute.view;
-    if (currentView === 'workspace-detail') {
-      // If on overview, navigate to overview with/without collection
-      const url = currentCollectionId
-        ? `/workspaces/${workspaceId}/collections/${currentCollectionId}`
-        : `/workspaces/${workspaceId}`;
-      navigate(url);
-    } else if (currentView && currentView.startsWith('workspace-')) {
-      // For other workspace views (board, list, etc.), extract the view name
-      let viewName = currentView.replace('workspace-', '');
-
-      // Workspace-only views cannot be scoped by collection, fallback to default collection view
-      if (currentCollectionId !== null && workspaceOnlyViewIds.has(viewName)) {
-        viewName = defaultCollectionView;
-      }
-
-      const url = getNavigationUrl(viewName);
-      navigate(url);
-    } else if (currentView === 'item-detail') {
-      const currentItemId = $currentRoute.params.itemId;
-      if (currentItemId) {
-        const url = currentCollectionId
-          ? `/workspaces/${workspaceId}/collections/${currentCollectionId}/items/${currentItemId}`
-          : `/workspaces/${workspaceId}/items/${currentItemId}`;
-        navigate(url);
-      }
-    } else if (currentView && workspaceTestViewIds.has(currentView)) {
-      // Test views are not collection-sensitive, redirect to default collection view
-      if (currentCollectionId !== null) {
-        navigate(getNavigationUrl(defaultCollectionView));
-      } else {
-        const url = getTestNavigationUrl(getTestNavIdFromView(currentView));
-        navigate(url);
-      }
-    }
+    // Re-scope the current view from the route path so compound paths
+    // (board/configure, settings/general, …) and detail params survive the
+    // switch. Views without a collection-scoped route fall back to the
+    // collection's default view; "All items" drops the collection segment.
+    navigate(collectionSwitchUrl($currentRoute, workspaceId, currentCollectionId, defaultCollectionView));
   }
 
   function getNavigationUrl(view) {
@@ -356,15 +345,6 @@
     }
   }
 
-  function getTestNavIdFromView(view) {
-    if (view === 'test-case-detail' || view === 'test-steps') return 'test-cases';
-    if (view === 'test-set-detail') return 'test-sets';
-    if (view === 'test-template-detail') return 'test-templates';
-    if (view === 'test-run-detail' || view === 'test-execution') return 'test-runs';
-    if (view === 'test-reports') return 'test-reports';
-    return 'test-cases';
-  }
-
   function getActiveTestNavId(route) {
     const view = route?.view;
     const path = route?.path || '';
@@ -384,66 +364,28 @@
   function isSettingsActive() {
     return SETTINGS_VIEWS.includes($currentRoute.view);
   }
+
+  function isWorkspaceViewActive(view) {
+    return view.activeViews?.includes($currentRoute.view)
+      || $currentRoute.view === `workspace-${view.id}`;
+  }
 </script>
 
 {#snippet resizeHandle()}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div
-    class="ws-resize-handle"
-    onmousedown={onResizeStart}
-    ondblclick={onResizeHandleDblClick}
-  ></div>
-{/snippet}
-
-{#snippet workspaceAvatar(collapsed = false)}
-  {#if $currentWorkspace?.avatar_url}
-    <div class={collapsed ? 'w-8 h-8 flex-shrink-0' : 'flex items-center justify-center w-10 h-10 flex-shrink-0'}>
-      <img
-        src={$currentWorkspace.avatar_url}
-        alt="{$currentWorkspace.name} avatar"
-        class="w-8 h-8 rounded-md object-cover"
-      />
-    </div>
-  {:else}
-    {@const WorkspaceIcon = workspaceIconMap[$currentWorkspace?.icon] || Grip}
-    <div class={collapsed ? 'w-8 h-8 rounded-md flex items-center justify-center flex-shrink-0' : 'flex items-center justify-center w-10 h-10 flex-shrink-0'}>
-      <div
-        class="w-8 h-8 rounded-md flex items-center justify-center"
-        style="background-color: {$currentWorkspace?.color || ($currentWorkspace?.is_personal ? '#f97316' : '#3b82f6')};"
-      >
-        <WorkspaceIcon size={collapsed ? 16 : 18} color="white" />
-      </div>
-    </div>
-  {/if}
-{/snippet}
-
-{#snippet workspaceHeader({ backLink = false } = {})}
-  <div class="px-4 pb-4 border-b" style="border-color: var(--ds-border);">
-    <div class="flex items-center gap-3">
-      {@render workspaceAvatar(false)}
-      <div class="flex-1 min-w-0">
-        <Tooltip content={$currentWorkspace?.name || 'Workspace'}>
-          <div class="font-medium text-sm truncate" style="color: var(--ds-text);">
-            {$currentWorkspace?.name || 'Workspace'}
-          </div>
-        </Tooltip>
-        {#if backLink}
-          <a class="workspace-header-back-link" href={`/workspaces/${workspaceId}`} data-testid="workspace-back-link">
-            <ArrowLeft size={13} />
-            <span>{t('workspaceSettings.backToWorkspace')}</span>
-          </a>
-        {:else if $currentWorkspace?.is_personal}
-          <div class="text-xs text-orange-600">Personal</div>
-        {:else if $currentWorkspace?.description}
-          <Tooltip content={$currentWorkspace.description}>
-            <div class="text-xs truncate" style="color: var(--ds-text-subtle);">
-              {$currentWorkspace.description}
-            </div>
-          </Tooltip>
-        {/if}
-      </div>
-    </div>
-  </div>
+  <SidebarResizeHandle
+    width={sidebarWidth}
+    minWidth={MIN_WIDTH}
+    maxWidth={MAX_WIDTH}
+    defaultWidth={WS_SIDEBAR_DEFAULT_WIDTH}
+    collapsed={isCollapsed}
+    collapsedWidth={COLLAPSED_WIDTH}
+    collapseThreshold={COLLAPSE_THRESHOLD}
+    label={t('aria.resizeNavigation')}
+    title={t('aria.sidebarResizeHint')}
+    testId="workspace-sidebar-resize"
+    onresize={(width) => uiStore.wsSidebarWidth = width}
+    oncollapsechange={(collapsed) => uiStore.wsSidebarCollapsed = collapsed}
+  />
 {/snippet}
 
 {#snippet navLink(item)}
@@ -451,10 +393,9 @@
   <Tooltip content={item.tooltip || item.label} placement="right">
     <a
       href={item.href}
-      class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-2 workspace-nav-item no-underline"
-      style={navItemStyle(item.isActive)}
-      onmouseenter={(e) => onNavMouseEnter(e, item.isActive)}
-      onmouseleave={(e) => onNavMouseLeave(e, item.isActive)}
+      data-testid={item.testId}
+      class="ws-nav-item w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-2 workspace-nav-item no-underline"
+      class:active={item.isActive}
     >
       <ItemIcon class="w-4 h-4" />
       {item.label}
@@ -467,10 +408,9 @@
   <Tooltip content={item.label} placement="right">
     <a
       href={item.href}
-      class="w-10 h-10 rounded flex items-center justify-center transition-colors no-underline"
-      style={navItemStyle(item.isActive)}
-      onmouseenter={(e) => onNavMouseEnter(e, item.isActive)}
-      onmouseleave={(e) => onNavMouseLeave(e, item.isActive)}
+      data-testid={item.testId}
+      class="ws-nav-item w-10 h-10 rounded flex items-center justify-center transition-colors no-underline"
+      class:active={item.isActive}
     >
       <ItemIcon size={20} />
     </a>
@@ -481,192 +421,250 @@
   <div class="w-8 border-t my-1" style="border-color: var(--ds-border);"></div>
 {/snippet}
 
+{#snippet regularSidebarHeader()}
+  <!-- Keep the collection selector visible while navigation scrolls. -->
+  <div class="px-4 pt-2 mb-6">
+    <Tooltip content={t('collections.collection')} placement="right">
+      <DropdownMenu
+        triggerText={collectionDisplayName}
+        triggerTestid="workspace-collection-select"
+        items={collectionDropdownItems}
+        maxWidth="max-w-full"
+        matchTriggerWidth={true}
+        showChevron={true}
+        placement="bottom-start"
+        triggerClass="w-full text-left font-medium rounded !px-3 !py-2.5 !text-sm transition-colors"
+        triggerStyle="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text);"
+        triggerAlignment="between"
+      />
+    </Tooltip>
+  </div>
+{/snippet}
+
+{#snippet sidebarResizeHandle()}
+  {@render resizeHandle()}
+{/snippet}
+
+{#snippet drilldownSidebarHeader()}
+  <div class="px-4 pb-3">
+    <a class="workspace-header-back-link" href={`/workspaces/${workspaceId}`} data-testid="workspace-back-link">
+      <ArrowLeft size={13} />
+      <span>{t('workspaceSettings.backToWorkspace')}</span>
+    </a>
+  </div>
+{/snippet}
+
+{#snippet collapsedSidebarContent()}
+  {#if isSettingsView}
+    <!-- Collapsed admin rail: back arrow + a module icon per settings page. -->
+    <div class="flex flex-col items-center space-y-1 mt-6">
+      {@render collapsedNavIcon({ href: `/workspaces/${workspaceId}`, testId: 'workspace-back-link', label: t('workspaceSettings.backToWorkspace'), icon: ArrowLeft, isActive: false })}
+      {@render sectionDivider()}
+      {#each visibleSettingsItems as item (item.id)}
+        {@render collapsedNavIcon({ href: workspaceSettingsRoute(workspaceId, item.id), testId: `workspace-admin-nav-${item.id}`, label: t(item.labelKey), icon: item.icon, isActive: $currentRoute.view === item.view })}
+      {/each}
+    </div>
+  {:else if $currentWorkspace?.is_personal}
+    <div class="flex flex-col items-center space-y-1 mt-6">
+      {#each PERSONAL_NAV_ITEMS as item (item.route)}
+        {@render collapsedNavIcon({ href: item.route, label: t(item.labelKey), icon: item.icon, isActive: $currentRoute.view === item.view })}
+      {/each}
+    </div>
+  {:else}
+    <div class="flex flex-col items-center space-y-1 mt-6">
+      {@render collapsedNavIcon({ href: getNavigationUrl('overview'), label: t('workspaceSettings.views.overview'), icon: Home, isActive: $currentRoute.view === 'workspace-overview' })}
+
+      {#each visibleWorkspaceViews as view (view.id)}
+        {@render collapsedNavIcon({ href: getNavigationUrl(view.id), label: viewLabel(view), icon: view.icon, isActive: $currentRoute.view === `workspace-${view.id}` })}
+      {/each}
+
+      {#if $moduleSettings.test_management_enabled && canViewTests && !currentCollectionId}
+        {@render sectionDivider()}
+        {#each visibleTestNavItems as view (view.id)}
+          {@render collapsedNavIcon({ href: getTestNavigationUrl(view.id), label: viewLabel(view), icon: view.icon, isActive: activeTestNavId === view.id })}
+        {/each}
+      {/if}
+
+      {@render sectionDivider()}
+      {#each filteredWorkspaceOnlyViews as view (view.id)}
+        {@render collapsedNavIcon({ href: getNavigationUrl(view.id), label: viewLabel(view), icon: view.icon, testId: view.testId, isActive: isWorkspaceViewActive(view) })}
+      {/each}
+
+      {#if canAdmin}
+        {@render collapsedNavIcon({ href: `/workspaces/${workspaceId}/settings/general`, label: t('workspaceSettings.title'), icon: Settings, testId: 'workspace-nav-settings', isActive: isSettingsActive() })}
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+{#snippet collapsedSidebarFooter()}
+  <Tooltip content={t('collections.expandSidebar')} placement="right">
+    <button
+      type="button"
+      onclick={() => uiStore.wsSidebarCollapsed = false}
+      class="nav-link w-10 h-10 rounded flex items-center justify-center transition-colors"
+    >
+      <IconChevronRight size={20} />
+    </button>
+  </Tooltip>
+
+  {@render resizeHandle()}
+{/snippet}
+
 {#if isCollapsed}
   <!-- Collapsed icon-only sidebar -->
-  <div class="relative h-full flex-shrink-0 border-r flex flex-col items-center py-4 {sidebarBgClass}" style="width: {COLLAPSED_WIDTH}px; {sidebarBgStyle}">
-    <div class="h-10 mb-2 w-full flex items-center justify-center">
-      {@render workspaceAvatar(true)}
-    </div>
-
-    {#if isSettingsView}
-      <!-- Collapsed admin rail: back arrow + a module icon per settings page. -->
-      <div class="flex flex-col items-center space-y-1 mt-6">
-        {@render collapsedNavIcon({ href: `/workspaces/${workspaceId}`, label: t('workspaceSettings.backToWorkspace'), icon: ArrowLeft, isActive: false })}
-        {@render sectionDivider()}
-        {#each workspaceSettingsItems as item}
-          {@render collapsedNavIcon({ href: workspaceSettingsRoute(workspaceId, item.id), label: t(item.labelKey), icon: item.icon, isActive: $currentRoute.view === item.view })}
-        {/each}
-      </div>
-    {:else if $currentWorkspace?.is_personal}
-      <div class="flex flex-col items-center space-y-1 mt-6">
-        {#each PERSONAL_NAV_ITEMS as item}
-          {@render collapsedNavIcon({ href: item.route, label: item.label, icon: item.icon, isActive: $currentRoute.view === item.view })}
-        {/each}
-      </div>
-    {:else}
-      <div class="flex flex-col items-center space-y-1 mt-6">
-        {@render collapsedNavIcon({ href: getNavigationUrl('overview'), label: 'Overview', icon: Home, isActive: $currentRoute.view === 'workspace-overview' })}
-
-        {#each workspaceViewItems as view}
-          {@render collapsedNavIcon({ href: getNavigationUrl(view.id), label: view.label, icon: view.icon, isActive: $currentRoute.view === `workspace-${view.id}` })}
-        {/each}
-
-        {#if $moduleSettings.test_management_enabled && canViewTests && !currentCollectionId}
-          {@render sectionDivider()}
-          {#each testNavigationItems as view}
-            {@render collapsedNavIcon({ href: getTestNavigationUrl(view.id), label: view.label, icon: view.icon, isActive: activeTestNavId === view.id })}
-          {/each}
-        {/if}
-
-        {@render sectionDivider()}
-        {#each filteredWorkspaceOnlyViews as view}
-          {@render collapsedNavIcon({ href: getNavigationUrl(view.id), label: view.label, icon: view.icon, isActive: $currentRoute.view === `workspace-${view.id}` })}
-        {/each}
-
-        {#if canAdmin}
-          {@render collapsedNavIcon({ href: `/workspaces/${workspaceId}/settings/general`, label: 'Settings', icon: Settings, isActive: isSettingsActive() })}
-        {/if}
-      </div>
-    {/if}
-
-    <div class="flex-1"></div>
-
-    <Tooltip content="Expand sidebar" placement="right">
-      <button
-        type="button"
-        onclick={() => uiStore.wsSidebarCollapsed = false}
-        class="w-10 h-10 rounded flex items-center justify-center transition-colors"
-        style="color: var(--ds-text-subtle);"
-        onmouseenter={(e) => e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'}
-        onmouseleave={(e) => e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'}
-      >
-        <IconChevronRight size={20} />
-      </button>
-    </Tooltip>
-
-    {@render resizeHandle()}
-  </div>
+  <ScrollableSidebar
+    class="workspace-resizable-sidebar relative h-full flex-shrink-0 border-r items-center py-4 {sidebarBgClass}"
+    style="width: {COLLAPSED_WIDTH}px; {sidebarBgStyle}"
+    aria-label={t('aria.mainNavigation')}
+    footer={collapsedSidebarFooter}
+    reserveScrollbarSpace={false}
+    scrollClass="w-full"
+    scrollTestid="workspace-navigation-scroll"
+  >
+    {@render collapsedSidebarContent()}
+  </ScrollableSidebar>
 {:else if isSettingsView}
-  <!-- Workspace admin drilldown: keep the workspace identity header (with a
-       back link) and swap the body for the folded admin module nav. -->
-  <div
-    class="sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r flex flex-col py-4"
+  <!-- Workspace admin navigation with a link back to the default view. -->
+  <ScrollableSidebar
+    class="workspace-resizable-sidebar sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r flex flex-col py-4"
     style="width: {sidebarWidth}px; min-width: {MIN_WIDTH}px; max-width: {MAX_WIDTH}px; {sidebarBgStyle}"
     data-testid="workspace-admin-sidebar"
+    aria-label={t('workspaceSettings.title')}
+    header={drilldownSidebarHeader}
+    footer={sidebarResizeHandle}
+    scrollTestid="workspace-admin-navigation-scroll"
   >
-    {@render workspaceHeader({ backLink: true })}
-    <div class="flex flex-1 min-h-0">
-      <WorkspaceAdminNav {workspaceId} />
-    </div>
-    {@render resizeHandle()}
-  </div>
+    <WorkspaceAdminNav {workspaceId} />
+  </ScrollableSidebar>
 {:else if $currentRoute.view === 'workspace-pages' || $currentRoute.view === 'workspace-pages-archived'}
-  <!-- Pages drilldown keeps the common workspace identity header and swaps the body for the page tree. -->
-  <div
-    class="sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r flex flex-col py-4"
+  <!-- Pages drilldown uses the page tree beneath its back link. -->
+  <ScrollableSidebar
+    class="workspace-resizable-sidebar sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r flex flex-col py-4"
     style="width: {sidebarWidth}px; min-width: {MIN_WIDTH}px; max-width: {MAX_WIDTH}px; {sidebarBgStyle}"
+    data-testid="workspace-pages-sidebar"
+    aria-label={t('pages.treeHeading')}
+    header={drilldownSidebarHeader}
+    footer={sidebarResizeHandle}
+    scrollContent={false}
+    reserveScrollbarSpace={false}
   >
-    {@render workspaceHeader({ backLink: true })}
-    <div class="flex flex-1 min-h-0">
+    <div class="flex h-full min-h-0">
       <PagesNavSidebar {workspaceId} embedded />
     </div>
-    {@render resizeHandle()}
-  </div>
+  </ScrollableSidebar>
 {:else if $currentWorkspace?.is_personal}
   <!-- Simplified Personal Workspace Sidebar -->
-  <div class="sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r flex flex-col py-4" style="width: {sidebarWidth}px; min-width: {MIN_WIDTH}px; max-width: {MAX_WIDTH}px; {sidebarBgStyle}">
-    {@render workspaceHeader()}
-
-    <nav class="flex-1 px-4 pt-2 space-y-1">
-      {#each PERSONAL_NAV_ITEMS as item}
-        {@render navLink({ href: item.route, label: item.label, icon: item.icon, isActive: $currentRoute.view === item.view })}
+  <ScrollableSidebar
+    class="workspace-resizable-sidebar sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r py-4"
+    style="width: {sidebarWidth}px; min-width: {MIN_WIDTH}px; max-width: {MAX_WIDTH}px; {sidebarBgStyle}"
+    aria-label={t('aria.mainNavigation')}
+    footer={sidebarResizeHandle}
+    scrollTestid="workspace-navigation-scroll"
+  >
+    <nav class="px-4 pt-2 space-y-1 pb-2">
+      {#each PERSONAL_NAV_ITEMS as item (item.route)}
+        {@render navLink({ href: item.route, label: t(item.labelKey), icon: item.icon, isActive: $currentRoute.view === item.view })}
       {/each}
     </nav>
-
-    {@render resizeHandle()}
-  </div>
+  </ScrollableSidebar>
 {:else}
   <!-- Regular Workspace Navigation Sidebar -->
-  <div class="sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r flex flex-col py-4" style="width: {sidebarWidth}px; min-width: {MIN_WIDTH}px; max-width: {MAX_WIDTH}px; {sidebarBgStyle}">
-    {@render workspaceHeader()}
+  <ScrollableSidebar
+    class="workspace-resizable-sidebar sidebar-mode-panel relative h-full flex-shrink-0 {sidebarBgClass} border-r py-4"
+    style="width: {sidebarWidth}px; min-width: {MIN_WIDTH}px; max-width: {MAX_WIDTH}px; {sidebarBgStyle}"
+    aria-label={t('aria.mainNavigation')}
+    header={regularSidebarHeader}
+    footer={sidebarResizeHandle}
+    scrollTestid="workspace-navigation-scroll"
+  >
+    <nav class="px-4 space-y-1 pb-2">
+      {@render navLink({ href: getNavigationUrl('overview'), label: t('workspaceSettings.views.overview'), tooltip: t('commandPalette.commands.workspaceOverview.description'), icon: Home, isActive: $currentRoute.view === 'workspace-overview' })}
 
-    <!-- Collection Selector -->
-    <div class="px-4 pt-2 mb-6">
-      <Tooltip content="Collection" placement="right">
-        <DropdownMenu
-          triggerText={currentCollectionName}
-          items={collectionDropdownItems}
-          maxWidth="max-w-full"
-          showChevron={true}
-          placement="bottom-start"
-          triggerClass="w-full text-left font-medium rounded !px-3 !py-2.5 !text-sm transition-colors"
-          triggerStyle="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text);"
-          triggerAlignment="between"
-        />
-      </Tooltip>
-    </div>
-
-    <nav class="flex-1 px-4 space-y-1">
-      {@render navLink({ href: getNavigationUrl('overview'), label: 'Overview', tooltip: 'Workspace overview and dashboard', icon: Home, isActive: $currentRoute.view === 'workspace-overview' })}
-
-      {#each workspaceViewItems as view}
-        {@render navLink({ href: getNavigationUrl(view.id), label: view.label, tooltip: view.tooltip, icon: view.icon, isActive: $currentRoute.view === `workspace-${view.id}` })}
+      {#each visibleWorkspaceViews as view (view.id)}
+        {@render navLink({ href: getNavigationUrl(view.id), label: viewLabel(view), tooltip: viewTooltip(view), icon: view.icon, testId: view.testId, isActive: $currentRoute.view === `workspace-${view.id}` })}
       {/each}
 
       {#if currentCollectionId}
         <div class="mt-4 pt-4 border-t" style="border-color: var(--ds-border);">
           <div class="text-xs font-semibold uppercase tracking-wide mb-2" style="color: var(--ds-text-subtle);">
-            Collection
+            {t('collections.collection')}
           </div>
-          {@render navLink({ href: `/collections/${currentCollectionId}?workspace=${workspaceId}`, label: 'Edit Collection', icon: Pencil, isActive: false })}
+          {@render navLink({ href: `/collections/${currentCollectionId}?workspace=${workspaceId}`, label: t('collections.editCollection'), icon: Pencil, isActive: false })}
+          {#if canConfigureCollectionNav}
+            {@render navLink({ href: `/workspaces/${workspaceId}/collections/${currentCollectionId}/nav-config`, label: t('navConfig.configureTitle'), icon: Settings, testId: 'workspace-nav-config-collection', isActive: $currentRoute.view === 'workspace-nav-config' })}
+          {/if}
         </div>
       {/if}
 
       {#if $moduleSettings.test_management_enabled && canViewTests && !currentCollectionId}
         <div class="mt-4 pt-4 border-t space-y-1" style="border-color: var(--ds-border);">
-          <div class="text-xs font-semibold uppercase tracking-wide" style="color: var(--ds-text-subtle);">
-            Tests
-          </div>
-          {#each testNavigationItems as view}
-            {@render navLink({ href: getTestNavigationUrl(view.id), label: view.label, tooltip: view.tooltip, icon: view.icon, isActive: activeTestNavId === view.id })}
-          {/each}
+          <button
+            type="button"
+            class="section-toggle w-full flex items-center justify-between text-xs font-semibold uppercase tracking-wide transition-colors"
+            aria-controls="workspace-tests-navigation"
+            aria-expanded={testsExpanded}
+            data-testid="workspace-tests-toggle"
+            onclick={toggleTestsSection}
+          >
+            <span>{t('commandPalette.commands.tests.label')}</span>
+            <ChevronDown class={`w-4 h-4 transition-transform ${testsExpanded ? 'rotate-180' : ''}`} />
+          </button>
+
+          {#if testsExpanded}
+            <div id="workspace-tests-navigation" class="space-y-1" data-testid="workspace-tests-navigation">
+              {#each visibleTestNavItems as view (view.id)}
+                {@render navLink({ href: getTestNavigationUrl(view.id), label: viewLabel(view), tooltip: viewTooltip(view), icon: view.icon, isActive: activeTestNavId === view.id })}
+              {/each}
+            </div>
+          {/if}
         </div>
       {/if}
 
       <div class="mt-4 pt-4 border-t" style="border-color: var(--ds-border);">
-        <button
-          type="button"
-          class="w-full flex items-center justify-between text-xs font-semibold uppercase tracking-wide mb-2 transition-colors"
-          style="color: var(--ds-text-subtle);"
-          onmouseenter={(e) => e.currentTarget.style.color = 'var(--ds-text)'}
-          onmouseleave={(e) => e.currentTarget.style.color = 'var(--ds-text-subtle)'}
-          onclick={toggleWorkspaceToolsSection}
-        >
-          <span>Workspace tools</span>
-          <ChevronDown class={`w-4 h-4 transition-transform ${workspaceToolsExpanded ? 'rotate-180' : ''}`} />
-        </button>
+        <div class="flex items-center justify-between gap-1">
+          <button
+            type="button"
+            class="section-toggle flex-1 min-w-0 flex items-center justify-between text-xs font-semibold uppercase tracking-wide mb-2 transition-colors"
+            onclick={toggleWorkspaceToolsSection}
+          >
+            <span>{t('actions.config.tools')}</span>
+            <ChevronDown class={`w-4 h-4 transition-transform ${workspaceToolsExpanded ? 'rotate-180' : ''}`} />
+          </button>
+          {#if canConfigureWorkspaceNav && !currentCollectionId}
+            <Tooltip content={t('navConfig.configureTitle')} placement="right">
+              <a
+                href={`/workspaces/${workspaceId}/nav-config`}
+                data-testid="workspace-nav-config-button"
+                class="shrink-0 inline-flex items-center justify-center w-6 h-6 mb-2 rounded transition-colors hover:bg-[var(--ds-background-neutral)]"
+                style="color: var(--ds-text-subtle);"
+                aria-label={t('navConfig.configureTitle')}
+              >
+                <Settings size={14} />
+              </a>
+            </Tooltip>
+          {/if}
+        </div>
 
         {#if workspaceToolsExpanded}
-          <div class="space-y-1">
-            {#each filteredWorkspaceOnlyViews as view}
-              {@render navLink({ href: getNavigationUrl(view.id), label: view.label, tooltip: view.tooltip, icon: view.icon, isActive: $currentRoute.view === `workspace-${view.id}` })}
+          <div class="space-y-1" data-testid="workspace-tools-navigation">
+            {#each filteredWorkspaceOnlyViews as view (view.id)}
+              {@render navLink({ href: getNavigationUrl(view.id), label: viewLabel(view), tooltip: viewTooltip(view), icon: view.icon, testId: view.testId, isActive: isWorkspaceViewActive(view) })}
             {/each}
 
             {#if canAdmin}
-              {@render navLink({ href: `/workspaces/${workspaceId}/look-and-feel`, label: 'Look and Feel', tooltip: 'Customize appearance and layout', icon: Palette, isActive: $currentRoute.view === 'workspace-look-and-feel' })}
-              {@render navLink({ href: `/workspaces/${workspaceId}/settings/general`, label: 'Settings', tooltip: 'Configure workspace settings and preferences', icon: Settings, isActive: isSettingsActive() })}
+              {@render navLink({ href: `/workspaces/${workspaceId}/look-and-feel`, label: t('lookAndFeel.title'), tooltip: t('lookAndFeel.subtitle'), icon: Palette, isActive: $currentRoute.view === 'workspace-look-and-feel' })}
+              {@render navLink({ href: `/workspaces/${workspaceId}/settings/general`, label: t('workspaceSettings.title'), tooltip: t('workspaceSettings.subtitle', { name: $currentWorkspace?.name || t('common.workspace') }), icon: Settings, testId: 'workspace-nav-settings', isActive: isSettingsActive() })}
             {/if}
           </div>
         {/if}
       </div>
     </nav>
-
-    {@render resizeHandle()}
-  </div>
+  </ScrollableSidebar>
 {/if}
 
 <style>
-  .sidebar-mode-panel {
+  :global(.sidebar-mode-panel) {
     animation: sidebar-mode-enter 180ms var(--ease-smooth, ease) both;
   }
 
@@ -699,21 +697,9 @@
     text-decoration: underline;
   }
 
-  /* Resize handle on sidebar right edge */
-  .ws-resize-handle {
-    position: absolute;
-    top: 0;
-    right: 0;
-    width: 4px;
-    height: 100%;
-    cursor: col-resize;
-    z-index: 10;
-    transition: background-color 150ms ease;
-  }
-
-  .ws-resize-handle:hover,
-  .ws-resize-handle:active {
-    background-color: var(--ds-border-focused, #3b82f6);
+  /* Keep the shared handle's outer half clickable. */
+  :global(.workspace-resizable-sidebar.scrollable-sidebar) {
+    overflow: visible;
   }
 
   /* Enhanced navigation item transitions */
@@ -721,7 +707,7 @@
     transition:
       background-color var(--duration-normal, 200ms) var(--ease-smooth, ease),
       color var(--duration-fast, 100ms) var(--ease-smooth, ease),
-      transform var(--duration-fast, 100ms) var(--ease-spring, cubic-bezier(0.34, 1.56, 0.64, 1));
+      transform var(--duration-fast, 100ms) var(--ease-smooth, cubic-bezier(0.16, 1, 0.3, 1));
   }
 
   :global(.workspace-nav-item:hover) {
@@ -732,17 +718,6 @@
     transform: translateX(2px) scale(0.98);
   }
 
-  /* Staggered entrance animation for nav sections */
-  nav {
-    animation: fade-up var(--duration-normal, 200ms) var(--ease-smooth, ease) forwards;
-  }
-
-  /* Section header animation */
-  nav .border-t {
-    animation: fade-up var(--duration-slow, 300ms) var(--ease-smooth, ease) forwards;
-    animation-delay: 100ms;
-  }
-
   /* Reduced motion support */
   @media (prefers-reduced-motion: reduce) {
     :global(.workspace-nav-item:hover),
@@ -750,10 +725,39 @@
       transform: none;
     }
 
-    .sidebar-mode-panel,
-    nav,
-    nav .border-t {
+    :global(.sidebar-mode-panel) {
       animation: none;
     }
+  }
+
+  .nav-link {
+    color: var(--ds-text-subtle);
+  }
+
+  .nav-link:hover {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .section-toggle {
+    color: var(--ds-text-subtle);
+  }
+
+  .section-toggle:hover {
+    color: var(--ds-text);
+  }
+
+  .ws-nav-item {
+    color: var(--ds-text-subtle);
+  }
+
+  .ws-nav-item:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .ws-nav-item.active {
+    background: var(--ds-surface-selected);
+    color: var(--ds-text);
   }
 </style>

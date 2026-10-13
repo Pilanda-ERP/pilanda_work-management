@@ -5,17 +5,24 @@
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast, successToast } from '../../stores/toasts.svelte.js';
+  import { isSystemAdmin } from '../../stores/permissions.svelte.js';
   import { channelCategoriesStore } from '../../stores/channelCategories.js';
   import ChannelAdminShell from './ChannelAdminShell.svelte';
   import ChannelAdminSettings from './ChannelAdminSettings.svelte';
   import ChannelPortalConfig from './ChannelPortalConfig.svelte';
   import ChannelManagersTab from '../../settings/ChannelManagersTab.svelte';
-  import { channelBasicFormData, parseChannelConfig, saveChannelSettings } from './channelAdmin.js';
+  import {
+    channelBasicFormData,
+    loadPortalConnectedMailboxes,
+    parseChannelConfig,
+    saveChannelSettings,
+  } from './channelAdmin.js';
 
   let channel = $state(null);
   let loading = $state(true);
   let saving = $state(false);
   let activeTab = $state('settings');
+  let loadSequence = 0;
 
   let portalConfigRef = $state(null);
 
@@ -35,21 +42,33 @@
     allowed_domains: '',
   });
 
+  // Email channels with an intake linked to this portal.
+  let connectedMailboxes = $state([]);
+
   let channelId = $derived(parseInt($currentRoute.path.match(/\/admin\/channels\/(\d+)\/portal/)?.[1]));
 
   onMount(async () => {
     await channelCategoriesStore.init();
-    await loadChannel();
   });
 
-  async function loadChannel() {
+  $effect(() => {
+    const id = channelId;
+    if (Number.isInteger(id) && id > 0) void loadChannel(id);
+  });
+
+  async function loadChannel(id) {
+    const requestSequence = ++loadSequence;
     try {
       loading = true;
-      channel = await api.channels.get(channelId);
+      const loadedChannel = await api.channels.get(id);
+      if (loadedChannel.type !== 'portal' || loadedChannel.direction !== 'inbound') {
+        throw new Error('This route requires an inbound portal channel');
+      }
+      const config = parseChannelConfig(loadedChannel.config);
+      if (requestSequence !== loadSequence) return;
+      channel = loadedChannel;
 
       channelFormData = channelBasicFormData(channel);
-
-      const config = parseChannelConfig(channel.config);
       portalFormData = {
         slug: config.portal_slug || '',
         workspace_ids: config.portal_workspace_ids || [],
@@ -61,11 +80,27 @@
           ? config.portal_allowed_domains.join(', ')
           : '',
       };
+      await loadConnectedMailboxes(id, requestSequence);
     } catch (err) {
+      if (requestSequence !== loadSequence) return;
       console.error('Failed to load channel:', err);
-      errorToast(t('channel.failedToLoad', 'Failed to load channel'));
+      channel = null;
+      errorToast(err.message || t('channel.failedToLoad', 'Failed to load channel'));
     } finally {
-      loading = false;
+      if (requestSequence === loadSequence) loading = false;
+    }
+  }
+
+  // Email channels linked to this portal. Best-effort: a load failure leaves
+  // the previous (or empty) list rather than blocking the settings page.
+  async function loadConnectedMailboxes(portalId, requestSequence) {
+    try {
+      const linked = await loadPortalConnectedMailboxes(portalId);
+      if (requestSequence !== loadSequence) return;
+      connectedMailboxes = linked;
+    } catch (err) {
+      console.error('Failed to load connected mailboxes:', err);
+      if (requestSequence === loadSequence) connectedMailboxes = [];
     }
   }
 
@@ -90,7 +125,7 @@
         enabled: portalFormData.enabled,
       });
 
-      channel = await api.channels.get(channelId);
+      await loadChannel(channelId);
       successToast(t('common.saved'));
     } catch (err) {
       console.error('Failed to save:', err);
@@ -100,10 +135,12 @@
     }
   }
 
-  const tabs = [
+  let tabs = $derived([
     { id: 'settings', label: () => t('channel.configuration'), icon: IconSettings },
-    { id: 'managers', label: () => t('channel.managers'), icon: IconUsers },
-  ];
+    ...($isSystemAdmin
+      ? [{ id: 'managers', label: () => t('channel.managers'), icon: IconUsers }]
+      : []),
+  ]);
 </script>
 
 <ChannelAdminShell
@@ -121,9 +158,10 @@
         <ChannelPortalConfig
           bind:this={portalConfigRef}
           bind:formData={portalFormData}
+          {connectedMailboxes}
         />
       </ChannelAdminSettings>
-    {:else if tabId === 'managers'}
+    {:else if tabId === 'managers' && $isSystemAdmin}
       <div class="px-16 py-8">
         <ChannelManagersTab
           channelId={channel.id}

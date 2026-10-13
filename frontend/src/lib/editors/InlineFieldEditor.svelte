@@ -1,5 +1,6 @@
 <script>
   import { api } from '../api.js';
+  import { updateCustomFieldValue } from '../utils/customFieldValueUpdates.js';
   import InlineTextEditor from './InlineTextEditor.svelte';
   import InlineSelectEditor from './InlineSelectEditor.svelte';
   import InlineDateEditor from './InlineDateEditor.svelte';
@@ -28,29 +29,23 @@
     return item[field] ?? null;
   }
 
-  // InlineFieldEditor only ever wraps simple string/date/select edits whose
-  // payload is `{ [field]: value }` (or a custom_field_values merge). Field-
-  // specific orchestration (status transitions, optimistic updates, edit
-  // lifecycle, joined display names) lives in itemDetailStore.saveField for
-  // the sidebar and in ListCellRenderer.handleItemUpdate for inline pickers.
-  // Keep this component a thin pass-through and don't reintroduce a
-  // field-mapping switch here.
+  // Keep simple field/custom-value updates here; field-specific orchestration
+  // belongs to itemDetailStore and ListCellRenderer.
   async function handleSave(detail) {
     const { value } = detail;
     if (saving) return;
 
     try {
       saving = true;
-      let updateData;
+      let updatedItem;
       if (field.startsWith('custom_field_')) {
         const fieldId = field.replace('custom_field_', '');
-        updateData = {
-          custom_field_values: { ...(item.custom_field_values || {}), [fieldId]: value }
-        };
+        // The server merges custom field patches per field, so a single-field
+        // payload leaves the item's other fields untouched.
+        updatedItem = await updateCustomFieldValue(api, item.id, fieldId, value);
       } else {
-        updateData = { [field]: value };
+        updatedItem = await api.items.update(item.id, { [field]: value });
       }
-      const updatedItem = await api.items.update(item.id, updateData);
       const merged = { ...item, ...updatedItem };
       editorComponent?.confirmSave?.(value);
       onitemUpdated?.({ item: merged, field, value });

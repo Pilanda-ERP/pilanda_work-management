@@ -25,6 +25,7 @@ export default {
     addTestPlan: 'إضافة خطة اختبار',
     createFirstTestPlan: 'أنشئ أول خطة اختبار لتنظيم حالات الاختبار',
     lastRun: 'آخر تشغيل',
+    neverRun: 'لم يتم التشغيل مطلقًا',
     deleteFolder: 'حذف المجلد',
     deleteStep: 'حذف الخطوة',
     steps: 'الخطوات',
@@ -81,6 +82,7 @@ export default {
     deleteTestCaseConfirm: 'هل أنت متأكد من حذف حالة الاختبار هذه؟ لا يمكن التراجع عن هذا الإجراء.',
     noTestCasesFound: 'لم يتم العثور على حالات اختبار',
     noTestCasesWithLabel: 'لم يتم العثور على حالات اختبار بفلتر التسمية المحدد.',
+    searchTestCases: 'البحث في حالات الاختبار...',
     createFirstTestCase: 'انقر على "إضافة حالة اختبار" لإنشاء أول حالة اختبار في هذا المجلد.',
     allLabels: 'جميع التسميات',
     noLabels: 'بدون تسميات',
@@ -105,7 +107,7 @@ export default {
     preconditionsPlaceholder: 'صف الشروط التي يجب استيفاؤها قبل تشغيل حالة الاختبار هذه...',
     testCaseStepsInfo:
       'بعد إنشاء حالة الاختبار هذه، يمكنك إضافة خطوات اختبار فردية بإجراءات وبيانات ونتائج متوقعة محددة لتنفيذ اختبار دقيق.',
-    pressToOpenSteps: 'اضغط 1-9 لفتح الخطوات',
+    pressToOpenSteps: 'اضغط على مفتاح مميز لفتح الخطوات',
     // Labels management
     manageLabels: 'إدارة التسميات',
     clickLabelsToAssign: 'انقر على التسميات لتعيينها/إزالتها من حالة الاختبار هذه',
@@ -317,7 +319,10 @@ export default {
     duration: 'Duration',
     failedToLoadSummary: 'Failed to load test summary',
     noResultsForExport: 'No results available for export',
-    stepsNotExecuted: '{count} step(s) were not individually executed',
+    testRunSummary: 'ملخص تشغيل الاختبار',
+    printLoading: 'جارٍ إعداد ملخص تشغيل الاختبار للطباعة…',
+    backToRun: 'العودة إلى تشغيل الاختبار',
+    stepsNotExecuted: 'لم تُنفّذ {count} خطوة بشكل فردي',
   },
 
   testCase: {

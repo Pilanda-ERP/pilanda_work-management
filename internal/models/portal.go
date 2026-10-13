@@ -37,13 +37,14 @@ type ChannelCategory struct {
 // ChannelConfig represents configuration for different channel types
 type ChannelConfig struct {
 	// SMTP Configuration
-	SMTPHost       string `json:"smtp_host,omitempty"`
-	SMTPPort       int    `json:"smtp_port,omitempty"`
-	SMTPUsername   string `json:"smtp_username,omitempty"`
-	SMTPPassword   string `json:"smtp_password,omitempty"`
-	SMTPFromEmail  string `json:"smtp_from_email,omitempty"`
-	SMTPFromName   string `json:"smtp_from_name,omitempty"`
-	SMTPEncryption string `json:"smtp_encryption,omitempty"` // tls, ssl, none
+	SMTPHost          string `json:"smtp_host,omitempty"`
+	SMTPPort          int    `json:"smtp_port,omitempty"`
+	SMTPUsername      string `json:"smtp_username,omitempty"`
+	SMTPPassword      string `json:"smtp_password,omitempty"`
+	SMTPFromEmail     string `json:"smtp_from_email,omitempty"`
+	SMTPFromName      string `json:"smtp_from_name,omitempty"`
+	SMTPEncryption    string `json:"smtp_encryption,omitempty"` // tls/starttls, ssl, none
+	SMTPSkipTLSVerify bool   `json:"smtp_skip_tls_verify,omitempty"`
 
 	// Webhook Configuration
 	WebhookURL              string            `json:"webhook_url,omitempty"`
@@ -74,18 +75,29 @@ type ChannelConfig struct {
 	EmailOAuthTenantID     string `json:"email_oauth_tenant_id,omitempty"`     // Microsoft tenant ID (or 'common')
 
 	// OAuth Tokens (populated after successful OAuth flow)
-	EmailOAuthAccessToken      string     `json:"email_oauth_access_token,omitempty"`      // Encrypted OAuth access token
-	EmailOAuthRefreshToken     string     `json:"email_oauth_refresh_token,omitempty"`     // Encrypted OAuth refresh token
-	EmailOAuthExpiresAt        *time.Time `json:"email_oauth_expires_at,omitempty"`        // Token expiration time
-	EmailOAuthEmail            string     `json:"email_oauth_email,omitempty"`             // Connected email address
-	EmailWorkspaceID           int        `json:"email_workspace_id,omitempty"`            // Target workspace for items
-	EmailItemTypeID            *int       `json:"email_item_type_id,omitempty"`            // Item type to create
-	EmailDefaultPriorityID     *int       `json:"email_default_priority_id,omitempty"`     // Default priority for items
-	EmailMailbox               string     `json:"email_mailbox,omitempty"`                 // IMAP mailbox (default "INBOX")
-	EmailMarkAsRead            bool       `json:"email_mark_as_read,omitempty"`            // Mark processed emails as read
-	EmailDeleteAfterProcess    bool       `json:"email_delete_after_process,omitempty"`    // Delete emails after processing
-	EmailConnectedPortalID     *int       `json:"email_connected_portal_id,omitempty"`     // Portal for "My Requests" visibility
-	EmailTrackingRetentionDays int        `json:"email_tracking_retention_days,omitempty"` // Days to keep processed-email tracking rows; 0 = default (365). Anchor rows (referenced by in_reply_to) are kept regardless.
+	EmailOAuthAccessToken   string     `json:"email_oauth_access_token,omitempty"`   // Encrypted OAuth access token
+	EmailOAuthRefreshToken  string     `json:"email_oauth_refresh_token,omitempty"`  // Encrypted OAuth refresh token
+	EmailOAuthExpiresAt     *time.Time `json:"email_oauth_expires_at,omitempty"`     // Token expiration time
+	EmailOAuthEmail         string     `json:"email_oauth_email,omitempty"`          // Connected email address
+	EmailWorkspaceID        int        `json:"email_workspace_id,omitempty"`         // Target workspace for items
+	EmailItemTypeID         *int       `json:"email_item_type_id,omitempty"`         // Item type to create
+	EmailDefaultPriorityID  *int       `json:"email_default_priority_id,omitempty"`  // Default priority for items
+	EmailMailbox            string     `json:"email_mailbox,omitempty"`              // IMAP mailbox (default "INBOX")
+	EmailMarkAsRead         bool       `json:"email_mark_as_read,omitempty"`         // Mark processed emails as read
+	EmailDeleteAfterProcess bool       `json:"email_delete_after_process,omitempty"` // Delete emails after processing
+	// EmailProcessingDisposition is the single post-processing action for
+	// successfully ingested mail. It replaces the EmailMarkAsRead /
+	// EmailDeleteAfterProcess booleans (kept for back-compat); an empty value
+	// derives from them (delete > mark_read > leave). Because it is one value,
+	// "mark read and delete" is no longer expressible.
+	EmailProcessingDisposition string `json:"email_processing_disposition,omitempty"`
+	EmailConnectedPortalID     *int   `json:"email_connected_portal_id,omitempty"`     // Portal for "My Requests" visibility
+	EmailTrackingRetentionDays int    `json:"email_tracking_retention_days,omitempty"` // Days to keep processed-email tracking rows; 0 = default (365). Anchor rows (referenced by in_reply_to) are kept regardless.
+	KBEventsRetentionDays      int    `json:"kb_events_retention_days,omitempty"`      // Days to keep this portal's kb_events analytics rows; 0 = instance default (365). See the kb_events retention sweeper.
+	// Per-sender cap on NEW tickets per rolling hour. nil = default
+	// (DefaultEmailRateLimitPerHour), 0 = unlimited, n = n. Replies to
+	// existing threads are never rate-limited.
+	EmailRateLimitPerHour *int `json:"email_rate_limit_per_hour,omitempty"`
 
 	// Portal Configuration
 	PortalSlug         string `json:"portal_slug,omitempty"`        // URL-friendly identifier (e.g., "support-portal")
@@ -118,6 +130,12 @@ type ChannelConfig struct {
 	KnowledgeBaseURL       string `json:"knowledge_base_url,omitempty"`        // Parsed base URL (e.g., https://wiki.realigned.tech)
 	KnowledgeBaseShareID   string `json:"knowledge_base_share_id,omitempty"`   // Parsed share ID (e.g., u1gkl0jk1u)
 
+	// Knowledge Base workspace-pages wiring. Explicit opt-in by the channel
+	// manager: every entry publishes a workspace pages tree (whole workspace
+	// when RootPageID is nil, otherwise the subtree rooted at that page)
+	// through the portal knowledge base.
+	KnowledgeBasePageSources []KnowledgeBasePageSource `json:"knowledge_base_page_sources,omitempty"`
+
 	// Form Channel Configuration
 	FormSlug           string `json:"form_slug,omitempty"`            // URL-friendly identifier for form channel
 	FormTheme          string `json:"form_theme,omitempty"`           // "light", "dark", "auto"
@@ -126,6 +144,22 @@ type ChannelConfig struct {
 	FormWorkspaceIDs   []int  `json:"form_workspace_ids"`             // Target workspaces for submissions
 	FormSuccessMessage string `json:"form_success_message,omitempty"` // Default post-submit message
 	FormRedirectURL    string `json:"form_redirect_url,omitempty"`    // Optional redirect after submit
+}
+
+// Email post-processing dispositions. Exactly one applies to successfully
+// ingested mail; rate-limited mail is always left untouched.
+const (
+	EmailDispositionLeave    = "leave"
+	EmailDispositionMarkRead = "mark_read"
+	EmailDispositionDelete   = "delete"
+)
+
+// KnowledgeBasePageSource wires one workspace's Pages feature into a
+// portal knowledge base. RootPageID nil publishes the entire pages tree;
+// a non-nil value publishes only the subtree rooted at that page.
+type KnowledgeBasePageSource struct {
+	WorkspaceID int  `json:"workspace_id"`
+	RootPageID  *int `json:"root_page_id,omitempty"`
 }
 
 // ChannelManager represents a user or group that can manage a channel
@@ -161,17 +195,41 @@ type PortalSection struct {
 }
 
 // PortalCustomer represents an individual portal user
+// Creation provenance values recorded on portal_customers.created_via
+// (WI-1553). 'unknown' covers rows created before provenance capture;
+// portal submissions never create customers (they attribute to existing
+// authenticated identities), so no 'portal' value exists.
+const (
+	CustomerCreatedViaAgent        = "agent"
+	CustomerCreatedViaEmailIntake  = "email-intake"
+	CustomerCreatedViaMagicLink    = "magic-link"
+	CustomerCreatedViaTicketImport = "ticket-import"
+	CustomerCreatedViaUnknown      = "unknown"
+)
+
+// CustomerCreatedViaValues lists every provenance value the bulk cleanup
+// filter accepts.
+var CustomerCreatedViaValues = []string{
+	CustomerCreatedViaAgent,
+	CustomerCreatedViaEmailIntake,
+	CustomerCreatedViaMagicLink,
+	CustomerCreatedViaTicketImport,
+	CustomerCreatedViaUnknown,
+}
+
 type PortalCustomer struct {
-	ID                     int                    `json:"id"`
-	Name                   string                 `json:"name"`
-	Email                  string                 `json:"email"`
-	Phone                  string                 `json:"phone,omitempty"`
-	UserID                 *int                   `json:"user_id,omitempty"`                  // Links to internal user if applicable
-	CustomerOrganisationID *int                   `json:"customer_organisation_id,omitempty"` //nolint:misspell // matches API/database field name
-	IsPrimary              bool                   `json:"is_primary"`                         // Primary contact for the organization
-	CustomFieldValues      map[string]interface{} `json:"custom_field_values,omitempty"`
-	CreatedAt              time.Time              `json:"created_at"`
-	UpdatedAt              time.Time              `json:"updated_at"`
+	ID                     int            `json:"id"`
+	Name                   string         `json:"name"`
+	Email                  string         `json:"email"`
+	Phone                  string         `json:"phone,omitempty"`
+	UserID                 *int           `json:"user_id,omitempty"`                  // Links to internal user if applicable
+	CustomerOrganisationID *int           `json:"customer_organisation_id,omitempty"` //nolint:misspell // matches API/database field name
+	IsPrimary              bool           `json:"is_primary"`                         // Primary contact for the organization
+	CustomFieldValues      map[string]any `json:"custom_field_values,omitempty"`
+	DeactivatedAt          *time.Time     `json:"deactivated_at,omitempty"` // Security deactivation (WI-1554); every portal auth path refuses deactivated customers
+	CreatedVia             string         `json:"created_via"`              // Creation provenance (WI-1553)
+	CreatedAt              time.Time      `json:"created_at"`
+	UpdatedAt              time.Time      `json:"updated_at"`
 	// Joined fields for API responses
 	UserName                 string        `json:"user_name,omitempty"`
 	UserEmail                string        `json:"user_email,omitempty"`
@@ -203,15 +261,132 @@ type PortalCustomerRole struct {
 
 // CustomerOrganisation represents a B2B entity for time tracking
 type CustomerOrganisation struct {
-	ID                int                    `json:"id"`
-	Name              string                 `json:"name"`
-	Email             string                 `json:"email"`
-	Description       string                 `json:"description"`
-	Active            bool                   `json:"active"`
-	AvatarURL         string                 `json:"avatar_url,omitempty"`
-	CustomFieldValues map[string]interface{} `json:"custom_field_values,omitempty"`
-	CreatedAt         time.Time              `json:"created_at"`
-	UpdatedAt         time.Time              `json:"updated_at"`
+	ID                int            `json:"id"`
+	Name              string         `json:"name"`
+	Email             string         `json:"email"`
+	Description       string         `json:"description"`
+	Active            bool           `json:"active"`
+	AvatarURL         string         `json:"avatar_url,omitempty"`
+	CustomFieldValues map[string]any `json:"custom_field_values,omitempty"`
+	// Settings is the flexible per-organisation attribute blob. Known keys
+	// (see ParseOrgRequestSharingSettings) are typed; unknown keys are preserved.
+	Settings  map[string]any `json:"settings,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+}
+
+// Portal organisation request-sharing modes stored in
+// CustomerOrganisation.Settings under "request_sharing".
+const (
+	// OrgRequestSharingDisabled is the default: only the creator and external
+	// participants can see a request.
+	OrgRequestSharingDisabled = "disabled"
+	// OrgRequestSharingRequesterChoice lets the creator share a request with
+	// their organisation at creation time.
+	OrgRequestSharingRequesterChoice = "requester_choice"
+	// OrgRequestSharingAutomatic shares every request with the organisation.
+	OrgRequestSharingAutomatic = "automatic"
+)
+
+// Portal organisation request-sharing audiences stored under
+// "request_sharing_audience". Only meaningful when sharing is enabled.
+const (
+	// OrgRequestSharingAudienceOrganisation exposes shared requests to every
+	// contact in the organisation.
+	OrgRequestSharingAudienceOrganisation = "organisation"
+	// OrgRequestSharingAudienceRoles restricts shared requests to contacts
+	// holding at least one role in "request_visible_role_ids".
+	OrgRequestSharingAudienceRoles = "roles"
+)
+
+// OrgRequestSharingSettings is the typed view of the request-sharing subset of
+// CustomerOrganisation.Settings. Missing or invalid keys fall back to the
+// defaults (disabled / organisation).
+type OrgRequestSharingSettings struct {
+	RequestSharing         string
+	RequestSharingAudience string
+	RequestVisibleRoleIDs  []int
+}
+
+// DefaultOrgRequestSharingSettings returns the settings an empty blob means.
+func DefaultOrgRequestSharingSettings() OrgRequestSharingSettings {
+	return OrgRequestSharingSettings{
+		RequestSharing:         OrgRequestSharingDisabled,
+		RequestSharingAudience: OrgRequestSharingAudienceOrganisation,
+	}
+}
+
+// ParseOrgRequestSharingSettings reads the known request-sharing keys from a
+// settings blob, applying defaults for missing or invalid values. Unknown keys
+// are ignored here and preserved by MergeOrgRequestSharingSettings.
+func ParseOrgRequestSharingSettings(settings map[string]any) OrgRequestSharingSettings {
+	out := DefaultOrgRequestSharingSettings()
+	if v, ok := settings["request_sharing"].(string); ok {
+		switch v {
+		case OrgRequestSharingDisabled, OrgRequestSharingRequesterChoice, OrgRequestSharingAutomatic:
+			out.RequestSharing = v
+		}
+	}
+	if v, ok := settings["request_sharing_audience"].(string); ok {
+		switch v {
+		case OrgRequestSharingAudienceOrganisation, OrgRequestSharingAudienceRoles:
+			out.RequestSharingAudience = v
+		}
+	}
+	for _, raw := range asAnySlice(settings["request_visible_role_ids"]) {
+		if id, ok := asInt(raw); ok {
+			out.RequestVisibleRoleIDs = append(out.RequestVisibleRoleIDs, id)
+		}
+	}
+	return out
+}
+
+// MergeOrgRequestSharingSettings writes the typed settings back into a settings
+// blob, preserving any unknown keys already present.
+func MergeOrgRequestSharingSettings(settings map[string]any, in OrgRequestSharingSettings) map[string]any {
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	settings["request_sharing"] = in.RequestSharing
+	settings["request_sharing_audience"] = in.RequestSharingAudience
+	if len(in.RequestVisibleRoleIDs) == 0 {
+		delete(settings, "request_visible_role_ids")
+	} else {
+		settings["request_visible_role_ids"] = in.RequestVisibleRoleIDs
+	}
+	return settings
+}
+
+// asAnySlice normalises a JSON-decoded array to []any. A []int is accepted too
+// so callers can pass a freshly built settings value without a JSON round trip.
+func asAnySlice(v any) []any {
+	switch value := v.(type) {
+	case []any:
+		return value
+	case []int:
+		out := make([]any, len(value))
+		for i, id := range value {
+			out[i] = id
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// asInt accepts the numeric shapes JSON decoding produces (float64) plus the
+// native int shapes callers may pass directly.
+func asInt(v any) (int, bool) {
+	switch value := v.(type) {
+	case float64:
+		return int(value), true
+	case int:
+		return value, true
+	case int64:
+		return int(value), true
+	default:
+		return 0, false
+	}
 }
 
 // ContactRole represents a role that can be assigned to portal customers
@@ -220,41 +395,71 @@ type ContactRole struct {
 	Name        string    `json:"name"`
 	Description string    `json:"description,omitempty"`
 	IsSystem    bool      `json:"is_system"`
+	SortOrder   int       `json:"sort_order"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
 // RequestTypeConfig represents per-form configuration for a request type used as a form
 type RequestTypeConfig struct {
 	RequireAuth      bool   `json:"require_auth"`
+	AllowAttachments bool   `json:"allow_attachments"`
 	SuccessMessage   string `json:"success_message,omitempty"`
 	SubmitButtonText string `json:"submit_button_text,omitempty"`
 	RedirectURL      string `json:"redirect_url,omitempty"`
+	// RowActions is only meaningful on asset reports: each action renders a
+	// per-row link that opens a request type with one field prefilled.
+	RowActions []AssetReportRowAction `json:"row_actions,omitempty"`
 }
+
+// AssetReportRowAction configures a portal asset report row link that opens a
+// request type with one form field prefilled from that row's asset. Source is
+// one of asset_id, asset_tag, or title; the row action only passes a scalar
+// through the URL, so a whole-object source is intentionally not supported.
+type AssetReportRowAction struct {
+	ID            string `json:"id"`
+	Label         string `json:"label"`
+	RequestTypeID int    `json:"request_type_id"`
+	TargetField   string `json:"target_field"`
+	Source        string `json:"source"`
+}
+
+// RequestTypeKindEmail marks the system-provisioned request type that routes
+// email intake into a portal. It is hidden from the public request-type form
+// and carries no fields, so required form fields can never block email.
+const RequestTypeKindEmail = "email"
 
 // RequestType represents a portal request type that maps to an item type
 type RequestType struct {
-	ID                 int       `json:"id"`
-	ChannelID          int       `json:"channel_id"` // Scope request type to specific portal/channel
-	Name               string    `json:"name"`
-	Description        string    `json:"description"`
-	ItemTypeID         int       `json:"item_type_id"`                   // n:1 relationship - which item type submissions create
-	Icon               string    `json:"icon"`                           // Lucide icon name for visual representation
-	Color              string    `json:"color"`                          // Hex color for visual representation
-	DisplayOrder       int       `json:"display_order"`                  // Ordering within channel
-	IsActive           bool      `json:"is_active"`                      // Enable/disable this request type
-	Config             *string   `json:"config,omitempty"`               // JSON configuration for form-specific settings
-	WorkspaceID        *int      `json:"workspace_id,omitempty"`         // Workspace for field resolution via config sets
-	VisibilityGroupIDs []int     `json:"visibility_group_ids,omitempty"` // Internal groups that can see this request type
-	VisibilityOrgIDs   []int     `json:"visibility_org_ids,omitempty"`   // Customer organizations that can see this request type
-	TitleTemplate      string    `json:"title_template"`                 // Template used as the item title when the title field is hidden from the request form. Supports {{var}} placeholders (see services/template).
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 int     `json:"id"`
+	ChannelID          int     `json:"channel_id"` // Scope request type to specific portal/channel
+	Name               string  `json:"name"`
+	Description        string  `json:"description"`
+	ItemTypeID         int     `json:"item_type_id"`                   // n:1 relationship - which item type submissions create
+	Icon               string  `json:"icon"`                           // Lucide icon name for visual representation
+	Color              string  `json:"color"`                          // Hex color for visual representation
+	DisplayOrder       int     `json:"display_order"`                  // Ordering within channel
+	IsActive           bool    `json:"is_active"`                      // Enable/disable this request type
+	Config             *string `json:"config,omitempty"`               // JSON configuration for form-specific settings
+	WorkspaceID        *int    `json:"workspace_id,omitempty"`         // Workspace for field resolution via config sets
+	VisibilityGroupIDs []int   `json:"visibility_group_ids,omitempty"` // Internal groups that can see this request type
+	VisibilityOrgIDs   []int   `json:"visibility_org_ids,omitempty"`   // Customer organizations that can see this request type
+	TitleTemplate      string  `json:"title_template"`                 // Template used as the item title when the title field is hidden from the request form. Supports {{var}} placeholders (see services/template).
+	// Kind marks a system-provisioned request type. Empty for admin-created
+	// rows; RequestTypeKindEmail is the per-portal Email intake type (WI-1644).
+	// System rows are hidden from the public portal form but remain editable
+	// (item type) in the admin request-type listing.
+	Kind      string    `json:"kind,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 	// Joined fields for API responses
 	ChannelName  string `json:"channel_name,omitempty"`
 	ItemTypeName string `json:"item_type_name,omitempty"`
-	// FieldCount is the number of configured form fields, populated by the
-	// portal request-types listing so the UI can show counts without a
-	// per-request-type fields fetch.
+	// WorkspaceName / WorkspaceKey identify the routing target workspace in
+	// listings so admins and customers can tell same-named request types
+	// across connected workspaces apart. Empty when workspace_id is NULL.
+	WorkspaceName string `json:"workspace_name,omitempty"`
+	WorkspaceKey  string `json:"workspace_key,omitempty"`
+	// FieldCount is the number of configured form fields in request-type listings.
 	FieldCount int `json:"field_count"`
 }
 
@@ -314,6 +519,31 @@ type AssetReport struct {
 	ChannelName  string `json:"channel_name,omitempty"`
 	AssetSetName string `json:"asset_set_name,omitempty"`
 	ItemTypeName string `json:"item_type_name,omitempty"`
+}
+
+// PublicAssetReport is the portal-facing contract for an asset report. It
+// excludes the internal CQL expression, visibility principal IDs,
+// channel/asset-set bindings, lifecycle flags, and timestamps.
+type PublicAssetReport struct {
+	ID           int                      `json:"id"`
+	Name         string                   `json:"name"`
+	Description  string                   `json:"description"`
+	Icon         string                   `json:"icon"`
+	Color        string                   `json:"color"`
+	DisplayOrder int                      `json:"display_order"`
+	ColumnConfig []string                 `json:"column_config,omitempty"`
+	RunMode      string                   `json:"run_mode"`
+	ItemTypeID   *int                     `json:"item_type_id,omitempty"`
+	WorkspaceID  *int                     `json:"workspace_id,omitempty"`
+	Config       *PublicAssetReportConfig `json:"config,omitempty"`
+}
+
+// PublicAssetReportConfig contains only copy used by the current portal form
+// UI. Internal auth and redirect controls are not part of the guest contract.
+type PublicAssetReportConfig struct {
+	SuccessMessage   string                 `json:"success_message,omitempty"`
+	SubmitButtonText string                 `json:"submit_button_text,omitempty"`
+	RowActions       []AssetReportRowAction `json:"row_actions,omitempty"`
 }
 
 // AssetReportField represents a field configuration for a form-mode asset report.
@@ -428,8 +658,25 @@ type EmailChannelState struct {
 	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
 	ErrorCount    int        `json:"error_count"`
 	LastError     string     `json:"last_error,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	// FailedMessage* is separate from ErrorCount: connection outages should
+	// affect health without making an unrelated email look like poison.
+	FailedMessageUID         int       `json:"-"`
+	FailedMessageUIDValidity uint32    `json:"-"`
+	FailedMessageCount       int       `json:"-"`
+	CreatedAt                time.Time `json:"created_at"`
+	UpdatedAt                time.Time `json:"updated_at"`
+}
+
+// EmailIntakeState is the per-folder IMAP cursor for an intake (WI-1644). The
+// mailbox connection is shared, but each intake advances its own watermark.
+// Channel-level health (last checked, error count) stays on EmailChannelState.
+type EmailIntakeState struct {
+	IntakeID                 int    `json:"intake_id"`
+	LastUID                  int    `json:"last_uid"`
+	UIDValidity              uint32 `json:"uid_validity"`
+	FailedMessageUID         int    `json:"-"`
+	FailedMessageUIDValidity uint32 `json:"-"`
+	FailedMessageCount       int    `json:"-"`
 }
 
 // EmailMessageTracking records processed emails for deduplication and reply threading
@@ -446,22 +693,39 @@ type EmailMessageTracking struct {
 	ProcessedAt time.Time `json:"processed_at"`
 }
 
-// Notification represents a system notification for a user
+const (
+	NotificationScopeLegacy    = "legacy"
+	NotificationScopeSystem    = "system"
+	NotificationScopeWorkspace = "workspace"
+	NotificationScopeAsset     = "asset"
+)
+
+// Notification represents a system notification for a user.
 type Notification struct {
-	ID        int        `json:"id"`
-	UserID    int        `json:"user_id"`
-	Title     string     `json:"title"`
-	Message   string     `json:"message"`
-	Type      string     `json:"type"` // info, warning, error, success, assignment, comment, status_change, reminder, milestone
-	Timestamp time.Time  `json:"timestamp"`
-	Read      bool       `json:"read"`
-	SeenAt    *time.Time `json:"seen_at,omitempty"`    // When the user observed the notification in the tray (NULL until then). Distinct from Read: seeing does not suppress email batching.
-	SentAt    *time.Time `json:"sent_at,omitempty"`    // When notification was sent via email (NULL if not sent)
-	Avatar    string     `json:"avatar,omitempty"`     // Initials or avatar identifier
-	ActionURL string     `json:"action_url,omitempty"` // URL to navigate to when clicked
-	Metadata  string     `json:"metadata,omitempty"`   // JSON for additional data
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID                            int        `json:"id"`
+	UserID                        int        `json:"user_id"`
+	Title                         string     `json:"title"`
+	Message                       string     `json:"message"`
+	Type                          string     `json:"type"` // info, warning, error, success, assignment, comment, status_change, reminder, milestone
+	Timestamp                     time.Time  `json:"timestamp"`
+	Read                          bool       `json:"read"`
+	SeenAt                        *time.Time `json:"seen_at,omitempty"`    // When the user observed the notification in the tray (NULL until then). Distinct from Read: seeing does not suppress email batching.
+	SentAt                        *time.Time `json:"sent_at,omitempty"`    // When notification was sent via email (NULL if not sent)
+	Avatar                        string     `json:"avatar,omitempty"`     // Initials or avatar identifier
+	ActionURL                     string     `json:"action_url,omitempty"` // URL to navigate to when clicked
+	Metadata                      string     `json:"metadata,omitempty"`   // JSON for additional data
+	AuthorizationScope            string     `json:"authorization_scope"`
+	WorkspaceID                   *int       `json:"workspace_id,omitempty"`
+	ItemID                        *int       `json:"item_id,omitempty"`
+	SourceType                    string     `json:"source_type,omitempty"`
+	SourceID                      *int       `json:"source_id,omitempty"`
+	ReferencedEntityType          string     `json:"referenced_entity_type,omitempty"`
+	ReferencedEntityID            *int       `json:"referenced_entity_id,omitempty"`
+	ReferencedWorkspaceID         *int       `json:"referenced_workspace_id,omitempty"`
+	ReferencedWorkspacePermission string     `json:"referenced_workspace_permission,omitempty"`
+	DeliveryKey                   string     `json:"-"`
+	CreatedAt                     time.Time  `json:"created_at"`
+	UpdatedAt                     time.Time  `json:"updated_at"`
 }
 
 // NotificationCache represents a cached notification for BigCache storage
@@ -469,6 +733,7 @@ type NotificationCache struct {
 	Notifications []Notification `json:"notifications"`
 	LastSynced    time.Time      `json:"last_synced"`
 	IsDirty       bool           `json:"is_dirty"` // Indicates if cache needs DB sync
+	Complete      bool           `json:"complete"` // True when the cached page contains the full retained inbox
 }
 
 // EmailTemplate represents a customizable email template managed from the
@@ -490,13 +755,16 @@ type EmailTemplate struct {
 
 // NotificationSetting represents a notification configuration that can be assigned to configuration sets
 type NotificationSetting struct {
-	ID          int       `json:"id"`
-	Name        string    `json:"name"`        // e.g., "Development Team Notifications"
-	Description string    `json:"description"` // e.g., "Standard notifications for development workspaces"
-	IsActive    bool      `json:"is_active"`
-	CreatedBy   int       `json:"created_by"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
+	Name               string    `json:"name"` // e.g., "Development Team Notifications"
+	DisplayName        string    `json:"display_name"`
+	Description        string    `json:"description"` // e.g., "Standard notifications for development workspaces"
+	DisplayDescription string    `json:"display_description,omitempty"`
+	IsActive           bool      `json:"is_active"`
+	CreatedBy          int       `json:"created_by"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 	// Joined fields for API responses
 	CreatedByName string `json:"created_by_name,omitempty"`
 	// Event rules
@@ -563,6 +831,10 @@ const (
 	// Mention events
 	EventMention = "mention.created"
 
+	// SLA events
+	EventSLABreached = "sla.breached"
+	EventSLAWarning  = "sla.warning"
+
 	// Approval events
 	EventApprovalRequested   = "approval.requested"
 	EventApprovalStepStarted = "approval.step_started"
@@ -585,6 +857,8 @@ func GetAvailableNotificationEvents() []NotificationEvent {
 		{EventItemLinked, "Item Linked", "When work items are linked together", "link"},
 		{EventItemUnlinked, "Item Unlinked", "When work item links are removed", "link"},
 		{EventStatusChanged, "Status Changed", "When a work item's status is changed", "status"},
+		{EventSLABreached, "SLA Breached", "When a work item misses an SLA goal", "sla"},
+		{EventSLAWarning, "SLA Warning", "When a work item approaches an SLA goal", "sla"},
 		{EventMention, "User Mentioned", "When a user is @mentioned in a comment or description", "mention"},
 		{EventApprovalRequested, "Approval Requested", "When an item enters a status that requires approval", "approval"},
 		{EventApprovalStepStarted, "Approval Step Started", "When a new approval step opens for its approvers", "approval"},
@@ -612,12 +886,18 @@ type PortalHubConfig struct {
 	FooterColumns     []FooterColumn `json:"footer_columns"`
 }
 
-// HubSection represents a customizable section in the Portal Hub
+// HubSection represents a customizable section in the Portal Hub. The shape
+// mirrors the frontend editor, which persists subtitle, ordering, and the
+// portals assigned to each section; dropping any of these on save would lose
+// section assignments on the next load.
 type HubSection struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Visible bool   `json:"visible"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Subtitle     string `json:"subtitle"`
+	Content      string `json:"content"`
+	Visible      bool   `json:"visible"`
+	DisplayOrder int    `json:"display_order"`
+	PortalIDs    []int  `json:"portal_ids"`
 }
 
 // FooterColumn represents a column in the Portal Hub footer

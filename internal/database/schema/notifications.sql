@@ -14,14 +14,30 @@ CREATE TABLE IF NOT EXISTS notifications (
 	-- triggered after a passive tray-glance, but the unread badge can drop.
 	seen_at DATETIME,
 	sent_at DATETIME, -- When notification was sent via email (NULL if not sent)
+	email_delivery_state TEXT NOT NULL DEFAULT 'pending',
+	email_claim_owner TEXT,
+	email_claim_token TEXT,
+	email_claim_expires_at DATETIME,
+	email_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+	email_last_error TEXT,
 	-- Set to 1 only when the scheduler tried to roll back sent_at after an SMTP
 	-- failure and the rollback ITSELF failed. Without this flag the row is wedged:
 	-- sent_at is set so the next tick's `WHERE sent_at IS NULL` skips it, and the
 	-- user never gets the email. Surfacing makes the wedge visible to operators.
-	last_send_failed BOOLEAN DEFAULT 0,
+	last_send_failed BOOLEAN DEFAULT FALSE,
 	avatar TEXT, -- Initials or avatar identifier
 	action_url TEXT, -- URL to navigate to when clicked
 	metadata TEXT, -- JSON for additional data
+	authorization_scope TEXT NOT NULL DEFAULT 'legacy', -- legacy rows fail closed at delivery
+	workspace_id INTEGER,
+	item_id INTEGER,
+	source_type TEXT,
+	source_id INTEGER,
+	referenced_entity_type TEXT,
+	referenced_entity_id INTEGER,
+	referenced_workspace_id INTEGER,
+	referenced_workspace_permission TEXT,
+	delivery_key TEXT,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -31,7 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_timestamp ON notifications(timestamp);
 CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
 CREATE INDEX IF NOT EXISTS idx_notifications_sent_at ON notifications(sent_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_email_delivery ON notifications(email_delivery_state, email_claim_expires_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type);
+CREATE INDEX IF NOT EXISTS idx_notifications_workspace_id ON notifications(workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_delivery_key ON notifications(delivery_key) WHERE delivery_key IS NOT NULL;
 
 -- Email templates: per-sender HTML/text/subject Go templates editable from the
 -- admin UI. `name` is the lookup key consumed by senders (e.g. "magic_link",
@@ -44,8 +63,8 @@ CREATE TABLE IF NOT EXISTS notification_templates (
 	content TEXT, -- HTML body template
 	text_body TEXT, -- Plain-text body template
 	description TEXT,
-	is_system BOOLEAN DEFAULT 0,
-	is_active BOOLEAN DEFAULT 1,
+	is_system BOOLEAN DEFAULT FALSE,
+	is_active BOOLEAN DEFAULT TRUE,
 	template_type TEXT, -- legacy, unused
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -56,6 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_notification_templates_active ON notification_tem
 -- Notification settings system for configuration sets
 CREATE TABLE IF NOT EXISTS notification_settings (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	builtin_key TEXT,
 	name TEXT NOT NULL,
 	description TEXT,
 	is_active BOOLEAN DEFAULT true,
@@ -67,6 +87,7 @@ CREATE TABLE IF NOT EXISTS notification_settings (
 
 CREATE INDEX IF NOT EXISTS idx_notification_settings_active ON notification_settings(is_active);
 CREATE INDEX IF NOT EXISTS idx_notification_settings_created_by ON notification_settings(created_by);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notification_settings_builtin_key ON notification_settings(builtin_key) WHERE builtin_key IS NOT NULL;
 
 -- Notification event rules for each setting
 CREATE TABLE IF NOT EXISTS notification_event_rules (
@@ -129,3 +150,5 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_push_subscriptions_endpoint ON push_subscriptions(endpoint);
 CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id ON push_subscriptions(user_id);
+
+-- migration: 0033_notifications_last_send_failed

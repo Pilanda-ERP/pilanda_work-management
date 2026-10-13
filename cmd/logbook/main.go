@@ -17,7 +17,10 @@ import (
 	"windshift/internal/logbookapi"
 	"windshift/internal/logger"
 	"windshift/internal/middleware"
+	"windshift/internal/utils"
 )
+
+const maxRequestHeaderValueCount = 128
 
 func main() {
 	// Resolve all env vars through the shared config package — no inline
@@ -26,6 +29,10 @@ func main() {
 
 	// Initialize logger
 	logger.Init(cfg.Logging.Level, cfg.Logging.Format)
+	utils.SetSkipTLSVerify(cfg.OutboundTLS.SkipVerify)
+	if cfg.OutboundTLS.SkipVerify {
+		slog.Warn("outbound TLS certificate verification is disabled; self-signed certificates will be accepted without server identity verification")
+	}
 
 	slog.Info("starting logbook service",
 		slog.String("port", cfg.Port),
@@ -74,12 +81,13 @@ func main() {
 
 	// Create and start logbook server
 	srvCfg := logbookapi.ServerConfig{
-		Port:             cfg.Port,
-		StoragePath:      cfg.StoragePath,
-		LLMEndpoint:      cfg.LLMEndpoint,
-		MainServerURL:    cfg.MainServerURL,
-		MainServerSecret: cfg.MainServerSecret,
-		BaseURL:          cfg.BaseURL,
+		Port:                   cfg.Port,
+		StoragePath:            cfg.StoragePath,
+		LLMEndpoint:            cfg.LLMEndpoint,
+		MainServerURL:          cfg.MainServerURL,
+		MainServerSecret:       cfg.MainServerSecret,
+		BaseURL:                cfg.BaseURL,
+		ActivateDurableActions: cfg.ActivateDurableActions,
 	}
 
 	srv, err := logbookapi.NewServer(db, srvCfg, articleClient)
@@ -93,11 +101,12 @@ func main() {
 
 	// Create HTTP server
 	httpServer := &http.Server{
-		Handler:        handler,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   120 * time.Second, // Long timeout for file uploads
-		IdleTimeout:    60 * time.Second,
-		MaxHeaderBytes: 1 << 20,
+		Handler:             handler,
+		ReadTimeout:         30 * time.Second,
+		WriteTimeout:        120 * time.Second, // Long timeout for file uploads
+		IdleTimeout:         60 * time.Second,
+		MaxHeaderBytes:      1 << 20,
+		MaxHeaderValueCount: maxRequestHeaderValueCount,
 	}
 
 	// Start listening
@@ -128,7 +137,9 @@ func main() {
 		slog.Error("HTTP server shutdown error", "error", err)
 	}
 
-	srv.Stop()
+	if err := srv.Stop(ctx); err != nil {
+		slog.Error("logbook event engine shutdown error", "error", err)
+	}
 
 	slog.Info("logbook service stopped")
 }

@@ -1,10 +1,4 @@
-/**
- * Server clock offset detection and correction.
- *
- * Compares the Date header from HTTP responses against the client clock
- * to compute a rolling offset, so all frontend "now" references stay
- * consistent with server-stamped timestamps.
- */
+/** Rolling server-clock offset from HTTP Date headers for consistent frontend now. */
 
 const SAMPLE_COUNT = 5;
 export const DRIFT_THRESHOLD_MS = 60_000;
@@ -40,7 +34,9 @@ export function updateOffset(serverDateHeader) {
 
   // Median filters out one-off network jitter better than mean
   const sorted = samples.map((s) => s.offsetMs).sort((a, b) => a - b);
-  clockOffset = sorted[Math.floor(sorted.length / 2)];
+  const middle = Math.floor(sorted.length / 2);
+  clockOffset =
+    sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
 }
 
 /**

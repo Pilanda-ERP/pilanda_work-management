@@ -24,6 +24,8 @@ internal/handlers/item_links.go|windshift/internal/database
 internal/handlers/item_types.go|windshift/internal/database
 internal/handlers/items.go|windshift/internal/database
 internal/handlers/jira_connector.go|windshift/internal/database
+internal/handlers/jira_import_service_management.go|windshift/internal/database
+internal/handlers/jira_import_xray.go|windshift/internal/database
 internal/handlers/ldap.go|windshift/internal/database
 internal/handlers/notification.go|windshift/internal/database
 internal/handlers/oauth.go|windshift/internal/database
@@ -38,9 +40,11 @@ internal/handlers/scm_providers_workspaces.go|windshift/internal/database
 internal/handlers/scm_providers.go|windshift/internal/database
 internal/handlers/screens.go|windshift/internal/database
 internal/handlers/setup.go|windshift/internal/database
+internal/handlers/sla.go|windshift/internal/database
 internal/handlers/sso.go|windshift/internal/database
 internal/handlers/time_projects.go|windshift/internal/database
 internal/handlers/time_worklogs.go|windshift/internal/database
 internal/handlers/todoist_sync.go|windshift/internal/database
 internal/handlers/webauthn.go|windshift/internal/database
 internal/handlers/workspaces_handler.go|windshift/internal/database
+internal/handlers/workspaces_personal.go|windshift/internal/database

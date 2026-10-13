@@ -1,15 +1,14 @@
 package services
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 
-	"windshift/internal/constants"
 	"windshift/internal/database"
 	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/validation"
 )
 
 // ItemValidationParams contains parameters for validating item creation
@@ -18,8 +17,6 @@ type ItemValidationParams struct {
 	Title             string
 	ItemTypeID        *int
 	ParentID          *int
-	StatusID          *int
-	IsTask            bool
 	RelatedWorkItemID *int
 	UserID            int // User creating the item (for personal workspace validation)
 	// PermService, when set, enforces that the caller has view permission on a
@@ -40,27 +37,19 @@ type ItemValidationResult struct {
 //   - the workspace has no configuration set (all types allowed), or
 //   - the item type appears in configuration_set_item_types for that config set.
 func IsItemTypeAllowedInWorkspace(db database.Database, workspaceID, itemTypeID int) (bool, error) {
-	var configSetID *int
-	err := db.QueryRow(
-		"SELECT configuration_set_id FROM workspace_configuration_sets WHERE workspace_id = ?",
-		workspaceID,
-	).Scan(&configSetID)
-	if errors.Is(err, sql.ErrNoRows) || configSetID == nil {
-		return true, nil // no config set → all types allowed
-	}
-	if err != nil {
-		return false, fmt.Errorf("failed to query workspace config set: %w", err)
-	}
-
-	var exists bool
-	err = db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM configuration_set_item_types WHERE configuration_set_id = ? AND item_type_id = ?)",
-		*configSetID, itemTypeID,
-	).Scan(&exists)
+	exists, err := repository.NewConfigurationSetRepository(db).ItemTypeAllowed(workspaceID, itemTypeID)
 	if err != nil {
 		return false, fmt.Errorf("failed to check item type in config set: %w", err)
 	}
 	return exists, nil
+}
+
+// IsPriorityAllowedInWorkspace verifies that the priority exists and is
+// available through the workspace's configuration set. Workspaces without a
+// configuration set, or whose configuration set has no explicit priority
+// assignments, use the default global priority catalog.
+func IsPriorityAllowedInWorkspace(db database.Database, workspaceID, priorityID int) (bool, error) {
+	return validation.IsPriorityAllowedInWorkspace(db, workspaceID, priorityID)
 }
 
 // ValidateItemCreation validates all parameters for creating an item
@@ -81,25 +70,21 @@ func ValidateItemCreation(db database.Database, params ItemValidationParams) *It
 		return &ItemValidationResult{Valid: false, Error: "Workspace not found"}
 	}
 
-	// Task-specific validation
-	if params.IsTask {
-		// Tasks can only have status_id Open or Done
-		if params.StatusID != nil && *params.StatusID != constants.StatusIDOpen && *params.StatusID != constants.StatusIDDone {
-			return &ItemValidationResult{Valid: false, Error: "Tasks can only have status 'Open' or 'Done'"}
-		}
-	}
-
 	// Validate parent item if specified
 	if params.ParentID != nil && *params.ParentID != 0 {
 		result := validateParentHierarchy(db, params.ParentID, params.ItemTypeID, params.WorkspaceID, params.UserID, params.PermService)
 		if !result.Valid {
 			return result
 		}
+	} else if params.ItemTypeID != nil && *params.ItemTypeID != 0 {
+		if err := validation.ValidateParentForItemType(db, *params.ItemTypeID, nil); err != nil {
+			return &ItemValidationResult{Valid: false, Error: err.Error()}
+		}
 	}
 
 	// Validate related_work_item_id if provided
 	if params.RelatedWorkItemID != nil {
-		result := validateRelatedWorkItem(db, params.WorkspaceID, params.UserID, *params.RelatedWorkItemID)
+		result := validateRelatedWorkItem(db, params.WorkspaceID, params.UserID, *params.RelatedWorkItemID, params.PermService)
 		if !result.Valid {
 			return result
 		}
@@ -137,64 +122,29 @@ func validateParentHierarchy(db database.Database, parentID, itemTypeID *int, wo
 		}
 	}
 
-	_, parentItemTypeHierarchyLevel, err := repo.GetItemTypeAndHierarchyLevel(*parentID)
-	if errors.Is(err, repository.ErrNotFound) {
-		return &ItemValidationResult{Valid: false, Error: "Parent item not found"}
-	}
-	if err != nil {
-		return &ItemValidationResult{Valid: false, Error: fmt.Sprintf("Failed to validate parent: %v", err)}
-	}
-
 	// Validate hierarchy relationship if item type is specified
 	if itemTypeID != nil && *itemTypeID != 0 {
-		var itemTypeHierarchyLevel int
-		var itemTypeName string
-		err := db.QueryRow(`
-			SELECT hierarchy_level, name FROM item_types
-			WHERE id = ?
-		`, *itemTypeID).Scan(&itemTypeHierarchyLevel, &itemTypeName)
-
-		if errors.Is(err, sql.ErrNoRows) {
-			return &ItemValidationResult{Valid: false, Error: "Item type not found"}
-		}
-		if err != nil {
-			return &ItemValidationResult{Valid: false, Error: fmt.Sprintf("Failed to validate item type: %v", err)}
-		}
-
-		// Check if child hierarchy level is exactly one more than parent
-		if itemTypeHierarchyLevel != parentItemTypeHierarchyLevel+1 {
-			return &ItemValidationResult{
-				Valid: false,
-				Error: fmt.Sprintf("Item type '%s' (hierarchy level %d) cannot be a child of an item at hierarchy level %d",
-					itemTypeName, itemTypeHierarchyLevel, parentItemTypeHierarchyLevel),
-			}
+		if err := validation.ValidateParentForItemType(db, *itemTypeID, parentID); err != nil {
+			return &ItemValidationResult{Valid: false, Error: err.Error()}
 		}
 	}
 
 	return &ItemValidationResult{Valid: true}
 }
 
-// validateRelatedWorkItem validates that the related work item exists and is in a valid workspace
-func validateRelatedWorkItem(db database.Database, workspaceID, userID, relatedWorkItemID int) *ItemValidationResult {
-	// Verify workspace is personal and belongs to the user
-	var isPersonal bool
-	var ownerID *int
-	err := db.QueryRow(`
-		SELECT is_personal, owner_id FROM workspaces WHERE id = ?
-	`, workspaceID).Scan(&isPersonal, &ownerID)
-
-	if err != nil {
-		return &ItemValidationResult{Valid: false, Error: fmt.Sprintf("Failed to validate workspace: %v", err)}
+// validateRelatedWorkItem applies the shared relationship validation used by
+// item updates so create and update paths enforce the same permission rule.
+func validateRelatedWorkItem(
+	db database.Database,
+	workspaceID, userID, relatedWorkItemID int,
+	permService *PermissionService,
+) *ItemValidationResult {
+	validator := validation.NewItemFieldValidator(db)
+	if permService != nil {
+		validator.WithPermissionChecker(permService)
 	}
-
-	if !isPersonal || ownerID == nil || *ownerID != userID {
-		return &ItemValidationResult{Valid: false, Error: "Personal tasks must be created in your own personal workspace"}
+	if err := validator.ValidateRelatedWorkItem(workspaceID, userID, relatedWorkItemID); err != nil {
+		return &ItemValidationResult{Valid: false, Error: err.Error()}
 	}
-
-	// Verify the related work item exists.
-	if _, err := repository.NewItemRepository(db).GetWorkspaceID(relatedWorkItemID); err != nil {
-		return &ItemValidationResult{Valid: false, Error: "Related work item not found or access denied"}
-	}
-
 	return &ItemValidationResult{Valid: true}
 }

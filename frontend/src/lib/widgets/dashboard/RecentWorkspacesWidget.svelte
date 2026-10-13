@@ -3,6 +3,7 @@
   import { homepageStore } from '../../stores';
   import { workspaceIconMap } from '../../utils/icons.js';
   import { navigate } from '../../router.js';
+  import { t } from '../../stores/i18n.svelte.js';
 
   let workspaces = $derived(homepageStore.recentWorkspaces);
   let loading = $derived(homepageStore.loading);
@@ -25,7 +26,7 @@
 {:else if workspaces.length === 0}
   <div class="flex flex-col items-center text-center py-6" style="color: var(--ds-text-subtle);">
     <Briefcase class="w-6 h-6 mb-2 opacity-60" />
-    <p class="text-sm">No recent workspaces</p>
+    <p class="text-sm">{t('dashboard.noRecentWorkspaces')}</p>
   </div>
 {:else}
   <ul class="flex flex-col gap-1.5">
@@ -33,16 +34,14 @@
       {@const Icon = iconFor(ws.icon)}
       <li>
         <button
-          class="w-full flex items-center gap-3 p-2 rounded border transition-colors text-left"
-          style="border-color: var(--ds-border); background-color: var(--ds-surface);"
-          onmouseenter={(e) => (e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)')}
-          onmouseleave={(e) => (e.currentTarget.style.backgroundColor = 'var(--ds-surface)')}
+          class="dashboard-recent-workspace w-full flex items-center gap-3 p-2 rounded border transition-colors text-left"
+          style="border-color: var(--ds-border);"
           onclick={() => go(ws)}
         >
           {#if ws.avatar_url}
             <img
               src={ws.avatar_url}
-              alt={`${ws.workspace_name} avatar`}
+              alt={t('dashboard.states.workspaceAvatarAlt', { name: ws.workspace_name })}
               class="w-8 h-8 rounded object-cover flex-shrink-0"
             />
           {:else}
@@ -60,7 +59,7 @@
             <p class="text-xs" style="color: var(--ds-text-subtle);">
               {ws.workspace_key}
               {#if ws.last_visited}
-                · visited {homepageStore.formatRelativeTime(ws.last_visited)}
+                · {t('dashboard.states.visited', { time: homepageStore.formatRelativeTime(ws.last_visited) })}
               {/if}
             </p>
           </div>
@@ -69,3 +68,13 @@
     {/each}
   </ul>
 {/if}
+
+<style>
+  .dashboard-recent-workspace {
+    background-color: var(--ds-surface);
+  }
+
+  .dashboard-recent-workspace:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+</style>

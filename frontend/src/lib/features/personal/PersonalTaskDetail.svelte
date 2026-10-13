@@ -1,34 +1,31 @@
 <script>
-  import { onMount } from 'svelte';
   import { api } from '../../api.js';
-  import { attachmentStatus, workspacesStore } from '../../stores';
+  import { attachmentStatus } from '../../stores';
+  import { workspaceDataStore } from '../../stores/workspaceDataStore.svelte.js';
   import Modal from '../../dialogs/Modal.svelte';
   import Comments from '../items/Comments.svelte';
   import ItemDetailDescription from '../items/ItemDetailDescription.svelte';
   import { X, Calendar, MessageSquare, ExternalLink } from '@lucide/svelte';
   import Button from '../../components/Button.svelte';
   import Checkbox from '../../components/Checkbox.svelte';
-  import { itemTypeIconMap } from '../../utils/icons.js';
+  import Input from '../../components/Input.svelte';
   import { copyToClipboard } from '../../utils/clipboard.js';
-  import { formatDate } from '../../utils/dateFormatter.js';
+  import { formatDateOnly } from '../../utils/dateFormatter.js';
   import { navigate } from '../../router.js';
   import ItemDetailBreadcrumbs from '../items/ItemDetailBreadcrumbs.svelte';
+  import { useItemEventStream } from '../../composables/useItemEventStream.svelte.js';
   import { t } from '../../stores/i18n.svelte.js';
-
-  // Use centralized icon map for work item types
-  const iconMap = itemTypeIconMap;
 
   let {
     itemId,
     workspaceId,
-    statuses = [],
     isModal = true,
     onclose = null,
     onupdate = null
   } = $props();
 
-  // Load statuses if not provided (for full-page mode)
-  let localStatuses = $state([]);
+  const STATUS_ID_OPEN = 1;
+  const STATUS_ID_DONE = 3;
 
   // Core state
   let item = $state(null);
@@ -57,54 +54,57 @@
   let currentHierarchyLevel = $state(null);
   let itemTypes = $state([]);
 
-  // Use provided statuses or fall back to locally loaded ones
-  let effectiveStatuses = $derived(statuses.length > 0 ? statuses : localStatuses);
-
-  onMount(async () => {
-    // Load statuses if not provided (full-page mode)
-    if (statuses.length === 0) {
-      await loadStatuses();
-    }
-    await loadItem();
-
-    // Load breadcrumbs data for full-page mode
-    await loadWorkspace();
-    if (item?.parent_id) {
-      await loadParentHierarchy();
-    }
-    await loadItemTypeData();
-
-    if (attachmentStatus.enabled) {
-      await loadAttachments();
-    }
-    loading = false;
-  });
-
-  async function loadStatuses() {
+  // Reload whenever the route targets a different item (WI-1378: the lazy
+  // route reuses this component across /personal/items/N navigations, so an
+  // onMount-only load left `item` pointing at the previously viewed task).
+  let itemGeneration = 0;
+  async function loadItem(id) {
+    const generation = ++itemGeneration;
+    loading = true;
+    error = null;
+    // Drop the previous task's attachment list and comment badge immediately
+    // so navigation never shows another task's data (WI-1418).
+    attachments = [];
+    commentCount = 0;
+    if (!isModal && attachmentStatus.enabled) void loadAttachments(id, generation);
     try {
-      localStatuses = await api.statuses.getAll();
-    } catch (err) {
-      console.error('Failed to load statuses:', err);
-      localStatuses = [];
-    }
-  }
-
-  async function loadItem() {
-    try {
-      item = await api.items.get(itemId);
+      const loaded = await api.items.get(id);
+      if (generation !== itemGeneration) return; // a newer load superseded this one
+      item = loaded;
       editTitle = item.title || '';
       editDescription = item.description || '';
+      if (!isModal) await loadHierarchyData();
     } catch (err) {
+      if (generation !== itemGeneration) return;
       console.error('Failed to load item:', err);
       error = 'Failed to load task';
+    } finally {
+      if (generation === itemGeneration) loading = false;
     }
   }
 
-  async function loadAttachments() {
+  $effect(() => {
+    const id = itemId;
+    if (id == null) return;
+    void loadItem(id);
+  });
+
+  // Deep links land here before the personal workspace id resolves (the prop
+  // is null until the store loads). Re-run when it transitions null → id
+  // (WI-1389) instead of initializing the workspace store with null once.
+  $effect(() => {
+    const wsId = workspaceId;
+    if (isModal || wsId == null) return;
+    void loadWorkspace();
+  });
+
+  async function loadAttachments(id = itemId, generation = itemGeneration) {
     try {
-      const response = await api.attachments.getByItem(itemId);
-      attachments = response?.attachments || response || [];
+      const response = await api.attachments.getByItem(id);
+      if (id !== itemId || generation !== itemGeneration) return; // superseded by navigation
+      attachments = response?.data || [];
     } catch (err) {
+      if (id !== itemId || generation !== itemGeneration) return;
       console.error('Failed to load attachments:', err);
       attachments = [];
     }
@@ -113,40 +113,26 @@
   // Breadcrumbs data loading functions
   async function loadWorkspace() {
     try {
-      workspace = await api.workspaces.get(workspaceId);
+      await workspaceDataStore.initialize(workspaceId);
+      workspace = workspaceDataStore.workspace;
     } catch (err) {
       console.error('Failed to load workspace:', err);
     }
   }
 
-  async function loadParentHierarchy() {
-    if (!item?.parent_id) {
-      parentHierarchy = [];
-      return;
-    }
+  async function loadHierarchyData() {
     try {
-      const ancestors = await api.items.getAncestors(item.id);
-      const itemTypesData = await api.itemTypes.getAll();
-      parentHierarchy = ancestors.map(ancestor => {
-        if (ancestor.item_type_id) {
-          const itemType = itemTypesData.find(type => type.id === ancestor.item_type_id);
-          return { ...ancestor, itemType };
-        }
-        return ancestor;
-      });
-    } catch (err) {
-      console.error('Failed to load parent hierarchy:', err);
-      parentHierarchy = [];
-    }
-  }
-
-  async function loadItemTypeData() {
-    try {
-      const [itemTypesData, hierarchyLevels] = await Promise.all([
-        api.itemTypes.getAll(),
-        api.hierarchyLevels.getAll()
+      const [itemTypesData, hierarchyLevels, ancestors] = await Promise.all([
+        Promise.resolve(workspaceDataStore.itemTypes),
+        api.hierarchyLevels.getAll(),
+        item?.parent_id ? api.items.getAncestors(item.id) : Promise.resolve([]),
       ]);
       itemTypes = itemTypesData || [];
+      parentHierarchy = (ancestors || []).map((ancestor) => {
+        if (!ancestor.item_type_id) return ancestor;
+        const itemType = itemTypes.find((type) => type.id === ancestor.item_type_id);
+        return { ...ancestor, itemType };
+      });
       if (item?.item_type_id) {
         currentItemType = itemTypes.find(type => type.id === item.item_type_id);
         if (currentItemType) {
@@ -154,7 +140,8 @@
         }
       }
     } catch (err) {
-      console.error('Failed to load item type data:', err);
+      console.error('Failed to load hierarchy data:', err);
+      parentHierarchy = [];
       currentItemType = null;
       currentHierarchyLevel = null;
     }
@@ -162,36 +149,16 @@
 
   // Done toggle logic (from TodoList)
   function isTaskCompleted() {
-    const status = effectiveStatuses.find(s => s.id === item?.status_id);
-    return status?.category_name === 'Done' ||
-           status?.name?.toLowerCase().includes('complete') ||
-           status?.name?.toLowerCase().includes('done');
+    return item?.status_id === STATUS_ID_DONE;
   }
 
   async function toggleDone() {
     try {
       saving = true;
-      let targetStatusId;
-
-      if (isTaskCompleted()) {
-        // Move to "Open" or first non-done status
-        const openStatus = effectiveStatuses.find(s => s.name?.toLowerCase() === 'open') ||
-                          effectiveStatuses.find(s => s.category_name !== 'Done') ||
-                          effectiveStatuses[0];
-        targetStatusId = openStatus?.id;
-      } else {
-        // Move to "Done" status
-        const doneStatus = effectiveStatuses.find(s => s.category_name === 'Done') ||
-                          effectiveStatuses.find(s => s.name?.toLowerCase().includes('done')) ||
-                          effectiveStatuses.find(s => s.name?.toLowerCase().includes('complete'));
-        targetStatusId = doneStatus?.id;
-      }
-
-      if (targetStatusId) {
-        await api.items.transition(item.id, targetStatusId);
-        item = { ...item, status_id: targetStatusId };
-        onupdate?.();
-      }
+      const targetStatusId = isTaskCompleted() ? STATUS_ID_OPEN : STATUS_ID_DONE;
+      await api.items.transition(item.id, targetStatusId);
+      item = { ...item, status_id: targetStatusId };
+      onupdate?.();
     } catch (err) {
       console.error('Failed to toggle done status:', err);
       error = err.message;
@@ -291,10 +258,7 @@
     const { files } = data;
     for (const file of files) {
       try {
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('item_id', item.id);
-        await api.attachments.upload(formData);
+        await api.attachments.uploadToItem(item.id, file);
       } catch (err) {
         console.error('Failed to upload:', err);
       }
@@ -325,12 +289,30 @@
     }
   }
 
-  function openFullDetails() {
-    const personalWsId = $workspacesStore.personalWorkspace?.id;
-    if (workspaceId && workspaceId !== personalWsId) {
-      navigate(`/workspaces/${workspaceId}/items/${itemId}`);
-    } else {
-      navigate(`/personal/items/${itemId}`);
+  // Live updates (WI-484): personal tasks use the same item event stream as the
+  // workspace item detail. Any change reloads the task and refreshes the
+  // embedded Comments; a deletion closes the view.
+  useItemEventStream(() => itemId, {
+    onReconcile: () => {
+      refreshItem();
+      window.dispatchEvent(new CustomEvent('item-comments-changed', { detail: { itemId } }));
+    },
+    onDeleted: () => closeModal(),
+  });
+
+  // Silent reload so a live change never flashes the loading state or clobbers
+  // fields the user is editing.
+  async function refreshItem() {
+    const id = item?.id;
+    if (id == null) return;
+    try {
+      const fresh = await api.items.get(id);
+      if (item?.id !== id) return;
+      item = { ...item, ...fresh };
+      if (!editingTitle) editTitle = fresh.title || '';
+      if (!editingDescription) editDescription = fresh.description || '';
+    } catch (err) {
+      if (err?.status === 404) closeModal();
     }
   }
 
@@ -340,7 +322,7 @@
   {#if loading}
     <div class="p-8 text-center" style="color: var(--ds-text-subtle);">{t('nav.loading')}</div>
   {:else if error && !item}
-    <div class="p-8 text-center text-red-600">{error}</div>
+    <div class="p-8 text-center text-ds-text-danger">{error}</div>
   {:else if item}
     {#if !isModal && workspace}
       <!-- Breadcrumbs for full-page mode using ItemDetailBreadcrumbs -->
@@ -351,10 +333,9 @@
           {currentItemType}
           {currentHierarchyLevel}
           {item}
-          {iconMap}
           {workspaceId}
           onnavigate={(path) => navigate(path)}
-          onparentChanged={loadParentHierarchy}
+          onparentChanged={loadHierarchyData}
           oncopyKey={() => {
             copyToClipboard(`${workspace?.key || 'WORK'}-${item.workspace_item_number}`);
           }}
@@ -372,12 +353,12 @@
           disabled={saving}
           size="medium"
           class="task-complete-checkbox"
+          dataTestid="personal-task-status-toggle"
         />
 
         <!-- Editable Title -->
         {#if editingTitle}
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
+          <Input
             type="text"
             bind:value={editTitle}
             onblur={saveTitle}
@@ -399,12 +380,8 @@
       </div>
 
       {#if isModal}
-        {@const personalWsId = $workspacesStore.personalWorkspace?.id}
-        {@const fullDetailsHref = workspaceId && workspaceId !== personalWsId
-          ? `/workspaces/${workspaceId}/items/${itemId}`
-          : `/personal/items/${itemId}`}
         <div class="flex items-center gap-1">
-          <Button variant="ghost" icon={ExternalLink} href={fullDetailsHref} title={t('items.fullDetails')} />
+          <Button variant="ghost" icon={ExternalLink} href={`/personal/items/${itemId}`} title={t('items.fullDetails')} />
           <Button variant="ghost" icon={X} onclick={closeModal} title={t('common.close')} />
         </div>
       {/if}
@@ -413,18 +390,17 @@
     <!-- Body -->
     <div class="{isModal ? 'p-4 max-h-[70vh] overflow-y-auto' : 'px-6 py-6'}">
       <!-- Due Date -->
-      <div class="mb-4">
+      <div class="mb-4" data-testid="personal-task-due-date">
         {#if editingDueDate}
           <div class="flex items-center gap-2">
             <Calendar class="w-4 h-4" style="color: var(--ds-text-subtle);" />
             <!-- svelte-ignore a11y_autofocus -->
-            <input
+            <Input
               type="date"
               value={item.due_date?.split('T')[0] || ''}
               onchange={(e) => saveDueDate(e.currentTarget.value || null)}
               onblur={() => editingDueDate = false}
-              class="px-2 py-1 border rounded text-sm"
-              style="background-color: var(--ds-surface); color: var(--ds-text); border-color: var(--ds-border);"
+              size="small"
               autofocus
             />
           </div>
@@ -437,7 +413,7 @@
               style="color: {item.due_date ? 'var(--ds-text)' : 'var(--ds-text-subtle)'}; background: none; border: none; padding: 0;"
             >
               <Calendar class="w-4 h-4" />
-              {item.due_date ? formatDate(item.due_date) : t('personal.setDueDate')}
+              {item.due_date ? formatDateOnly(item.due_date) : t('personal.setDueDate')}
             </button>
             {#if item.due_date}
               <button
@@ -468,6 +444,7 @@
           diagrams={[]}
           onsavefield={handleSaveField}
           oncanceledit={handleCancelEdit}
+          onstartEditingDescription={() => { editingDescription = true; }}
           onattachmentUploadFiles={handleAttachmentUploadFiles}
           onattachmentDelete={handleAttachmentDelete}
         />
@@ -483,13 +460,13 @@
           {/if}
         </div>
       </div>
-      <Comments itemId={item.id} isPersonalWorkspace={true} onCommentsLoaded={handleCommentsLoaded} />
+      <Comments itemId={item.id} workspaceId={item.workspace_id} isPersonalWorkspace={true} onCommentsLoaded={handleCommentsLoaded} />
     </div>
   {/if}
 {/snippet}
 
 {#if isModal}
-  <Modal isOpen={true} onclose={closeModal} maxWidth="max-w-2xl">
+  <Modal isOpen={true} onclose={closeModal} maxWidth="max-w-2xl" dataTestid="personal-task-detail">
     {@render taskContent()}
   </Modal>
 {:else}

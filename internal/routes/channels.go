@@ -19,25 +19,39 @@ func RegisterChannelRoutes(deps *Deps) {
 	// Channel endpoints - Read operations
 	api.HandleH("GET /channels", auth(http.HandlerFunc(deps.Channels.Channel.GetChannels)))
 	api.HandleH("GET /channels/{id}", auth(http.HandlerFunc(deps.Channels.Channel.GetChannel)))
-	api.HandleH("GET /channels/{id}/managers", auth(http.HandlerFunc(deps.Channels.Channel.GetChannelManagers)))
+	api.HandleH("GET /channels/{id}/managers", channelMgmt(http.HandlerFunc(deps.Channels.Channel.GetChannelManagers)))
 
 	// Channel endpoints - Write operations
 	api.HandleH("POST /channels", admin(http.HandlerFunc(deps.Channels.Channel.CreateChannel)))
 	api.HandleH("PUT /channels/{id}", channelMgmt(http.HandlerFunc(deps.Channels.Channel.UpdateChannel)))
 	api.HandleH("PUT /channels/{id}/toggle", channelMgmt(http.HandlerFunc(deps.Channels.Channel.ToggleChannel)))
-	api.HandleH("DELETE /channels/{id}", channelMgmt(http.HandlerFunc(deps.Channels.Channel.DeleteChannel)))
+	api.HandleH("DELETE /channels/{id}", admin(http.HandlerFunc(deps.Channels.Channel.DeleteChannel)))
 	api.HandleH("GET /channels/{id}/delete-impact", channelMgmt(http.HandlerFunc(deps.Channels.Channel.GetChannelDeleteImpact)))
-	api.HandleH("POST /channels/{id}/test", channelMgmt(http.HandlerFunc(deps.Channels.Channel.TestChannel)))
+	api.HandleH("POST /channels/{id}/test", admin(http.HandlerFunc(deps.Channels.Channel.TestChannel)))
 	api.HandleH("PUT /channels/{id}/config", channelMgmt(http.HandlerFunc(deps.Channels.Channel.UpdateChannelConfig)))
-	api.HandleH("POST /channels/{id}/managers", channelMgmt(http.HandlerFunc(deps.Channels.Channel.AddChannelManager)))
-	api.HandleH("DELETE /channels/{id}/managers/{managerId}", channelMgmt(http.HandlerFunc(deps.Channels.Channel.RemoveChannelManager)))
+	api.HandleH("POST /channels/{id}/managers", admin(http.HandlerFunc(deps.Channels.Channel.AddChannelManager)))
+	api.HandleH("DELETE /channels/{id}/managers/{managerId}", admin(http.HandlerFunc(deps.Channels.Channel.RemoveChannelManager)))
 	api.HandleH("POST /channels/{id}/test-config", channelMgmt(http.HandlerFunc(deps.Channels.Channel.TestChannelConfig)))
 	api.HandleH("POST /channels/{id}/process-emails", auth(deps.AuthRateLimiter.Limit(http.HandlerFunc(deps.Channels.Channel.ProcessEmailsNow))))
 	api.HandleH("GET /channels/{id}/email-log", channelMgmt(http.HandlerFunc(deps.Channels.Channel.GetEmailLog)))
+	api.HandleH("POST /channels/{id}/email/requeue-rate-limited", channelMgmt(http.HandlerFunc(deps.Channels.Channel.RequeueRateLimitedEmails)))
+	api.HandleH("GET /channels/{id}/email/replies", channelMgmt(http.HandlerFunc(deps.Channels.Channel.ListEmailReplies)))
+	api.HandleH("POST /channels/{id}/email/replies/{commentId}/retry", channelMgmt(http.HandlerFunc(deps.Channels.Channel.RetryEmailReply)))
+	api.HandleH("POST /channels/{id}/email/replies/{commentId}/discard", channelMgmt(http.HandlerFunc(deps.Channels.Channel.DiscardEmailReply)))
+
+	// Mailbox intake endpoints (WI-1644). channelMgmt gates the mailbox; the
+	// handler additionally requires manage on the intake target for writes.
+	api.HandleH("GET /channels/{id}/intakes", channelMgmt(http.HandlerFunc(deps.Channels.Channel.ListChannelIntakes)))
+	api.HandleH("POST /channels/{id}/intakes", channelMgmt(http.HandlerFunc(deps.Channels.Channel.CreateChannelIntake)))
+	api.HandleH("PUT /channels/{id}/intakes/{intakeId}", channelMgmt(http.HandlerFunc(deps.Channels.Channel.UpdateChannelIntake)))
+	api.HandleH("DELETE /channels/{id}/intakes/{intakeId}", channelMgmt(http.HandlerFunc(deps.Channels.Channel.DeleteChannelIntake)))
 
 	// Channel email OAuth endpoints
-	api.HandleH("POST /channels/{id}/inline-oauth/start", channelMgmt(http.HandlerFunc(deps.Channels.Channel.StartChannelEmailOAuth)))
-	api.Handle("GET /channels/inline-oauth/callback", deps.Channels.Channel.ChannelEmailOAuthCallback) // No auth - OAuth redirect
+	api.HandleH("POST /channels/{id}/inline-oauth/start", admin(http.HandlerFunc(deps.Channels.Channel.StartChannelEmailOAuth)))
+	// OptionalAuth so the callback can bind the completing browser to the
+	// account that started the flow; the handler rejects unauthenticated or
+	// mismatched callers.
+	api.HandleH("GET /channels/inline-oauth/callback", deps.AuthMiddleware.OptionalAuth(http.HandlerFunc(deps.Channels.Channel.ChannelEmailOAuthCallback)))
 
 	// Request Type endpoints (channel-scoped). Write paths nest under /channels/{channel_id}/
 	// so the channelMgmt middleware can gate them and the handler/SQL constrains by channel_id.
@@ -64,7 +78,11 @@ func RegisterChannelRoutes(deps *Deps) {
 
 	// Notification endpoints
 	api.HandleH("GET /notifications", auth(http.HandlerFunc(deps.Channels.Notification.GetNotifications)))
+	// Per-user notification invalidation stream (WI-1625).
+	api.HandleH("GET /notifications/events", auth(http.HandlerFunc(deps.Channels.Notification.NotificationEvents)))
 	api.HandleH("POST /notifications", auth(http.HandlerFunc(deps.Channels.Notification.CreateNotification)))
+	api.HandleH("DELETE /notifications", auth(http.HandlerFunc(deps.Channels.Notification.ClearNotifications)))
+	api.HandleH("PATCH /notifications/read-all", auth(http.HandlerFunc(deps.Channels.Notification.MarkAllNotificationsAsRead)))
 	api.HandleH("PATCH /notifications/{id}/read", auth(http.HandlerFunc(deps.Channels.Notification.MarkNotificationAsRead)))
 	api.HandleH("PATCH /notifications/seen-all", auth(http.HandlerFunc(deps.Channels.Notification.MarkAllNotificationsAsSeen)))
 	api.HandleH("POST /notifications/mark-item-read", auth(http.HandlerFunc(deps.Channels.Notification.MarkItemNotificationsAsRead)))

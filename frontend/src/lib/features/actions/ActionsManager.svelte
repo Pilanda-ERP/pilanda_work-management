@@ -1,5 +1,6 @@
 <script>
   import { t } from '../../stores/i18n.svelte.js';
+  import StateDisplay from '../../components/StateDisplay.svelte';
   import { confirm } from '../../composables/useConfirm.js';
   import { toHotkeyString, getShortcutDisplay } from '../../utils/keyboardShortcuts.js';
   import Button from '../../components/Button.svelte';
@@ -41,6 +42,8 @@
     const labels = {
       'status_transition': t('actions.trigger.statusTransition'),
       'item_created': t('actions.trigger.itemCreated'),
+      'sla_breached': t('actions.trigger.slaBreached'),
+      'sla_warning': t('actions.trigger.slaWarning'),
       'item_updated': t('actions.trigger.itemUpdated'),
       'item_linked': t('actions.trigger.itemLinked'),
       'scm_tag_created': 'SCM: Tag created',
@@ -112,9 +115,7 @@
   </PageHeader>
 
   {#if loading}
-    <div class="flex items-center justify-center py-12">
-      <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-    </div>
+    <StateDisplay type="loading" />
   {:else if actions.length === 0}
     <EmptyState
       icon={Zap}
@@ -135,7 +136,7 @@
   {:else}
     <div class="actions-list space-y-3">
       {#each actions as action}
-        <div class="action-card p-4 border rounded-lg">
+        <div class="action-card p-4 border rounded-lg" data-testid={`action-card-${action.id}`}>
           <div class="flex items-center justify-between">
             <div class="flex-1">
               <div class="flex items-center gap-3">
@@ -169,6 +170,7 @@
                 class="p-2 rounded-md action-button"
                 onclick={() => handleTest(action)}
                 title={t('actions.test.run')}
+                data-testid="action-test"
               >
                 <Play class="h-5 w-5" />
               </button>
@@ -176,6 +178,7 @@
                 class="p-2 rounded-md action-button"
                 onclick={() => handleViewLogs(action)}
                 title={t('actions.viewLogs')}
+                data-testid="action-view-logs"
               >
                 <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -185,6 +188,7 @@
                 class="p-2 rounded-md action-button"
                 onclick={() => handleToggle(action)}
                 title={action.is_enabled ? t('actions.disable') : t('actions.enable')}
+                data-testid="action-toggle"
               >
                 {#if action.is_enabled}
                   <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -201,6 +205,7 @@
                 class="p-2 rounded-md action-button"
                 onclick={() => handleEdit(action)}
                 title={t('common.edit')}
+                data-testid={`action-edit-${action.id}`}
               >
                 <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />

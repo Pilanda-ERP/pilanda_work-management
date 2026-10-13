@@ -19,47 +19,59 @@ type ChannelRepository struct {
 	db database.Database
 }
 
+// DB exposes the underlying database for handlers that need adjacent
+// repositories (e.g. channel intakes) without a second connection.
+func (r *ChannelRepository) DB() database.Database { return r.db }
+
 // NewChannelRepository creates a new channel repository
 func NewChannelRepository(db database.Database) *ChannelRepository {
 	return &ChannelRepository{db: db}
 }
 
-// SlugCandidate is a minimal channel row used for slug matching from JSON config.
+// SlugCandidate is a minimal public-channel row together with its parsed
+// configuration.
 type SlugCandidate struct {
 	Channel models.Channel
 	Config  models.ChannelConfig
 }
 
-// ListSlugCandidates returns channels of a type with parsed config, newest first.
-func (r *ChannelRepository) ListSlugCandidates(ctx context.Context, channelType string) ([]SlugCandidate, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, type, config, status
+// FindEnabledByPublicSlug resolves a public channel through the normalized,
+// uniquely indexed slug column. The old implementation loaded and decoded
+// every portal/form config on every public request, making anonymous traffic
+// O(number of channels) and allowing one malformed row to affect lookup.
+func (r *ChannelRepository) FindEnabledByPublicSlug(ctx context.Context, channelType, slug string) (*SlugCandidate, error) {
+	var candidate SlugCandidate
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id, name, type, COALESCE(config, '{}'), status
 		FROM channels
-		WHERE type = ?
-		ORDER BY created_at DESC
-	`, channelType)
+		WHERE type = ? AND direction = 'inbound' AND status = 'enabled'
+		  AND public_slug = ?
+	`, channelType, slug).Scan(
+		&candidate.Channel.ID,
+		&candidate.Channel.Name,
+		&candidate.Channel.Type,
+		&candidate.Channel.Config,
+		&candidate.Channel.Status,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to query %s channels: %w", channelType, err)
+		return nil, fmt.Errorf("find enabled %s channel by public slug: %w", channelType, err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	candidates := []SlugCandidate{}
-	for rows.Next() {
-		var ch models.Channel
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Type, &ch.Config, &ch.Status); err != nil {
-			slog.Warn("ListSlugCandidates scan failed", slog.String("component", "repository"), slog.String("channel_type", channelType), slog.Any("error", err))
-			continue
-		}
-		var cfg models.ChannelConfig
-		if ch.Config != "" {
-			if err := json.Unmarshal([]byte(ch.Config), &cfg); err != nil {
-				slog.Warn("ListSlugCandidates config unmarshal failed", slog.String("component", "repository"), slog.String("channel_type", channelType), slog.Int("channel_id", ch.ID), slog.Any("error", err))
-				continue
-			}
-		}
-		candidates = append(candidates, SlugCandidate{Channel: ch, Config: cfg})
+	actualSlug, err := publicSlugForConfig(candidate.Channel.Type, "inbound", candidate.Channel.Config)
+	if err != nil {
+		return nil, fmt.Errorf("parse public channel %d config: %w", candidate.Channel.ID, err)
 	}
-	return candidates, rows.Err()
+	if actualSlug != slug {
+		// public_slug is derived metadata. Refuse a stale/corrupt row instead of
+		// routing a request to a config that advertises a different public URL.
+		return nil, ErrNotFound
+	}
+	if err := json.Unmarshal([]byte(candidate.Channel.Config), &candidate.Config); err != nil {
+		return nil, fmt.Errorf("parse public channel %d config: %w", candidate.Channel.ID, err)
+	}
+	return &candidate, nil
 }
 
 // ChannelListFilters contains filter parameters for listing channels
@@ -74,10 +86,10 @@ type ChannelListFilters struct {
 // FindAll returns channels visible to the user
 // If isAdmin is true, returns all channels; otherwise returns only channels the user manages
 func (r *ChannelRepository) FindAll(ctx context.Context, userID int, isAdmin bool, filters ChannelListFilters) ([]models.Channel, error) {
-	var args []interface{}
+	var args []any
 
 	baseSelect := `
-		SELECT c.id, c.name, c.type, c.direction, c.description, c.status, c.is_default, c.config,
+		SELECT c.id, c.name, c.type, c.direction, COALESCE(c.description, ''), c.status, COALESCE(c.is_default, false), COALESCE(c.config, '{}'),
 			   c.plugin_name, c.plugin_webhook_id, c.category_id, c.created_at, c.updated_at, c.last_activity,
 			   cc.name, cc.color
 		FROM channels c
@@ -95,10 +107,13 @@ func (r *ChannelRepository) FindAll(ctx context.Context, userID int, isAdmin boo
 			  AND (
 			      (cm.manager_type = 'user' AND cm.manager_id = ?)
 			   OR (cm.manager_type = 'group' AND cm.manager_id IN (
-			          SELECT group_id FROM group_members WHERE user_id = ?
+			          SELECT gm.group_id
+			          FROM group_members gm
+			          JOIN groups g ON g.id = gm.group_id
+			          WHERE gm.user_id = ? AND g.is_active = true
 			      ))
 			  )
-		)`)
+		) AND COALESCE(c.is_default, false) = false`)
 		args = append(args, userID, userID)
 	}
 
@@ -171,7 +186,10 @@ func (r *ChannelRepository) UserCanManage(ctx context.Context, userID, channelID
 			  AND (
 			      (cm.manager_type = 'user' AND cm.manager_id = ?)
 			   OR (cm.manager_type = 'group' AND cm.manager_id IN (
-			          SELECT group_id FROM group_members WHERE user_id = ?
+			          SELECT gm.group_id
+			          FROM group_members gm
+			          JOIN groups g ON g.id = gm.group_id
+			          WHERE gm.user_id = ? AND g.is_active = true
 			      ))
 			  )
 		)
@@ -182,13 +200,41 @@ func (r *ChannelRepository) UserCanManage(ctx context.Context, userID, channelID
 	return found, nil
 }
 
+// UserManagesAny reports whether userID directly manages, or belongs to an
+// active group that manages, at least one non-default channel. Default channels
+// are intentionally excluded because non-admin managers cannot operate them.
+func (r *ChannelRepository) UserManagesAny(ctx context.Context, userID int) (bool, error) {
+	var found bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM channel_managers cm
+			JOIN channels c ON c.id = cm.channel_id
+			WHERE COALESCE(c.is_default, false) = false
+			  AND (
+			      (cm.manager_type = 'user' AND cm.manager_id = ?)
+			   OR (cm.manager_type = 'group' AND cm.manager_id IN (
+			          SELECT gm.group_id
+			          FROM group_members gm
+			          JOIN groups g ON g.id = gm.group_id
+			          WHERE gm.user_id = ? AND g.is_active = true
+			      ))
+			  )
+		)
+	`, userID, userID).Scan(&found)
+	if err != nil {
+		return false, fmt.Errorf("failed to check channel manager availability: %w", err)
+	}
+	return found, nil
+}
+
 // ListEnabledByTypeAndDirection returns all enabled channels of a given
 // type/direction, regardless of manager scope. Used by the
 // GET /api/items/{id}/webhooks endpoint to enumerate triggerable outbound
 // webhooks; the per-item permission check happens above this in the handler.
 func (r *ChannelRepository) ListEnabledByTypeAndDirection(ctx context.Context, channelType, direction string) ([]models.Channel, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, config
+		SELECT id, name, COALESCE(config, '{}')
 		FROM channels
 		WHERE type = ? AND direction = ? AND status = 'enabled'
 	`, channelType, direction)
@@ -214,7 +260,7 @@ func (r *ChannelRepository) ListEnabledByTypeAndDirection(ctx context.Context, c
 // FindByID retrieves a single channel by ID
 func (r *ChannelRepository) FindByID(ctx context.Context, id int) (*models.Channel, error) {
 	query := `
-		SELECT c.id, c.name, c.type, c.direction, c.description, c.status, c.is_default, c.config,
+		SELECT c.id, c.name, c.type, c.direction, COALESCE(c.description, ''), c.status, COALESCE(c.is_default, false), COALESCE(c.config, '{}'),
 			   c.plugin_name, c.plugin_webhook_id, c.category_id, c.created_at, c.updated_at, c.last_activity,
 			   cc.name, cc.color
 		FROM channels c
@@ -226,20 +272,71 @@ func (r *ChannelRepository) FindByID(ctx context.Context, id int) (*models.Chann
 	return r.scanChannelRow(row)
 }
 
+// FindInboundPortalBySlug returns a portal channel for import-time slug
+// collision resolution.
+func (r *ChannelRepository) FindInboundPortalBySlug(ctx context.Context, slug string) (*models.Channel, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT c.id, c.name, c.type, c.direction, COALESCE(c.description, ''),
+		       c.status, COALESCE(c.is_default, false), COALESCE(c.config, '{}'),
+		       c.plugin_name, c.plugin_webhook_id, c.category_id, c.created_at,
+		       c.updated_at, c.last_activity, cc.name, cc.color
+		FROM channels c
+		LEFT JOIN channel_categories cc ON c.category_id = cc.id
+		WHERE c.type = 'portal' AND c.direction = 'inbound' AND c.public_slug = ?
+	`, slug)
+	return r.scanChannelRow(row)
+}
+
+// CreatePortalWithManager atomically creates a portal and grants its importing
+// user channel-manager access when one is available.
+func (r *ChannelRepository) CreatePortalWithManager(
+	ctx context.Context,
+	channel *models.Channel,
+	managerUserID int,
+) (int, error) {
+	return database.WithTxResult(r.db, func(tx database.Tx) (int, error) {
+		id, err := r.Create(ctx, tx, channel)
+		if err != nil {
+			return 0, err
+		}
+		if managerUserID > 0 {
+			if _, err := r.AddManager(ctx, tx, id, "user", managerUserID, managerUserID); err != nil {
+				return 0, err
+			}
+		}
+		return id, nil
+	})
+}
+
+// SetConfig performs a repository-owned transaction for callers that only
+// need to replace channel configuration.
+func (r *ChannelRepository) SetConfig(ctx context.Context, id int, config string) error {
+	return database.WithTx(r.db, func(tx database.Tx) error {
+		return r.UpdateConfig(ctx, tx, id, config)
+	})
+}
+
 // Create inserts a new channel and returns its ID
 func (r *ChannelRepository) Create(ctx context.Context, tx database.Tx, channel *models.Channel) (int, error) {
 	now := time.Now()
 	channel.CreatedAt = now
 	channel.UpdatedAt = now
+	publicSlug, err := publicSlugForConfig(channel.Type, channel.Direction, channel.Config)
+	if err != nil {
+		return 0, fmt.Errorf("derive channel public slug: %w", err)
+	}
 
 	var id int64
-	err := tx.QueryRow(`
-		INSERT INTO channels (name, type, direction, description, status, is_default, config, category_id, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+	err = tx.QueryRow(`
+		INSERT INTO channels (name, type, direction, description, status, is_default, config, public_slug, category_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 		channel.Name, channel.Type, channel.Direction, channel.Description,
-		channel.Status, channel.IsDefault, channel.Config, channel.CategoryID, channel.CreatedAt, channel.UpdatedAt,
+		channel.Status, channel.IsDefault, channel.Config, nullableSlug(publicSlug), channel.CategoryID, channel.CreatedAt, channel.UpdatedAt,
 	).Scan(&id)
 	if err != nil {
+		if isPublicSlugConstraintError(err) {
+			return 0, ErrChannelSlugConflict
+		}
 		return 0, fmt.Errorf("failed to create channel: %w", err)
 	}
 
@@ -252,10 +349,9 @@ func (r *ChannelRepository) Update(ctx context.Context, tx database.Tx, channel 
 
 	result, err := tx.Exec(`
 		UPDATE channels
-		SET name = ?, description = ?, status = ?, is_default = ?, config = ?, category_id = ?, updated_at = ?
+		SET name = ?, description = ?, category_id = ?, updated_at = ?
 		WHERE id = ? AND plugin_name IS NULL`,
-		channel.Name, channel.Description, channel.Status, channel.IsDefault,
-		channel.Config, channel.CategoryID, channel.UpdatedAt, channel.ID,
+		channel.Name, channel.Description, channel.CategoryID, channel.UpdatedAt, channel.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update channel: %w", err)
@@ -278,14 +374,42 @@ func (r *ChannelRepository) Delete(ctx context.Context, tx database.Tx, id int) 
 	}
 
 	// Then delete the channel
-	result, err := tx.Exec("DELETE FROM channels WHERE id = ? AND plugin_name IS NULL", id)
+	// Keep the default predicate on the DELETE itself. The handler's earlier
+	// read is only for a friendly fast-path; another transaction may promote
+	// this channel before we reach the write.
+	result, err := tx.Exec(`
+		DELETE FROM channels
+		WHERE id = ? AND plugin_name IS NULL AND COALESCE(is_default, false) = false
+	`, id)
 	if err != nil {
 		return fmt.Errorf("failed to delete channel: %w", err)
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
+		var isDefault bool
+		err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(is_default, false) FROM channels WHERE id = ?
+		`, id).Scan(&isDefault)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("inspect channel after rejected delete: %w", err)
+		}
+		if isDefault {
+			return ErrDefaultChannel
+		}
 		return ErrNotFound
+	}
+
+	// A deleted portal leaves no target for the mailboxes that fed it. Remove
+	// those intakes so the scheduler stops polling folders that can only fail.
+	if _, err := tx.Exec(
+		`DELETE FROM intakes WHERE portal_channel_id = ?`,
+		id,
+	); err != nil {
+		return fmt.Errorf("failed to delete intakes targeting channel %d: %w", id, err)
 	}
 
 	return nil
@@ -314,11 +438,47 @@ func (r *ChannelRepository) SetStatus(ctx context.Context, tx database.Tx, id in
 	return nil
 }
 
+// SetStatusIfConfigUnchanged enables/disables a channel only when the exact
+// config that the caller validated is still current. This closes the window
+// where a concurrent config edit could land between readiness validation and
+// the status mutation.
+func (r *ChannelRepository) SetStatusIfConfigUnchanged(ctx context.Context, tx database.Tx, id int, status, expectedConfig string) (bool, error) {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE channels SET status = ?, updated_at = ?
+		WHERE id = ? AND plugin_name IS NULL AND COALESCE(config, '{}') = ?
+	`, status, time.Now(), id, expectedConfig)
+	if err != nil {
+		return false, fmt.Errorf("conditionally update channel status: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count conditionally updated channel statuses: %w", err)
+	}
+	return rows > 0, nil
+}
+
 // UpdateConfig updates only the config column. Caller is responsible for any
 // merging or validation before passing the JSON in.
 func (r *ChannelRepository) UpdateConfig(ctx context.Context, tx database.Tx, id int, config string) error {
-	result, err := tx.Exec(`UPDATE channels SET config = ?, updated_at = ? WHERE id = ? AND plugin_name IS NULL`, config, time.Now(), id)
+	portalSlug, formSlug, err := configSlugValues(config)
 	if err != nil {
+		return fmt.Errorf("derive channel public slug: %w", err)
+	}
+	result, err := tx.Exec(`
+		UPDATE channels
+		SET config = ?,
+			public_slug = CASE
+				WHEN type = 'portal' AND direction = 'inbound' THEN ?
+				WHEN type = 'form' AND direction = 'inbound' THEN ?
+				ELSE NULL
+			END,
+			updated_at = ?
+		WHERE id = ? AND plugin_name IS NULL
+	`, config, nullableSlug(portalSlug), nullableSlug(formSlug), time.Now(), id)
+	if err != nil {
+		if isPublicSlugConstraintError(err) {
+			return ErrChannelSlugConflict
+		}
 		return fmt.Errorf("failed to update channel config: %w", err)
 	}
 	rowsAffected, _ := result.RowsAffected()
@@ -328,12 +488,56 @@ func (r *ChannelRepository) UpdateConfig(ctx context.Context, tx database.Tx, id
 	return nil
 }
 
+// UpdateConfigIfUnchanged performs an optimistic config write. It returns
+// false when another writer changed the raw config or status after the caller
+// loaded it, allowing the handler to report a conflict instead of racing a
+// readiness-validated enable against an incomplete config patch.
+func (r *ChannelRepository) UpdateConfigIfUnchanged(ctx context.Context, tx database.Tx, id int, expectedConfig, expectedStatus, config string) (bool, error) {
+	portalSlug, formSlug, err := configSlugValues(config)
+	if err != nil {
+		return false, fmt.Errorf("derive channel public slug: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE channels
+		SET config = ?,
+			public_slug = CASE
+				WHEN type = 'portal' AND direction = 'inbound' THEN ?
+				WHEN type = 'form' AND direction = 'inbound' THEN ?
+				ELSE NULL
+			END,
+			updated_at = ?
+		WHERE id = ? AND plugin_name IS NULL AND COALESCE(config, '{}') = ? AND status = ?
+	`, config, nullableSlug(portalSlug), nullableSlug(formSlug), time.Now(), id, expectedConfig, expectedStatus)
+	if err != nil {
+		if isPublicSlugConstraintError(err) {
+			return false, ErrChannelSlugConflict
+		}
+		return false, fmt.Errorf("conditionally update channel config: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count conditionally updated channel configs: %w", err)
+	}
+	return rowsAffected > 0, nil
+}
+
 // Exists checks if a channel exists
 func (r *ChannelRepository) Exists(ctx context.Context, id int) (bool, error) {
 	var exists bool
 	err := r.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?)", id).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("failed to check channel existence: %w", err)
+	}
+	return exists, nil
+}
+
+// CategoryExists validates the optional category FK before a write so API
+// callers receive a 400 instead of a backend-specific constraint error/500.
+func (r *ChannelRepository) CategoryExists(ctx context.Context, id int) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM channel_categories WHERE id = ?)", id).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check channel category: %w", err)
 	}
 	return exists, nil
 }
@@ -351,7 +555,7 @@ func (r *ChannelRepository) IsPluginManaged(ctx context.Context, id int) (bool, 
 // GetConfig retrieves the raw config JSON for a channel
 func (r *ChannelRepository) GetConfig(ctx context.Context, id int) (string, error) {
 	var config string
-	err := r.db.QueryRowContext(ctx, "SELECT config FROM channels WHERE id = ?", id).Scan(&config)
+	err := r.db.QueryRowContext(ctx, "SELECT COALESCE(config, '{}') FROM channels WHERE id = ?", id).Scan(&config)
 	if err != nil {
 		return "", notFoundOrWrap(err, "failed to get config")
 	}
@@ -419,27 +623,71 @@ func (r *ChannelRepository) FindManagers(ctx context.Context, channelID int) ([]
 }
 
 // AddManager adds a manager to a channel. ON CONFLICT DO NOTHING so re-adding
-// an existing (channel, type, id) row is a no-op rather than an error.
-func (r *ChannelRepository) AddManager(ctx context.Context, tx database.Tx, channelID int, managerType string, managerID, addedBy int) error {
+// an existing (channel, type, id) row is a no-op rather than an error. The
+// bool reports whether a new row was inserted.
+func (r *ChannelRepository) AddManager(ctx context.Context, tx database.Tx, channelID int, managerType string, managerID, addedBy int) (bool, error) {
 	now := time.Now()
-	_, err := tx.Exec(`
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO channel_managers (channel_id, manager_type, manager_id, added_by, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT DO NOTHING
 	`, channelID, managerType, managerID, addedBy, now, now)
 	if err != nil {
-		return fmt.Errorf("failed to add channel manager: %w", err)
+		return false, fmt.Errorf("failed to add channel manager: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count added channel managers: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// LockManagerSet serializes manager-count mutations for a channel. The no-op
+// UPDATE acquires a row/write lock on both supported databases without
+// changing user-visible data.
+func (r *ChannelRepository) LockManagerSet(ctx context.Context, tx database.Tx, channelID int) error {
+	result, err := tx.ExecContext(ctx, "UPDATE channels SET updated_at = updated_at WHERE id = ?", channelID)
+	if err != nil {
+		return fmt.Errorf("lock channel manager set: %w", err)
+	}
+	if n, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if n == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-// CountManagers returns the number of channel_managers rows for a channel.
-// Callers use this to enforce the "can't remove the last manager" rule
-// without racing against another concurrent remove (callers should hold the
-// same Tx for the check + the delete).
+// CountManagers returns the number of effective channel managers: direct
+// users and groups must still exist and be active. Callers use this after a
+// tentative delete to enforce the last-manager rule without letting stale or
+// deactivated assignments make an orphaned channel look managed.
 func (r *ChannelRepository) CountManagers(ctx context.Context, tx database.Tx, channelID int) (int, error) {
 	var n int
-	err := tx.QueryRow(`SELECT COUNT(*) FROM channel_managers WHERE channel_id = ?`, channelID).Scan(&n)
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM channel_managers cm
+		WHERE cm.channel_id = ?
+		  AND (
+			(cm.manager_type = 'user' AND EXISTS (
+				SELECT 1 FROM users u
+				WHERE u.id = cm.manager_id AND u.is_active = true
+			))
+			OR
+			(cm.manager_type = 'group' AND EXISTS (
+				SELECT 1
+				FROM groups g
+				WHERE g.id = cm.manager_id
+				  AND g.is_active = true
+				  AND EXISTS (
+					SELECT 1
+					FROM group_members gm
+					JOIN users u ON u.id = gm.user_id AND u.is_active = true
+					WHERE gm.group_id = g.id
+				  )
+			))
+		  )
+	`, channelID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count channel managers: %w", err)
 	}
@@ -533,38 +781,6 @@ func (r *ChannelRepository) scanChannelRow(row *sql.Row) (*models.Channel, error
 	return &channel, nil
 }
 
-// UpdatePortalSections loads a channel's config JSON, hands it to mutator
-// for in-place editing, and writes it back when mutator reports modified=true.
-// Errors are swallowed (best-effort cleanup, matching prior handler behavior).
-//
-// This is the consolidated form of what request_type and asset_report
-// handlers used to do separately: load config, walk PortalSections, mutate
-// the type-specific ID slice (RequestTypeIDs / AssetReportIDs), and save.
-// The mutator-callback shape lets each caller target the right field
-// without each repo carrying its own copy of the load/save dance.
-func (r *ChannelRepository) UpdatePortalSections(channelID int, mutator func(cfg *models.ChannelConfig) bool) {
-	var configStr string
-	err := r.db.QueryRow("SELECT config FROM channels WHERE id = ?", channelID).Scan(&configStr)
-	if err != nil || configStr == "" {
-		return
-	}
-	var config models.ChannelConfig
-	if err := json.Unmarshal([]byte(configStr), &config); err != nil {
-		return
-	}
-	if !mutator(&config) {
-		return
-	}
-	updated, err := json.Marshal(config)
-	if err != nil {
-		return
-	}
-	_, _ = r.db.ExecWrite(
-		"UPDATE channels SET config = ?, updated_at = ? WHERE id = ?",
-		string(updated), time.Now(), channelID,
-	)
-}
-
 // GetGroupName fetches a group's name. Used to enrich audit details on
 // channel-manager add/remove; returns empty string + nil if the row is
 // missing (caller treats that as "unknown group"). User-side equivalent
@@ -592,31 +808,72 @@ type ChannelDeleteImpact struct {
 	AssetReports           int `json:"asset_reports"`
 	PortalCustomerChannels int `json:"portal_customer_channels"`
 	EmailMessageTracking   int `json:"email_message_tracking"`
+	EmailReplyOutbox       int `json:"email_reply_outbox"`
+	EmailOAuthStates       int `json:"email_oauth_states"`
+	EmailCredentialLeases  int `json:"email_credential_leases"`
+	EmailProcessingLeases  int `json:"email_processing_leases"`
+	EmailChannelState      int `json:"email_channel_state"`
+	WebhookDeliveries      int `json:"webhook_deliveries"`
+	ChannelManagers        int `json:"channel_managers"`
+	PortalRequestDrafts    int `json:"portal_request_drafts"`
+	PortalMagicLinks       int `json:"portal_magic_links"`
+	PortalSessions         int `json:"portal_sessions"`
 	Items                  int `json:"items"`
+	// IntakeTargets counts intakes that feed this channel as a portal target.
+	// They are removed by the delete so they do not outlive their target.
+	IntakeTargets int `json:"intake_targets"`
 }
 
 // GetDeleteImpact gathers row counts for the cascading-or-orphaning tables
-// referenced by a channel. Best-effort: a missing table (older schema) yields
-// 0 rather than failing the whole call.
+// referenced by a channel. Any failed count aborts the preview so callers do
+// not present a dangerously incomplete impact summary.
 func (r *ChannelRepository) GetDeleteImpact(ctx context.Context, channelID int) (ChannelDeleteImpact, error) {
 	var out ChannelDeleteImpact
-	count := func(table, column string) int {
+	count := func(table, column string) (int, error) {
 		var n int
 		q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s = ?", table, column)
 		if err := r.db.QueryRowContext(ctx, q, channelID).Scan(&n); err != nil {
-			// Treat unknown-table / missing-column errors as "no rows"
-			// rather than failing the impact preview. The diagnostics UI
-			// degrades gracefully.
-			slog.Debug("delete-impact count failed", "table", table, "error", err)
-			return 0
+			return 0, fmt.Errorf("count %s for channel delete impact: %w", table, err)
 		}
-		return n
+		return n, nil
 	}
-	out.RequestTypes = count("request_types", "channel_id")
-	out.AssetReports = count("asset_reports", "channel_id")
-	out.PortalCustomerChannels = count("portal_customer_channels", "channel_id")
-	out.EmailMessageTracking = count("email_message_tracking", "channel_id")
-	out.Items = count("items", "channel_id")
+	counts := []struct {
+		table  string
+		target *int
+	}{
+		{table: "request_types", target: &out.RequestTypes},
+		{table: "asset_reports", target: &out.AssetReports},
+		{table: "portal_customer_channels", target: &out.PortalCustomerChannels},
+		{table: "email_message_tracking", target: &out.EmailMessageTracking},
+		{table: "email_reply_outbox", target: &out.EmailReplyOutbox},
+		{table: "email_oauth_state", target: &out.EmailOAuthStates},
+		{table: "email_credential_leases", target: &out.EmailCredentialLeases},
+		{table: "email_processing_leases", target: &out.EmailProcessingLeases},
+		{table: "email_channel_state", target: &out.EmailChannelState},
+		{table: "webhook_deliveries", target: &out.WebhookDeliveries},
+		{table: "channel_managers", target: &out.ChannelManagers},
+		{table: "portal_request_drafts", target: &out.PortalRequestDrafts},
+		{table: "portal_customer_magic_links", target: &out.PortalMagicLinks},
+		{table: "portal_customer_sessions", target: &out.PortalSessions},
+		{table: "items", target: &out.Items},
+	}
+	for _, item := range counts {
+		value, err := count(item.table, "channel_id")
+		if err != nil {
+			return ChannelDeleteImpact{}, err
+		}
+		*item.target = value
+	}
+
+	// Intakes link to a portal by portal_channel_id rather than channel_id, so
+	// count them separately.
+	var intakeTargets int
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM intakes WHERE portal_channel_id = ?
+	`, channelID).Scan(&intakeTargets); err != nil {
+		return ChannelDeleteImpact{}, fmt.Errorf("count intakes targeting channel %d: %w", channelID, err)
+	}
+	out.IntakeTargets = intakeTargets
 	return out, nil
 }
 
@@ -629,36 +886,89 @@ func (r *ChannelRepository) FindBadWorkspaceIDs(ids []int) ([]int, error) {
 	return NewWorkspaceRepository(r.db).FindMissingOrPersonal(ids)
 }
 
-// SlugInUse reports whether another enabled channel of the same type already
+// ChannelRequestTypeRoute contains the fields needed to validate a public
+// request type against its channel's current workspace routing.
+type ChannelRequestTypeRoute struct {
+	ID          int
+	Name        string
+	ItemTypeID  int
+	WorkspaceID *int
+}
+
+// ListRequestTypeRoutes returns every request type owned by a channel,
+// including legacy NULL workspace routes that resolve to the channel's first
+// configured workspace at runtime.
+func (r *ChannelRepository) ListRequestTypeRoutes(channelID int) ([]ChannelRequestTypeRoute, error) {
+	// The system Email request type's workspace is advisory (email intakes route
+	// by their own workspace), so it must not block a portal from dropping a
+	// workspace the intake links can still be re-pointed away from.
+	rows, err := r.db.Query(
+		`SELECT id, name, item_type_id, workspace_id FROM request_types
+		 WHERE channel_id = ? AND COALESCE(kind, '') <> 'email'`,
+		channelID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query request types for channel %d: %w", channelID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var routes []ChannelRequestTypeRoute
+	for rows.Next() {
+		var route ChannelRequestTypeRoute
+		if err := rows.Scan(&route.ID, &route.Name, &route.ItemTypeID, &route.WorkspaceID); err != nil {
+			return nil, fmt.Errorf("scan request type: %w", err)
+		}
+		routes = append(routes, route)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate request types: %w", err)
+	}
+	return routes, nil
+}
+
+// SlugInUse reports whether another channel of the same type already
 // uses the given slug. excludeChannelID is the row currently being edited and
-// is ignored from the comparison. JSON-path syntax differs between SQLite
-// and Postgres; the field name is interpolated from a hardcoded mapping
-// (slugFieldFor), never from user input, so the format string is safe.
+// is ignored from the comparison. Config is decoded in Go instead of cast to
+// JSON in SQL: a malformed legacy row must not make every later slug update
+// fail (Postgres's text-to-jsonb cast and SQLite's json_extract both error).
 func (r *ChannelRepository) SlugInUse(ctx context.Context, channelType, slug string, excludeChannelID int) (bool, error) {
 	field := slugFieldFor(channelType)
 	if field == "" {
 		return false, nil
 	}
-	var jsonExpr string
-	switch r.db.GetDriverName() {
-	case "postgres":
-		jsonExpr = fmt.Sprintf("config::jsonb ->> '%s'", field)
-	default:
-		jsonExpr = fmt.Sprintf("json_extract(config, '$.%s')", field)
-	}
-	query := fmt.Sprintf(`
-		SELECT EXISTS(
-			SELECT 1 FROM channels
-			WHERE type = ? AND status = 'enabled' AND id <> ?
-			  AND %s = ?
-		)
-	`, jsonExpr)
-	var found bool
-	err := r.db.QueryRowContext(ctx, query, channelType, excludeChannelID, slug).Scan(&found)
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, COALESCE(config, '{}')
+		FROM channels
+		WHERE type = ? AND direction = 'inbound' AND id <> ?
+	`, channelType, excludeChannelID)
 	if err != nil {
 		return false, fmt.Errorf("check slug uniqueness: %w", err)
 	}
-	return found, nil
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var channelID int
+		var raw string
+		if err := rows.Scan(&channelID, &raw); err != nil {
+			return false, fmt.Errorf("scan slug candidate: %w", err)
+		}
+		var cfg models.ChannelConfig
+		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+			slog.Warn("ignoring malformed legacy channel config during slug uniqueness check",
+				"channel_id", channelID, "channel_type", channelType, "error", err)
+			continue
+		}
+		candidate := cfg.PortalSlug
+		if field == "form_slug" {
+			candidate = cfg.FormSlug
+		}
+		if candidate == slug {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate slug candidates: %w", err)
+	}
+	return false, nil
 }
 
 // slugFieldFor maps a channel type to the JSON config key that holds its
@@ -674,14 +984,61 @@ func slugFieldFor(channelType string) string {
 	}
 }
 
-// GroupExists reports whether a row exists in the groups table for groupID.
+func publicSlugForConfig(channelType, direction, config string) (string, error) {
+	portalSlug, formSlug, err := configSlugValues(config)
+	if err != nil {
+		return "", err
+	}
+	if direction != "inbound" || (channelType != "portal" && channelType != "form") {
+		return "", nil
+	}
+	if channelType == "portal" {
+		return portalSlug, nil
+	}
+	return formSlug, nil
+}
+
+func configSlugValues(config string) (portalSlug, formSlug string, err error) {
+	if strings.TrimSpace(config) == "" {
+		config = "{}"
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(config), &object); err != nil {
+		return "", "", err
+	}
+	if object == nil {
+		return "", "", fmt.Errorf("channel configuration must be a JSON object")
+	}
+	var cfg models.ChannelConfig
+	if err := json.Unmarshal([]byte(config), &cfg); err != nil {
+		return "", "", err
+	}
+	return cfg.PortalSlug, cfg.FormSlug, nil
+}
+
+func nullableSlug(slug string) any {
+	if slug == "" {
+		return nil
+	}
+	return slug
+}
+
+func isPublicSlugConstraintError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "uq_channels_public_slug") ||
+		strings.Contains(message, "channels.type, channels.public_slug")
+}
+
+// GroupExists reports whether an active row exists in the groups table for
+// groupID. Inactive groups cannot confer channel-management authority and
+// therefore cannot be assigned as effective managers.
 // AddChannelManager uses this to fail fast with a clear 400 instead of
 // relying on a deferred FK-violation string match (which differs between
 // SQLite and Postgres).
 func (r *ChannelRepository) GroupExists(ctx context.Context, groupID int) (bool, error) {
 	var n int
 	err := r.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM groups WHERE id = ?`, groupID,
+		`SELECT COUNT(*) FROM groups WHERE id = ? AND is_active = true`, groupID,
 	).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("check group exists: %w", err)
@@ -694,6 +1051,7 @@ func (r *ChannelRepository) GroupExists(ctx context.Context, groupID int) (bool,
 // LastCheckedAt is nullable; nil means "never polled".
 type EmailChannelState struct {
 	LastUID       int
+	UIDValidity   uint32
 	LastCheckedAt *time.Time
 	ErrorCount    int
 	LastError     string
@@ -707,9 +1065,9 @@ func (r *ChannelRepository) GetEmailChannelState(ctx context.Context, channelID 
 	var lastCheckedAt sql.NullTime
 	var lastError sql.NullString
 	err := r.db.QueryRowContext(ctx,
-		"SELECT last_uid, last_checked_at, error_count, last_error FROM email_channel_state WHERE channel_id = ?",
+		"SELECT last_uid, COALESCE(uid_validity, 0), last_checked_at, error_count, last_error FROM email_channel_state WHERE channel_id = ?",
 		channelID,
-	).Scan(&state.LastUID, &lastCheckedAt, &state.ErrorCount, &lastError)
+	).Scan(&state.LastUID, &state.UIDValidity, &lastCheckedAt, &state.ErrorCount, &lastError)
 	if err != nil {
 		return nil, notFoundOrWrap(err, fmt.Sprintf("get email_channel_state for channel %d", channelID))
 	}
@@ -732,6 +1090,7 @@ type EmailMessageRow struct {
 	ItemID              *int
 	CommentID           *int
 	ProcessedAt         time.Time
+	RateLimitedAt       *time.Time
 	WorkspaceID         *int
 	WorkspaceItemNumber int
 	WorkspaceKey        string
@@ -764,11 +1123,11 @@ func (r *ChannelRepository) ListEmailMessages(ctx context.Context, channelID int
 
 	whereClause, args := emailMessageWhere(channelID, search)
 	offset := (page - 1) * pageSize
-	queryArgs := append([]interface{}{}, args...)
+	queryArgs := append([]any{}, args...)
 	queryArgs = append(queryArgs, pageSize, offset)
 
 	rows, err := r.db.QueryContext(ctx,
-		"SELECT emt.id, emt.from_email, emt.from_name, emt.subject, emt.item_id, emt.comment_id, emt.processed_at, i.workspace_item_number, i.workspace_id, w.key as workspace_key "+
+		"SELECT emt.id, emt.from_email, emt.from_name, COALESCE(emt.subject, ''), emt.item_id, emt.comment_id, emt.processed_at, emt.rate_limited_at, i.workspace_item_number, i.workspace_id, w.key as workspace_key "+
 			"FROM email_message_tracking emt "+
 			"LEFT JOIN items i ON emt.item_id = i.id "+
 			"LEFT JOIN workspaces w ON i.workspace_id = w.id "+
@@ -786,11 +1145,16 @@ func (r *ChannelRepository) ListEmailMessages(ctx context.Context, channelID int
 		var msg EmailMessageRow
 		var itemID, commentID, workspaceID, workspaceItemNumber sql.NullInt64
 		var fromName, workspaceKey sql.NullString
-		if err := rows.Scan(&msg.ID, &msg.FromEmail, &fromName, &msg.Subject, &itemID, &commentID, &msg.ProcessedAt, &workspaceItemNumber, &workspaceID, &workspaceKey); err != nil {
+		var rateLimitedAt sql.NullTime
+		if err := rows.Scan(&msg.ID, &msg.FromEmail, &fromName, &msg.Subject, &itemID, &commentID, &msg.ProcessedAt, &rateLimitedAt, &workspaceItemNumber, &workspaceID, &workspaceKey); err != nil {
 			return nil, fmt.Errorf("scan email_message_tracking row: %w", err)
 		}
 		if fromName.Valid {
 			msg.FromName = fromName.String
+		}
+		if rateLimitedAt.Valid {
+			t := rateLimitedAt.Time
+			msg.RateLimitedAt = &t
 		}
 		if itemID.Valid {
 			v := int(itemID.Int64)
@@ -818,9 +1182,9 @@ func (r *ChannelRepository) ListEmailMessages(ctx context.Context, channelID int
 	return out, nil
 }
 
-func emailMessageWhere(channelID int, search string) (whereClause string, args []interface{}) {
+func emailMessageWhere(channelID int, search string) (whereClause string, args []any) {
 	whereClause = "WHERE emt.channel_id = ?"
-	args = []interface{}{channelID}
+	args = []any{channelID}
 	if search != "" {
 		searchPattern := "%" + search + "%"
 		whereClause += " AND (emt.from_email LIKE ? OR emt.from_name LIKE ? OR emt.subject LIKE ?)"
@@ -829,14 +1193,304 @@ func emailMessageWhere(channelID int, search string) (whereClause string, args [
 	return whereClause, args
 }
 
-// CreateOAuthState records an in-flight OAuth state for a channel-level
-// OAuth flow. provider_id is fixed to 0 (the provider-flow uses non-zero).
-// expiresAt is a hard cutoff the consume call enforces.
-func (r *ChannelRepository) CreateOAuthState(ctx context.Context, state string, channelID, userID int, expiresAt time.Time) error {
+// CountRateLimitedEmails returns how many tracking rows for a channel were
+// declined by per-sender flood protection and are awaiting operator requeue.
+func (r *ChannelRepository) CountRateLimitedEmails(ctx context.Context, channelID int) (int, error) {
+	var total int
+	if err := r.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM email_message_tracking WHERE channel_id = ? AND rate_limited_at IS NOT NULL",
+		channelID,
+	).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count rate-limited email_message_tracking for channel %d: %w", channelID, err)
+	}
+	return total, nil
+}
+
+// GetEarliestRateLimitedUID returns the lowest IMAP UID among rate-limited
+// messages recorded in the given UIDVALIDITY epoch. ok is false when there is
+// nothing to requeue. UIDs from older epochs are ignored: they are meaningless
+// in the current one, and an epoch change already resets the watermark to 0.
+func (r *ChannelRepository) GetEarliestRateLimitedUID(ctx context.Context, channelID int, uidValidity uint32) (uid int, ok bool, err error) {
+	var minUID sql.NullInt64
+	err = r.db.QueryRowContext(ctx, `
+		SELECT MIN(uid) FROM email_message_tracking
+		WHERE channel_id = ? AND intake_id IS NULL AND rate_limited_at IS NOT NULL AND uid_validity = ? AND uid > 0
+	`, channelID, int64(uidValidity)).Scan(&minUID)
+	if err != nil {
+		return 0, false, fmt.Errorf("find earliest rate-limited email for channel %d: %w", channelID, err)
+	}
+	if !minUID.Valid {
+		return 0, false, nil
+	}
+	return int(minUID.Int64), true, nil
+}
+
+// GetEarliestRateLimitedUIDForIntake is the per-intake equivalent of
+// GetEarliestRateLimitedUID: it looks only at rows this intake ingested.
+func (r *ChannelRepository) GetEarliestRateLimitedUIDForIntake(ctx context.Context, intakeID int, uidValidity uint32) (uid int, ok bool, err error) {
+	var minUID sql.NullInt64
+	err = r.db.QueryRowContext(ctx, `
+		SELECT MIN(uid) FROM email_message_tracking
+		WHERE intake_id = ? AND rate_limited_at IS NOT NULL AND uid_validity = ? AND uid > 0
+	`, intakeID, int64(uidValidity)).Scan(&minUID)
+	if err != nil {
+		return 0, false, fmt.Errorf("find earliest rate-limited email for intake %d: %w", intakeID, err)
+	}
+	if !minUID.Valid {
+		return 0, false, nil
+	}
+	return int(minUID.Int64), true, nil
+}
+
+// RequeueRateLimitedClaims invalidates the preclaim window on a channel's
+// rate-limited tracking rows so the next poll reclaims and reprocesses them
+// instead of deferring behind the 5-minute stale-claim lease. The
+// rate_limited_at marker stays until the message is genuinely reprocessed, so
+// the operator log keeps reporting it as waiting. Returns how many rows were
+// reset. Only rows in the given UIDVALIDITY epoch are touched: an older
+// epoch cannot be re-fetched by an IMAP watermark rewind.
+func (r *ChannelRepository) RequeueRateLimitedClaims(ctx context.Context, channelID int, uidValidity uint32) (int, error) {
+	res, err := r.db.ExecWriteContext(ctx, `
+		UPDATE email_message_tracking
+		SET processed_at = ?
+		WHERE channel_id = ? AND intake_id IS NULL AND rate_limited_at IS NOT NULL AND uid_validity = ? AND uid > 0
+		  AND item_id IS NULL AND comment_id IS NULL
+	`, time.Unix(0, 0).UTC(), channelID, int64(uidValidity))
+	if err != nil {
+		return 0, fmt.Errorf("reset rate-limited claims for channel %d: %w", channelID, err)
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count reset rate-limited claims for channel %d: %w", channelID, err)
+	}
+	return int(count), nil
+}
+
+// RequeueRateLimitedClaimsForIntake is the per-intake equivalent of
+// RequeueRateLimitedClaims.
+func (r *ChannelRepository) RequeueRateLimitedClaimsForIntake(ctx context.Context, intakeID int, uidValidity uint32) (int, error) {
+	res, err := r.db.ExecWriteContext(ctx, `
+		UPDATE email_message_tracking
+		SET processed_at = ?
+		WHERE intake_id = ? AND rate_limited_at IS NOT NULL AND uid_validity = ? AND uid > 0
+		  AND item_id IS NULL AND comment_id IS NULL
+	`, time.Unix(0, 0).UTC(), intakeID, int64(uidValidity))
+	if err != nil {
+		return 0, fmt.Errorf("reset rate-limited claims for intake %d: %w", intakeID, err)
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count reset rate-limited claims for intake %d: %w", intakeID, err)
+	}
+	return int(count), nil
+}
+
+// ResetEmailWatermarkToUID rewinds the channel's poll watermark so the next
+// IMAP poll re-fetches from lastUID onward, and clears the poison-message
+// tracker so a fresh retry starts unblocked. A channel that has never polled
+// has no state row and nothing to rewind.
+func (r *ChannelRepository) ResetEmailWatermarkToUID(ctx context.Context, channelID, lastUID int) error {
+	if lastUID < 0 {
+		lastUID = 0
+	}
 	if _, err := r.db.ExecWriteContext(ctx, `
-		INSERT INTO email_oauth_state (provider_id, channel_id, state, user_id, expires_at)
-		VALUES (0, ?, ?, ?, ?)
-	`, channelID, state, userID, expiresAt); err != nil {
+		UPDATE email_channel_state
+		SET last_uid = ?, failed_message_uid = 0, failed_message_uid_validity = 0,
+		    failed_message_count = 0, updated_at = CURRENT_TIMESTAMP
+		WHERE channel_id = ?
+	`, lastUID, channelID); err != nil {
+		return fmt.Errorf("rewind email watermark for channel %d: %w", channelID, err)
+	}
+	return nil
+}
+
+// ResetIntakeWatermarkToUID rewinds one intake's per-folder watermark and
+// clears its poison tracker.
+func (r *ChannelRepository) ResetIntakeWatermarkToUID(ctx context.Context, intakeID, lastUID int) error {
+	if lastUID < 0 {
+		lastUID = 0
+	}
+	if _, err := r.db.ExecWriteContext(ctx, `
+		UPDATE email_intake_state
+		SET last_uid = ?, failed_message_uid = 0, failed_message_uid_validity = 0,
+		    failed_message_count = 0, updated_at = CURRENT_TIMESTAMP
+		WHERE intake_id = ?
+	`, lastUID, intakeID); err != nil {
+		return fmt.Errorf("rewind email watermark for intake %d: %w", intakeID, err)
+	}
+	return nil
+}
+
+// EmailReplyOutboxStatus narrows the reply-outbox listing. The zero value
+// lists everything the operator can still act on.
+type EmailReplyOutboxStatus string
+
+const (
+	EmailReplyOutboxPending   EmailReplyOutboxStatus = "pending"
+	EmailReplyOutboxDelivered EmailReplyOutboxStatus = "delivered"
+	EmailReplyOutboxDiscarded EmailReplyOutboxStatus = "discarded"
+	EmailReplyOutboxAll       EmailReplyOutboxStatus = "all"
+)
+
+// EmailReplyOutboxRow is one row of the outbound customer-reply queue as the
+// channel UI renders it. Bodies are deliberately excluded — the queue shows
+// envelope metadata and delivery state, never message content.
+type EmailReplyOutboxRow struct {
+	ID            int
+	CommentID     int
+	ItemID        int
+	ToEmail       string
+	ToName        string
+	Subject       string
+	AttemptCount  int
+	NextAttemptAt sql.NullTime
+	LastError     sql.NullString
+	DeliveredAt   sql.NullTime
+	DiscardedAt   sql.NullTime
+	CreatedAt     time.Time
+	WorkspaceID   *int
+	WorkspaceKey  string
+}
+
+func emailReplyOutboxStatusWhere(status EmailReplyOutboxStatus) string {
+	switch status {
+	case EmailReplyOutboxPending:
+		return " AND eo.delivered_at IS NULL AND eo.discarded_at IS NULL"
+	case EmailReplyOutboxDelivered:
+		return " AND eo.delivered_at IS NOT NULL"
+	case EmailReplyOutboxDiscarded:
+		return " AND eo.discarded_at IS NOT NULL"
+	default: // EmailReplyOutboxAll
+		return ""
+	}
+}
+
+// CountEmailReplies returns how many email_reply_outbox rows a channel has
+// for the given status filter.
+func (r *ChannelRepository) CountEmailReplies(ctx context.Context, channelID int, status EmailReplyOutboxStatus) (int, error) {
+	var total int
+	if err := r.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM email_reply_outbox eo WHERE eo.channel_id = ?"+emailReplyOutboxStatusWhere(status),
+		channelID,
+	).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count email_reply_outbox for channel %d: %w", channelID, err)
+	}
+	return total, nil
+}
+
+// ListEmailReplies returns a page of the channel's outbound reply queue,
+// pending rows first (oldest attempt first), then delivered/discarded.
+func (r *ChannelRepository) ListEmailReplies(ctx context.Context, channelID int, status EmailReplyOutboxStatus, page, pageSize int) ([]EmailReplyOutboxRow, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 50
+	}
+
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT eo.id, eo.comment_id, eo.item_id, eo.to_email, eo.to_name, eo.subject, eo.attempt_count, eo.next_attempt_at, eo.last_error, eo.delivered_at, eo.discarded_at, eo.created_at, i.workspace_id, w.key "+
+			"FROM email_reply_outbox eo "+
+			"LEFT JOIN items i ON eo.item_id = i.id "+
+			"LEFT JOIN workspaces w ON i.workspace_id = w.id "+
+			"WHERE eo.channel_id = ?"+emailReplyOutboxStatusWhere(status)+
+			" ORDER BY (eo.delivered_at IS NULL) DESC, eo.created_at DESC LIMIT ? OFFSET ?",
+		channelID, pageSize, (page-1)*pageSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list email_reply_outbox for channel %d: %w", channelID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []EmailReplyOutboxRow
+	for rows.Next() {
+		var row EmailReplyOutboxRow
+		var workspaceID sql.NullInt64
+		var workspaceKey sql.NullString
+		if err := rows.Scan(&row.ID, &row.CommentID, &row.ItemID, &row.ToEmail, &row.ToName, &row.Subject, &row.AttemptCount,
+			&row.NextAttemptAt, &row.LastError, &row.DeliveredAt, &row.DiscardedAt, &row.CreatedAt, &workspaceID, &workspaceKey); err != nil {
+			return nil, fmt.Errorf("scan email_reply_outbox row: %w", err)
+		}
+		if workspaceID.Valid {
+			v := int(workspaceID.Int64)
+			row.WorkspaceID = &v
+		}
+		if workspaceKey.Valid {
+			row.WorkspaceKey = workspaceKey.String
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate email_reply_outbox rows: %w", err)
+	}
+	return out, nil
+}
+
+// EmailReplyDiscardOutcome distinguishes what a discard found, so the
+// operator API can promise cancellation only when it actually took effect.
+type EmailReplyDiscardOutcome int
+
+const (
+	// EmailReplyDiscarded: the pending row was marked never-send.
+	EmailReplyDiscarded EmailReplyDiscardOutcome = iota
+	// EmailReplyNotDiscardable: the row is delivered, already discarded, or
+	// missing.
+	EmailReplyNotDiscardable
+	// EmailReplySending: a worker still holds the delivery lease, so the mail
+	// may already be crossing the SMTP boundary (WI-1573).
+	EmailReplySending
+)
+
+// DiscardEmailReply marks a pending outbound reply as never-send. A live
+// delivery lease reports EmailReplySending instead of pretending the mail
+// was canceled; delivered, already-discarded, and missing rows report
+// EmailReplyNotDiscardable.
+func (r *ChannelRepository) DiscardEmailReply(ctx context.Context, channelID, commentID int) (EmailReplyDiscardOutcome, error) {
+	res, err := r.db.ExecWriteContext(ctx, `
+		UPDATE email_reply_outbox
+		SET discarded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE channel_id = ? AND comment_id = ?
+		  AND delivered_at IS NULL AND discarded_at IS NULL
+		  AND (lease_owner IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
+	`, channelID, commentID)
+	if err != nil {
+		return EmailReplyNotDiscardable, fmt.Errorf("discard email_reply_outbox row %d: %w", commentID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return EmailReplyNotDiscardable, fmt.Errorf("count discarded email_reply_outbox rows: %w", err)
+	}
+	if rows > 0 {
+		return EmailReplyDiscarded, nil
+	}
+
+	// Classify the refusal: a live lease means the send may already be in
+	// progress; anything else is terminal or missing.
+	var delivered, discarded, lease sql.NullTime
+	err = r.db.QueryRowContext(ctx, `
+		SELECT delivered_at, discarded_at, next_attempt_at FROM email_reply_outbox
+		WHERE channel_id = ? AND comment_id = ?
+	`, channelID, commentID).Scan(&delivered, &discarded, &lease)
+	if errors.Is(err, sql.ErrNoRows) {
+		return EmailReplyNotDiscardable, nil
+	}
+	if err != nil {
+		return EmailReplyNotDiscardable, fmt.Errorf("load email_reply_outbox row %d: %w", commentID, err)
+	}
+	if !delivered.Valid && !discarded.Valid && lease.Valid && lease.Time.After(time.Now()) {
+		return EmailReplySending, nil
+	}
+	return EmailReplyNotDiscardable, nil
+}
+
+// CreateOAuthState records an in-flight OAuth state for a channel-level
+// OAuth flow. provider_id is NULL (the provider-flow uses non-zero).
+// expiresAt is a hard cutoff the consume call enforces.
+func (r *ChannelRepository) CreateOAuthState(ctx context.Context, state string, channelID, userID int, restoreChannelEnabled bool, expiresAt time.Time) error {
+	if _, err := r.db.ExecWriteContext(ctx, `
+		INSERT INTO email_oauth_state (provider_id, channel_id, state, user_id, restore_channel_enabled, expires_at)
+		VALUES (NULL, ?, ?, ?, ?, ?)
+	`, channelID, state, userID, restoreChannelEnabled, expiresAt); err != nil {
 		return fmt.Errorf("create email_oauth_state: %w", err)
 	}
 	return nil
@@ -845,18 +1499,34 @@ func (r *ChannelRepository) CreateOAuthState(ctx context.Context, state string, 
 // ConsumeOAuthState looks up an OAuth state row, returns its associated IDs,
 // and deletes the row in one call. Returns ErrNotFound when the state is
 // missing or already expired.
-func (r *ChannelRepository) ConsumeOAuthState(ctx context.Context, state string) (providerID, channelID, userID int, err error) {
-	err = r.db.QueryRowContext(ctx, `
-		SELECT provider_id, channel_id, user_id
-		FROM email_oauth_state
-		WHERE state = ? AND expires_at > CURRENT_TIMESTAMP
-	`, state).Scan(&providerID, &channelID, &userID)
-	if err != nil {
-		return 0, 0, 0, notFoundOrWrap(err, "get email_oauth_state")
+func (r *ChannelRepository) ConsumeOAuthState(ctx context.Context, state string, providerFlow bool) (providerID, channelID, userID int, restoreChannelEnabled bool, err error) {
+	type oauthState struct {
+		ProviderID            int
+		ChannelID             int
+		UserID                int
+		RestoreChannelEnabled bool
 	}
-	// Best-effort delete; the caller already has the data it needs.
-	_, _ = r.db.ExecWriteContext(ctx, `DELETE FROM email_oauth_state WHERE state = ?`, state)
-	return providerID, channelID, userID, nil
+	providerPredicate := "provider_id IS NULL"
+	if providerFlow {
+		providerPredicate = "provider_id IS NOT NULL"
+	}
+	row, err := database.WithTxResult(r.db, func(tx database.Tx) (oauthState, error) {
+		var out oauthState
+		query := fmt.Sprintf(`
+			DELETE FROM email_oauth_state
+			WHERE state = ? AND expires_at > CURRENT_TIMESTAMP AND %s
+			RETURNING COALESCE(provider_id, 0), channel_id, user_id, restore_channel_enabled
+		`, providerPredicate)
+		scanErr := tx.QueryRowContext(ctx, query, state).Scan(&out.ProviderID, &out.ChannelID, &out.UserID, &out.RestoreChannelEnabled)
+		if scanErr != nil {
+			return oauthState{}, notFoundOrWrap(scanErr, "consume email_oauth_state")
+		}
+		return out, nil
+	})
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	return row.ProviderID, row.ChannelID, row.UserID, row.RestoreChannelEnabled, nil
 }
 
 // ScrubChannelConfig removes sensitive fields from the configuration JSON
@@ -865,9 +1535,12 @@ func ScrubChannelConfig(configJSON string) string {
 		return ""
 	}
 
-	var config map[string]interface{}
+	var config map[string]any
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
-		return configJSON // Return as is if invalid JSON
+		return "{}"
+	}
+	if config == nil {
+		return "{}"
 	}
 
 	// Remove sensitive fields
@@ -881,7 +1554,7 @@ func ScrubChannelConfig(configJSON string) string {
 	// Re-marshal
 	scrubbed, err := json.Marshal(config)
 	if err != nil {
-		return configJSON
+		return "{}"
 	}
 	return string(scrubbed)
 }

@@ -1,17 +1,8 @@
-/**
- * Store for managing Time Entry state.
- * Uses Svelte 5 class-based reactive state pattern.
- * Centralizes worklogs, filters, and modal state.
- */
 import { api } from '../api.js';
-import { formatDateWithOptions } from '../utils/dateFormatter.js';
-
-function formatLocalDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
+import { getUserTimezone } from '../utils/dateFormatter.js';
+import { formatClockInZone, monthBoundsInZone } from '../utils/worklogTimezone.js';
+import { authStore } from './auth.svelte.js';
+import { workspacesStore } from './workspaces.svelte.js';
 
 class TimeEntryStore {
   // === Data ===
@@ -40,48 +31,34 @@ class TimeEntryStore {
 
   // === Derived Values ===
 
-  /**
-   * Get active projects.
-   */
   get activeProjects() {
     return this.projects.filter((p) => p.status === 'Active');
   }
 
-  /**
-   * Get projects filtered by customer.
-   */
   get filteredProjects() {
     return this.filters.customer_id
       ? this.activeProjects.filter((p) => p.customer_id === parseInt(this.filters.customer_id, 10))
       : this.activeProjects;
   }
 
-  /**
-   * Get filtered worklogs based on current filters.
-   */
   get filteredWorklogs() {
     return this.worklogs;
   }
 
-  /**
-   * Get total duration of filtered worklogs.
-   */
   get totalDuration() {
     return this.worklogs.reduce((sum, w) => sum + w.duration_minutes, 0);
   }
 
   // === Initialization ===
 
-  /**
-   * Initialize the store and load all data.
-   */
   async init() {
     this.loading = true;
     try {
-      // Set default date range to current month BEFORE loading worklogs
-      const now = new Date();
-      this.filters.date_from = formatLocalDate(new Date(now.getFullYear(), now.getMonth(), 1));
-      this.filters.date_to = formatLocalDate(new Date(now.getFullYear(), now.getMonth() + 1, 0));
+      // Default date range to the current month in the reporting timezone so
+      // client-side labels and server-side inclusion agree.
+      const { from, to } = monthBoundsInZone(getUserTimezone(authStore?.currentUser));
+      this.filters.date_from = from;
+      this.filters.date_to = to;
 
       await Promise.all([
         this.loadWorklogs(),
@@ -105,13 +82,23 @@ class TimeEntryStore {
   async loadWorklogs() {
     try {
       this.worklogsLoading = true;
-      this.worklogs = (await api.time.worklogs.getAll(this.filters)) || [];
+      this.worklogs = (await api.time.worklogs.getAll(this.dateFilters())) || [];
     } catch (err) {
       console.error('Failed to load worklogs:', err);
       this.worklogs = [];
     } finally {
       this.worklogsLoading = false;
     }
+  }
+
+  // Date filters travel with the reporting timezone the views group in, so
+  // the server interprets the civil range the same way the client displays it.
+  dateFilters() {
+    const { date_from, date_to, ...rest } = this.filters;
+    return {
+      ...rest,
+      ...(date_from || date_to ? { timezone: getUserTimezone(authStore?.currentUser) } : {}),
+    };
   }
 
   async loadCustomers() {
@@ -135,7 +122,7 @@ class TimeEntryStore {
   async loadWorkItems() {
     try {
       const result = await api.items.getAll({ limit: 100 });
-      this.workItems = result.items || [];
+      this.workItems = result.data ?? [];
     } catch (err) {
       console.error('Failed to load work items:', err);
       this.workItems = [];
@@ -144,7 +131,7 @@ class TimeEntryStore {
 
   async loadWorkspaces() {
     try {
-      this.workspaces = (await api.workspaces.getAll()) || [];
+      this.workspaces = (await workspacesStore.load()) || [];
     } catch (err) {
       console.error('Failed to load workspaces:', err);
       this.workspaces = [];
@@ -153,23 +140,14 @@ class TimeEntryStore {
 
   // === Filter Management ===
 
-  /**
-   * Set a filter value.
-   */
   setFilter(key, value) {
     this.filters[key] = value;
   }
 
-  /**
-   * Apply filters and reload worklogs.
-   */
   async applyFilters() {
     await this.loadWorklogs();
   }
 
-  /**
-   * Clear all filters.
-   */
   clearFilters() {
     this.filters = {
       customer_id: '',
@@ -182,9 +160,6 @@ class TimeEntryStore {
 
   // === Worklog CRUD ===
 
-  /**
-   * Create a new worklog.
-   */
   async createWorklog(data) {
     try {
       await api.time.worklogs.create(data);
@@ -195,9 +170,6 @@ class TimeEntryStore {
     }
   }
 
-  /**
-   * Update an existing worklog.
-   */
   async updateWorklog(id, data) {
     try {
       await api.time.worklogs.update(id, data);
@@ -208,9 +180,6 @@ class TimeEntryStore {
     }
   }
 
-  /**
-   * Delete a worklog.
-   */
   async deleteWorklog(worklog) {
     try {
       await api.time.worklogs.delete(worklog.id);
@@ -221,9 +190,6 @@ class TimeEntryStore {
     }
   }
 
-  /**
-   * Save worklog (create or update based on editingWorklog).
-   */
   async saveWorklog(data) {
     if (this.editingWorklog) {
       await this.updateWorklog(this.editingWorklog.id, data);
@@ -235,47 +201,29 @@ class TimeEntryStore {
 
   // === Modal Controls ===
 
-  /**
-   * Open time log modal for creating new entry.
-   */
   openTimeLogModal() {
     this.editingWorklog = null;
     this.showTimeLogModal = true;
   }
 
-  /**
-   * Open time log modal for editing existing entry.
-   */
   editWorklog(worklog) {
     this.editingWorklog = worklog;
     this.showTimeLogModal = true;
   }
 
-  /**
-   * Close time log modal.
-   */
   closeTimeLogModal() {
     this.showTimeLogModal = false;
     this.editingWorklog = null;
   }
 
-  /**
-   * Show onboarding wizard.
-   */
   openOnboarding() {
     this.showOnboarding = true;
   }
 
-  /**
-   * Close onboarding wizard.
-   */
   closeOnboarding() {
     this.showOnboarding = false;
   }
 
-  /**
-   * Handle onboarding completion.
-   */
   async handleOnboardingCompleted() {
     await Promise.all([this.loadCustomers(), this.loadProjects()]);
     this.showOnboarding = false;
@@ -283,21 +231,10 @@ class TimeEntryStore {
 
   // === Utility Methods ===
 
-  /**
-   * Format time from unix timestamp.
-   */
   formatTime(unixTimestamp) {
-    const date = new Date(unixTimestamp * 1000);
-    return formatDateWithOptions(date, {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
+    return formatClockInZone(unixTimestamp, getUserTimezone(authStore?.currentUser));
   }
 
-  /**
-   * Format duration in minutes to human-readable string.
-   */
   formatDuration(minutes) {
     const hours = Math.floor(minutes / 60);
     const mins = minutes % 60;
@@ -306,9 +243,6 @@ class TimeEntryStore {
     return `${hours}h ${mins}m`;
   }
 
-  /**
-   * Check if a project is over budget.
-   */
   isProjectOverBudget(worklog) {
     if (!worklog.project_max_hours || worklog.project_max_hours <= 0) return false;
     return (worklog.project_total_hours || 0) > worklog.project_max_hours;

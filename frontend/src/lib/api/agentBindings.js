@@ -5,8 +5,63 @@
 import { fetchAPI } from './core.js';
 
 export const agentBindings = {
+  /** List the member-safe Agent Studio catalog projection. */
+  listCatalog: (workspaceId) => fetchAPI(`/workspaces/${workspaceId}/agent-profiles`),
+
+  /** List the approved immutable templates available to workspace admins. */
+  listTemplates: (workspaceId) => fetchAPI(`/workspaces/${workspaceId}/agent-templates`),
+
+  /** Create an Agent Studio profile as a Draft. */
+  createProfile: (workspaceId, body) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-profiles`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Edit mutable overview fields with optimistic profile-version checking. */
+  updateProfile: (workspaceId, id, body) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-profiles/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  /** Move a grandfathered Legacy local profile to an authorized runner. */
+  migrateLegacyProfile: (workspaceId, id, targetPoolId) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-profiles/${id}/migrate-runner`, {
+      method: 'POST',
+      body: JSON.stringify({ target_pool_id: Number(targetPoolId) }),
+    }),
+
+  /** Authorize the first runner pool for an incomplete Coding Draft. */
+  connectCodingRunner: (workspaceId, id, targetPoolId) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-profiles/${id}/connect-runner`, {
+      method: 'POST',
+      body: JSON.stringify({ target_pool_id: Number(targetPoolId) }),
+    }),
+
+  /** Run a private Standard test or queue a bounded Coding verification. */
+  testProfile: (workspaceId, id, prompt = '') =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-profiles/${id}/test`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt }),
+    }),
+
+  /** Check current dependencies without changing the profile lifecycle. */
+  validateProfile: (workspaceId, id) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-profiles/${id}/validation`),
+
+  /** Promote a valid Draft or Paused profile to Ready. */
+  activateProfile: (workspaceId, id) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-profiles/${id}/ready`, {
+      method: 'POST',
+    }),
+
   /** List bindings configured in a workspace. */
   listForWorkspace: (workspaceId) => fetchAPI(`/workspaces/${workspaceId}/agent-bindings`),
+
+  /** Fetch the effective server-managed prompt, including runtime overrides. */
+  getStandardPrompt: (workspaceId) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-bindings/standard-prompt`),
 
   /**
    * Create a binding. The acting identity is validated server-side by
@@ -39,6 +94,12 @@ export const agentBindings = {
       method: 'DELETE',
     }),
 
+  /** Restore an archived profile as Draft with its stable identity/history. */
+  restore: (workspaceId, id) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-bindings/${id}/restore`, {
+      method: 'POST',
+    }),
+
   /**
    * Rewrite the binding's prompt-shaping config: custom instructions (the
    * persona appended to the run's initial prompt) + attached skill ids
@@ -66,7 +127,7 @@ export const agentBindings = {
    * @param {number} id
    * @param {{ repos?: object[], llm_connection_id?: number, token_scopes?: string[],
    *   token_ttl_minutes?: number, max_runs_per_day?: number, instructions?: string,
-   *   runner_image?: string, skill_ids?: number[] }} body
+   *   capability_groups?: string[], runner_image?: string, skill_ids?: number[] }} body
    */
   update: (workspaceId, id, body) =>
     fetchAPI(`/workspaces/${workspaceId}/agent-bindings/${id}`, {
@@ -74,42 +135,24 @@ export const agentBindings = {
       body: JSON.stringify(body),
     }),
 
-  /**
-   * Round-trip a prompt through the binding's LLM connection and return the
-   * model's reply, plus — when the binding is repo-backed — a snapshot of the
-   * cloned worktree's project root:
-   *   { prompt, answer, repo?: { repo_slug, base_ref, entries: [{name, is_dir}], error? } }
-   * A blank prompt uses a server default. 502 means the provider/connection
-   * failed; 400 means the binding has no LLM connection. The repo block is
-   * reported inline (its own `error`) so a working model reply still returns
-   * even when the SCM/clone leg is broken; `repo` is absent for bindings with
-   * no repo configured.
-   */
+  /** Test a binding's LLM, optionally including its cloned-root snapshot. A
+   * repo error does not discard a working reply; blank prompts use a default. */
   testLLM: (workspaceId, id, prompt) =>
     fetchAPI(`/workspaces/${workspaceId}/agent-bindings/${id}/test-llm`, {
       method: 'POST',
       body: JSON.stringify(prompt ? { prompt } : {}),
     }),
 
-  /**
-   * Provision a real, ephemeral coding-agent container run for the binding —
-   * the same machinery a work-item assignment drives, but with no work item and
-   * a read-only prompt, marked so it can never push a branch or open a PR. Use
-   * it to verify the full chain end-to-end: model reachable + repo checked out +
-   * the agent can read its files. Returns { run_id }; watch it via the agentRuns
-   * events endpoints. 400 = binding has no repo; 409 = runner not configured on
-   * this server; 404 = no such binding.
-   */
+  /** Run an ephemeral read-only binding check: no work item, branch, or PR. */
   testRun: (workspaceId, id) =>
     fetchAPI(`/workspaces/${workspaceId}/agent-bindings/${id}/test-run`, {
       method: 'POST',
     }),
 
-  /**
-   * List the acting-identity options the workspace admin may pick:
-   * owned agent users + allowlisted centralized service users (when the
-   * WI-87 master flag is on). The chokepoint re-validates at create
-   * time; this just keeps the picker honest.
-   */
+  /** List candidate identities; creation revalidates this advisory picker. */
   getCandidates: (workspaceId) => fetchAPI(`/workspaces/${workspaceId}/agent-binding-candidates`),
+
+  /** List the canonical capability groups exposed by the Standard runtime. */
+  listToolCapabilities: (workspaceId) =>
+    fetchAPI(`/workspaces/${workspaceId}/agent-tool-capabilities`),
 };

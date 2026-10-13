@@ -1,5 +1,10 @@
 <script>
-  import { Sun, Moon, Palette, Type, Ruler, Square, TextCursor, AlertCircle, List, AlignLeft, FormInput, Search, Loader, MessageCircle, Tag, CircleDot, Inbox, PanelTop, Columns3, Navigation, Link2, ChevronsLeftRight, Layers, ChevronDown, Menu, Hash, MousePointer, Sliders, Building, Users, Shield, Folder, AtSign, Flag, Grid, FileText, BarChart3, BadgeCheck, Disc, MousePointer2 } from '@lucide/svelte'
+  import { Sun, Moon, Palette, Type, Ruler, Square, TextCursor, AlertCircle, List, AlignLeft, FormInput, Search, Loader, MessageCircle, Tag, CircleDot, Inbox, PanelTop, Columns3, Navigation, Link2, ChevronsLeftRight, Layers, ChevronDown, Hash, MousePointer, Sliders, Building, Users, AtSign, Grid, FileText, BarChart3, BadgeCheck, Disc, MousePointer2, LayoutDashboard, ClipboardPenLine } from '@lucide/svelte'
+
+  // Composition Examples
+  import BoardExample from './pages/BoardExample.svelte'
+  import FormExample from './pages/FormExample.svelte'
+  import IconNavigationLab from './pages/IconNavigationLab.svelte'
 
   // Token Pages
   import Colors from './pages/Colors.svelte'
@@ -59,8 +64,13 @@
   import FieldSelectorPage from './pages/FieldSelectorPage.svelte'
   import MentionPickerPage from './pages/MentionPickerPage.svelte'
 
-  let currentPage = $state('colors')
+  let currentPage = $state(window.location.hash.slice(1) || 'board-example')
   let colorMode = $state('light')
+
+  function selectPage(pageId) {
+    currentPage = pageId
+    window.history.replaceState(null, '', `#${pageId}`)
+  }
 
   function toggleColorMode() {
     colorMode = colorMode === 'light' ? 'dark' : 'light'
@@ -68,6 +78,14 @@
   }
 
   const navGroups = [
+    {
+      title: 'Examples',
+      items: [
+        { id: 'board-example', label: 'Board', icon: LayoutDashboard },
+        { id: 'form-example', label: 'Form', icon: ClipboardPenLine },
+        { id: 'icon-navigation-lab', label: 'Icon navigation lab', icon: Grid },
+      ]
+    },
     {
       title: 'Design Tokens',
       items: [
@@ -184,15 +202,16 @@
           </h2>
           <ul class="space-y-1">
             {#each group.items as item}
+              {@const NavigationIcon = item.icon}
               <li>
                 <button
-                  onclick={() => currentPage = item.id}
+                  onclick={() => selectPage(item.id)}
                   class="w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors"
                   style={currentPage === item.id
                     ? 'background-color: var(--ds-surface-selected); color: var(--ds-text);'
                     : 'color: var(--ds-text-subtle);'}
                 >
-                  <svelte:component this={item.icon} class="w-4 h-4" />
+                  <NavigationIcon class="w-4 h-4" />
                   {item.label}
                 </button>
               </li>
@@ -222,7 +241,13 @@
 
   <!-- Main Content -->
   <main class="flex-1 overflow-y-auto">
-    {#if currentPage === 'colors'}
+    {#if currentPage === 'board-example'}
+      <BoardExample />
+    {:else if currentPage === 'form-example'}
+      <FormExample />
+    {:else if currentPage === 'icon-navigation-lab'}
+      <IconNavigationLab />
+    {:else if currentPage === 'colors'}
       <Colors />
     {:else if currentPage === 'typography'}
       <Typography />

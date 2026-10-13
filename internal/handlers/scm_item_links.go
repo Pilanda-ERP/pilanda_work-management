@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"windshift/internal/database"
@@ -25,7 +26,9 @@ type SCMItemLinksHandler struct {
 	db                database.Database
 	encryption        *sso.SecretEncryption
 	syncService       *scm.SyncService
+	webhookRepo       *repository.SCMWebhookRepository
 	permissionService *services.PermissionService
+	baseURL           string
 }
 
 // getItemURL constructs the URL to an item based on the request context
@@ -98,12 +101,14 @@ type CreateBranchForItemResponse struct {
 }
 
 // NewSCMItemLinksHandler creates a new item SCM links handler
-func NewSCMItemLinksHandler(db database.Database, encryption *sso.SecretEncryption, permissionService *services.PermissionService) *SCMItemLinksHandler {
+func NewSCMItemLinksHandler(db database.Database, encryption *sso.SecretEncryption, permissionService *services.PermissionService, baseURL string) *SCMItemLinksHandler {
 	return &SCMItemLinksHandler{
 		db:                db,
 		encryption:        encryption,
 		syncService:       scm.NewSyncService(db, encryption),
+		webhookRepo:       repository.NewSCMWebhookRepository(db),
 		permissionService: permissionService,
+		baseURL:           strings.TrimRight(baseURL, "/"),
 	}
 }
 
@@ -178,7 +183,7 @@ func (h *SCMItemLinksHandler) GetItemSCMLinks(w http.ResponseWriter, r *http.Req
 			link.DetectionSource = detectionSource.String
 		}
 
-		// Track if there are OAuth PR links that need background refresh
+		// Refresh non-merged OAuth PR links after the response completes.
 		if link.AuthMethod == string(models.SCMAuthMethodOAuth) && link.LinkType == "pull_request" && link.State != "merged" {
 			hasOAuthPRLinks = true
 		}
@@ -192,13 +197,7 @@ func (h *SCMItemLinksHandler) GetItemSCMLinks(w http.ResponseWriter, r *http.Req
 
 	respondJSONOK(w, links)
 
-	// Fire background refresh for OAuth PR links if the user is authenticated.
-	// Detach from the request context: r.Context() is canceled the moment
-	// ServeHTTP returns (which is immediately, since the response is already
-	// flushed above), so a child of it would be canceled before the provider
-	// round-trip completes — leaving OAuth-connection links (the only kind
-	// refreshed on-view; both background schedulers skip OAuth) permanently
-	// stale. WithoutCancel keeps request-scoped values but drops cancellation.
+	// Preserve request values but detach cancellation so the OAuth refresh can finish after the response.
 	if hasOAuthPRLinks {
 		if user := utils.GetCurrentUser(r); user != nil {
 			detached := context.WithoutCancel(r.Context())
@@ -230,17 +229,13 @@ func (h *SCMItemLinksHandler) CreateItemSCMLink(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	// Title + AuthorName render in item link chips and the SCM panel;
-	// State is a short status string (e.g. "open", "merged"). External
-	// URL/ID stay raw — they're SCM-side identifiers validated by the
-	// integration.
+	// Sanitize fields rendered in the item and SCM views; SCM identifiers stay raw.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: &req.Title, Policy: sanitize.PlainTextField, Label: "Title"},
 		sanitize.Pair{Target: &req.AuthorName, Policy: sanitize.PlainTextField, Label: "Author name"},
 		sanitize.Pair{Target: &req.State, Policy: sanitize.ShortIdentifier, Label: "State"},
 	)
 
-	// Validate required fields
 	if req.WorkspaceRepositoryID == 0 {
 		respondValidationError(w, r, "workspace_repository_id is required")
 		return
@@ -254,7 +249,6 @@ func (h *SCMItemLinksHandler) CreateItemSCMLink(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Validate link type
 	linkType := models.SCMLinkType(req.LinkType)
 	if linkType != models.SCMLinkTypePullRequest &&
 		linkType != models.SCMLinkTypeCommit &&
@@ -263,7 +257,6 @@ func (h *SCMItemLinksHandler) CreateItemSCMLink(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Verify item exists
 	exists, err := repository.NewItemRepository(h.db).Exists(itemID)
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to verify item: %w", err))
@@ -274,7 +267,6 @@ func (h *SCMItemLinksHandler) CreateItemSCMLink(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Verify workspace repository exists and get workspace to verify item belongs to same workspace
 	var repoWorkspaceID, itemWorkspaceID int
 	err = h.db.QueryRow(`
 		SELECT wsc.workspace_id
@@ -302,7 +294,6 @@ func (h *SCMItemLinksHandler) CreateItemSCMLink(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Insert the link
 	var id int64
 	err = h.db.QueryRow(`
 		INSERT INTO item_scm_links (
@@ -313,12 +304,11 @@ func (h *SCMItemLinksHandler) CreateItemSCMLink(w http.ResponseWriter, r *http.R
 		nullString(req.ExternalURL), nullString(req.Title), nullString(req.State), nullString(req.AuthorName)).Scan(&id)
 	if err != nil {
 		slog.Error("failed to create link", slog.String("component", "scm_item_links"), slog.Any("error", err))
-		// Check for unique constraint violation
+		// Duplicate links are reported as a conflict.
 		respondConflict(w, r, "Failed to create SCM link. It may already exist.")
 		return
 	}
 
-	// Get the created link
 	link, err := h.getLinkByID(int(id))
 	if err != nil {
 		slog.Error("failed to get created link", slog.String("component", "scm_item_links"), slog.Any("error", err))
@@ -328,7 +318,7 @@ func (h *SCMItemLinksHandler) CreateItemSCMLink(w http.ResponseWriter, r *http.R
 
 	// Live-update publish (WI-484): the SCM-links detail section is separate from
 	// the generic linked-items section, so announce the change for both.
-	services.PublishItemChange(itemID, services.ItemChangeLink)
+	services.PublishItemChange(itemID)
 
 	respondJSONCreated(w, struct {
 		*ItemSCMLinkResponse
@@ -350,7 +340,6 @@ func (h *SCMItemLinksHandler) DeleteItemSCMLink(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Look up item for permission check
 	itemID, err := h.getItemIDForLink(linkID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -373,7 +362,7 @@ func (h *SCMItemLinksHandler) DeleteItemSCMLink(w http.ResponseWriter, r *http.R
 	}
 
 	// Live-update publish (WI-484): itemID captured before the delete.
-	services.PublishItemChange(itemID, services.ItemChangeLink)
+	services.PublishItemChange(itemID)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -385,7 +374,6 @@ func (h *SCMItemLinksHandler) RefreshItemSCMLink(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Look up item for permission check
 	itemID, err := h.getItemIDForLink(linkID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -403,7 +391,7 @@ func (h *SCMItemLinksHandler) RefreshItemSCMLink(w http.ResponseWriter, r *http.
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	// Check if this link uses OAuth — if so, route through user credentials
+	// OAuth links require the requesting user's SCM credentials.
 	var authMethod string
 	_ = h.db.QueryRow(`
 		SELECT sp.auth_method
@@ -423,7 +411,7 @@ func (h *SCMItemLinksHandler) RefreshItemSCMLink(w http.ResponseWriter, r *http.
 		err = h.syncService.RefreshItemSCMLinkForUser(ctx, linkID, user.ID)
 		if err != nil {
 			if errors.Is(err, scm.ErrUserSCMNotConnected) {
-				respondJSON(w, http.StatusForbidden, map[string]interface{}{
+				respondJSON(w, http.StatusForbidden, map[string]any{
 					"error":   "scm_not_connected",
 					"message": "You need to connect your SCM account to refresh this link",
 				})
@@ -442,7 +430,6 @@ func (h *SCMItemLinksHandler) RefreshItemSCMLink(w http.ResponseWriter, r *http.
 		}
 	}
 
-	// Return the updated link
 	link, err := h.getLinkByID(linkID)
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to retrieve updated link: %w", err))
@@ -451,7 +438,7 @@ func (h *SCMItemLinksHandler) RefreshItemSCMLink(w http.ResponseWriter, r *http.
 
 	// Live-update publish (WI-484): a refreshed link (e.g. PR state change) is a
 	// visible SCM-section change.
-	services.PublishItemChange(itemID, services.ItemChangeLink)
+	services.PublishItemChange(itemID)
 
 	respondJSONOK(w, link)
 }
@@ -465,7 +452,6 @@ func (h *SCMItemLinksHandler) SyncWorkspaceRepository(w http.ResponseWriter, r *
 
 	var err error
 
-	// Look up the workspace ID for this repository
 	var workspaceID int
 	err = h.db.QueryRow(`
 		SELECT wsc.workspace_id FROM workspace_repositories wr
@@ -481,7 +467,6 @@ func (h *SCMItemLinksHandler) SyncWorkspaceRepository(w http.ResponseWriter, r *
 		return
 	}
 
-	// Require workspace admin permission
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
@@ -506,10 +491,45 @@ func (h *SCMItemLinksHandler) SyncWorkspaceRepository(w http.ResponseWriter, r *
 		return
 	}
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"success": true,
 		"message": "Repository sync completed",
 	})
+}
+
+// ListReleaseCandidates returns tags/releases that can be attached to a milestone.
+func (h *SCMItemLinksHandler) ListReleaseCandidates(w http.ResponseWriter, r *http.Request) {
+	repoID, ok := requireIDParam(w, r, "repoId")
+	if !ok {
+		return
+	}
+	user, ok := RequireAuth(w, r)
+	if !ok {
+		return
+	}
+	var workspaceID int
+	err := h.db.QueryRow(`
+		SELECT wsc.workspace_id FROM workspace_repositories wr
+		JOIN workspace_scm_connections wsc ON wr.workspace_scm_connection_id = wsc.id
+		WHERE wr.id = ?
+	`, repoID).Scan(&workspaceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		respondNotFound(w, r, "repository")
+		return
+	}
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
+	}
+	if !RequireWorkspacePermission(w, r, user.ID, workspaceID, models.PermissionItemView, h.permissionService) {
+		return
+	}
+	candidates, err := h.syncService.ListReleaseCandidates(r.Context(), repoID, user.ID)
+	if err != nil {
+		respondBadRequest(w, r, "Failed to load tags and releases: "+err.Error())
+		return
+	}
+	respondJSONOK(w, candidates)
 }
 
 // GetWorkspaceRepositoriesForItem returns repositories available for linking to an item
@@ -525,7 +545,6 @@ func (h *SCMItemLinksHandler) GetWorkspaceRepositoriesForItem(w http.ResponseWri
 		return
 	}
 
-	// Get item's workspace
 	workspaceID, err := repository.NewItemRepository(h.db).GetWorkspaceID(itemID)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -536,7 +555,6 @@ func (h *SCMItemLinksHandler) GetWorkspaceRepositoriesForItem(w http.ResponseWri
 		return
 	}
 
-	// Get repositories linked to this workspace
 	rows, err := h.db.Query(`
 		SELECT
 			wr.id, wr.repository_name, wr.repository_url, wr.default_branch,
@@ -599,11 +617,7 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	// BranchName + BaseBranch are git refs (identifier-shaped). PRTitle
-	// renders in the SCM panel + the eventual GitHub PR list (plain
-	// text); PRBody is multi-line markdown that surfaces in the same
-	// places. Sanitizing here also keeps the SCM API call from posting
-	// crafted HTML to GitHub on our behalf.
+	// Sanitize refs and user-authored PR content before sending it to the SCM API.
 	warnings := sanitize.ApplyAllWithWarnings(
 		sanitize.Pair{Target: &req.BranchName, Policy: sanitize.ShortIdentifier, Label: "Branch name"},
 		sanitize.Pair{Target: &req.BaseBranch, Policy: sanitize.ShortIdentifier, Label: "Base branch"},
@@ -612,7 +626,6 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 	)
 	_ = warnings // CreateBranchForItemResponse predates WI-186 — sanitize lands; warnings surfacing is a follow-up.
 
-	// Validate required fields
 	if req.WorkspaceRepositoryID == 0 {
 		respondValidationError(w, r, "workspace_repository_id is required")
 		return
@@ -622,7 +635,6 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Verify item exists and get item info for PR body
 	item, err := repository.NewItemRepository(h.db).FindByIDWithDetails(itemID)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -637,7 +649,6 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 	itemTitle := item.Title
 	itemWorkspaceID := item.WorkspaceID
 
-	// Verify repository belongs to the item's workspace
 	var repoWorkspaceID int
 	err = h.db.QueryRow(`
 		SELECT wsc.workspace_id
@@ -659,7 +670,6 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Get authenticated user for per-user OAuth tokens
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
@@ -668,12 +678,10 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	// Create the branch using user's credentials
 	branchURL, err := h.syncService.CreateBranchForRepository(ctx, req.WorkspaceRepositoryID, req.BranchName, req.BaseBranch, user.ID)
 	if err != nil {
 		if errors.Is(err, scm.ErrUserSCMNotConnected) {
-			// User needs to connect their SCM account
-			respondJSON(w, http.StatusForbidden, map[string]interface{}{
+			respondJSON(w, http.StatusForbidden, map[string]any{
 				"error":   "scm_not_connected",
 				"message": "You need to connect your SCM account before creating branches or PRs",
 			})
@@ -684,7 +692,6 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Create branch link
 	branchLinkID, err := h.syncService.CreateItemSCMLink(ctx, itemID, req.WorkspaceRepositoryID, "branch", req.BranchName, branchURL, req.BranchName)
 	if err != nil {
 		slog.Error("failed to create branch link", slog.String("component", "scm_item_links"), slog.Any("error", err))
@@ -696,7 +703,6 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 		LinkID:    branchLinkID,
 	}
 
-	// Create PR if requested
 	if req.CreatePR {
 		prTitle := req.PRTitle
 		if prTitle == "" {
@@ -723,7 +729,7 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 			if errors.Is(err, scm.ErrAlreadyExists) {
 				errorMsg = "Branch created but a pull request already exists for this branch"
 			}
-			respondJSON(w, http.StatusPartialContent, map[string]interface{}{
+			respondJSON(w, http.StatusPartialContent, map[string]any{
 				"branch_url": branchURL,
 				"link_id":    branchLinkID,
 				"error":      errorMsg,
@@ -734,7 +740,6 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 		response.PRURL = prURL
 		response.PRNumber = pr.Number
 
-		// Create PR link
 		prLinkID, err := h.syncService.CreateItemSCMLink(ctx, itemID, req.WorkspaceRepositoryID, "pull_request", strconv.Itoa(pr.Number), prURL, prTitle)
 		if err != nil {
 			slog.Error("failed to create PR link", slog.String("component", "scm_item_links"), slog.Any("error", err))
@@ -744,7 +749,7 @@ func (h *SCMItemLinksHandler) CreateBranchForItem(w http.ResponseWriter, r *http
 	}
 
 	// Live-update publish (WI-484): a branch (and optional PR) link was added.
-	services.PublishItemChange(itemID, services.ItemChangeLink)
+	services.PublishItemChange(itemID)
 
 	respondJSONCreated(w, response)
 }
@@ -776,16 +781,13 @@ func (h *SCMItemLinksHandler) CreatePRFromBranch(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
-	// Same field shapes as CreateBranchForItem — see that handler for
-	// rationale. Sanitize at decode; response is the existing
-	// CreatePRFromBranchResponse without warnings (follow-up).
+	// Keep the same ref and content sanitization as CreateBranchForItem.
 	sanitize.ApplyAll(
 		sanitize.Pair{Target: &req.PRTitle, Policy: sanitize.PlainTextField},
 		sanitize.Pair{Target: &req.PRBody, Policy: sanitize.RichText},
 		sanitize.Pair{Target: &req.BaseBranch, Policy: sanitize.ShortIdentifier},
 	)
 
-	// Get the branch link details
 	var itemID, workspaceRepoID, itemWorkspaceID int
 	var branchName, linkType string
 	var itemKey, itemTitle string
@@ -812,19 +814,16 @@ func (h *SCMItemLinksHandler) CreatePRFromBranch(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Get authenticated user for per-user OAuth tokens
 	user, ok := RequireAuth(w, r)
 	if !ok {
 		return
 	}
 
-	// Verify this is a branch link
 	if linkType != "branch" {
 		respondValidationError(w, r, "Can only create PR from a branch link")
 		return
 	}
 
-	// Get default branch if not specified
 	baseBranch := req.BaseBranch
 	if baseBranch == "" {
 		err = h.db.QueryRow(`
@@ -835,13 +834,11 @@ func (h *SCMItemLinksHandler) CreatePRFromBranch(w http.ResponseWriter, r *http.
 		}
 	}
 
-	// Set PR title if not provided
 	prTitle := req.PRTitle
 	if prTitle == "" {
 		prTitle = itemKey + ": " + itemTitle
 	}
 
-	// Set PR body if not provided
 	prBody := req.PRBody
 	if prBody == "" {
 		itemURL := getItemURL(r, itemWorkspaceID, itemID)
@@ -851,7 +848,6 @@ func (h *SCMItemLinksHandler) CreatePRFromBranch(w http.ResponseWriter, r *http.
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	// Create the PR using user's credentials
 	pr, prURL, err := h.syncService.CreatePullRequestForRepository(ctx, workspaceRepoID, scm.CreatePROptions{
 		Title:      prTitle,
 		Body:       prBody,
@@ -861,7 +857,7 @@ func (h *SCMItemLinksHandler) CreatePRFromBranch(w http.ResponseWriter, r *http.
 	}, user.ID)
 	if err != nil {
 		if errors.Is(err, scm.ErrUserSCMNotConnected) {
-			respondJSON(w, http.StatusForbidden, map[string]interface{}{
+			respondJSON(w, http.StatusForbidden, map[string]any{
 				"error":   "scm_not_connected",
 				"message": "You need to connect your SCM account before creating branches or PRs",
 			})
@@ -876,14 +872,12 @@ func (h *SCMItemLinksHandler) CreatePRFromBranch(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Create PR link
 	prLinkID, err := h.syncService.CreateItemSCMLink(ctx, itemID, workspaceRepoID, "pull_request", strconv.Itoa(pr.Number), prURL, prTitle)
 	if err != nil {
 		slog.Error("failed to create PR link", slog.String("component", "scm_item_links"), slog.Any("error", err))
 		// PR was created but link failed - return success with the PR info
 	}
 
-	// Get the created PR link
 	var prLink *ItemSCMLinkResponse
 	if prLinkID > 0 {
 		prLink, _ = h.getLinkByID(prLinkID)
@@ -896,7 +890,7 @@ func (h *SCMItemLinksHandler) CreatePRFromBranch(w http.ResponseWriter, r *http.
 	}
 
 	// Live-update publish (WI-484): a PR link was added to the item.
-	services.PublishItemChange(itemID, services.ItemChangeLink)
+	services.PublishItemChange(itemID)
 
 	respondJSONCreated(w, response)
 }
@@ -1070,7 +1064,7 @@ func (h *SCMItemLinksHandler) GetSCMConnectionStatus(w http.ResponseWriter, r *h
 
 	connected := allConnected || !hasOAuthProvider
 
-	respondJSONOK(w, map[string]interface{}{
+	respondJSONOK(w, map[string]any{
 		"providers":          providers,
 		"user_connected":     connected,
 		"connected":          connected,

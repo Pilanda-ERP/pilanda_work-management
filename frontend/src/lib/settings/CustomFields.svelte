@@ -2,11 +2,9 @@
   import { onMount, untrack } from 'svelte';
   import { api } from '../api.js';
   import { currentRoute, navigate } from '../router.js';
-  import { Plus, Edit, Trash2, MoreHorizontal, Circle, Database, Settings, Type, AlignLeft, ChevronDownCircle, ListChecks, Hash, Calendar, User, Repeat, Flag, Box, Globe, Building2, Link2 } from '@lucide/svelte';
+  import { Plus, Edit, Trash2, MoreHorizontal, Circle, Database, Settings, Type, AlignLeft, ChevronDownCircle, ListChecks, Hash, Calendar, User, Repeat, Flag, Box, Globe, Building2, Link2, CheckSquare } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
   import Input from '../components/Input.svelte';
-  import Select from '../components/Select.svelte';
-  import Textarea from '../components/Textarea.svelte';
   import DataTable from '../components/DataTable.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import Modal from '../dialogs/Modal.svelte';
@@ -25,9 +23,15 @@
   import { confirm } from '../composables/useConfirm.js';
   import { formatDateSimple } from '../utils/dateFormatter.js';
   import BasePicker from '../pickers/BasePicker.svelte';
-  import { parseFieldOptions, serializeOptions } from '../utils/optionUtils.js';
+  import { fieldOptionsObject, parseFieldOptions, serializeOptions } from '../utils/optionUtils.js';
   import { X as XIcon } from '@lucide/svelte';
   import DescriptionText from '../components/DescriptionText.svelte';
+  import { customFieldFormData, customFieldUpdatePayload, linkingFieldOptions, loadCustomFieldsOverview } from './customFieldsData.js';
+  import { BOOLEAN_CUSTOM_FIELD_TYPE, canonicalCustomFieldType, isBooleanCustomFieldType } from '../utils/customFieldTypes.js';
+  import { workspaceDataStore } from '../stores/workspaceDataStore.svelte.js';
+	import TextField from '../components/TextField.svelte';
+	import SelectField from '../components/SelectField.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
 
   const entityTypeOptions = [
     { id: 'item', name: 'Items' },
@@ -40,14 +44,14 @@
   let screens = $state([]);
   let showCreateForm = $state(false);
   let editingField = $state(null);
+  // Validated board-configuration route to return to after a create/cancel
+  // flow, or to surface as a "Back to board fields" action in the manage flow.
+  let boardReturnTarget = $state(null);
+  // True only when this page was opened via action=create from board
+  // configuration, in which case cancel/success should return automatically.
+  let boardCreateFlow = $state(false);
   /** @type {{ field_name: string, field_type: string, field_config: Record<string, any>, applies_to_portal_customers: boolean, applies_to_customer_organisations: boolean, description?: string, required?: boolean }} */
-  let formData = $state({
-    field_name: '',
-    field_type: 'text',
-    field_config: { max_length: '' },
-    applies_to_portal_customers: false,
-    applies_to_customer_organisations: false
-  });
+  let formData = $state(customFieldFormData());
 
   // Settings modal state
   let showSettingsModal = $state(false);
@@ -81,10 +85,15 @@
     { value: 'asset', label: 'Asset', icon: Box, iconColor: '#7B8A9E' },
     { value: 'portalcustomer', label: 'Portal Customer', icon: Globe, iconColor: '#E07BAF' },
     { value: 'customerorganisation', label: 'Customer Organisation', icon: Building2, iconColor: '#8B7EC8' },
+    { value: BOOLEAN_CUSTOM_FIELD_TYPE, label: t('fields.checkbox'), icon: CheckSquare, iconColor: '#2F9E8F' },
     { value: 'linking', label: 'Linking', icon: Link2, iconColor: '#3B82F6' }
   ];
 
-  const selectedFieldType = $derived(fieldTypes.find(ft => ft.value === formData.field_type));
+  const fieldTypePickerPositioning = {
+    strategy: 'fixed',
+    placement: 'bottom-start',
+    sameWidth: true
+  };
 
   // Asset field configuration
   let assetSetId = $state(null);
@@ -116,59 +125,50 @@
   });
 
   onMount(async () => {
-    await loadCustomFields();
-
-    // Load asset sets for asset field type
-    try {
-      assetSets = await api.assetSets.getAll() || [];
-    } catch (error) {
-      console.error('Failed to load asset sets:', error);
-      assetSets = [];
+    // Board-configuration entry: validate `returnTo` and consume `action=create`
+    // exactly once (removing it from browser history so back/forward never
+    // re-opens the create form).
+    const query = $currentRoute.query || {};
+    const returnPath = validateReturnTo(query.returnTo);
+    if (query.action === 'create') {
+      boardCreateFlow = true;
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('action');
+        history.replaceState(history.state, '', url.toString());
+      } catch { /* history rewrite is best-effort */ }
+      boardReturnTarget = returnPath;
+      if (returnPath) startCreate();
+    } else if (returnPath) {
+      boardCreateFlow = false;
+      boardReturnTarget = returnPath;
     }
 
-    // Load link types and item types for linking field type
-    try {
-      linkTypes = await api.linkTypes.getAll() || [];
-    } catch (error) {
-      console.error('Failed to load link types:', error);
-      linkTypes = [];
-    }
-    try {
-      itemTypes = await api.itemTypes.getAll() || [];
-    } catch (error) {
-      console.error('Failed to load item types:', error);
-      itemTypes = [];
-    }
+    const loadCatalog = async (loader, label) => {
+      try {
+        return (await loader()) || [];
+      } catch (error) {
+        console.error(`Failed to load ${label}:`, error);
+        return [];
+      }
+    };
+    const [, loadedAssetSets, loadedLinkTypes, loadedItemTypes] = await Promise.all([
+      loadCustomFields(),
+      loadCatalog(() => api.assetSets.getAll(), 'asset sets'),
+      loadCatalog(() => api.linkTypes.getAll(), 'link types'),
+      loadCatalog(() => api.itemTypes.getAll(), 'item types'),
+    ]);
+    assetSets = loadedAssetSets;
+    linkTypes = loadedLinkTypes;
+    itemTypes = loadedItemTypes;
   });
 
   async function loadCustomFields() {
     try {
-      const [fieldsResult, screensResult] = await Promise.all([
-        api.customFields.getAll(),
-        api.screens.getAll()
-      ]);
-      // Handle new response format with data array and index_counts
-      if (fieldsResult && fieldsResult.data) {
-        customFields = fieldsResult.data || [];
-        indexCounts = fieldsResult.index_counts || { items: { current: 0, max: 20 }, assets: { current: 0, max: 20 } };
-      } else {
-        customFields = fieldsResult || [];
-      }
-      
-      // Load screen fields for each screen
-      const screensWithFields = await Promise.all(
-        (screensResult || []).map(async (screen) => {
-          try {
-            const fields = await api.screens.getFields(screen.id);
-            return { ...screen, fields: fields || [] };
-          } catch (error) {
-            console.error(`Failed to load fields for screen ${screen.id}:`, error);
-            return { ...screen, fields: [] };
-          }
-        })
-      );
-      
-      screens = screensWithFields;
+      const overview = await loadCustomFieldsOverview(api);
+      customFields = overview.customFields;
+      indexCounts = overview.indexCounts;
+      screens = overview.screens;
     } catch (error) {
       console.error('Failed to load custom fields:', error);
       customFields = [];
@@ -201,13 +201,7 @@
 
   function startEdit(field) {
     editingField = field;
-    formData = {
-      field_name: field.name,
-      field_type: field.field_type,
-      field_config: { max_length: '' },
-      applies_to_portal_customers: field.applies_to_portal_customers || false,
-      applies_to_customer_organisations: field.applies_to_customer_organisations || false
-    };
+    formData = customFieldFormData(field);
 
     // Parse options using the unified parser (handles both legacy and new format)
     if ((field.field_type === 'select' || field.field_type === 'multiselect') && field.options) {
@@ -222,7 +216,7 @@
     // Parse asset field config
     if (field.field_type === 'asset' && field.options) {
       try {
-        const config = JSON.parse(field.options);
+        const config = fieldOptionsObject(field.options);
         assetSetId = config.asset_set_id || null;
         assetQlQuery = config.ql_query || config.cql_query || '';
         assetMulti = config.multi === true;
@@ -240,7 +234,7 @@
     // Parse linking field config
     if (field.field_type === 'linking' && field.options) {
       try {
-        const config = JSON.parse(field.options);
+        const config = fieldOptionsObject(field.options);
         linkingLinkTypeId = config.link_type_id || null;
         linkingAllowedItemTypeIds = config.allowed_item_type_ids || [];
         linkingAllowedEntityTypes = config.allowed_entity_types || ['item'];
@@ -270,13 +264,7 @@
   }
 
   function resetForm() {
-    formData = {
-      field_name: '',
-      field_type: 'text',
-      field_config: { max_length: '' },
-      applies_to_portal_customers: false,
-      applies_to_customer_organisations: false
-    };
+    formData = customFieldFormData();
     optionItems = [];
     nextOptionId = 1;
     assetSetId = null;
@@ -292,10 +280,39 @@
     linkingMirrorAllowedItemTypeIds = [];
   }
 
+  function selectFieldType(type) {
+    if (!type) return;
+    if (isBooleanCustomFieldType(type.value)) {
+      optionItems = [];
+      nextOptionId = 1;
+    }
+    formData.field_type = type.value;
+  }
+
+  // Board-configuration routes this page may return to. External, protocol-
+  // relative, and unrelated paths are rejected rather than trusted.
+  function validateReturnTo(raw) {
+    if (typeof raw !== 'string' || !raw) return null;
+    let p = raw;
+    try { p = decodeURIComponent(raw); } catch { /* keep raw */ }
+    if (!p.startsWith('/') || p.startsWith('//') || /[?#\s:]/.test(p)) return null;
+    const ok = /^\/(?:collections\/\d+\/board\/configure|workspaces\/\d+(?:\/collections\/\d+)?\/board\/configure)$/.test(p);
+    return ok ? p : null;
+  }
+
+  function returnToBoard() {
+    if (!boardReturnTarget) return;
+    navigate(boardReturnTarget);
+    boardReturnTarget = null;
+    boardCreateFlow = false;
+  }
+
   function cancelForm() {
+    const navigateAway = boardCreateFlow && boardReturnTarget;
     showCreateForm = false;
     editingField = null;
     resetForm();
+    if (navigateAway) returnToBoard();
   }
 
   function processFieldConfig() {
@@ -330,21 +347,27 @@
       config.ql_query = assetQlQuery || '';
       config.multi = assetMulti;
     } else if (formData.field_type === 'linking') {
-      if (!linkingLinkTypeId) {
+      // Mirrors are configured through their primary field, so editing a
+      // mirror only renames it and keeps the stored options. Primary fields
+      // pass their stored options through too, preserving the mirror linkage.
+      let editingLinkingOptions = null;
+      try {
+        editingLinkingOptions = fieldOptionsObject(editingField?.options || null);
+      } catch {
+        editingLinkingOptions = null;
+      }
+      if (!isLinkingMirror && !linkingLinkTypeId) {
         throw new Error('Linking fields require a link type');
       }
-      config.link_type_id = parseInt(linkingLinkTypeId);
-      config.allowed_entity_types = linkingAllowedEntityTypes;
-      config.multi = linkingMulti;
-      if (linkingAllowedItemTypeIds.length > 0) {
-        config.allowed_item_type_ids = linkingAllowedItemTypeIds.map(Number);
-      }
-      if (linkingMirrorName.trim()) {
-        config.mirror_name = linkingMirrorName.trim();
-        if (linkingMirrorAllowedItemTypeIds.length > 0) {
-          config.mirror_allowed_item_type_ids = linkingMirrorAllowedItemTypeIds.map(Number);
-        }
-      }
+      config.linkingOptions = linkingFieldOptions({
+        editingOptions: editingLinkingOptions,
+        linkTypeId: linkingLinkTypeId,
+        allowedItemTypeIds: linkingAllowedItemTypeIds,
+        allowedEntityTypes: linkingAllowedEntityTypes,
+        multi: linkingMulti,
+        mirrorName: linkingMirrorName,
+        mirrorAllowedItemTypeIds: linkingMirrorAllowedItemTypeIds,
+      });
     }
 
     return config;
@@ -355,14 +378,7 @@
       // Process field configuration based on type
       const processedConfig = processFieldConfig();
 
-      const data = {
-        name: formData.field_name,
-        field_type: formData.field_type,
-        description: formData.description || '',
-        required: formData.required || false,
-        applies_to_portal_customers: formData.applies_to_portal_customers || false,
-        applies_to_customer_organisations: formData.applies_to_customer_organisations || false
-      };
+      const data = customFieldUpdatePayload(formData, editingField);
 
       // Convert config to options format expected by backend
       if (processedConfig.selectOptions) {
@@ -375,21 +391,7 @@
           multi: processedConfig.multi
         });
       } else if (formData.field_type === 'linking') {
-        const linkOpts = {
-          link_type_id: processedConfig.link_type_id,
-          allowed_entity_types: processedConfig.allowed_entity_types,
-          multi: processedConfig.multi
-        };
-        if (processedConfig.allowed_item_type_ids) {
-          linkOpts.allowed_item_type_ids = processedConfig.allowed_item_type_ids;
-        }
-        if (processedConfig.mirror_name) {
-          linkOpts.mirror_name = processedConfig.mirror_name;
-          if (processedConfig.mirror_allowed_item_type_ids) {
-            linkOpts.mirror_allowed_item_type_ids = processedConfig.mirror_allowed_item_type_ids;
-          }
-        }
-        data.options = JSON.stringify(linkOpts);
+        data.options = JSON.stringify(processedConfig.linkingOptions);
       }
 
       let saveResult = null;
@@ -413,6 +415,7 @@
       }
 
       await loadCustomFields();
+      await workspaceDataStore.invalidate('customFieldDefinitions');
       cancelForm();
       window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
     } catch (error) {
@@ -442,7 +445,7 @@
   }
 
   function getFieldTypeLabel(type) {
-    return fieldTypes.find(t => t.value === type)?.label || type;
+    return fieldTypes.find(t => t.value === canonicalCustomFieldType(type))?.label || type;
   }
 
   function getScreenCount(fieldId) {
@@ -477,7 +480,7 @@
   const isPortalCustomerField = $derived(formData.field_type === 'portalcustomer');
   const isCustomerOrganisationField = $derived(formData.field_type === 'customerorganisation');
   const isLinkingField = $derived(formData.field_type === 'linking');
-  const isLinkingMirror = $derived(isLinkingField && editingField && (() => { try { const o = JSON.parse(editingField.options || '{}'); return !!o.mirror_of_field_id; } catch { return false; } })());
+  const isLinkingMirror = $derived(isLinkingField && editingField && (() => { try { return !!fieldOptionsObject(editingField.options).mirror_of_field_id; } catch { return false; } })());
   const hideAppliesToSection = $derived(formData.field_type === 'portalcustomer' || formData.field_type === 'customerorganisation' || formData.field_type === 'linking');
 
   // Reactive statement to trigger re-calculation when screens data changes
@@ -562,6 +565,7 @@
         type: 'regular',
         icon: Edit,
         title: t('common.edit'),
+        testid: 'custom-field-edit',
         hoverClass: 'hover-bg',
         onClick: () => startEdit(field)
       }
@@ -574,6 +578,7 @@
         type: 'regular',
         icon: Trash2,
         title: t('common.delete'),
+        testid: 'custom-field-delete',
         color: 'var(--ds-text-danger)',
         hoverClass: 'hover-danger',
         onClick: () => deleteField(field)
@@ -607,7 +612,7 @@
       render: (field) => {
         if (field.options) {
           try {
-            const options = JSON.parse(field.options);
+            const options = fieldOptionsObject(field.options);
             if (options && options.items && Array.isArray(options.items)) {
               return `${options.items.length} options`;
             } else if (Array.isArray(options)) {
@@ -655,6 +660,14 @@
   ]);
 </script>
 
+{#snippet fieldTypeOption({ item: fieldType })}
+  {@const FieldTypeIcon = fieldType.icon}
+  <div class="flex items-center gap-3 min-w-0">
+    <FieldTypeIcon class="w-4 h-4 flex-shrink-0" style="color: {fieldType.iconColor};" />
+    <span class="truncate">{fieldType.label}</span>
+  </div>
+{/snippet}
+
 <PageHeader
   icon={Database}
   title={t('fields.title')}
@@ -667,10 +680,20 @@
         placeholder={t('fields.searchFields')}
         class="w-64"
       />
+      {#if boardReturnTarget && !boardCreateFlow}
+        <Button
+          variant="default"
+          dataTestid="custom-fields-return-to-board"
+          onclick={returnToBoard}
+        >
+          {t('fields.returnToBoard')}
+        </Button>
+      {/if}
       <Button
         id="create-field-button"
         variant="primary"
         icon={Plus}
+        dataTestid="custom-field-create"
         onclick={startCreate}
         keyboardHint="A"
         hotkeyConfig={{ key: toHotkeyString('customFields', 'add'), guard: () => !showCreateForm }}
@@ -697,7 +720,7 @@
 </PageHeader>
 
 
-<Modal isOpen={showCreateForm} onclose={cancelForm} maxWidth="max-w-2xl">
+<Modal isOpen={showCreateForm} onclose={cancelForm} onSubmit={saveField} maxWidth="max-w-2xl" dataTestid="custom-field-dialog">
   <ModalHeader title={editingField ? t('fields.editField') : t('fields.createField')} showCloseButton={false} />
 
   <!-- Modal content -->
@@ -706,35 +729,37 @@
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 
         <div>
-          <Label for="field-name" required class="mb-2">{t('fields.fieldName')}</Label>
-          <Input
+          <TextField
+            label={t('fields.fieldName')}
             id="field-name"
-            bind:value={formData.field_name}
-            placeholder="e.g., Sprint, Epic, Customer Impact"
             required
+            dataTestid="custom-field-name"
+            placeholder="e.g., Sprint, Epic, Customer Impact"
+            bind:value={formData.field_name}
           />
         </div>
 
         <div>
           <Label for="field-type" required class="mb-2">{t('fields.fieldType')}</Label>
-          <DropdownMenu
-            triggerIcon={selectedFieldType?.icon}
-            triggerIconBgColor={selectedFieldType?.iconColor}
-            triggerText={selectedFieldType?.label || 'Select type...'}
-            triggerClass="w-full h-[38px] rounded-lg border px-3 text-sm"
-            triggerStyle="border-color: var(--ds-border); background: var(--ds-surface); color: var(--ds-text);"
-            triggerAlignment="between"
-            showChevron={true}
-            maxWidth="max-w-72"
-            items={fieldTypes.map(type => ({
-              id: type.value,
-              type: 'regular',
-              icon: type.icon,
-              iconColor: type.iconColor,
-              title: type.label,
-              onClick: () => { formData.field_type = type.value; }
-            }))}
+          <BasePicker
+            id="field-type"
+            value={formData.field_type}
+            items={fieldTypes}
+            placeholder="Select type..."
+            ariaLabel={t('fields.fieldType')}
+            disabled={!!editingField}
+            getValue={(type) => type.value}
+            getLabel={(type) => type.label}
+            itemSnippet={fieldTypeOption}
+            optionTestid={(option) => `custom-field-type-${option.value}`}
+            positioning={fieldTypePickerPositioning}
+            onSelect={selectFieldType}
           />
+          {#if editingField}
+            <p class="mt-2 text-xs" style="color: var(--ds-text-subtle);">
+              Field type cannot be changed after creation.
+            </p>
+          {/if}
           {#if isMilestoneField}
             <p class="text-sm mt-2 p-2 rounded" style="color: var(--ds-text); background: var(--ds-surface); border: 1px solid var(--ds-border);">
               {t('fields.milestoneHint')}
@@ -787,19 +812,19 @@
 
       {#if needsMaxLength}
         <div class="mt-6">
-          <Label for="field-max-length" class="mb-2">Maximum Length (optional)</Label>
-          <Input
+          <TextField
+            label={"Maximum Length (optional)"}
             id="field-max-length"
             type="number"
-            bind:value={formData.field_config.max_length}
             min={1}
             placeholder="Leave empty for no limit"
+            bind:value={formData.field_config.max_length}
           />
         </div>
       {/if}
 
       {#if needsOptions}
-        <div class="mt-6">
+        <div class="mt-6" data-testid="custom-field-options">
           <Label required class="mb-2">Options</Label>
           <div class="flex flex-col gap-2">
             {#each optionItems as item, index}
@@ -841,8 +866,13 @@
 
       {#if isAssetField}
         <div class="mt-6">
-          <Label for="asset-set" required class="mb-2">Asset Set</Label>
-          <Select id="asset-set" bind:value={assetSetId} required options={[{ value: null, label: 'Select asset set...' }, ...assetSets.map(set => ({ value: set.id, label: set.name }))]} />
+          <SelectField
+            label={"Asset Set"}
+            id="asset-set"
+            required
+            options={[{ value: null, label: 'Select asset set...' }, ...assetSets.map(set => ({ value: set.id, label: set.name }))]}
+            bind:value={assetSetId}
+          />
         </div>
 
         <div class="mt-4 flex items-center gap-4">
@@ -854,12 +884,12 @@
         </div>
 
         <div class="mt-4">
-          <Label for="asset-ql" class="mb-2">Filter Query (QL)</Label>
-          <Textarea
+          <TextareaField
+            label={"Filter Query (QL)"}
             id="asset-ql"
-            bind:value={assetQlQuery}
             rows={3}
-            placeholder='e.g., type = "Laptop" AND status = "Active"'
+            placeholder="e.g., type = &quot;Laptop&quot; AND status = &quot;Active&quot;"
+            bind:value={assetQlQuery}
           />
           <p class="text-sm mt-1" style="color: var(--ds-text-subtle);">
             Optional: Filter assets shown to users. Leave empty to show all assets in the set.
@@ -875,8 +905,13 @@
             </p>
           {:else}
             <div>
-              <Label for="linking-link-type" required class="mb-2">Link Type</Label>
-              <Select id="linking-link-type" bind:value={linkingLinkTypeId} required options={[{ value: null, label: 'Select link type...' }, ...linkTypes.filter(lt => lt.active !== false).map(lt => ({ value: lt.id, label: `${lt.name} (${lt.forward_label} / ${lt.reverse_label})` }))]} />
+              <SelectField
+                label={"Link Type"}
+                id="linking-link-type"
+                required
+                options={[{ value: null, label: 'Select link type...' }, ...linkTypes.filter(lt => lt.active !== false).map(lt => ({ value: lt.id, label: `${lt.name} (${lt.forward_label} / ${lt.reverse_label})` }))]}
+                bind:value={linkingLinkTypeId}
+              />
             </div>
 
             <div>
@@ -919,11 +954,11 @@
             </div>
 
             <div class="p-4 rounded-lg" style="background: var(--ds-surface); border: 1px solid var(--ds-border);">
-              <Label for="linking-mirror-name" class="mb-2">Mirror Field Name (optional)</Label>
-              <Input
+              <TextField
+                label={"Mirror Field Name (optional)"}
                 id="linking-mirror-name"
+                placeholder="e.g., &quot;Blocks&quot; (reverse of &quot;Blocked By&quot;)"
                 bind:value={linkingMirrorName}
-                placeholder='e.g., "Blocks" (reverse of "Blocked By")'
               />
               <DescriptionText>
                 Creates a reverse field that shows the other side of the relationship. Leave empty for no mirror.
@@ -984,6 +1019,9 @@
     onCancel={cancelForm}
     onConfirm={saveField}
     confirmLabel={editingField ? t('common.update') : t('common.create')}
+    confirmTestid="custom-field-save"
+    showKeyboardHint={true}
+    confirmKeyboardHint="⏎"
     disabled={!formData.field_name.trim() || (needsOptions && optionItems.filter(i => i.label.trim()).length === 0) || (isAssetField && !assetSetId) || (isLinkingField && !isLinkingMirror && !linkingLinkTypeId)}
   />
 </Modal>
@@ -991,13 +1029,13 @@
 <Modal isOpen={showSettingsModal} onclose={() => showSettingsModal = false} maxWidth="max-w-md">
   <ModalHeader title={t('fields.indexSettings')} showCloseButton={false} />
   <div class="px-6 py-4">
-    <Label for="max-indexes" class="mb-2">Maximum indexes per table</Label>
-    <Input
+    <TextField
+      label={"Maximum indexes per table"}
       id="max-indexes"
       type="number"
-      bind:value={settingsMaxIndexes}
       min={1}
       max={100}
+      bind:value={settingsMaxIndexes}
     />
     <p class="text-xs mt-2" style="color: var(--ds-text-subtle);">
       Controls how many custom field indexes can be created per table (items, assets). Higher values allow more indexed fields but may impact write performance. Currently using {indexCounts.items?.current || 0} on items and {indexCounts.assets?.current || 0} on assets.
@@ -1011,7 +1049,7 @@
   />
 </Modal>
 
-  <div class="mb-6">
+  <div class="mb-6" data-testid="custom-fields-table">
     <DataTable
       columns={fieldColumns}
       data={paginatedCustomFields}
@@ -1019,6 +1057,8 @@
       emptyMessage={t('fields.noFields')}
       emptyIcon={Circle}
       actionItems={buildFieldDropdownItems}
+      actionTriggerTestid={() => 'custom-field-actions'}
+      rowAttrs={() => ({ 'data-testid': 'custom-field-row' })}
     >
       {#snippet name(field)}
         <div>
@@ -1061,7 +1101,7 @@
             {t('common.noData')}
           {/if}
         {:else}
-          <span class="text-gray-400">{t('common.loading')}</span>
+          <span class="text-ds-text-subtlest">{t('common.loading')}</span>
         {/if}
         </div>
       {/snippet}

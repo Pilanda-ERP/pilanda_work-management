@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { Pencil, RefreshCw, MessageSquare, Bell, HelpCircle, Database, PlusSquare, Box, Globe, Sparkles, Bot, Milestone, UsersRound, X } from '@lucide/svelte';
+  import { Pencil, RefreshCw, MessageSquare, Bell, HelpCircle, Database, PlusSquare, Box, Globe, Sparkles, Bot, Milestone, UsersRound, Send, FileText, Tag, X } from '@lucide/svelte';
   import { toHotkeyString, getShortcutDisplay } from '../../utils/keyboardShortcuts.js';
   import { api } from '../../api.js';
   import FieldSelector from '../../pickers/FieldSelector.svelte';
@@ -21,17 +21,23 @@
   import AIExtractNode from './nodes/AIExtractNode.svelte';
   import AIAgentNode from './nodes/AIAgentNode.svelte';
   import CreateMilestoneNode from './nodes/CreateMilestoneNode.svelte';
+  import NotifyCustomerNode from './nodes/NotifyCustomerNode.svelte';
+  import InsertCannedResponseNode from './nodes/InsertCannedResponseNode.svelte';
+  import AdjustLabelsNode from './nodes/AdjustLabelsNode.svelte';
   import CreateMilestoneConfigPanel from './CreateMilestoneConfigPanel.svelte';
   import UpdateAssetConfigPanel from './UpdateAssetConfigPanel.svelte';
   import CreateAssetConfigPanel from './CreateAssetConfigPanel.svelte';
   import PlaceholderReferenceModal from './PlaceholderReferenceModal.svelte';
   import BaseActionFlowEditor from './shared/BaseActionFlowEditor.svelte';
   import HttpHeadersEditor from './shared/HttpHeadersEditor.svelte';
-  import { getFieldSelectorValue, backendFieldName, standardFieldTypes, collectOutputFields, isValidOutputFieldName } from './shared/fieldNameMapping.js';
+  import { getFieldSelectorValue, backendFieldName, standardFieldTypes, collectOutputFields, isValidOutputFieldName, conditionFieldScope, stripConditionScope, scopeConditionFieldName } from './shared/fieldNameMapping.js';
   import { t } from '../../stores/i18n.svelte.js';
   import Checkbox from '../../components/Checkbox.svelte';
+  import Input from '../../components/Input.svelte';
   import Select from '../../components/Select.svelte';
+  import Textarea from '../../components/Textarea.svelte';
   import UserPicker from '../../pickers/UserPicker.svelte';
+  import RolePicker from '../../pickers/RolePicker.svelte';
   import { actionFlowStore } from '../../stores/actionFlowStore.svelte.js';
   import { permissionStore } from '../../stores';
   import { agentRuns } from '../../stores/agentRuns.svelte.js';
@@ -51,6 +57,8 @@
   let itemTypes = $state([]);
   let statusCategories = $state([]);
   let assignableUsers = $state([]);
+  let cannedResponses = $state([]);
+  let workspaceLabels = $state([]);
 
   // Actor override: null means the action runs under the triggering user's
   // permissions. Only users with the global action.set_actor permission can
@@ -58,6 +66,9 @@
   // svelte-ignore state_referenced_locally
   let actorUserId = $state(action?.actor_user_id ?? null);
   let lastActorSource = $state(null);
+  // svelte-ignore state_referenced_locally
+  let allowedRoleIds = $state([...(action?.allowed_role_ids ?? [])]);
+  let lastAllowedRolesSource = $state(null);
   let canSetActor = $derived(permissionStore.hasPermissionKey('action.set_actor'));
 
   $effect(() => {
@@ -65,6 +76,14 @@
     if (source === lastActorSource) return;
     lastActorSource = source;
     actorUserId = action?.actor_user_id ?? null;
+  });
+
+  $effect(() => {
+    const roleIDs = action?.allowed_role_ids ?? [];
+    const source = `${action?.id ?? 'new'}:${roleIDs.join(',')}`;
+    if (source === lastAllowedRolesSource) return;
+    lastAllowedRolesSource = source;
+    allowedRoleIds = [...roleIDs];
   });
 
   const nodeTypes = {
@@ -84,6 +103,9 @@
     ai_extract: AIExtractNode,
     ai_agent: AIAgentNode,
     create_milestone: CreateMilestoneNode,
+    notify_customer: NotifyCustomerNode,
+    insert_canned_response: InsertCannedResponseNode,
+    adjust_labels: AdjustLabelsNode,
   };
 
   // Mirror each node's accentColor in the minimap so the overview reflects
@@ -105,6 +127,9 @@
     ai_extract: 'purple',
     ai_agent: 'magenta',
     create_milestone: 'green',
+    notify_customer: 'magenta',
+    insert_canned_response: 'orange',
+    adjust_labels: 'purple',
   };
 
   function minimapNodeColor(node) {
@@ -140,6 +165,9 @@
     related_items: RefreshCw,
     round_robin_assign: UsersRound,
     create_milestone: Milestone,
+    notify_customer: Send,
+    insert_canned_response: FileText,
+    adjust_labels: Tag,
   };
 
   // i18n keys for node types. When a type isn't in this map, the palette
@@ -160,6 +188,10 @@
     transition_item: 'actions.nodes.transitionItem',
     related_items: 'actions.nodes.relatedItems',
     round_robin_assign: 'actions.nodes.roundRobinAssign',
+    create_milestone: 'actions.nodes.createMilestone',
+    notify_customer: 'actions.nodes.notifyCustomer',
+    insert_canned_response: 'actions.nodes.insertCannedResponse',
+    adjust_labels: 'actions.nodes.adjustLabels',
   };
 
   // nodePalette is built from the catalog response on mount. Trigger nodes
@@ -188,6 +220,10 @@
       case 'item_created': return 'actions.trigger.itemCreated';
       case 'item_updated': return 'actions.trigger.itemUpdated';
       case 'item_linked': return 'actions.trigger.itemLinked';
+      case 'sla_breached': return 'actions.trigger.slaBreached';
+      case 'sla_warning': return 'actions.trigger.slaWarning';
+      case 'comment_created': return 'actions.trigger.commentCreated';
+      case 'item_inactive': return 'actions.trigger.itemInactive';
       case 'manual': return 'actions.trigger.manual';
       default: return null;
     }
@@ -279,6 +315,27 @@
     }
   }
 
+  async function loadCannedResponses() {
+    if (!action?.workspace_id) return;
+    try {
+      const list = await api.cannedResponses.getAll(action.workspace_id, true) || [];
+      cannedResponses = list.filter((response) => response.is_active !== false);
+    } catch (err) {
+      console.error('Failed to load canned responses for action editor', err);
+      cannedResponses = [];
+    }
+  }
+
+  async function loadWorkspaceLabels() {
+    if (!action?.workspace_id) return;
+    try {
+      workspaceLabels = await api.labels.getAll(action.workspace_id) || [];
+    } catch (err) {
+      console.error('Failed to load labels for action editor', err);
+      workspaceLabels = [];
+    }
+  }
+
   onMount(() => {
     if (action?.workspace_id) {
       loadCatalog();
@@ -291,6 +348,8 @@
       loadItemTypes();
       loadStatusCategories();
       loadAssignableUsers();
+      loadCannedResponses();
+      loadWorkspaceLabels();
     }
 
     // Live-reload after every AI chat agent run, regardless of tool calls:
@@ -299,7 +358,7 @@
     const unsub = agentRuns.subscribe(async () => {
       if (!action?.id) return;
       try {
-        const fresh = await api.get(`/workspaces/${action.workspace_id}/actions/${action.id}`);
+        const fresh = await api.actions.get(action.workspace_id, action.id);
         actionFlowStore.init(fresh, statuses);
         infoToast(t('actions.aiUpdated', 'Action updated by AI'));
       } catch (err) {
@@ -316,6 +375,15 @@
       return [{ value: '', label: t('actions.config.noCapabilitiesForWorkspace') }];
     }
     return empty.concat(list.map((c) => ({ value: String(c.id), label: c.name })));
+  }
+
+  // Toggle a label ID in one of the adjust_labels config lists.
+  function toggleLabelID(store, nodeId, config, field, labelId, checked) {
+    const current = Array.isArray(config?.[field]) ? config[field] : [];
+    const next = checked
+      ? Array.from(new Set([...current, labelId]))
+      : current.filter((id) => id !== labelId);
+    store.updateNodeConfig(nodeId, { [field]: next });
   }
 
   // Block save on invalid or duplicate output field names. doSave() in
@@ -347,6 +415,7 @@
     // enforces action.set_actor when the value actually changes vs the stored
     // action, so passing through unchanged is a no-op.
     apiData.actor_user_id = actorUserId;
+    apiData.allowed_role_ids = apiData.trigger_type === 'manual' ? allowedRoleIds : [];
     await onSave(apiData);
   }
 
@@ -374,6 +443,28 @@
     };
     if (fieldName === 'milestone_ids') updates.value = '[]';
     return updates;
+  }
+
+  // Condition fields can evaluate against the trigger item's parent — the
+  // backend resolver honors a "parent." prefix (GH #267: "transition the
+  // parent when all its children are done").
+  function conditionScope(fieldName) {
+    return conditionFieldScope(fieldName);
+  }
+
+  // Applies the chosen scope while preserving the selected backend field key.
+  function applyConditionScope(fieldName, scope) {
+    return scopeConditionFieldName(fieldName, scope);
+  }
+
+  // Keeps the current scope when a different field is picked.
+  function withConditionScope(currentFieldName, backendName) {
+    return scopeConditionFieldName(backendName, conditionScope(currentFieldName));
+  }
+
+  // Hydrates the condition's field selection with the scope prefix stripped.
+  function getConditionSelectorValue(config) {
+    return getFieldSelectorValue({ ...config, field_name: stripConditionScope(config?.field_name) });
   }
 
   function isMilestoneSetField(config) {
@@ -603,6 +694,35 @@
         size="small"
       />
     </div>
+    {#if (selectedNode.data?.triggerType || action?.trigger_type) === 'manual'}
+      <div
+        id="manual-action-role-selector"
+        class="pt-4 border-t cascade-option"
+        role="group"
+        aria-labelledby="manual-action-role-selector-label"
+        aria-describedby="manual-action-role-selector-hint"
+      >
+        <label
+          id="manual-action-role-selector-label"
+          for="manual-action-role-selector-input"
+          class="block text-xs font-medium mb-1"
+        >
+          {t('actions.manualAccess.label')}
+        </label>
+        <RolePicker
+          bind:value={allowedRoleIds}
+          id="manual-action-role-selector-input"
+          multiple={true}
+          placeholder={t('actions.manualAccess.allEditors')}
+          onChange={(roleIDs) => { allowedRoleIds = roleIDs; }}
+        />
+        <p id="manual-action-role-selector-hint" class="mt-2 text-xs sidebar-hints">
+          {allowedRoleIds.length > 0
+            ? t('actions.manualAccess.restrictedHint')
+            : t('actions.manualAccess.unrestrictedHint')}
+        </p>
+      </div>
+    {/if}
     {#if (selectedNode.data?.triggerType || action?.trigger_type) === 'status_transition'}
       <div>
         <label for="config-from-status" class="block text-xs font-medium mb-1">{t('actions.config.fromStatus')}</label>
@@ -676,6 +796,38 @@
         />
       </div>
     {/if}
+    {#if (selectedNode.data?.triggerType || action?.trigger_type) === 'comment_created'}
+      <div>
+        <label for="config-comment-author" class="block text-xs font-medium mb-1">{t('actions.config.commentAuthor')}</label>
+        <Select
+          id="config-comment-author"
+          options={[
+            { value: '', label: t('actions.config.commentAnyAuthor') },
+            { value: 'customer', label: t('actions.config.commentCustomer') },
+            { value: 'agent', label: t('actions.config.commentAgent') },
+          ]}
+          value={selectedNode.data?.config?.from_customer === true ? 'customer' : selectedNode.data?.config?.from_customer === false ? 'agent' : ''}
+          onchange={(v) => store.updateNodeConfig(selectedNode.id, { from_customer: v === '' ? null : v === 'customer' })}
+          size="small"
+        />
+      </div>
+      <p class="text-xs mt-1 sidebar-hints">{t('actions.config.commentPrivacyHint')}</p>
+    {/if}
+    {#if (selectedNode.data?.triggerType || action?.trigger_type) === 'item_inactive'}
+      <div>
+        <label for="config-inactive-hours" class="block text-xs font-medium mb-1">{t('actions.config.inactiveHours')}</label>
+        <Input
+          id="config-inactive-hours"
+          dataTestid="trigger-inactive-hours"
+          type="number"
+          min="1"
+          value={selectedNode.data?.config?.inactive_hours || ''}
+          oninput={(e) => store.updateNodeConfig(selectedNode.id, { inactive_hours: e.currentTarget.value ? parseInt(e.currentTarget.value) : 0 })}
+          placeholder={t('actions.config.inactiveHoursPlaceholder')}
+        />
+        <p class="text-xs mt-1 sidebar-hints">{t('actions.config.inactiveHoursHint')}</p>
+      </div>
+    {/if}
     <div class="pt-4 border-t cascade-option">
       <Checkbox
         checked={selectedNode.data?.config?.respond_to_cascades || false}
@@ -710,6 +862,7 @@
         <label for="config-set-field-name" class="block text-xs font-medium mb-1">{t('actions.config.fieldName')}</label>
         <FieldSelector
           selectedField={getFieldSelectorValue(selectedNode.data?.config)}
+          excludedFieldIds={['itemType', 'createdAt', 'updatedAt', 'labels']}
           onSelect={(field) => {
             store.updateNodeConfig(selectedNode.id, setFieldConfigForSelection(field));
           }}
@@ -749,19 +902,18 @@
           <p class="text-xs mt-1 sidebar-hints">
             {t('actions.config.userPickerHint')}
           </p>
-          <input
+          <Input
             id="config-set-field-value"
             type="text"
-            class="w-full px-3 py-2 border rounded-md text-sm config-input mt-2"
+            class="mt-2"
             value={selectedNode.data?.config?.value || ''}
             oninput={(e) => store.updateNodeConfig(selectedNode.id, { value: e.currentTarget.value, value_display_name: '' })}
             placeholder="{'{{'}item.creator_id{'}}'}"
           />
         {:else}
-          <input
+          <Input
             id="config-set-field-value"
             type="text"
-            class="w-full px-3 py-2 border rounded-md text-sm config-input"
             value={selectedNode.data?.config?.value || ''}
             oninput={(e) => store.updateNodeConfig(selectedNode.id, { value: e.currentTarget.value, value_display_name: '' })}
             placeholder="{'{{'}item.creator_id{'}}'}"
@@ -780,14 +932,14 @@
             <HelpCircle class="w-3.5 h-3.5" />
           </button>
         </div>
-        <textarea
+        <Textarea
           id="config-comment-content"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="4"
+          rows={4}
           value={selectedNode.data?.config?.content || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { content: e.currentTarget.value })}
           placeholder={t('actions.config.commentPlaceholder')}
-        ></textarea>
+          size="small"
+        />
       </div>
       <Checkbox
         checked={selectedNode.data?.config?.is_private || false}
@@ -798,11 +950,24 @@
     {:else if selectedNode.type === 'condition'}
       <div>
         <label for="config-condition-field" class="block text-xs font-medium mb-1">{t('actions.config.fieldToCheck')}</label>
-        <FieldSelector
-          selectedField={getFieldSelectorValue(selectedNode.data?.config)}
-          onSelect={(field) => store.updateNodeConfig(selectedNode.id, { field_name: backendFieldName(field) })}
-          onClear={() => store.updateNodeConfig(selectedNode.id, { field_name: '' })}
-        />
+        <div class="flex items-center gap-2">
+          <Select
+            id="config-condition-scope"
+            options={[
+              { value: 'item', label: t('actions.config.scopeThisItem') },
+              { value: 'parent', label: t('actions.config.scopeParentItem') }
+            ]}
+            value={conditionScope(selectedNode.data?.config?.field_name)}
+            onchange={(v) => store.updateNodeConfig(selectedNode.id, { field_name: applyConditionScope(selectedNode.data?.config?.field_name || '', v) })}
+            size="small"
+          />
+          <FieldSelector
+            selectedField={getConditionSelectorValue(selectedNode.data?.config)}
+            includeAggregates
+            onSelect={(field) => store.updateNodeConfig(selectedNode.id, { field_name: withConditionScope(selectedNode.data?.config?.field_name, backendFieldName(field)) })}
+            onClear={() => store.updateNodeConfig(selectedNode.id, { field_name: '' })}
+          />
+        </div>
       </div>
       <div>
         <label for="config-condition-operator" class="block text-xs font-medium mb-1">{t('actions.config.operator')}</label>
@@ -824,10 +989,9 @@
       </div>
       <div>
         <label for="config-condition-value" class="block text-xs font-medium mb-1">{t('actions.config.compareValue')}</label>
-        <input
+        <Input
           id="config-condition-value"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.value || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { value: e.currentTarget.value })}
         />
@@ -893,14 +1057,14 @@
             <HelpCircle class="w-3.5 h-3.5" />
           </button>
         </div>
-        <textarea
+        <Textarea
           id="config-notify-message"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="4"
+          rows={4}
           value={selectedNode.data?.config?.message || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { message: e.currentTarget.value })}
           placeholder={t('actions.config.notifyPlaceholder')}
-        ></textarea>
+          size="small"
+        />
       </div>
       <Checkbox
         checked={selectedNode.data?.config?.include_link ?? true}
@@ -914,6 +1078,94 @@
       <CreateAssetConfigPanel {selectedNode} flowStore={store} bind:showPlaceholderModal />
     {:else if selectedNode.type === 'create_milestone'}
       <CreateMilestoneConfigPanel {selectedNode} flowStore={store} bind:showPlaceholderModal />
+    {:else if selectedNode.type === 'notify_customer'}
+      <div>
+        <label for="config-notify-customer-subject" class="block text-xs font-medium mb-1">{t('actions.config.notifySubject')}</label>
+        <Input
+          id="config-notify-customer-subject"
+          dataTestid="notify-customer-subject"
+          type="text"
+          value={selectedNode.data?.config?.subject || ''}
+          oninput={(e) => store.updateNodeConfig(selectedNode.id, { subject: e.currentTarget.value })}
+          placeholder={t('actions.config.notifySubjectPlaceholder')}
+        />
+      </div>
+      <div>
+        <div class="flex items-center gap-1 mb-1">
+          <label for="config-notify-customer-message" class="block text-xs font-medium">{t('actions.config.notifyMessage')}</label>
+          <button
+            onclick={() => showPlaceholderModal = true}
+            class="text-[var(--ds-text-subtlest)] hover:text-[var(--ds-interactive)] transition-colors"
+            title={t('actions.placeholders.showReference')}
+          >
+            <HelpCircle class="w-3.5 h-3.5" />
+          </button>
+        </div>
+        <Textarea
+          id="config-notify-customer-message"
+          data-testid="notify-customer-message"
+          rows={4}
+          value={selectedNode.data?.config?.message || ''}
+          oninput={(e) => store.updateNodeConfig(selectedNode.id, { message: e.currentTarget.value })}
+          placeholder={t('actions.config.notifyPlaceholder')}
+          size="small"
+        />
+      </div>
+      <p class="text-xs sidebar-hints">{t('actions.config.notifyCustomerPrivacyHint')}</p>
+    {:else if selectedNode.type === 'insert_canned_response'}
+      <div>
+        <label for="config-canned-response" class="block text-xs font-medium mb-1">{t('actions.config.cannedResponse')}</label>
+        <Select
+          id="config-canned-response"
+          options={[
+            { value: '', label: t('actions.config.selectCannedResponse') },
+            ...cannedResponses.map((response) => ({
+              value: String(response.id),
+              label: response.is_private ? `${response.name} (${t('actions.config.private')})` : response.name,
+            })),
+          ]}
+          value={selectedNode.data?.config?.canned_response_id ? String(selectedNode.data.config.canned_response_id) : ''}
+          onchange={(v) => store.updateNodeConfig(selectedNode.id, { canned_response_id: v ? parseInt(v) : 0 })}
+          size="small"
+        />
+      </div>
+      <p class="text-xs mt-1 sidebar-hints">{t('actions.config.cannedResponseHint')}</p>
+    {:else if selectedNode.type === 'adjust_labels'}
+      {@const addLabelIDs = selectedNode.data?.config?.add_label_ids || []}
+      {@const removeLabelIDs = selectedNode.data?.config?.remove_label_ids || []}
+      <div>
+        <span class="block text-xs font-medium mb-1">{t('actions.config.addLabels')}</span>
+        {#if workspaceLabels.length === 0}
+          <p class="text-xs sidebar-hints">{t('actions.config.noLabels')}</p>
+        {:else}
+          <div class="flex flex-col gap-1" data-testid="adjust-labels-add">
+            {#each workspaceLabels as label (label.id)}
+              <Checkbox
+                checked={addLabelIDs.includes(label.id)}
+                onchange={(checked) => toggleLabelID(store, selectedNode.id, selectedNode.data?.config, 'add_label_ids', label.id, checked)}
+                label={label.name}
+                dataTestid={`adjust-label-add-${label.id}`}
+                size="small"
+              />
+            {/each}
+          </div>
+        {/if}
+      </div>
+      <div>
+        <span class="block text-xs font-medium mb-1">{t('actions.config.removeLabels')}</span>
+        <div class="flex flex-col gap-1" data-testid="adjust-labels-remove">
+          {#each workspaceLabels as label (label.id)}
+            <Checkbox
+              checked={removeLabelIDs.includes(label.id)}
+              onchange={(checked) => toggleLabelID(store, selectedNode.id, selectedNode.data?.config, 'remove_label_ids', label.id, checked)}
+              label={label.name}
+              dataTestid={`adjust-label-remove-${label.id}`}
+              size="small"
+            />
+          {/each}
+        </div>
+      </div>
+      <p class="text-xs sidebar-hints">{t('actions.config.adjustLabelsHint')}</p>
     {:else if selectedNode.type === 'related_items'}
       <div>
         <label for="config-related-relation" class="block text-xs font-medium mb-1">Relation</label>
@@ -967,12 +1219,11 @@
       />
       <div>
         <label for="config-related-max-items" class="block text-xs font-medium mb-1">Max items</label>
-        <input
+        <Input
           id="config-related-max-items"
-          data-testid="related-max-items"
+          dataTestid="related-max-items"
           type="number"
           min="0"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.max_items || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { max_items: e.currentTarget.value ? parseInt(e.currentTarget.value) : 0 })}
           placeholder="Engine default"
@@ -1040,10 +1291,9 @@
               size="small"
             />
           {:else}
-            <input
+            <Input
               id="config-transition-category"
               type="text"
-              class="w-full px-3 py-2 border rounded-md text-sm config-input"
               value={target.category_name || ''}
               oninput={(e) => store.updateNodeConfig(selectedNode.id, { target: { ...target, category_name: e.currentTarget.value } })}
               placeholder="Done"
@@ -1070,10 +1320,9 @@
       </div>
       <div>
         <label for="config-container-output" class="block text-xs font-medium mb-1">{t('actions.config.outputField')}</label>
-        <input
+        <Input
           id="config-container-output"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.output_field || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { output_field: e.currentTarget.value })}
           placeholder={t('actions.config.outputFieldPlaceholder')}
@@ -1082,11 +1331,10 @@
       </div>
       <div>
         <label for="config-container-timeout" class="block text-xs font-medium mb-1">{t('actions.config.timeoutSecs')}</label>
-        <input
+        <Input
           id="config-container-timeout"
           type="number"
           min="1"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.timeout_secs || 60}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { timeout_secs: parseInt(e.currentTarget.value) || 60 })}
         />
@@ -1129,10 +1377,9 @@
             <HelpCircle class="w-3.5 h-3.5" />
           </button>
         </div>
-        <input
+        <Input
           id="config-http-url"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.url_template || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { url_template: e.currentTarget.value })}
           placeholder="https://example.com/api/items/{'{{'}item.id{'}}'}"
@@ -1140,14 +1387,14 @@
       </div>
       <div>
         <label for="config-http-body" class="block text-xs font-medium mb-1">{t('actions.config.requestBody')}</label>
-        <textarea
+        <Textarea
           id="config-http-body"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="3"
+          rows={3}
           value={selectedNode.data?.config?.body || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { body: e.currentTarget.value })}
           placeholder={t('actions.config.requestBodyPlaceholder')}
-        ></textarea>
+          size="small"
+        />
       </div>
       <div>
         <span class="block text-xs font-medium mb-1">{t('actions.config.httpHeaders')}</span>
@@ -1159,10 +1406,9 @@
       </div>
       <div>
         <label for="config-http-output" class="block text-xs font-medium mb-1">{t('actions.config.outputField')}</label>
-        <input
+        <Input
           id="config-http-output"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.output_field || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { output_field: e.currentTarget.value })}
           placeholder="response"
@@ -1182,10 +1428,9 @@
       </div>
       <div>
         <label for="config-aix-input" class="block text-xs font-medium mb-1">{t('actions.config.inputField')}</label>
-        <input
+        <Input
           id="config-aix-input"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.input_field || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { input_field: e.currentTarget.value })}
           placeholder={t('actions.config.inputFieldPlaceholder')}
@@ -1193,33 +1438,32 @@
       </div>
       <div>
         <label for="config-aix-prompt" class="block text-xs font-medium mb-1">{t('actions.config.aiPrompt')}</label>
-        <textarea
+        <Textarea
           id="config-aix-prompt"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="4"
+          rows={4}
           value={selectedNode.data?.config?.prompt || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { prompt: e.currentTarget.value })}
           placeholder={t('actions.config.aiExtractPromptPlaceholder')}
-        ></textarea>
+          size="small"
+        />
       </div>
       <div>
         <label for="config-aix-schema" class="block text-xs font-medium mb-1">{t('actions.config.outputSchema')}</label>
-        <textarea
+        <Textarea
           id="config-aix-schema"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="4"
+          rows={4}
           value={selectedNode.data?.config?.output_schema || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { output_schema: e.currentTarget.value })}
           placeholder={'{"type":"object","properties":{...}}'}
           style="font-family: monospace;"
-        ></textarea>
+          size="small"
+        />
       </div>
       <div>
         <label for="config-aix-output" class="block text-xs font-medium mb-1">{t('actions.config.outputField')}</label>
-        <input
+        <Input
           id="config-aix-output"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.output_field || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { output_field: e.currentTarget.value })}
           placeholder="extracted_data"
@@ -1239,14 +1483,14 @@
       </div>
       <div>
         <label for="config-aia-prompt" class="block text-xs font-medium mb-1">{t('actions.config.systemPrompt')}</label>
-        <textarea
+        <Textarea
           id="config-aia-prompt"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="4"
+          rows={4}
           value={selectedNode.data?.config?.prompt || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { prompt: e.currentTarget.value })}
           placeholder={t('actions.config.systemPromptPlaceholder')}
-        ></textarea>
+          size="small"
+        />
       </div>
       <div>
         <label for="config-aia-input-fields" class="block text-xs font-medium mb-1">{t('actions.config.inputFields')}</label>
@@ -1267,12 +1511,11 @@
             {/each}
           </div>
         {/if}
-        <input
+        <Input
           id="config-aia-input-fields"
-          data-testid="ai-input-field-add"
+          dataTestid="ai-input-field-add"
           type="text"
           list={`ai-input-suggestions-${selectedNode.id}`}
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           placeholder={t('actions.config.inputFieldsPlaceholder')}
           onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addInputField(selectedNode.id, selectedNode.data?.config, e.currentTarget.value); e.currentTarget.value = ''; } }}
           onchange={(e) => { if (e.currentTarget.value) { addInputField(selectedNode.id, selectedNode.data?.config, e.currentTarget.value); e.currentTarget.value = ''; } }}
@@ -1290,41 +1533,38 @@
           <p class="text-xs" style="color: var(--ds-text-subtle); font-style: italic;">{t('actions.config.noToolsAvailable')}</p>
         {:else}
           {#each capabilitiesByType.http_client as cap}
-            <label class="flex items-center gap-2 text-sm py-1 cursor-pointer">
-              <input
-                type="checkbox"
+            <Checkbox
                 checked={(selectedNode.data?.config?.tools || []).includes(String(cap.id))}
-                onchange={(e) => {
+                onchange={(checked) => {
                   const current = selectedNode.data?.config?.tools || [];
-                  const next = e.currentTarget.checked
+                  const next = checked
                     ? [...current.filter((id) => id !== String(cap.id)), String(cap.id)]
                     : current.filter((id) => id !== String(cap.id));
                   store.updateNodeConfig(selectedNode.id, { tools: next });
                 }}
+                label={cap.name}
+                class="py-1"
+                size="small"
               />
-              <span style="color: var(--ds-text);">{cap.name}</span>
-            </label>
           {/each}
         {/if}
       </div>
       <div>
         <label for="config-aia-max-steps" class="block text-xs font-medium mb-1">{t('actions.config.maxSteps')}</label>
-        <input
+        <Input
           id="config-aia-max-steps"
           type="number"
           min="1"
           max="50"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.max_steps || 10}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { max_steps: parseInt(e.currentTarget.value) || 10 })}
         />
       </div>
       <div>
         <label for="config-aia-output" class="block text-xs font-medium mb-1">{t('actions.config.outputField')}</label>
-        <input
+        <Input
           id="config-aia-output"
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.output_field || ''}
           oninput={(e) => store.updateNodeConfig(selectedNode.id, { output_field: e.currentTarget.value })}
           placeholder="agent_answer"

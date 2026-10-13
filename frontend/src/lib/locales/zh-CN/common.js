@@ -128,6 +128,8 @@ export default {
     custom: '自定义',
 
     loading: '加载中...',
+    loadingSlow: '网络连接较慢时，这可能需要一些时间。',
+    skipToMainContent: '跳转到主要内容',
     saving: '保存中...',
     deleting: '删除中...',
     processing: '处理中...',
@@ -145,6 +147,7 @@ export default {
     loadingMore: '正在加载更多...',
     remaining: '剩余',
     showingOfTotal: '显示 {count} / {total}',
+    showingXofY: '显示第 {from}–{to} 项，共 {total} 项',
 
     noResults: '未找到结果',
     noData: '暂无数据',
@@ -207,6 +210,7 @@ export default {
     updated: '更新成功',
     copied: '已复制到剪贴板',
     failed: '操作失败',
+    layoutSaveFailed: '无法保存仪表板更改。重新加载后您的编辑将丢失。',
   },
 
   errors: {
@@ -286,5 +290,16 @@ export default {
     noRequirements: '未配置需求',
     configureFilter: '配置筛选器以查看项目',
     createToStart: '创建 {item} 以开始使用',
+  },
+  dueDate: {
+    noDueDate: '无截止日期',
+    dueToday: '今天到期',
+    dueTomorrow: '明天到期',
+    dueYesterday: '昨天到期',
+    dueInDays: '{days} 天后到期',
+    overdueByDays: '已逾期 {days} 天',
+    overdueTooltip: '已逾期 {days} 天 — 原定于 {date}',
+    dueSoonTooltip: '{days} 天后到期 — {date}',
+    dueLaterTooltip: '{date} 到期',
   },
 };

@@ -1,6 +1,7 @@
 <script>
   import { tick } from 'svelte';
-  import { ChevronDown, Check, X, Loader2 } from '@lucide/svelte';
+  import Spinner from '../components/Spinner.svelte';
+  import { ChevronDown, Check, X } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
   import Select from '../components/Select.svelte';
 
@@ -122,7 +123,7 @@
       />
 
       {#if error}
-        <div class="absolute top-full left-0 mt-1 text-xs text-red-600 bg-white px-2 py-1 border border-red-200 rounded shadow-sm z-10">
+        <div class="absolute top-full left-0 mt-1 text-xs text-ds-text-danger bg-ds-surface-raised px-2 py-1 border border-ds-status-danger-border rounded shadow-sm z-10">
           {error}
         </div>
       {/if}
@@ -130,12 +131,12 @@
 
     <div class="flex items-center gap-1">
       {#if saving}
-        <Loader2 class="w-4 h-4 animate-spin" style="color: var(--ds-text-subtle);" />
+        <Spinner size="sm" />
       {:else}
         <button
           type="button"
           onclick={saveValue}
-          class="p-1 text-green-600 hover:bg-green-50 rounded"
+          class="p-1 text-ds-icon-success hover:bg-ds-success-subtle rounded"
           title={t('editors.saveEnter')}
         >
           <Check class="w-4 h-4" />

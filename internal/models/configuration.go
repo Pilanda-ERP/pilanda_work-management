@@ -7,12 +7,20 @@ import (
 	"time"
 )
 
+// HierarchyLevelGenericSubtask is the sentinel used by item types that may be
+// attached below any regular hierarchy level. Generic subtasks are terminal
+// leaves: they require a parent and cannot themselves parent another item.
+const HierarchyLevelGenericSubtask = -1
+
 // ConfigurationSet represents a configuration set for workspaces
 type ConfigurationSet struct {
 	ID                      int       `json:"id"`
+	BuiltinKey              string    `json:"builtin_key,omitempty"`
 	WorkspaceID             int       `json:"workspace_id"` // Keep for backward compatibility
 	Name                    string    `json:"name"`
+	DisplayName             string    `json:"display_name"`
 	Description             string    `json:"description"`
+	DisplayDescription      string    `json:"display_description,omitempty"`
 	IsDefault               bool      `json:"is_default"`
 	DifferentiateByItemType bool      `json:"differentiate_by_item_type"`
 	WorkflowID              *int      `json:"workflow_id,omitempty"`
@@ -22,11 +30,13 @@ type ConfigurationSet struct {
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
 	// Joined fields for API responses
-	WorkspaceName           string `json:"workspace_name,omitempty"`
-	WorkflowName            string `json:"workflow_name,omitempty"`
-	NotificationSettingName string `json:"notification_setting_name,omitempty"`
-	ConditionSetName        string `json:"condition_set_name,omitempty"`
-	ApprovalSetName         string `json:"approval_set_name,omitempty"`
+	WorkspaceName                 string `json:"workspace_name,omitempty"`
+	WorkflowName                  string `json:"workflow_name,omitempty"`
+	WorkflowBuiltinKey            string `json:"workflow_builtin_key,omitempty"`
+	NotificationSettingName       string `json:"notification_setting_name,omitempty"`
+	NotificationSettingBuiltinKey string `json:"notification_setting_builtin_key,omitempty"`
+	ConditionSetName              string `json:"condition_set_name,omitempty"`
+	ApprovalSetName               string `json:"approval_set_name,omitempty"`
 	// Many-to-many workspace relationships
 	WorkspaceIDs []int    `json:"workspace_ids,omitempty"`
 	Workspaces   []string `json:"workspaces,omitempty"` // Workspace names for display
@@ -38,15 +48,19 @@ type ConfigurationSet struct {
 	PriorityIDs        []int             `json:"priority_ids,omitempty"`        // IDs of associated priorities
 	PrioritiesDetailed []PriorityDisplay `json:"priorities_detailed,omitempty"` // Full priority data with icons and colors
 	// Screen assignments for different contexts
-	CreateScreenID   *int   `json:"create_screen_id,omitempty"`
-	EditScreenID     *int   `json:"edit_screen_id,omitempty"`
-	ViewScreenID     *int   `json:"view_screen_id,omitempty"`
-	CreateScreenName string `json:"create_screen_name,omitempty"`
-	EditScreenName   string `json:"edit_screen_name,omitempty"`
-	ViewScreenName   string `json:"view_screen_name,omitempty"`
+	CreateScreenID         *int   `json:"create_screen_id,omitempty"`
+	EditScreenID           *int   `json:"edit_screen_id,omitempty"`
+	ViewScreenID           *int   `json:"view_screen_id,omitempty"`
+	CreateScreenName       string `json:"create_screen_name,omitempty"`
+	CreateScreenBuiltinKey string `json:"create_screen_builtin_key,omitempty"`
+	EditScreenName         string `json:"edit_screen_name,omitempty"`
+	EditScreenBuiltinKey   string `json:"edit_screen_builtin_key,omitempty"`
+	ViewScreenName         string `json:"view_screen_name,omitempty"`
+	ViewScreenBuiltinKey   string `json:"view_screen_builtin_key,omitempty"`
 	// Default item type for new items (when user has no localStorage preference)
-	DefaultItemTypeID   *int   `json:"default_item_type_id,omitempty"`
-	DefaultItemTypeName string `json:"default_item_type_name,omitempty"`
+	DefaultItemTypeID         *int   `json:"default_item_type_id,omitempty"`
+	DefaultItemTypeName       string `json:"default_item_type_name,omitempty"`
+	DefaultItemTypeBuiltinKey string `json:"default_item_type_builtin_key,omitempty"`
 }
 
 // ConfigurationSetScreen represents a screen assignment for a configuration set
@@ -63,11 +77,14 @@ type ConfigurationSetScreen struct {
 
 // Screen represents a field layout screen
 type Screen struct {
-	ID          int       `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
+	Name               string    `json:"name"`
+	DisplayName        string    `json:"display_name"`
+	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 	// Joined fields for API responses
 	Fields       []ScreenField `json:"fields,omitempty"`
 	SystemFields []string      `json:"system_fields,omitempty"` // List of system field names to show
@@ -83,17 +100,20 @@ type ScreenField struct {
 	IsRequired      bool   `json:"is_required"`
 	FieldWidth      string `json:"field_width"`
 	// Joined/computed fields for API responses
-	FieldName   string                 `json:"field_name,omitempty"`
-	FieldLabel  string                 `json:"field_label,omitempty"`
-	FieldConfig map[string]interface{} `json:"field_config,omitempty"`
+	FieldName   string         `json:"field_name,omitempty"`
+	FieldLabel  string         `json:"field_label,omitempty"`
+	FieldConfig map[string]any `json:"field_config,omitempty"`
 }
 
 // ItemType represents a type of work item
 type ItemType struct {
 	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
 	ConfigurationSetID int       `json:"configuration_set_id,omitempty"` // Deprecated: kept for backward compatibility
 	Name               string    `json:"name"`
+	DisplayName        string    `json:"display_name"`
 	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
 	IsDefault          bool      `json:"is_default"`
 	Icon               string    `json:"icon"`            // Lucide icon name
 	Color              string    `json:"color"`           // Hex color for background
@@ -102,8 +122,9 @@ type ItemType struct {
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 	// Many-to-many configuration set relationships
-	ConfigurationSetIDs   []int    `json:"configuration_set_ids,omitempty"`   // IDs of associated configuration sets
-	ConfigurationSetNames []string `json:"configuration_set_names,omitempty"` // Names for display
+	ConfigurationSetIDs         []int    `json:"configuration_set_ids,omitempty"`          // IDs of associated configuration sets
+	ConfigurationSetNames       []string `json:"configuration_set_names,omitempty"`        // Names for display
+	ConfigurationSetBuiltinKeys []string `json:"configuration_set_builtin_keys,omitempty"` // Stable keys for built-in configuration sets
 	// Deprecated joined fields (kept for backward compatibility)
 	ConfigurationSetName string `json:"configuration_set_name,omitempty"`
 	WorkspaceName        string `json:"workspace_name,omitempty"`
@@ -111,6 +132,7 @@ type ItemType struct {
 
 // ItemTypeDisplay holds minimal item type data for displaying in configuration sets
 type ItemTypeDisplay struct {
+	BuiltinKey     string `json:"builtin_key,omitempty"`
 	Name           string `json:"name"`
 	Icon           string `json:"icon"`
 	Color          string `json:"color"`
@@ -119,14 +141,16 @@ type ItemTypeDisplay struct {
 
 // ItemTypeConfig represents item type configuration with optional workflow and screen overrides
 type ItemTypeConfig struct {
-	ItemTypeID     int    `json:"item_type_id"`
-	ItemTypeName   string `json:"item_type_name"`
-	ItemTypeIcon   string `json:"item_type_icon"`
-	ItemTypeColor  string `json:"item_type_color"`
-	HierarchyLevel int    `json:"hierarchy_level"`
+	ItemTypeID         int    `json:"item_type_id"`
+	ItemTypeBuiltinKey string `json:"item_type_builtin_key,omitempty"`
+	ItemTypeName       string `json:"item_type_name"`
+	ItemTypeIcon       string `json:"item_type_icon"`
+	ItemTypeColor      string `json:"item_type_color"`
+	HierarchyLevel     int    `json:"hierarchy_level"`
 	// Override workflow (NULL = use configuration set default)
-	WorkflowID   *int   `json:"workflow_id,omitempty"`
-	WorkflowName string `json:"workflow_name,omitempty"` // "Default" or workflow name
+	WorkflowID         *int   `json:"workflow_id,omitempty"`
+	WorkflowName       string `json:"workflow_name,omitempty"` // "Default" or workflow name
+	WorkflowBuiltinKey string `json:"workflow_builtin_key,omitempty"`
 	// Override condition set (NULL = use configuration set default)
 	ConditionSetID   *int   `json:"condition_set_id,omitempty"`
 	ConditionSetName string `json:"condition_set_name,omitempty"`
@@ -134,108 +158,166 @@ type ItemTypeConfig struct {
 	ApprovalSetID   *int   `json:"approval_set_id,omitempty"`
 	ApprovalSetName string `json:"approval_set_name,omitempty"`
 	// Override screens (NULL = use configuration set defaults)
-	CreateScreenID   *int   `json:"create_screen_id,omitempty"`
-	CreateScreenName string `json:"create_screen_name,omitempty"`
-	EditScreenID     *int   `json:"edit_screen_id,omitempty"`
-	EditScreenName   string `json:"edit_screen_name,omitempty"`
-	ViewScreenID     *int   `json:"view_screen_id,omitempty"`
-	ViewScreenName   string `json:"view_screen_name,omitempty"`
+	CreateScreenID         *int   `json:"create_screen_id,omitempty"`
+	CreateScreenName       string `json:"create_screen_name,omitempty"`
+	CreateScreenBuiltinKey string `json:"create_screen_builtin_key,omitempty"`
+	EditScreenID           *int   `json:"edit_screen_id,omitempty"`
+	EditScreenName         string `json:"edit_screen_name,omitempty"`
+	EditScreenBuiltinKey   string `json:"edit_screen_builtin_key,omitempty"`
+	ViewScreenID           *int   `json:"view_screen_id,omitempty"`
+	ViewScreenName         string `json:"view_screen_name,omitempty"`
+	ViewScreenBuiltinKey   string `json:"view_screen_builtin_key,omitempty"`
 }
 
 // Priority represents a priority level
 type Priority struct {
-	ID          int       `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	IsDefault   bool      `json:"is_default"`
-	Icon        string    `json:"icon"`       // Lucide icon name
-	Color       string    `json:"color"`      // Hex color for background
-	SortOrder   int       `json:"sort_order"` // For ordering priorities
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
+	Name               string    `json:"name"`
+	DisplayName        string    `json:"display_name"`
+	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
+	IsDefault          bool      `json:"is_default"`
+	Icon               string    `json:"icon"`       // Lucide icon name
+	Color              string    `json:"color"`      // Hex color for background
+	SortOrder          int       `json:"sort_order"` // For ordering priorities
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 	// Many-to-many configuration set relationships
-	ConfigurationSetIDs   []int    `json:"configuration_set_ids,omitempty"`   // IDs of associated configuration sets
-	ConfigurationSetNames []string `json:"configuration_set_names,omitempty"` // Names for display
+	ConfigurationSetIDs         []int    `json:"configuration_set_ids,omitempty"`          // IDs of associated configuration sets
+	ConfigurationSetNames       []string `json:"configuration_set_names,omitempty"`        // Names for display
+	ConfigurationSetBuiltinKeys []string `json:"configuration_set_builtin_keys,omitempty"` // Stable keys for built-in configuration sets
 }
 
 // PriorityDisplay holds minimal priority data for displaying in configuration sets
 type PriorityDisplay struct {
-	ID        int    `json:"id"`
-	Name      string `json:"name"`
-	Icon      string `json:"icon"`
-	Color     string `json:"color"`
-	SortOrder int    `json:"sort_order"`
+	ID         int    `json:"id"`
+	BuiltinKey string `json:"builtin_key,omitempty"`
+	Name       string `json:"name"`
+	Icon       string `json:"icon"`
+	Color      string `json:"color"`
+	SortOrder  int    `json:"sort_order"`
 }
 
 // HierarchyLevel represents a hierarchy level definition
 type HierarchyLevel struct {
-	ID          int       `json:"id"`
-	Level       int       `json:"level"` // 0, 1, 2, 3...
-	Name        string    `json:"name"`  // e.g., "Initiative", "Epic", "Task", "Sub-task"
-	Description string    `json:"description"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
+	Level              int       `json:"level"` // 0, 1, 2, 3...
+	Name               string    `json:"name"`  // e.g., "Initiative", "Epic", "Task", "Sub-task"
+	DisplayName        string    `json:"display_name"`
+	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // StatusCategory represents a category for statuses
 type StatusCategory struct {
-	ID          int       `json:"id"`
-	Name        string    `json:"name"`
-	Color       string    `json:"color"` // Hex color code (e.g., "#3b82f6")
-	Description string    `json:"description"`
-	IsDefault   bool      `json:"is_default"`
-	IsCompleted bool      `json:"is_completed"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
+	Name               string    `json:"name"`
+	DisplayName        string    `json:"display_name"`
+	Color              string    `json:"color"` // Hex color code (e.g., "#3b82f6")
+	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
+	IsDefault          bool      `json:"is_default"`
+	IsCompleted        bool      `json:"is_completed"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // Status represents a workflow status
 type Status struct {
-	ID          int       `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	CategoryID  int       `json:"category_id"`
-	IsDefault   bool      `json:"is_default"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
+	Name               string    `json:"name"`
+	DisplayName        string    `json:"display_name"`
+	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
+	CategoryID         int       `json:"category_id"`
+	IsDefault          bool      `json:"is_default"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 	// Joined fields for API responses
-	CategoryName  string `json:"category_name,omitempty"`
-	CategoryColor string `json:"category_color,omitempty"`
-	IsCompleted   bool   `json:"is_completed,omitempty"`
+	CategoryName        string `json:"category_name,omitempty"`
+	CategoryBuiltinKey  string `json:"category_builtin_key,omitempty"`
+	CategoryDescription string `json:"category_description,omitempty"`
+	CategoryColor       string `json:"category_color,omitempty"`
+	CategoryIsDefault   bool   `json:"category_is_default,omitempty"`
+	IsCompleted         bool   `json:"is_completed,omitempty"`
 }
 
 // Workflow represents a workflow definition
 type Workflow struct {
-	ID          int       `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	IsDefault   bool      `json:"is_default"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	BuiltinKey         string    `json:"builtin_key,omitempty"`
+	Name               string    `json:"name"`
+	DisplayName        string    `json:"display_name"`
+	Description        string    `json:"description"`
+	DisplayDescription string    `json:"display_description,omitempty"`
+	IsDefault          bool      `json:"is_default"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 	// Joined fields for API responses
 	Transitions []WorkflowTransition `json:"transitions,omitempty"`
 }
 
 // WorkflowTransition represents a transition between statuses in a workflow
 type WorkflowTransition struct {
-	ID           int       `json:"id"`
-	WorkflowID   int       `json:"workflow_id"`
-	FromStatusID *int      `json:"from_status_id"` // NULL means it's an initial status
-	ToStatusID   int       `json:"to_status_id"`
-	DisplayOrder int       `json:"display_order"`
-	SourceHandle string    `json:"source_handle,omitempty"` // Connection point on source status (top, right, bottom, left)
-	TargetHandle string    `json:"target_handle,omitempty"` // Connection point on target status (top, right, bottom, left)
-	CreatedAt    time.Time `json:"created_at"`
+	ID              int       `json:"id"`
+	WorkflowID      int       `json:"workflow_id"`
+	FromStatusID    *int      `json:"from_status_id"` // NULL means it's an initial status
+	ToStatusID      int       `json:"to_status_id"`
+	FromAllStatuses bool      `json:"from_all_statuses"` // TRUE = allowed from every other status; from_status_id stays NULL
+	DisplayOrder    int       `json:"display_order"`
+	SourceHandle    string    `json:"source_handle,omitempty"` // Connection point on source status (top, right, bottom, left)
+	TargetHandle    string    `json:"target_handle,omitempty"` // Connection point on target status (top, right, bottom, left)
+	CreatedAt       time.Time `json:"created_at"`
 	// Joined fields for API responses
 	FromStatusName string `json:"from_status_name,omitempty"`
 	ToStatusName   string `json:"to_status_name,omitempty"`
 	WorkflowName   string `json:"workflow_name,omitempty"`
+	// Category metadata supports alternate transport projections without
+	// expanding the legacy workflow-transition response.
+	FromStatusBuiltinKey   string `json:"-"`
+	FromCategoryBuiltinKey string `json:"-"`
+	FromCategoryName       string `json:"-"`
+	FromCategoryColor      string `json:"-"`
+	ToStatusBuiltinKey     string `json:"-"`
+	ToCategoryBuiltinKey   string `json:"-"`
+	ToCategoryName         string `json:"-"`
+	ToCategoryColor        string `json:"-"`
 }
 
 // CustomFieldIndexInfo represents which tables have indexes for a custom field
 type CustomFieldIndexInfo struct {
 	Items  bool `json:"items"`
 	Assets bool `json:"assets"`
+}
+
+const (
+	// CustomFieldTypeBoolean is the canonical field type used by the asset
+	// subsystem and every surface that consumes global custom fields.
+	CustomFieldTypeBoolean = "boolean"
+	// CustomFieldTypeCheckbox is retained as a compatibility alias for
+	// definitions written by older clients and prerelease WI-891 builds.
+	CustomFieldTypeCheckbox = "checkbox"
+)
+
+// IsBooleanCustomFieldType reports whether a definition uses either the
+// canonical asset type or its legacy UI-oriented alias.
+func IsBooleanCustomFieldType(fieldType string) bool {
+	return fieldType == CustomFieldTypeBoolean || fieldType == CustomFieldTypeCheckbox
+}
+
+// CanonicalCustomFieldType maps compatibility aliases to the asset subsystem's
+// canonical type before definitions are persisted or compared for reuse.
+func CanonicalCustomFieldType(fieldType string) string {
+	if IsBooleanCustomFieldType(fieldType) {
+		return CustomFieldTypeBoolean
+	}
+	return fieldType
 }
 
 // CustomFieldDefinition represents a custom field definition
@@ -327,7 +409,7 @@ type ItemTypeMigrationInfo struct {
 	RequiresMigration     bool             `json:"requires_migration"`
 	SuggestedItemTypeID   *int             `json:"suggested_item_type_id,omitempty"`
 	SuggestedItemTypeName string           `json:"suggested_item_type_name,omitempty"`
-	AvailableTargets      []ItemTypeTarget `json:"available_targets,omitempty"`
+	AvailableTargets      []ItemTypeTarget `json:"available_targets"`
 }
 
 // ItemTypeTarget represents an available target item type for migration
@@ -408,9 +490,9 @@ type ItemTypeMigrationMapping struct {
 
 // CustomFieldMigrationMapping specifies how to handle a custom field
 type CustomFieldMigrationMapping struct {
-	FieldID      int         `json:"field_id"`
-	Action       string      `json:"action"`                  // keep, orphan, add_default
-	DefaultValue interface{} `json:"default_value,omitempty"` // for new required fields
+	FieldID      int    `json:"field_id"`
+	Action       string `json:"action"`                  // keep, orphan, add_default
+	DefaultValue any    `json:"default_value,omitempty"` // for new required fields
 }
 
 // PriorityMigrationMapping maps old priority to new
@@ -450,6 +532,13 @@ type ComprehensiveMigrationRequest struct {
 	// When set, status mappings are validated against this workflow rather
 	// than the workflow currently persisted on the config set.
 	ApplyWorkflowToConfigSet *int `json:"apply_workflow_to_config_set,omitempty"`
+
+	// ApplyItemTypeConfigsToConfigSet, when non-nil, replaces the target
+	// configuration set's item-type allow-list in the same transaction as the
+	// item migrations. This is the intra-set item-type-removal path: it avoids
+	// a gap in which newly-created items could continue using a removed type
+	// between migration execution and the follow-up configuration-set update.
+	ApplyItemTypeConfigsToConfigSet *[]ItemTypeConfig `json:"apply_item_type_configs_to_config_set,omitempty"`
 }
 
 // SelectOption represents a single option in a select/multiselect custom field
@@ -528,11 +617,13 @@ type ConditionSet struct {
 
 // ConditionSetTransitionSummary is a minimal transition descriptor for list
 // responses: just enough to render a "From → To" lozenge in the manager UI.
-// FromStatusName is empty for initial transitions (from_status_id IS NULL).
+// FromStatusName is empty for initial transitions and from-all rows (both have
+// from_status_id IS NULL); FromAllStatuses tells them apart.
 type ConditionSetTransitionSummary struct {
-	TransitionID   int    `json:"transition_id"`
-	FromStatusName string `json:"from_status_name,omitempty"`
-	ToStatusName   string `json:"to_status_name"`
+	TransitionID    int    `json:"transition_id"`
+	FromStatusName  string `json:"from_status_name,omitempty"`
+	ToStatusName    string `json:"to_status_name"`
+	FromAllStatuses bool   `json:"from_all_statuses,omitempty"`
 }
 
 // TransitionCondition links a condition set to a specific transition with conditions
@@ -599,17 +690,8 @@ type ConditionScriptConfig struct {
 	TimeoutMs int    `json:"timeout_ms,omitempty"`
 }
 
-// ============================================================================
-// Approvals
-// ============================================================================
-//
-// Approvals are the asynchronous sibling of condition_sets: when an item enters
-// a designated status, an approval request is opened that one or more approvers
-// must decide. The decision drives one of two configured transitions
-// (approve_transition_id / deny_transition_id). Those two transitions cannot be
-// invoked directly by users — only by ApprovalService. Every other transition
-// on the status works normally; leaving the status via a non-gated transition
-// cancels the pending request, and re-entering opens a fresh one.
+// Approvals open asynchronous requests on configured statuses. ApprovalService
+// alone drives approve/deny transitions; leaving cancels and re-entry reopens.
 
 // FieldRef is a generic reference to either a regular item field or a custom field.
 // Used by approvals today and by conditions/validators after the migration in slice 10.
@@ -704,6 +786,7 @@ type ApprovalStep struct {
 type ApprovalRequest struct {
 	ID                  int                    `json:"id"`
 	ItemID              int                    `json:"item_id"`
+	WorkspaceID         int                    `json:"workspace_id"`
 	ApprovalSetStatusID int                    `json:"approval_set_status_id"`
 	StatusID            int                    `json:"status_id"`
 	FromStatusID        *int                   `json:"from_status_id,omitempty"` // snapshot of prior status; revert target on cancel

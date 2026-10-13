@@ -14,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"windshift/internal/itemevents"
 	"windshift/internal/services"
+	"windshift/internal/utils"
 
 	extism "github.com/extism/go-sdk"
 )
@@ -117,7 +119,7 @@ func (m *Manager) httpFetchHostFunction(ctx context.Context, plugin *extism.Curr
 
 	client := m.httpClient
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = utils.NewHTTPClient(10 * time.Second)
 	}
 
 	timeout := m.pluginTimeout
@@ -378,6 +380,7 @@ func (m *Manager) createCommentHostFunction(ctx context.Context, plugin *extism.
 		Content:               req.Content,
 		ActorUserID:           req.AuthorID,
 		SuppressNotifications: req.SuppressNotifications,
+		EventMetadata:         itemevents.Integration(pluginName, "plugin"),
 	})
 	if err != nil {
 		m.logger.Warn("create_comment failed", "error", err, "plugin", pluginName, "item_id", req.ItemID)

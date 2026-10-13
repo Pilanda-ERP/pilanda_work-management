@@ -1,13 +1,18 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"windshift/internal/cql"
+	"windshift/internal/database"
 	"windshift/internal/models"
 )
 
@@ -53,6 +58,7 @@ type ItemFilters struct {
 	StatusIDNot   *int
 	PriorityID    *int
 	AssigneeID    *int
+	TeamID        *int
 	CreatorID     *int
 	ItemTypeID    *int
 	MilestoneID   *int
@@ -66,14 +72,38 @@ type ItemFilters struct {
 	// entered that status on/after this ISO date; non-completed items always
 	// pass. Caps the indefinitely-growing "done" list on personal views.
 	CompletedSince *string
-	QLQuery        string // Custom QL query
-	QLArgs         []interface{}
-	StatusIDs      []int  // Multi-value status filter (for backlog + search)
-	StatusIDsNot   []int  // Multi-value negated status filter
-	PriorityIDs    []int  // Multi-value priority filter
-	TextQuery      string // LIKE search on title/description
-	ItemKeyQuery   string // Workspace key pattern match (e.g. "OK-40")
-	ItemID         *int   // Filter by specific item ID
+	// CompletedActivitySince constrains completed items by their most recent
+	// activity while leaving unfinished items untouched.
+	CompletedActivitySince *time.Time
+	QLQuery                string // Custom QL query
+	QLArgs                 []any
+	StatusIDs              []int  // Multi-value status filter (for backlog + search)
+	StatusIDsNot           []int  // Multi-value negated status filter
+	PriorityIDs            []int  // Multi-value priority filter
+	ItemIDs                []int  // Multi-value item ID filter
+	TextQuery              string // LIKE search on title/description
+	ItemKeyQuery           string // Workspace key pattern match (e.g. "OK-40")
+	ItemID                 *int   // Filter by specific item ID
+}
+
+func (f ItemFilters) hasScalarFilters() bool {
+	return f.StatusID != nil || f.StatusIDNot != nil || f.PriorityID != nil ||
+		f.AssigneeID != nil || f.TeamID != nil || f.CreatorID != nil || f.ItemTypeID != nil ||
+		f.MilestoneID != nil || f.IterationID != nil || f.ParentIDIsSet ||
+		f.Level != nil || f.MaxLevel != nil || f.CreatedSince != nil ||
+		f.CompletedSince != nil || f.CompletedActivitySince != nil || f.ItemID != nil
+}
+
+func (f ItemFilters) hasListFilters() bool {
+	return len(f.StatusIDs) != 0 || len(f.StatusIDsNot) != 0 || len(f.PriorityIDs) != 0 || len(f.ItemIDs) != 0
+}
+
+func (f ItemFilters) hasTextFilters() bool {
+	return f.TextQuery != "" || f.ItemKeyQuery != ""
+}
+
+func (f ItemFilters) isUnfiltered() bool {
+	return f.QLQuery == "" && !f.hasScalarFilters() && !f.hasListFilters() && !f.hasTextFilters()
 }
 
 // PaginationParams contains pagination parameters
@@ -81,6 +111,65 @@ type PaginationParams struct {
 	Page   int
 	Limit  int
 	Offset int
+	// Cursor is an opaque continuation token for the default-ranked workspace
+	// list. CursorMode opts the first request into the continuation contract;
+	// collection, QL, and filtered lists intentionally continue to use their
+	// existing page/offset contract.
+	Cursor     string
+	CursorMode bool
+}
+
+// ItemListPage is the repository result for a list request. The legacy list
+// methods below still return only items and total; callers that opt into the
+// workspace cursor contract can also consume NextCursor.
+type ItemListPage struct {
+	Items      []models.Item
+	Total      int
+	NextCursor string
+}
+
+// ItemIDPage is the lightweight counterpart to ItemListPage for callers that
+// need the selected item set without hydrating item details.
+type ItemIDPage struct {
+	IDs   []int
+	Total int
+}
+
+// ErrInvalidItemListCursor identifies a malformed opaque list continuation.
+// Handlers map it to a validation response instead of exposing a SQL error.
+var ErrInvalidItemListCursor = errors.New("invalid item list cursor")
+
+type itemListCursor struct {
+	Rank string `json:"r"`
+	ID   int    `json:"i"`
+}
+
+// ItemListFilterFromClause contains every table alias referenced by
+// buildWhereClause, including aliases emitted by the CQL generator. Keep this
+// shared by item-list and analytics queries so a valid filter cannot succeed
+// in one path and fail in another.
+func ItemListFilterFromClause() string {
+	return `FROM items i
+		JOIN workspaces w ON i.workspace_id = w.id
+		LEFT JOIN item_types it ON i.item_type_id = it.id
+		LEFT JOIN iterations iter ON i.iteration_id = iter.id
+		LEFT JOIN time_projects proj ON i.project_id = proj.id
+		LEFT JOIN time_projects tp ON i.time_project_id = tp.id
+		LEFT JOIN statuses st ON i.status_id = st.id
+		LEFT JOIN status_categories sc ON st.category_id = sc.id
+		LEFT JOIN priorities pri ON i.priority_id = pri.id
+	`
+}
+
+// itemListPagePlan keeps the count and page-selection SQL together so the
+// unfiltered workspace fast path cannot drift from filtered/collection lists.
+type itemListPagePlan struct {
+	countQuery       string
+	countArgs        []any
+	pageFromClause   string
+	pageWhereClause  string
+	pageArgs         []any
+	workspaceCountID int
 }
 
 // systemFieldSortColumns maps field identifiers to safe SQL column references for sorting.
@@ -91,6 +180,7 @@ var systemFieldSortColumns = map[string]string{
 	"status":         "i.status_id",
 	"priority":       "i.priority_id",
 	"assignee":       "i.assignee_id",
+	"team":           "i.team_id",
 	"milestone":      "(SELECT MIN(milestone_id) FROM item_milestones WHERE item_id = i.id)",
 	"iteration":      "i.iteration_id",
 	"due_date":       "i.due_date",
@@ -102,12 +192,29 @@ var systemFieldSortColumns = map[string]string{
 	"project":        "i.project_id",
 	"rank":           "i.rank",
 	"frac_index":     "i.frac_index",
+	// SLA urgency: nearest running deadline first; paused cycles carry no
+	// deadline and sort last. Exact business-time remaining is display-only.
+	"sla_deadline": "(SELECT sla_c.next_deadline_at FROM item_sla_cycles sla_c WHERE sla_c.item_id = i.id AND sla_c.status = 'ongoing' AND sla_c.next_deadline_at IS NOT NULL ORDER BY sla_c.next_deadline_at LIMIT 1)",
+	"sla_urgency":  "(SELECT MAX(CASE WHEN sla_c.pause_started_at IS NOT NULL THEN 1 ELSE 0 END) FROM item_sla_cycles sla_c WHERE sla_c.item_id = i.id AND sla_c.status = 'ongoing')",
 }
 
 // unsortableCustomFieldTypes lists custom field types that cannot be meaningfully sorted.
 var unsortableCustomFieldTypes = map[string]bool{
 	"multiselect": true,
+	"multi_user":  true,
 	"linking":     true,
+}
+
+// numericCustomFieldSortTypes store scalar numbers or entity/option IDs.
+var numericCustomFieldSortTypes = map[string]bool{
+	"number":               true,
+	"select":               true,
+	"milestone":            true,
+	"iteration":            true,
+	"user":                 true,
+	"asset":                true,
+	"portalcustomer":       true,
+	"customerorganisation": true, //nolint:misspell // matches the field type
 }
 
 // SystemSortableFieldKeys returns the list of system field identifiers that support sorting.
@@ -121,6 +228,34 @@ func SystemSortableFieldKeys() []string {
 
 // FindAllWithDetails retrieves items with all joined data, supporting filters and pagination
 func (r *ItemRepository) FindAllWithDetails(params ItemListParams) ([]models.Item, int, error) {
+	page, err := r.FindAllWithDetailsPageContext(context.Background(), params)
+	return page.Items, page.Total, err
+}
+
+// FindAllWithDetailsContext retrieves a page of items while allowing request
+// cancellation to stop both the count and data queries and release their pool
+// connections promptly.
+func (r *ItemRepository) FindAllWithDetailsContext(ctx context.Context, params ItemListParams) ([]models.Item, int, error) {
+	page, err := r.FindAllWithDetailsPageContext(ctx, params)
+	return page.Items, page.Total, err
+}
+
+// FindAllWithDetailsPageContext is the cursor-aware form of the item list
+// query. Cursor mode is deliberately limited to the direct, unfiltered
+// workspace path; collection and filtered lists continue through the same
+// joined page plan and offset semantics as before.
+func (r *ItemRepository) FindAllWithDetailsPageContext(ctx context.Context, params ItemListParams) (ItemListPage, error) {
+	cursorMode := itemListCursorEligible(params) &&
+		(params.Pagination.CursorMode || params.Pagination.Cursor != "")
+	var cursor itemListCursor
+	if cursorMode && params.Pagination.Cursor != "" {
+		var err error
+		cursor, err = decodeItemListCursor(params.Pagination.Cursor)
+		if err != nil {
+			return ItemListPage{}, err
+		}
+	}
+
 	// Build the SELECT clause. Collection/list surfaces can opt out of the
 	// heavy description payload; detail endpoints still fetch full descriptions.
 	descriptionExpr := "i.description"
@@ -131,41 +266,71 @@ func (r *ItemRepository) FindAllWithDetails(params ItemListParams) ([]models.Ite
 		i.id, i.workspace_id, i.workspace_item_number, i.item_type_id, i.title, %s, i.status_id, i.priority_id, i.due_date, i.start_date, i.end_date, i.is_task,
 		i.iteration_id, i.project_id, i.inherit_project, i.time_project_id, i.assignee_id, i.creator_id, i.custom_field_values, i.calendar_data, i.parent_id,
 		i.story_points, i.estimate_minutes, i.frac_index, i.created_at, i.updated_at, i.last_active_at,
-		w.name as workspace_name, w.key as workspace_key, it.name as item_type_name,
+		w.name as workspace_name, w.key as workspace_key, it.name as item_type_name, COALESCE(it.builtin_key, '') as item_type_builtin_key, COALESCE(it.icon, '') as item_type_icon, COALESCE(it.color, '') as item_type_color,
 		p.title as parent_title, p.workspace_item_number as parent_workspace_item_number, iter.name as iteration_name, COALESCE(CAST(iter.end_date AS TEXT), '') as iteration_end_date, proj.name as project_name, tp.name as time_project_name,
 		assignee.first_name || ' ' || assignee.last_name as assignee_name, assignee.email as assignee_email, assignee.avatar_url as assignee_avatar,
 		creator.first_name || ' ' || creator.last_name as creator_name, creator.email as creator_email,
-		st.name as status_name, pri.name as priority_name, pri.icon as priority_icon, pri.color as priority_color,
-		COALESCE((SELECT MAX(ih.changed_at) FROM item_history ih WHERE ih.item_id = i.id AND ih.field_name = 'status_id' AND ih.new_value = CAST(i.status_id AS TEXT)), i.created_at) as status_since
-	`, descriptionExpr)
+		st.name as status_name, COALESCE(st.builtin_key, '') as status_builtin_key, sc.color as status_color,
+		pri.name as priority_name, COALESCE(pri.builtin_key, '') as priority_builtin_key, pri.icon as priority_icon, pri.color as priority_color,
+		COALESCE(%s, i.created_at) as status_since,
+		i.team_id, i.incident_id, team.name as team_name, team.color as team_color, team.avatar_url as team_avatar
+	`, descriptionExpr, cql.CurrentStatusTransitionAtExpr(""))
 
-	fromClause := `FROM items i
-		JOIN workspaces w ON i.workspace_id = w.id
-		LEFT JOIN item_types it ON i.item_type_id = it.id
+	fromClause := ItemListFilterFromClause() + `
 		LEFT JOIN items p ON i.parent_id = p.id
-		LEFT JOIN iterations iter ON i.iteration_id = iter.id
-		LEFT JOIN time_projects proj ON i.project_id = proj.id
-		LEFT JOIN time_projects tp ON i.time_project_id = tp.id
 		LEFT JOIN users assignee ON i.assignee_id = assignee.id
 		LEFT JOIN users creator ON i.creator_id = creator.id
-		LEFT JOIN statuses st ON i.status_id = st.id
-		LEFT JOIN status_categories sc ON st.category_id = sc.id
-		LEFT JOIN priorities pri ON i.priority_id = pri.id
+		LEFT JOIN teams team ON i.team_id = team.id
 	`
 
 	whereClause, args := r.buildWhereClause(params)
 
-	// Get total count
-	countQuery := "SELECT COUNT(DISTINCT i.id) " + fromClause + whereClause
+	// Keep display-only parent and user joins out of the count/page plan, but
+	// retain every alias that buildWhereClause or generated QL can reference.
+	countFromClause := ItemListFilterFromClause()
+	pagePlan := r.buildItemListPagePlan(params, countFromClause, whereClause, args)
 	var total int
-	if err := r.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("failed to count items: %w", err)
+	var err error
+	if pagePlan.workspaceCountID != 0 {
+		total, err = cachedItemListCount(ctx, r.db, pagePlan.workspaceCountID, pagePlan.countQuery, pagePlan.countArgs...)
+		if err != nil {
+			return ItemListPage{}, fmt.Errorf("failed to count items: %w", err)
+		}
+	} else if err := r.db.QueryRowContext(ctx, pagePlan.countQuery, pagePlan.countArgs...).Scan(&total); err != nil {
+		return ItemListPage{}, fmt.Errorf("failed to count items: %w", err)
 	}
 
-	// Build ORDER BY clause
+	var pageTx database.Tx
+	var pageQueryer itemListPageQueryer = r.db
+	if cursorMode && params.Pagination.Cursor != "" {
+		// Resolve the cursor row and select the continuation page in one database
+		// transaction. The shared global-rank lock allows concurrent list calls and
+		// ordinary mutations, while preventing a migration batch from changing the
+		// anchor between these two reads. This remains correct when normalization
+		// assigns a new fractional payload rather than merely changing its bucket.
+		pageTx, err = beginItemListCursorTransaction(ctx, r.db)
+		if err != nil {
+			return ItemListPage{}, fmt.Errorf("begin item list cursor transaction: %w", err)
+		}
+		defer func() { _ = pageTx.Rollback() }()
+		if err := acquireGlobalRankMutationLock(pageTx, r.db.GetDriverName()); err != nil {
+			return ItemListPage{}, err
+		}
+		cursor, err = resolveItemListCursor(ctx, pageTx, pagePlan.workspaceCountID, cursor)
+		if err != nil {
+			return ItemListPage{}, err
+		}
+		cursorWhere, cursorArgs, err := itemListCursorWhere(cursor)
+		if err != nil {
+			return ItemListPage{}, err
+		}
+		pagePlan.pageWhereClause += cursorWhere
+		pagePlan.pageArgs = append(append([]any{}, pagePlan.pageArgs...), cursorArgs...)
+		pageQueryer = pageTx
+	}
+
 	orderByClause := r.buildOrderByClause(params.SortBy, params.SortAsc)
 
-	// Build pagination
 	limit := params.Pagination.Limit
 	if limit <= 0 {
 		limit = 50
@@ -177,57 +342,290 @@ func (r *ItemRepository) FindAllWithDetails(params ItemListParams) ([]models.Ite
 	if offset < 0 {
 		offset = 0
 	}
+	if cursorMode {
+		// A cursor is a continuation of the sorted stream, not a second offset.
+		offset = 0
+	}
+	fetchLimit := limit
+	if cursorMode {
+		// Fetch one sentinel row so the response can omit NextCursor on the last
+		// page without issuing a second count query after the keyset boundary.
+		fetchLimit++
+	}
 
-	// Execute query
-	fullQuery := selectClause + fromClause + whereClause + orderByClause + fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
-	rows, err := r.db.Query(fullQuery, args...)
+	// Execute the page selection against the narrow filtering joins first. The
+	// old query hydrated every display join before OFFSET discarded deep-page
+	// rows. Keeping the page IDs in a CTE means only the requested rows pay for
+	// descriptions, hierarchy/status enrichment, and the correlated status
+	// transition lookup.
+	pageQuery := "WITH page_items AS (SELECT i.id " + pagePlan.pageFromClause + pagePlan.pageWhereClause + orderByClause + fmt.Sprintf(" LIMIT %d OFFSET %d", fetchLimit, offset) + ") "
+	fullQuery := pageQuery + selectClause + fromClause + " JOIN page_items page ON page.id = i.id" + orderByClause
+	rows, err := pageQueryer.QueryContext(ctx, fullQuery, pagePlan.pageArgs...)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to query items: %w", err)
+		return ItemListPage{}, fmt.Errorf("failed to query items: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	items, err := r.scanItemList(rows)
 	if err != nil {
-		return nil, 0, err
+		return ItemListPage{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return ItemListPage{}, fmt.Errorf("close item list rows: %w", err)
+	}
+	if pageTx != nil {
+		if err := pageTx.Commit(); err != nil {
+			return ItemListPage{}, fmt.Errorf("commit item list cursor transaction: %w", err)
+		}
 	}
 
-	return items, total, nil
+	page := ItemListPage{Items: items, Total: total}
+	if cursorMode && len(page.Items) > limit {
+		page.Items = page.Items[:limit]
+		last := page.Items[len(page.Items)-1]
+		if last.FracIndex != nil && *last.FracIndex != "" {
+			page.NextCursor = encodeItemListCursor(itemListCursor{Rank: *last.FracIndex, ID: last.ID})
+		}
+	}
+	return page, nil
 }
 
-// Search searches items by title and description with text matching.
-// It delegates to FindAllWithDetails using TextQuery/ItemKeyQuery filters.
+// FindIDPageContext returns one ordered item-ID page using the same filters,
+// access scope, count, and sorting contract as the full item list.
+func (r *ItemRepository) FindIDPageContext(ctx context.Context, params ItemListParams) (ItemIDPage, error) {
+	whereClause, args := r.buildWhereClause(params)
+	fromClause := ItemListFilterFromClause()
+	plan := r.buildItemListPagePlan(params, fromClause, whereClause, args)
+
+	var total int
+	if plan.workspaceCountID != 0 {
+		var err error
+		total, err = cachedItemListCount(ctx, r.db, plan.workspaceCountID, plan.countQuery, plan.countArgs...)
+		if err != nil {
+			return ItemIDPage{}, fmt.Errorf("failed to count item ids: %w", err)
+		}
+	} else if err := r.db.QueryRowContext(ctx, plan.countQuery, plan.countArgs...).Scan(&total); err != nil {
+		return ItemIDPage{}, fmt.Errorf("failed to count item ids: %w", err)
+	}
+
+	limit := params.Pagination.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := max(params.Pagination.Offset, 0)
+	query := "SELECT i.id " + plan.pageFromClause + plan.pageWhereClause +
+		r.buildOrderByClause(params.SortBy, params.SortAsc) +
+		fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+
+	rows, err := r.db.QueryContext(ctx, query, plan.pageArgs...)
+	if err != nil {
+		return ItemIDPage{}, fmt.Errorf("failed to query item ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	ids := make([]int, 0, limit)
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return ItemIDPage{}, fmt.Errorf("failed to scan item id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return ItemIDPage{}, fmt.Errorf("failed to iterate item ids: %w", err)
+	}
+	return ItemIDPage{IDs: ids, Total: total}, nil
+}
+
+// unfilteredWorkspaceListWorkspaceID identifies the direct workspace-list hot
+// path. Its total is invariant under sorting and can be
+// shared safely for the short cache window. Filtered/search lists retain an
+// exact count query so their totals do not inherit a stale workspace total.
+func unfilteredWorkspaceListWorkspaceID(params ItemListParams) (int, bool) {
+	if len(params.WorkspaceIDs) == 0 || params.Filters.WorkspaceID == nil || !params.Filters.isUnfiltered() {
+		return 0, false
+	}
+	workspaceID := *params.Filters.WorkspaceID
+	for _, accessibleWorkspaceID := range params.WorkspaceIDs {
+		if accessibleWorkspaceID == workspaceID {
+			return workspaceID, true
+		}
+	}
+	return 0, false
+}
+
+func itemListCursorEligible(params ItemListParams) bool {
+	if _, ok := unfilteredWorkspaceListWorkspaceID(params); !ok {
+		return false
+	}
+	// The keyset predicate below matches only the canonical default order. A
+	// caller asking for another sort keeps the established offset contract.
+	return params.SortBy == "" || (params.SortBy == "frac_index" && params.SortAsc)
+}
+
+func encodeItemListCursor(cursor itemListCursor) string {
+	payload, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func decodeItemListCursor(raw string) (itemListCursor, error) {
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return itemListCursor{}, fmt.Errorf("%w: malformed base64", ErrInvalidItemListCursor)
+	}
+	var cursor itemListCursor
+	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Rank == "" || cursor.ID <= 0 {
+		return itemListCursor{}, fmt.Errorf("%w: malformed payload", ErrInvalidItemListCursor)
+	}
+	if _, err := ParseGlobalRank(cursor.Rank); err != nil {
+		return itemListCursor{}, fmt.Errorf("%w: invalid rank", ErrInvalidItemListCursor)
+	}
+	return cursor, nil
+}
+
+type itemListPageQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func beginItemListCursorTransaction(ctx context.Context, db database.Database) (database.Tx, error) {
+	if !database.IsPostgresDriver(db.GetDriverName()) {
+		// SQLiteDB.BeginTx intentionally uses the single dedicated writer. Cursor
+		// continuations need only a stable read snapshot, so use the ordinary read
+		// pool and avoid serializing unrelated list calls with writes.
+		tx, err := db.GetDB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return nil, err
+		}
+		return database.NewSQLiteTx(tx), nil
+	}
+	return db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+}
+
+func resolveItemListCursor(ctx context.Context, queryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}, workspaceID int, cursor itemListCursor) (itemListCursor, error) {
+	if workspaceID <= 0 {
+		return itemListCursor{}, fmt.Errorf("%w: cursor requires a workspace", ErrInvalidItemListCursor)
+	}
+	var currentRank string
+	if err := queryer.QueryRowContext(ctx, `SELECT frac_index FROM items WHERE id = ? AND workspace_id = ?`, cursor.ID, workspaceID).Scan(&currentRank); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return itemListCursor{}, fmt.Errorf("%w: cursor item no longer exists", ErrInvalidItemListCursor)
+		}
+		return itemListCursor{}, fmt.Errorf("resolve item list cursor: %w", err)
+	}
+	if _, err := ParseGlobalRank(currentRank); err != nil {
+		return itemListCursor{}, fmt.Errorf("%w: cursor item has invalid rank", ErrInvalidItemListCursor)
+	}
+	cursor.Rank = currentRank
+	return cursor, nil
+}
+
+func itemListCursorWhere(cursor itemListCursor) (where string, args []any, err error) {
+	if _, err := ParseGlobalRank(cursor.Rank); err != nil {
+		return "", nil, fmt.Errorf("%w: invalid rank", ErrInvalidItemListCursor)
+	}
+	return " AND (i.frac_index > ? OR (i.frac_index = ? AND i.id > ?))", []any{cursor.Rank, cursor.Rank, cursor.ID}, nil
+}
+
+func (r *ItemRepository) buildItemListPagePlan(
+	params ItemListParams,
+	countFromClause, whereClause string,
+	args []any,
+) itemListPagePlan {
+	plan := itemListPagePlan{
+		countQuery:      "SELECT COUNT(*) " + countFromClause + whereClause,
+		countArgs:       args,
+		pageFromClause:  countFromClause,
+		pageWhereClause: whereClause,
+		pageArgs:        args,
+	}
+	if workspaceID, cacheable := unfilteredWorkspaceListWorkspaceID(params); cacheable {
+		// The explicit workspace filter is safe to use directly because the
+		// workspace ID must also be present in the caller's accessible set.
+		// Collection/QL/filter requests never enter this branch.
+		workspaceArgs := []any{workspaceID}
+		plan.countQuery = "SELECT COUNT(*) FROM items WHERE workspace_id = ? AND merged_into_item_id IS NULL"
+		plan.countArgs = workspaceArgs
+		plan.pageFromClause = "FROM items i "
+		plan.pageWhereClause = "WHERE i.workspace_id = ? AND i.merged_into_item_id IS NULL"
+		plan.pageArgs = workspaceArgs
+		plan.workspaceCountID = workspaceID
+	}
+	return plan
+}
+
+// FindDistinctWorkspaceIDsContext returns the workspace IDs represented by an
+// item filter without loading the matching item rows. It uses the same joins
+// and WHERE builder as the paginated item list so CQL aliases and access
+// scoping remain identical while the result size stays bounded by workspace
+// count rather than item count.
+func (r *ItemRepository) FindDistinctWorkspaceIDsContext(ctx context.Context, params ItemListParams) ([]int, error) {
+	whereClause, args := r.buildWhereClause(params)
+	query := `SELECT DISTINCT i.workspace_id
+		` + ItemListFilterFromClause() + whereClause + `
+		ORDER BY i.workspace_id`
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query distinct item workspaces: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	workspaceIDs := []int{}
+	for rows.Next() {
+		var workspaceID int
+		if err := rows.Scan(&workspaceID); err != nil {
+			return nil, fmt.Errorf("failed to scan distinct item workspace: %w", err)
+		}
+		workspaceIDs = append(workspaceIDs, workspaceID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate distinct item workspaces: %w", err)
+	}
+	return workspaceIDs, nil
+}
+
+// Search matches complete item keys or searches title and description text.
 func (r *ItemRepository) Search(query string, workspaceIDs []int, pagination PaginationParams) ([]models.Item, int, error) {
+	return r.SearchContext(context.Background(), query, workspaceIDs, pagination)
+}
+
+// SearchContext is the request-aware form of Search.
+func (r *ItemRepository) SearchContext(ctx context.Context, query string, workspaceIDs []int, pagination PaginationParams) ([]models.Item, int, error) {
 	if len(workspaceIDs) == 0 {
 		return []models.Item{}, 0, nil
 	}
 
-	// Detect workspace key pattern (e.g. "OK-40")
-	filters := ItemFilters{}
-	parts := strings.Split(strings.ToUpper(query), "-")
-	isKeyPattern := len(parts) == 2 && parts[0] != "" && parts[1] != ""
-	if isKeyPattern {
-		if _, err := strconv.Atoi(parts[1]); err == nil {
-			filters.ItemKeyQuery = query
-		} else {
-			filters.TextQuery = query
-		}
-	} else {
-		filters.TextQuery = query
-	}
-
-	return r.FindAllWithDetails(ItemListParams{
+	return r.FindAllWithDetailsContext(ctx, ItemListParams{
 		WorkspaceIDs: workspaceIDs,
-		Filters:      filters,
+		Filters:      itemSearchFilters(query),
 		Pagination:   pagination,
 		SortBy:       "updated_at",
 	})
 }
 
-// buildWhereClause constructs the WHERE clause and arguments for item queries
-func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause string, args []interface{}) {
-	whereClause = "WHERE 1=1"
+func itemSearchFilters(query string) ItemFilters {
+	query = strings.TrimSpace(query)
+	// Right-anchor: legacy personal-workspace keys may contain dashes, so the
+	// number is everything after the last one.
+	if lastDash := strings.LastIndex(query, "-"); lastDash > 0 {
+		if num, err := strconv.Atoi(query[lastDash+1:]); err == nil && num > 0 {
+			return ItemFilters{ItemKeyQuery: query}
+		}
+	}
+	return ItemFilters{TextQuery: query}
+}
 
-	// Filter by accessible workspaces
+// buildWhereClause constructs the WHERE clause and arguments for item queries
+func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause string, args []any) {
+	// Merged duplicates are redirects to their canonical ticket: they must not
+	// appear in lists, counts, or stats (WI-1528).
+	whereClause = "WHERE 1=1 AND i.merged_into_item_id IS NULL"
+
 	if len(params.WorkspaceIDs) > 0 {
 		placeholders := make([]string, len(params.WorkspaceIDs))
 		for i, id := range params.WorkspaceIDs {
@@ -237,13 +635,11 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 		whereClause += " AND i.workspace_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
 
-	// Apply QL query if provided
 	if params.Filters.QLQuery != "" {
 		whereClause += " AND (" + params.Filters.QLQuery + ")"
 		args = append(args, params.Filters.QLArgs...)
 	}
 
-	// Apply individual filters
 	if params.Filters.WorkspaceID != nil {
 		whereClause += " AND i.workspace_id = ?"
 		args = append(args, *params.Filters.WorkspaceID)
@@ -269,6 +665,11 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 		args = append(args, *params.Filters.AssigneeID)
 	}
 
+	if params.Filters.TeamID != nil {
+		whereClause += " AND i.team_id = ?"
+		args = append(args, *params.Filters.TeamID)
+	}
+
 	if params.Filters.CreatorID != nil {
 		whereClause += " AND i.creator_id = ?"
 		args = append(args, *params.Filters.CreatorID)
@@ -289,7 +690,6 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 		args = append(args, *params.Filters.IterationID)
 	}
 
-	// Handle parent_id filter
 	if params.Filters.ParentIDIsSet {
 		if params.Filters.ParentID == nil || *params.Filters.ParentID == 0 {
 			whereClause += " AND i.parent_id IS NULL"
@@ -305,7 +705,7 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 	}
 
 	if params.Filters.MaxLevel != nil {
-		whereClause += " AND COALESCE(it.hierarchy_level, 0) <= ?"
+		whereClause += " AND COALESCE(it.hierarchy_level, 0) >= 0 AND COALESCE(it.hierarchy_level, 0) <= ?"
 		args = append(args, *params.Filters.MaxLevel)
 	}
 
@@ -322,12 +722,19 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 	if params.Filters.CompletedSince != nil {
 		whereClause += ` AND (
 			COALESCE(sc.is_completed, FALSE) = FALSE
-			OR COALESCE((SELECT MAX(ih.changed_at) FROM item_history ih WHERE ih.item_id = i.id AND ih.field_name = 'status_id' AND ih.new_value = CAST(i.status_id AS TEXT)), i.created_at) >= ?
+			OR ` + cql.CurrentCompletedAtExpr("") + ` >= ?
 		)`
 		args = append(args, *params.Filters.CompletedSince)
 	}
 
-	// Multi-value status filter
+	if params.Filters.CompletedActivitySince != nil {
+		whereClause += ` AND (
+			COALESCE(sc.is_completed, FALSE) = FALSE
+			OR COALESCE(i.last_active_at, i.updated_at, i.created_at) >= ?
+		)`
+		args = append(args, *params.Filters.CompletedActivitySince)
+	}
+
 	if len(params.Filters.StatusIDs) > 0 {
 		placeholders := make([]string, len(params.Filters.StatusIDs))
 		for i, id := range params.Filters.StatusIDs {
@@ -337,7 +744,6 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 		whereClause += " AND i.status_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
 
-	// Multi-value negated status filter
 	if len(params.Filters.StatusIDsNot) > 0 {
 		placeholders := make([]string, len(params.Filters.StatusIDsNot))
 		for i, id := range params.Filters.StatusIDsNot {
@@ -347,7 +753,6 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 		whereClause += " AND i.status_id NOT IN (" + strings.Join(placeholders, ",") + ")"
 	}
 
-	// Multi-value priority filter
 	if len(params.Filters.PriorityIDs) > 0 {
 		placeholders := make([]string, len(params.Filters.PriorityIDs))
 		for i, id := range params.Filters.PriorityIDs {
@@ -357,31 +762,95 @@ func (r *ItemRepository) buildWhereClause(params ItemListParams) (whereClause st
 		whereClause += " AND i.priority_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
 
-	// Text search on title/description
+	if len(params.Filters.ItemIDs) > 0 {
+		placeholders := make([]string, len(params.Filters.ItemIDs))
+		for i, id := range params.Filters.ItemIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		whereClause += " AND i.id IN (" + strings.Join(placeholders, ",") + ")"
+	}
+
 	if params.Filters.TextQuery != "" {
 		whereClause += " AND (LOWER(i.title) LIKE LOWER(?) OR LOWER(i.description) LIKE LOWER(?))"
 		searchPattern := "%" + params.Filters.TextQuery + "%"
 		args = append(args, searchPattern, searchPattern)
 	}
 
-	// Workspace key pattern match (e.g. "OK-40")
 	if params.Filters.ItemKeyQuery != "" {
-		parts := strings.Split(strings.ToUpper(params.Filters.ItemKeyQuery), "-")
-		if len(parts) == 2 {
-			if num, err := strconv.Atoi(parts[1]); err == nil && num > 0 {
-				whereClause += " AND (LOWER(w.key) = LOWER(?) AND i.workspace_item_number = ?)"
-				args = append(args, parts[0], num)
+		// Right-anchored KEY-NUMBER split: workspace keys may contain dashes
+		// (legacy personal-workspace keys), so only the number after the last
+		// dash is the item number.
+		query := strings.ToUpper(params.Filters.ItemKeyQuery)
+		if lastDash := strings.LastIndex(query, "-"); lastDash > 0 {
+			if num, err := strconv.Atoi(query[lastDash+1:]); err == nil && num > 0 {
+				keyPart := query[:lastDash]
+				if strings.Contains(keyPart, "-") {
+					// A multi-segment prefix is ambiguous with prose: queries like
+					// "release-2026-09-18" end in digits but are usually text
+					// (WI-1417). Match the key OR the full query as text.
+					whereClause += " AND ((LOWER(w.key) = LOWER(?) AND i.workspace_item_number = ?) OR (LOWER(i.title) LIKE LOWER(?) OR LOWER(i.description) LIKE LOWER(?)))"
+					pattern := "%" + params.Filters.ItemKeyQuery + "%"
+					args = append(args, keyPart, num, pattern, pattern)
+				} else {
+					whereClause += " AND (LOWER(w.key) = LOWER(?) AND i.workspace_item_number = ?)"
+					args = append(args, keyPart, num)
+				}
 			}
 		}
 	}
 
-	// Filter by specific item ID
 	if params.Filters.ItemID != nil {
 		whereClause += " AND i.id = ?"
 		args = append(args, *params.Filters.ItemID)
 	}
 
 	return whereClause, args
+}
+
+// QueueCountQuery is one compiled QL fragment to count in a batched call.
+type QueueCountQuery struct {
+	Key     string
+	Filters ItemFilters
+}
+
+// CountQLQueries runs one COUNT per query in a single statement, reusing the
+// same filter and QL plan as the item list. Results are keyed by Key. The
+// workspace ids apply to every query, so a queue count never crosses the
+// caller's accessible workspaces.
+func (r *ItemRepository) CountQLQueries(ctx context.Context, workspaceIDs []int, queries []QueueCountQuery) (map[string]int64, error) {
+	if len(queries) == 0 {
+		return map[string]int64{}, nil
+	}
+	from := ItemListFilterFromClause()
+	var builder strings.Builder
+	args := make([]any, 0, len(queries)*2)
+	for i, query := range queries {
+		where, whereArgs := r.buildWhereClause(ItemListParams{WorkspaceIDs: workspaceIDs, Filters: query.Filters})
+		if i > 0 {
+			builder.WriteString(" UNION ALL ")
+		}
+		fmt.Fprintf(&builder, "SELECT %d AS idx, COUNT(*) AS n %s %s", i, from, where)
+		args = append(args, whereArgs...)
+	}
+	rows, err := r.db.QueryContext(ctx, builder.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("count queue queries: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	result := make(map[string]int64, len(queries))
+	for rows.Next() {
+		var idx int
+		var count int64
+		if err := rows.Scan(&idx, &count); err != nil {
+			return nil, fmt.Errorf("scan queue count: %w", err)
+		}
+		if idx < 0 || idx >= len(queries) {
+			continue
+		}
+		result[queries[idx].Key] = count
+	}
+	return result, rows.Err()
 }
 
 // buildOrderByClause constructs the ORDER BY clause.
@@ -397,16 +866,31 @@ func (r *ItemRepository) buildOrderByClause(sortBy string, sortAsc bool) string 
 		direction = "ASC"
 	}
 
-	// System field?
+	// Preserve the canonical rank order for ascending fractional indexes.
 	if sortBy == "frac_index" && sortAsc {
 		return r.defaultOrderBy()
 	}
+	if sortBy == "last_active_at" {
+		// Bubble Mode is paginated, so its ordering must be both null-safe and
+		// deterministic. Older rows can lack last_active_at; use the same
+		// fallback the API model exposes and break timestamp ties by item ID so
+		// page boundaries cannot shuffle between requests.
+		return fmt.Sprintf(
+			" ORDER BY COALESCE(i.last_active_at, i.updated_at, i.created_at) %s, i.id %s",
+			direction,
+			direction,
+		)
+	}
 	if col, ok := systemFieldSortColumns[sortBy]; ok {
-		return fmt.Sprintf(" ORDER BY %s %s", col, direction)
+		if sortBy == "sla_deadline" || sortBy == "sla_urgency" {
+			// Items with no matching cycle sort last regardless of direction,
+			// and the item id breaks ties so pages cannot reshuffle.
+			return fmt.Sprintf(" ORDER BY (%s IS NULL) ASC, %s %s, i.id ASC", col, col, direction)
+		}
+		return fmt.Sprintf(" ORDER BY %s %s, i.id ASC", col, direction)
 	}
 
-	// Treat as custom field ID — look up field type for appropriate casting.
-	// Only numeric field IDs are valid custom field references (prevents SQL injection).
+	// Numeric IDs select custom fields; reject other input before building SQL.
 	if _, err := strconv.Atoi(sortBy); err != nil {
 		return r.defaultOrderBy()
 	}
@@ -417,28 +901,25 @@ func (r *ItemRepository) buildOrderByClause(sortBy string, sortAsc bool) string 
 		return r.defaultOrderBy()
 	}
 
-	// Build JSON extraction expression based on DB driver
+	// Use the JSON extraction syntax supported by the active database.
 	var expr string
-	if r.db.GetDriverName() == "postgres" {
+	if database.IsPostgresDriver(r.db.GetDriverName()) {
 		expr = fmt.Sprintf("(i.custom_field_values->>'%s')", sortBy)
 	} else {
-		// SQLite
 		expr = fmt.Sprintf(`NULLIF(i.custom_field_values, '') ->> '$.%q'`, sortBy)
 	}
 
-	// Wrap in CAST for numeric types
-	if fieldType == "number" {
+	if numericCustomFieldSortTypes[fieldType] {
 		expr = fmt.Sprintf("CAST(%s AS NUMERIC)", expr)
 	}
 
-	return fmt.Sprintf(" ORDER BY %s %s", expr, direction)
+	return fmt.Sprintf(" ORDER BY %s %s, i.id ASC", expr, direction)
 }
 
 func (r *ItemRepository) defaultOrderBy() string {
-	return ` ORDER BY
-		CASE WHEN i.frac_index IS NULL THEN 1 ELSE 0 END,
-		i.frac_index ASC,
-		i.created_at DESC`
+	// frac_index is non-null and globally unique, so it fully determines order
+	// while allowing workspace lists to seek through the composite rank index.
+	return ` ORDER BY i.frac_index ASC`
 }
 
 // scanItemList scans rows into a slice of items
@@ -451,9 +932,11 @@ func (r *ItemRepository) scanItemList(rows *sql.Rows) ([]models.Item, error) {
 		var itemTypeID, parentID, parentWorkspaceItemNumber, iterationID, projectID, timeProjectID, assigneeID, creatorID, statusID, priorityID sql.NullInt64
 		var dueDate, startDate, endDate sql.NullTime
 		var statusSince sql.NullString
-		var itemTypeName, parentTitle, iterationName, iterationEndDate, projectName, timeProjectName sql.NullString
-		var assigneeName, assigneeEmail, assigneeAvatar, creatorName, creatorEmail, statusName sql.NullString
-		var priorityName, priorityIcon, priorityColor sql.NullString
+		var teamID, incidentID sql.NullInt64
+		var itemTypeName, itemTypeBuiltinKey, itemTypeIcon, itemTypeColor, parentTitle, iterationName, iterationEndDate, projectName, timeProjectName sql.NullString
+		var teamName, teamColor, teamAvatar sql.NullString
+		var assigneeName, assigneeEmail, assigneeAvatar, creatorName, creatorEmail, statusName, statusColor sql.NullString
+		var statusBuiltinKey, priorityName, priorityBuiltinKey, priorityIcon, priorityColor sql.NullString
 		var fracIndex sql.NullString
 		var storyPoints sql.NullFloat64
 		var estimateMinutes sql.NullInt64
@@ -465,9 +948,10 @@ func (r *ItemRepository) scanItemList(rows *sql.Rows) ([]models.Item, error) {
 		err := rows.Scan(
 			&item.ID, &item.WorkspaceID, &item.WorkspaceItemNumber, &itemTypeID, &item.Title, &item.Description,
 			&statusID, &priorityID, &dueDate, &startDate, &endDate, &item.IsTask, &iterationID, &projectID, &inheritProject, &timeProjectID, &assigneeID, &creatorID, &customFieldValuesJSON, &calendarDataJSON, &parentID,
-			&storyPoints, &estimateMinutes, &fracIndex, &item.CreatedAt, &item.UpdatedAt, &lastActiveAt, &item.WorkspaceName, &item.WorkspaceKey, &itemTypeName, &parentTitle, &parentWorkspaceItemNumber, &iterationName, &iterationEndDate, &projectName, &timeProjectName,
-			&assigneeName, &assigneeEmail, &assigneeAvatar, &creatorName, &creatorEmail, &statusName, &priorityName, &priorityIcon, &priorityColor,
+			&storyPoints, &estimateMinutes, &fracIndex, &item.CreatedAt, &item.UpdatedAt, &lastActiveAt, &item.WorkspaceName, &item.WorkspaceKey, &itemTypeName, &itemTypeBuiltinKey, &itemTypeIcon, &itemTypeColor, &parentTitle, &parentWorkspaceItemNumber, &iterationName, &iterationEndDate, &projectName, &timeProjectName,
+			&assigneeName, &assigneeEmail, &assigneeAvatar, &creatorName, &creatorEmail, &statusName, &statusBuiltinKey, &statusColor, &priorityName, &priorityBuiltinKey, &priorityIcon, &priorityColor,
 			&statusSince,
+			&teamID, &incidentID, &teamName, &teamColor, &teamAvatar,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan item: %w", err)
@@ -479,7 +963,6 @@ func (r *ItemRepository) scanItemList(rows *sql.Rows) ([]models.Item, error) {
 			item.LastActiveAt = item.UpdatedAt
 		}
 
-		// Handle nullable fields
 		assignNullableInt(&item.ItemTypeID, itemTypeID)
 		assignNullableInt(&item.ParentID, parentID)
 		assignNullableInt(&item.ParentWorkspaceItemNumber, parentWorkspaceItemNumber)
@@ -489,6 +972,8 @@ func (r *ItemRepository) scanItemList(rows *sql.Rows) ([]models.Item, error) {
 		assignNullableInt(&item.TimeProjectID, timeProjectID)
 		assignNullableInt(&item.PriorityID, priorityID)
 		assignNullableInt(&item.AssigneeID, assigneeID)
+		assignNullableInt(&item.TeamID, teamID)
+		assignNullableInt(&item.IncidentID, incidentID)
 		assignNullableInt(&item.CreatorID, creatorID)
 
 		if dueDate.Valid {
@@ -512,13 +997,19 @@ func (r *ItemRepository) scanItemList(rows *sql.Rows) ([]models.Item, error) {
 
 		item.InheritProject = inheritProject
 		assignNullableString(&item.ItemTypeName, itemTypeName)
+		assignNullableString(&item.ItemTypeBuiltinKey, itemTypeBuiltinKey)
+		assignNullableString(&item.ItemTypeIcon, itemTypeIcon)
+		assignNullableString(&item.ItemTypeColor, itemTypeColor)
 		assignNullableString(&item.ParentTitle, parentTitle)
 		assignNullableString(&item.IterationName, iterationName)
 		assignNullableString(&item.IterationEndDate, iterationEndDate)
 		assignNullableString(&item.StatusName, statusName)
+		assignNullableString(&item.StatusBuiltinKey, statusBuiltinKey)
+		assignNullableString(&item.StatusColor, statusColor)
 		assignNullableString(&item.ProjectName, projectName)
 		assignNullableString(&item.TimeProjectName, timeProjectName)
 		assignNullableString(&item.PriorityName, priorityName)
+		assignNullableString(&item.PriorityBuiltinKey, priorityBuiltinKey)
 		assignNullableString(&item.PriorityIcon, priorityIcon)
 		assignNullableString(&item.PriorityColor, priorityColor)
 		assignNullableString(&item.AssigneeName, assigneeName)
@@ -526,21 +1017,22 @@ func (r *ItemRepository) scanItemList(rows *sql.Rows) ([]models.Item, error) {
 		assignNullableString(&item.AssigneeAvatar, assigneeAvatar)
 		assignNullableString(&item.CreatorName, creatorName)
 		assignNullableString(&item.CreatorEmail, creatorEmail)
+		assignNullableString(&item.TeamName, teamName)
+		assignNullableString(&item.TeamColor, teamColor)
+		assignNullableString(&item.TeamAvatarURL, teamAvatar)
 
 		if fracIndex.Valid {
 			item.FracIndex = &fracIndex.String
 		}
 
-		// Parse custom field values JSON
 		if customFieldValuesJSON.Valid && customFieldValuesJSON.String != "" {
 			if err := json.Unmarshal([]byte(customFieldValuesJSON.String), &item.CustomFieldValues); err != nil {
-				item.CustomFieldValues = make(map[string]interface{})
+				item.CustomFieldValues = make(map[string]any)
 			}
 		} else {
-			item.CustomFieldValues = make(map[string]interface{})
+			item.CustomFieldValues = make(map[string]any)
 		}
 
-		// Parse calendar data JSON
 		if calendarDataJSON.Valid && calendarDataJSON.String != "" {
 			if err := json.Unmarshal([]byte(calendarDataJSON.String), &item.CalendarData); err != nil {
 				item.CalendarData = []models.CalendarScheduleEntry{}
@@ -562,10 +1054,15 @@ func (r *ItemRepository) scanItemList(rows *sql.Rows) ([]models.Item, error) {
 // GetBacklogStatusIDs returns status IDs for backlog items.
 // It first checks board_configurations for the workspace, then falls back to non-completed statuses.
 func (r *ItemRepository) GetBacklogStatusIDs(workspaceID int) ([]int, error) {
+	return r.GetBacklogStatusIDsContext(context.Background(), workspaceID)
+}
+
+// GetBacklogStatusIDsContext is the request-aware form of GetBacklogStatusIDs.
+func (r *ItemRepository) GetBacklogStatusIDsContext(ctx context.Context, workspaceID int) ([]int, error) {
 	// First, check if there's a board configuration with backlog_status_ids
 	if workspaceID > 0 {
 		var backlogStatusIDsJSON sql.NullString
-		err := r.db.QueryRow(`
+		err := r.db.QueryRowContext(ctx, `
 			SELECT backlog_status_ids
 			FROM board_configurations
 			WHERE workspace_id = ?`, workspaceID).Scan(&backlogStatusIDsJSON)
@@ -582,7 +1079,7 @@ func (r *ItemRepository) GetBacklogStatusIDs(workspaceID int) ([]int, error) {
 	}
 
 	// Fall back to global "Open" statuses only (not "In Progress")
-	rows, err := r.db.Query(`
+	rows, err := r.db.QueryContext(ctx, `
 		SELECT DISTINCT s.id
 		FROM statuses s
 		JOIN status_categories sc ON s.category_id = sc.id

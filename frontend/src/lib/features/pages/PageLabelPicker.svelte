@@ -5,21 +5,10 @@
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
+  import Input from '../../components/Input.svelte';
 
-  /**
-   * Workspace page-label picker popover.
-   *
-   * Used in two places:
-   *   1. `PagesView` page header — attach/detach labels to the current page
-   *      (allowCreate=true so editors can mint a new label inline).
-   *   2. `PagesNavSidebar` filter row — multi-select existing labels to filter
-   *      the tree (allowCreate=false so the filter UI doesn't bloat the label
-   *      list with one-off labels).
-   *
-   * Emits `onToggle` for every checkbox flip and `onCreate` after a successful
-   * create. Both callbacks receive the full label object. The parent owns the
-   * selectedIds set so it can persist (chip row) or just filter (sidebar).
-   */
+  /** Page-label picker for page editing and sidebar filtering. The parent owns
+   * selection; callbacks receive full labels. Sidebar callers disable creation. */
 
   let {
     workspaceId,
@@ -47,7 +36,7 @@
     states: { open },
   } = createPopover({
     forceVisible: true,
-    positioning: { placement: 'bottom-start' },
+    positioning: { strategy: 'fixed', placement: 'bottom-start', fitViewport: true },
     portal: 'body',
   });
 
@@ -165,8 +154,8 @@
 {#if $open}
   <div use:melt={$content} class="popover" data-testid="page-label-picker">
     <div class="search-row">
-      <input
-        bind:this={searchInputEl}
+      <Input
+        bind:inputRef={searchInputEl}
         bind:value={search}
         onkeydown={onSearchKeydown}
         type="text"
@@ -174,7 +163,8 @@
         placeholder={allowCreate
           ? t('pages.labelsSearchPlaceholder')
           : t('pages.labelsFilterPlaceholder')}
-        data-testid="page-label-picker-search"
+        dataTestid="page-label-picker-search"
+        size="small"
       />
     </div>
 
@@ -183,7 +173,7 @@
     {:else if filtered.length === 0 && !canCreate}
       <p class="status">{t('pages.labelsEmpty')}</p>
     {:else}
-      <ul class="list" role="listbox" aria-multiselectable="true">
+      <ul class="list" data-testid="page-label-picker-list" role="listbox" aria-multiselectable="true">
         {#each filtered as label (label.id)}
           {@const checked = selectedIds.has(label.id)}
           <li>
@@ -274,7 +264,7 @@
   }
 
   .trigger:hover {
-    background: var(--ds-surface-hover);
+    background: var(--ds-surface-hovered);
     color: var(--ds-text);
   }
 
@@ -296,6 +286,7 @@
   }
 
   .search-row {
+    flex-shrink: 0;
     padding: 0.5rem;
     border-bottom: 1px solid var(--ds-border);
   }
@@ -324,6 +315,8 @@
   }
 
   .list {
+    min-height: 0;
+    overscroll-behavior: contain;
     list-style: none;
     padding: 0.25rem;
     margin: 0;
@@ -347,7 +340,7 @@
   }
 
   .row:hover {
-    background: var(--ds-surface-hover);
+    background: var(--ds-surface-hovered);
   }
 
   .row--checked {
@@ -443,7 +436,7 @@
   }
 
   .create-btn:hover:not(:disabled) {
-    background: var(--ds-surface-hover);
+    background: var(--ds-surface-hovered);
   }
 
   .create-btn:disabled {

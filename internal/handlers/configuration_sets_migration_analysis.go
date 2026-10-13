@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -17,7 +18,6 @@ import (
 
 // normalizeStatusName normalizes status names for comparison by replacing underscores with spaces and converting to lowercase
 func normalizeStatusName(name string) string {
-	// Replace underscores with spaces and convert to lowercase
 	normalized := strings.ReplaceAll(name, "_", " ")
 	return strings.ToLower(normalized)
 }
@@ -30,7 +30,7 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Get configuration set details including differentiate_by_item_type
+	// Resolve the configuration set and its affected workspaces.
 	var configSet models.ConfigurationSet
 	var workflowName sql.NullString
 	err := h.db.QueryRow(`
@@ -51,12 +51,10 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 
 	configSet.WorkflowName = workflowName.String
 
-	// Get affected workspaces - check for workspace filter in query params
 	workspaceFilter := r.URL.Query().Get("workspace_id")
 	var affectedWorkspaces []int
 
 	if workspaceFilter != "" {
-		// If workspace filter is provided, only analyze that specific workspace
 		workspaceID, err := strconv.Atoi(workspaceFilter)
 		if err != nil {
 			respondBadRequest(w, r, "Invalid workspace_id parameter")
@@ -64,7 +62,6 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 		}
 		affectedWorkspaces = []int{workspaceID}
 	} else {
-		// Otherwise, get all workspaces assigned to this configuration set
 		workspaceQuery := `
 			SELECT w.id
 			FROM workspace_configuration_sets wcs
@@ -92,7 +89,6 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 		}
 	}
 
-	// Handle empty workspace list
 	if len(affectedWorkspaces) == 0 {
 		analysis := models.WorkflowMigrationAnalysis{
 			NewWorkflowID:      configSet.WorkflowID,
@@ -106,23 +102,20 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Use WorkflowService for proper item type workflow resolution
 	workflowService := services.NewWorkflowService(h.db)
 
 	var statusMigrations []models.StatusMigrationInfo
 	totalAffectedItems := 0
 	requiresMigration := false
 
-	// When differentiate_by_item_type is enabled, analyze per item type
+	// With item-type differentiation, resolve each type's workflow separately.
 	if configSet.DifferentiateByItemType {
-		// Get items grouped by item type and status
 		rowsByType, err := repository.NewItemRepository(h.db).ListItemTypeStatusCountsForWorkspaces(affectedWorkspaces)
 		if err != nil {
 			respondInternalError(w, r, err)
 			return
 		}
 
-		// Cache workflow statuses by workflow ID to avoid repeated queries
 		workflowStatusesCache := make(map[int]map[string]models.Status)
 
 		for _, row := range rowsByType {
@@ -135,7 +128,6 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 
 			itemTypeIDPtr := row.ItemTypeID
 
-			// Use first workspace for workflow lookup (they all share the same config set)
 			workflowID, err := workflowService.GetWorkflowIDForItem(affectedWorkspaces[0], itemTypeIDPtr)
 			if err != nil {
 				respondInternalError(w, r, err)
@@ -151,13 +143,11 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 				ItemCount:         itemCount,
 			}
 
-			// No workflow configured - no migration needed for this item type
 			if workflowID == nil {
 				statusMigrations = append(statusMigrations, migration)
 				continue
 			}
 
-			// Get or cache workflow statuses
 			workflowStatuses, exists := workflowStatusesCache[*workflowID]
 			if !exists {
 				workflowStatuses = make(map[string]models.Status)
@@ -194,7 +184,6 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 				workflowStatusesCache[*workflowID] = workflowStatuses
 			}
 
-			// Check if current status exists in workflow
 			normalizedCurrentStatus := normalizeStatusName(currentStatusName)
 			if workflowStatus, exists := workflowStatuses[normalizedCurrentStatus]; exists {
 				migration.SuggestedStatusID = &workflowStatus.ID
@@ -208,7 +197,7 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 			statusMigrations = append(statusMigrations, migration)
 		}
 	} else {
-		// Original behavior: no item type differentiation, use config set default workflow
+		// Without differentiation, reconcile against the config-set workflow.
 		if configSet.WorkflowID == nil {
 			analysis := models.WorkflowMigrationAnalysis{
 				NewWorkflowID:      configSet.WorkflowID,
@@ -222,14 +211,12 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 			return
 		}
 
-		// Get current statuses used in affected workspaces and their counts
 		statusCounts, err := repository.NewItemRepository(h.db).ListStatusCountsForWorkspaces(affectedWorkspaces)
 		if err != nil {
 			respondInternalError(w, r, err)
 			return
 		}
 
-		// Get available statuses in the workflow
 		workflowStatusQuery := `
 			SELECT DISTINCT s.id, s.name
 			FROM workflow_transitions wt
@@ -244,7 +231,6 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 		}
 		defer func() { _ = workflowStatusRows.Close() }()
 
-		// Build map of available workflow statuses
 		workflowStatuses := make(map[string]models.Status)
 		for workflowStatusRows.Next() {
 			var status models.Status
@@ -260,7 +246,6 @@ func (h *ConfigurationSetHandler) AnalyzeMigration(w http.ResponseWriter, r *htt
 			return
 		}
 
-		// Analyze each current status
 		for _, row := range statusCounts {
 			currentStatusID := row.StatusID
 			currentStatusName := row.StatusName
@@ -451,7 +436,7 @@ func (h *ConfigurationSetHandler) analyzeItemTypeMigration(workspaceID, sourceCo
 		FROM configuration_set_item_types csit
 		JOIN item_types it ON csit.item_type_id = it.id
 		WHERE csit.configuration_set_id = ?
-		ORDER BY it.hierarchy_level, it.sort_order
+		ORDER BY CASE WHEN it.hierarchy_level = -1 THEN 1 ELSE 0 END, it.hierarchy_level, it.sort_order
 	`, targetConfigSetID)
 	if err == nil {
 		defer func() { _ = rows.Close() }()
@@ -469,7 +454,7 @@ func (h *ConfigurationSetHandler) analyzeItemTypeMigration(workspaceID, sourceCo
 		rows, err = h.db.Query(`
 			SELECT id, name, icon, color, hierarchy_level
 			FROM item_types
-			ORDER BY hierarchy_level, sort_order
+			ORDER BY CASE WHEN hierarchy_level = -1 THEN 1 ELSE 0 END, hierarchy_level, sort_order
 		`)
 		if err == nil {
 			defer func() { _ = rows.Close() }()
@@ -484,9 +469,11 @@ func (h *ConfigurationSetHandler) analyzeItemTypeMigration(workspaceID, sourceCo
 	}
 
 	// Build map by normalized name for suggestion matching
-	targetByName := make(map[string]models.ItemTypeTarget)
+	targetByNameAndLevel := make(map[string]models.ItemTypeTarget)
+	targetsByLevel := make(map[int][]models.ItemTypeTarget)
 	for _, t := range targetItemTypes {
-		targetByName[strings.ToLower(t.Name)] = t
+		targetByNameAndLevel[fmt.Sprintf("%d:%s", t.HierarchyLevel, strings.ToLower(t.Name))] = t
+		targetsByLevel[t.HierarchyLevel] = append(targetsByLevel[t.HierarchyLevel], t)
 	}
 
 	// Count items by type in workspace
@@ -503,10 +490,20 @@ func (h *ConfigurationSetHandler) analyzeItemTypeMigration(workspaceID, sourceCo
 		typeName := tc.TypeName
 		itemCount := tc.ItemCount
 
+		mappingTargets := availableTargets
+		sourceLevel := 0
+		if typeID != 0 {
+			if err := h.db.QueryRow(`SELECT hierarchy_level FROM item_types WHERE id = ?`, typeID).Scan(&sourceLevel); err == nil {
+				mappingTargets = append([]models.ItemTypeTarget{}, targetsByLevel[sourceLevel]...)
+			} else {
+				mappingTargets = []models.ItemTypeTarget{}
+			}
+		}
+
 		migration := models.ItemTypeMigrationInfo{
 			CurrentItemTypeName: typeName,
 			ItemCount:           itemCount,
-			AvailableTargets:    availableTargets,
+			AvailableTargets:    mappingTargets,
 		}
 
 		if typeID == 0 {
@@ -520,15 +517,15 @@ func (h *ConfigurationSetHandler) analyzeItemTypeMigration(workspaceID, sourceCo
 			migration.SuggestedItemTypeID = &target.ID
 			migration.SuggestedItemTypeName = target.Name
 			migration.RequiresMigration = false
-		} else if target, exists := targetByName[strings.ToLower(typeName)]; exists {
+		} else if target, exists := targetByNameAndLevel[fmt.Sprintf("%d:%s", sourceLevel, strings.ToLower(typeName))]; exists {
 			// Match by name
 			migration.SuggestedItemTypeID = &target.ID
 			migration.SuggestedItemTypeName = target.Name
 			migration.RequiresMigration = false
-		} else if typeID == 0 && len(availableTargets) > 0 {
+		} else if typeID == 0 && len(mappingTargets) > 0 {
 			// No type set - suggest first available
-			migration.SuggestedItemTypeID = &availableTargets[0].ID
-			migration.SuggestedItemTypeName = availableTargets[0].Name
+			migration.SuggestedItemTypeID = &mappingTargets[0].ID
+			migration.SuggestedItemTypeName = mappingTargets[0].Name
 			migration.RequiresMigration = true
 			requiresMigration = true
 		} else if typeID != 0 {
@@ -610,7 +607,7 @@ func (h *ConfigurationSetHandler) analyzeCustomFieldMigration(workspaceID, sourc
 	cfvJSONs, err := repository.NewItemRepository(h.db).ListNonEmptyCustomFieldJSONForWorkspace(workspaceID)
 	if err == nil {
 		for _, cfvJSON := range cfvJSONs {
-			var cfv map[string]interface{}
+			var cfv map[string]any
 			if json.Unmarshal([]byte(cfvJSON), &cfv) == nil {
 				for key := range cfv {
 					if fieldID, err := strconv.Atoi(key); err == nil {

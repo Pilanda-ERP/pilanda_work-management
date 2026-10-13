@@ -291,7 +291,9 @@ func isDefaultPort(scheme, port string) bool {
 	return (scheme == "https" && port == "443") || (scheme == "http" && port == "80")
 }
 
-func createSecurityHeaders(enableHTTPS, useProxy bool, additionalProxies []net.IP, jiraOrigins func() []string) func(http.Handler) http.Handler {
+const excalidrawFontCDNOrigin = "https://esm.sh"
+
+func createSecurityHeaders(enableHTTPS, useProxy bool, additionalProxies []net.IP, jiraOrigins func() []string, externalImagesAllowed func() bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -318,7 +320,12 @@ func createSecurityHeaders(enableHTTPS, useProxy bool, additionalProxies []net.I
 			ctx := context.WithValue(r.Context(), contextKeyCSPNonce, nonce)
 			r = r.WithContext(ctx)
 
-			imgSrc := "'self' data: blob: https://images.unsplash.com"
+			// Keep remote images restricted unless an administrator explicitly
+			// accepts the tracking and browser-network request risk.
+			imgSrc := "'self' data: blob: https://images.unsplash.com https://api.atlassian.com"
+			if externalImagesAllowed != nil && externalImagesAllowed() {
+				imgSrc = "'self' data: blob: https: http:"
+			}
 			if jiraOrigins != nil {
 				for _, origin := range jiraOrigins() {
 					imgSrc += " " + origin
@@ -329,8 +336,8 @@ func createSecurityHeaders(enableHTTPS, useProxy bool, additionalProxies []net.I
 				"script-src 'self' 'nonce-" + nonce + "'; " +
 				"style-src 'self' 'unsafe-inline'; " +
 				"img-src " + imgSrc + "; " +
-				"font-src 'self'; " +
-				"connect-src 'self'; " +
+				"font-src 'self' " + excalidrawFontCDNOrigin + "; " +
+				"connect-src 'self' " + excalidrawFontCDNOrigin + "; " +
 				"media-src 'self'; " +
 				"object-src 'none'; " +
 				"frame-ancestors " + frameAncestors + "; " +

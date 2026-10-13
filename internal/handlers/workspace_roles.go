@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"strings"
-	"time"
 
 	"windshift/internal/logger"
 	"windshift/internal/models"
+	"windshift/internal/objecttranslation"
 	"windshift/internal/repository"
-	"windshift/internal/sanitize"
 	"windshift/internal/services"
 	"windshift/internal/utils"
 )
@@ -21,6 +19,13 @@ type WorkspaceRoleHandler struct {
 	permissionService *services.PermissionService
 	approvalService   *services.ApprovalService
 	auditor           *logger.Auditor
+	translations      *objecttranslation.Service
+	provisioning      *services.WorkspaceRoleProvisioningService
+}
+
+func (h *WorkspaceRoleHandler) WithObjectTranslations(service *objecttranslation.Service) *WorkspaceRoleHandler {
+	h.translations = service
+	return h
 }
 
 func NewWorkspaceRoleHandlerWithPool(repo *repository.WorkspaceRoleRepository, permissionService *services.PermissionService, auditor *logger.Auditor) *WorkspaceRoleHandler {
@@ -28,6 +33,7 @@ func NewWorkspaceRoleHandlerWithPool(repo *repository.WorkspaceRoleRepository, p
 		repo:              repo,
 		permissionService: permissionService,
 		auditor:           auditor,
+		provisioning:      services.NewWorkspaceRoleProvisioningService(repo.DB(), repo, permissionService, nil),
 	}
 }
 
@@ -43,6 +49,9 @@ func (h *WorkspaceRoleHandler) GetAll(w http.ResponseWriter, r *http.Request) {
 	roles, err := h.repo.List()
 	if err != nil {
 		respondInternalError(w, r, err)
+		return
+	}
+	if !localizeObjectResponse(w, r, h.translations, "workspace_role", roles) {
 		return
 	}
 
@@ -73,6 +82,9 @@ func (h *WorkspaceRoleHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role.Permissions = permissions
+	if !localizeObjectResponse(w, r, h.translations, "workspace_role", role) {
+		return
+	}
 
 	respondJSONOK(w, role)
 }
@@ -88,6 +100,14 @@ func (h *WorkspaceRoleHandler) AssignRoleToUser(w http.ResponseWriter, r *http.R
 	granterID := h.getSessionUserID(r)
 	if granterID == 0 {
 		respondUnauthorized(w, r)
+		return
+	}
+
+	// Assigning a role is a workspace-admin action. The workspace comes from the
+	// body, so the route middleware cannot check it; respond 404 like the shared
+	// helper so workspace existence is not disclosed to non-admins.
+	if h.permissionService != nil &&
+		!RequireWorkspacePermission(w, r, granterID, req.WorkspaceID, models.PermissionWorkspaceAdmin, h.permissionService) {
 		return
 	}
 
@@ -129,7 +149,9 @@ func (h *WorkspaceRoleHandler) AssignRoleToUser(w http.ResponseWriter, r *http.R
 	var warnings []models.APIWarning
 	if h.permissionService != nil {
 		if countBefore == 0 {
-			h.permissionService.OnEveryoneAccessChanged()
+			if err := h.permissionService.ResetPermissionCache(); err != nil {
+				warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("workspace_id:%d", req.WorkspaceID)))
+			}
 		} else {
 			if err := h.permissionService.OnUserPermissionChanged(req.UserID); err != nil {
 				warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("user_id:%d", req.UserID)))
@@ -146,7 +168,7 @@ func (h *WorkspaceRoleHandler) AssignRoleToUser(w http.ResponseWriter, r *http.R
 		workspaceName := h.repo.WorkspaceName(req.WorkspaceID)
 
 		h.auditor.LogWithDetails(r, currentUser, logger.ActionRoleAssign, logger.ResourceRole, &req.RoleID, roleName,
-			map[string]interface{}{
+			map[string]any{
 				"target_user_id":  req.UserID,
 				"target_username": targetUsername,
 				"role_id":         req.RoleID,
@@ -196,7 +218,9 @@ func (h *WorkspaceRoleHandler) RevokeRoleFromUser(w http.ResponseWriter, r *http
 	if h.permissionService != nil {
 		if countBefore == 1 {
 			// Was the only assignment, now removed → role becomes open to everyone
-			h.permissionService.OnEveryoneAccessChanged()
+			if err := h.permissionService.ResetPermissionCache(); err != nil {
+				warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("workspace_id:%d", workspaceID)))
+			}
 		} else {
 			if err := h.permissionService.OnUserPermissionChanged(userID); err != nil {
 				warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("user_id:%d", userID)))
@@ -213,7 +237,7 @@ func (h *WorkspaceRoleHandler) RevokeRoleFromUser(w http.ResponseWriter, r *http
 		workspaceName := h.repo.WorkspaceName(workspaceID)
 
 		h.auditor.LogWithDetails(r, currentUser, logger.ActionRoleRevoke, logger.ResourceRole, &roleID, roleName,
-			map[string]interface{}{
+			map[string]any{
 				"target_user_id":  userID,
 				"target_username": targetUsername,
 				"role_id":         roleID,
@@ -249,6 +273,9 @@ func (h *WorkspaceRoleHandler) GetUserRolesInWorkspace(w http.ResponseWriter, r 
 		respondInternalError(w, r, err)
 		return
 	}
+	if !localizeObjectResponse(w, r, h.translations, "workspace_role", roles) {
+		return
+	}
 
 	respondJSONOK(w, roles)
 }
@@ -269,6 +296,7 @@ func (h *WorkspaceRoleHandler) GetWorkspaceRoleAssignments(w http.ResponseWriter
 
 	type Role struct {
 		RoleID          int    `json:"role_id"`
+		RoleBuiltinKey  string `json:"role_builtin_key,omitempty"`
 		RoleName        string `json:"role_name"`
 		RoleDescription string `json:"role_description"`
 		AssignmentID    int    `json:"assignment_id"`
@@ -306,6 +334,7 @@ func (h *WorkspaceRoleHandler) GetWorkspaceRoleAssignments(w http.ResponseWriter
 		// Add role to user
 		user.Roles = append(user.Roles, Role{
 			RoleID:          a.RoleID,
+			RoleBuiltinKey:  a.RoleBuiltinKey,
 			RoleName:        a.RoleName,
 			RoleDescription: a.RoleDescription,
 			AssignmentID:    a.AssignmentID,
@@ -338,6 +367,12 @@ func (h *WorkspaceRoleHandler) AssignRoleToGroup(w http.ResponseWriter, r *http.
 	granterID := h.getSessionUserID(r)
 	if granterID == 0 {
 		respondUnauthorized(w, r)
+		return
+	}
+
+	// Same workspace-admin gate as AssignRoleToUser (workspace in the body).
+	if h.permissionService != nil &&
+		!RequireWorkspacePermission(w, r, granterID, req.WorkspaceID, models.PermissionWorkspaceAdmin, h.permissionService) {
 		return
 	}
 
@@ -384,7 +419,9 @@ func (h *WorkspaceRoleHandler) AssignRoleToGroup(w http.ResponseWriter, r *http.
 	var warnings []models.APIWarning
 	if h.permissionService != nil {
 		if countBefore == 0 {
-			h.permissionService.OnEveryoneAccessChanged()
+			if err := h.permissionService.ResetPermissionCache(); err != nil {
+				warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("workspace_id:%d", req.WorkspaceID)))
+			}
 		} else if err := h.permissionService.OnGroupPermissionChanged(req.GroupID); err != nil {
 			warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("group_id:%d", req.GroupID)))
 		}
@@ -398,7 +435,7 @@ func (h *WorkspaceRoleHandler) AssignRoleToGroup(w http.ResponseWriter, r *http.
 		workspaceName := h.repo.WorkspaceName(req.WorkspaceID)
 
 		h.auditor.LogWithDetails(r, currentUser, logger.ActionRoleAssign, logger.ResourceRole, &req.RoleID, roleName,
-			map[string]interface{}{
+			map[string]any{
 				"target_group_id":   req.GroupID,
 				"target_group_name": groupName,
 				"role_id":           req.RoleID,
@@ -448,7 +485,9 @@ func (h *WorkspaceRoleHandler) RevokeRoleFromGroup(w http.ResponseWriter, r *htt
 	var warnings []models.APIWarning
 	if h.permissionService != nil {
 		if countBefore == 1 {
-			h.permissionService.OnEveryoneAccessChanged()
+			if err := h.permissionService.ResetPermissionCache(); err != nil {
+				warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("workspace_id:%d", workspaceID)))
+			}
 		} else if err := h.permissionService.OnGroupPermissionChanged(groupID); err != nil {
 			warnings = append(warnings, createCacheWarning("permission", err, fmt.Sprintf("group_id:%d", groupID)))
 		}
@@ -462,7 +501,7 @@ func (h *WorkspaceRoleHandler) RevokeRoleFromGroup(w http.ResponseWriter, r *htt
 		workspaceName := h.repo.WorkspaceName(workspaceID)
 
 		h.auditor.LogWithDetails(r, currentUser, logger.ActionRoleRevoke, logger.ResourceRole, &roleID, roleName,
-			map[string]interface{}{
+			map[string]any{
 				"target_group_id":   groupID,
 				"target_group_name": groupName,
 				"role_id":           roleID,
@@ -495,6 +534,7 @@ func (h *WorkspaceRoleHandler) GetWorkspaceGroupRoleAssignments(w http.ResponseW
 
 	type Role struct {
 		RoleID          int    `json:"role_id"`
+		RoleBuiltinKey  string `json:"role_builtin_key,omitempty"`
 		RoleName        string `json:"role_name"`
 		RoleDescription string `json:"role_description"`
 		AssignmentID    int    `json:"assignment_id"`
@@ -527,6 +567,7 @@ func (h *WorkspaceRoleHandler) GetWorkspaceGroupRoleAssignments(w http.ResponseW
 
 		group.Roles = append(group.Roles, Role{
 			RoleID:          a.RoleID,
+			RoleBuiltinKey:  a.RoleBuiltinKey,
 			RoleName:        a.RoleName,
 			RoleDescription: a.RoleDescription,
 			AssignmentID:    a.AssignmentID,
@@ -569,7 +610,30 @@ type createCustomRoleRequest struct {
 //
 // POST /api/workspace-roles
 func (h *WorkspaceRoleHandler) Create(w http.ResponseWriter, r *http.Request) {
-	user, ok := RequireAuth(w, r)
+	body, ok := decodeJSON[createCustomRoleRequest](w, r)
+	if !ok {
+		return
+	}
+
+	result, err := h.provisioning.Create(serviceActor(r), body.Name, body.Description)
+	if err != nil {
+		handleServiceError(w, r, err)
+		return
+	}
+
+	if !localizeObjectResponse(w, r, h.translations, "workspace_role", result.Role) {
+		return
+	}
+	respondJSONCreated(w, struct {
+		models.WorkspaceRole
+		Warnings []string `json:"warnings,omitempty"`
+	}{*result.Role, result.Warnings})
+}
+
+// Update changes a workspace role's canonical fallback label without changing
+// its identity, built-in key, permission behavior, or assignments.
+func (h *WorkspaceRoleHandler) Update(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireIDParam(w, r, "id")
 	if !ok {
 		return
 	}
@@ -577,108 +641,34 @@ func (h *WorkspaceRoleHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Role Name renders in every member list, role picker, and assignment
-	// dialog — a short user-facing label. Description shows in the role
-	// directory and is multi-line free-form text.
-	warnings := sanitize.ApplyAllWithWarnings(
-		sanitize.Pair{Target: &body.Name, Policy: sanitize.PlainTextField, Label: "Name"},
-		sanitize.Pair{Target: &body.Description, Policy: sanitize.RichText, Label: "Description"},
-	)
-	name := strings.TrimSpace(body.Name)
-	if name == "" {
-		respondValidationError(w, r, "name is required")
-		return
-	}
 
-	// Workspace_roles.name is UNIQUE — short-circuit with a friendly conflict
-	// before letting the DB raise a generic constraint error.
-	if nameTaken, err := h.repo.NameExists(name); err == nil && nameTaken {
-		respondConflict(w, r, fmt.Sprintf("A role named %q already exists", name))
-		return
-	}
-
-	now := time.Now()
-	id, err := h.repo.CreateCustomRole(name, body.Description, now)
+	result, err := h.provisioning.Update(serviceActor(r), id, body.Name, body.Description)
 	if err != nil {
-		respondInternalError(w, r, err)
+		handleServiceError(w, r, err)
 		return
 	}
 
-	h.auditor.Log(r, user, logger.ActionWorkspaceRoleCreate, logger.ResourceRole, &id, name)
-
-	out := models.WorkspaceRole{
-		ID:                 id,
-		Name:               name,
-		Description:        body.Description,
-		IsSystem:           false,
-		PermissionsEnabled: false,
-		CreatedAt:          now,
-		UpdatedAt:          now,
-		Permissions:        []models.Permission{},
+	if !localizeObjectResponse(w, r, h.translations, "workspace_role", result.Role) {
+		return
 	}
-	respondJSONCreated(w, struct {
-		models.WorkspaceRole
+	respondJSONOK(w, struct {
+		*models.WorkspaceRole
 		Warnings []string `json:"warnings,omitempty"`
-	}{out, warnings})
+	}{result.Role, result.Warnings})
 }
 
-// Delete removes a custom workspace role. System roles (is_system=true) cannot
-// be deleted. The DELETE cascades to user_workspace_roles + group_workspace_roles
-// + role_permissions via existing FKs; we still flush the permission cache for
-// affected users so any cached label-only role assignment goes away.
-//
-// DELETE /api/workspace-roles/{id}
+// Delete removes a custom workspace role. System roles cannot be deleted; the
+// shared provisioning service refuses roles referenced by pending approvals or
+// manual-action restrictions and invalidates affected permission caches.
 func (h *WorkspaceRoleHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	user, ok := RequireAuth(w, r)
-	if !ok {
-		return
-	}
 	id, ok := requireIDParam(w, r, "id")
 	if !ok {
 		return
 	}
 
-	role, err := h.repo.GetByID(id)
-	if errors.Is(err, repository.ErrNotFound) {
-		respondNotFound(w, r, "workspace_role")
+	if err := h.provisioning.Delete(serviceActor(r), id); err != nil {
+		handleServiceError(w, r, err)
 		return
 	}
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if role.IsSystem {
-		respondValidationError(w, r, "System roles cannot be deleted")
-		return
-	}
-
-	// Refuse delete if the role is referenced by any pending approval — the
-	// snapshot's source_role_id stays intact for audit, but we don't want to
-	// orphan an in-flight pool. Cancel the approval first, then delete.
-	if h.approvalService != nil {
-		if pendingCount, err := h.approvalService.CountPendingApproversForRole(r.Context(), id); err == nil && pendingCount > 0 {
-			respondConflict(w, r, fmt.Sprintf("Cannot delete: %d pending approval(s) still reference this role", pendingCount))
-			return
-		}
-	}
-
-	// Snapshot affected users for cache invalidation before the DELETE cascades.
-	affected := h.repo.AffectedUserIDs(id)
-
-	if err := h.repo.Delete(id); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	h.auditor.Log(r, user, logger.ActionWorkspaceRoleDelete, logger.ResourceRole, &id, role.Name)
-
-	if h.permissionService != nil && len(affected) > 0 {
-		ids := make([]int, 0, len(affected))
-		for uid := range affected {
-			ids = append(ids, uid)
-		}
-		_ = h.permissionService.InvalidateMultipleUserCaches(ids)
-	}
-
 	w.WriteHeader(http.StatusNoContent)
 }

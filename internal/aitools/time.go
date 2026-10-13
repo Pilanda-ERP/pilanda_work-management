@@ -2,17 +2,13 @@ package aitools
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"windshift/internal/auth"
 	"windshift/internal/repository"
 	"windshift/internal/services"
-	"windshift/internal/utils"
 )
 
 // ----------------------------------------------------------------------------
@@ -64,6 +60,17 @@ type listWorklogsOut struct {
 	Worklogs []worklogDTO `json:"worklogs"`
 }
 
+type temporalContextArgs struct {
+	Timezone string `json:"timezone,omitempty" jsonschema:"Optional IANA timezone, only when the user explicitly asks about a different zone; defaults to the acting user's timezone"`
+}
+
+type temporalContextOut struct {
+	Timezone  string `json:"timezone"`
+	LocalNow  string `json:"local_now"`
+	LocalDate string `json:"local_date"`
+	UTCNow    string `json:"utc_now"`
+}
+
 // ----------------------------------------------------------------------------
 // log_time / create_worklog
 // ----------------------------------------------------------------------------
@@ -75,12 +82,13 @@ type logTimeArgs struct {
 	ProjectID       int    `json:"project_id" jsonschema:"Time project ID"`
 	Description     string `json:"description" jsonschema:"Description of the work done"`
 	Date            string `json:"date" jsonschema:"Date in YYYY-MM-DD format"`
-	Duration        string `json:"duration,omitempty" jsonschema:"Duration string like '2h', '30m', '1h30m', '1d' (1d = 8h)"`
+	Duration        string `json:"duration,omitempty" jsonschema:"Duration string like '2h', '30m', '1h30m', '1d' (1d = 8h). Hours and minutes only; seconds and other units are rejected."`
 	DurationMinutes int    `json:"duration_minutes,omitempty" jsonschema:"Alternative to duration: minutes as integer"`
 	StartTime       string `json:"start_time,omitempty" jsonschema:"HH:MM start time. Pair with end_time."`
 	EndTime         string `json:"end_time,omitempty" jsonschema:"HH:MM end time. Pair with start_time."`
 	ItemID          *int   `json:"item_id,omitempty" jsonschema:"Optional linked work item ID (alternative: item_key)"`
 	ItemKey         string `json:"item_key,omitempty" jsonschema:"Optional linked work item key like PROJ-42 (alternative to item_id)"`
+	Timezone        string `json:"timezone,omitempty" jsonschema:"Optional IANA timezone only when the user explicitly named a different zone. Defaults to the acting user's timezone. Enter date and HH:MM exactly as local wall-clock values; never convert or pre-offset them."`
 }
 
 type logTimeOut struct {
@@ -90,6 +98,11 @@ type logTimeOut struct {
 	Date            string `json:"date"`
 	DurationMinutes int    `json:"duration_minutes"`
 	Description     string `json:"description"`
+	Timezone        string `json:"timezone"`
+	StartTimeLocal  string `json:"start_time_local"`
+	EndTimeLocal    string `json:"end_time_local"`
+	StartAt         string `json:"start_at"`
+	EndAt           string `json:"end_at"`
 }
 
 // ----------------------------------------------------------------------------
@@ -123,8 +136,38 @@ type stopTimerOut struct {
 }
 
 func init() {
+	Register(Default, Tool[temporalContextArgs]{
+		Name:        "get_temporal_context",
+		Group:       CapabilityTime,
+		Access:      AccessRead,
+		Risk:        RiskLow,
+		Description: "Get authoritative current local and UTC time context for relative phrases such as today or yesterday. Defaults to the acting user's IANA timezone.",
+		Scopes:      []string{auth.ScopeTimeRead},
+		Run: func(_ context.Context, env *Env, args temporalContextArgs) (any, error) {
+			timezone := env.Timezone
+			if args.Timezone != "" {
+				timezone = args.Timezone
+			}
+			resolved, location, err := services.ResolveTimezone(timezone)
+			if err != nil {
+				return map[string]string{"error": err.Error()}, nil //nolint:nilerr // tool validation errors are returned in the JSON result
+			}
+			now := time.Now()
+			local := now.In(location)
+			return temporalContextOut{
+				Timezone:  resolved,
+				LocalNow:  local.Format(time.RFC3339),
+				LocalDate: local.Format(time.DateOnly),
+				UTCNow:    now.UTC().Format(time.RFC3339),
+			}, nil
+		},
+	})
+
 	Register(Default, Tool[listTimeProjectsArgs]{
 		Name:        "list_time_projects",
+		Group:       CapabilityTime,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "List time tracking projects the user has access to.",
 		Scopes:      []string{auth.ScopeTimeRead},
 		Run: func(_ context.Context, env *Env, args listTimeProjectsArgs) (any, error) {
@@ -135,41 +178,17 @@ func init() {
 			if accessibleIDs != nil && len(accessibleIDs) == 0 {
 				return listTimeProjectsOut{Projects: []timeProjectDTO{}}, nil
 			}
-			query := `SELECT tp.id, tp.name, tp.status, COALESCE(tp.description, ''),
-			       COALESCE(co.name, ''), COALESCE(tpc.name, ''), tp.hourly_rate
-			FROM time_projects tp
-			LEFT JOIN customer_organisations co ON tp.customer_id = co.id
-			LEFT JOIN time_project_categories tpc ON tp.category_id = tpc.id
-			WHERE 1=1`
-			var qa []interface{}
-			if accessibleIDs != nil {
-				ph := make([]string, len(accessibleIDs))
-				for i, id := range accessibleIDs {
-					ph[i] = "?"
-					qa = append(qa, id)
-				}
-				query += fmt.Sprintf(" AND tp.id IN (%s)", strings.Join(ph, ","))
-			}
-			if args.Status != "" {
-				query += " AND tp.status = ?"
-				qa = append(qa, args.Status)
-			}
-			query += " ORDER BY tp.name"
-			rows, err := env.DB.Query(query, qa...)
+			projects, err := repository.NewTimeProjectRepository(env.DB).ListDetails(accessibleIDs, args.Status)
 			if err != nil {
 				return nil, err
 			}
-			defer func() { _ = rows.Close() }()
 			out := listTimeProjectsOut{Projects: []timeProjectDTO{}}
-			for rows.Next() {
-				var p timeProjectDTO
-				if err := rows.Scan(&p.ID, &p.Name, &p.Status, &p.Description, &p.CustomerName, &p.CategoryName, &p.HourlyRate); err != nil {
-					continue
-				}
-				out.Projects = append(out.Projects, p)
-			}
-			if err := rows.Err(); err != nil {
-				return nil, err
+			for _, project := range projects {
+				out.Projects = append(out.Projects, timeProjectDTO{
+					ID: project.ID, Name: project.Name, Status: project.Status,
+					Description: project.Description, CustomerName: project.CustomerName,
+					CategoryName: project.CategoryName, HourlyRate: project.HourlyRate,
+				})
 			}
 			return out, nil
 		},
@@ -177,6 +196,9 @@ func init() {
 
 	Register(Default, Tool[listWorklogsArgs]{
 		Name:        "list_worklogs",
+		Group:       CapabilityTime,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "List the current user's time tracking worklogs with optional date and project filters.",
 		Scopes:      []string{auth.ScopeTimeRead},
 		Run: func(_ context.Context, env *Env, args listWorklogsArgs) (any, error) {
@@ -184,64 +206,39 @@ func init() {
 			if limit <= 0 || limit > 200 {
 				limit = 50
 			}
-			query := `SELECT tw.id, tw.project_id, tp.name, COALESCE(co.name, ''), tw.description, tw.date,
-			       tw.duration_minutes, COALESCE(tw.item_id, 0),
-			       COALESCE(i.workspace_item_number, 0), COALESCE(w.key, ''), COALESCE(i.workspace_id, 0)
-			FROM time_worklogs tw
-			JOIN time_projects tp ON tw.project_id = tp.id
-			LEFT JOIN customer_organisations co ON tw.customer_id = co.id
-			LEFT JOIN items i ON tw.item_id = i.id
-			LEFT JOIN workspaces w ON i.workspace_id = w.id
-			WHERE tw.user_id = ?`
-			qa := []interface{}{env.UserID}
+			filter := repository.WorklogListFilter{UserID: env.UserID, ProjectID: args.ProjectID, Limit: limit}
 			if args.DateFrom != "" {
-				t, err := time.Parse("2006-01-02", args.DateFrom)
+				start, _, err := services.CivilDateRangeUTC(args.DateFrom, args.DateFrom, time.UTC)
 				if err != nil {
-					return map[string]string{"error": "invalid date_from format, use YYYY-MM-DD"}, nil
+					return map[string]string{"error": "invalid date_from format, use YYYY-MM-DD"}, nil //nolint:nilerr // Tool validation errors use response payloads.
 				}
-				query += " AND tw.date >= ?"
-				qa = append(qa, t.Unix())
+				from := start.Unix()
+				filter.DateFromUnix = &from
 			}
 			if args.DateTo != "" {
-				t, err := time.Parse("2006-01-02", args.DateTo)
+				_, endExclusive, err := services.CivilDateRangeUTC(args.DateTo, args.DateTo, time.UTC)
 				if err != nil {
-					return map[string]string{"error": "invalid date_to format, use YYYY-MM-DD"}, nil
+					return map[string]string{"error": "invalid date_to format, use YYYY-MM-DD"}, nil //nolint:nilerr // Tool validation errors use response payloads.
 				}
-				query += " AND tw.date <= ?"
-				qa = append(qa, t.Add(24*time.Hour-time.Second).Unix())
+				to := endExclusive.Unix()
+				filter.DateToExclusiveUnix = &to
 			}
-			if args.ProjectID != nil && *args.ProjectID > 0 {
-				query += " AND tw.project_id = ?"
-				qa = append(qa, *args.ProjectID)
-			}
-			query += " ORDER BY tw.date DESC LIMIT ?"
-			qa = append(qa, limit)
-
-			rows, err := env.DB.Query(query, qa...)
+			worklogs, _, err := repository.NewTimeWorklogRepository(env.DB).ListForUser(filter)
 			if err != nil {
 				return nil, err
 			}
-			defer func() { _ = rows.Close() }()
 			out := listWorklogsOut{Worklogs: []worklogDTO{}}
-			for rows.Next() {
-				var w worklogDTO
-				var dateUnix int64
-				var itemID, itemNumber, wsID int
-				var wsKey string
-				if err := rows.Scan(&w.ID, &w.ProjectID, &w.ProjectName, &w.CustomerName, &w.Description,
-					&dateUnix, &w.DurationMinutes, &itemID, &itemNumber, &wsKey, &wsID); err != nil {
-					continue
+			for _, worklog := range worklogs {
+				result := worklogDTO{
+					ID: worklog.ID, ProjectID: worklog.ProjectID, ProjectName: worklog.ProjectName,
+					CustomerName: worklog.CustomerName, Description: worklog.Description,
+					Date: time.Unix(worklog.Date, 0).UTC().Format("2006-01-02"), DurationMinutes: worklog.DurationMins,
 				}
-				w.Date = time.Unix(dateUnix, 0).UTC().Format("2006-01-02")
-				if itemID > 0 && wsKey != "" && env.HasWorkspaceAccess(wsID) {
-					w.ItemKey = fmt.Sprintf("%s-%d", wsKey, itemNumber)
-					id := itemID
-					w.ItemID = &id
+				if worklog.ItemID != nil && worklog.WorkspaceID != nil && worklog.WorkspaceKey != "" && env.HasWorkspaceAccess(*worklog.WorkspaceID) {
+					result.ItemKey = fmt.Sprintf("%s-%d", worklog.WorkspaceKey, worklog.WorkspaceItemNumber)
+					result.ItemID = worklog.ItemID
 				}
-				out.Worklogs = append(out.Worklogs, w)
-			}
-			if err := rows.Err(); err != nil {
-				return nil, err
+				out.Worklogs = append(out.Worklogs, result)
 			}
 			return out, nil
 		},
@@ -249,7 +246,10 @@ func init() {
 
 	Register(Default, Tool[logTimeArgs]{
 		Name:        "log_time",
-		Description: "Log a time entry on a time tracking project. Provide duration (e.g. '2h', '30m', '1h30m', '1d') OR duration_minutes OR start_time + end_time (HH:MM). An optional work item can be linked by numeric ID or key (e.g. PROJ-42).",
+		Group:       CapabilityTime,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
+		Description: "Log a time entry on a time tracking project. Date and HH:MM are exact local wall-clock values in the acting user's IANA timezone: never convert or pre-offset them. Provide duration OR duration_minutes OR start_time + end_time; when clocks and a duration are both sent the duration must match, and an end clock at or before the start means the next day. Use timezone only when the user explicitly names a different zone.",
 		Scopes:      []string{auth.ScopeTimeWrite},
 		Run: func(_ context.Context, env *Env, args logTimeArgs) (any, error) {
 			if args.ProjectID == 0 || args.Description == "" || args.Date == "" {
@@ -262,62 +262,36 @@ func init() {
 			if !canBook {
 				return map[string]string{"error": "no permission to book time on this project"}, nil
 			}
-			var projectName, projectStatus string
-			var customerID sql.NullInt64
-			err = env.DB.QueryRow("SELECT name, status, customer_id FROM time_projects WHERE id = ?", args.ProjectID).
-				Scan(&projectName, &projectStatus, &customerID)
+			project, err := repository.NewTimeProjectRepository(env.DB).GetBookingInfo(args.ProjectID)
 			if err != nil {
 				return map[string]string{"error": "project not found"}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
 			}
-			if projectStatus != "Active" {
-				return map[string]string{"error": fmt.Sprintf("project %q is not active (status: %s)", projectName, projectStatus)}, nil
+			if project.Status != "Active" {
+				return map[string]string{"error": fmt.Sprintf("project %q is not active (status: %s)", project.Name, project.Status)}, nil
 			}
-			if !customerID.Valid {
+			if project.CustomerID == nil {
 				return map[string]string{"error": "project has no customer assigned, cannot log time"}, nil
 			}
-			date, err := time.Parse("2006-01-02", args.Date)
+			timezone := env.Timezone
+			if args.Timezone != "" {
+				timezone = args.Timezone
+			}
+			resolvedTimezone, location, err := services.ResolveTimezone(timezone)
 			if err != nil {
-				return map[string]string{"error": "invalid date format, use YYYY-MM-DD"}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
+				return map[string]string{"error": err.Error()}, nil //nolint:nilerr // tool validation errors are returned in the JSON result
 			}
-			var durationMins int
-			var startUnix, endUnix int64
-			switch {
-			case args.Duration != "":
-				dur, err := utils.ParseDuration(args.Duration)
-				if err != nil {
-					return map[string]string{"error": fmt.Sprintf("invalid duration: %s", err.Error())}, nil
-				}
-				durationMins = int(dur.Minutes())
-				startUnix = date.Unix()
-				endUnix = date.Add(dur).Unix()
-			case args.DurationMinutes > 0:
-				durationMins = args.DurationMinutes
-				startUnix = date.Unix()
-				endUnix = date.Add(time.Duration(args.DurationMinutes) * time.Minute).Unix()
-			case args.StartTime != "" && args.EndTime != "":
-				sp, ep := strings.SplitN(args.StartTime, ":", 2), strings.SplitN(args.EndTime, ":", 2)
-				if len(sp) != 2 || len(ep) != 2 {
-					return map[string]string{"error": "start_time and end_time must be in HH:MM format"}, nil
-				}
-				sh, e1 := strconv.Atoi(sp[0])
-				sm, e2 := strconv.Atoi(sp[1])
-				eh, e3 := strconv.Atoi(ep[0])
-				em, e4 := strconv.Atoi(ep[1])
-				if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-					return map[string]string{"error": "start_time and end_time must be in HH:MM format"}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
-				}
-				st := date.Add(time.Duration(sh)*time.Hour + time.Duration(sm)*time.Minute)
-				et := date.Add(time.Duration(eh)*time.Hour + time.Duration(em)*time.Minute)
-				if !et.After(st) {
-					return map[string]string{"error": "end_time must be after start_time"}, nil
-				}
-				durationMins = int(et.Sub(st).Minutes())
-				startUnix, endUnix = st.Unix(), et.Unix()
-			default:
-				return map[string]string{"error": "provide duration, duration_minutes, or start_time and end_time"}, nil
+			date, err := services.ParseCivilDate(args.Date, location)
+			if err != nil {
+				return map[string]string{"error": err.Error()}, nil //nolint:nilerr // surface as a tool error in JSON, not as a protocol error
 			}
-			if durationMins <= 0 {
-				return map[string]string{"error": "duration must be positive"}, nil
+			durationMins, startUnix, endUnix, err := services.ParseWorklogTimes(date, services.WorklogTimeInput{
+				Duration:        args.Duration,
+				DurationMinutes: args.DurationMinutes,
+				StartTime:       args.StartTime,
+				EndTime:         args.EndTime,
+			})
+			if err != nil {
+				return map[string]string{"error": err.Error()}, nil //nolint:nilerr // tool validation errors are returned in the JSON result
 			}
 			itemID, toolErr := resolveOptionalItemRef(env, args.ItemID, args.ItemKey)
 			if toolErr != nil {
@@ -325,11 +299,11 @@ func init() {
 			}
 			id, err := repository.NewTimeWorklogRepository(env.DB).Create(repository.NewWorklog{
 				ProjectID:       args.ProjectID,
-				CustomerID:      customerID.Int64,
+				CustomerID:      *project.CustomerID,
 				UserID:          env.UserID,
 				ItemID:          itemID,
 				Description:     args.Description,
-				DateUnix:        date.Unix(),
+				DateUnix:        services.WorklogDateUnix(date),
 				StartTimeUnix:   startUnix,
 				EndTimeUnix:     endUnix,
 				DurationMinutes: durationMins,
@@ -341,16 +315,24 @@ func init() {
 			return logTimeOut{
 				ID:              id,
 				ProjectID:       args.ProjectID,
-				ProjectName:     projectName,
+				ProjectName:     project.Name,
 				Date:            args.Date,
 				DurationMinutes: durationMins,
 				Description:     args.Description,
+				Timezone:        resolvedTimezone,
+				StartTimeLocal:  time.Unix(startUnix, 0).In(location).Format("15:04"),
+				EndTimeLocal:    time.Unix(endUnix, 0).In(location).Format("15:04"),
+				StartAt:         time.Unix(startUnix, 0).UTC().Format(time.RFC3339),
+				EndAt:           time.Unix(endUnix, 0).UTC().Format(time.RFC3339),
 			}, nil
 		},
 	})
 
 	Register(Default, Tool[startTimerArgs]{
 		Name:        "start_timer",
+		Group:       CapabilityTime,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Start a time tracking timer. Only one timer can be active at a time. An optional work item can be linked by numeric ID or key (e.g. PROJ-42).",
 		Scopes:      []string{auth.ScopeTimeWrite},
 		Run: func(_ context.Context, env *Env, args startTimerArgs) (any, error) {
@@ -377,6 +359,9 @@ func init() {
 
 	Register(Default, Tool[stopTimerArgs]{
 		Name:        "stop_timer",
+		Group:       CapabilityTime,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Stop the user's currently running timer and create a worklog entry.",
 		Scopes:      []string{auth.ScopeTimeWrite},
 		Run: func(_ context.Context, env *Env, _ stopTimerArgs) (any, error) {
@@ -416,15 +401,10 @@ func resolveOptionalItemRef(env *Env, itemID *int, itemKey string) (resolvedID *
 	if itemID != nil {
 		rawID = *itemID
 	}
-	id, err := resolveItemID(env.DB, rawID, itemKey)
+	id, err := services.ResolveAccessibleWorklogItem(env.DB, rawID, itemKey, func(workspaceID int) (bool, error) {
+		return env.HasWorkspaceAccess(workspaceID), nil
+	})
 	if err != nil {
-		return nil, map[string]string{"error": err.Error()}
-	}
-	wsID, err := repository.NewItemRepository(env.DB).GetWorkspaceID(id)
-	if err != nil {
-		return nil, map[string]string{"error": "item not found"}
-	}
-	if !env.HasWorkspaceAccess(wsID) {
 		return nil, map[string]string{"error": "item not found"}
 	}
 	return &id, nil

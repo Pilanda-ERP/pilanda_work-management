@@ -24,6 +24,19 @@ CREATE INDEX IF NOT EXISTS idx_actions_is_enabled ON actions(is_enabled);
 CREATE INDEX IF NOT EXISTS idx_actions_trigger_type ON actions(trigger_type);
 CREATE INDEX IF NOT EXISTS idx_actions_created_by ON actions(created_by);
 
+-- Optional role allowlist for manual actions. No rows means the action is
+-- available to every workspace editor; one or more rows restrict visibility
+-- and execution to members of those roles (workspace admins retain override).
+CREATE TABLE IF NOT EXISTS action_allowed_roles (
+	action_id INTEGER NOT NULL,
+	role_id INTEGER NOT NULL,
+	PRIMARY KEY (action_id, role_id),
+	FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE CASCADE,
+	FOREIGN KEY (role_id) REFERENCES workspace_roles(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_allowed_roles_role_id ON action_allowed_roles(role_id);
+
 -- Action nodes: steps in the flow (set_field, add_comment, condition, etc.)
 CREATE TABLE IF NOT EXISTS action_nodes (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +85,7 @@ CREATE TABLE IF NOT EXISTS action_execution_logs (
 	completed_at DATETIME,
 	error_message TEXT,
 	execution_trace TEXT,          -- JSON step log
+	durable_event_key TEXT,
 	FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE CASCADE,
 	FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE SET NULL,
 	FOREIGN KEY (trigger_user_id) REFERENCES users(id) ON DELETE SET NULL,
@@ -82,6 +96,9 @@ CREATE INDEX IF NOT EXISTS idx_action_execution_logs_action_id ON action_executi
 CREATE INDEX IF NOT EXISTS idx_action_execution_logs_item_id ON action_execution_logs(item_id);
 CREATE INDEX IF NOT EXISTS idx_action_execution_logs_status ON action_execution_logs(status);
 CREATE INDEX IF NOT EXISTS idx_action_execution_logs_started_at ON action_execution_logs(started_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_action_execution_logs_durable_target
+	ON action_execution_logs(durable_event_key, action_id)
+	WHERE durable_event_key IS NOT NULL;
 
 -- Action capabilities: admin-provisioned resources that action nodes can reference
 CREATE TABLE IF NOT EXISTS action_capabilities (
@@ -94,7 +111,7 @@ CREATE TABLE IF NOT EXISTS action_capabilities (
 	-- reference this capability. When false, restricted to workspaces in the
 	-- action_capability_workspaces join table. Default true preserves the
 	-- pre-scoping behavior for legacy capabilities.
-	applies_to_all_workspaces BOOLEAN DEFAULT 1,
+	applies_to_all_workspaces BOOLEAN DEFAULT TRUE,
 	created_by INTEGER,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -126,7 +143,7 @@ CREATE TABLE IF NOT EXISTS action_credentials (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	name TEXT NOT NULL,
 	credential_type TEXT NOT NULL,   -- bearer_token, api_key, basic_auth, custom_header
-	applies_to_all_workspaces BOOLEAN NOT NULL DEFAULT 1,
+	applies_to_all_workspaces BOOLEAN NOT NULL DEFAULT TRUE,
 	created_by INTEGER,
 	encrypted_secret TEXT NOT NULL,  -- AES-GCM ciphertext (label-bound HKDF key)
 	secret_prefix TEXT,              -- non-sensitive fingerprint (first 4 chars + "…")
@@ -150,3 +167,5 @@ CREATE TABLE IF NOT EXISTS action_credential_workspaces (
 );
 
 CREATE INDEX IF NOT EXISTS idx_action_credential_workspaces_workspace ON action_credential_workspaces(workspace_id);
+
+-- migration: 0032_action_capabilities_applies_to_all_workspaces

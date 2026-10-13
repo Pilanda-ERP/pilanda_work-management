@@ -2,6 +2,7 @@
   import { Tag, Trash2 } from '@lucide/svelte';
   import Modal from './Modal.svelte';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import IconSelector from '../pickers/IconSelector.svelte';
   import EmptyState from '../components/EmptyState.svelte';
   import { t } from '../stores/i18n.svelte.js';
@@ -85,25 +86,31 @@
     <!-- Add New Category Form -->
     <div class="mb-6 p-4 rounded border" style="background-color: var(--ds-background-neutral); border-color: var(--ds-border);">
       <h4 class="text-sm font-medium mb-3" style="color: var(--ds-text);">{t('categories.addNewCategory')}</h4>
-      <div class="flex gap-3 items-center">
+      <div class="flex gap-3 items-center" data-testid="category-create-form">
         <div class="flex-1">
-          <input
+          <Input
             type="text"
             bind:value={newCategoryName}
-            class="w-full px-3 py-2 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
             placeholder={t('categories.categoryNamePlaceholder')}
             onkeydown={(e) => e.key === 'Enter' && addCategory()}
             disabled={loading}
+            size="small"
+            dataTestid="category-create-name"
           />
         </div>
         {#if showColorPicker}
-          <IconSelector bind:selectedColor={newCategoryColor} colorOnly compact />
+          <IconSelector
+            bind:selectedColor={newCategoryColor}
+            colorOnly
+            compact
+            dataTestid="category-create-color"
+          />
         {/if}
         <Button
           variant="primary"
           onclick={addCategory}
           disabled={!newCategoryName.trim() || loading}
+          dataTestid="category-create-submit"
         >
           {t('categories.addCategory')}
         </Button>

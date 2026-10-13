@@ -1,13 +1,13 @@
 <script>
   import { createPopover, melt } from '@melt-ui/svelte';
-  import { Link2, FileText, Trash2, Plus, X } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../../utils/icons.js';
+  import { Link2, Trash2, Plus, X } from '@lucide/svelte';
+  import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
   import StatusBadge from '../../components/StatusBadge.svelte';
-  import { useDebounce } from 'runed';
-  import { untrack } from 'svelte';
+  import Input from '../../components/Input.svelte';
+  import { onDestroy } from 'svelte';
 
   /**
    * Top-right popover on a page detail showing the work items linked to
@@ -26,14 +26,12 @@
     onlinkRemoved = () => {},
   } = $props();
 
-  const iconMap = itemTypeIconMap;
-
   const {
     elements: { trigger, content },
     states: { open },
   } = createPopover({
     forceVisible: true,
-    positioning: { placement: 'bottom-end' },
+    positioning: { strategy: 'fixed', placement: 'bottom-end', fitViewport: true },
     portal: 'body',
   });
 
@@ -44,49 +42,61 @@
   let searching = $state(false);
   let highlightedIndex = $state(-1);
   let submitting = $state(false);
+  let searchTimer;
+  let searchVersion = 0;
 
   $effect(() => {
     if (!$open) {
-      mode = 'list';
-      searchQuery = '';
-      searchResults = [];
-      highlightedIndex = -1;
+      resetSearch();
     }
   });
 
-  const runSearch = useDebounce(async (q) => {
+  onDestroy(() => {
+    clearTimeout(searchTimer);
+    searchVersion += 1;
+  });
+
+  function resetSearch(nextMode = 'list') {
+    clearTimeout(searchTimer);
+    searchVersion += 1;
+    mode = nextMode;
+    searchQuery = '';
+    searchResults = [];
+    highlightedIndex = -1;
+    searching = false;
+  }
+
+  function handleSearchInput(event) {
+    const q = event.currentTarget.value;
+    searchQuery = q;
+    clearTimeout(searchTimer);
+    const version = ++searchVersion;
+
+    if (q.trim().length < 2) {
+      searchResults = [];
+      highlightedIndex = -1;
+      searching = false;
+      return;
+    }
+
+    searching = true;
+    searchTimer = setTimeout(() => searchItems(q.trim(), version), 250);
+  }
+
+  async function searchItems(q, version) {
     try {
-      searching = true;
       const results = await api.links.search(q, 'item', 10);
+      if (version !== searchVersion) return;
       searchResults = Array.isArray(results) ? results : [];
       highlightedIndex = searchResults.length > 0 ? 0 : -1;
     } catch (err) {
+      if (version !== searchVersion) return;
       console.error('work-item search failed', err);
       searchResults = [];
     } finally {
-      searching = false;
+      if (version === searchVersion) searching = false;
     }
-  }, 250);
-
-  // Reactive search. Mirror the LinkItemModal pattern: untrack() the debounce
-  // call so we don't subscribe to its internal $state and loop.
-  $effect(() => {
-    const q = (searchQuery || '').trim();
-    if (mode !== 'add') {
-      untrack(() => runSearch.cancel?.());
-      searchResults = [];
-      highlightedIndex = -1;
-      return;
-    }
-    if (q.length >= 2) {
-      untrack(() => runSearch(q));
-    } else {
-      untrack(() => runSearch.cancel?.());
-      searchResults = [];
-      highlightedIndex = -1;
-      searching = false;
-    }
-  });
+  }
 
   async function linkItem(item) {
     if (!pageLinkTypeId || submitting) return;
@@ -100,9 +110,7 @@
         target_id: pageId,
       });
       onlinkCreated(link);
-      mode = 'list';
-      searchQuery = '';
-      searchResults = [];
+      resetSearch();
     } catch (err) {
       errorToast(err?.message || t('pages.workItemsErrorLink'));
     } finally {
@@ -122,9 +130,7 @@
   function handleSearchKeyDown(e) {
     if (e.key === 'Escape') {
       e.preventDefault();
-      mode = 'list';
-      searchQuery = '';
-      searchResults = [];
+      resetSearch();
       return;
     }
     if (searchResults.length === 0) return;
@@ -164,7 +170,7 @@
         <button
           type="button"
           class="add-btn"
-          onclick={() => (mode = 'add')}
+          onclick={() => resetSearch('add')}
           data-testid="page-work-items-add"
         >
           <Plus size={14} />
@@ -175,7 +181,7 @@
         <button
           type="button"
           class="add-btn"
-          onclick={() => (mode = 'list')}
+          onclick={() => resetSearch()}
           data-testid="page-work-items-add-cancel"
         >
           <X size={14} />
@@ -186,13 +192,15 @@
 
     {#if mode === 'add'}
       <div class="search-row">
-        <input
+        <Input
           type="text"
-          bind:value={searchQuery}
+          value={searchQuery}
+          oninput={handleSearchInput}
           onkeydown={handleSearchKeyDown}
           placeholder={t('pages.addWorkItemSearchPlaceholder')}
           class="search-input"
-          data-testid="page-work-items-add-search"
+          dataTestid="page-work-items-add-search"
+          size="small"
         />
       </div>
       {#if searching}
@@ -206,7 +214,7 @@
           {/if}
         </p>
       {:else}
-        <ul class="list">
+        <ul class="list" data-testid="page-work-items-search-list">
           {#each searchResults as result, index}
             {@const isHighlighted = highlightedIndex === index}
             <li>
@@ -219,17 +227,7 @@
                 data-testid="page-work-items-add-result"
                 data-item-id={result.id}
               >
-                <div
-                  class="row-icon"
-                  style="background-color: {(result.item_type_color || '#6b7280')}20; color: {(result.item_type_color || '#6b7280')};"
-                >
-                  {#if result.item_type_icon && iconMap[result.item_type_icon]}
-                    {@const I = iconMap[result.item_type_icon]}
-                    <I size={12} />
-                  {:else}
-                    <FileText size={12} />
-                  {/if}
-                </div>
+                <ItemTypeIcon icon={result.item_type_icon} color={result.item_type_color} />
                 <span class="row-title">{result.title}</span>
                 <span class="row-meta">{result.workspace_name || ''}</span>
               </button>
@@ -262,17 +260,7 @@
               data-item-id={linkedItemId}
             >
               <a class="row row--link" href={linkedItemHref}>
-                <div
-                  class="row-icon"
-                  style="background-color: {(linkedItemIconColor || '#6b7280')}20; color: {(linkedItemIconColor || '#6b7280')};"
-                >
-                  {#if linkedItemIconKey && iconMap[linkedItemIconKey]}
-                    {@const I = iconMap[linkedItemIconKey]}
-                    <I size={12} />
-                  {:else}
-                    <FileText size={12} />
-                  {/if}
-                </div>
+                <ItemTypeIcon icon={linkedItemIconKey} color={linkedItemIconColor} />
                 <span class="row-key">{linkedItemKey}</span>
                 <span class="row-title">{linkedItemTitle}</span>
                 {#if linkedItemStatus}
@@ -316,7 +304,7 @@
     transition: background 120ms, color 120ms;
   }
   .trigger:hover {
-    background: var(--ds-surface-hover);
+    background: var(--ds-surface-hovered);
     color: var(--ds-text);
   }
   .trigger-label {
@@ -346,6 +334,7 @@
     overflow: hidden;
   }
   .popover-header {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -371,10 +360,11 @@
   }
   .add-btn:hover {
     color: var(--ds-text);
-    background: var(--ds-surface-hover);
+    background: var(--ds-surface-hovered);
   }
 
   .search-row {
+    flex-shrink: 0;
     padding: 0.5rem;
     border-bottom: 1px solid var(--ds-border);
   }
@@ -401,6 +391,8 @@
   }
 
   .list {
+    min-height: 0;
+    overscroll-behavior: contain;
     list-style: none;
     padding: 0.25rem;
     margin: 0;
@@ -432,16 +424,7 @@
   .row:hover,
   .row--link:hover,
   .row--highlighted {
-    background: var(--ds-surface-hover);
-  }
-  .row-icon {
-    width: 22px;
-    height: 22px;
-    border-radius: 999px;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+    background: var(--ds-surface-hovered);
   }
   .row-key {
     font-family: var(--ds-font-mono, ui-monospace, monospace);
@@ -473,6 +456,6 @@
   }
   .row-delete:hover {
     color: var(--ds-text-danger);
-    background: var(--ds-surface-hover);
+    background: var(--ds-surface-hovered);
   }
 </style>

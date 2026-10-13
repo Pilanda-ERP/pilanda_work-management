@@ -2,16 +2,15 @@
   import Modal from './Modal.svelte';
   import ModalHeader from './ModalHeader.svelte';
   import DialogFooter from './DialogFooter.svelte';
+  import LinkItemSearchResult from './LinkItemSearchResult.svelte';
   import BasePicker from '../pickers/BasePicker.svelte';
   import PagePicker from '../pickers/PagePicker.svelte';
-  import { FileText } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../utils/icons.js';
+  import Input from '../components/Input.svelte';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
-  import { useEventListener, useDebounce } from 'runed';
-  import { untrack } from 'svelte';
+  import { useEventListener } from 'runed';
+  import { onDestroy } from 'svelte';
 
-  const iconMap = itemTypeIconMap;
   const TEST_LINK_TYPE_ID = 1;
 
   let {
@@ -38,6 +37,8 @@
   let searching = $state(false);
   let highlightedIndex = $state(-1);
   let inputRef = $state(null);
+  let searchTimer;
+  let searchVersion = 0;
 
   // Dropdown coordinates. The results dropdown is rendered as `position:
   // fixed` rather than `absolute` so it escapes the modal's `overflow-hidden`
@@ -79,73 +80,77 @@
   let searchDisabled = $derived(!formData.link_type_id);
   let canSubmit = $derived(formData.link_type_id && formData.target_id);
 
-  const runSearch = useDebounce(async (/** @type {string} */ query, /** @type {string} */ searchType) => {
-    try {
-      searching = true;
-      const results = await api.links.search(query, searchType, 10);
-      const items = Array.isArray(results) ? results : [];
-      searchResults = searchType === 'item'
-        ? items.filter(item => item.id !== currentItemId)
-        : items;
-      highlightedIndex = searchResults.length > 0 ? 0 : -1;
-    } catch (error) {
-      console.error('Search failed:', error);
-      searchResults = [];
-      highlightedIndex = -1;
-    } finally {
-      searching = false;
-    }
-  }, 300);
+  onDestroy(() => {
+    clearTimeout(searchTimer);
+    searchVersion += 1;
+  });
 
-  // Reactive search when query changes.
-  // runed's useDebounce holds its scheduling state in a $state, so calling
-  // the debounced wrapper (or .cancel()) from inside an $effect subscribes
-  // the effect to that internal state and re-runs forever. untrack() the
-  // calls so we only react to our own inputs.
-  $effect(() => {
-    const trimmedQuery = (searchQuery || '').trim();
-    const searchType = isTestLinkTypeSelected ? 'test_case' : 'item';
+  function clearSearch({ clearQuery = false } = {}) {
+    clearTimeout(searchTimer);
+    searchVersion += 1;
+    if (clearQuery) searchQuery = '';
+    searchResults = [];
+    highlightedIndex = -1;
+    searching = false;
+  }
 
-    // The Page link type swaps the search box for PagePicker — skip the
-    // inline runSearch entirely so we don't fire item-search requests
-    // while the user types into the page picker.
-    if (isPageLinkTypeSelected) {
-      untrack(() => runSearch.cancel());
+  function handleSearchInput(event) {
+    const query = event.currentTarget.value;
+    searchQuery = query;
+    clearTimeout(searchTimer);
+    const version = ++searchVersion;
+    const trimmedQuery = query.trim();
+
+    if (isPageLinkTypeSelected || trimmedQuery.length < 2 || !formData.link_type_id) {
       searchResults = [];
       highlightedIndex = -1;
       searching = false;
       return;
     }
 
-    if (trimmedQuery.length >= 2 && formData.link_type_id) {
-      untrack(() => runSearch(trimmedQuery, searchType));
-    } else {
-      untrack(() => runSearch.cancel());
+    const searchType = isTestLinkTypeSelected ? 'test_case' : 'item';
+    searching = true;
+    searchTimer = setTimeout(() => searchItems(trimmedQuery, searchType, version), 300);
+  }
+
+  async function searchItems(query, searchType, version) {
+    try {
+      const results = await api.links.search(query, searchType, 10);
+      if (version !== searchVersion) return;
+      const items = Array.isArray(results) ? results : [];
+      searchResults = searchType === 'item'
+        ? items.filter(item => item.id !== currentItemId)
+        : items;
+      highlightedIndex = searchResults.length > 0 ? 0 : -1;
+    } catch (error) {
+      if (version !== searchVersion) return;
+      console.error('Search failed:', error);
       searchResults = [];
       highlightedIndex = -1;
-      searching = false;
+    } finally {
+      if (version === searchVersion) searching = false;
     }
-  });
+  }
 
   // Reset target when link type changes
+  let previousSearchLinkTypeId;
   $effect(() => {
+    const currentLinkTypeId = selectedLinkTypeId;
     const isTestLink = selectedLinkTypeId === TEST_LINK_TYPE_ID;
     const isPageLink = isPageLinkTypeSelected;
+    if (currentLinkTypeId !== previousSearchLinkTypeId) {
+      previousSearchLinkTypeId = currentLinkTypeId;
+      clearSearch({ clearQuery: true });
+    }
     if (!isTestLink && formData.target_type === 'test_case') {
       formData.target_id = null;
       formData.target_title = '';
       formData.target_type = 'item';
-      searchQuery = '';
-      searchResults = [];
-      highlightedIndex = -1;
     }
     if (!isPageLink && formData.target_type === 'page') {
       formData.target_id = null;
       formData.target_title = '';
       formData.target_type = 'item';
-      searchQuery = '';
-      searchResults = [];
-      highlightedIndex = -1;
     }
   });
 
@@ -177,11 +182,9 @@
       handleSelectItem(searchResults[highlightedIndex]);
     } else if (e.key === 'Escape') {
       e.stopPropagation(); // Prevent modal close
-      searchResults = [];
-      highlightedIndex = -1;
+      clearSearch();
     } else if (e.key === 'Tab') {
-      searchResults = [];
-      highlightedIndex = -1;
+      clearSearch();
     }
   }
 
@@ -189,9 +192,7 @@
     formData.target_id = item.id;
     formData.target_title = item.title;
     formData.target_type = item.type || (isTestLinkTypeSelected ? 'test_case' : 'item');
-    searchQuery = '';
-    searchResults = [];
-    highlightedIndex = -1;
+    clearSearch({ clearQuery: true });
   }
 
   function handleSelectPage(page) {
@@ -199,8 +200,7 @@
     formData.target_id = page.id;
     formData.target_title = page.title;
     formData.target_type = 'page';
-    searchResults = [];
-    highlightedIndex = -1;
+    clearSearch({ clearQuery: true });
   }
 
   function clearTarget() {
@@ -211,9 +211,7 @@
       : isTestLinkTypeSelected
         ? 'test_case'
         : 'item';
-    searchQuery = '';
-    searchResults = [];
-    highlightedIndex = -1;
+    clearSearch({ clearQuery: true });
   }
 
   function handleSubmit() {
@@ -235,9 +233,7 @@
       target_title: '',
       target_type: 'item'
     };
-    searchQuery = '';
-    searchResults = [];
-    highlightedIndex = -1;
+    clearSearch({ clearQuery: true });
     isOpen = false;
     oncancel?.();
   }
@@ -274,12 +270,13 @@
           unassignedLabel={t('items.chooseRelationshipType')}
           getValue={(item) => item.id}
           getLabel={(item) => item.name}
+          optionTestid={(opt) => `link-type-option-${opt.value}`}
         />
         {#if isTestLinkTypeSelected}
-          <p class="text-xs text-blue-600">{t('items.linkToTestCase')}</p>
+          <p class="text-xs" style="color: var(--ds-text-info);">{t('items.linkToTestCase')}</p>
         {/if}
         {#if isPageLinkTypeSelected}
-          <p class="text-xs text-blue-600">{t('items.linkToPage')}</p>
+          <p class="text-xs" style="color: var(--ds-text-info);">{t('items.linkToPage')}</p>
         {/if}
       </div>
 
@@ -306,7 +303,8 @@
             </div>
             <button
               type="button"
-              class="text-red-600 hover:text-red-800 text-xs cursor-pointer"
+              class="text-xs cursor-pointer hover:underline"
+              style="color: var(--ds-text-danger);"
               onclick={clearTarget}
             >
               {t('common.clear')}
@@ -323,16 +321,16 @@
         {:else}
           <!-- Search Input -->
           <div class="relative">
-            <input
+            <Input
               id="link-target-search"
-              bind:this={inputRef}
+              bind:inputRef={inputRef}
               type="text"
               bind:value={searchQuery}
+              oninput={handleSearchInput}
               onkeydown={handleKeyDown}
               placeholder={searchPlaceholder}
-              class="w-full px-3 py-2 text-sm border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:text-gray-400"
-              style="border-color: var(--ds-border); background-color: var(--ds-surface-raised); color: var(--ds-text);"
               disabled={searchDisabled}
+              size="small"
             />
 
             {#if searchDisabled}
@@ -343,7 +341,7 @@
 
             {#if searching}
               <div class="absolute right-3 top-2.5">
-                <div class="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                <div class="w-4 h-4 border-2 rounded-full animate-spin" style="border-color: var(--ds-border-focused); border-top-color: transparent;"></div>
               </div>
             {/if}
 
@@ -351,56 +349,16 @@
                  Modal.svelte's `overflow-hidden` content wrapper. -->
             {#if searchResults.length > 0}
               <div
-                class="z-[70] border rounded shadow-lg max-h-48 overflow-y-auto"
-                style="{dropdownStyle} border-color: var(--ds-border); background-color: var(--ds-surface-raised);"
+                class="z-[70] border rounded max-h-48 overflow-y-auto"
+                style="{dropdownStyle} border-color: var(--ds-border-bold); background-color: var(--ds-surface-overlay); box-shadow: var(--ds-shadow-raised);"
               >
                 {#each searchResults as result, index}
-                  {@const isHighlighted = highlightedIndex === index}
-                  {@const itemTypeIcon = result.item_type_icon}
-                  {@const itemTypeColor = result.item_type_color}
-                  <button
-                    type="button"
-                    data-testid="link-search-result"
-                    data-result-type={result.type || 'item'}
-                    data-result-id={result.id}
-                    class="w-full text-left px-3 py-2 cursor-pointer border-b last:border-b-0 transition-colors"
-                    style="color: var(--ds-text); border-color: var(--ds-border); {isHighlighted ? 'background-color: var(--ds-background-neutral-hovered);' : ''}"
-                    onmouseenter={() => highlightedIndex = index}
-                    onclick={() => handleSelectItem(result)}
-                  >
-                    <div class="flex items-center gap-2">
-                      <!-- Item type icon -->
-                      {#if itemTypeIcon && iconMap[itemTypeIcon]}
-                        {@const ItemTypeIconComponent = iconMap[itemTypeIcon]}
-                        <div
-                          class="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0"
-                          style="background-color: {itemTypeColor || '#6b7280'}20; color: {itemTypeColor || '#6b7280'};"
-                        >
-                        <ItemTypeIconComponent class="w-3 h-3" />
-                        </div>
-                      {:else}
-                        <div
-                          class="w-5 h-5 rounded-full flex items-center justify-center flex-shrink-0"
-                          style="background-color: #6b728020; color: #6b7280;"
-                        >
-                          <FileText class="w-3 h-3" />
-                        </div>
-                      {/if}
-                      <div class="flex-1 min-w-0">
-                        <div class="font-medium text-sm truncate">{result.title}</div>
-                        <div class="text-xs" style="color: var(--ds-text-subtle);">
-                          {#if result.type === 'test_case'}
-                            {result.description || `Test Case #${result.id}`}
-                          {:else}
-                            {result.workspace_name || 'Workspace'} · ID {result.id}
-                          {/if}
-                        </div>
-                      </div>
-                      <span class="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded-full flex-shrink-0 {result.type === 'test_case' ? 'bg-purple-100 text-purple-600' : 'bg-gray-100 text-gray-600'}">
-                        {result.type === 'test_case' ? t('items.testCase') : t('items.workItem')}
-                      </span>
-                    </div>
-                  </button>
+                  <LinkItemSearchResult
+                    {result}
+                    highlighted={highlightedIndex === index}
+                    onhighlight={() => highlightedIndex = index}
+                    onselect={() => handleSelectItem(result)}
+                  />
                 {/each}
               </div>
             {/if}

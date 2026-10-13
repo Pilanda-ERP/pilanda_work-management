@@ -251,7 +251,7 @@ func (h *AdminOAuthClientHandler) CreateClient(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	h.audit(r, user, logger.ActionOAuthClientCreate, &created.ID, created.DisplayName, map[string]interface{}{
+	h.audit(r, user, logger.ActionOAuthClientCreate, &created.ID, created.DisplayName, map[string]any{
 		"slug":           created.Slug,
 		"client_id":      created.ClientID,
 		"client_type":    created.ClientType,
@@ -294,7 +294,7 @@ func (h *AdminOAuthClientHandler) UpdateClient(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	changes := map[string]interface{}{}
+	changes := map[string]any{}
 
 	if dn := strings.TrimSpace(req.DisplayName); dn != "" && dn != existing.DisplayName {
 		if _, err := h.db.ExecWrite(`UPDATE oauth_clients SET display_name = ? WHERE id = ?`, dn, id); err != nil {
@@ -368,7 +368,7 @@ func (h *AdminOAuthClientHandler) UpdateClient(w http.ResponseWriter, r *http.Re
 	}
 
 	if len(changes) > 0 {
-		h.audit(r, user, logger.ActionOAuthClientUpdate, &updated.ID, updated.DisplayName, map[string]interface{}{
+		h.audit(r, user, logger.ActionOAuthClientUpdate, &updated.ID, updated.DisplayName, map[string]any{
 			"changes": changes,
 		})
 	}
@@ -469,7 +469,7 @@ func (h *AdminOAuthClientHandler) DeleteClient(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	h.audit(r, user, logger.ActionOAuthClientDelete, &existing.ID, existing.DisplayName, map[string]interface{}{
+	h.audit(r, user, logger.ActionOAuthClientDelete, &existing.ID, existing.DisplayName, map[string]any{
 		"client_id":      existing.ClientID,
 		"tokens_revoked": revoked,
 	})
@@ -532,7 +532,7 @@ func (h *AdminOAuthClientHandler) cascadeRevokeTokensForClient(clientID string) 
 
 // audit emits a single audit-log entry for an oauth_client.* action. Errors
 // are swallowed because audit-log failures shouldn't break admin actions.
-func (h *AdminOAuthClientHandler) audit(r *http.Request, user *models.User, action string, resourceID *int, resourceName string, details map[string]interface{}) {
+func (h *AdminOAuthClientHandler) audit(r *http.Request, user *models.User, action string, resourceID *int, resourceName string, details map[string]any) {
 	_ = logger.LogAudit(h.db, logger.AuditEvent{
 		UserID:       user.ID,
 		Username:     user.Username,
@@ -568,7 +568,7 @@ func (h *AdminOAuthClientHandler) queryClientByClientID(clientID string) *sql.Ro
 // oauthClientScanner unifies sql.Row and sql.Rows so scanOAuthClient backs
 // both the list and the single-row paths.
 type oauthClientScanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }
 
 func scanOAuthClient(s oauthClientScanner) (OAuthClientResponse, error) {
@@ -600,23 +600,14 @@ func scanOAuthClient(s oauthClientScanner) (OAuthClientResponse, error) {
 	return c, nil
 }
 
-// Bounds for redirect URI registration (WI-185): every entry is
-// json.Marshal'ed verbatim into oauth_clients.redirect_uris and rendered
-// back in the admin UI, so both the per-URI length and the entry count
-// need a cap. Rejecting (rather than truncating through a sanitize
-// policy) keeps a redirect target from being silently rewritten. 2048
-// covers real-world URLs with room to spare; no legitimate client
-// registers anywhere near 32 URIs.
+// Bound stored/rendered redirect URIs. Reject rather than truncate targets.
 const (
 	maxRedirectURIs   = 32
 	maxRedirectURILen = 2048
 )
 
-// validateRedirectURIs enforces basic shape: non-empty, parseable, no
-// fragments, and either http(s) with a host or a non-browser-executable custom
-// scheme. Loopback constraints from cli_auth aren't applied — OAuth third-party
-// apps can register any URL the admin trusts. Entry count + per-URI length
-// are capped so the stored JSON blob is bounded.
+// validateRedirectURIs requires non-fragment HTTP(S) or safe custom schemes;
+// admin-trusted third-party clients are not limited to CLI loopbacks.
 func validateRedirectURIs(uris []string) error {
 	if len(uris) == 0 {
 		return errInvalidf("at least one redirect_uri is required")

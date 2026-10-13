@@ -16,12 +16,22 @@
     if (!statusId) return;
     window.dispatchEvent(new CustomEvent('workflow-set-initial', { detail: { statusId } }));
   }
+
+  function handleToggleAllIncoming(event) {
+    event.stopPropagation();
+    const statusId = data.statusId;
+    if (!statusId) return;
+    window.dispatchEvent(
+      new CustomEvent('workflow-toggle-all-incoming', { detail: { statusId } })
+    );
+  }
 </script>
 
 <div 
+  data-testid={`workflow-status-node-${data.statusId}`}
   class="status-node rounded border-2 shadow-lg select-none transition-all duration-200 group relative"
-  class:border-blue-500={selected}
-  class:border-gray-300={!selected}
+  class:border-ds-interactive={selected}
+  class:border-ds-border={!selected}
   style="width: 100px; height: 32px;"
 >
   <!-- Source handles (visible) - for initiating connections -->
@@ -51,9 +61,29 @@
       {/if}
     </button>
 
+    <!-- All-statuses checkbox: allow transitions from every other status -->
+    <button
+      class="all-incoming-chip"
+      class:all-incoming-active={data.fromAll}
+      role="checkbox"
+      aria-checked={data.fromAll ? 'true' : 'false'}
+      data-testid="status-all-toggle"
+      onclick={handleToggleAllIncoming}
+      title={t('workflows.fromAllStatuses')}
+    >
+      <span class="all-incoming-box" aria-hidden="true">
+        {#if data.fromAll}
+          <svg viewBox="0 0 10 10" width="8" height="8">
+            <path d="M1.5 5.5 L4 8 L8.5 2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        {/if}
+      </span>
+      {t('workflows.allStatuses')}
+    </button>
+
     <!-- Remove button - positioned in top-right corner -->
     <button
-      class="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-red-500 hover:text-red-700 p-1 transition-opacity duration-200 z-10"
+      class="absolute top-1 right-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 text-ds-text-danger hover:opacity-80 p-1 transition-opacity duration-200 z-10"
       onclick={handleRemove}
       title={t('workflows.removeFromWorkflow')}
     >
@@ -125,6 +155,55 @@
     background: rgba(59, 130, 246, 0.12);
     color: var(--workflow-accent);
     border-color: var(--workflow-accent);
+  }
+
+  .all-incoming-chip {
+    position: absolute;
+    bottom: -12px;
+    left: -8px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9px;
+    line-height: 1;
+    padding: 2px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--workflow-border);
+    background: var(--workflow-panel);
+    color: var(--workflow-text-subtle);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    pointer-events: auto;
+    z-index: 12;
+  }
+
+  .status-node:hover .all-incoming-chip {
+    opacity: 1;
+  }
+
+  .all-incoming-chip:hover {
+    background: var(--workflow-panel-hover);
+    color: var(--workflow-accent);
+    border-color: var(--workflow-accent);
+  }
+
+  .all-incoming-active {
+    opacity: 1 !important;
+    background: rgba(59, 130, 246, 0.12);
+    color: var(--workflow-accent);
+    border-color: var(--workflow-accent);
+  }
+
+  .all-incoming-box {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 9px;
+    height: 9px;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    flex-shrink: 0;
   }
 
   /* Source handles - visible, higher z-index to capture clicks first */

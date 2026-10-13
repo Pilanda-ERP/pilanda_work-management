@@ -1,15 +1,16 @@
 <script>
   import Modal from './Modal.svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import ModalHeader from './ModalHeader.svelte';
   import { confirm } from '../composables/useConfirm.js';
   import AssigneePicker from '../pickers/AssigneePicker.svelte';
   import Button from '../components/Button.svelte';
-  import Spinner from '../components/Spinner.svelte';
+  import TabStrip from '../components/TabStrip.svelte';
   import ActionButton from '../layout/ActionButton.svelte';
   import { api } from '../api.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast } from '../stores/toasts.svelte.js';
-  import { formatDateTimeLocale } from '../utils/dateFormatter.js';
+  import { formatAuthenticatedDateTime as formatDateTimeLocale } from '../utils/authenticatedDateFormatter.js';
   import { User, Users, X, Plus, Shield, UserCheck } from '@lucide/svelte';
   import DescriptionText from '../components/DescriptionText.svelte';
 
@@ -93,7 +94,7 @@
   async function initiateRemove(item, type) {
     const ok = await confirm({
       title: type === 'manager' ? t('time.permissions.removeManager') : t('time.permissions.removeMember'),
-      message: t('time.permissions.confirmRemove', { name: item?.manager_name || item?.member_name }),
+      message: t('time.permissions.confirmRemove', { name: item?.name }),
       confirmText: t('common.remove'),
       variant: 'danger',
     });
@@ -128,22 +129,15 @@
 
   <div class="p-6">
     <!-- Tabs -->
-    <div class="flex border-b mb-6" style="border-color: var(--ds-border);">
-      <button
-        class="px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px {activeTab === 'managers' ? '' : 'border-transparent'}"
-        style="{activeTab === 'managers' ? 'border-color: var(--ds-interactive); color: var(--ds-interactive);' : 'color: var(--ds-text-subtle);'}"
-        onclick={() => { activeTab = 'managers'; showAddForm = false; resetAddForm(); }}
-      >
-        {t('time.permissions.managers')} ({managers.length})
-      </button>
-      <button
-        class="px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px {activeTab === 'members' ? '' : 'border-transparent'}"
-        style="{activeTab === 'members' ? 'border-color: var(--ds-interactive); color: var(--ds-interactive);' : 'color: var(--ds-text-subtle);'}"
-        onclick={() => { activeTab = 'members'; showAddForm = false; resetAddForm(); }}
-      >
-        {t('time.permissions.members')} ({members.length})
-      </button>
-    </div>
+    <TabStrip
+      class="mb-6"
+      tabs={[
+        { id: 'managers', label: t('time.permissions.managers'), count: managers.length },
+        { id: 'members', label: t('time.permissions.members'), count: members.length }
+      ]}
+      bind:activeTab
+      onTabChange={() => { showAddForm = false; resetAddForm(); }}
+    />
 
     <!-- Add Button -->
     <div class="flex justify-end mb-4">
@@ -183,9 +177,7 @@
     <!-- List -->
     <div class="space-y-2">
       {#if loading}
-        <div class="flex items-center justify-center py-12">
-          <Spinner />
-        </div>
+        <StateDisplay type="loading" />
       {:else if activeTab === 'managers'}
         {#if managers.length === 0}
           <div
@@ -211,9 +203,9 @@
               <!-- Icon -->
               <div
                 class="flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center"
-                style="background-color: {manager.manager_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'};"
+                style="background-color: {manager.principal_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'};"
               >
-                {#if manager.manager_type === 'user'}
+                {#if manager.principal_type === 'user'}
                   <User class="w-5 h-5" style="color: var(--ds-interactive);" />
                 {:else}
                   <Users class="w-5 h-5" style="color: var(--ds-text-subtle);" />
@@ -224,18 +216,18 @@
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
                   <h4 class="text-sm font-medium" style="color: var(--ds-text);">
-                    {manager.manager_name}
+                    {manager.name}
                   </h4>
                   <span
                     class="px-2 py-0.5 text-xs font-medium rounded"
-                    style="background-color: {manager.manager_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'}; color: {manager.manager_type === 'user' ? 'var(--ds-interactive-pressed)' : 'var(--ds-text-subtle)'};"
+                    style="background-color: {manager.principal_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'}; color: {manager.principal_type === 'user' ? 'var(--ds-interactive-pressed)' : 'var(--ds-text-subtle)'};"
                   >
-                    {manager.manager_type === 'user' ? t('common.user') : t('common.group')}
+                    {manager.principal_type === 'user' ? t('common.user') : t('common.group')}
                   </span>
                 </div>
-                {#if manager.manager_email}
+                {#if manager.email}
                   <DescriptionText>
-                    {manager.manager_email}
+                    {manager.email}
                   </DescriptionText>
                 {/if}
                 <p class="text-xs mt-1" style="color: var(--ds-text-disabled);">
@@ -278,9 +270,9 @@
               <!-- Icon -->
               <div
                 class="flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center"
-                style="background-color: {member.member_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'};"
+                style="background-color: {member.principal_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'};"
               >
-                {#if member.member_type === 'user'}
+                {#if member.principal_type === 'user'}
                   <User class="w-5 h-5" style="color: var(--ds-interactive);" />
                 {:else}
                   <Users class="w-5 h-5" style="color: var(--ds-text-subtle);" />
@@ -291,18 +283,18 @@
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2">
                   <h4 class="text-sm font-medium" style="color: var(--ds-text);">
-                    {member.member_name}
+                    {member.name}
                   </h4>
                   <span
                     class="px-2 py-0.5 text-xs font-medium rounded"
-                    style="background-color: {member.member_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'}; color: {member.member_type === 'user' ? 'var(--ds-interactive-pressed)' : 'var(--ds-text-subtle)'};"
+                    style="background-color: {member.principal_type === 'user' ? 'var(--ds-interactive-subtle)' : 'var(--ds-surface)'}; color: {member.principal_type === 'user' ? 'var(--ds-interactive-pressed)' : 'var(--ds-text-subtle)'};"
                   >
-                    {member.member_type === 'user' ? t('common.user') : t('common.group')}
+                    {member.principal_type === 'user' ? t('common.user') : t('common.group')}
                   </span>
                 </div>
-                {#if member.member_email}
+                {#if member.email}
                   <DescriptionText>
-                    {member.member_email}
+                    {member.email}
                   </DescriptionText>
                 {/if}
                 <p class="text-xs mt-1" style="color: var(--ds-text-disabled);">
@@ -338,4 +330,3 @@
     </div>
   </div>
 </Modal>
-

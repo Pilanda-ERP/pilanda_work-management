@@ -1,13 +1,19 @@
 <script>
   import { onMount } from 'svelte';
+  import Spinner from '../../components/Spinner.svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
   import { api } from '../../api.js';
   import { successToast, errorToast } from '../../stores/toasts.svelte.js';
+  import Checkbox from '../../components/Checkbox.svelte';
+  import Input from '../../components/Input.svelte';
   import Label from '../../components/Label.svelte';
   import Textarea from '../../components/Textarea.svelte';
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
   import BasePicker from '../../pickers/BasePicker.svelte';
-  import { IconTag as Tag, IconLoader as Loader2, IconSparkles as Sparkles } from '@tabler/icons-svelte-runes';
+  import { IconTag as Tag, IconSparkles as Sparkles } from '@tabler/icons-svelte-runes';
   import AlertBox from '../../components/AlertBox.svelte';
+  import { loadMilestoneReleaseConnections } from './milestoneReleaseData.js';
+	import TextField from '../../components/TextField.svelte';
 
   let { milestone, workspaceId = null, hasExistingRelease = false, onreleased, onclose } = $props();
 
@@ -24,6 +30,10 @@
   let repositories = $state([]);
   let selectedRepository = $state(''); // "owner/repo" full_name
   let loadingRepos = $state(false);
+  let releaseMode = $state('create');
+  let releaseCandidates = $state([]);
+  let loadingCandidates = $state(false);
+  const selectedProviderType = $derived(connections.find(connection => connection.id === selectedConnectionId)?.provider_type);
 
   // Release form fields (snapshot of milestone at open; user-edited thereafter)
   // svelte-ignore state_referenced_locally
@@ -35,6 +45,7 @@
   let targetCommitish = $state('');
   let isDraft = $state(false);
   let isPrerelease = $state(false);
+  let idempotencyKey = $state(null);
 
   function sanitizeTagName(name) {
     return 'v' + (name ?? '')
@@ -56,29 +67,11 @@
     loading = true;
     error = null;
     try {
-      if (workspaceId) {
-        // Workspace-scoped milestone: load connections for this workspace only
-        const conns = await api.workspaceSCM.getConnections(workspaceId) || [];
-        connections = conns.map(c => ({ ...c, _workspaceName: null, _workspaceId: workspaceId }));
-      } else {
-        // Global milestone: load connections across all accessible workspaces
-        const allWorkspaces = await api.workspaces.getAll() || [];
-        const allConns = [];
-        await Promise.all(
-          allWorkspaces.map(async (ws) => {
-            try {
-              const conns = await api.workspaceSCM.getConnections(ws.id) || [];
-              conns.forEach(c => allConns.push({ ...c, _workspaceName: ws.name, _workspaceId: ws.id }));
-            } catch {
-              // skip workspaces where connections can't be loaded
-            }
-          })
-        );
-        connections = allConns;
-      }
+      connections = await loadMilestoneReleaseConnections(api, workspaceId);
 
       if (connections.length === 1) {
         selectedConnectionId = connections[0].id;
+        await loadRepositories(selectedConnectionId);
       }
     } catch (err) {
       console.error('Failed to load SCM connections:', err);
@@ -107,6 +100,7 @@
       repositories = repos;
       if (repos.length === 1) {
         selectedRepository = repos[0].repository_name ?? '';
+        await loadReleaseCandidates(selectedRepository);
       } else {
         selectedRepository = '';
       }
@@ -118,9 +112,34 @@
     }
   }
 
-  $effect(() => {
-    loadRepositories(selectedConnectionId);
-  });
+  async function loadReleaseCandidates(repositoryName) {
+    releaseCandidates = [];
+    if (releaseMode !== 'attach' || !repositoryName) return;
+    const repository = repositories.find(repo => repo.repository_name === repositoryName);
+    if (!repository?.id) return;
+    loadingCandidates = true;
+    try {
+      releaseCandidates = await api.workspaceSCM.getReleaseCandidates(repository.id) || [];
+      if (releaseCandidates.length === 1) tagName = releaseCandidates[0].tag_name;
+    } catch (err) {
+      console.error('Failed to load release candidates:', err);
+      error = err.message || 'Failed to load existing tags and releases.';
+    } finally {
+      loadingCandidates = false;
+    }
+  }
+
+  async function handleReleaseModeChange(mode) {
+    if (mode === 'attach') {
+      await loadReleaseCandidates(selectedRepository);
+    } else {
+      releaseCandidates = [];
+    }
+  }
+
+  async function handleConnectionChange(connection) {
+    await loadRepositories(connection?.id ?? null);
+  }
 
   function getConnectionLabel(conn) {
     const base = conn.name ?? conn.provider_name ?? `Connection ${conn.id}`;
@@ -130,7 +149,8 @@
   const canSubmit = $derived(
     !submitting &&
     tagName.trim().length > 0 &&
-    (!selectedConnectionId || selectedRepository.length > 0)
+    (!selectedConnectionId || selectedRepository.length > 0) &&
+    (releaseMode !== 'attach' || releaseCandidates.some(candidate => candidate.tag_name === tagName))
   );
 
   async function generateNotes() {
@@ -156,22 +176,27 @@
 
     try {
       const payload = {
+        mode: releaseMode,
         tag_name: tagName.trim(),
         name: releaseName.trim(),
         body: releaseBody.trim(),
-        is_draft: isDraft,
-        is_prerelease: isPrerelease,
+        is_draft: selectedProviderType === 'gitlab' ? false : isDraft,
+        is_prerelease: selectedProviderType === 'gitlab' ? false : isPrerelease,
         target_commitish: targetCommitish.trim()
       };
 
       if (selectedConnectionId) {
         payload.connection_id = selectedConnectionId;
         payload.repository = selectedRepository;
+        payload.repository_id = repositories.find(repo => repo.repository_name === selectedRepository)?.id;
       }
 
-      const updatedMilestone = await api.milestones.release(milestone.id, payload);
+      idempotencyKey ??= crypto.randomUUID();
+      const updatedMilestone = await api.milestones.release(milestone.id, payload, idempotencyKey);
       successToast(
-        updatedMilestone.latest_release?.scm_release_url
+        releaseMode === 'attach'
+          ? `Attached ${tagName.trim()} to the milestone.`
+          : updatedMilestone.latest_release?.scm_release_url
           ? `Release created at ${updatedMilestone.latest_release.scm_release_url}`
           : 'Milestone marked as completed.',
         'Released'
@@ -202,10 +227,7 @@
   {/if}
 
   {#if loading}
-    <div class="flex items-center justify-center py-8 gap-2" style="color: var(--ds-text-subtle);">
-      <Loader2 class="w-5 h-5 animate-spin" />
-      <span>Loading SCM connections…</span>
-    </div>
+    <StateDisplay type="loading" message="Loading SCM connections…" />
   {:else}
     {#if error}
       <AlertBox variant="error" message={error} />
@@ -222,6 +244,7 @@
           allowClear={true}
           getValue={(c) => c.id}
           getLabel={getConnectionLabel}
+          onSelect={handleConnectionChange}
         />
       </div>
 
@@ -230,10 +253,7 @@
         <div>
           <Label>Repository</Label>
           {#if loadingRepos}
-            <div class="flex items-center gap-2 text-sm py-2" style="color: var(--ds-text-subtle);">
-              <Loader2 class="w-4 h-4 animate-spin" />
-              Loading repositories…
-            </div>
+            <StateDisplay type="loading" inline message="Loading repositories…" class="py-2 text-sm" />
           {:else if repositories.length === 0}
             <p class="text-sm py-2" style="color: var(--ds-text-subtle);">No linked repositories found for this connection.</p>
           {:else}
@@ -243,8 +263,25 @@
               placeholder="Select a repository"
               getValue={(r) => r.repository_name ?? ''}
               getLabel={(r) => r.repository_name ?? ''}
+              onSelect={(repository) => loadReleaseCandidates(repository.repository_name)}
             />
           {/if}
+        </div>
+      {/if}
+
+      {#if selectedConnectionId && selectedRepository}
+        <div>
+          <Label>Release action</Label>
+          <BasePicker
+            bind:value={releaseMode}
+            items={[
+              { value: 'create', label: 'Create a new SCM release' },
+              { value: 'attach', label: 'Attach an existing tag or release' }
+            ]}
+            getValue={(item) => item.value}
+            getLabel={(item) => item.label}
+            onSelect={(item) => handleReleaseModeChange(item.value)}
+          />
         </div>
       {/if}
     {:else}
@@ -255,25 +292,40 @@
 
     <!-- Tag Name -->
     <div>
-      <Label required>Tag Name</Label>
-      <input
-        type="text"
-        bind:value={tagName}
-        placeholder="v1.0.0"
-        class="w-full px-3 py-2 text-sm rounded border focus:outline-none"
-        style="background: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border);"
-      />
+      <Label required>{releaseMode === 'attach' ? 'Existing tag or release' : 'Tag Name'}</Label>
+      {#if releaseMode === 'attach'}
+        {#if loadingCandidates}
+          <StateDisplay type="loading" inline message="Loading tags and releases…" class="py-2 text-sm" />
+        {:else if releaseCandidates.length === 0}
+          <p class="text-sm py-2" style="color: var(--ds-text-subtle);">No tags or releases were found in this repository.</p>
+        {:else}
+          <BasePicker
+            bind:value={tagName}
+            items={releaseCandidates}
+            placeholder="Select a tag or release"
+            getValue={(candidate) => candidate.tag_name}
+            getLabel={(candidate) => `${candidate.tag_name} · ${candidate.release ? 'release' : 'tag'}`}
+          />
+        {/if}
+      {:else}
+        <Input
+          type="text"
+          bind:value={tagName}
+          placeholder="v1.0.0"
+          size="small"
+        />
+      {/if}
     </div>
 
     <!-- Release Title -->
+    {#if releaseMode === 'create'}
     <div>
-      <Label>Release Title</Label>
-      <input
+      <TextField
+        label={"Release Title"}
         type="text"
-        bind:value={releaseName}
         placeholder="Release title"
-        class="w-full px-3 py-2 text-sm rounded border focus:outline-none"
-        style="background: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border);"
+        size="small"
+        bind:value={releaseName}
       />
     </div>
 
@@ -291,7 +343,7 @@
             title="Generate release notes with AI"
           >
             {#if generatingNotes}
-              <Loader2 class="w-3 h-3 animate-spin" />
+              <Spinner size="sm" />
             {:else}
               <Sparkles class="w-3 h-3" />
             {/if}
@@ -312,26 +364,24 @@
     <!-- Target Branch (optional) -->
     <div>
       <Label>Target Branch / Commit <span class="font-normal" style="color: var(--ds-text-subtle);">(optional)</span></Label>
-      <input
+      <Input
         type="text"
         bind:value={targetCommitish}
         placeholder="main"
-        class="w-full px-3 py-2 text-sm rounded border focus:outline-none"
-        style="background: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border);"
+        size="small"
       />
     </div>
 
     <!-- Draft / Pre-release checkboxes -->
-    <div class="flex items-center gap-6">
-      <label class="flex items-center gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-        <input type="checkbox" bind:checked={isDraft} />
-        Draft
-      </label>
-      <label class="flex items-center gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-        <input type="checkbox" bind:checked={isPrerelease} />
-        Pre-release
-      </label>
-    </div>
+    {#if selectedProviderType === 'gitlab'}
+      <p class="text-xs" style="color: var(--ds-text-subtle);">GitLab Releases are published directly and do not expose draft or pre-release states.</p>
+    {:else}
+      <div class="flex items-center gap-6">
+        <Checkbox bind:checked={isDraft} label="Draft" size="small" />
+        <Checkbox bind:checked={isPrerelease} label="Pre-release" size="small" />
+      </div>
+    {/if}
+    {/if}
   {/if}
 </div>
 

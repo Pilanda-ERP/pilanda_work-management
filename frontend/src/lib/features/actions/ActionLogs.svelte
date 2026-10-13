@@ -1,11 +1,13 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
   import DataTable from '../../components/DataTable.svelte';
   import Button from '../../components/Button.svelte';
   import ExecutionTraceModal from './ExecutionTraceModal.svelte';
   import { ArrowLeft, CheckCircle, XCircle, Clock, SkipForward, Eye } from '@lucide/svelte';
+  import { formatAuthenticatedDateTime } from '../../utils/authenticatedDateFormatter.js';
 
   let { workspaceId, action, onBack } = $props();
 
@@ -13,6 +15,8 @@
     const labels = {
       'status_transition': t('actions.trigger.statusTransition'),
       'item_created': t('actions.trigger.itemCreated'),
+      'sla_breached': t('actions.trigger.slaBreached'),
+      'sla_warning': t('actions.trigger.slaWarning'),
       'item_updated': t('actions.trigger.itemUpdated'),
       'item_linked': t('actions.trigger.itemLinked')
     };
@@ -47,7 +51,7 @@
   async function loadLogs() {
     loading = true;
     try {
-      logs = await api.get(`/workspaces/${workspaceId}/actions/${action.id}/logs?limit=50`) || [];
+      logs = await api.actions.getLogs(workspaceId, action.id) || [];
     } catch (err) {
       console.error('Failed to load logs:', err);
       logs = [];
@@ -65,11 +69,11 @@
 
   function formatDate(dateStr) {
     if (!dateStr) return '-';
-    return new Date(dateStr).toLocaleString();
+    return formatAuthenticatedDateTime(dateStr);
   }
 </script>
 
-<div class="action-logs h-full flex flex-col">
+<div class="action-logs h-full flex flex-col" data-testid="action-logs">
   <!-- Header with back button -->
   <div class="flex items-center gap-4 p-4 border-b header">
     <Button variant="ghost" icon={ArrowLeft} onclick={onBack} />
@@ -82,9 +86,7 @@
   <!-- DataTable -->
   <div class="flex-1 p-4 overflow-auto">
     {#if loading}
-      <div class="flex justify-center py-12">
-        <div class="animate-spin h-8 w-8 border-b-2 rounded-full" style="border-color: var(--ds-interactive);"></div>
-      </div>
+      <StateDisplay type="loading" />
     {:else}
       <DataTable
         {columns}
@@ -94,6 +96,7 @@
         emptyIcon={Clock}
         pagination={true}
         pageSize={25}
+        rowAttrs={(item) => ({ 'data-testid': `action-log-row-${item.id}` })}
       >
         <!-- Status slot with icon -->
         {#snippet status(item)}
@@ -108,8 +111,8 @@
               <Clock class="w-4 h-4 animate-pulse" style="color: var(--ds-text-info);" />
               <span style="color: var(--ds-text-info);">{t('actions.logs.running')}</span>
             {:else if item.status === 'skipped'}
-              <SkipForward class="w-4 h-4 text-gray-400" />
-              <span class="text-gray-500">{t('actions.logs.skipped')}</span>
+              <SkipForward class="w-4 h-4 text-ds-icon-subtle" />
+              <span class="text-ds-text-subtle">{t('actions.logs.skipped')}</span>
             {:else}
               <span class="capitalize status-text">{item.status}</span>
             {/if}
@@ -138,11 +141,11 @@
         <!-- Error slot -->
         {#snippet error(item)}
           {#if item.error_message}
-            <span class="text-red-500 text-xs truncate block max-w-xs" title={item.error_message}>
+            <span class="text-ds-text-danger text-xs truncate block max-w-xs" title={item.error_message}>
               {item.error_message}
             </span>
           {:else}
-            <span class="text-gray-400">—</span>
+            <span class="text-ds-text-subtlest">—</span>
           {/if}
         {/snippet}
 
@@ -153,6 +156,7 @@
             size="sm"
             onclick={() => showDetails(item)}
             title={t('actions.logs.viewDetails')}
+            dataTestid="action-log-details"
           >
             <Eye class="w-4 h-4" />
           </Button>

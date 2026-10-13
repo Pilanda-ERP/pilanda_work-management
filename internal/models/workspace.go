@@ -1,6 +1,13 @@
 package models
 
-import "time"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+)
 
 // Workspace is a container for Items and Pages plus their configuration.
 // "Project" in Windshift refers exclusively to time-tracking projects
@@ -14,6 +21,8 @@ type Workspace struct {
 	// Personal workspace fields
 	IsPersonal bool `json:"is_personal"`        // Flag to indicate personal workspace
 	OwnerID    *int `json:"owner_id,omitempty"` // User ID for personal workspaces
+	// Template flag: workspace can be selected as a source when creating workspaces
+	IsTemplate bool `json:"is_template"`
 	// Time tracking integration
 	TimeProjectID *int `json:"time_project_id,omitempty"` // Default time-tracking project for worklogs on items in this workspace
 	// Visual identity fields
@@ -26,10 +35,24 @@ type Workspace struct {
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
 	// Joined fields for API responses
+	IsRestricted          bool   `json:"is_restricted,omitempty"` // Explicit Viewer-role assignments gate this workspace to assigned users only
 	TimeProjectName       string `json:"time_project_name,omitempty"`
 	OwnerName             string `json:"owner_name,omitempty"` // Name of workspace owner for API responses
 	ConfigurationSetID    *int64 `json:"configuration_set_id,omitempty"`
 	TimeProjectCategories []int  `json:"time_project_categories,omitempty"` // Restricted time project categories for this workspace
+}
+
+// WorkspaceTemplateSummary is the picker-facing summary of a workspace marked
+// as a template: identity fields plus counts of what a clone would receive.
+type WorkspaceTemplateSummary struct {
+	ID                   int    `json:"id"`
+	Name                 string `json:"name"`
+	Description          string `json:"description"`
+	Icon                 string `json:"icon"`
+	Color                string `json:"color"`
+	ConfigurationSetName string `json:"configuration_set_name"`
+	TemplateCount        int    `json:"template_count"`
+	ItemCount            int    `json:"item_count"`
 }
 
 // WorkspaceHomepageSection represents a section on the workspace homepage
@@ -43,12 +66,12 @@ type WorkspaceHomepageSection struct {
 
 // WorkspaceWidget represents a single widget in the workspace homepage
 type WorkspaceWidget struct {
-	ID        string                 `json:"id"`               // UUID for client-side tracking
-	Type      string                 `json:"type"`             // Widget type: "stats", "completion-chart", "created-chart", "milestone-progress", etc.
-	SectionID string                 `json:"section_id"`       // Which section this widget belongs to
-	Position  int                    `json:"position"`         // Display order within the section
-	Width     int                    `json:"width"`            // Column span: 1, 2, or 3 (for grid-based sections)
-	Config    map[string]interface{} `json:"config,omitempty"` // Widget-specific configuration
+	ID        string         `json:"id"`               // UUID for client-side tracking
+	Type      string         `json:"type"`             // Widget type: "stats", "completion-chart", "created-chart", "milestone-progress", etc.
+	SectionID string         `json:"section_id"`       // Which section this widget belongs to
+	Position  int            `json:"position"`         // Display order within the section
+	Width     int            `json:"width"`            // Column span: 1, 2, or 3 (for grid-based sections)
+	Config    map[string]any `json:"config,omitempty"` // Widget-specific configuration
 }
 
 // WorkspaceHomepageLayout represents the complete homepage layout structure
@@ -109,20 +132,26 @@ type MilestoneCategory struct {
 
 // MilestoneRelease represents a release record for a milestone
 type MilestoneRelease struct {
-	ID              int     `json:"id"`
-	MilestoneID     int     `json:"milestone_id"`
-	TagName         string  `json:"tag_name"`
-	Name            string  `json:"name,omitempty"`
-	Body            string  `json:"body,omitempty"`
-	IsDraft         bool    `json:"is_draft"`
-	IsPrerelease    bool    `json:"is_prerelease"`
-	TargetCommitish string  `json:"target_commitish,omitempty"`
-	SCMConnectionID *int    `json:"scm_connection_id,omitempty"` // Visible only to users with connection workspace access
-	SCMRepository   *string `json:"scm_repository,omitempty"`    // "owner/repo"; same visibility as SCMConnectionID
-	SCMReleaseID    *string `json:"scm_release_id,omitempty"`
-	SCMReleaseURL   *string `json:"scm_release_url,omitempty"`
-	CreatedBy       *int    `json:"created_by,omitempty"`
-	CreatedAt       string  `json:"created_at"`
+	ID                    int               `json:"id"`
+	MilestoneID           int               `json:"milestone_id"`
+	WorkspaceRepositoryID *int              `json:"workspace_repository_id,omitempty"`
+	TagName               string            `json:"tag_name"`
+	TagURL                *string           `json:"tag_url,omitempty"`
+	ReleaseStatus         string            `json:"release_status,omitempty"`
+	ReleasedAt            *string           `json:"released_at,omitempty"`
+	Assets                []SCMReleaseAsset `json:"assets,omitempty"`
+	LastSyncedAt          *string           `json:"last_synced_at,omitempty"`
+	Name                  string            `json:"name,omitempty"`
+	Body                  string            `json:"body,omitempty"`
+	IsDraft               bool              `json:"is_draft"`
+	IsPrerelease          bool              `json:"is_prerelease"`
+	TargetCommitish       string            `json:"target_commitish,omitempty"`
+	SCMConnectionID       *int              `json:"scm_connection_id,omitempty"` // Visible only to users with connection workspace access
+	SCMRepository         *string           `json:"scm_repository,omitempty"`    // "owner/repo"; same visibility as SCMConnectionID
+	SCMReleaseID          *string           `json:"scm_release_id,omitempty"`
+	SCMReleaseURL         *string           `json:"scm_release_url,omitempty"`
+	CreatedBy             *int              `json:"created_by,omitempty"`
+	CreatedAt             string            `json:"created_at"`
 }
 
 // Milestone represents a project milestone
@@ -178,20 +207,245 @@ type Iteration struct {
 	WorkspaceName string `json:"workspace_name,omitempty"`
 }
 
+// NullableIntPatch distinguishes an omitted JSON field from an explicit null.
+// This is required for nullable foreign keys such as iteration.type_id.
+type NullableIntPatch struct {
+	Present bool
+	Value   *int
+}
+
+func (p *NullableIntPatch) UnmarshalJSON(data []byte) error {
+	p.Present = true
+	if string(data) == "null" {
+		p.Value = nil
+		return nil
+	}
+	var value int
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	p.Value = &value
+	return nil
+}
+
+// NullableStringPatch is the string counterpart of NullableIntPatch, for
+// nullable columns such as milestone.target_date. An empty string reads as a
+// clear too, since a blank date is never a meaningful stored value.
+type NullableStringPatch struct {
+	Present bool
+	Value   *string
+}
+
+func (p *NullableStringPatch) UnmarshalJSON(data []byte) error {
+	p.Present = true
+	if string(data) == "null" {
+		p.Value = nil
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if strings.TrimSpace(value) == "" {
+		p.Value = nil
+		return nil
+	}
+	p.Value = &value
+	return nil
+}
+
+// MilestonePatch is the presence-aware update contract for milestones. Empty
+// description is a valid clear, null (or blank) target_date and null
+// category_id are valid clears, and omitted fields preserve their stored
+// values.
+type MilestonePatch struct {
+	Name        *string             `json:"name,omitempty"`
+	Description *string             `json:"description,omitempty"`
+	TargetDate  NullableStringPatch `json:"target_date,omitempty" swaggertype:"string" extensions:"x-nullable"`
+	Status      *string             `json:"status,omitempty"`
+	CategoryID  NullableIntPatch    `json:"category_id,omitempty" swaggertype:"integer" extensions:"x-nullable"`
+}
+
+func (p MilestonePatch) Apply(existing Milestone) Milestone {
+	if p.Name != nil {
+		existing.Name = *p.Name
+	}
+	if p.Description != nil {
+		existing.Description = *p.Description
+	}
+	if p.TargetDate.Present {
+		existing.TargetDate = p.TargetDate.Value
+	}
+	if p.Status != nil {
+		existing.Status = *p.Status
+	}
+	if p.CategoryID.Present {
+		existing.CategoryID = p.CategoryID.Value
+	}
+	return existing
+}
+
+// IterationPatch is the presence-aware update contract shared by the legacy
+// and v1 adapters. Empty description is a valid clear, null type_id is a valid
+// clear, and omitted fields preserve their stored values.
+type IterationPatch struct {
+	Name        *string          `json:"name,omitempty"`
+	Description *string          `json:"description,omitempty"`
+	StartDate   *string          `json:"start_date,omitempty"`
+	EndDate     *string          `json:"end_date,omitempty"`
+	Status      *string          `json:"status,omitempty"`
+	TypeID      NullableIntPatch `json:"type_id,omitempty" swaggertype:"integer" extensions:"x-nullable"`
+}
+
+func (p IterationPatch) Apply(existing Iteration) Iteration {
+	if p.Name != nil {
+		existing.Name = *p.Name
+	}
+	if p.Description != nil {
+		existing.Description = *p.Description
+	}
+	if p.StartDate != nil {
+		existing.StartDate = *p.StartDate
+	}
+	if p.EndDate != nil {
+		existing.EndDate = *p.EndDate
+	}
+	if p.Status != nil {
+		existing.Status = *p.Status
+	}
+	if p.TypeID.Present {
+		existing.TypeID = p.TypeID.Value
+	}
+	return existing
+}
+
+// BoardViewIDs lists the collection-scoped views that view visibility
+// settings can toggle, in navigation order.
+var BoardViewIDs = []string{"backlog", "board", "list", "tree", "map", "roadmap"}
+
+// WorkspaceNavItemIDs lists every navigable workspace entry that view
+// visibility settings can toggle at the workspace scope: the
+// collection-scoped BoardViewIDs plus the workspace-only tools entries (the
+// ids used by the frontend navigation registry). Test-management entries are
+// deliberately absent — they are core navigation for testing workspaces — as
+// are overview, look-and-feel, and settings: overview is the disabled-view
+// redirect fallback and the others are admin affordances, not workspace
+// feature surfaces.
+var WorkspaceNavItemIDs = append(slices.Clone(BoardViewIDs),
+	"queue", "agents", "iterations", "milestones", "analytics", "actions", "pages",
+)
+
+// DefaultWorkspaceNavItemIDs is the workspace-scope nav set a workspace gets
+// when it has no explicit enabled-views override. It is WorkspaceNavItemIDs
+// without the support queue: the queue is opt-in and enabled by the helpdesk
+// pack. A workspace admin can still toggle any id, queue included.
+var DefaultWorkspaceNavItemIDs = slices.DeleteFunc(slices.Clone(WorkspaceNavItemIDs), func(id string) bool {
+	return id == "queue"
+})
+
+// IsWorkspaceNavID reports whether id is a workspace-scope nav item.
+func IsWorkspaceNavID(id string) bool {
+	return slices.Contains(WorkspaceNavItemIDs, id)
+}
+
+// IsCollectionViewID reports whether id is one of the collection-scoped
+// views, the only ids a per-collection override may toggle.
+func IsCollectionViewID(id string) bool {
+	return slices.Contains(BoardViewIDs, id)
+}
+
+// ViewSettings holds view-scoped settings for a board configuration scope.
+// New settings are added as keys of this object instead of new columns.
+type ViewSettings struct {
+	// EnabledViews limits which nav entries are visible and reachable. A
+	// workspace-scope override may contain any WorkspaceNavItemIDs entry; a
+	// collection-scope override only the collection-scoped views. nil means
+	// inherit: all nav items for a workspace scope, the workspace's
+	// effective set for a collection scope. A pointer to a nil slice resets
+	// an override to the inherited default.
+	EnabledViews *[]string `json:"enabled_views,omitempty"`
+}
+
+// UnmarshalJSON rejects unknown keys and distinguishes an omitted
+// enabled_views (inherit, nil pointer) from an explicit null (reset to the
+// default, pointer to a nil slice).
+func (v *ViewSettings) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&fields); err != nil {
+		return err
+	}
+	for key := range fields {
+		if key != "enabled_views" {
+			return fmt.Errorf("view_settings: unknown key %q", key)
+		}
+	}
+	v.EnabledViews = nil
+	if raw, ok := fields["enabled_views"]; ok {
+		var views []string
+		if string(raw) != "null" {
+			if err := json.Unmarshal(raw, &views); err != nil {
+				return err
+			}
+		}
+		v.EnabledViews = &views
+	}
+	return nil
+}
+
+// MarshalJSON writes the inherit state as {} and the reset state as an
+// explicit null so both round-trip without ambiguity.
+func (v ViewSettings) MarshalJSON() ([]byte, error) {
+	if v.EnabledViews == nil {
+		return []byte(`{}`), nil
+	}
+	if len(*v.EnabledViews) == 0 {
+		return []byte(`{"enabled_views":null}`), nil
+	}
+	return json.Marshal(struct {
+		EnabledViews []string `json:"enabled_views"`
+	}{EnabledViews: *v.EnabledViews})
+}
+
+// HasEnabledViewsOverride reports whether the settings carry an explicit
+// enabled-views override (as opposed to inheriting the default).
+func (v *ViewSettings) HasEnabledViewsOverride() bool {
+	return v != nil && v.EnabledViews != nil && len(*v.EnabledViews) > 0
+}
+
+// EnabledViewSet returns the enabled views as a set, or nil when the settings
+// do not carry an override.
+func (v *ViewSettings) EnabledViewSet() map[string]struct{} {
+	if v == nil || v.EnabledViews == nil {
+		return nil
+	}
+	set := make(map[string]struct{}, len(*v.EnabledViews))
+	for _, id := range *v.EnabledViews {
+		set[id] = struct{}{}
+	}
+	return set
+}
+
 // BoardConfiguration represents a board layout configuration for a collection
 type BoardConfiguration struct {
-	ID                        int            `json:"id"`
-	CollectionID              *int           `json:"collection_id,omitempty"`
-	WorkspaceID               *int           `json:"workspace_id,omitempty"`
-	BacklogStatusIDs          []int          `json:"backlog_status_ids,omitempty"`
-	ListColumns               []ListColumn   `json:"list_columns,omitempty"`
-	CardFields                []ListColumn   `json:"card_fields,omitempty"`
-	RoadmapConfig             *RoadmapConfig `json:"roadmap_config,omitempty"`
-	ShowRightmostColumnLast50 bool           `json:"show_rightmost_column_last_50"`
-	CreatedAt                 time.Time      `json:"created_at"`
-	UpdatedAt                 time.Time      `json:"updated_at"`
+	ID                         int            `json:"id"`
+	CollectionID               *int           `json:"collection_id,omitempty"`
+	WorkspaceID                *int           `json:"workspace_id,omitempty"`
+	BacklogStatusIDs           []int          `json:"backlog_status_ids,omitempty"`
+	ListColumns                []ListColumn   `json:"list_columns,omitempty"`
+	CardFields                 []ListColumn   `json:"card_fields,omitempty"`
+	RoadmapConfig              *RoadmapConfig `json:"roadmap_config,omitempty"`
+	ShowRightmostColumnLast50  bool           `json:"show_rightmost_column_last_50"`
+	CompletedItemRetentionDays *int           `json:"completed_item_retention_days,omitempty"`
+	ViewSettings               *ViewSettings  `json:"view_settings,omitempty"`
+	CreatedAt                  time.Time      `json:"created_at"`
+	UpdatedAt                  time.Time      `json:"updated_at"`
 	// Joined fields
 	Columns []BoardColumn `json:"columns,omitempty"`
+	// ViewSettingsInherited reports that ViewSettings was resolved from the
+	// workspace default rather than this collection's own row. Only set on
+	// collection-scoped reads.
+	ViewSettingsInherited bool `json:"view_settings_inherited,omitempty"`
 }
 
 // RoadmapConfig represents the configuration for a roadmap view
@@ -233,12 +487,14 @@ type BoardColumnStatus struct {
 
 // BoardConfigurationRequest represents the payload for creating/updating a board configuration
 type BoardConfigurationRequest struct {
-	Columns                   []BoardColumnRequest `json:"columns"`
-	BacklogStatusIDs          []int                `json:"backlog_status_ids,omitempty"`
-	ListColumns               []ListColumn         `json:"list_columns,omitempty"`
-	CardFields                []ListColumn         `json:"card_fields,omitempty"`
-	RoadmapConfig             *RoadmapConfig       `json:"roadmap_config,omitempty"`
-	ShowRightmostColumnLast50 bool                 `json:"show_rightmost_column_last_50"`
+	Columns                    []BoardColumnRequest `json:"columns"`
+	BacklogStatusIDs           []int                `json:"backlog_status_ids,omitempty"`
+	ListColumns                []ListColumn         `json:"list_columns,omitempty"`
+	CardFields                 []ListColumn         `json:"card_fields,omitempty"`
+	RoadmapConfig              *RoadmapConfig       `json:"roadmap_config,omitempty"`
+	ShowRightmostColumnLast50  bool                 `json:"show_rightmost_column_last_50"`
+	CompletedItemRetentionDays *int                 `json:"completed_item_retention_days"`
+	ViewSettings               *ViewSettings        `json:"view_settings,omitempty"`
 }
 
 // BoardColumnRequest represents the payload for a column in the board configuration

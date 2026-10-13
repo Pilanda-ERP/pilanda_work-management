@@ -1,7 +1,9 @@
 <script>
+  import { onDestroy } from 'svelte';
+  import { api } from '../api.js';
   import { BasePicker } from '../pickers';
-  import Input from '../components/Input.svelte';
   import Label from '../components/Label.svelte';
+  import StatusPill from '../components/StatusPill.svelte';
   import ModalHeader from './ModalHeader.svelte';
   import {
     addMinutesToTime,
@@ -13,7 +15,10 @@
   import Modal from './Modal.svelte';
   import DialogFooter from './DialogFooter.svelte';
   import { t } from '../stores/i18n.svelte.js';
-  import { formatDate } from '../utils/dateFormatter.js';
+  import { getUserTimezone } from '../utils/dateFormatter.js';
+  import { authStore } from '../stores/auth.svelte.js';
+  import { dateKeyInZone, formatClockInZone } from '../utils/worklogTimezone.js';
+	import TextField from '../components/TextField.svelte';
 
   // Configuration props
   let {
@@ -33,12 +38,10 @@
     oncancel = () => {}
   } = $props();
 
-  // Helper to format unix timestamp to HH:MM
-  function formatTimeFromUnix(unixTimestamp) {
-    if (!unixTimestamp) return '';
-    const date = new Date(unixTimestamp * 1000);
-    return date.toTimeString().substring(0, 5);
-  }
+  // One explicit timezone populates and interprets every form control, so
+  // browser and profile timezone differences cannot silently reinterpret
+  // stored work on save.
+  const formTimezone = $derived(getUserTimezone(authStore?.currentUser));
 
   // Helper to format minutes to duration string
   function formatDurationFromMinutes(minutes) {
@@ -57,11 +60,22 @@
     project_id: editingWorklog?.project_id ?? defaultProjectId,
     item_id: editingWorklog?.item_id ?? defaultItemId,
     description: editingWorklog?.description ?? '',
-    date: editingWorklog ? formatDate(new Date(editingWorklog.date * 1000)) : (defaultDate ?? formatDate(new Date())),
-    start_time: editingWorklog ? formatTimeFromUnix(editingWorklog.start_time) : (defaultStartTime ?? ''),
-    end_time: editingWorklog ? formatTimeFromUnix(editingWorklog.end_time) : '',
+    date: editingWorklog
+      ? dateKeyInZone(editingWorklog.start_time, formTimezone)
+      : (defaultDate ?? dateKeyInZone(Date.now() / 1000, formTimezone)),
+    start_time: editingWorklog ? formatClockInZone(editingWorklog.start_time, formTimezone) : (defaultStartTime ?? ''),
+    end_time: editingWorklog ? formatClockInZone(editingWorklog.end_time, formTimezone) : '',
     duration: editingWorklog ? formatDurationFromMinutes(editingWorklog.duration_minutes) : ''
   });
+
+  // Time fields the form was opened with; an edit that leaves them untouched
+  // must not resubmit them, so the server preserves the stored interval exactly.
+  const initialTimeFields = {
+    date: formData.date,
+    start_time: formData.start_time,
+    end_time: formData.end_time,
+    duration: formData.duration
+  };
 
   // Initialize form data when defaults change
   $effect(() => {
@@ -86,8 +100,46 @@
       };
     }));
 
-  // Prepare work items for combobox with workspace info
-  const workItemOptions = $derived(workItems.map(item => ({
+  let workItemResults = $state(null);
+  let searchingWorkItems = $state(false);
+  let selectedWorkItem = $state(null);
+  let workItemSearchVersion = 0;
+
+  function resetWorkItemSearch() {
+    workItemSearchVersion += 1;
+    workItemResults = null;
+    searchingWorkItems = false;
+  }
+
+  onDestroy(() => { workItemSearchVersion += 1; });
+
+  async function searchWorkItems(query) {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) {
+      resetWorkItemSearch();
+      return;
+    }
+    const version = ++workItemSearchVersion;
+    searchingWorkItems = true;
+    workItemResults = [];
+    try {
+      const results = await api.links.search(trimmedQuery, 'item', 20);
+      if (version !== workItemSearchVersion) return;
+      workItemResults = Array.isArray(results) ? results : [];
+    } catch (error) {
+      if (version !== workItemSearchVersion) return;
+      console.error('Work item search failed:', error);
+      workItemResults = [];
+    } finally {
+      if (version === workItemSearchVersion) searchingWorkItems = false;
+    }
+  }
+
+  // Keep a remotely selected item available after the search closes.
+  const initialWorkItems = $derived(selectedWorkItem && !workItems.some(item => item.id === selectedWorkItem.id)
+    ? [selectedWorkItem, ...workItems]
+    : workItems);
+  const workItemOptions = $derived((workItemResults ?? initialWorkItems).map(item => ({
     id: item.id,
     title: item.title,
     subtitle: item.workspace_name || 'Unknown Workspace',
@@ -142,14 +194,30 @@
   }
 
   function handleSave() {
+    const timeChanged =
+      formData.date !== initialTimeFields.date ||
+      formData.start_time !== initialTimeFields.start_time ||
+      formData.end_time !== initialTimeFields.end_time ||
+      formData.duration !== initialTimeFields.duration;
+    // A create, or an edit that touched any time field, submits the full
+    // civil date/clocks/duration in the explicit form timezone. A metadata-only
+    // edit sends no time fields so the stored interval is preserved exactly.
+    const timeFields = (!editingWorklog || timeChanged)
+      ? {
+          date: formData.date,
+          timezone: formTimezone,
+          ...(formData.start_time ? { start_time: formData.start_time } : {}),
+          ...(formData.end_time ? { end_time: formData.end_time } : {}),
+          ...(formData.duration ? { duration: formData.duration } : {})
+        }
+      : {};
     const data = {
       project_id: parseInt(formData.project_id),
-      item_id: formData.item_id ? parseInt(formData.item_id) : undefined,
+      // An explicit null clears an existing link under merge-PATCH; an omitted
+      // key would preserve the stored link after the user cleared the picker.
+      item_id: formData.item_id ? parseInt(formData.item_id) : null,
       description: formData.description,
-      date: formData.date,
-      start_time: formData.start_time || undefined,
-      end_time: formData.end_time || undefined,
-      duration: formData.duration || undefined
+      ...timeFields
     };
     onsave({ detail: data });
   }
@@ -163,6 +231,7 @@
 
 <Modal
   isOpen={true}
+  dataTestid="time-log-modal"
   onclose={handleCancel}
   maxWidth="max-w-2xl"
   onSubmit={handleSave}
@@ -179,6 +248,7 @@
       <div>
         <Label color="default" required={!defaultItemId} class="mb-2">{t('time.timeTrackingProject')}</Label>
         <BasePicker
+          id="time-log-project"
           bind:value={formData.project_id}
           items={projectOptions}
           placeholder={t('placeholders.searchProjects')}
@@ -186,6 +256,7 @@
           searchFields={['name', 'subtitle']}
           getValue={(project) => project?.id}
           getLabel={(project) => project?.name ?? ''}
+          optionTestid={(option) => `time-log-project-option-${option.value}`}
         >
           {#snippet itemSnippet({ item: project })}
             <div class="flex flex-col min-w-0">
@@ -204,14 +275,20 @@
       <div>
         <Label color="default" class="mb-2">{t('time.workItemOptional')}</Label>
         <BasePicker
+          id="time-log-work-item"
           bind:value={formData.item_id}
           items={workItemOptions}
           placeholder={t('placeholders.searchWorkItems')}
           allowClear={true}
-          searchFields={['title', 'subtitle']}
+          serverSearch={true}
+          loading={searchingWorkItems}
+          onSearchChange={searchWorkItems}
+          onClose={resetWorkItemSearch}
+          optionTestid={(option) => `time-log-work-item-option-${option.value}`}
           getValue={(item) => item?.id}
           getLabel={(item) => item?.title ?? ''}
           onSelect={(item) => {
+            selectedWorkItem = item?.item ?? null;
             if (item && !formData.description.trim()) {
               formData.description = item.title;
             }
@@ -224,9 +301,7 @@
                 <span class="text-xs truncate" style="color: var(--ds-text-subtle);">{workItem.subtitle}</span>
               {/if}
               {#if workItem.status}
-                <span class="text-xs px-1.5 py-0.5 bg-gray-100 text-gray-700 rounded mt-1 inline-block w-fit">
-                  {workItem.status}
-                </span>
+                <StatusPill name={workItem.status} />
               {/if}
             </div>
           {/snippet}
@@ -236,12 +311,14 @@
 
     <!-- Description -->
     <div>
-      <Label color="default" required class="mb-2">{t('common.description')}</Label>
-      <Input
+      <TextField
+        label={t('common.description')}
         id="time-log-description"
-        bind:value={formData.description}
+        required
+        labelColor="default"
         placeholder={t('time.whatDidYouWorkOn')}
         size="small"
+        bind:value={formData.description}
       />
     </div>
 
@@ -250,45 +327,53 @@
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
       <!-- Start Time -->
       <div>
-        <Label color="default" class="mb-2">{t('time.start')}</Label>
-        <Input
+        <TextField
+          label={t('time.start')}
+          id="time-log-start-time"
+          labelColor="default"
           type="time"
-          bind:value={formData.start_time}
           oninput={onStartTimeChange}
           size="small"
+          bind:value={formData.start_time}
         />
       </div>
 
       <!-- Duration -->
       <div>
-        <Label color="default" required class="mb-2">{t('time.duration')}</Label>
-        <Input
+        <TextField
+          label={t('time.duration')}
           id="time-log-duration"
-          bind:value={formData.duration}
+          required
+          labelColor="default"
           oninput={onDurationChange}
           placeholder="2h"
           size="small"
+          bind:value={formData.duration}
         />
       </div>
 
       <!-- End Time -->
       <div>
-        <Label color="default" class="mb-2">{t('time.end')}</Label>
-        <Input
+        <TextField
+          label={t('time.end')}
+          id="time-log-end-time"
+          labelColor="default"
           type="time"
-          bind:value={formData.end_time}
           oninput={onEndTimeChange}
           size="small"
+          bind:value={formData.end_time}
         />
       </div>
 
       <!-- Date -->
       <div>
-        <Label color="default" class="mb-2">{t('common.date')}</Label>
-        <Input
+        <TextField
+          label={t('common.date')}
+          id="time-log-date"
+          labelColor="default"
           type="date"
-          bind:value={formData.date}
           size="small"
+          bind:value={formData.date}
         />
       </div>
     </div>

@@ -27,20 +27,12 @@ func sanitizeStatusMappings(mappings []models.StatusMigrationMapping) {
 	}
 }
 
-// defaultValueNodeBudget caps the total number of JSON nodes (strings,
-// array elements, object entries, scalars) retained from a single
-// DefaultValue. Legitimate defaults are a scalar or a small array of
-// option ids; 256 nodes is far beyond anything the migration UI emits.
+// defaultValueNodeBudget bounds migration default-value JSON structure.
 const defaultValueNodeBudget = 256
 
-// sanitizeJSONValue recursively bounds the free-form strings inside a
-// decoded JSON value: every string (including object keys) gets the
-// PlainTextField scrub, arrays and objects are walked, and a shared node
-// budget caps the total structure retained. Without the recursion a
-// client could bypass the string-typed scrub by wrapping the same
-// free-form text in an array or object (e.g. ["<multi-MB string>"]).
-// Numbers, bools, and nulls are bounded by construction and pass through.
-func sanitizeJSONValue(v interface{}, budget *int) interface{} {
+// sanitizeJSONValue recursively sanitizes strings and keys under a shared node
+// budget, preventing nested values from bypassing input bounds.
+func sanitizeJSONValue(v any, budget *int) any {
 	if *budget <= 0 {
 		return nil
 	}
@@ -48,8 +40,8 @@ func sanitizeJSONValue(v interface{}, budget *int) interface{} {
 	switch x := v.(type) {
 	case string:
 		return sanitize.PlainTextField.Sanitize(x)
-	case []interface{}:
-		out := make([]interface{}, 0, len(x))
+	case []any:
+		out := make([]any, 0, len(x))
 		for _, e := range x {
 			if *budget <= 0 {
 				break
@@ -57,8 +49,8 @@ func sanitizeJSONValue(v interface{}, budget *int) interface{} {
 			out = append(out, sanitizeJSONValue(e, budget))
 		}
 		return out
-	case map[string]interface{}:
-		out := make(map[string]interface{}, len(x))
+	case map[string]any:
+		out := make(map[string]any, len(x))
 		for k, e := range x {
 			if *budget <= 0 {
 				break
@@ -135,9 +127,15 @@ func (h *ConfigurationSetHandler) ExecuteMigration(w http.ResponseWriter, r *htt
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Remapped items land in item history attributed to the acting admin.
+	actorUserID := 0
+	if currentUser := utils.GetCurrentUser(r); currentUser != nil {
+		actorUserID = currentUser.ID
+	}
+
 	totalMigrated := 0
 	for _, mapping := range migrationReq.StatusMappings {
-		rows, err := h.applyStatusMapping(tx, mapping, migrationReq.WorkspaceIDs)
+		rows, err := h.applyStatusMapping(tx, mapping, migrationReq.WorkspaceIDs, actorUserID)
 		if err != nil {
 			respondInternalError(w, r, err)
 			return
@@ -152,7 +150,7 @@ func (h *ConfigurationSetHandler) ExecuteMigration(w http.ResponseWriter, r *htt
 	}
 
 	if currentUser := utils.GetCurrentUser(r); currentUser != nil {
-		logAuditWithDetails(h.db, r, currentUser, logger.ActionConfigSetMigrationExecute, logger.ResourceConfigurationSet, &migrationReq.ConfigurationSetID, "", map[string]interface{}{
+		logAuditWithDetails(h.db, r, currentUser, logger.ActionConfigSetMigrationExecute, logger.ResourceConfigurationSet, &migrationReq.ConfigurationSetID, "", map[string]any{
 			"configuration_set_id": migrationReq.ConfigurationSetID,
 			"workspace_ids":        migrationReq.WorkspaceIDs,
 			"status_mapping_count": len(migrationReq.StatusMappings),
@@ -160,7 +158,7 @@ func (h *ConfigurationSetHandler) ExecuteMigration(w http.ResponseWriter, r *htt
 		})
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"success":        true,
 		"message":        fmt.Sprintf("Successfully migrated %d items", totalMigrated),
 		"migrated_items": totalMigrated,
@@ -213,8 +211,16 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 	}
 
 	// Target item types: must be members of the target config set's allow-list,
-	// or any item_type if the target has no explicit list ("accept all").
-	allowedItemTypes, err := h.allowedItemTypesForConfigSet(req.NewConfigurationSetID)
+	// or any item_type if the target has no explicit list ("accept all"). The
+	// intra-set removal flow validates against the proposed list that will be
+	// applied atomically below rather than the list currently persisted.
+	var allowedItemTypes map[int]struct{}
+	var err error
+	if req.ApplyItemTypeConfigsToConfigSet != nil {
+		allowedItemTypes, err = h.allowedItemTypesForConfigs(*req.ApplyItemTypeConfigsToConfigSet)
+	} else {
+		allowedItemTypes, err = h.allowedItemTypesForConfigSet(req.NewConfigurationSetID)
+	}
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to load target item types: %w", err))
 		return
@@ -222,6 +228,55 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 	for _, mapping := range req.ItemTypeMappings {
 		if !inIntSet(allowedItemTypes, mapping.ToItemTypeID) {
 			respondBadRequest(w, r, fmt.Sprintf("Target item type ID %d is not allowed by the target configuration set", mapping.ToItemTypeID))
+			return
+		}
+		if mapping.FromItemTypeID != nil {
+			sameLevel, err := h.itemTypesShareHierarchyLevel(*mapping.FromItemTypeID, mapping.ToItemTypeID)
+			if err != nil {
+				respondBadRequest(w, r, err.Error())
+				return
+			}
+			if !sameLevel {
+				respondBadRequest(w, r, fmt.Sprintf(
+					"Target item type ID %d must use the same hierarchy level as source item type ID %d",
+					mapping.ToItemTypeID, *mapping.FromItemTypeID,
+				))
+				return
+			}
+		}
+	}
+
+	// When this call also narrows the configuration set's allow-list, require
+	// a mapping for every currently-used type that would become disallowed.
+	// This prevents a forged or stale wizard request from applying the config
+	// change while leaving items behind on removed types.
+	if req.ApplyItemTypeConfigsToConfigSet != nil {
+		required, _, _, err := h.analyzeItemTypesAgainstConfigs(req.WorkspaceIDs, *req.ApplyItemTypeConfigsToConfigSet)
+		if err != nil {
+			respondInternalError(w, r, fmt.Errorf("failed to validate proposed item type configuration: %w", err))
+			return
+		}
+		provided := make(map[int]struct{}, len(req.ItemTypeMappings))
+		providedNil := false
+		for _, mapping := range req.ItemTypeMappings {
+			if mapping.FromItemTypeID == nil {
+				providedNil = true
+				continue
+			}
+			provided[*mapping.FromItemTypeID] = struct{}{}
+		}
+		for _, migration := range required {
+			if migration.CurrentItemTypeID == nil {
+				if providedNil {
+					continue
+				}
+			} else if _, ok := provided[*migration.CurrentItemTypeID]; ok {
+				continue
+			}
+			respondJSON(w, http.StatusConflict, map[string]any{
+				"error":   "item_type_migration_incomplete",
+				"message": fmt.Sprintf("A migration mapping is required for item type %q", migration.CurrentItemTypeName),
+			})
 			return
 		}
 	}
@@ -289,10 +344,16 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 
 	itemRepo := repository.NewItemRepository(h.db)
 
+	// Remapped items land in item history attributed to the acting admin.
+	actorUserID := 0
+	if currentUser := utils.GetCurrentUser(r); currentUser != nil {
+		actorUserID = currentUser.ID
+	}
+
 	// 1. Execute Item Type Migrations
 	for _, mapping := range req.ItemTypeMappings {
 		var rowsAffected int
-		rowsAffected, err = itemRepo.RemapFieldForWorkspacesTx(tx, "item_type_id", mapping.FromItemTypeID, mapping.ToItemTypeID, nil, req.WorkspaceIDs, now)
+		rowsAffected, err = itemRepo.RemapFieldForWorkspacesTxAsUser(tx, "item_type_id", mapping.FromItemTypeID, mapping.ToItemTypeID, nil, req.WorkspaceIDs, now, actorUserID)
 		if err != nil {
 			respondInternalError(w, r, fmt.Errorf("failed to migrate item types: %w", err))
 			return
@@ -316,7 +377,7 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 
 	// 3. Execute Status Migrations (NULL-aware via *int FromStatusID)
 	for _, mapping := range req.StatusMappings {
-		rows, err := h.applyStatusMappingTx(tx, mapping, req.WorkspaceIDs, now)
+		rows, err := h.applyStatusMappingTx(tx, mapping, req.WorkspaceIDs, now, actorUserID)
 		if err != nil {
 			respondInternalError(w, r, fmt.Errorf("failed to migrate statuses: %w", err))
 			return
@@ -327,7 +388,7 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 	// 4. Execute Priority Migrations
 	for _, mapping := range req.PriorityMappings {
 		var rowsAffected int
-		rowsAffected, err = itemRepo.RemapFieldForWorkspacesTx(tx, "priority_id", mapping.FromPriorityID, mapping.ToPriorityID, nil, req.WorkspaceIDs, now)
+		rowsAffected, err = itemRepo.RemapFieldForWorkspacesTxAsUser(tx, "priority_id", mapping.FromPriorityID, mapping.ToPriorityID, nil, req.WorkspaceIDs, now, actorUserID)
 		if err != nil {
 			respondInternalError(w, r, fmt.Errorf("failed to migrate priorities: %w", err))
 			return
@@ -344,7 +405,7 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 		for _, wsID := range req.WorkspaceIDs {
 			if err = h.swapWorkspaceConfigSet(tx, wsID, req.OldConfigurationSetID, req.NewConfigurationSetID, now); err != nil {
 				if errors.Is(err, errMigrationConflict) {
-					respondJSON(w, http.StatusConflict, map[string]interface{}{
+					respondJSON(w, http.StatusConflict, map[string]any{
 						"error":   "workspace_configuration_changed",
 						"message": fmt.Sprintf("Workspace %d is no longer assigned to configuration set %d; refresh and retry.", wsID, req.OldConfigurationSetID),
 					})
@@ -371,6 +432,17 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 		}
 	}
 
+	// 7. Optional atomic item-type allow-list replacement. Item remaps above
+	// and this configuration change commit together, so there is no successful
+	// state in which migrated items still depend on a removed type.
+	if req.ApplyItemTypeConfigsToConfigSet != nil {
+		configRepo := repository.NewConfigurationSetRepository(h.db)
+		if err = configRepo.SaveItemTypeConfigs(tx, req.NewConfigurationSetID, *req.ApplyItemTypeConfigsToConfigSet); err != nil {
+			respondInternalError(w, r, fmt.Errorf("failed to apply configuration set item types: %w", err))
+			return
+		}
+	}
+
 	// Commit the transaction
 	if err = tx.Commit(); err != nil {
 		respondInternalError(w, r, err)
@@ -378,8 +450,9 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 	}
 
 	// Invalidate permission caches for any workspaces whose config set changed.
-	// Also invalidate when only the workflow was swapped, since downstream
-	// permission checks consume workflow state via the config set lookup.
+	// Also invalidate when the workflow or item-type list was changed, since
+	// downstream permission and validation checks consume configuration-set
+	// state.
 	if h.permissionService != nil {
 		seen := make(map[int]struct{}, len(swappedWorkspaceIDs))
 		for _, wsID := range swappedWorkspaceIDs {
@@ -389,7 +462,7 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 			seen[wsID] = struct{}{}
 			_ = h.permissionService.InvalidateWorkspaceMemberCaches(wsID)
 		}
-		if req.ApplyWorkflowToConfigSet != nil {
+		if req.ApplyWorkflowToConfigSet != nil || req.ApplyItemTypeConfigsToConfigSet != nil {
 			affected, _ := repository.NewConfigurationSetRepository(h.db).ListWorkspaceIDsForConfigSet(req.NewConfigurationSetID)
 			for _, wsID := range affected {
 				if _, ok := seen[wsID]; ok {
@@ -404,7 +477,7 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 	totalMigrated := stats.ItemTypesMigrated + stats.StatusesMigrated + stats.PrioritiesMigrated
 
 	if currentUser := utils.GetCurrentUser(r); currentUser != nil {
-		logAuditWithDetails(h.db, r, currentUser, logger.ActionConfigSetComprehensiveMigrationExecute, logger.ResourceConfigurationSet, &req.NewConfigurationSetID, "", map[string]interface{}{
+		logAuditWithDetails(h.db, r, currentUser, logger.ActionConfigSetComprehensiveMigrationExecute, logger.ResourceConfigurationSet, &req.NewConfigurationSetID, "", map[string]any{
 			"old_configuration_set_id":   req.OldConfigurationSetID,
 			"new_configuration_set_id":   req.NewConfigurationSetID,
 			"workspace_ids":              req.WorkspaceIDs,
@@ -416,16 +489,18 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 			"details":                    stats,
 			"attached":                   req.AttachAfterMigration,
 			"workflow_applied":           req.ApplyWorkflowToConfigSet != nil,
+			"item_types_applied":         req.ApplyItemTypeConfigsToConfigSet != nil,
 		})
 	}
 
-	response := map[string]interface{}{
-		"success":          true,
-		"message":          fmt.Sprintf("Successfully migrated %d items", totalMigrated),
-		"migrated_items":   totalMigrated,
-		"details":          stats,
-		"attached":         req.AttachAfterMigration,
-		"workflow_applied": req.ApplyWorkflowToConfigSet != nil,
+	response := map[string]any{
+		"success":            true,
+		"message":            fmt.Sprintf("Successfully migrated %d items", totalMigrated),
+		"migrated_items":     totalMigrated,
+		"details":            stats,
+		"attached":           req.AttachAfterMigration,
+		"workflow_applied":   req.ApplyWorkflowToConfigSet != nil,
+		"item_types_applied": req.ApplyItemTypeConfigsToConfigSet != nil,
 	}
 
 	respondJSONOK(w, response)
@@ -435,18 +510,18 @@ func (h *ConfigurationSetHandler) ExecuteComprehensiveMigration(w http.ResponseW
 // transaction. Returns the number of rows updated. Branches on whether the
 // caller addressed items via NULL status_id (FromStatusID == nil) or a
 // concrete status_id, since SQL `=` does not match NULL.
-func (h *ConfigurationSetHandler) applyStatusMapping(tx database.Tx, mapping models.StatusMigrationMapping, workspaceIDs []int) (int, error) {
-	return h.applyStatusMappingTx(tx, mapping, workspaceIDs, time.Now())
+func (h *ConfigurationSetHandler) applyStatusMapping(tx database.Tx, mapping models.StatusMigrationMapping, workspaceIDs []int, actorUserID int) (int, error) {
+	return h.applyStatusMappingTx(tx, mapping, workspaceIDs, time.Now(), actorUserID)
 }
 
-func (h *ConfigurationSetHandler) applyStatusMappingTx(tx database.Tx, mapping models.StatusMigrationMapping, workspaceIDs []int, now time.Time) (int, error) {
+func (h *ConfigurationSetHandler) applyStatusMappingTx(tx database.Tx, mapping models.StatusMigrationMapping, workspaceIDs []int, now time.Time, actorUserID int) (int, error) {
 	// FromStatusID == nil OR == 0 both mean "items with status_id IS NULL".
 	// Older clients may send 0; treat it the same as nil for back-compat.
 	fromStatusID := mapping.FromStatusID
 	if fromStatusID != nil && *fromStatusID == 0 {
 		fromStatusID = nil
 	}
-	return repository.NewItemRepository(h.db).RemapFieldForWorkspacesTx(tx, "status_id", fromStatusID, mapping.ToStatusID, mapping.ItemTypeID, workspaceIDs, now)
+	return repository.NewItemRepository(h.db).RemapFieldForWorkspacesTxAsUser(tx, "status_id", fromStatusID, mapping.ToStatusID, mapping.ItemTypeID, workspaceIDs, now, actorUserID)
 }
 
 // statusIsInWorkflow reports whether statusID participates in workflowID via
@@ -507,6 +582,51 @@ func (h *ConfigurationSetHandler) allowedItemTypesForConfigSet(configSetID int) 
 		return nil, err
 	}
 	return allowed, nil
+}
+
+// allowedItemTypesForConfigs resolves a proposed item-type configuration list.
+// As with persisted configuration sets, an empty list means "accept all".
+func (h *ConfigurationSetHandler) allowedItemTypesForConfigs(configs []models.ItemTypeConfig) (map[int]struct{}, error) {
+	if len(configs) == 0 {
+		rows, err := h.db.Query(`SELECT id FROM item_types`)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		allowed := make(map[int]struct{})
+		for rows.Next() {
+			var id int
+			if err := rows.Scan(&id); err != nil {
+				return nil, err
+			}
+			allowed[id] = struct{}{}
+		}
+		return allowed, rows.Err()
+	}
+
+	allowed := make(map[int]struct{}, len(configs))
+	for _, config := range configs {
+		var exists bool
+		if err := h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM item_types WHERE id = ?)`, config.ItemTypeID).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, fmt.Errorf("proposed item type ID %d does not exist", config.ItemTypeID)
+		}
+		allowed[config.ItemTypeID] = struct{}{}
+	}
+	return allowed, nil
+}
+
+func (h *ConfigurationSetHandler) itemTypesShareHierarchyLevel(sourceID, targetID int) (bool, error) {
+	var sourceLevel, targetLevel int
+	if err := h.db.QueryRow(`SELECT hierarchy_level FROM item_types WHERE id = ?`, sourceID).Scan(&sourceLevel); err != nil {
+		return false, fmt.Errorf("source item type ID %d does not exist", sourceID)
+	}
+	if err := h.db.QueryRow(`SELECT hierarchy_level FROM item_types WHERE id = ?`, targetID).Scan(&targetLevel); err != nil {
+		return false, fmt.Errorf("target item type ID %d does not exist", targetID)
+	}
+	return sourceLevel == targetLevel, nil
 }
 
 // allowedPrioritiesForConfigSet mirrors allowedItemTypesForConfigSet for
@@ -603,7 +723,7 @@ func (h *ConfigurationSetHandler) swapWorkspaceConfigSet(tx database.Tx, workspa
 }
 
 // addDefaultFieldValue adds a default value for a custom field to items that don't have it
-func (h *ConfigurationSetHandler) addDefaultFieldValue(tx database.Tx, workspaceIDs []int, fieldID int, defaultValue interface{}) (int, error) {
+func (h *ConfigurationSetHandler) addDefaultFieldValue(tx database.Tx, workspaceIDs []int, fieldID int, defaultValue any) (int, error) {
 	fieldKey := strconv.Itoa(fieldID)
 	count := 0
 
@@ -624,9 +744,9 @@ func (h *ConfigurationSetHandler) addDefaultFieldValue(tx database.Tx, workspace
 		id := row.ID
 		cfvJSON := row.CFVJSON
 
-		var cfv map[string]interface{}
+		var cfv map[string]any
 		if err := json.Unmarshal([]byte(cfvJSON), &cfv); err != nil {
-			cfv = make(map[string]interface{})
+			cfv = make(map[string]any)
 		}
 
 		// Only add if field not already set

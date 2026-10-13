@@ -13,6 +13,13 @@ type ItemChangeRow struct {
 	Deleted bool
 }
 
+// ItemChangeEvent is one ordered item change-log entry.
+type ItemChangeEvent struct {
+	Cursor     int64
+	ItemID     int
+	ChangeType string
+}
+
 // ItemChangeRepository provides data access for item delta/change-log queries.
 type ItemChangeRepository struct {
 	db database.Database
@@ -51,36 +58,66 @@ func (r *ItemChangeRepository) CurrentWatermark(accessibleWorkspaceIDs []int, wo
 	return watermark.Int64, nil
 }
 
-// QuerySince returns grouped item changes after the given watermark, capped by limit.
-func (r *ItemChangeRepository) QuerySince(accessibleWorkspaceIDs []int, workspaceID int, since int64, limit int) ([]ItemChangeRow, error) {
-	where, args := itemChangeScopeWhere(accessibleWorkspaceIDs, workspaceID, since)
+// StableCurrentWatermark returns a watermark that cannot be overtaken by an
+// already-started PostgreSQL writer. BIGSERIAL values are allocated before
+// commit, so a plain MAX(id) can otherwise observe a later transaction and
+// permanently skip an earlier one that commits afterward.
+func (r *ItemChangeRepository) StableCurrentWatermark(accessibleWorkspaceIDs []int, workspaceID int) (int64, error) {
+	if r.db.GetDriverName() != "postgres" {
+		return r.CurrentWatermark(accessibleWorkspaceIDs, workspaceID)
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec("LOCK TABLE item_change_log IN SHARE MODE"); err != nil {
+		return 0, err
+	}
+
+	where, args := itemChangeScopeWhere(accessibleWorkspaceIDs, workspaceID, 0)
+	var watermark sql.NullInt64
+	if err := tx.QueryRow("SELECT COALESCE(MAX(id), 0) FROM item_change_log "+where, args...).Scan(&watermark); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return watermark.Int64, nil
+}
+
+// QueryPage returns ordered changes in the fixed (after, through] watermark
+// window. Callers can page without incorporating changes committed after the
+// first page's watermark.
+func (r *ItemChangeRepository) QueryPage(accessibleWorkspaceIDs []int, workspaceID int, after, through int64, limit int) ([]ItemChangeEvent, error) {
+	where, args := itemChangeScopeWhere(accessibleWorkspaceIDs, workspaceID, after)
+	where += " AND id <= ?"
+	args = append(args, through, limit)
 	rows, err := r.db.Query(`
-		SELECT item_id, MAX(CASE WHEN change_type = 'delete' THEN 1 ELSE 0 END) AS deleted
+		SELECT id, item_id, change_type
 		FROM item_change_log
 		`+where+`
-		GROUP BY item_id
-		ORDER BY MAX(id) ASC
+		ORDER BY id ASC
 		LIMIT ?
-	`, append(args, limit)...)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	changes := []ItemChangeRow{}
+	changes := []ItemChangeEvent{}
 	for rows.Next() {
-		var change ItemChangeRow
-		var deleted int
-		if err := rows.Scan(&change.ItemID, &deleted); err != nil {
+		var change ItemChangeEvent
+		if err := rows.Scan(&change.Cursor, &change.ItemID, &change.ChangeType); err != nil {
 			return nil, err
 		}
-		change.Deleted = deleted > 0
 		changes = append(changes, change)
 	}
 	return changes, rows.Err()
 }
 
-func itemChangeScopeWhere(accessibleWorkspaceIDs []int, workspaceID int, since int64) (where string, args []interface{}) {
+func itemChangeScopeWhere(accessibleWorkspaceIDs []int, workspaceID int, since int64) (where string, args []any) {
 	clauses := []string{}
 	if since > 0 {
 		clauses = append(clauses, "id > ?")

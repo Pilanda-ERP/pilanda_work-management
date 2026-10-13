@@ -1,7 +1,9 @@
 <script>
-  import { FileText, Pencil, Bell, HelpCircle, Zap } from '@lucide/svelte';
+  import { FileText, Pencil, Bell, HelpCircle, Zap, X } from '@lucide/svelte';
   import Select from '../../components/Select.svelte';
   import Button from '../../components/Button.svelte';
+  import Input from '../../components/Input.svelte';
+  import Textarea from '../../components/Textarea.svelte';
   import TriggerNode from '../actions/nodes/TriggerNode.svelte';
   import SetFieldNode from '../actions/nodes/SetFieldNode.svelte';
   import SetStatusNode from '../actions/nodes/SetStatusNode.svelte';
@@ -13,8 +15,13 @@
   import ConditionConfigPanel from '../actions/shared/ConditionConfigPanel.svelte';
   import { assetActionFlowStore } from '../../stores/assetActionFlowStore.svelte.js';
   import FieldSelector from '../../pickers/FieldSelector.svelte';
+  import UserPicker from '../../pickers/UserPicker.svelte';
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import {
+    assetActionConditionFields,
+    loadAssetActionCustomFields,
+  } from './assetActionVariables.js';
 
   let { action, onSave, onCancel } = $props();
 
@@ -30,19 +37,97 @@
   ];
 
   let assetCustomFields = $state([]);
+  let assetTypes = $state([]);
+  let assetStatuses = $state([]);
+  let users = $state([]);
+  let taxonomyLoadToken = 0;
+  let fieldLoadToken = 0;
+
+  let scopedAssetTypeId = $derived(
+    assetActionFlowStore.nodes.find((node) => node.type === 'trigger')?.data?.config?.asset_type_id,
+  );
+
   $effect(() => {
-    api.customFields.getAll().then((result) => {
-      assetCustomFields = (result?.data || []).map((field) => ({
-        id: String(field.id),
-        name: field.name,
-        type: field.field_type,
-        description: field.description || '',
-        isCustom: true,
-      }));
+    const setId = action?.set_id;
+    if (!setId) {
+      taxonomyLoadToken += 1;
+      assetTypes = [];
+      assetStatuses = [];
+      return;
+    }
+    const token = ++taxonomyLoadToken;
+    Promise.all([
+      api.assetTypes.getAll(setId),
+      api.assetStatuses.getAll(setId),
+    ]).then(([types, statuses]) => {
+      if (token !== taxonomyLoadToken) return;
+      assetTypes = types || [];
+      assetStatuses = statuses || [];
     }).catch(() => {
+      if (token !== taxonomyLoadToken) return;
+      assetTypes = [];
+      assetStatuses = [];
+    });
+  });
+
+  $effect(() => {
+    const typeId = scopedAssetTypeId;
+    const token = ++fieldLoadToken;
+    if (!typeId) {
+      assetCustomFields = [];
+      return;
+    }
+    loadAssetActionCustomFields(api, typeId).then((result) => {
+      if (token !== fieldLoadToken) return;
+      assetCustomFields = result;
+    }).catch(() => {
+      if (token !== fieldLoadToken) return;
       assetCustomFields = [];
     });
   });
+
+  $effect(() => {
+    api.getUsers().then((result) => {
+      users = result || [];
+    }).catch(() => {
+      users = [];
+    });
+  });
+
+  function getUserDisplayName(user) {
+    if (!user) return '';
+    const fullName = `${user.first_name || ''} ${user.last_name || ''}`.trim();
+    return fullName || user.username || user.email || `User #${user.id}`;
+  }
+
+  function specificRecipientIds(config) {
+    return (config?.recipients || []).filter((recipient) => /^\d+$/.test(String(recipient)));
+  }
+
+  function recipientDisplayName(id) {
+    const user = users.find((candidate) => String(candidate.id) === String(id));
+    return user ? getUserDisplayName(user) : `#${id}`;
+  }
+
+  function addRecipient(store, nodeId, config, user) {
+    if (!user?.id) return;
+    const recipients = specificRecipientIds(config);
+    const id = String(user.id);
+    if (recipients.includes(id)) return;
+    store.updateNodeConfig(nodeId, {
+      recipient_type: 'specific',
+      recipients: [...recipients, id],
+    });
+  }
+
+  function removeRecipient(store, nodeId, config, id) {
+    store.updateNodeConfig(nodeId, {
+      recipient_type: 'specific',
+      recipients: specificRecipientIds(config).filter(
+        (recipient) => String(recipient) !== String(id),
+      ),
+    });
+  }
 
   function resolveSetField(selectedNode) {
     if (!selectedNode || selectedNode.type !== 'set_field') return null;
@@ -79,12 +164,7 @@
     { value: 'manual', label: 'Manual' },
   ];
 
-  const conditionFields = [
-    { value: 'title', label: 'Title' },
-    { value: 'asset_tag', label: 'Asset Tag' },
-    { value: 'type_name', label: 'Type Name' },
-    { value: 'status_name', label: 'Status Name' },
-  ];
+  const conditionFields = assetActionConditionFields;
 
   const conditionOperators = [
     { value: 'eq', label: 'Equals' },
@@ -123,45 +203,45 @@
 
     {#if store.triggerType === 'asset_status_changed'}
       <div>
-        <div class="block text-xs font-medium mb-1">From Status ID (optional)</div>
-        <input
-          type="number"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
+        <label for="asset-trigger-from-status" class="block text-xs font-medium mb-1">From Status (optional)</label>
+        <Select
+          id="asset-trigger-from-status"
+          options={[{ value: '', label: 'Any status' }, ...assetStatuses.map(status => ({ value: status.id, label: status.name }))]}
           value={selectedNode.data?.config?.from_status_id || ''}
-          oninput={(e) =>
+          onchange={(value) =>
             store.updateNodeConfig(selectedNode.id, {
-              from_status_id: parseInt(e.currentTarget.value) || null,
+              from_status_id: parseInt(value) || null,
             })}
         />
       </div>
       <div>
-        <div class="block text-xs font-medium mb-1">To Status ID (optional)</div>
-        <input
-          type="number"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
+        <label for="asset-trigger-to-status" class="block text-xs font-medium mb-1">To Status (optional)</label>
+        <Select
+          id="asset-trigger-to-status"
+          options={[{ value: '', label: 'Any status' }, ...assetStatuses.map(status => ({ value: status.id, label: status.name }))]}
           value={selectedNode.data?.config?.to_status_id || ''}
-          oninput={(e) =>
+          onchange={(value) =>
             store.updateNodeConfig(selectedNode.id, {
-              to_status_id: parseInt(e.currentTarget.value) || null,
+              to_status_id: parseInt(value) || null,
             })}
         />
       </div>
     {/if}
 
-    {#if store.triggerType !== 'manual'}
-      <div>
-        <div class="block text-xs font-medium mb-1">Asset Type ID (optional filter)</div>
-        <input
-          type="number"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          value={selectedNode.data?.config?.asset_type_id || ''}
-          oninput={(e) =>
-            store.updateNodeConfig(selectedNode.id, {
-              asset_type_id: parseInt(e.currentTarget.value) || null,
-            })}
-        />
-      </div>
-    {/if}
+    <div>
+      <label for="asset-trigger-type-filter" class="block text-xs font-medium mb-1">
+        Asset Type {store.triggerType === 'manual' ? '(field scope)' : '(optional filter)'}
+      </label>
+      <Select
+        id="asset-trigger-type-filter"
+        options={[{ value: '', label: 'Any type' }, ...assetTypes.map(type => ({ value: type.id, label: type.name }))]}
+        value={selectedNode.data?.config?.asset_type_id || ''}
+        onchange={(value) =>
+          store.updateNodeConfig(selectedNode.id, {
+            asset_type_id: parseInt(value) || null,
+          })}
+      />
+    </div>
   {/snippet}
 
   {#snippet nodeConfig(selectedNode, store, handleDeleteNode)}
@@ -191,25 +271,25 @@
       </div>
       <div>
         <div class="block text-xs font-medium mb-1">Value</div>
-        <input
+        <Input
           type="text"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
           value={selectedNode.data?.config?.value || ''}
           oninput={(e) =>
             store.updateNodeConfig(selectedNode.id, { value: e.currentTarget.value })}
+          size="small"
         />
       </div>
       <Button variant="ghost" size="small" onclick={handleDeleteNode}>Delete Node</Button>
     {:else if selectedNode.type === 'set_status'}
       <div>
-        <div class="block text-xs font-medium mb-1">Status ID</div>
-        <input
-          type="number"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
+        <label for="asset-action-set-status" class="block text-xs font-medium mb-1">Status</label>
+        <Select
+          id="asset-action-set-status"
+          options={[{ value: '', label: 'Select status' }, ...assetStatuses.map(status => ({ value: status.id, label: status.name }))]}
           value={selectedNode.data?.config?.status_id || ''}
-          oninput={(e) =>
+          onchange={(value) =>
             store.updateNodeConfig(selectedNode.id, {
-              status_id: parseInt(e.currentTarget.value) || 0,
+              status_id: parseInt(value) || 0,
             })}
         />
       </div>
@@ -223,27 +303,50 @@
         onDelete={handleDeleteNode}
       />
     {:else if selectedNode.type === 'notify_user'}
+      {@const recipientIds = specificRecipientIds(selectedNode.data?.config)}
       <div>
-        <div class="block text-xs font-medium mb-1">User ID</div>
-        <input
-          type="number"
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          value={selectedNode.data?.config?.user_id || ''}
-          oninput={(e) =>
-            store.updateNodeConfig(selectedNode.id, {
-              user_id: parseInt(e.currentTarget.value) || 0,
-            })}
-        />
+        <span class="block text-xs font-medium mb-1">Recipients</span>
+        {#if recipientIds.length > 0}
+          <div class="flex flex-wrap gap-1.5 mb-2">
+            {#each recipientIds as id (id)}
+              <span class="chip" data-testid={`asset-notify-recipient-chip-${id}`}>
+                {recipientDisplayName(id)}
+                <button
+                  type="button"
+                  class="chip-remove"
+                  onclick={() => removeRecipient(store, selectedNode.id, selectedNode.data?.config, id)}
+                  aria-label="Remove recipient"
+                >
+                  <X class="w-3 h-3" />
+                </button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+        <div data-testid="asset-notify-recipient-add">
+          <UserPicker
+            value={null}
+            {users}
+            placeholder="Add recipient"
+            showSelectedInTrigger={false}
+            allowClear={false}
+            onSelect={(user) =>
+              addRecipient(store, selectedNode.id, selectedNode.data?.config, user)}
+          />
+        </div>
+        <p class="text-xs mt-1 sidebar-hints">
+          Recipients without access to this asset set are skipped.
+        </p>
       </div>
       <div>
         <div class="block text-xs font-medium mb-1">Message</div>
-        <textarea
-          class="w-full px-3 py-2 border rounded-md text-sm config-input"
-          rows="3"
+        <Textarea
+          rows={3}
           value={selectedNode.data?.config?.message || ''}
           oninput={(e) =>
             store.updateNodeConfig(selectedNode.id, { message: e.currentTarget.value })}
-        ></textarea>
+          size="small"
+        />
       </div>
       <Button variant="ghost" size="small" onclick={handleDeleteNode}>Delete Node</Button>
     {/if}

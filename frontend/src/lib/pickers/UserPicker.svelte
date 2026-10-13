@@ -3,7 +3,7 @@
   import { BasePicker } from '.';
   import { createAsyncLoader } from '../composables';
   import { api } from '../api.js';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import Avatar from '../components/Avatar.svelte';
   import Text from '../components/Text.svelte';
   import { t } from '../stores/i18n.svelte.js';
@@ -19,10 +19,15 @@
     children: customTrigger = null,  // Optional custom trigger from caller
     workspaceId = null,
     users = null,
+    loading = false,
     label = '',
     autoOpen = false,
     allowClear = true,
     positioning = null,
+    // (value) => string | null. Labels the selected user when it is not in
+    // usersList yet (options may load lazily).
+    resolveMissingLabel = null,
+    onOpen = null,
     onSelect = () => {},
     onCancel = () => {}
   } = $props();
@@ -35,6 +40,7 @@
     workspaceId ? api.getAssignableUsers(workspaceId) : api.getUsers()
   );
   onMount(() => { if (!users) loader.load(); });
+  onDestroy(() => loader.dispose());
 
   let usersList = $derived(users ?? loader.data ?? []);
 
@@ -72,7 +78,7 @@
 <BasePicker
   bind:value
   items={usersList}
-  loading={loader.loading}
+  loading={users === null ? loader.loading : loading}
   placeholder={resolvedPlaceholder}
   {showUnassigned}
   unassignedLabel={resolvedUnassignedLabel}
@@ -88,6 +94,7 @@
   getLabel={getUserLabel}
   searchTestid="user-picker-search"
   optionTestid={(opt) => `user-picker-option-${opt.value}`}
+  onOpen={() => onOpen?.()}
   onSelect={handleSelect}
   onCancel={handleCancel}
 >
@@ -97,19 +104,18 @@
     {:else}
       <div
         aria-disabled={disabled}
-        tabindex={disabled ? -1 : 0}
         class="relative w-full flex items-center justify-between gap-2 px-3 py-2 rounded text-sm transition-colors"
         style="background-color: var(--ds-background-input); border: 1px solid var(--ds-border); color: var(--ds-text);"
         style:opacity={disabled ? 0.5 : 1}
         style:cursor={disabled ? 'not-allowed' : 'pointer'}
-        role="combobox"
-        aria-haspopup="listbox"
         data-testid="user-picker-trigger"
       >
         <div class="flex items-center gap-2 flex-1 min-w-0">
           {#if selectedUser && showSelectedInTrigger}
             <Avatar src={selectedUser.avatar_url} firstName={selectedUser.first_name} lastName={selectedUser.last_name} size="xs" />
             <span class="truncate">{selectedUser.first_name} {selectedUser.last_name}</span>
+          {:else if !selectedUser && showSelectedInTrigger && value != null && (resolveMissingLabel?.(value) || '')}
+            <span class="truncate">{resolveMissingLabel(value)}</span>
           {:else}
             <span style="color: var(--ds-text-subtle);">{resolvedPlaceholder}</span>
           {/if}

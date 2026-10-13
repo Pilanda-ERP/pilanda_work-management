@@ -6,7 +6,10 @@
   import { confirm } from '../../composables/useConfirm.js';
   import Button from '../../components/Button.svelte';
   import Label from '../../components/Label.svelte';
-  import Spinner from '../../components/Spinner.svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
+  import AlertBox from '../../components/AlertBox.svelte';
+  import Card from '../../components/Card.svelte';
+  import PageHeader from '../../layout/PageHeader.svelte';
   import DataTable from '../../components/DataTable.svelte';
   import { toHotkeyString } from '../../utils/keyboardShortcuts.js';
   import { t } from '../../stores/i18n.svelte.js';
@@ -209,48 +212,37 @@
 <!-- Header -->
 <div class="p-6 pb-0">
   {#if loading}
-    <div class="flex items-center justify-center py-12">
-      <Spinner size="lg" />
-    </div>
+    <StateDisplay type="loading" message={t('common.loading')} size="lg" />
   {:else if error}
-    <div class="text-center py-12">
-      <div class="text-lg font-medium mb-2" style="color: var(--ds-text-danger);">{t('common.error')}</div>
-      <div class="text-sm" style="color: var(--ds-text-subtle);">{error}</div>
-    </div>
+    <StateDisplay type="error" title={t('common.error')} message={error} size="lg" />
   {:else if testCase}
-    <div class="flex items-start justify-between gap-4 mb-6">
-      <div>
-        <h2 class="text-lg font-semibold" style="color: var(--ds-text);">
-          {t('testing.testStepsFor', { title: testCase.title })}
-        </h2>
-        {#if testCase.preconditions}
-          <div class="text-sm mt-3 px-4 py-3 rounded border-l-4"
-               style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle); border-left-color: var(--ds-status-info-solid);">
-            <strong style="color: var(--ds-text);">{t('testing.preconditions')}:</strong> {testCase.preconditions}
-          </div>
-        {/if}
-      </div>
-      <div class="flex items-center gap-3">
-        <Button
-          onclick={goBack}
-          icon={IconArrowLeft}
-        >
-          {t('testing.backToTestCases')}
-        </Button>
-        {#if !showStepForm}
-          <Button
-            variant="primary"
-            onclick={showAddStepForm}
-            icon={IconPlus}
-            size="medium"
-            keyboardHint="A"
-            hotkeyConfig={{ key: toHotkeyString('testSteps', 'addStep'), guard: () => !showStepForm }}
-          >
-            {t('testing.addTestStep')}
+    <PageHeader title={t('testing.testStepsFor', { title: testCase.title })} marginClass="mb-4">
+      {#snippet actions()}
+        <div class="flex items-center gap-3">
+          <Button onclick={goBack} variant="ghost" icon={IconArrowLeft} dataTestid="test-steps-back">
+            {t('testing.backToTestCases')}
           </Button>
-        {/if}
-      </div>
-    </div>
+          {#if !showStepForm}
+            <Button
+              variant="primary"
+              onclick={showAddStepForm}
+              icon={IconPlus}
+              size="medium"
+              keyboardHint="A"
+              hotkeyConfig={{ key: toHotkeyString('testSteps', 'addStep'), guard: () => !showStepForm }}
+              dataTestid="test-step-create-button"
+            >
+              {t('testing.addTestStep')}
+            </Button>
+          {/if}
+        </div>
+      {/snippet}
+    </PageHeader>
+    {#if testCase.preconditions}
+      <AlertBox variant="info" class="mb-6">
+        <strong>{t('testing.preconditions')}:</strong> {testCase.preconditions}
+      </AlertBox>
+    {/if}
   {/if}
 </div>
 
@@ -259,7 +251,7 @@
   <div class="p-6">
     <!-- Add Step Form (if showing) -->
     {#if showStepForm}
-      <div class="test-step-form mb-6 p-5 rounded-xl border shadow-sm" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
+      <Card variant="raised" padding="spacious" shadow class="test-step-form mb-6">
         <h4 class="text-lg font-medium mb-4" style="color: var(--ds-text);">
           {editingStep ? t('testing.editTestStep') : t('testing.addTestStep')}
         </h4>
@@ -269,9 +261,10 @@
             <!-- Action Column -->
             <div>
               <Label color="default" class="mb-2" required>{t('testing.action')}</Label>
-              <div id="step-action-input" class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
+              <div id="step-action-input" data-testid="test-step-action" class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
                 <MilkdownEditor
                   bind:content={stepFormData.action}
+                  testId="test-step-action-editor"
                   placeholder={t('testing.actionPlaceholder')}
                   showToolbar={true}
                   entityType="test_case"
@@ -283,9 +276,10 @@
             <!-- Data Column -->
             <div>
               <Label color="default" class="mb-2">{t('testing.data')}</Label>
-              <div class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
+              <div data-testid="test-step-data" class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
                 <MilkdownEditor
                   bind:content={stepFormData.data}
+                  testId="test-step-data-editor"
                   placeholder={t('testing.dataPlaceholder')}
                   showToolbar={true}
                   entityType="test_case"
@@ -297,9 +291,10 @@
             <!-- Expected Result Column -->
             <div>
               <Label color="default" class="mb-2" required>{t('testing.expectedResult')}</Label>
-              <div class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
+              <div data-testid="test-step-expected" class="border rounded overflow-hidden" style="border-color: var(--ds-border); min-height: 80px;">
                 <MilkdownEditor
                   bind:content={stepFormData.expected}
+                  testId="test-step-expected-editor"
                   placeholder={t('testing.expectedPlaceholder')}
                   showToolbar={true}
                   entityType="test_case"
@@ -324,12 +319,13 @@
               disabled={!stepFormData.action.trim() || !stepFormData.expected.trim()}
               size="medium"
               keyboardHint="⌘ ↵"
+              dataTestid="test-step-submit"
             >
               {editingStep ? t('testing.updateStep') : t('testing.addStep')}
             </Button>
           </div>
         </form>
-      </div>
+      </Card>
     {/if}
 
     <!-- Test Steps List -->
@@ -341,6 +337,7 @@
       emptyDescription={t('testing.addFirstTestStep')}
       emptyIcon={IconClipboardList}
       actionItems={buildStepDropdownItems}
+      rowAttrs={(step) => ({ 'data-testid': `test-step-row-${step.id}` })}
     >
       {#snippet step_number(step)}
         <span style="color: var(--ds-text-link); font-weight: 500;">

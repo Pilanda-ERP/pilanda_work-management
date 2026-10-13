@@ -1,22 +1,29 @@
 <script>
-  import { AlertCircle, ChevronDown, ChevronUp, MoreHorizontal, Briefcase, Calendar, Globe, Building2, Repeat, Shield } from '@lucide/svelte';
+  import { AlertCircle, ChevronDown, ChevronUp, MoreHorizontal, Briefcase, Globe, Building2, Repeat, Shield } from '@lucide/svelte';
   import { priorityIconMap } from '../../utils/icons.js';
   import { buildIterationPickerConfig } from '../iterations/iterationPickerUtils.js';
   import { rruleToText } from '../../editors/rruleUtils.js';
   import Lozenge from '../../components/Lozenge.svelte';
   import Avatar from '../../components/Avatar.svelte';
+  import Input from '../../components/Input.svelte';
   import Text from '../../components/Text.svelte';
+  import TruncatedFieldValue from '../../components/TruncatedFieldValue.svelte';
   import DropdownMenu from '../../layout/DropdownMenu.svelte';
   import ItemPicker from '../../pickers/ItemPicker.svelte';
   import UserPicker from '../../pickers/UserPicker.svelte';
+  import TeamPicker from '../../pickers/TeamPicker.svelte';
   import CustomFieldRenderer from '../items/CustomFieldRenderer.svelte';
-  import PersonalLabelCombobox from '../../pickers/PersonalLabelCombobox.svelte';
+  import WorkspaceLabelCombobox from '../../pickers/WorkspaceLabelCombobox.svelte';
   import MilestoneCombobox from '../../pickers/MilestoneCombobox.svelte';
   import PersonalTasksPanel from '../personal/PersonalTasksPanel.svelte';
   import { api } from '../../api.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
   import ItemSCMLinks from './ItemSCMLinks.svelte';
   import ItemIntegrationLinks from './ItemIntegrationLinks.svelte';
+  import ZammadItemPanel from './ZammadItemPanel.svelte';
+	import RequesterOpenTickets from './RequesterOpenTickets.svelte';
+  import CustomerContextSection from './CustomerContextSection.svelte';
+  import ParticipantsSection from './ParticipantsSection.svelte';
   import AddSCMLinkModal from '../../dialogs/AddSCMLinkModal.svelte';
   import AddIntegrationLinkModal from '../../dialogs/AddIntegrationLinkModal.svelte';
   import CreateBranchModal from '../../dialogs/CreateBranchModal.svelte';
@@ -24,30 +31,20 @@
   import { getShortcutDisplay } from '../../utils/keyboardShortcuts.js';
   import { workspacePermissions } from '../../stores';
   import { t } from '../../stores/i18n.svelte.js';
-  import { formatDateShort, formatCustomFieldDate } from '../../utils/dateFormatter.js';
+  import { formatDateOnly, formatCustomFieldDate } from '../../utils/dateFormatter.js';
   import { parseDuration, durationToString } from '../../utils/timeUtils.js';
   import { resolveOptionLabel, resolveOptionLabels } from '../../utils/optionUtils.js';
+  import { booleanCustomFieldChecked, isBooleanCustomFieldType } from '../../utils/customFieldTypes.js';
+  import { customFieldLinkHref } from '../../utils/customFieldLinks.js';
   import { isSystemFieldConfigured, systemFieldIdentifiers } from '../../utils/screenFields.js';
+  import { isExternalRequest } from '../../utils/requestOrigin.js';
   import StatusBadge from '../../components/StatusBadge.svelte';
+  import { objectDisplayName } from '../../utils/systemLabels.js';
   import Badge from '../../components/Badge.svelte';
   import ApprovalsTimeline from './ApprovalsTimeline.svelte';
-
-  // Click outside action
-  function clickOutside(node) {
-    const handleClick = (event) => {
-      if (!node.contains(event.target)) {
-        node.dispatchEvent(new CustomEvent('clickOutside'));
-      }
-    };
-    
-    document.addEventListener('click', handleClick, true);
-    
-    return {
-      destroy() {
-        document.removeEventListener('click', handleClick, true);
-      }
-    };
-  }
+  import SidebarDateField from './SidebarDateField.svelte';
+  import SidebarStoryPointsField from './SidebarStoryPointsField.svelte';
+  import { clickOutside } from '../../actions/clickOutside.js';
   
   const iterationConfig = buildIterationPickerConfig({
     icon: {
@@ -64,11 +61,11 @@
       source: (item) => priorityIconMap[item.icon] || AlertCircle
     },
     primary: {
-      text: (item) => item.name
+      text: (item) => objectDisplayName(item, 'priority')
     },
     searchFields: ['name'],
     getValue: (item) => item.id,
-    getLabel: (item) => item.name
+    getLabel: (item) => objectDisplayName(item, 'priority')
   };
 
   // Status picker configuration
@@ -79,11 +76,11 @@
       size: 'w-2 h-2'
     },
     primary: {
-      text: (item) => item.label
+      text: (item) => objectDisplayName({ name: item.label, builtin_key: item.builtin_key }, 'status')
     },
     searchFields: ['label', 'value'],
     getValue: (item) => item.id,
-    getLabel: (item) => item.label
+    getLabel: (item) => objectDisplayName({ name: item.label, builtin_key: item.builtin_key }, 'status')
   };
 
   // Project picker configuration
@@ -118,6 +115,7 @@
     editingIteration = false,
     editingCustomFields = {},
     editCustomFieldValues = {},
+    storyPointsRollup = null,
     workspaceScreenFields = [],
     workspaceScreenSystemFields = [],
     editableScreenFieldIds = null,
@@ -145,6 +143,7 @@
     recurrenceRule = null,
     onsetupRecurrence = null,
     oneditRecurrence = null,
+    onrequestmerge = null,
   } = $props();
 
   // State for SCM Link modals
@@ -175,17 +174,15 @@
   }
 
   // Skip rendering the Approvals section entirely when the item has no
-  // approval activity (current or historical). Pre-fetch the count so we
-  // don't flash an empty card on mount; ApprovalsTimeline re-fetches the
-  // full timeline when shown.
-  let approvalCount = $state(null);
+  // approval activity (current or historical). Keep the fetched list so the
+  // timeline can render it without downloading the same payload again.
+  let approvalRequests = $state(null);
 
-  async function loadApprovalCount(id) {
+  async function loadApprovalRequests(id) {
     try {
-      const reqs = await api.approvals.forItem(id);
-      approvalCount = (reqs ?? []).length;
+      approvalRequests = (await api.approvals.forItem(id)) ?? [];
     } catch {
-      approvalCount = 0;
+      approvalRequests = [];
     }
   }
 
@@ -195,14 +192,14 @@
     const id = item?.id;
     void item?.status_id;
     if (id) {
-      loadApprovalCount(id);
+      loadApprovalRequests(id);
     } else {
-      approvalCount = null;
+      approvalRequests = null;
     }
   });
 
   let showApprovalsSection = $derived(
-    !!pendingApproval || (approvalCount != null && approvalCount > 0)
+    !!pendingApproval || (approvalRequests != null && approvalRequests.length > 0)
   );
 
   // Scheduling section collapse state
@@ -226,46 +223,35 @@
     localStorage.setItem(SCHEDULING_COLLAPSED_KEY, String(schedulingUserPref));
   }
 
-  // Story points inline editing
-  let editingStoryPoints = $state(false);
-  let storyPointsEditValue = $state('');
-
   // Estimate inline editing (duration string parsed to minutes)
   let editingEstimate = $state(false);
   let estimateEditValue = $state('');
   let estimateError = $state(false);
 
-  // Personal labels inline editing
-  let editingPersonalLabels = $state(false);
+  // Workspace labels inline editing
+  let editingLabels = $state(false);
 
-  async function savePersonalLabels(result) {
+  async function saveLabels(result) {
     const labelIds = (result?.labels || [])
       .map((l) => l?.id)
       .filter((id) => Number.isFinite(id));
 
-    // Optimistic close so creating/picking feels instantaneous; the
-    // setForItem round-trip resolves in the background.
-    if (item) item.personal_labels = result?.labels || [];
-    editingPersonalLabels = false;
-    onsaveField?.({ field: 'personal_labels', value: result?.labels || [] });
+    if (item) item.labels = result?.labels || [];
+    editingLabels = false;
 
     try {
-      const updated = await api.personalLabels.setForItem(item.id, labelIds);
-      if (item) item.personal_labels = updated || [];
+      const updated = await api.labels.setForItem(item.id, labelIds);
+      if (item) item.labels = updated || [];
     } catch (err) {
-      console.error('Failed to save personal labels:', err);
-      errorToast(err?.message || 'Failed to save labels');
+      console.error('Failed to save labels:', err);
+      errorToast(err?.message || t('items.failedToSaveLabels'));
     }
   }
 
-  function saveStoryPoints() {
-    editingStoryPoints = false;
-    const raw = storyPointsEditValue;
-    const parsed = raw === '' || raw == null ? null : parseFloat(raw);
-    const value = parsed != null && !Number.isNaN(parsed) && parsed >= 0 ? parsed : null;
-    if (value === (item?.story_points ?? null)) return;
-    onsaveField?.({ field: 'story_points', value });
-  }
+  // Recursive descendant story-point rollup from the detail summary
+  // (GH #256), shown as a hint on the story-points row. Display-only —
+  // the parent's own points stay manually editable.
+  const childStoryPointRollup = $derived(storyPointsRollup);
 
   function saveEstimate() {
     const raw = (estimateEditValue ?? '').trim();
@@ -306,20 +292,9 @@
     return customFieldDefinitions.find(field => field.id === parseInt(fieldId));
   }
 
-  function coerceCheckboxValue(raw) {
-    if (typeof raw === 'boolean') return raw;
-    if (typeof raw === 'number') return raw !== 0;
-    if (typeof raw === 'string') {
-      const normalized = raw.trim().toLowerCase();
-      if (['false', '0', 'no', 'off'].includes(normalized)) return false;
-      if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
-    }
-    return Boolean(raw);
-  }
-
   function formatCustomFieldValue(fieldDef, value) {
-    if (fieldDef.field_type === 'checkbox') {
-      return coerceCheckboxValue(value) ? t('common.yes') : t('common.no');
+    if (isBooleanCustomFieldType(fieldDef.field_type)) {
+      return booleanCustomFieldChecked(value) ? t('common.yes') : t('common.no');
     }
     if (fieldDef.field_type === 'select') {
       return resolveOptionLabel(fieldDef.options, value);
@@ -414,26 +389,6 @@
     editingEstimate = true;
   }
 
-  // Story Points helpers
-  function startEditingStoryPoints() {
-    if (!canEdit || !isSystemFieldEditable('story_points')) return;
-    storyPointsEditValue = item?.story_points ?? '';
-    editingStoryPoints = true;
-  }
-
-  // Svelte action to focus and show date picker
-  function focusAndShowPicker(node) {
-    node.focus();
-    // Use setTimeout to ensure the focus has taken effect
-    setTimeout(() => {
-      try {
-        node.showPicker();
-      } catch (e) {
-        // showPicker() may not be supported in all browsers
-      }
-    }, 0);
-  }
-
   // Helper to check if a system field should be shown. Keep the legacy
   // "show all" fallback only when no field configuration at all was resolved.
   // A custom-only screen is still a configured screen and should not leak every
@@ -494,6 +449,10 @@
     return editableScreenFieldIds.has(fieldId);
   }
 
+  // Free-form controls hold focus while the user types and only save when the
+  // edit is committed (Enter or blur), so partial values are never persisted.
+  const DEFERRED_SAVE_CUSTOM_FIELD_TYPES = new Set(['text', 'textarea', 'number', 'email', 'url']);
+
   // Status helpers
   function startEditingStatus() {
     if (!canEdit || !isSystemFieldEditable('status')) return;
@@ -519,7 +478,7 @@
     // Add "None" special item
     items.push({
       id: 'none',
-      name: 'None',
+      name: t('common.none'),
       isSpecial: true,
       specialType: 'none'
     });
@@ -552,7 +511,7 @@
     } else if (item?.project_id === null || item?.project_id === undefined) {
       return {
         id: 'none',
-        name: 'None',
+        name: t('common.none'),
         isSpecial: true,
         specialType: 'none'
       };
@@ -579,22 +538,22 @@
     if (item.inherit_project) {
       // Inheriting
       return item.effective_project_name
-        ? `${item.effective_project_name} (inherited)`
-        : 'Inherit';
+        ? t('items.projectInherited', { name: item.effective_project_name })
+        : t('items.inheritProject');
     }
     if (item.project_id === null || item.project_id === undefined) {
       // None
-      return 'Project: None';
+      return t('items.noProject');
     }
     // Direct assignment
-    return item.project_name || 'Set project';
+    return item.project_name || t('items.setProject');
   }
 
   function getInheritLabel(item) {
     if (item.effective_project_name) {
-      return `Inherit (${item.effective_project_name})`;
+      return t('items.inheritProjectFrom', { name: item.effective_project_name });
     }
-    return 'Inherit';
+    return t('items.inheritProject');
   }
 
   function handleClickOutsideSidebar() {
@@ -623,6 +582,7 @@
         <DropdownMenu
           triggerText=""
           triggerIcon={MoreHorizontal}
+          triggerTestid="item-detail-actions-menu"
           triggerClass="flex items-center justify-center p-1.5 rounded-md transition-colors"
           triggerStyle="color: var(--ds-text-subtle);"
           items={dropdownItems}
@@ -641,11 +601,11 @@
         >
           <div class="flex items-center gap-2">
             <Shield class="w-3.5 h-3.5" style="color: var(--ds-text-subtle);" />
-            <Text variant="subtle" size="sm">Approvals</Text>
+            <Text variant="subtle" size="sm">{t('items.approvals.title')}</Text>
             {#if pendingApproval?.you_can_decide}
-              <Badge variant="warning" size="xs">Action required</Badge>
+              <Badge variant="warning" size="xs">{t('items.approvals.actionRequired')}</Badge>
             {:else if pendingApproval}
-              <Badge variant="neutral" size="xs">Pending</Badge>
+              <Badge variant="neutral" size="xs">{t('items.approvals.statuses.pending')}</Badge>
             {/if}
           </div>
           {#if !approvalsForcedOpen}
@@ -660,9 +620,11 @@
           <div class="mt-2 px-1">
             <ApprovalsTimeline
               itemId={item.id}
-              ondecisionMade={() => {
+              canCancel={canEdit}
+              initialRequests={approvalRequests}
+              ondecisionMade={(requests) => {
+                approvalRequests = requests;
                 onapprovalsChanged?.();
-                loadApprovalCount(item.id);
               }}
             />
           </div>
@@ -677,7 +639,7 @@
         value={item?.status_id ?? null}
         items={statusOptions}
         config={statusConfig}
-        placeholder="Select status..."
+        placeholder={t('pickers.selectStatus')}
         showUnassigned={false}
         autoOpen={editingStatus}
         disabled={!canEdit || !isSystemFieldEditable('status')}
@@ -695,9 +657,7 @@
         {#snippet children()}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+            class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
           >
             <div class="flex items-center gap-2">
               <Text variant="subtle" size="sm">{t('common.status')}</Text>
@@ -707,7 +667,12 @@
               </kbd>
             </div>
             {#if selectedStatus}
-              <StatusBadge status={selectedStatus} />
+              <StatusBadge
+                status={{
+                  ...selectedStatus,
+                  label: objectDisplayName({ name: selectedStatus.label, builtin_key: selectedStatus.builtin_key }, 'status'),
+                }}
+              />
             {:else}
               <Text variant="subtle" size="sm">{t('items.setStatus')}</Text>
             {/if}
@@ -723,9 +688,9 @@
               <Shield class="w-3 h-3 mt-0.5 flex-shrink-0" />
               <span>
                 {#if pendingApproval.you_can_decide}
-                  Pending approval — your decision is required
+                  {t('items.approvals.decisionRequiredHint')}
                 {:else}
-                  Pending approval — gated transitions are hidden
+                  {t('items.approvals.transitionsHiddenHint')}
                 {/if}
               </span>
             </div>
@@ -740,9 +705,9 @@
           value={item?.priority_id ?? null}
           items={priorities}
           config={priorityConfig}
-          placeholder="Select priority..."
+          placeholder={t('pickers.selectPriority')}
           showUnassigned={true}
-          unassignedLabel="No priority"
+          unassignedLabel={t('pickers.noPriority')}
           disabled={!canEdit || !isSystemFieldEditable('priority')}
           class="w-full"
           onSelect={(selectedPriority) => {
@@ -755,16 +720,14 @@
           {#snippet children()}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
-              class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+              class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
             >
               <Text variant="subtle" size="sm">{t('common.priority')}</Text>
               <div class="flex items-center gap-2">
                 {#if selectedPriority}
                   {@const PriorityIcon = priorityIconMap[selectedPriority.icon] || AlertCircle}
                   <PriorityIcon size={14} class="flex-shrink-0" style="color: {selectedPriority.color};" />
-                  <span style="color: var(--ds-text);">{selectedPriority.name}</span>
+                  <span style="color: var(--ds-text);">{objectDisplayName(selectedPriority, 'priority')}</span>
                 {:else}
                   <Text variant="subtle" size="sm">{t('common.none')}</Text>
                 {/if}
@@ -782,7 +745,7 @@
             value={selectedProject?.id ?? null}
             items={projectItems}
             config={projectConfig}
-            placeholder="Select project..."
+            placeholder={t('pickers.selectProject')}
             showUnassigned={false}
             disabled={!canEdit || !isSystemFieldEditable('project')}
             class="w-full"
@@ -810,9 +773,7 @@
             {#snippet children()}
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
-                class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-                onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+                class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
               >
                 <Text variant="subtle" size="sm">{t('items.project')}</Text>
                 <div class="flex items-center gap-2">
@@ -834,7 +795,7 @@
       <div class="mb-3">
         <UserPicker
           value={item.assignee_id ?? null}
-          placeholder="Select assignee..."
+          placeholder={t('items.selectAssignee')}
           showUnassigned={true}
           disabled={!canEdit || !isSystemFieldEditable('assignee')}
           workspaceId={item?.workspace_id}
@@ -850,9 +811,7 @@
           {#snippet children()}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
-              class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+              class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
             >
               <Text variant="subtle" size="sm">{t('common.assignee')}</Text>
               <div class="flex items-center gap-2">
@@ -866,6 +825,44 @@
             </div>
           {/snippet}
         </UserPicker>
+      </div>
+    {/snippet}
+
+    {#snippet teamField()}
+      <div class="mb-3" data-testid="item-team-field">
+        <TeamPicker
+          value={item.team_id ?? null}
+          placeholder={t('items.selectTeam')}
+          disabled={!canEdit || !isSystemFieldEditable('team')}
+          class="w-full"
+          onSelect={(selectedTeam) => {
+            onsaveField?.({
+              field: 'team',
+              value: selectedTeam?.id || null,
+              teamName: selectedTeam ? selectedTeam.name : null
+            });
+          }}
+        >
+          {#snippet children()}
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+              class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
+            >
+              <Text variant="subtle" size="sm">{t('common.team')}</Text>
+              <div class="flex items-center gap-2">
+                {#if item.team_id && item.team_name}
+                  <span
+                    class="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+                    style="background-color: {item.team_color || '#9ca3af'};"
+                  ></span>
+                  <span style="color: var(--ds-text);">{item.team_name}</span>
+                {:else}
+                  <Text variant="subtle" size="sm">{t('items.noTeam')}</Text>
+                {/if}
+              </div>
+            </div>
+          {/snippet}
+        </TeamPicker>
       </div>
     {/snippet}
 
@@ -889,9 +886,7 @@
           {#snippet children()}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
-              class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+              class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
             >
               <Text variant="subtle" size="sm">{t('items.milestone')}</Text>
               <div class="flex items-center gap-1 flex-wrap justify-end">
@@ -920,9 +915,9 @@
           value={item?.iteration_id ?? null}
           items={iterations}
           config={iterationConfig}
-          placeholder="Select iteration..."
+          placeholder={t('pickers.selectIteration')}
           showUnassigned={true}
-          unassignedLabel="No iteration"
+          unassignedLabel={t('pickers.noIteration')}
           disabled={!canEdit || !isSystemFieldEditable('iteration')}
           class="w-full"
           onSelect={(selectedIteration) => {
@@ -936,9 +931,7 @@
           {#snippet children()}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
-              class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+              class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
             >
               <Text variant="subtle" size="sm">{t('items.iteration')}</Text>
               <div class="flex items-center gap-2">
@@ -961,32 +954,32 @@
 
     {#snippet labelsField()}
       {#if item?.id}
-        <div class="mb-3" data-testid="personal-labels-field">
-          {#if editingPersonalLabels}
+        <div class="mb-3" data-testid="labels-field">
+          {#if editingLabels}
             <div class="px-2 py-1.5">
-              <PersonalLabelCombobox
-                value={(item?.personal_labels || []).map((l) => l.name)}
+              <WorkspaceLabelCombobox
+                workspaceId={item?.workspace_id || workspace?.id}
+                value={(item?.labels || []).map((l) => l.name)}
                 placeholder={t('items.selectOrCreateLabels') || 'Select or create labels...'}
                 disabled={!canEdit || !isSystemFieldEditable('labels')}
-                onSelect={savePersonalLabels}
-                onCancel={() => (editingPersonalLabels = false)}
+                onSelect={saveLabels}
+                onClose={() => (editingLabels = false)}
+                onCancel={() => (editingLabels = false)}
               />
             </div>
           {:else}
             <button
-              onclick={() => canEdit && isSystemFieldEditable('labels') && (editingPersonalLabels = true)}
-              class="w-full flex items-start justify-between gap-2 px-2 py-1.5 text-sm transition-colors rounded group text-left"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+              onclick={() => canEdit && isSystemFieldEditable('labels') && (editingLabels = true)}
+              class="hover-bg w-full flex items-start justify-between gap-2 px-2 py-1.5 text-sm transition-colors rounded group text-left"
               disabled={!canEdit || !isSystemFieldEditable('labels')}
             >
               <Text variant="subtle" size="sm" class="shrink-0">{t('items.labels') || 'Labels'}</Text>
               <div class="flex flex-wrap justify-end gap-1.5 min-w-0">
-                {#each (item?.personal_labels || []) as label (label.id)}
+                {#each (item?.labels || []) as label (label.id)}
                   <span
                     class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs"
                     style="background-color: {label.color || '#3B82F6'}1A; color: var(--ds-text); border: 1px solid {label.color || '#3B82F6'};"
-                    data-testid="item-personal-label"
+                    data-testid="item-label"
                   >
                     <span
                       class="inline-block w-2 h-2 rounded-full"
@@ -1008,16 +1001,16 @@
     {/snippet}
 
     {#snippet estimateField()}
-      <div class="mb-3">
+      <div class="mb-3" data-testid="item-estimate-field">
         {#if editingEstimate}
           <div class="w-full flex items-center justify-between px-2 py-1.5 text-sm">
             <Text variant="subtle" size="sm">{t('items.estimate') || 'Estimate'}</Text>
-            <!-- svelte-ignore a11y_autofocus -->
-            <input
+            <Input
               type="text"
               placeholder="3d 4h"
-              class="w-24 text-right text-sm rounded px-1.5 py-0.5 border focus:outline-none focus:ring-1"
-              style="background: var(--ds-surface-sunken); border-color: {estimateError ? 'var(--ds-border-danger, #cc3344)' : 'var(--ds-border)'}; color: var(--ds-text); --tw-ring-color: var(--ds-border-focused);"
+              variant="ghost"
+              class="w-24 text-right text-sm px-1.5 py-0.5"
+              style="color: {estimateError ? 'var(--ds-text-danger, #cc3344)' : 'var(--ds-text)'};"
               value={estimateEditValue ?? ''}
               onfocus={(e) => e.currentTarget.select()}
               oninput={(e) => { estimateEditValue = e.currentTarget.value; estimateError = false; }}
@@ -1027,14 +1020,13 @@
                 if (e.key === 'Escape') { editingEstimate = false; estimateError = false; }
               }}
               autofocus
+              size="small"
             />
           </div>
         {:else}
           <button
             onclick={startEditingEstimate}
-            class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+            class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
             disabled={!canEdit || !isSystemFieldEditable('estimate')}
           >
             <Text variant="subtle" size="sm">{t('items.estimate') || 'Estimate'}</Text>
@@ -1051,53 +1043,19 @@
     {/snippet}
 
     {#snippet storyPointsField()}
-      <div class="mb-3">
-        {#if editingStoryPoints}
-          <div class="w-full flex items-center justify-between px-2 py-1.5 text-sm">
-            <Text variant="subtle" size="sm">{t('items.storyPoints')}</Text>
-            <!-- svelte-ignore a11y_autofocus -->
-            <input
-              type="number"
-              step="0.5"
-              min="0"
-              class="w-20 text-right text-sm rounded px-1.5 py-0.5 border focus:outline-none focus:ring-1"
-              style="background: var(--ds-surface-sunken); border-color: var(--ds-border); color: var(--ds-text); --tw-ring-color: var(--ds-border-focused);"
-              value={storyPointsEditValue ?? ''}
-              onfocus={(e) => e.currentTarget.select()}
-              oninput={(e) => storyPointsEditValue = e.currentTarget.value}
-              onblur={() => saveStoryPoints()}
-              onkeydown={(e) => {
-                if (e.key === 'Enter') { e.currentTarget.blur(); }
-                if (e.key === 'Escape') { editingStoryPoints = false; }
-              }}
-              autofocus
-            />
-          </div>
-        {:else}
-          <button
-            onclick={startEditingStoryPoints}
-            class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
-            disabled={!canEdit || !isSystemFieldEditable('story_points')}
-          >
-            <Text variant="subtle" size="sm">{t('items.storyPoints')}</Text>
-            <div class="flex items-center gap-2">
-              {#if item?.story_points != null && item?.story_points !== 0}
-                <span style="color: var(--ds-text);">{item.story_points}</span>
-              {:else}
-                <Text variant="subtle" size="sm">{t('common.none')}</Text>
-              {/if}
-            </div>
-          </button>
-        {/if}
-      </div>
+      <SidebarStoryPointsField
+        value={item?.story_points ?? null}
+        editable={canEdit && isSystemFieldEditable('story_points')}
+        rollup={childStoryPointRollup}
+        onSave={(value) => onsaveField?.({ field: 'story_points', value })}
+      />
     {/snippet}
 
     {#each orderedMiddleFields as ident (ident)}
       {#if ident === 'priority'}{@render priorityField()}
       {:else if ident === 'project'}{@render projectField()}
       {:else if ident === 'assignee'}{@render assigneeField()}
+      {:else if ident === 'team'}{@render teamField()}
       {:else if ident === 'milestone'}{@render milestoneField()}
       {:else if ident === 'iteration'}{@render iterationField()}
       {:else if ident === 'labels'}{@render labelsField()}
@@ -1110,14 +1068,13 @@
     {#if recurrenceRule}
     <div class="mb-3">
       <div
-        class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
+        data-testid="item-recurrence-summary"
+        class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
         role="button"
         tabindex="0"
         onclick={() => oneditRecurrence?.()}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); oneditRecurrence?.(); } }}
-        onmouseenter={(e) => e.currentTarget.style.background = 'var(--ds-background-neutral-hovered)'}
-        onmouseleave={(e) => e.currentTarget.style.background = ''}
-      >
+              >
         <div class="flex items-center gap-1.5">
           <Repeat class="w-3.5 h-3.5" style="color: var(--ds-icon-subtle);" />
           <Text variant="subtle" size="sm">{t('recurrence.title')}</Text>
@@ -1152,133 +1109,43 @@
       </button>
 
       {#if schedulingExpanded}
-      <!-- Due Date Field -->
       {#if shouldShowSystemField('due_date')}
-      <div class="mb-3">
-        {#if editingDueDate}
-          <div class="w-full py-1.5" use:clickOutside onclickOutside={() => {
-            oncancelEdit?.({ field: 'due_date' });
-          }}>
-            <input
-              type="date"
-              value={item?.due_date ? item.due_date.split('T')[0] : ''}
-              onchange={(e) => {
-                onsaveField?.({
-                  field: 'due_date',
-                  value: e.currentTarget.value || null
-                });
-              }}
-              class="w-full px-2 py-1 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-              use:focusAndShowPicker
-            />
-          </div>
-        {:else}
-          <button
-            onclick={startEditingDueDate}
-            class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
-            disabled={!canEdit || !isSystemFieldEditable('due_date')}
-          >
-            <Text variant="subtle" size="sm">{t('common.dueDate')}</Text>
-            <div class="flex items-center gap-2">
-              {#if item?.due_date}
-                <Calendar size={14} class="flex-shrink-0" style="color: var(--ds-text-subtle);" />
-                <span style="color: var(--ds-text);">{formatDateShort(item.due_date)}</span>
-              {:else}
-                <Text variant="subtle" size="sm">{t('common.none')}</Text>
-              {/if}
-            </div>
-          </button>
-        {/if}
-      </div>
+        <SidebarDateField
+          fieldKey="due_date"
+          label={t('common.dueDate')}
+          value={item?.due_date}
+          editing={editingDueDate}
+          editable={canEdit && isSystemFieldEditable('due_date')}
+          onStartEdit={startEditingDueDate}
+          onCancel={() => oncancelEdit?.({ field: 'due_date' })}
+          onSave={(value) => onsaveField?.({ field: 'due_date', value })}
+        />
       {/if}
 
-      <!-- Start Date Field -->
       {#if shouldShowSystemField('start_date')}
-      <div class="mb-3">
-        {#if editingStartDate}
-          <div class="w-full py-1.5" use:clickOutside onclickOutside={() => {
-            oncancelEdit?.({ field: 'start_date' });
-          }}>
-            <input
-              type="date"
-              value={item?.start_date ? item.start_date.split('T')[0] : ''}
-              onchange={(e) => {
-                onsaveField?.({
-                  field: 'start_date',
-                  value: e.currentTarget.value || null
-                });
-              }}
-              class="w-full px-2 py-1 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-              use:focusAndShowPicker
-            />
-          </div>
-        {:else}
-          <button
-            onclick={startEditingStartDate}
-            class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
-            disabled={!canEdit || !isSystemFieldEditable('start_date')}
-          >
-            <Text variant="subtle" size="sm">{t('common.startDate')}</Text>
-            <div class="flex items-center gap-2">
-              {#if item?.start_date}
-                <Calendar size={14} class="flex-shrink-0" style="color: var(--ds-text-subtle);" />
-                <span style="color: var(--ds-text);">{formatDateShort(item.start_date)}</span>
-              {:else}
-                <Text variant="subtle" size="sm">{t('common.none')}</Text>
-              {/if}
-            </div>
-          </button>
-        {/if}
-      </div>
+        <SidebarDateField
+          fieldKey="start_date"
+          label={t('common.startDate')}
+          value={item?.start_date}
+          editing={editingStartDate}
+          editable={canEdit && isSystemFieldEditable('start_date')}
+          onStartEdit={startEditingStartDate}
+          onCancel={() => oncancelEdit?.({ field: 'start_date' })}
+          onSave={(value) => onsaveField?.({ field: 'start_date', value })}
+        />
       {/if}
 
-      <!-- End Date Field -->
       {#if shouldShowSystemField('end_date')}
-      <div class="mb-3">
-        {#if editingEndDate}
-          <div class="w-full py-1.5" use:clickOutside onclickOutside={() => {
-            oncancelEdit?.({ field: 'end_date' });
-          }}>
-            <input
-              type="date"
-              value={item?.end_date ? item.end_date.split('T')[0] : ''}
-              onchange={(e) => {
-                onsaveField?.({
-                  field: 'end_date',
-                  value: e.currentTarget.value || null
-                });
-              }}
-              class="w-full px-2 py-1 border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-              use:focusAndShowPicker
-            />
-          </div>
-        {:else}
-          <button
-            onclick={startEditingEndDate}
-            class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
-            disabled={!canEdit || !isSystemFieldEditable('end_date')}
-          >
-            <Text variant="subtle" size="sm">{t('common.endDate')}</Text>
-            <div class="flex items-center gap-2">
-              {#if item?.end_date}
-                <Calendar size={14} class="flex-shrink-0" style="color: var(--ds-text-subtle);" />
-                <span style="color: var(--ds-text);">{formatDateShort(item.end_date)}</span>
-              {:else}
-                <Text variant="subtle" size="sm">{t('common.none')}</Text>
-              {/if}
-            </div>
-          </button>
-        {/if}
-      </div>
+        <SidebarDateField
+          fieldKey="end_date"
+          label={t('common.endDate')}
+          value={item?.end_date}
+          editing={editingEndDate}
+          editable={canEdit && isSystemFieldEditable('end_date')}
+          onStartEdit={startEditingEndDate}
+          onCancel={() => oncancelEdit?.({ field: 'end_date' })}
+          onSave={(value) => onsaveField?.({ field: 'end_date', value })}
+        />
       {/if}
 
       <!-- Date-type Custom Fields in Scheduling -->
@@ -1291,7 +1158,7 @@
           {@const currentValue = isEditing ? editCustomFieldValues[screenField.field_identifier] : storedValue}
           {#if fieldDef}
             {@const fieldEditable = isCustomFieldEditable(fieldDef.id)}
-            <div class="mb-3">
+            <div class="mb-3" data-testid={`item-custom-field-${fieldDef.id}`}>
               {#if isEditing}
                 <CustomFieldRenderer
                   field={fieldDef}
@@ -1312,9 +1179,8 @@
               {:else}
                 <button
                   onclick={() => startEditingCustomField(screenField.field_identifier)}
-                  class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-                  onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                  onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
+                  data-testid={`item-custom-field-edit-${fieldDef.id}`}
+                  class="hover-bg w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
                   disabled={!canEdit || !fieldEditable}
                 >
                   <Text variant="subtle" size="sm">{fieldDef.name}</Text>
@@ -1355,7 +1221,7 @@
             {@const currentValue = isEditing ? editCustomFieldValues[screenField.field_identifier] : storedValue}
             {#if fieldDef}
               {@const fieldEditable = isCustomFieldEditable(fieldDef.id)}
-              <div class="mb-3">
+              <div class="mb-3" data-testid={`item-custom-field-${fieldDef.id}`}>
                 {#if fieldDef.field_type === 'linking'}
                   <div class="px-2 py-1.5">
                     <Text variant="subtle" size="sm" class="mb-1">{fieldDef.name}</Text>
@@ -1379,28 +1245,69 @@
                     required={screenField.is_required}
                     onChange={(val) => {
                       editCustomFieldValues[screenField.field_identifier] = val;
-                      onsaveField?.({ field: `custom_field_${screenField.field_identifier}` });
+                      if (!DEFERRED_SAVE_CUSTOM_FIELD_TYPES.has(fieldDef.field_type)) {
+                        onsaveField?.({ field: `custom_field_${screenField.field_identifier}` });
+                      }
                     }}
+                    onCommit={(val) => onsaveField?.({
+                      field: `custom_field_${screenField.field_identifier}`,
+                      value: val,
+                    })}
                     onStartEdit={() => startEditingCustomField(screenField.field_identifier)}
                     onCancel={() => oncancelEdit?.({ field: `custom_field_${screenField.field_identifier}` })}
                   />
                 {:else}
-                  <button
-                    onclick={() => startEditingCustomField(screenField.field_identifier)}
-                    class="w-full flex items-center justify-between px-2 py-1.5 text-sm transition-colors rounded group"
-                    onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                    onmouseleave={(e) => e.currentTarget.style.backgroundColor = ''}
-                    disabled={!canEdit || !fieldEditable}
+                  {@const hasValue = currentValue !== null && currentValue !== undefined && currentValue !== ''}
+                  {@const displayValue = hasValue ? formatCustomFieldValue(fieldDef, currentValue) : t('common.none')}
+                  {@const valueHref = customFieldLinkHref(fieldDef.field_type, currentValue)}
+                  <!-- Unified read-only row: label left, value right. The row owns
+                       padding and hover; the value renderer adds no chrome. -->
+                  <div
+                    class="hover-bg group flex w-full min-w-0 items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors"
                   >
-                    <Text variant="subtle" size="sm">{fieldDef.name}</Text>
-                    <span style="color: {currentValue ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};">
-                      {#if currentValue !== null && currentValue !== undefined && currentValue !== ''}
-                        {formatCustomFieldValue(fieldDef, currentValue)}
+                    <button
+                      type="button"
+                      onclick={() => startEditingCustomField(screenField.field_identifier)}
+                      data-testid={valueHref
+                        ? `item-custom-field-edit-${fieldDef.id}`
+                        : `item-custom-field-label-${fieldDef.id}`}
+                      class="max-w-[45%] shrink-0 truncate rounded-sm text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-default"
+                      style="outline-color: var(--ds-border-focused);"
+                      disabled={!canEdit || !fieldEditable}
+                    >
+                      <Text variant="subtle" size="sm">{fieldDef.name}</Text>
+                    </button>
+
+                    <div class="min-w-0 flex-1 text-right">
+                      {#if ['user', 'multi_user', 'asset'].includes(fieldDef.field_type)}
+                        <CustomFieldRenderer
+                          field={fieldDef}
+                          value={currentValue}
+                          readonly={true}
+                          disabled={!canEdit || !fieldEditable}
+                          bare={true}
+                          displayAlignment="end"
+                          truncateDisplay={true}
+                          displayTestId={`item-custom-field-display-${fieldDef.id}`}
+                          {milestones}
+                          {iterations}
+                          itemId={item?.id}
+                          onStartEdit={() => startEditingCustomField(screenField.field_identifier)}
+                        />
                       {:else}
-                        {t('common.none')}
+                        <TruncatedFieldValue
+                          value={displayValue}
+                          href={valueHref}
+                          onactivate={valueHref ? null : () => startEditingCustomField(screenField.field_identifier)}
+                          disabled={!canEdit || !fieldEditable}
+                          subtle={!hasValue}
+                          testId={valueHref
+                            ? `item-custom-field-value-${fieldDef.id}`
+                            : `item-custom-field-edit-${fieldDef.id}`}
+                        />
                       {/if}
-                    </span>
-                  </button>
+                    </div>
+                  </div>
                 {/if}
               </div>
             {/if}
@@ -1451,6 +1358,26 @@
     {/if}
 
     <!-- Integration Links (Notion, etc.) -->
+    {#if item?.id && item?.workspace_id}
+      <ZammadItemPanel itemId={item.id} workspaceId={item.workspace_id} {canEdit} />
+    {/if}
+
+    <!-- Customer context (WI-1139): requester, organisation history, and
+         linked assets. External requests only; expands on demand. The
+         WI-1548 duplicate-candidates panel belongs to the same customer
+         context, so it shares the guard. -->
+    {#if item?.id && isExternalRequest(item)}
+      <RequesterOpenTickets itemId={item.id} {canEdit} {onrequestmerge} />
+      <CustomerContextSection {item} />
+    {/if}
+
+    <!-- External request participants (WI-1136). Internal items have no
+         external audience, so the section only appears for requests that
+         originated from the portal or a helpdesk mailbox. -->
+    {#if item?.id && isExternalRequest(item)}
+      <ParticipantsSection itemId={item.id} {canEdit} />
+    {/if}
+
     {#if item?.id}
       <ItemIntegrationLinks
         bind:this={integrationLinksRef}
@@ -1535,22 +1462,3 @@
     }}
   />
 {/if}
-
-<style>
-  /* Override Tailwind hover states for dark mode compatibility */
-  :global(.group):hover :global(.hover\:bg-gray-50) {
-    background-color: var(--ds-background-neutral-hovered) !important;
-  }
-
-  :global(.hover\:bg-gray-50):hover {
-    background-color: var(--ds-background-neutral-hovered) !important;
-  }
-
-  :global(.hover\:bg-gray-200):hover {
-    background-color: var(--ds-background-neutral-hovered) !important;
-  }
-
-  :global(.text-gray-600) {
-    color: var(--ds-text-subtle) !important;
-  }
-</style>

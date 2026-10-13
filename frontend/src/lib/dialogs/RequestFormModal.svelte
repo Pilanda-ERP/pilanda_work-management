@@ -1,24 +1,33 @@
 <script>
   import { api } from '../api.js';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { authStore } from '../stores';
   import { portalAuthStore } from '../stores/portalAuth.svelte.js';
-  import { portalStore, iconMap } from '../stores/portal.svelte.js';
+  import { portalCustomizationStore as portalStore } from '../stores/portal.svelte.js';
+  import { iconMap } from '../stores/portalPresentation.js';
   import Button from '../components/Button.svelte';
-  import CustomFieldRenderer from '../features/items/CustomFieldRenderer.svelte';
-  import Spinner from '../components/Spinner.svelte';
-  import Textarea from '../components/Textarea.svelte';
+  import Checkbox from '../components/Checkbox.svelte';
   import AlertBox from '../components/AlertBox.svelte';
-  import Label from '../components/Label.svelte';
   import PortalModal from './PortalModal.svelte';
-  import { ChevronLeft, ChevronRight, Package, X, Check } from '@lucide/svelte';
-  import BasePicker from '../pickers/BasePicker.svelte';
+  import { ChevronLeft, ChevronRight, Package, Paperclip, X } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import FormFields from '../features/forms/FormFields.svelte';
+  import {
+    buildFormSteps,
+    clampFormStep,
+    initializeFormValues,
+    validateFormStep,
+  } from '../features/forms/formModel.js';
 
   let {
     isOpen = $bindable(false),
     requestType = null,
     portalSlug = '',
     isDarkMode = false,
+    // Field values to seed on open, keyed by field_identifier (e.g. the
+    // clicked asset id for an asset field). Applied after any draft resume so
+    // the prefill wins for its target field while other draft values remain.
+    prefill = {},
     onsubmitted = () => {},
     onclose = () => {}
   } = $props();
@@ -32,6 +41,13 @@
   let error = $state(null);
   let success = $state(false);
 
+  // Organisation sharing (WI-1139): the org decides whether contacts may opt
+  // in, and the creator's choice is fixed at submission. automatic shares
+  // every request, disabled never shares.
+  let shareWithOrganisation = $state(false);
+  const orgSharingMode = $derived($portalAuthStore.userBootstrap?.request_sharing || 'disabled');
+  const canShareWithOrg = $derived(orgSharingMode === 'requester_choice');
+
   // Multi-step support
   let steps = $state([1]);
   let currentStep = $state(1);
@@ -43,27 +59,30 @@
   });
   let customFieldValues = $state({});
 
-  // Draft state — only used on the portal path (portalSlug truthy).
-  // resumedDraft tracks the most recently loaded draft so we can show the
-  // "Resuming draft" banner; cleared once the user opts to start fresh.
-  // savingDraft is shown briefly while the auto-save fetch is in flight so
-  // users get feedback that progress is persisted.
+  // Show the resume banner only for a draft loaded when the portal form opens.
   let resumedDraft = $state(null);
   let savingDraft = $state(false);
   let draftJustSaved = $state(false);
   let draftSavedTimer = null;
 
-  // Computed: fields for current step
-  let currentStepFields = $derived(fields.filter(f => (f.step_number || 1) === currentStep));
   let totalSteps = $derived(steps.length);
   let isLastStep = $derived(currentStep === Math.max(...steps));
   let isFirstStep = $derived(currentStep === Math.min(...steps));
+  let hasPortalVisual = $derived(portalStore.hasBackgroundImage || portalStore.hasGradient);
+
+  // Files staged for upload once the request exists. Drafts store form data
+  // only, so staged files intentionally do not survive close-and-reopen.
+  let stagedFiles = $state([]);
+  let uploadingFiles = $state(false);
+  let uploadFailures = $state([]);
 
 
   // Load fields when modal opens
   $effect(() => {
+    // Read prefill here so a URL-driven change re-seeds the form.
+    const prefillValues = prefill;
     if (isOpen && requestType) {
-      loadFields();
+      loadFields(prefillValues);
     }
   });
 
@@ -85,7 +104,7 @@
     };
   });
 
-  async function loadFields() {
+  async function loadFields(prefillValues = {}) {
     try {
       loading = true;
       error = null;
@@ -100,9 +119,8 @@
       }
 
       // Calculate steps from field data
-      const stepNumbers = [...new Set(fields.map(f => f.step_number || 1))].sort((a, b) => a - b);
-      steps = stepNumbers.length > 0 ? stepNumbers : [1];
-      currentStep = Math.min(...steps);
+      steps = buildFormSteps(fields);
+      currentStep = steps[0];
 
       // Load custom field definitions for rendering
       // Use portal API if on portal (only returns fields used by this portal)
@@ -110,27 +128,23 @@
       if (portalSlug) {
         customFieldDefinitions = await api.portal.getCustomFields(portalSlug) || [];
       } else {
-        customFieldDefinitions = (await api.customFields.getAll())?.data || [];
+        customFieldDefinitions = await api.customFields.getAll();
       }
 
-      // Initialize custom field values (for both custom and virtual fields)
-      customFieldValues = {};
-      fields.forEach(field => {
-        if (field.field_type === 'custom' || field.field_type === 'virtual') {
-          // For checkbox virtual fields, initialize to false
-          if (field.field_type === 'virtual' && field.virtual_field_type === 'checkbox') {
-            customFieldValues[field.field_identifier] = false;
-          } else {
-            customFieldValues[field.field_identifier] = '';
-          }
-        }
-      });
+      const initialValues = initializeFormValues(fields, null, customFieldDefinitions);
+      formData = initialValues.formData;
+      customFieldValues = initialValues.customFieldValues;
 
       // Auto-resume any saved draft for this request type. Only the portal
       // path has drafts — internal usage of this modal opens fresh.
       if (portalSlug) {
         await applyDraftIfPresent();
       }
+
+      // Apply prefill last so it wins over a resumed draft for its target
+      // field. Fields the form does not configure are ignored here and would
+      // be dropped by the submit API anyway.
+      applyPrefill(prefillValues);
     } catch (err) {
       console.error('Failed to load request type fields:', err);
       error = err.message || t('requestForm.failedToLoadFields');
@@ -146,21 +160,14 @@
         resumedDraft = null;
         return;
       }
-      formData.title = draft.title || '';
-      formData.description = draft.description || '';
-      // Merge draft values onto the freshly-initialized customFieldValues so
-      // fields the draft doesn't mention keep their default (e.g. unchecked
-      // checkbox stays false, not undefined).
-      if (draft.custom_field_values && typeof draft.custom_field_values === 'object') {
-        for (const [k, v] of Object.entries(draft.custom_field_values)) {
-          customFieldValues[k] = v;
-        }
-      }
-      // Clamp the saved step back into the current step layout — the request
-      // type may have been edited since the draft was created.
-      const validSteps = steps.length > 0 ? steps : [1];
-      const savedStep = Number(draft.current_step) || validSteps[0];
-      currentStep = validSteps.includes(savedStep) ? savedStep : validSteps[0];
+      const restored = initializeFormValues(fields, {
+        title: draft.title,
+        description: draft.description,
+        custom_fields: draft.custom_field_values,
+      }, customFieldDefinitions);
+      formData = restored.formData;
+      customFieldValues = restored.customFieldValues;
+      currentStep = clampFormStep(steps, draft.current_step);
       resumedDraft = draft;
     } catch (err) {
       // A missing draft already returns null; anything that reaches here is a
@@ -168,6 +175,22 @@
       // resume is far better than blocking submission.
       console.warn('Failed to load draft for resume:', err);
       resumedDraft = null;
+    }
+  }
+
+  // Seed fields configured in the request type whose field_identifier is
+  // present in the prefill map. Unknown keys are ignored.
+  function applyPrefill(prefillValues) {
+    if (!prefillValues || typeof prefillValues !== 'object') return;
+    for (const field of fields) {
+      const identifier = field.field_identifier;
+      if (!identifier || prefillValues[identifier] === undefined) continue;
+      const value = prefillValues[identifier];
+      if (field.field_type === 'default') {
+        formData = { ...formData, [identifier]: value };
+      } else if (field.field_type === 'custom' || field.field_type === 'virtual') {
+        customFieldValues = { ...customFieldValues, [identifier]: value };
+      }
     }
   }
 
@@ -183,6 +206,9 @@
     resumedDraft = null;
     savingDraft = false;
     draftJustSaved = false;
+    stagedFiles = [];
+    uploadingFiles = false;
+    uploadFailures = [];
   }
 
   function buildDraftPayload() {
@@ -206,7 +232,6 @@
     try {
       const saved = await api.portal.drafts.save(portalSlug, buildDraftPayload());
       if (saved) {
-        resumedDraft = saved;
         draftJustSaved = true;
         if (draftSavedTimer) clearTimeout(draftSavedTimer);
         draftSavedTimer = setTimeout(() => {
@@ -233,78 +258,26 @@
     }
     // Reset form state to a pristine first-step view, but keep the loaded
     // fields metadata (no need to re-fetch).
-    formData = { title: '', description: '' };
-    const reset = {};
-    fields.forEach(field => {
-      if (field.field_type === 'custom' || field.field_type === 'virtual') {
-        if (field.field_type === 'virtual' && field.virtual_field_type === 'checkbox') {
-          reset[field.field_identifier] = false;
-        } else {
-          reset[field.field_identifier] = '';
-        }
-      }
-    });
-    customFieldValues = reset;
-    currentStep = steps.length ? Math.min(...steps) : 1;
+    const reset = initializeFormValues(fields, null, customFieldDefinitions);
+    formData = reset.formData;
+    customFieldValues = reset.customFieldValues;
+    currentStep = steps[0] || 1;
     resumedDraft = null;
     error = null;
-  }
-
-  function isFieldRequired(fieldIdentifier) {
-    const field = fields.find(f => f.field_identifier === fieldIdentifier);
-    return field ? field.is_required : false;
-  }
-
-  function hasField(fieldIdentifier) {
-    return fields.some(f => f.field_identifier === fieldIdentifier);
-  }
-
-  function hasFieldInCurrentStep(fieldIdentifier) {
-    return currentStepFields.some(f => f.field_identifier === fieldIdentifier);
-  }
-
-  function getCustomFieldDefinition(fieldId) {
-    return customFieldDefinitions.find(f => f.id.toString() === fieldId);
-  }
-
-  function getFieldLabel(field) {
-    return field.display_name || field.field_label || field.field_name || field.field_identifier;
+    applyPrefill(prefill);
   }
 
   function validateCurrentStep() {
-    // Validate fields in current step
-    for (const field of currentStepFields) {
-      if (!field.is_required) continue;
-
-      if (field.field_type === 'default') {
-        if (field.field_identifier === 'title' && !formData.title.trim()) {
-          error = t('requestForm.fieldRequired', { field: getFieldLabel(field) });
-          return false;
-        }
-        if (field.field_identifier === 'description' && !formData.description.trim()) {
-          error = t('requestForm.fieldRequired', { field: getFieldLabel(field) });
-          return false;
-        }
-      } else if (field.field_type === 'custom') {
-        const value = customFieldValues[field.field_identifier];
-        if (value === undefined || value === null || value === '') {
-          const fieldDef = getCustomFieldDefinition(field.field_identifier);
-          error = t('requestForm.fieldRequired', { field: field.display_name || fieldDef?.name || 'Field' });
-          return false;
-        }
-      } else if (field.field_type === 'virtual') {
-        const value = customFieldValues[field.field_identifier];
-        // Checkbox fields with false are valid (only truly empty is invalid)
-        if (field.virtual_field_type === 'checkbox') {
-          // Checkbox is always valid (false is a valid value)
-        } else if (value === undefined || value === null || value === '') {
-          error = t('requestForm.fieldRequired', { field: getFieldLabel(field) });
-          return false;
-        }
-      }
-    }
-
-    return true;
+    const message = validateFormStep({
+      fields,
+      step: currentStep,
+      formData,
+      customFieldValues,
+      customFieldDefinitions,
+      requiredMessage: (label) => t('requestForm.fieldRequired', { field: label }),
+    });
+    error = message || null;
+    return !message;
   }
 
   function goToNextStep() {
@@ -358,10 +331,29 @@
         request_type_id: requestType.id,
         title: formData.title,
         description: formData.description,
-        custom_fields: customFieldValues
+        custom_fields: customFieldValues,
+        share_with_organisation: canShareWithOrg && shareWithOrganisation
       };
 
       const result = await api.portal.submit(portalSlug, submissionData);
+
+      // Upload staged files to the created request. The request already
+      // exists at this point, so per-file failures are reported but never
+      // fail the submission — the customer can retry from the timeline.
+      if (stagedFiles.length > 0) {
+        uploadingFiles = true;
+        const failures = [];
+        for (const file of stagedFiles) {
+          try {
+            await api.portal.addRequestAttachment(portalSlug, result.item_id, file);
+          } catch (err) {
+            console.error('Failed to upload attachment after submit:', err);
+            failures.push(file.name);
+          }
+        }
+        uploadFailures = failures;
+        uploadingFiles = false;
+      }
 
       success = true;
 
@@ -377,11 +369,15 @@
         });
       }
 
-      // Close modal after short delay
-      setTimeout(() => {
-        handleClose();
-        onsubmitted(result.item_id);
-      }, 1500);
+      // Close modal after short delay. Upload failures keep it open so the
+      // customer can read the retry hint before the timeline takes over.
+      setTimeout(
+        () => {
+          handleClose();
+          onsubmitted(result.item_id);
+        },
+        uploadFailures.length > 0 ? 6000 : 1500
+      );
     } catch (err) {
       console.error('Failed to submit request:', err);
       error = err.message || t('requestForm.failedToSubmit');
@@ -395,13 +391,6 @@
     onclose();
   }
 
-  function parseSelectOptions(optionsJson) {
-    try {
-      return JSON.parse(optionsJson) || [];
-    } catch {
-      return [];
-    }
-  }
 </script>
 
 {#if isOpen && requestType}
@@ -413,74 +402,67 @@
     bodyClass=""
     onClose={handleClose}
   >
-    <!-- Gradient Header with Integrated Stepper -->
+    <!-- Compact task header -->
     {@const RequestTypeIcon = iconMap[requestType?.icon] || Package}
     <div
-      class="px-8 pt-8 pb-6 text-white text-center relative"
-      style="{portalStore.headerBackgroundStyle}"
+      class="px-5 sm:px-6 py-5 border-b flex items-start gap-3 relative"
+      style="{hasPortalVisual
+        ? portalStore.headerBackgroundStyle
+        : 'background-color: var(--ds-surface-card);'} border-color: {hasPortalVisual
+        ? 'rgba(255,255,255,0.18)'
+        : 'var(--ds-border)'};"
     >
-      <!-- Close button -->
+      <div
+        class="w-9 h-9 rounded-md flex items-center justify-center flex-none"
+        style="background-color: {hasPortalVisual ? 'rgba(255,255,255,0.14)' : 'var(--ds-background-neutral)'}; color: {hasPortalVisual ? '#ffffff' : 'var(--ds-text-subtle)'};"
+      >
+        <RequestTypeIcon class="w-[18px] h-[18px]" />
+      </div>
+      <div class="min-w-0 flex-1 pr-8">
+        <h2 class="text-lg font-semibold leading-6" style="color: {hasPortalVisual ? '#ffffff' : 'var(--ds-text)'};">{requestType?.name}</h2>
+        {#if requestType?.description}
+          <p class="mt-1 text-sm leading-5" style="color: {hasPortalVisual ? 'rgba(255,255,255,0.82)' : 'var(--ds-text-subtle)'};">{requestType.description}</p>
+        {/if}
+        {#if totalSteps > 1}
+          <div class="mt-3 flex items-center gap-3">
+            <span class="text-xs font-medium" style="color: {hasPortalVisual ? 'rgba(255,255,255,0.82)' : 'var(--ds-text-subtle)'};">
+              Step {steps.indexOf(currentStep) + 1} of {totalSteps}
+            </span>
+            <div class="h-1 flex-1 max-w-32 rounded-full overflow-hidden" style="background-color: {hasPortalVisual ? 'rgba(255,255,255,0.28)' : 'var(--ds-background-neutral)'};">
+              <div
+                class="h-full rounded-full transition-all"
+                style="width: {((steps.indexOf(currentStep) + 1) / totalSteps) * 100}%; background-color: {hasPortalVisual ? '#ffffff' : 'var(--ds-interactive, #2563eb)'};"
+              ></div>
+            </div>
+          </div>
+        {/if}
+      </div>
       <button
         onclick={handleClose}
-        class="absolute top-4 right-4 p-2 rounded-full hover:bg-white/20 transition-all"
+        class="absolute top-4 right-4 p-1.5 rounded-md transition-colors"
+        style="color: {hasPortalVisual ? 'rgba(255,255,255,0.88)' : 'var(--ds-text-subtle)'};"
         aria-label="Close"
       >
         <X class="w-5 h-5" />
       </button>
-
-      <!-- Icon -->
-      <div class="flex justify-center mb-3">
-        <div class="w-14 h-14 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center">
-          <RequestTypeIcon class="w-7 h-7 text-white" />
-        </div>
-      </div>
-
-      <!-- Title -->
-      <h2 class="text-xl font-bold">{requestType?.name}</h2>
-      {#if requestType?.description}
-        <p class="text-white/80 mt-1 text-sm">{requestType.description}</p>
-      {/if}
-
-      <!-- Integrated Stepper (white theme for gradient background) -->
-      {#if totalSteps > 1}
-        <div class="mt-6 flex items-center justify-center gap-2">
-          {#each steps as step, index}
-            {@const isCompleted = index + 1 < currentStep}
-            {@const isCurrent = index + 1 === currentStep}
-            <div class="flex items-center">
-              <div
-                class="w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-all"
-                style="background: {isCurrent || isCompleted ? 'white' : 'rgba(255,255,255,0.3)'}; color: {isCurrent || isCompleted ? '#667eea' : 'white'};"
-              >
-                {#if isCompleted}
-                  <Check class="w-4 h-4" />
-                {:else}
-                  {index + 1}
-                {/if}
-              </div>
-              {#if index < steps.length - 1}
-                <div
-                  class="w-8 h-0.5 mx-1"
-                  style="background: {isCompleted ? 'white' : 'rgba(255,255,255,0.3)'};"
-                ></div>
-              {/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
     </div>
 
     <!-- Form Body -->
     {#if loading}
-      <div class="flex items-center justify-center py-12">
-        <Spinner />
-      </div>
+      <StateDisplay type="loading" />
     {:else if success}
       <div class="px-6 py-4">
         <AlertBox variant="success" message={t('requestForm.requestSubmittedSuccess')} />
+        {#if uploadFailures.length > 0}
+          <AlertBox
+            variant="warning"
+            message="Some attachments failed to upload. You can attach them from the request timeline."
+            class="mt-3"
+          />
+        {/if}
       </div>
     {:else}
-      <div class="px-6 py-4 max-h-[50vh] overflow-y-auto">
+      <div class="px-5 sm:px-6 py-5 sm:py-6 max-h-[60vh] overflow-y-auto">
         {#if error}
           <AlertBox variant="error" message={error} class="mb-4" />
         {/if}
@@ -488,17 +470,17 @@
         {#if resumedDraft && portalSlug}
           <div
             data-testid="request-form-draft-resume-banner"
-            class="mb-4 p-3 rounded border flex items-center justify-between gap-3"
-            style="background-color: {isDarkMode ? 'rgba(245, 158, 11, 0.1)' : '#fffbeb'}; border-color: {isDarkMode ? 'rgba(245, 158, 11, 0.3)' : '#fde68a'};"
+            class="mb-5 pb-4 border-b flex items-center justify-between gap-3"
+            style="border-color: var(--ds-border);"
           >
-            <p class="text-sm" style="color: {isDarkMode ? '#fcd34d' : '#92400e'};">
+            <p class="text-sm" style="color: var(--ds-text-subtle);">
               {t('portal.draftResumeBanner')}
             </p>
             <button
               type="button"
               onclick={startFreshFromDraft}
-              class="text-sm font-medium underline whitespace-nowrap"
-              style="color: {isDarkMode ? '#fcd34d' : '#92400e'};"
+              class="text-sm font-medium hover:underline whitespace-nowrap"
+              style="color: var(--ds-text-link);"
             >
               {t('portal.draftStartFresh')}
             </button>
@@ -506,141 +488,59 @@
         {/if}
 
         <div class="space-y-4">
-        <!-- Default Fields -->
-        {#if hasFieldInCurrentStep('title')}
-          {@const titleField = currentStepFields.find(f => f.field_identifier === 'title')}
-          <div>
-            <Label for="request-title" required={titleField.is_required} class="mb-2">
-              {titleField.display_name || t('requestForm.title')}
-            </Label>
-            <input
-              id="request-title"
-              bind:value={formData.title}
-              type="text"
-              class="w-full px-4 py-3 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-              style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
-              placeholder={t('requestForm.enterTitle')}
-              required={titleField.is_required}
-            />
-            {#if titleField.description}
-              <p class="text-xs mt-1" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
-                {titleField.description}
-              </p>
-            {/if}
-          </div>
-        {/if}
+          <FormFields
+            {fields}
+            {customFieldDefinitions}
+            {currentStep}
+            bind:formData
+            bind:customFieldValues
+            {isDarkMode}
+            idPrefix="request"
+          />
 
-        {#if hasFieldInCurrentStep('description')}
-          {@const descField = currentStepFields.find(f => f.field_identifier === 'description')}
-          <div>
-            <Label for="request-description" required={descField.is_required} class="mb-2">
-              {descField.display_name || t('requestForm.description')}
-            </Label>
-            <Textarea
-              id="request-description"
-              bind:value={formData.description}
-              rows={4}
-              class="w-full"
-              style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
-              placeholder={t('requestForm.describeRequest')}
-              required={descField.is_required}
-            />
-            {#if descField.description}
-              <p class="text-xs mt-1" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
-                {descField.description}
-              </p>
-            {/if}
-          </div>
-        {/if}
-
-        <!-- Custom Fields -->
-        {#each currentStepFields.filter(f => f.field_type === 'custom') as field}
-          {@const fieldDef = getCustomFieldDefinition(field.field_identifier)}
-          {#if fieldDef}
-            <div>
-              {#if field.display_name || field.description}
-                <Label required={field.is_required} class="mb-2">
-                  {field.display_name || fieldDef.name}
-                </Label>
-                {#if field.description}
-                  <p class="text-xs mb-2" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
-                    {field.description}
-                  </p>
-                {/if}
-                <CustomFieldRenderer
-                  field={{ ...fieldDef, is_required: field.is_required, name: '' }}
-                  value={customFieldValues[field.field_identifier]}
-                  readonly={false}
-                  onChange={(val) => customFieldValues[field.field_identifier] = val}
-                  milestones={[]}
-                  {isDarkMode}
-                />
-              {:else}
-                <CustomFieldRenderer
-                  field={{ ...fieldDef, is_required: field.is_required }}
-                  value={customFieldValues[field.field_identifier]}
-                  readonly={false}
-                  onChange={(val) => customFieldValues[field.field_identifier] = val}
-                  milestones={[]}
-                  {isDarkMode}
-                />
+          <!-- Staged attachments (last step only). Uploads happen after the
+               request is created; per-file failures surface on the success
+               screen and can be retried from the request timeline. -->
+          {#if isLastStep}
+            <div class="pt-4" data-testid="request-form-attachments">
+              <label
+                class="inline-flex items-center gap-1.5 text-sm cursor-pointer hover:underline"
+                style="color: var(--ds-text-link);"
+                for="request-form-attachment-input"
+              >
+                <Paperclip class="w-4 h-4" aria-hidden="true" />
+                Attach files
+              </label>
+              <input
+                id="request-form-attachment-input"
+                type="file"
+                class="hidden"
+                multiple
+                onchange={(event) => {
+                  const input = event.currentTarget;
+                  stagedFiles = [...stagedFiles, ...Array.from(input.files ?? [])];
+                  input.value = '';
+                }}
+              />
+              {#if stagedFiles.length > 0}
+                <ul class="mt-2 space-y-1">
+                  {#each stagedFiles as file, index}
+                    <li class="flex items-center gap-2 text-xs" style="color: var(--ds-text-subtle);">
+                      <span class="truncate max-w-60">{file.name}</span>
+                      <button
+                        type="button"
+                        class="hover:underline"
+                        style="color: var(--ds-text-link);"
+                        onclick={() => (stagedFiles = stagedFiles.filter((_, i) => i !== index))}
+                      >
+                        Remove
+                      </button>
+                    </li>
+                  {/each}
+                </ul>
               {/if}
             </div>
           {/if}
-        {/each}
-
-        <!-- Virtual Fields -->
-        {#each currentStepFields.filter(f => f.field_type === 'virtual') as field}
-          <div>
-            <Label required={field.is_required} class="mb-2">
-              {getFieldLabel(field)}
-            </Label>
-            {#if field.description}
-              <p class="text-xs mb-2" style="color: {isDarkMode ? '#94a3b8' : '#6b7280'};">
-                {field.description}
-              </p>
-            {/if}
-
-            {#if field.virtual_field_type === 'text'}
-              <input
-                type="text"
-                bind:value={customFieldValues[field.field_identifier]}
-                class="w-full px-4 py-3 rounded border focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
-                placeholder={field.display_name || field.field_name}
-              />
-            {:else if field.virtual_field_type === 'textarea'}
-              <Textarea
-                bind:value={customFieldValues[field.field_identifier]}
-                rows={4}
-                class="w-full"
-                style="background-color: {isDarkMode ? '#1e293b' : '#ffffff'}; color: {isDarkMode ? '#e2e8f0' : '#111827'}; border-color: {isDarkMode ? '#475569' : '#d1d5db'};"
-                placeholder={field.display_name || field.field_name}
-              />
-            {:else if field.virtual_field_type === 'select'}
-              <BasePicker
-                bind:value={customFieldValues[field.field_identifier]}
-                items={parseSelectOptions(field.virtual_field_options)}
-                placeholder={t('requestForm.selectOption')}
-                showUnassigned={true}
-                unassignedLabel={t('requestForm.selectOption')}
-                getValue={(option) => option.value}
-                getLabel={(option) => option.label}
-              />
-            {:else if field.virtual_field_type === 'checkbox'}
-              <label class="flex items-center gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  bind:checked={customFieldValues[field.field_identifier]}
-                  class="h-5 w-5 rounded border-gray-300 focus:ring-2 focus:ring-blue-500"
-                />
-                <span class="text-sm" style="color: {isDarkMode ? '#e2e8f0' : '#374151'};">
-                  {field.display_name || field.field_name}
-                </span>
-              </label>
-            {/if}
-          </div>
-        {/each}
 
           <!-- Submitting as info (only on last step, only when we know who).
                portalAuthStore has two authenticated shapes: an internal user
@@ -648,8 +548,8 @@
                with customer null; a portal customer populates `customer` with
                user null. Handle both, plus the standalone authStore. -->
           {#if isLastStep && ((authStore.isAuthenticated && authStore.currentUser) || ($portalAuthStore.isAuthenticated && ($portalAuthStore.user || $portalAuthStore.customer)))}
-            <div class="p-3 rounded border" style="background-color: {isDarkMode ? 'rgba(59, 130, 246, 0.1)' : '#eff6ff'}; border-color: {isDarkMode ? 'rgba(59, 130, 246, 0.3)' : '#bfdbfe'};">
-              <p class="text-sm" style="color: {isDarkMode ? '#93c5fd' : '#1e40af'};">
+            <div class="pt-4 border-t" style="border-color: var(--ds-border);">
+              <p class="text-xs" style="color: var(--ds-text-subtle);">
                 {#if authStore.isAuthenticated && authStore.currentUser}
                   {t('requestForm.submittingAs', { name: `${authStore.currentUser?.first_name} ${authStore.currentUser?.last_name}`, email: authStore.currentUser?.email })}
                 {:else if $portalAuthStore.isAuthenticated && $portalAuthStore.user}
@@ -660,12 +560,30 @@
               </p>
             </div>
           {/if}
+
+          {#if isLastStep && canShareWithOrg}
+            <div class="pt-4 border-t" style="border-color: var(--ds-border);">
+              <Checkbox
+                bind:checked={shareWithOrganisation}
+                dataTestid="request-form-share-with-organisation"
+                label={t('requestForm.shareWithOrganisation')}
+                hint={t('requestForm.shareWithOrganisationHint')}
+                size="small"
+              />
+            </div>
+          {:else if isLastStep && orgSharingMode === 'automatic'}
+            <div class="pt-4 border-t" style="border-color: var(--ds-border);">
+              <p class="text-xs" style="color: var(--ds-text-subtle);">
+                {t('requestForm.sharedWithOrganisationNote')}
+              </p>
+            </div>
+          {/if}
         </div>
       </div>
 
       <!-- Footer with Navigation Buttons (fixed at bottom) -->
       <div
-        class="px-6 py-4 border-t flex items-center justify-between"
+        class="px-5 sm:px-6 py-4 border-t flex items-center justify-between gap-3"
         style="border-color: {isDarkMode ? '#475569' : '#e5e7eb'};"
       >
         <div>
@@ -689,14 +607,16 @@
               {savingDraft ? t('portal.draftSaving') : t('portal.draftSaved')}
             </span>
           {/if}
-          <Button
-            onclick={handleClose}
-            variant="default"
-            size="medium"
-            disabled={submitting}
-          >
-            {t('common.cancel')}
-          </Button>
+          <div class="hidden sm:block">
+            <Button
+              onclick={handleClose}
+              variant="default"
+              size="medium"
+              disabled={submitting}
+            >
+              {t('common.cancel')}
+            </Button>
+          </div>
           {#if isLastStep}
             <Button
               dataTestid="request-form-submit"
@@ -705,7 +625,7 @@
               size="medium"
               disabled={submitting || loading}
             >
-              {submitting ? t('requestForm.submitting') : t('requestForm.submitRequest')}
+              {submitting || uploadingFiles ? t('requestForm.submitting') : t('requestForm.submitRequest')}
             </Button>
           {:else}
             <Button

@@ -1,15 +1,17 @@
 <script>
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { attachClosestEdge, extractClosestEdge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
   import { createPopover, melt } from '@melt-ui/svelte';
-  import { fly } from 'svelte/transition';
   import { tick } from 'svelte';
   import { api } from '../api.js';
   import { Plus, Trash2, Pencil, Type, AlignLeft, ListChecks, ToggleLeft, AlertTriangle, Search, X } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import Spinner from '../components/Spinner.svelte';
+  import Textarea from '../components/Textarea.svelte';
   import PortalModal from './PortalModal.svelte';
-  import DropIndicator from '../layout/DropIndicator.svelte';
+  import DraggableFieldRow from '../components/DraggableFieldRow.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import Checkbox from '../components/Checkbox.svelte';
   import DescriptionText from '../components/DescriptionText.svelte';
@@ -60,10 +62,12 @@
   let steps = $state([1]);
   let currentStep = $state(1);
 
-  // Drag state (for reordering configured fields only)
+  // Drag state for reordering fields and moving them between steps.
   let fieldDragState = $state(new Map());
   let setupCleanups = $state([]);
-  let setupTimeout;
+  let builderRoot = $state(null);
+  let stepDropTarget = $state(null);
+  let dragSetupVersion = 0;
 
   // Virtual field creation
   let addingVirtualField = $state(false);
@@ -76,6 +80,8 @@
   let editingField = $state(null);
   let editDisplayName = $state('');
   let editDescription = $state('');
+  let editVirtualFieldOptions = $state([]);
+  let editFieldError = $state(null);
 
   // Add-field popover
   let addFieldQuery = $state('');
@@ -138,12 +144,21 @@
     };
   });
 
-  // Re-setup drag-and-drop (configured fields reorder) when fields/step change
+  // Re-setup drag-and-drop when the visible fields or steps change.
   $effect(() => {
-    if (!loading && fields && typeof document !== 'undefined') {
-      if (setupTimeout) clearTimeout(setupTimeout);
-      setupTimeout = setTimeout(() => setupDragAndDrop(), 50);
+    const dragSetupKey = !loading
+      ? `${currentStep}:${steps.join(',')}:${currentStepFields.map(f => f.field_identifier).join(',')}`
+      : '';
+    const version = ++dragSetupVersion;
+    if (dragSetupKey && builderRoot && typeof document !== 'undefined') {
+      tick().then(() => {
+        if (version === dragSetupVersion) setupDragAndDrop();
+      });
     }
+    return () => {
+      dragSetupVersion++;
+      cleanupDragAndDrop();
+    };
   });
 
   async function loadFields() {
@@ -196,7 +211,8 @@
     try {
       titleTemplateSaving = true;
       titleTemplateError = null;
-      // PUT /channels/.../request-types/:id requires the full editable body.
+      // Omitted fields keep their stored values; only the title template
+      // changes here.
       await api.requestTypes.update(channelId, requestTypeId, {
         name: requestTypeRow.name,
         description: requestTypeRow.description || '',
@@ -229,20 +245,19 @@
     }
   }
 
-  // === Drag and Drop (configured fields reorder only) ===
+  // === Drag and Drop ===
 
   function cleanupDragAndDrop() {
-    if (setupTimeout) clearTimeout(setupTimeout);
     setupCleanups.forEach(fn => fn());
     setupCleanups = [];
     fieldDragState = new Map();
+    stepDropTarget = null;
   }
 
   function setupDragAndDrop() {
     cleanupDragAndDrop();
 
-    /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-configured-field]')).forEach((element) => {
-      const fieldIndex = parseInt(element.dataset.fieldIndex);
+    /** @type {NodeListOf<HTMLElement>} */ (builderRoot.querySelectorAll('[data-configured-field]')).forEach((element) => {
       const fieldId = element.dataset.fieldId;
 
       fieldDragState.set(fieldId, { closestEdge: null });
@@ -251,7 +266,7 @@
       const draggableCleanup = draggable({
         element,
         dragHandle: dragHandle || element,
-        getInitialData: () => ({ fieldIndex, fieldId, type: 'configured-field' }),
+        getInitialData: () => ({ fieldId, sourceStep: currentStep, type: 'configured-field' }),
         onDragStart: () => { element.style.opacity = '0.5'; },
         onDrop: () => {
           element.style.opacity = '';
@@ -263,8 +278,8 @@
         element,
         canDrop: ({ source }) => {
           const data = source.data;
-          if (data.type === 'configured-field' && data.fieldIndex === fieldIndex) return false;
-          return data.type === 'configured-field';
+          return data.type === 'configured-field' &&
+            data.sourceStep === currentStep && data.fieldId !== fieldId;
         },
         getData: ({ input, element }) => {
           return attachClosestEdge({}, { input, element, allowedEdges: ['top', 'bottom'] });
@@ -279,7 +294,7 @@
         onDrop: ({ self, source }) => {
           const closestEdge = extractClosestEdge(self.data);
           if (source.data.type === 'configured-field') {
-            reorderFieldWithEdge(source.data.fieldIndex, fieldIndex, closestEdge);
+            reorderFieldWithEdge(source.data.fieldId, fieldId, closestEdge);
           }
           setDragState(fieldId, { closestEdge: null });
         }
@@ -289,6 +304,23 @@
         draggableCleanup();
         dropTargetCleanup();
       });
+    });
+
+    /** @type {NodeListOf<HTMLElement>} */ (builderRoot.querySelectorAll('[data-step-drop-target]')).forEach((element) => {
+      const targetStep = Number(element.dataset.stepDropTarget);
+      const cleanup = dropTargetForElements({
+        element,
+        canDrop: ({ source }) => source.data.type === 'configured-field' && source.data.sourceStep !== targetStep,
+        onDragEnter: () => { stepDropTarget = targetStep; },
+        onDragLeave: () => {
+          if (stepDropTarget === targetStep) stepDropTarget = null;
+        },
+        onDrop: ({ source }) => {
+          moveFieldToStep(source.data.fieldId, targetStep);
+          stepDropTarget = null;
+        }
+      });
+      setupCleanups.push(cleanup);
     });
   }
 
@@ -330,11 +362,11 @@
     $addFieldOpen = false;
   }
 
-  function reorderFieldWithEdge(fromIndex, toIndex, closestEdge) {
-    if (fromIndex === toIndex) return;
+  function reorderFieldWithEdge(sourceFieldId, targetFieldId, closestEdge) {
+    if (sourceFieldId === targetFieldId) return;
     const sortedFields = currentStepFields;
-    const movedField = sortedFields[fromIndex];
-    const targetField = sortedFields[toIndex];
+    const movedField = sortedFields.find(field => field.field_identifier === sourceFieldId);
+    const targetField = sortedFields.find(field => field.field_identifier === targetFieldId);
     if (!movedField || !targetField) return;
 
     let newOrder;
@@ -345,6 +377,18 @@
     }
     movedField.display_order = newOrder;
     recalculateDisplayOrder();
+    saveFields();
+  }
+
+  function moveFieldToStep(fieldId, targetStep) {
+    const movedField = fields.find(field => field.field_identifier === fieldId);
+    if (!movedField || (movedField.step_number || 1) === targetStep) return;
+
+    const targetFields = fields.filter(field => (field.step_number || 1) === targetStep);
+    movedField.step_number = targetStep;
+    movedField.display_order = targetFields.length;
+    recalculateDisplayOrder();
+    currentStep = targetStep;
     saveFields();
   }
 
@@ -441,10 +485,22 @@
     editingField = field;
     editDisplayName = field.display_name || '';
     editDescription = field.description || '';
+    editVirtualFieldOptions = parseVirtualFieldOptions(field.virtual_field_options);
+    editFieldError = null;
   }
 
   function saveFieldEdit() {
     if (editingField) {
+      if (editingField.field_type === 'virtual' && editingField.virtual_field_type === 'select') {
+        const validOptions = editVirtualFieldOptions
+          .map(option => ({ value: option.value.trim(), label: option.label.trim() }))
+          .filter(option => option.value && option.label);
+        if (validOptions.length === 0) {
+          editFieldError = t('requestTypeFields.addAtLeastOneOption');
+          return;
+        }
+        editingField.virtual_field_options = JSON.stringify(validOptions);
+      }
       editingField.display_name = editDisplayName.trim() || null;
       editingField.description = editDescription.trim() || null;
       fields = [...fields];
@@ -457,6 +513,28 @@
     editingField = null;
     editDisplayName = '';
     editDescription = '';
+    editVirtualFieldOptions = [];
+    editFieldError = null;
+  }
+
+  function parseVirtualFieldOptions(value) {
+    if (!value) return [];
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed)
+        ? parsed.map(option => ({ value: option.value || '', label: option.label || '' }))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function addEditVirtualFieldOption() {
+    editVirtualFieldOptions = [...editVirtualFieldOptions, { value: '', label: '' }];
+  }
+
+  function removeEditVirtualFieldOption(index) {
+    editVirtualFieldOptions = editVirtualFieldOptions.filter((_, optionIndex) => optionIndex !== index);
   }
 
   // === Step Management ===
@@ -529,7 +607,7 @@
   }
 </script>
 
-<div class="flex flex-col h-full">
+<div class="flex flex-col h-full" bind:this={builderRoot}>
   <!-- Header — matches the customize panel's header sizing (px-6 py-4 + text-lg) so they line up across the seam. -->
   <div
     class="flex items-center justify-between px-6 py-4 border-b flex-shrink-0"
@@ -551,9 +629,7 @@
   <!-- Body -->
   <div class="flex-1 overflow-y-auto px-4 py-4">
     {#if loading}
-      <div class="flex items-center justify-center py-12">
-        <Spinner />
-      </div>
+      <StateDisplay type="loading" />
     {:else}
       {#if error}
         <div
@@ -570,10 +646,14 @@
           {@const hasFields = stepHasFields(step)}
           <button
             onclick={() => currentStep = step}
+            data-step-drop-target={step}
+            data-testid={`request-type-step-${step}`}
             class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-1.5"
             style="
               background-color: {currentStep === step
                 ? 'var(--ds-interactive)'
+                : stepDropTarget === step
+                  ? 'var(--ds-interactive-subtle)'
                 : hasFields
                   ? 'var(--ds-surface-raised)'
                   : 'var(--ds-status-warning-subtle)'};
@@ -630,15 +710,14 @@
               </p>
             </div>
           </div>
-          <input
+          <Input
             id="rtfb-title-template"
             type="text"
             bind:value={titleTemplate}
             oninput={scheduleTitleTemplateSave}
             onblur={saveTitleTemplate}
             placeholder={'Request: {{type.name}} from {{requester.name}}'}
-            class="w-full px-3 py-2 rounded border text-sm focus:outline-none focus:ring-2"
-            style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border); --tw-ring-color: var(--ds-interactive);"
+            size="small"
           />
           {#if titleTemplateError}
             <p class="text-xs mt-1" style="color: var(--ds-status-error);">{titleTemplateError}</p>
@@ -685,31 +764,16 @@
       <!-- Configured Fields list (full width) -->
       <div class="space-y-2">
         {#each currentStepFields as field, index (field.field_identifier)}
-          <div
-            data-configured-field
-            data-field-index={index}
-            data-field-id={field.field_identifier}
-            class="relative group flex items-center gap-2 px-3 py-2 rounded border transition-all"
+          <DraggableFieldRow
+            attributes={{ 'data-configured-field': true }}
+            fieldIndex={index}
+            fieldId={field.field_identifier}
+            closestEdge={fieldDragState.get(field.field_identifier)?.closestEdge}
+            class="gap-2 px-3 py-2 rounded border transition-all"
             style="border-color: var(--ds-border); background-color: var(--ds-background); user-select: none;"
+            handleColor="var(--ds-text-subtle)"
+            handleAttributes={{ 'data-testid': `request-type-field-drag-${field.field_identifier}` }}
           >
-            {#if fieldDragState.get(field.field_identifier)?.closestEdge}
-              <DropIndicator edge={fieldDragState.get(field.field_identifier)?.closestEdge} gap={8} />
-            {/if}
-
-            <div
-              class="cursor-grab active:cursor-grabbing flex-shrink-0 p-1 rounded"
-              style="touch-action: none;"
-            >
-              <svg class="w-4 h-4" style="color: var(--ds-text-subtle);" fill="currentColor" viewBox="0 0 24 24">
-                <circle cx="9" cy="6" r="1.5"/>
-                <circle cx="15" cy="6" r="1.5"/>
-                <circle cx="9" cy="12" r="1.5"/>
-                <circle cx="15" cy="12" r="1.5"/>
-                <circle cx="9" cy="18" r="1.5"/>
-                <circle cx="15" cy="18" r="1.5"/>
-              </svg>
-            </div>
-
             <div class="flex-1 min-w-0">
               <div class="font-medium text-sm flex items-center gap-2 truncate" style="color: var(--ds-text);">
                 {capitalizeLabel(field.display_name || field.field_name || field.field_identifier)}
@@ -737,7 +801,8 @@
               />
               <button
                 onclick={() => startEditingField(field)}
-                class="p-1.5 rounded transition-all opacity-0 group-hover:opacity-100"
+                data-testid={`request-type-field-edit-${field.field_identifier}`}
+                class="p-1.5 rounded transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
                 style="color: var(--ds-text-subtle);"
                 title={t('layout.editDisplaySettings')}
               >
@@ -745,14 +810,14 @@
               </button>
               <button
                 onclick={() => removeField(field)}
-                class="p-1.5 rounded transition-all opacity-0 group-hover:opacity-100"
+                class="p-1.5 rounded transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100"
                 style="color: var(--ds-status-error);"
                 title={t('requestTypeFields.removeField')}
               >
                 <Trash2 class="w-3.5 h-3.5" />
               </button>
             </div>
-          </div>
+          </DraggableFieldRow>
         {/each}
       </div>
 
@@ -770,13 +835,12 @@
             <label for="virtual-field-name" class="block text-sm font-medium mb-2" style="color: var(--ds-text);">
               {t('requestTypeFields.fieldName')}
             </label>
-            <input
+            <Input
               id="virtual-field-name"
               type="text"
               bind:value={virtualFieldName}
               placeholder={t('requestTypeFields.fieldNamePlaceholder')}
-              class="w-full px-3 py-2 rounded border focus:outline-none focus:ring-2 text-sm"
-              style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border); --tw-ring-color: var(--ds-interactive);"
+              size="small"
             />
           </div>
 
@@ -811,19 +875,19 @@
               <div class="space-y-2" role="group" aria-labelledby="virtual-field-options-label">
                 {#each virtualFieldOptions as option, i}
                   <div class="flex gap-2">
-                    <input
+                    <Input
                       type="text"
                       bind:value={option.value}
                       placeholder={t('requestTypeFields.value')}
-                      class="flex-1 px-2 py-1.5 rounded border focus:outline-none focus:ring-2 text-sm"
-                      style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border); --tw-ring-color: var(--ds-interactive);"
+                      size="small"
+                      class="flex-1"
                     />
-                    <input
+                    <Input
                       type="text"
                       bind:value={option.label}
                       placeholder={t('requestTypeFields.label')}
-                      class="flex-1 px-2 py-1.5 rounded border focus:outline-none focus:ring-2 text-sm"
-                      style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border); --tw-ring-color: var(--ds-interactive);"
+                      size="small"
+                      class="flex-1"
                     />
                     <button
                       onclick={() => removeVirtualFieldOption(i)}
@@ -889,18 +953,17 @@
     use:melt={$addFieldContent}
     class="z-[70] w-72 rounded border shadow-lg flex flex-col"
     style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
-    transition:fly={{ duration: 150, y: -5 }}
   >
     <div class="p-2 border-b" style="border-color: var(--ds-border);">
       <div class="relative">
         <Search class="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2" style="color: var(--ds-text-subtle);" />
-        <input
-          bind:this={addFieldSearchEl}
+        <Input
+          bind:inputRef={addFieldSearchEl}
           type="text"
           bind:value={addFieldQuery}
           placeholder={t('requestTypeFields.searchFields')}
-          class="w-full pl-8 pr-2 py-1.5 rounded border text-sm focus:outline-none focus:ring-2"
-          style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border); --tw-ring-color: var(--ds-interactive);"
+          size="small"
+          class="pl-8"
         />
       </div>
     </div>
@@ -908,10 +971,7 @@
       {#each filteredAvailableFields as field (field.identifier)}
         <button
           onclick={() => pickField(field)}
-          class="w-full flex items-center justify-between gap-2 px-3 py-2 text-left transition-colors"
-          style="color: var(--ds-text);"
-          onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-          onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+          class="field-option w-full flex items-center justify-between gap-2 px-3 py-2 text-left transition-colors"
         >
           <span class="text-sm font-medium truncate">{field.name}</span>
           <span
@@ -945,13 +1005,12 @@
         <label for="edit-field-display-name" class="block text-sm font-medium mb-2" style="color: var(--ds-text);">
           {t('requestTypeFields.displayName')}
         </label>
-        <input
+        <Input
           id="edit-field-display-name"
           type="text"
           bind:value={editDisplayName}
           placeholder={editingField.field_name || editingField.field_identifier}
-          class="w-full px-3 py-2 rounded border focus:outline-none focus:ring-2"
-          style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border); --tw-ring-color: var(--ds-interactive);"
+          size="small"
         />
         <DescriptionText>
           {t('requestTypeFields.overrideLabel')}
@@ -962,15 +1021,64 @@
         <label for="edit-field-description" class="block text-sm font-medium mb-2" style="color: var(--ds-text);">
           {t('requestTypeFields.descriptionHelpText')}
         </label>
-        <textarea
+        <Textarea
           id="edit-field-description"
           bind:value={editDescription}
           placeholder={t('requestTypeFields.helpTextPlaceholder')}
-          rows="3"
-          class="w-full px-3 py-2 rounded border focus:outline-none focus:ring-2"
-          style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border); --tw-ring-color: var(--ds-interactive);"
-        ></textarea>
+          rows={3}
+          size="small"
+        />
       </div>
+
+      {#if editingField.field_type === 'virtual' && editingField.virtual_field_type === 'select'}
+        <div>
+          <span class="block text-sm font-medium mb-2" style="color: var(--ds-text);">
+            {t('requestTypeFields.options')}
+          </span>
+          <div class="space-y-2">
+            {#each editVirtualFieldOptions as option, index}
+              <div class="flex gap-2">
+                <Input
+                  type="text"
+                  bind:value={option.value}
+                  placeholder={t('requestTypeFields.value')}
+                  size="small"
+                  dataTestid={`request-type-edit-option-value-${index}`}
+                  class="flex-1"
+                />
+                <Input
+                  type="text"
+                  bind:value={option.label}
+                  placeholder={t('requestTypeFields.label')}
+                  size="small"
+                  dataTestid={`request-type-edit-option-label-${index}`}
+                  class="flex-1"
+                />
+                <button
+                  onclick={() => removeEditVirtualFieldOption(index)}
+                  class="p-1.5 rounded"
+                  style="color: var(--ds-status-error);"
+                  aria-label={t('common.remove')}
+                >
+                  <Trash2 class="w-4 h-4" />
+                </button>
+              </div>
+            {/each}
+            <button
+              onclick={addEditVirtualFieldOption}
+              class="text-sm flex items-center gap-1"
+              style="color: var(--ds-interactive);"
+            >
+              <Plus class="w-4 h-4" />
+              {t('requestTypeFields.addOption')}
+            </button>
+          </div>
+        </div>
+      {/if}
+
+      {#if editFieldError}
+        <p class="text-sm" style="color: var(--ds-status-error);">{editFieldError}</p>
+      {/if}
 
       <div class="flex gap-2 pt-2">
         <Button onclick={saveFieldEdit} variant="primary" size="medium" class="flex-1">
@@ -983,3 +1091,13 @@
     </div>
   </PortalModal>
 {/if}
+
+<style>
+  .field-option {
+    color: var(--ds-text);
+  }
+
+  .field-option:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+</style>

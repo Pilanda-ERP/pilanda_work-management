@@ -2,9 +2,7 @@
 package handlers
 
 import (
-	"fmt"
 	"net/http"
-	"strings"
 
 	"windshift/internal/database"
 	"windshift/internal/middleware"
@@ -23,22 +21,6 @@ type AvailableField struct {
 	Name       string `json:"name"`
 	Type       string `json:"type"`
 	FieldType  string `json:"field_type,omitempty"`
-}
-
-// requireWorkspaceIDAndID parses {workspaceId} and {id} path params and pulls
-// the current user. Used by workspace-scoped resource handlers that don't need
-// a DB handle (services/repositories manage their own connections).
-func requireWorkspaceIDAndID(w http.ResponseWriter, r *http.Request) (workspaceID, id int, user *models.User, ok bool) {
-	workspaceID, ok = requireIDParam(w, r, "workspaceId")
-	if !ok {
-		return
-	}
-	id, ok = requireIDParam(w, r, "id")
-	if !ok {
-		return
-	}
-	user = utils.GetCurrentUser(r)
-	return
 }
 
 // RequireAuth checks if a user is authenticated and returns the user.
@@ -60,7 +42,8 @@ func RequireAuth(w http.ResponseWriter, r *http.Request) (*models.User, bool) {
 }
 
 // RequireWorkspacePermission checks if the user has a specific workspace permission.
-// If the user doesn't have permission, it writes a 403 Forbidden response.
+// If the user doesn't have permission, it writes a 404 response so private
+// workspace existence is not disclosed.
 // Returns true if permitted, false otherwise (error already written to response).
 // Usage:
 //
@@ -70,7 +53,7 @@ func RequireAuth(w http.ResponseWriter, r *http.Request) (*models.User, bool) {
 func RequireWorkspacePermission(w http.ResponseWriter, r *http.Request, userID, workspaceID int, permission string, permService *services.PermissionService) bool {
 	hasPermission, err := permService.HasWorkspacePermission(userID, workspaceID, permission)
 	if err != nil || !hasPermission {
-		respondForbidden(w, r)
+		respondNotFound(w, r, "workspace")
 		return false
 	}
 	return true
@@ -148,7 +131,7 @@ func CheckItemPermission(w http.ResponseWriter, r *http.Request, itemRepo *repos
 // CheckItemPermission — approver-derived access is read-only and never extends
 // to edit/delete.
 //
-// Active-pool membership is a snapshot: once the step closes (is_active=0) or
+// Active-pool membership is a snapshot: once the step closes (is_active=FALSE) or
 // the request is no longer pending, the fallback fails and access disappears.
 //
 // approvalService may be nil (e.g. in tests); behavior degrades to
@@ -171,38 +154,13 @@ func CheckItemPermissionAsActor(w http.ResponseWriter, r *http.Request, itemRepo
 		return true
 	}
 	if permission == models.PermissionItemView && approvalService != nil {
-		inPool, perr := approvalService.UserHasActivePoolMembershipOnItem(user.ID, itemID, nil)
+		inPool, perr := approvalService.UserHasActivePoolMembershipOnItem(r.Context(), user.ID, itemID, nil)
 		if perr == nil && inPool {
 			return true
 		}
 	}
 	respondNotFound(w, r, "Item") // 404, not 403 — prevents existence leakage
 	return false
-}
-
-// userCanViewItemAsActor is the boolean-returning sibling of
-// CheckItemPermissionAsActor for callers that need to make their own response
-// decision. Returns true if the user has workspace item.view OR is an active
-// approver on the item. See CheckItemPermissionAsActor for the security model.
-//
-// approvalService may be nil; in that case only the workspace-permission
-// branch is consulted.
-func userCanViewItemAsActor(userID, itemID, workspaceID int,
-	permService *services.PermissionService, approvalService *services.ApprovalService) (bool, error) {
-	if permService == nil {
-		return false, nil
-	}
-	hasView, err := permService.HasWorkspacePermission(userID, workspaceID, models.PermissionItemView)
-	if err != nil {
-		return false, err
-	}
-	if hasView {
-		return true, nil
-	}
-	if approvalService == nil {
-		return false, nil
-	}
-	return approvalService.UserHasActivePoolMembershipOnItem(userID, itemID, nil)
 }
 
 // GetAccessibleWorkspaceIDs returns IDs of active workspaces the user can view.
@@ -212,39 +170,4 @@ func GetAccessibleWorkspaceIDs(user *models.User, db database.Database,
 		return []int{}, nil
 	}
 	return permService.AccessibleWorkspaceIDs(user.ID)
-}
-
-// GetAccessibleWorkspaceKeys returns a set of workspace keys the user can view.
-func GetAccessibleWorkspaceKeys(user *models.User, db database.Database,
-	permService *services.PermissionService) (map[string]bool, error) {
-	if user == nil || permService == nil {
-		return map[string]bool{}, nil
-	}
-	pairs, err := repository.NewWorkspaceRepository(db).ListActiveIDKeys()
-	if err != nil {
-		return nil, fmt.Errorf("failed to query workspaces: %w", err)
-	}
-	keys := make(map[string]bool)
-	for _, pair := range pairs {
-		hasView, err := permService.HasWorkspacePermission(user.ID, pair.ID, models.PermissionItemView)
-		if err != nil {
-			continue
-		}
-		if hasView {
-			keys[pair.Key] = true
-		}
-	}
-	return keys, nil
-}
-
-// BuildWorkspaceIDPlaceholders builds a parameterized IN clause for workspace IDs.
-func BuildWorkspaceIDPlaceholders(ids []int) (placeholders string, args []interface{}) {
-	ph := make([]string, len(ids))
-	args = make([]interface{}, len(ids))
-	for i, id := range ids {
-		ph[i] = "?"
-		args[i] = id
-	}
-	placeholders = strings.Join(ph, ", ")
-	return placeholders, args
 }

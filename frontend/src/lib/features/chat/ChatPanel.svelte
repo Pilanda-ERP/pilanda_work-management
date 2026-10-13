@@ -1,12 +1,14 @@
 <script>
-  import { fly } from 'svelte/transition';
-  import { IconMessage, IconX, IconLoader2, IconSend, IconChevronDown, IconRefresh } from '@tabler/icons-svelte-runes';
+  import { IconArchive, IconMessage, IconX, IconLoader2, IconSend, IconPlus, IconRefresh } from '@tabler/icons-svelte-runes';
   import { useEventListener } from 'runed';
   import MilkdownEditor from '../../editors/LazyMilkdownEditor.svelte';
   import ChatToolTrace from './ChatToolTrace.svelte';
-  import { chatStore } from '../../stores/chatStore.svelte.js';
+  import { chatStore, preprocessItemKeys } from '../../stores/chatStore.svelte.js';
+  import { workspacePermissions } from '../../stores';
   import { currentRoute } from '../../router.js';
+  import Button from '../../components/Button.svelte';
   import Select from '../../components/Select.svelte';
+  import Textarea from '../../components/Textarea.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
   import { buildChatContext } from './chatContext.js';
 
@@ -19,6 +21,7 @@
   let messagesContainer = $state(null);
   let textareaEl = $state(null);
   let previousFocusEl = $state(null);
+  let initializedForOpen = $state(false);
 
   // Resize state
   let panelWidth = $state(400);
@@ -42,6 +45,39 @@
   let dragStartBottom = $state(0);
 
   const isInteracting = $derived(isResizing || isDragging);
+  const workspaceId = $derived.by(() => {
+    if (!$currentRoute.path?.startsWith('/workspaces/')) return 0;
+    return Number($currentRoute.params?.id) || 0;
+  });
+  const canUseStandard = $derived(
+    workspaceId > 0 && workspacePermissions.canEdit(workspaceId)
+  );
+  const conversationValue = $derived(
+    chatStore.sessionType === 'standard' ? `session:${chatStore.sessionId}` : 'general'
+  );
+  const activeStandardAgent = $derived(
+    chatStore.availableAgents.find((agent) => agent.id === chatStore.agentProfileId) || null
+  );
+  const conversationOptions = $derived.by(() => {
+    const options = [{ value: 'general', label: 'General' }];
+    if (!canUseStandard) return options;
+    for (const session of chatStore.sessions) {
+      const agent = chatStore.availableAgents.find(
+        (candidate) => candidate.id === session.agent_profile_id
+      );
+      options.push({
+        value: `session:${session.id}`,
+        label: session.title || agent?.name || 'Standard agent chat',
+      });
+    }
+    for (const agent of chatStore.availableAgents) {
+      options.push({
+        value: `new:${agent.id}`,
+        label: `New chat · ${agent.name || `@${agent.handle}`}`,
+      });
+    }
+    return options;
+  });
 
   function startResize(event, type) {
     isResizing = true;
@@ -116,9 +152,17 @@
 
   // Load LLM connections when panel opens
   $effect(() => {
-    if (isOpen) {
-      chatStore.loadConnections();
+    if (!isOpen) {
+      initializedForOpen = false;
+      return;
     }
+    if (initializedForOpen) return;
+    initializedForOpen = true;
+    chatStore.loadConnections();
+    void (async () => {
+      await chatStore.startNewGeneralChat();
+      await chatStore.prepareWorkspaceOptions(workspaceId, canUseStandard);
+    })();
   });
 
   function handleClose() {
@@ -153,7 +197,7 @@
 
   function send() {
     const text = inputText.trim();
-    if (!text || chatStore.loading) return;
+    if (!text || chatStore.loading || chatStore.conversationLoading) return;
     inputText = '';
     chatStore.sendMessage(text, buildContext());
     // Reset textarea height
@@ -183,15 +227,6 @@
     }
   }
 
-  function preprocessItemKeys(text) {
-    if (!text) return '';
-    return text.replace(/\b([A-Z]{2,10}-\d+)\b/g, (match, key) => {
-      const item = chatStore.itemKeyMap?.[key];
-      const href = item ? `/workspaces/${item.workspaceId}/items/${item.id}` : '#';
-      return `[${key}](${href})`;
-    });
-  }
-
   const activeConnection = $derived.by(() => {
     const conns = chatStore.connections;
     if (!conns.length) return null;
@@ -208,10 +243,9 @@
   <div
     class="fixed z-40 flex flex-col shadow-2xl rounded-lg overflow-hidden"
     class:select-none={isInteracting}
-    style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);
+    style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border); container-type: inline-size;
            width: {panelWidth}px; height: {panelHeight}px; max-height: calc(100vh - 32px);
            right: {panelRight}px; bottom: {panelBottom}px;"
-    transition:fly={{ y: 100, duration: 250 }}
     onkeydown={handleKeydown}
   >
     <!-- Resize handles -->
@@ -229,33 +263,74 @@
       style="border-color: var(--ds-border);"
       onmousedown={startDrag}
     >
-      <div class="flex items-center gap-2">
+      <div class="flex min-w-0 flex-1 items-center gap-2">
         <IconMessage size={20} stroke={1.5} style="color: var(--ds-text-subtle);" />
         <h2 class="text-sm font-semibold" style="color: var(--ds-text);">AI Chat</h2>
       </div>
       <div class="flex items-center gap-2">
-        {#if chatStore.connections.length > 1}
+        {#if chatStore.sessionType === 'general' && chatStore.connections.length > 1}
           <Select
+            id="agent-chat-model"
             value={chatStore.connectionId}
             onchange={(v) => { chatStore.connectionId = parseInt(v) || 0; }}
             size="small"
+            class="w-[clamp(8rem,55cqi,22rem)]"
+            menuWidth="min(22rem, calc(100vw - 2rem))"
             options={[{ value: 0, label: 'Default' }, ...chatStore.connections.map(c => ({ value: c.id, label: c.name }))]}
           />
         {/if}
-        <button
+        <Button
+          variant="ghost"
+          size="small"
+          icon={IconX}
+          title="Close chat"
           onclick={handleClose}
-          class="p-1 rounded transition-colors"
-          style="color: var(--ds-text-subtle);"
-          onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-          onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-          aria-label="Close chat"
-        >
-          <IconX size={20} stroke={1.5} />
-        </button>
+          dataTestid="agent-chat-close"
+          class="!px-2"
+        />
       </div>
     </div>
 
-    {#if activeConnection}
+    {#if canUseStandard && conversationOptions.length > 1}
+      <div class="flex items-center gap-2 border-b px-4 py-2" style="border-color: var(--ds-border);">
+        <Select
+          id="agent-chat-conversation"
+          value={conversationValue}
+          onchange={(value) => chatStore.selectConversation(value, workspaceId)}
+          size="small"
+          class="min-w-0 flex-1"
+          options={conversationOptions}
+          disabled={chatStore.loading || chatStore.conversationLoading}
+        />
+        {#if chatStore.sessionType === 'standard'}
+          <Button
+            variant="ghost"
+            size="small"
+            icon={IconPlus}
+            title="New chat with this agent"
+            onclick={() => chatStore.startStandardConversation(workspaceId)}
+            dataTestid="agent-chat-new"
+            class="!px-2"
+          />
+          <Button
+            variant="ghost"
+            size="small"
+            icon={IconArchive}
+            title="Archive this chat"
+            onclick={() => chatStore.archiveCurrentSession()}
+            dataTestid="agent-chat-archive"
+            class="!px-2"
+          />
+        {/if}
+      </div>
+    {/if}
+
+    {#if chatStore.sessionType === 'standard'}
+      <div class="px-4 py-1.5 border-b text-xs" style="border-color: var(--ds-border); color: var(--ds-text-subtlest);">
+        {activeStandardAgent?.name || 'Standard agent'}
+        <span style="color: var(--ds-text-disabled);"> · fixed profile model and grants</span>
+      </div>
+    {:else if activeConnection}
       <div class="px-4 py-1.5 border-b text-xs" style="border-color: var(--ds-border); color: var(--ds-text-subtlest);">
         {activeConnection.model}
         {#if chatStore.connections.length > 1}
@@ -275,7 +350,9 @@
         <div class="flex items-center justify-center h-full">
           <EmptyState
             icon={IconMessage}
-            title="Ask anything about your workspaces and items."
+            title={chatStore.sessionType === 'standard'
+              ? `Start a private chat with ${activeStandardAgent?.name || 'this agent'}.`
+              : 'Ask anything about your workspaces and items.'}
           />
         </div>
       {:else}
@@ -294,10 +371,7 @@
                   {#if msg === chatStore.messages[chatStore.messages.length - 1] && !chatStore.loading}
                     <button
                       onclick={() => chatStore.retryLastMessage()}
-                      class="mt-1.5 flex items-center gap-1 text-xs px-2 py-1 rounded transition-colors"
-                      style="color: var(--ds-text-subtle); background-color: var(--ds-surface);"
-                      onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                      onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-surface)'}
+                      class="retry-btn mt-1.5 flex items-center gap-1 text-xs px-2 py-1 rounded transition-colors"
                     >
                       <IconRefresh size={12} stroke={1.5} />
                       Retry
@@ -314,6 +388,8 @@
                     stopReason={msg.stopReason}
                     needsReview={msg.needsReview}
                     reviewReasons={msg.reviewReasons}
+                    model={msg.model}
+                    usage={msg.usage}
                   />
                 {/if}
               </div>
@@ -335,27 +411,28 @@
     <!-- Input -->
     <div class="border-t px-4 py-3" style="border-color: var(--ds-border);">
       <div class="flex items-end gap-2">
-        <textarea
-          bind:this={textareaEl}
+        <Textarea
+          bind:textareaRef={textareaEl}
+          data-testid="chat-input"
           bind:value={inputText}
           oninput={autoResize}
           onkeydown={handleTextareaKeydown}
           placeholder="Ask a question..."
-          rows="1"
+          rows={1}
           class="flex-1 resize-none rounded-lg px-3 py-2 text-sm border focus:outline-none focus:ring-1"
           style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text); --tw-ring-color: var(--ds-border-focused);"
-          disabled={chatStore.loading}
-        ></textarea>
-        <button
+          disabled={chatStore.loading || chatStore.conversationLoading}
+        />
+        <Button
           onclick={send}
-          disabled={chatStore.loading || !inputText.trim()}
-          class="p-2 rounded-lg transition-colors flex-shrink-0"
-          class:opacity-50={chatStore.loading || !inputText.trim()}
-          style="background-color: var(--ds-interactive); color: var(--ds-text-inverse);"
-          aria-label="Send message"
-        >
-          <IconSend size={16} stroke={1.5} />
-        </button>
+          disabled={chatStore.loading || chatStore.conversationLoading || !inputText.trim()}
+          variant="primary"
+          size="small"
+          icon={IconSend}
+          title="Send message"
+          dataTestid="chat-send"
+          class="!px-2.5 !py-2"
+        />
       </div>
     </div>
   </div>
@@ -377,5 +454,13 @@
   }
   .chat-message-content :global(.editor) {
     padding: 0 !important;
+  }
+  .retry-btn {
+    color: var(--ds-text-subtle);
+    background-color: var(--ds-surface);
+  }
+
+  .retry-btn:hover {
+    background-color: var(--ds-background-neutral-hovered);
   }
 </style>

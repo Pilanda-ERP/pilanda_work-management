@@ -1,10 +1,16 @@
 <script>
   import { onMount } from 'svelte';
+  import Spinner from '../components/Spinner.svelte';
+  import { setOAuthReturnURL } from '../utils/oauthReturn.js';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import { useDebounce } from 'runed';
   import { api } from '../api.js';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import EmptyState from '../components/EmptyState.svelte';
+  import ModalBackdrop from '../components/ModalBackdrop.svelte';
   import DialogFooter from '../dialogs/DialogFooter.svelte';
-  import { X, Search, Loader2, Check, GitBranch, Lock, Globe } from '@lucide/svelte';
+  import { X, Search, Check, GitBranch, Lock, Globe } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
 
   let { workspaceId, connection, onclose, onlinked } = $props();
@@ -26,6 +32,9 @@
     await loadRepositories();
   });
 
+  // Search goes to the SCM provider so results come from all projects, not
+  // just the pages already fetched. Providers without native search ignore
+  // the param and return the unfiltered page; filteredRepos narrows those.
   async function loadRepositories(resetPage = true) {
     if (resetPage) {
       page = 1;
@@ -36,10 +45,10 @@
     errorCode = null;
 
     try {
-      const result = await api.workspaceSCM.getAvailableRepos(workspaceId, connection.id, {
-        page,
-        per_page: perPage
-      });
+      const params = { page, per_page: perPage };
+      const query = searchQuery.trim();
+      if (query) params.search = query;
+      const result = await api.workspaceSCM.getAvailableRepos(workspaceId, connection.id, params);
 
       if (result.error) {
         error = result.error;
@@ -67,6 +76,11 @@
     page += 1;
     await loadRepositories(false);
   }
+
+  // Debounced re-fetch on search input so each keystroke doesn't hit the SCM
+  // API — the query goes to the provider (page 1) rather than only filtering
+  // whatever pages happen to be loaded already.
+  const debouncedSearch = useDebounce(() => loadRepositories(true), 350);
 
   function toggleRepo(repo) {
     if (repo.is_linked) return; // Already linked, can't select
@@ -110,7 +124,7 @@
   }
 
   function startOAuthConnect() {
-    sessionStorage.setItem('scm_oauth_return', window.location.href);
+    setOAuthReturnURL();
     api.workspaceSCM.startOAuth(workspaceId, connection.id).then(result => {
       if (result?.auth_url) {
         window.location.href = result.auth_url;
@@ -144,18 +158,10 @@
 </script>
 
 <!-- Modal Backdrop -->
-<div
-  class="fixed inset-0 flex items-center justify-center p-4 z-50"
-  style="background-color: rgba(0, 0, 0, 0.3); backdrop-filter: blur(2px);"
-  onclick={(e) => e.target === e.currentTarget && close()}
-  onkeypress={(e) => e.key === 'Escape' && close()}
-  role="dialog"
-  aria-modal="true"
-  aria-labelledby="repo-selector-title"
-  tabindex="-1"
->
+<!-- shortcut-guard-exempt: picker confirms via its explicit footer button; no submit shortcut owned -->
+<ModalBackdrop show={true} onclose={close} ariaLabelledBy="repo-selector-title">
   <div
-    class="w-full max-w-2xl max-h-[80vh] flex flex-col rounded-xl shadow-xl border overflow-hidden"
+    class="w-full max-w-2xl max-h-[80vh] flex flex-col rounded-lg shadow-xl border overflow-hidden"
     style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
   >
     <!-- Header -->
@@ -181,12 +187,14 @@
     <div class="px-6 py-3 border-b" style="border-color: var(--ds-border);">
       <div class="relative">
         <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style="color: var(--ds-text-subtle);" />
-        <input
+        <Input
           type="text"
           bind:value={searchQuery}
+          oninput={debouncedSearch}
+          dataTestid="repository-selector-search"
           placeholder={t('pickers.searchRepositories')}
-          class="w-full pl-10 pr-4 py-2 rounded-lg border text-sm"
-          style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
+          class="pl-10"
+          size="small"
         />
       </div>
     </div>
@@ -194,10 +202,7 @@
     <!-- Repository List -->
     <div class="flex-1 overflow-y-auto px-6 py-3">
       {#if loading && repositories.length === 0}
-        <div class="flex items-center justify-center py-12">
-          <Loader2 class="w-6 h-6 animate-spin" style="color: var(--ds-text-subtle);" />
-          <span class="ml-2 text-sm" style="color: var(--ds-text-subtle);">{t('pickers.loadingRepositories')}</span>
-        </div>
+        <StateDisplay type="loading" message={t('pickers.loadingRepositories')} />
       {:else if error}
         <div class="text-center py-12">
           {#if errorCode === 'user_scm_not_connected'}
@@ -224,6 +229,7 @@
         <div class="space-y-2">
           {#each filteredRepos as repo}
             <button
+              data-testid="repository-selector-repo"
               class="w-full flex items-start gap-3 px-3 py-3 rounded-lg border text-left transition-colors"
               class:opacity-50={repo.is_linked}
               class:cursor-not-allowed={repo.is_linked}
@@ -277,10 +283,10 @@
         </div>
 
         <!-- Load More -->
-        {#if hasMore && !searchQuery}
+        {#if hasMore}
           <div class="flex justify-center py-4">
             {#if loading}
-              <Loader2 class="w-5 h-5 animate-spin" style="color: var(--ds-text-subtle);" />
+              <Spinner size="sm" />
             {:else}
               <Button size="sm" variant="secondary" onclick={loadMore}>
                 {t('common.loadMore')}
@@ -307,4 +313,4 @@
       {/snippet}
     </DialogFooter>
   </div>
-</div>
+</ModalBackdrop>

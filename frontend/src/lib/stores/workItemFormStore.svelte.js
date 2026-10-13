@@ -1,32 +1,34 @@
-/**
- * Store for managing Work Item Form state.
- * Uses Svelte 5 class-based reactive state pattern.
- * Centralizes form data, validation, data loading, and selection persistence.
- */
+// Centralized reactive state for the work-item create form.
 import { api } from '../api.js';
+import { defaultCustomFieldValue, isBooleanCustomFieldType } from '../utils/customFieldTypes.js';
+import { dateInputToISOString } from '../utils/dateFormatter.js';
+import { isGenericSubtaskType, sortItemTypesByHierarchy } from '../utils/hierarchy.js';
 import {
   isCreateSystemFieldAutoManaged,
   isCreateSystemFieldRenderable,
   isSystemFieldConfigured,
-  resolveEffectiveScreenIds,
   systemFieldIdentifiers,
 } from '../utils/screenFields.js';
 import { parseDuration } from '../utils/timeUtils.js';
 import { getSystemFieldName } from './fieldConfig.js';
+import { workspaceDataStore } from './workspaceDataStore.svelte.js';
 
 const STORAGE_KEYS = {
   workspace: 'vertex_create_modal_workspace',
   itemType: 'vertex_create_modal_item_type',
 };
 
-// System fields that are auto-managed or rendered in fixed locations and should
-// not be duplicated in the create form's generated field sections.
+// System fields managed or rendered outside generated form sections.
 const EXCLUDED_SYSTEM_FIELDS = ['status'];
 const FIXED_SYSTEM_FIELDS = ['title', 'description'];
 
-class WorkItemFormStore {
-  // === Form Data ===
-  formData = $state({
+/**
+ * Default work-item form values. Single source of truth for both initial
+ * state and form resets so the create modal starts and restarts the same way.
+ * @param {{ itemTypeId?: number|null }} [opts]
+ */
+function defaultFormData({ itemTypeId = null } = {}) {
+  return {
     name: '',
     description: '',
     due_date: '',
@@ -36,15 +38,21 @@ class WorkItemFormStore {
     priority_id: null,
     milestone_ids: [],
     assignee_id: null,
+    team_id: null,
     iteration_id: null,
     project_id: null,
-    personal_label_names: [],
+    label_names: [],
     story_points: '',
     estimate: '',
-    item_type_id: null,
-  });
+    item_type_id: itemTypeId,
+  };
+}
+
+class WorkItemFormStore {
+  // === Form Data ===
+  formData = $state(defaultFormData());
   customFieldValues = $state({});
-  selectedPersonalLabels = $state([]);
+  selectedLabels = $state([]);
   validationErrors = $state([]);
   pendingDescriptionImages = $state([]);
 
@@ -56,6 +64,9 @@ class WorkItemFormStore {
   // === Data Loading State ===
   users = $state([]);
   usersLoaded = $state(false);
+
+  teams = $state([]);
+  teamsLoaded = $state(false);
 
   allMilestones = $state([]);
   milestones = $state([]);
@@ -78,22 +89,13 @@ class WorkItemFormStore {
   availableItemTypes = $state([]);
   itemTypesLoaded = $state(false);
 
-  // === Work item templates (WI-438) ===
-  // templateOptions: selectable templates valid for the current type (type-
-  // targeted + global). mandatoryTemplate: the active mandatory template the
-  // current type enforces (or null) — when set, its body is auto-applied and
-  // the picker is locked. templateApplyNonce forces the Milkdown editor to
-  // re-mount when a body is written into formData.description (the editable
-  // editor does not sync external content changes otherwise).
+  // Templates for the selected type; mandatory bodies lock the picker.
   templateOptions = $state([]);
   mandatoryTemplate = $state(null);
   selectedTemplateId = $state(null);
   templatesLoading = $state(false);
   templateApplyNonce = $state(0);
-  // Key of the (workspace:item_type) template fetch currently in flight. Used
-  // only to dedup concurrent identical fetches — NOT to permanently cache a
-  // loaded key. See loadTemplatesForCurrentType for why permanent caching is
-  // wrong here.
+  // Deduplicates only the current template fetch.
   #templatesInFlightKey = null;
 
   allCustomFields = $state([]);
@@ -159,11 +161,20 @@ class WorkItemFormStore {
   }
 
   /**
+   * Get the currently selected team object.
+   */
+  get selectedTeam() {
+    return this.teams.find((team) => team.id === this.formData.team_id) || null;
+  }
+
+  /**
    * Get the currently selected milestone objects (multi-select).
    */
   get selectedMilestones() {
     const ids = this.formData.milestone_ids || [];
-    return ids.map((id) => this.milestones.find((m) => m.id === id)).filter(Boolean);
+    return ids
+      .map((id) => this.milestones.find((milestone) => String(milestone.id) === String(id)))
+      .filter(Boolean);
   }
 
   /**
@@ -181,10 +192,10 @@ class WorkItemFormStore {
   }
 
   /**
-   * Get selected personal label IDs for post-create assignment.
+   * Get selected global label IDs for post-create assignment.
    */
-  get selectedPersonalLabelIds() {
-    return (this.selectedPersonalLabels || [])
+  get selectedLabelIds() {
+    return (this.selectedLabels || [])
       .map((label) => label?.id)
       .filter((id) => Number.isFinite(id));
   }
@@ -243,6 +254,19 @@ class WorkItemFormStore {
    * Load assignable users. When workspaceId is provided, fetches only active users
    * via the assignable-users endpoint; otherwise falls back to the general users endpoint.
    */
+  async loadTeams() {
+    if (this.teamsLoaded) return;
+    try {
+      this.teams = (await api.teams.getAll()) || [];
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      console.error('Failed to load teams:', error);
+      this.teams = [];
+    } finally {
+      this.teamsLoaded = true;
+    }
+  }
+
   async loadUsers(workspaceId = null) {
     if (this.usersLoaded) return;
     try {
@@ -250,6 +274,7 @@ class WorkItemFormStore {
       this.users = result || [];
       this.usersLoaded = true;
     } catch (error) {
+      if (error?.name === 'AbortError') return;
       console.error('Failed to load users:', error);
       this.users = [];
       this.usersLoaded = true;
@@ -262,8 +287,7 @@ class WorkItemFormStore {
   async loadCustomFields() {
     if (this.customFieldsLoaded) return;
     try {
-      const result = await api.customFields.getAll();
-      this.allCustomFields = result?.data || [];
+      this.allCustomFields = await api.customFields.getAll();
       this.customFieldsLoaded = true;
     } catch (error) {
       console.error('Failed to load custom fields:', error);
@@ -451,6 +475,10 @@ class WorkItemFormStore {
     // Apply restricted item types if set (child item creation)
     if (this.restrictedItemTypes?.length > 0) {
       baseTypes = this.restrictedItemTypes;
+    } else if (!this.parentItem) {
+      // A level -1 generic sub-task is invalid without a parent. The API also
+      // enforces this, but hiding it prevents an avoidable failed submission.
+      baseTypes = baseTypes.filter((type) => !isGenericSubtaskType(type));
     }
 
     // Apply config set item type restrictions
@@ -459,9 +487,7 @@ class WorkItemFormStore {
       baseTypes = baseTypes.filter((t) => allowedItemTypeIds.includes(t.id));
     }
 
-    this.availableItemTypes = baseTypes.sort(
-      (a, b) => a.hierarchy_level - b.hierarchy_level || a.sort_order - b.sort_order
-    );
+    this.availableItemTypes = sortItemTypesByHierarchy(baseTypes);
 
     // Auto-select first item type if current is invalid
     if (
@@ -477,28 +503,24 @@ class WorkItemFormStore {
   }
 
   /**
-   * Load configuration set for a workspace.
+   * Load the workspace's effective configuration (resolved once per workspace
+   * by the backend: assigned config set, else the global default) and project
+   * the parts the create flow needs onto currentConfigSet.
    */
   async loadConfigSetForWorkspace(workspaceId) {
     if (this.configSetLoadedForWorkspace === workspaceId) return;
     try {
-      const response = await api.configurationSets.getAll();
-      const configSets = response?.configuration_sets || [];
-      this.currentConfigSet = null;
-      let defaultConfigSet = null;
-
-      for (const configSet of configSets) {
-        if (configSet.is_default) defaultConfigSet = configSet;
-        if (configSet.workspace_ids?.includes(workspaceId)) {
-          this.currentConfigSet = await api.configurationSets.get(configSet.id);
-          break;
-        }
+      if (Number(workspaceDataStore.workspaceId) !== Number(workspaceId)) {
+        await workspaceDataStore.initialize(workspaceId);
       }
-
-      if (!this.currentConfigSet && defaultConfigSet) {
-        this.currentConfigSet = await api.configurationSets.get(defaultConfigSet.id);
-      }
-
+      const config = await workspaceDataStore.screenConfig(null);
+      this.currentConfigSet = config
+        ? {
+            priorities_detailed: config.priorities || [],
+            item_type_configs: (config.item_type_ids || []).map((id) => ({ item_type_id: id })),
+            default_item_type_id: config.default_item_type_id ?? null,
+          }
+        : null;
       this.configSetLoadedForWorkspace = workspaceId;
       this.#updateAvailableItemTypes();
     } catch (error) {
@@ -510,10 +532,12 @@ class WorkItemFormStore {
   }
 
   /**
-   * Resolve the create screen ID for an item type.
+   * Resolve the create screen ID for an item type through the shared
+   * effective-config cache (resolved server-side per workspace + type).
    */
-  #resolveCreateScreenId(itemTypeId) {
-    return resolveEffectiveScreenIds(this.currentConfigSet, itemTypeId, 1).create;
+  async #resolveCreateScreenId(itemTypeId) {
+    const config = await workspaceDataStore.screenConfig(itemTypeId);
+    return config?.screens?.create ?? 1;
   }
 
   /**
@@ -524,8 +548,8 @@ class WorkItemFormStore {
     if (this.loadingScreenFields || this.screenFieldsLoadedForKey === key) return;
     try {
       this.loadingScreenFields = true;
-      const createScreenId = this.#resolveCreateScreenId(itemTypeId);
-      const fields = await api.screens.getFields(createScreenId);
+      const createScreenId = await this.#resolveCreateScreenId(itemTypeId);
+      const fields = createScreenId ? await api.screens.getFields(createScreenId) : [];
       this.screenFields = fields || [];
 
       this.screenSystemFields = this.screenFields
@@ -540,10 +564,18 @@ class WorkItemFormStore {
         customFieldIds.includes(field.id)
       );
 
-      // Reset custom field values for new fields
+      // Keep values the user already entered for fields that remain configured
+      // across the workspace/type change; only fields new to the screen get
+      // their default. Resetting wholesale silently discarded picks when the
+      // item type changed after a field was filled.
+      const previousValues = this.customFieldValues;
       this.customFieldValues = {};
       filteredCustomFields.forEach((field) => {
-        this.customFieldValues[field.id] = '';
+        const previous = previousValues[field.id];
+        this.customFieldValues[field.id] =
+          previous !== undefined && previous !== null && previous !== ''
+            ? previous
+            : defaultCustomFieldValue(field.field_type);
       });
 
       this.customFields = filteredCustomFields;
@@ -587,8 +619,13 @@ class WorkItemFormStore {
    * Set the selected workspace.
    */
   setWorkspace(workspace) {
+    const nextWorkspaceID = workspace?.id || null;
+    if (this.formData.workspace_id && this.formData.workspace_id !== nextWorkspaceID) {
+      this.formData.label_names = [];
+      this.selectedLabels = [];
+    }
     this.selectedWorkspace = workspace;
-    this.formData.workspace_id = workspace?.id || null;
+    this.formData.workspace_id = nextWorkspaceID;
 
     if (workspace?.id) {
       this.#persistWorkspaceSelection(workspace.id);
@@ -609,12 +646,7 @@ class WorkItemFormStore {
     this.loadTemplatesForCurrentType();
   }
 
-  /**
-   * Load the work item templates valid for the current (workspace, item type).
-   * Populates the selectable picker options and, when the type enforces an
-   * active mandatory template, auto-applies its body into the description and
-   * locks the picker. No-op until both workspace and item type are known.
-   */
+  // Load selectable and mandatory templates for the current workspace and type.
   async loadTemplatesForCurrentType() {
     const workspaceId = this.formData.workspace_id;
     const itemTypeId = this.formData.item_type_id;
@@ -626,22 +658,14 @@ class WorkItemFormStore {
       return;
     }
     const key = `${workspaceId}:${itemTypeId}`;
-    // Dedup only against a fetch already in flight for the same key — never
-    // permanently cache a resolved key. The create modal sets item_type_id
-    // several times during init (first available type → stored type → config
-    // default), so a permanent cache would record an *empty* load for a type
-    // and then refuse to re-fetch it. A mandatory template added (or any
-    // template created) for that type after init must still be picked up when
-    // the user later selects the type (WI-438); a permanent cache silently
-    // dropped it and left the picker unlocked.
+    // Never cache resolved keys: templates can change while the modal is open.
     if (this.#templatesInFlightKey === key) return;
     this.#templatesInFlightKey = key;
 
     this.templatesLoading = true;
     try {
       const list =
-        (await api.itemTemplates.getAll({ workspace_id: workspaceId, item_type_id: itemTypeId })) ??
-        [];
+        (await api.itemTemplates.getAll(workspaceId, { item_type_id: itemTypeId })) ?? [];
       // Guard against an out-of-order response after another type change.
       if (`${this.formData.workspace_id}:${this.formData.item_type_id}` !== key) return;
 
@@ -650,9 +674,7 @@ class WorkItemFormStore {
       this.mandatoryTemplate = mandatory;
       if (mandatory) {
         this.selectedTemplateId = mandatory.id;
-        // Only fill an empty description — mirrors the server's "apply only when
-        // empty" rule (services.CreateItem) so a slow async load can't clobber
-        // text the user typed after switching type. The picker still locks.
+        // Never overwrite description text entered during the async load.
         if (!this.formData.description?.trim()) {
           this.formData.description = mandatory.description_body || '';
           this.templateApplyNonce += 1;
@@ -665,8 +687,7 @@ class WorkItemFormStore {
       this.templateOptions = [];
       this.mandatoryTemplate = null;
     } finally {
-      // Only clear the in-flight marker if it still points at this fetch — a
-      // newer type change may already have started its own fetch.
+      // Preserve a newer fetch marker.
       if (this.#templatesInFlightKey === key) this.#templatesInFlightKey = null;
       this.templatesLoading = false;
     }
@@ -833,7 +854,7 @@ class WorkItemFormStore {
       case 'milestone':
         return this.formData.milestone_ids;
       case 'labels':
-        return this.selectedPersonalLabelIds;
+        return this.selectedLabelIds;
       case 'estimate_minutes':
       case 'estimate':
         return this.formData.estimate;
@@ -896,8 +917,9 @@ class WorkItemFormStore {
         } else if (field.field_type === 'custom') {
           const fieldId = parseInt(field.field_identifier, 10);
           const value = this.customFieldValues[fieldId];
-          if (value === undefined || value === null || value === '') {
-            const fieldDef = this.allCustomFields.find((f) => f.id === fieldId);
+          const fieldDef = this.allCustomFields.find((f) => f.id === fieldId);
+          if (isBooleanCustomFieldType(fieldDef?.field_type)) continue;
+          if (this.#isEmptyValue(value)) {
             errors.push(`${fieldDef?.name || 'Custom field'} is required`);
           }
         }
@@ -921,17 +943,15 @@ class WorkItemFormStore {
       priority_id: this.formData.priority_id || null,
       milestone_ids: Array.isArray(this.formData.milestone_ids) ? this.formData.milestone_ids : [],
       assignee_id: this.formData.assignee_id || null,
-      personal_label_ids: this.selectedPersonalLabelIds,
+      team_id: this.formData.team_id || null,
+      label_ids: this.selectedLabelIds,
       iteration_id: this.formData.iteration_id || null,
       project_id: this.formData.project_id || null,
       story_points: this.#parsedStoryPoints(),
       estimate_minutes: this.#parsedEstimateMinutes(),
-      due_date: this.formData.due_date ? new Date(this.formData.due_date).toISOString() : null,
-      start_date: this.formData.start_date
-        ? new Date(this.formData.start_date).toISOString()
-        : null,
-      end_date: this.formData.end_date ? new Date(this.formData.end_date).toISOString() : null,
-      status: 'open',
+      due_date: dateInputToISOString(this.formData.due_date),
+      start_date: dateInputToISOString(this.formData.start_date),
+      end_date: dateInputToISOString(this.formData.end_date),
       item_type_id: this.formData.item_type_id,
       parent_id: this.parentItem?.id || null,
       custom_field_values: this.customFieldValues,
@@ -944,25 +964,16 @@ class WorkItemFormStore {
    * Reset form state while keeping loaded reference data.
    */
   resetForm() {
-    this.formData = {
-      name: '',
-      description: '',
-      due_date: '',
-      start_date: '',
-      end_date: '',
-      workspace_id: null,
-      priority_id: null,
-      milestone_ids: [],
-      assignee_id: null,
-      iteration_id: null,
-      project_id: null,
-      personal_label_names: [],
-      story_points: '',
-      estimate: '',
-      item_type_id: this.availableItemTypes.length > 0 ? this.availableItemTypes[0].id : null,
-    };
-    this.customFieldValues = {};
-    this.selectedPersonalLabels = [];
+    this.formData = defaultFormData({
+      itemTypeId: this.availableItemTypes.length > 0 ? this.availableItemTypes[0].id : null,
+    });
+    // Keep one defined value per rendered field. Blanking the map to {} while
+    // customFields still holds the old screen leaves `bind:value` undefined on
+    // reopen, which makes Svelte throw props_invalid_value.
+    this.customFieldValues = Object.fromEntries(
+      this.customFields.map((field) => [field.id, defaultCustomFieldValue(field.field_type)])
+    );
+    this.selectedLabels = [];
     this.validationErrors = [];
     this.clearPendingDescriptionImages();
     this.selectedWorkspace = null;
@@ -1014,7 +1025,7 @@ class WorkItemFormStore {
     this.itemTypesLoaded = false;
     this.allCustomFields = [];
     this.customFields = [];
-    this.selectedPersonalLabels = [];
+    this.selectedLabels = [];
     this.customFieldsLoaded = false;
     this.screenFields = [];
     this.screenSystemFields = [];
@@ -1035,6 +1046,7 @@ class WorkItemFormStore {
     this.loadStoredSelections();
     await Promise.all([
       this.loadUsers(),
+      this.loadTeams(),
       this.loadMilestones(),
       this.loadItemTypes(),
       this.loadCustomFields(),

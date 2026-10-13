@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -37,7 +38,7 @@ const assetReportSelectQuery = `
 	LEFT JOIN asset_management_sets ams ON ar.asset_set_id = ams.id
 	LEFT JOIN item_types it ON ar.item_type_id = it.id`
 
-func scanAssetReport(scanner interface{ Scan(...interface{}) error }) (models.AssetReport, error) {
+func scanAssetReport(scanner interface{ Scan(...any) error }) (models.AssetReport, error) {
 	var ar models.AssetReport
 	var columnConfig, visibilityGroupIDs, visibilityOrgIDs, config *string
 	var itemTypeName sql.NullString
@@ -51,13 +52,31 @@ func scanAssetReport(scanner interface{ Scan(...interface{}) error }) (models.As
 		return ar, err
 	}
 	ar.ColumnConfig = decodeStringJSONArray(columnConfig)
-	ar.VisibilityGroupIDs = decodeIntJSONArray(visibilityGroupIDs)
-	ar.VisibilityOrgIDs = decodeIntJSONArray(visibilityOrgIDs)
+	var err error
+	ar.VisibilityGroupIDs, err = decodeAssetReportVisibilityIDs(visibilityGroupIDs)
+	if err != nil {
+		return ar, fmt.Errorf("parse asset report %d visibility groups: %w", ar.ID, err)
+	}
+	ar.VisibilityOrgIDs, err = decodeAssetReportVisibilityIDs(visibilityOrgIDs)
+	if err != nil {
+		return ar, fmt.Errorf("parse asset report %d visibility organizations: %w", ar.ID, err)
+	}
 	ar.Config = config
 	if itemTypeName.Valid {
 		ar.ItemTypeName = itemTypeName.String
 	}
 	return ar, nil
+}
+
+func decodeAssetReportVisibilityIDs(raw *string) ([]int, error) {
+	if raw == nil || *raw == "" {
+		return nil, nil
+	}
+	var ids []int
+	if err := json.Unmarshal([]byte(*raw), &ids); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // ListByChannel returns all asset reports for a channel, ordered by
@@ -102,10 +121,13 @@ func (r *AssetReportRepository) GetByID(id int) (*models.AssetReport, error) {
 
 // AssetReportBasic is the small field set Update needs to detect changes.
 type AssetReportBasic struct {
-	Name       string
-	AssetSetID int
-	Icon       string
-	Color      string
+	Name        string
+	AssetSetID  int
+	Icon        string
+	Color       string
+	RunMode     string
+	ItemTypeID  *int
+	WorkspaceID *int
 }
 
 // GetBasicForChannel returns the editable-field snapshot for an asset_report
@@ -113,9 +135,9 @@ type AssetReportBasic struct {
 func (r *AssetReportRepository) GetBasicForChannel(id, channelID int) (*AssetReportBasic, error) {
 	var b AssetReportBasic
 	err := r.db.QueryRow(
-		`SELECT name, asset_set_id, icon, color FROM asset_reports WHERE id = ? AND channel_id = ?`,
+		`SELECT name, asset_set_id, icon, color, run_mode, item_type_id, workspace_id FROM asset_reports WHERE id = ? AND channel_id = ?`,
 		id, channelID,
-	).Scan(&b.Name, &b.AssetSetID, &b.Icon, &b.Color)
+	).Scan(&b.Name, &b.AssetSetID, &b.Icon, &b.Color, &b.RunMode, &b.ItemTypeID, &b.WorkspaceID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -142,36 +164,21 @@ func (r *AssetReportRepository) GetNameForChannel(id, channelID int) (string, er
 	return name, nil
 }
 
-// GetItemTypeAndWorkspace returns item_type_id and workspace_id for an
-// asset_report (both nullable). Returns ErrNotFound when missing.
-func (r *AssetReportRepository) GetItemTypeAndWorkspace(id int) (itemTypeID, workspaceID *int, err error) {
-	err = r.db.QueryRow(
-		"SELECT item_type_id, workspace_id FROM asset_reports WHERE id = ?",
-		id,
-	).Scan(&itemTypeID, &workspaceID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("get asset_report %d itemtype/workspace: %w", id, err)
-	}
-	return itemTypeID, workspaceID, nil
-}
-
-// ChannelExists / AssetSetExists are FK-style validators the handler runs
-// before insert/update.
-func (r *AssetReportRepository) ChannelExists(id int) (bool, error) {
-	var ok bool
-	if err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?)", id).Scan(&ok); err != nil {
-		return false, fmt.Errorf("check channel %d: %w", id, err)
-	}
-	return ok, nil
-}
-
+// AssetSetExists is an FK-style validator the handler runs before insert/update.
 func (r *AssetReportRepository) AssetSetExists(id int) (bool, error) {
 	var ok bool
 	if err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM asset_management_sets WHERE id = ?)", id).Scan(&ok); err != nil {
 		return false, fmt.Errorf("check asset_set %d: %w", id, err)
+	}
+	return ok, nil
+}
+
+// ItemTypeExists validates the optional form-mode item type before an asset
+// report is persisted without a workspace-specific configuration set.
+func (r *AssetReportRepository) ItemTypeExists(id int) (bool, error) {
+	var ok bool
+	if err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM item_types WHERE id = ?)", id).Scan(&ok); err != nil {
+		return false, fmt.Errorf("check item_type %d: %w", id, err)
 	}
 	return ok, nil
 }
@@ -233,30 +240,59 @@ func (r *AssetReportRepository) Create(ar *models.AssetReport) (int64, error) {
 	return id, nil
 }
 
-// Update replaces editable fields scoped to channelID. Returns ErrNotFound on
-// rowsAffected == 0; ErrDuplicateEntry on (name, channel_id) collision.
+// Update replaces editable fields scoped to channelID. Form routing changes
+// clear the old field schema in the same transaction: fields from a previous
+// workspace/create screen must never survive under a new binding.
 func (r *AssetReportRepository) Update(id, channelID int, ar *models.AssetReport) error {
-	res, err := r.db.ExecWrite(`
-		UPDATE asset_reports
-		SET asset_set_id = ?, name = ?, description = ?, cql_query = ?, icon = ?, color = ?, display_order = ?, is_active = ?,
-		    column_config = ?, visibility_group_ids = ?, visibility_org_ids = ?,
-		    run_mode = ?, item_type_id = ?, config = ?,
-		    updated_at = ?
-		WHERE id = ? AND channel_id = ?
-	`, ar.AssetSetID, ar.Name, ar.Description, ar.CQLQuery, ar.Icon, ar.Color, ar.DisplayOrder, ar.IsActive,
-		encodeStringJSONArray(ar.ColumnConfig), encodeIntJSONArray(ar.VisibilityGroupIDs), encodeIntJSONArray(ar.VisibilityOrgIDs),
-		ar.RunMode, ar.ItemTypeID, ar.Config, time.Now(), id, channelID,
-	)
-	if err != nil {
-		if database.IsUniqueConstraintError(err) {
-			return ErrDuplicateEntry
+	return database.WithTx(r.db, func(tx database.Tx) error {
+		var oldRunMode string
+		var oldItemTypeID, oldWorkspaceID *int
+		if err := tx.QueryRow(`
+			SELECT run_mode, item_type_id, workspace_id
+			FROM asset_reports WHERE id = ? AND channel_id = ?
+		`, id, channelID).Scan(&oldRunMode, &oldItemTypeID, &oldWorkspaceID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("get asset_report %d routing: %w", id, err)
 		}
-		return fmt.Errorf("update asset_report %d: %w", id, err)
+
+		res, err := tx.ExecWrite(`
+			UPDATE asset_reports
+			SET asset_set_id = ?, name = ?, description = ?, cql_query = ?, icon = ?, color = ?, display_order = ?, is_active = ?,
+			    column_config = ?, visibility_group_ids = ?, visibility_org_ids = ?,
+			    run_mode = ?, item_type_id = ?, workspace_id = ?, config = ?,
+			    updated_at = ?
+			WHERE id = ? AND channel_id = ?
+		`, ar.AssetSetID, ar.Name, ar.Description, ar.CQLQuery, ar.Icon, ar.Color, ar.DisplayOrder, ar.IsActive,
+			encodeStringJSONArray(ar.ColumnConfig), encodeIntJSONArray(ar.VisibilityGroupIDs), encodeIntJSONArray(ar.VisibilityOrgIDs),
+			ar.RunMode, ar.ItemTypeID, ar.WorkspaceID, ar.Config, time.Now(), id, channelID,
+		)
+		if err != nil {
+			if database.IsUniqueConstraintError(err) {
+				return ErrDuplicateEntry
+			}
+			return fmt.Errorf("update asset_report %d: %w", id, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+
+		bindingChanged := oldRunMode != ar.RunMode || !equalOptionalInt(oldItemTypeID, ar.ItemTypeID) || !equalOptionalInt(oldWorkspaceID, ar.WorkspaceID)
+		if bindingChanged {
+			if _, err := tx.Exec("DELETE FROM asset_report_fields WHERE asset_report_id = ?", id); err != nil {
+				return fmt.Errorf("clear stale fields for asset_report %d: %w", id, err)
+			}
+		}
+		return nil
+	})
+}
+
+func equalOptionalInt(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return *left == *right
 }
 
 // UpdateVisibility writes only the visibility columns. ErrNotFound on miss.
@@ -277,14 +313,19 @@ func (r *AssetReportRepository) UpdateVisibility(id, channelID int, groupIDs, or
 // Delete removes an asset_report row. asset_report_fields cascades by FK.
 // Returns ErrNotFound on miss.
 func (r *AssetReportRepository) Delete(id, channelID int) error {
-	res, err := r.db.ExecWrite("DELETE FROM asset_reports WHERE id = ? AND channel_id = ?", id, channelID)
-	if err != nil {
-		return fmt.Errorf("delete asset_report %d: %w", id, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return database.WithTx(r.db, func(tx database.Tx) error {
+		if err := removePortalSectionReference(context.Background(), tx, channelID, id, portalAssetReportReference); err != nil {
+			return err
+		}
+		res, err := tx.Exec("DELETE FROM asset_reports WHERE id = ? AND channel_id = ?", id, channelID)
+		if err != nil {
+			return fmt.Errorf("delete asset_report %d: %w", id, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 const assetReportFieldsSelectQuery = `
@@ -339,28 +380,38 @@ func (r *AssetReportRepository) ListFields(assetReportID int) ([]models.AssetRep
 // ReplaceFields atomically replaces the field schema. step_number defaults
 // to 1 when zero on input.
 func (r *AssetReportRepository) ReplaceFields(assetReportID int, fields []models.AssetReportField) error {
-	if _, err := r.db.ExecWrite("DELETE FROM asset_report_fields WHERE asset_report_id = ?", assetReportID); err != nil {
-		return fmt.Errorf("clear fields for asset_report %d: %w", assetReportID, err)
-	}
-
-	now := time.Now()
-	for _, f := range fields {
-		step := f.StepNumber
-		if step == 0 {
-			step = 1
+	return database.WithTx(r.db, func(tx database.Tx) error {
+		lock, err := tx.Exec("UPDATE asset_reports SET updated_at = updated_at WHERE id = ?", assetReportID)
+		if err != nil {
+			return fmt.Errorf("lock asset_report %d fields: %w", assetReportID, err)
 		}
-		if _, err := r.db.ExecWrite(`
+		if rows, rowsErr := lock.RowsAffected(); rowsErr != nil {
+			return fmt.Errorf("count locked asset_reports: %w", rowsErr)
+		} else if rows == 0 {
+			return ErrNotFound
+		}
+		if _, err := tx.Exec("DELETE FROM asset_report_fields WHERE asset_report_id = ?", assetReportID); err != nil {
+			return fmt.Errorf("clear fields for asset_report %d: %w", assetReportID, err)
+		}
+		now := time.Now()
+		for _, f := range fields {
+			step := f.StepNumber
+			if step == 0 {
+				step = 1
+			}
+			if _, err := tx.Exec(`
 			INSERT INTO asset_report_fields (asset_report_id, field_identifier, field_type, display_order, is_required,
 			                                 display_name, description, step_number, virtual_field_type, virtual_field_options,
 			                                 created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, assetReportID, f.FieldIdentifier, f.FieldType, f.DisplayOrder, f.IsRequired,
-			f.DisplayName, f.Description, step, f.VirtualFieldType, f.VirtualFieldOptions,
-			now, now); err != nil {
-			return fmt.Errorf("insert field %q: %w", f.FieldIdentifier, err)
+			`, assetReportID, f.FieldIdentifier, f.FieldType, f.DisplayOrder, f.IsRequired,
+				f.DisplayName, f.Description, step, f.VirtualFieldType, f.VirtualFieldOptions,
+				now, now); err != nil {
+				return fmt.Errorf("insert field %q: %w", f.FieldIdentifier, err)
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func encodeStringJSONArray(strs []string) *string {

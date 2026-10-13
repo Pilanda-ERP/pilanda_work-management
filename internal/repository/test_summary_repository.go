@@ -183,8 +183,8 @@ func (r *TestSummaryRepository) GetTrend(filter ReportFilter) ([]TrendPoint, err
 	// which will not scan into a Go string. Cast to text explicitly on Postgres
 	// so the scan target stays uniform across backends. SQLite's DATE()
 	// returns TEXT in ISO format and works correctly now that the driver is
-	// configured with _time_format=sqlite (and legacy rows are normalized at
-	// startup — see backfillLegacyDatetimeFormat).
+	// configured with _time_format=sqlite (legacy rows were normalized by the
+	// one-time datetime backfill that shipped with the 0.8.5 schema floor).
 	dateExpr := "DATE(tr.started_at)"
 	if r.db.GetDriverName() == "postgres" {
 		dateExpr = "TO_CHAR(tr.started_at, 'YYYY-MM-DD')"
@@ -245,7 +245,7 @@ func (r *TestSummaryRepository) GetRecentFailures(filter ReportFilter, limit int
 		LIMIT ?
 	`
 
-	args := append(append([]interface{}{}, baseArgs...), limit)
+	args := append(append([]any{}, baseArgs...), limit)
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query recent failures: %w", err)
@@ -288,7 +288,7 @@ func (r *TestSummaryRepository) GetRecentBlocked(filter ReportFilter, limit int)
 		LIMIT ?
 	`
 
-	args := append(append([]interface{}{}, baseArgs...), limit)
+	args := append(append([]any{}, baseArgs...), limit)
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query recent blocked: %w", err)
@@ -320,12 +320,12 @@ const reportBaseFrom = `
 	JOIN test_sets ts ON tr.set_id = ts.id
 `
 
-func reportBase(filter ReportFilter) (where string, args []interface{}) {
+func reportBase(filter ReportFilter) (where string, args []any) {
 	where = `
 		WHERE tr.workspace_id = ?
 		AND tr.started_at >= ?
 	`
-	args = []interface{}{filter.WorkspaceID, filter.StartDate}
+	args = []any{filter.WorkspaceID, filter.StartDate}
 	if filter.MilestoneID != nil {
 		where += " AND ts.milestone_id = ?"
 		args = append(args, *filter.MilestoneID)

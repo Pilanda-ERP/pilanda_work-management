@@ -2,10 +2,11 @@
   import { authStore, workspacesStore, attachmentStatus } from '../stores';
   import { navigate } from '../router.js';
   import DropdownMenu from '../layout/DropdownMenu.svelte';
-  import { User, Home, Shield, Sun, Moon, Monitor, Download } from '@lucide/svelte';
+  import { User, Home, Shield, Sun, Moon, Monitor, Download, Settings } from '@lucide/svelte';
   import { themeStore } from '../stores/theme.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import { api } from '../api';
+  import { hasDelegatedAdmin } from '../navigation/delegatedAdminNavigation.js';
   import { installAvailable, requestInstall } from '../mobile/installClient.js';
 
   let {
@@ -14,7 +15,9 @@
     // minimal drops the items that navigate to the desktop app (My Workspace,
     // Profile, Security) — used on the mobile surface where those routes render
     // the full desktop UI. Theme + Sign Out remain.
-    minimal = false
+    minimal = false,
+    isOpen = $bindable(false),
+    onOpenChange = null,
   } = $props();
 
   // Local state
@@ -22,13 +25,6 @@
 
   // Subscribe to personal workspace from store
   const personalWorkspace = $derived($workspacesStore.personalWorkspace);
-
-  // Generate user initials
-  const userInitials = $derived(
-    authStore.currentUser
-      ? (authStore.currentUser.first_name?.[0]?.toUpperCase() || '') + (authStore.currentUser.last_name?.[0]?.toUpperCase() || '')
-      : ''
-  );
 
   // Only show avatar if attachments are enabled and user has an avatar
   const showAvatar = $derived(attachmentStatus.enabled && authStore.currentUser?.avatar_url);
@@ -109,19 +105,22 @@
 <div data-testid="user-avatar-menu" onmouseenter={loadPersonalWorkspaceIfNeeded} onfocusin={loadPersonalWorkspaceIfNeeded}>
 <DropdownMenu
   triggerAvatar={showAvatar ? authStore.currentUser?.avatar_url : null}
-  triggerText={expanded && label ? label : (showAvatar ? '' : userInitials)}
-  triggerIcon={expanded && !showAvatar ? User : null}
+  triggerText={expanded && label ? label : ''}
+  triggerLabel={label || t('nav.profile')}
+  triggerIcon={!showAvatar ? User : null}
   triggerIconClass="w-5 h-5"
-  triggerClass={expanded
-    ? "w-full px-3 h-10 rounded flex items-center cursor-pointer nav-button"
-    : (showAvatar
-      ? "w-8 h-8 rounded-full cursor-pointer hover:opacity-80 transition-opacity overflow-hidden"
-      : "w-8 h-8 rounded-full flex items-center justify-center cursor-pointer nav-button text-xs font-bold select-none"
-    )
+  triggerClass={showAvatar
+    ? (expanded
+        ? "w-full pl-1.5 pr-3 h-10 rounded flex items-center cursor-pointer nav-button overflow-hidden"
+        : "w-full px-1.5 h-10 rounded flex items-center justify-center cursor-pointer nav-button overflow-hidden")
+    : "w-full px-3 h-10 rounded flex items-center cursor-pointer nav-button"
   }
-  triggerGap={expanded ? "gap-3" : ""}
+  triggerGap={showAvatar || expanded ? "gap-3" : ""}
   triggerAlignment={expanded ? "start" : "center"}
   showChevron={false}
+  triggerTestid="user-avatar-trigger"
+  {isOpen}
+  {onOpenChange}
   items={[
     ...((!minimal && authStore.currentUser) ? [{
       id: 'my-workspace',
@@ -151,9 +150,35 @@
       subtitle: t('components.userAvatar.securitySubtitle'),
       onClick: () => navigate('/security')
     },
-    { type: 'divider' }] : []),
+    { type: 'divider' },
+    ...($hasDelegatedAdmin ? [{
+      id: 'delegated-admin',
+      testid: 'delegated-admin-menu-item',
+      type: 'regular',
+      icon: Settings,
+      iconColor: '#3b82f6',
+      title: t('nav.delegatedAdmin'),
+      subtitle: t('nav.delegatedAdminSubtitle'),
+      onClick: () => navigate('/manage')
+    },
+    { type: 'divider' }] : [])] : []),
+    ...(minimal
+      ? [
+          {
+            id: 'mobile-settings',
+            testid: 'mobile-settings-menu-item',
+            type: 'regular',
+            icon: Settings,
+            iconColor: '#3b82f6',
+            title: t('mobile.settings.title'),
+            onClick: () => navigate('/m/settings'),
+          },
+          { type: 'divider' },
+        ]
+      : []),
     {
       id: 'theme',
+      testid: 'theme-menu',
       type: 'accordion',
       icon: themeIcon,
       iconColor: '#8b5cf6',
@@ -161,6 +186,7 @@
       subItems: [
         {
           id: 'theme-light',
+          testid: 'theme-light',
           icon: Sun,
           title: t('components.userAvatar.themeLight'),
           selected: themeStore.colorMode === 'light',
@@ -169,6 +195,7 @@
         },
         {
           id: 'theme-dark',
+          testid: 'theme-dark',
           icon: Moon,
           title: t('components.userAvatar.themeDark'),
           selected: themeStore.colorMode === 'dark',
@@ -177,6 +204,7 @@
         },
         {
           id: 'theme-system',
+          testid: 'theme-system',
           icon: Monitor,
           title: t('components.userAvatar.themeSystem'),
           selected: themeStore.colorMode === 'system',

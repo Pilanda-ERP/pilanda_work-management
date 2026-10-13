@@ -1,12 +1,13 @@
 <script>
   import { t } from '../stores/i18n.svelte.js';
-  import { FileText, ChevronRight, ChevronDown } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../utils/icons.js';
+  import { ChevronRight, ChevronDown } from '@lucide/svelte';
+  import ItemTypeIcon from '../components/ItemTypeIcon.svelte';
   import ConfigurationSetEntityPicker from '../pickers/ConfigurationSetEntityPicker.svelte';
   import ScreenPicker from '../pickers/ScreenPicker.svelte';
   import WorkflowPicker from '../pickers/WorkflowPicker.svelte';
   import ConditionSetPicker from '../pickers/ConditionSetPicker.svelte';
   import ApprovalSetPicker from '../pickers/ApprovalSetPicker.svelte';
+  import { objectDisplayName } from '../utils/systemLabels.js';
 
   let {
     itemTypes = [],
@@ -124,6 +125,10 @@
   // for any row that already carries a screen override so the user lands on
   // the configured value without an extra click.
   let expandedScreenRows = $state(new Set());
+
+  function getItemTypeDisplayName(itemType) {
+    return objectDisplayName(itemType);
+  }
   $effect(() => {
     const next = new Set(expandedScreenRows);
     for (const c of itemTypeConfigs) {
@@ -145,8 +150,8 @@
     const n = (config.create_screen_id ? 1 : 0)
             + (config.edit_screen_id ? 1 : 0)
             + (config.view_screen_id ? 1 : 0);
-    if (n === 0) return 'default';
-    return `${n} custom`;
+    if (n === 0) return t('settings.configSets.default');
+    return t('settings.configSets.customScreenOverrides', { count: n });
   }
 </script>
 
@@ -183,23 +188,17 @@
               <th class="text-left px-4 py-3 font-medium" style="color: var(--ds-text);">{t('settings.configSets.workflow')}</th>
               <th class="text-left px-4 py-3 font-medium" style="color: var(--ds-text);">{t('conditionSets.title')}</th>
               <th class="text-left px-4 py-3 font-medium" style="color: var(--ds-text);">{t('approvalSets.title')}</th>
-              <th class="text-left px-4 py-3 font-medium rounded-tr-lg" style="color: var(--ds-text);">Screens</th>
+              <th class="text-left px-4 py-3 font-medium rounded-tr-lg" style="color: var(--ds-text);">{t('settings.configSets.screens')}</th>
             </tr>
           </thead>
           <tbody>
             {#each assignedItemTypes as itemType}
               {@const config = getConfig(itemType.id)}
-              {@const ItemTypeIcon = itemTypeIconMap[itemType.icon] || FileText}
               <tr class="border-t" style="border-color: var(--ds-border);">
                 <td class="px-4 py-3">
                   <div class="flex items-center gap-2">
-                    <div
-                      class="w-6 h-6 rounded flex items-center justify-center flex-shrink-0"
-                      style="background-color: {itemType.color || '#3b82f6'};"
-                    >
-                      <ItemTypeIcon class="w-4 h-4 text-white" />
-                    </div>
-                    <span class="font-medium" style="color: var(--ds-text);">{itemType.name}</span>
+                    <ItemTypeIcon itemType={itemType} />
+                    <span class="font-medium" style="color: var(--ds-text);">{getItemTypeDisplayName(itemType)}</span>
                   </div>
                 </td>
                 <td class="px-4 py-3">
@@ -207,7 +206,6 @@
                     value={config.workflow_id}
                     items={workflows}
                     {defaultWorkflowId}
-                    placeholder="Select workflow..."
                     onSelect={(workflow) => updateConfig(itemType.id, 'workflow_id', workflow?.id || null)}
                   />
                 </td>
@@ -253,7 +251,7 @@
                       style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);"
                     >
                       <div class="text-xs font-semibold uppercase tracking-wider mb-2" style="color: var(--ds-text-subtle);">
-                        Screens
+                        {t('settings.configSets.screens')}
                       </div>
                       <div class="grid grid-cols-3 gap-3">
                         <div>
@@ -262,7 +260,6 @@
                             value={config.create_screen_id}
                             items={screens}
                             defaultScreenId={defaultCreateScreenId}
-                            placeholder="Select screen..."
                             onSelect={(screen) => updateConfig(itemType.id, 'create_screen_id', screen?.id || null)}
                           />
                         </div>
@@ -272,7 +269,6 @@
                             value={config.edit_screen_id}
                             items={screens}
                             defaultScreenId={defaultEditScreenId}
-                            placeholder="Select screen..."
                             onSelect={(screen) => updateConfig(itemType.id, 'edit_screen_id', screen?.id || null)}
                           />
                         </div>
@@ -282,7 +278,6 @@
                             value={config.view_screen_id}
                             items={screens}
                             defaultScreenId={defaultViewScreenId}
-                            placeholder="Select screen..."
                             onSelect={(screen) => updateConfig(itemType.id, 'view_screen_id', screen?.id || null)}
                           />
                         </div>

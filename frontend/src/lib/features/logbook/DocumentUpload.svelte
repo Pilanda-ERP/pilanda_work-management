@@ -3,9 +3,11 @@
   import { api } from '../../api.js';
   import { successToast, errorToast } from '../../stores/toasts.svelte.js';
   import Button from '../../components/Button.svelte';
-  import Spinner from '../../components/Spinner.svelte';
+  import FileInput from '../../components/FileInput.svelte';
+  import Input from '../../components/Input.svelte';
   import FormField from '../../components/FormField.svelte';
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
+  import Modal from '../../dialogs/Modal.svelte';
   import { IconUpload as Upload, IconX as X, IconFileText as FileText } from '@tabler/icons-svelte-runes';
 
   let { bucketId, onclose = () => {}, onupload = () => {} } = $props();
@@ -76,19 +78,7 @@
 </script>
 
 <!-- Modal overlay -->
-<div
-  class="fixed inset-0 z-50 flex items-center justify-center"
-  style="background-color: rgba(0, 0, 0, 0.4); backdrop-filter: blur(2px);"
-  onclick={(e) => { if (e.target === e.currentTarget && !uploading) onclose(); }}
-  onkeydown={(e) => { if (e.key === 'Escape' && !uploading) onclose(); }}
-  role="dialog"
-  aria-modal="true"
-  tabindex="-1"
->
-  <div
-    class="w-full max-w-lg rounded-xl border shadow-xl"
-    style="background-color: var(--ds-surface-overlay); border-color: var(--ds-border);"
-  >
+<Modal isOpen={true} preventClose={uploading} maxWidth="max-w-lg" onclose={onclose}>
     <ModalHeader title={t('logbook.uploadDocument')} onClose={onclose} />
 
     <!-- Content -->
@@ -124,9 +114,8 @@
         {/if}
       </div>
 
-      <input
+      <FileInput
         id="file-input"
-        type="file"
         accept={acceptedTypes}
         onchange={handleFileSelect}
         class="hidden"
@@ -134,12 +123,10 @@
 
       <!-- Title field -->
       <FormField label={t('logbook.documentTitle')} id="doc-title">
-        <input
+        <Input
           id="doc-title"
           type="text"
           bind:value={title}
-          class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-          style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
           placeholder={t('logbook.documentTitlePlaceholder')}
         />
       </FormField>
@@ -152,17 +139,12 @@
       </Button>
       <Button
         variant="primary"
-        icon={uploading ? null : Upload}
+        icon={Upload}
         onclick={uploadFile}
-        disabled={!selectedFile || uploading}
+        loading={uploading}
+        disabled={!selectedFile}
       >
-        {#if uploading}
-          <Spinner size="sm" class="mr-2" />
-          {t('logbook.uploading')}
-        {:else}
-          {t('logbook.uploadDocument')}
-        {/if}
+        {uploading ? t('logbook.uploading') : t('logbook.uploadDocument')}
       </Button>
     </div>
-  </div>
-</div>
+</Modal>

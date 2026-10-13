@@ -1,13 +1,3 @@
-/**
- * Português Brasil (pt-BR) - Traduções de autenticação e usuários
- *
- * Este módulo contém traduções para:
- * - auth: Login, logout, redefinição de senha e fluxos de autenticação
- * - users: Gerenciamento de usuários, perfis e configurações de conta
- * - security: Configurações de segurança, tokens de API e credenciais
- * - portalLogin: Interface de login específica do portal
- */
-
 export default {
   auth: {
     login: 'Entrar',
@@ -24,7 +14,7 @@ export default {
     confirmPassword: 'Confirmar Senha',
     passwordRequired: 'A senha é obrigatória',
     rememberMe: 'Lembrar de mim',
-    staySignedIn: 'Permanecer conectado',
+    staySignedIn: 'Manter minha sessão no Windshift por 30 dias',
     emailOrUsername: 'E-mail ou Nome de Usuário',
     welcomeBack: 'Bem-vindo de volta',
     loginTitle: 'Entre na sua conta',
@@ -123,7 +113,40 @@ export default {
     saveSettings: 'Salvar Configurações',
     settingsSaved: 'Configurações salvas com sucesso',
     connectedAccounts: 'Contas Conectadas',
+    connectedAccountsTab: 'Contas',
     connectedAccountsDesc: 'Conecte suas contas de controle de versão para criar branches e pull requests',
+    agents: {
+      title: 'Agentes',
+      description:
+        'Agentes são usuários não humanos que herdam suas permissões e se autenticam somente com tokens de API. Eles não podem entrar de forma interativa.',
+      createTitle: 'Criar agente',
+      create: 'Criar agente',
+      creating: 'Criando agente…',
+      creationUnavailable:
+        'A criação de agentes não está disponível para esta conta. Talvez o administrador precise habilitar agentes gerenciados pelo usuário, ou o limite de agentes pode ter sido atingido.',
+      requiredFields: 'Nome de usuário, nome e sobrenome são obrigatórios.',
+      createFailed: 'Não foi possível criar o agente.',
+      yourAgents: 'Seus agentes',
+      empty: 'Você ainda não tem agentes.',
+      actionsFor: 'Ações para {name}',
+      deleteTitle: 'Excluir agente',
+      deleteMessage: 'Excluir este agente? Todos os tokens de API dele deixarão de funcionar.',
+      rename: 'Renomear agente',
+      nameRequired: 'O nome do agente é obrigatório.',
+      renameFailed: 'Não foi possível renomear o agente.',
+      renameHint: 'O nome de usuário permanente @{username} não será alterado.',
+      manageTokens: 'Gerenciar tokens',
+      hideTokens: 'Ocultar tokens',
+      tokenExpirationHint:
+        'O token permanece válido até esta data no fuso horário configurado. Deixe em branco para não expirar.',
+      existingTokens: 'Tokens existentes',
+      tokenDates: 'Criado em {created} • Expira em {expires}',
+      neverExpires: 'Nunca expira',
+      noTokens: 'Ainda não há tokens.',
+      tokenCreateFailed: 'Não foi possível criar o token.',
+      confirmRevokeUnnamedToken:
+        'Revogar este token? Tudo que o utiliza deixará de funcionar imediatamente.',
+    },
     calendarIntegration: 'Integração de Calendário',
     calendarIntegrationDesc: 'Inscreva-se nos seus itens agendados em aplicativos de calendário externos',
     loadCalendarFeedSettings: 'Carregar Configurações do Feed de Calendário',

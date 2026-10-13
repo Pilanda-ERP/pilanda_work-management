@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
   import { ssoStore, capabilitiesStore } from '../stores';
   import { api } from '../api.js';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
@@ -27,6 +28,7 @@
   import DescriptionText from '../components/DescriptionText.svelte';
   import { confirm } from '../composables/useConfirm.js';
   import { publicBaseURL } from '../runtime/contextPath.js';
+	import TextField from '../components/TextField.svelte';
 
   let providers = $state([]);
   let loading = $state(true);
@@ -177,7 +179,10 @@
       await loadProviders();
     } catch (err) {
       console.error('Failed to create SSO provider:', err);
-      error = err.message || t('settings.sso.failedToCreate');
+      formErrors = {
+        ...formErrors,
+        submit: err.message || t('settings.sso.failedToCreate')
+      };
     } finally {
       saving = false;
     }
@@ -194,7 +199,10 @@
       await loadProviders();
     } catch (err) {
       console.error('Failed to update SSO provider:', err);
-      error = err.message || t('settings.sso.failedToUpdate');
+      formErrors = {
+        ...formErrors,
+        submit: err.message || t('settings.sso.failedToUpdate')
+      };
     } finally {
       saving = false;
     }
@@ -272,9 +280,7 @@
 
   <!-- Loading State -->
   {#if loading}
-    <div class="flex items-center justify-center py-12">
-      <Spinner />
-    </div>
+    <StateDisplay type="loading" />
   {:else if providers.length === 0}
     <Card variant="dashed" padding="spacious">
       <EmptyState
@@ -391,18 +397,21 @@
       onClose={closeModals}
     />
     <form onsubmit={(e) => { e.preventDefault(); showCreateModal ? handleCreate() : handleUpdate(); }} class="p-6 space-y-4">
+      {#if formErrors.submit}
+        <AlertBox type="error">{formErrors.submit}</AlertBox>
+      {/if}
+
       <div class="grid grid-cols-2 gap-4">
         <!-- Name -->
         <div>
           <Label for="name" color="default" required class="mb-1">{t('settings.sso.displayName')}</Label>
-          <input
+          <Input
             type="text"
             id="name"
             bind:value={formData.name}
             oninput={handleNameChange}
-            class="w-full px-3 py-2 border rounded-md focus:ring-2"
-            class:border-red-500={formErrors.name}
-            style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+            size="small"
+            class={formErrors.name ? 'border-ds-border-danger' : ''}
             placeholder={t('settings.sso.displayNamePlaceholder')}
           />
           {#if formErrors.name}
@@ -413,13 +422,12 @@
         <!-- Slug -->
         <div>
           <Label for="slug" color="default" required class="mb-1">{t('settings.sso.slug')}</Label>
-          <input
+          <Input
             type="text"
             id="slug"
             bind:value={formData.slug}
-            class="w-full px-3 py-2 border rounded-md focus:ring-2 font-mono"
-            class:border-red-500={formErrors.slug}
-            style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+            class={formErrors.slug ? 'font-mono border-ds-border-danger' : 'font-mono'}
+            size="small"
             placeholder={t('settings.sso.slugPlaceholder')}
           />
           {#if formErrors.slug}
@@ -447,13 +455,12 @@
       <!-- Issuer URL -->
       <div>
         <Label for="issuer_url" color="default" required class="mb-1">{t('settings.sso.issuerUrl')}</Label>
-        <input
+        <Input
           type="url"
           id="issuer_url"
           bind:value={formData.issuer_url}
-          class="w-full px-3 py-2 border rounded-md focus:ring-2 font-mono text-sm"
-          class:border-red-500={formErrors.issuer_url}
-          style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+          class={formErrors.issuer_url ? 'font-mono border-ds-border-danger' : 'font-mono'}
+          size="small"
           placeholder={t('settings.sso.issuerUrlPlaceholder')}
         />
         {#if formErrors.issuer_url}
@@ -466,13 +473,12 @@
         <!-- Client ID -->
         <div>
           <Label for="client_id" color="default" required class="mb-1">{t('settings.sso.clientId')}</Label>
-          <input
+          <Input
             type="text"
             id="client_id"
             bind:value={formData.client_id}
-            class="w-full px-3 py-2 border rounded-md focus:ring-2 font-mono"
-            class:border-red-500={formErrors.client_id}
-            style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+            class={formErrors.client_id ? 'font-mono border-ds-border-danger' : 'font-mono'}
+            size="small"
             placeholder={t('settings.sso.clientIdPlaceholder')}
           />
           {#if formErrors.client_id}
@@ -483,13 +489,12 @@
         <!-- Client Secret -->
         <div>
           <Label for="client_secret" color="default" required={showCreateModal} class="mb-1">{t('settings.sso.clientSecret')}</Label>
-          <input
+          <Input
             type="password"
             id="client_secret"
             bind:value={formData.client_secret}
-            class="w-full px-3 py-2 border rounded-md focus:ring-2"
-            class:border-red-500={formErrors.client_secret}
-            style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+            size="small"
+            class={formErrors.client_secret ? 'border-ds-border-danger' : ''}
             placeholder={showEditModal ? t('settings.sso.leaveEmptyToKeepCurrent') : t('settings.sso.enterClientSecret')}
           />
           {#if formErrors.client_secret}
@@ -500,14 +505,14 @@
 
       <!-- Scopes -->
       <div>
-        <Label for="scopes" color="default" class="mb-1">{t('settings.sso.scopes')}</Label>
-        <input
-          type="text"
+        <TextField
+          label={t('settings.sso.scopes')}
           id="scopes"
-          bind:value={formData.scopes}
-          class="w-full px-3 py-2 border rounded-md focus:ring-2"
-          style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
+          labelColor="default"
+          type="text"
+          size="small"
           placeholder="openid email profile"
+          bind:value={formData.scopes}
         />
         <DescriptionText>{t('settings.sso.scopesHelp')}</DescriptionText>
       </div>
@@ -535,7 +540,7 @@
           size="small"
         />
 
-        {#if formData.auto_provision_users && !formData.require_verified_email}
+        {#if formData.require_verified_email}
           <AlertBox type="warning">
             <strong>{t('settings.sso.unsafeProvisioningWarningTitle')}</strong>
             <div class="mt-1">{t('settings.sso.unsafeProvisioningWarningBody')}</div>
@@ -592,4 +597,3 @@
     </form>
   </Modal>
 {/if}
-

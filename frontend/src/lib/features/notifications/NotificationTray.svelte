@@ -4,34 +4,47 @@
   import { notifications, notificationActions } from '../../stores/notifications.js';
   import NotificationCard from '../notifications/NotificationCard.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
-  import { scale, fly } from 'svelte/transition';
-  import { quintOut } from 'svelte/easing';
   import { navigate } from '../../router.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { createPopover, melt } from '@melt-ui/svelte';
+  import { toStore } from 'svelte/store';
 
   const AUTO_SEEN_DELAY_MS = 5000;
 
   let {
     expanded = false,
-    label = ''
+    label = '',
+    isOpen = $bindable(false),
+    onOpenChange = null,
   } = $props();
 
   let unreadCount = $state(0);
 
-  // Create popover with portal to body to escape sidebar stacking context
+  // Portal above the sidebar stacking context.
+  const controlledOpen = toStore(
+    () => isOpen,
+    (value) => {
+      if (isOpen === value) return;
+      isOpen = value;
+      onOpenChange?.(value);
+    }
+  );
+
   const {
     elements: { trigger, content },
     states: { open }
   } = createPopover({
     forceVisible: true,
+    open: controlledOpen,
     positioning: {
+      strategy: 'fixed',
+      fitViewport: true,
       placement: 'right-start'
     },
     portal: 'body'
   });
 
-  // Subscribe to notifications store
+  // Track unread notifications.
   let unsubscribe;
   onMount(() => {
     unsubscribe = notifications.subscribe(items => {
@@ -39,14 +52,8 @@
     });
   });
 
-  // Auto mark-all-as-seen after the tray has been open for 5s. Runs once per
-  // open — closing and reopening arms a fresh timer. Cancelled on early close
-  // so a quick glance doesn't immediately drop the new-since-glance cue.
-  //
-  // Bughunt #11: this used to call markAllAsRead, which silently suppressed
-  // email batching (the scheduler only sends rows with read = false). Seeing
-  // is separate from acknowledging — the email digest still fires unless the
-  // user explicitly marks read.
+  // Mark seen after a sustained open, but never read: email batching still
+  // depends on unread rows. Closing early cancels the timer.
   let autoSeenTimer;
   let unsubscribeOpen = open.subscribe((isOpen) => {
     clearTimeout(autoSeenTimer);
@@ -86,7 +93,10 @@
   <!-- Notification Bell Button -->
   <button
     use:melt={$trigger}
-    class="{expanded ? 'w-full px-3' : 'w-10 justify-center'} h-10 rounded flex items-center cursor-pointer nav-button {$open ? 'nav-button-selected' : ''}"
+    data-testid="notifications-trigger"
+    class="w-full h-10 rounded flex items-center {expanded
+      ? 'justify-start px-3'
+      : 'justify-center'} cursor-pointer nav-button {$open ? 'nav-button-selected' : ''}"
     title={t('notifications.title')}
     aria-label={t('notifications.title')}
   >
@@ -98,8 +108,6 @@
         <span
           class="absolute -top-1 -right-1 text-xs font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center"
           style="background-color: var(--ds-danger); color: var(--ds-text-inverse);"
-          in:scale={{ duration: 200, easing: quintOut }}
-          out:scale={{ duration: 150 }}
         >
           {unreadCount > 99 ? '99+' : unreadCount}
         </span>
@@ -114,13 +122,13 @@
   {#if $open}
     <div
       use:melt={$content}
-      class="notification-dropdown w-96 rounded shadow-xl max-h-[500px] overflow-hidden"
+      data-testid="notifications-menu"
+      tabindex="-1"
+      class="notification-dropdown z-[60] w-96 rounded shadow-xl flex flex-col overflow-hidden"
       style="background-color: var(--ds-surface-overlay); border: 1px solid var(--ds-border); color: var(--ds-text);"
-      in:fly={{ x: -10, duration: 200, easing: quintOut }}
-      out:fly={{ x: -10, duration: 150 }}
     >
       <!-- Header -->
-      <div class="p-4 flex items-center justify-between" style="border-bottom: 1px solid var(--ds-border);">
+      <div class="p-4 shrink-0 flex items-center justify-between" style="border-bottom: 1px solid var(--ds-border);">
         <h3 class="text-lg font-semibold" style="color: var(--ds-text);">{t('notifications.title')}</h3>
         <div class="flex items-center gap-2">
           {#if unreadCount > 0}
@@ -145,7 +153,7 @@
       </div>
 
       <!-- Notifications List -->
-      <div class="max-h-96 overflow-y-auto">
+      <div data-testid="notifications-scroll" class="min-h-0 max-h-96 overflow-y-auto overscroll-contain">
         {#if $notifications.length === 0}
           <EmptyState
             icon={Bell}
@@ -155,8 +163,6 @@
         {:else}
           {#each $notifications as notification (notification.id)}
             <div
-              in:fly={{ x: 20, duration: 200, easing: quintOut }}
-              out:fly={{ x: -20, duration: 150 }}
             >
               <NotificationCard
                 {notification}
@@ -169,9 +175,10 @@
 
       <!-- Footer -->
       {#if $notifications.length > 0}
-        <div class="p-3 text-center" style="border-top: 1px solid var(--ds-border);">
+        <div class="p-3 shrink-0 text-center" style="border-top: 1px solid var(--ds-border);">
           <button
             class="text-sm font-medium view-all-btn"
+            data-testid="notifications-view-all"
             onclick={() => {
               navigate('/notifications');
               closeDropdown();

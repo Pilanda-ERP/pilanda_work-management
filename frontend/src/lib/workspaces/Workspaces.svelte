@@ -23,9 +23,26 @@
   // Use centralized icon map for workspace icons
   const iconMap = workspaceIconMap;
 
-  onMount(async () => {
-    // Load workspaces from store
-    await workspacesStore.load();
+  // The admin directory needs the complete list, not the store's cached first
+  // page, so it fetches all pages itself at the v2 page-size cap. WI-1446
+  // replaces this with server-side paging and search.
+  let workspaceRows = $state([]);
+
+  async function loadWorkspaceRows() {
+    try {
+      const all = await api.workspaces.getAll({}, { pageSize: 1000 });
+      workspaceRows = (all || []).filter((ws) => !ws.is_personal);
+    } catch (error) {
+      console.error('Failed to load workspaces:', error);
+      workspaceRows = [];
+    }
+  }
+
+  onMount(() => {
+    // Refresh the shared directory cache alongside the admin table so other
+    // surfaces pick up workspaces created outside this session.
+    workspacesStore.load({ force: true });
+    return loadWorkspaceRows();
   });
 
   function startCreate() {
@@ -35,7 +52,7 @@
   async function deleteWorkspace(workspace) {
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: `Are you sure you want to delete workspace "${workspace.name}"? This will affect all associated projects.`,
+      message: t('workspaces.confirmDelete', { name: workspace.name }),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger'
@@ -43,7 +60,8 @@
     if (confirmed) {
       try {
         await api.workspaces.delete(workspace.id);
-        await workspacesStore.reload();
+        workspacesStore.remove(workspace.id);
+        await loadWorkspaceRows();
       } catch (error) {
         console.error('Failed to delete workspace:', error);
         errorToast(t('dialogs.alerts.failedToDelete', { error: error.message || error }));
@@ -53,8 +71,8 @@
 
   function getStatusBadgeClass(active) {
     return active
-      ? 'bg-green-100 text-green-800'
-      : 'bg-gray-100 text-gray-800';
+      ? 'bg-ds-success-subtle text-ds-text-success'
+      : 'bg-ds-background-neutral text-ds-text-subtle';
   }
 
   function buildWorkspaceDropdownItems(workspace) {
@@ -68,7 +86,7 @@
         id: 'edit',
         type: 'regular',
         icon: Edit,
-        title: 'Edit',
+        title: t('common.edit'),
         hoverClass: 'hover-bg',
         onClick: () => navigate(`/workspaces/${workspace.id}`)
       }
@@ -77,28 +95,35 @@
   }
 
   // Table column definitions
-  const workspaceColumns = [
+  const workspaceColumns = $derived([
     {
       key: 'name',
-      label: 'Workspace',
+      label: t('workspaces.workspace'),
       slot: 'name'
     },
     {
       key: 'active',
-      label: 'Status',
+      label: t('common.status'),
       slot: 'status'
     },
     {
+      key: 'visibility',
+      label: t('workspaces.visibility'),
+      slot: 'visibility'
+    },
+    {
       key: 'created_at',
-      label: 'Created',
+      label: t('common.created'),
+      sortable: true,
+      sortValue: (workspace) => workspace.created_at,
       render: (workspace) => formatDateSimple(workspace.created_at),
       textColor: 'var(--ds-text-subtle)'
     },
     {
       key: 'actions',
-      label: 'Actions'
+      label: t('common.actions')
     }
-  ];
+  ]);
 
 
 </script>
@@ -107,19 +132,20 @@
     <div class="{noPadding ? '' : 'px-6 pt-6'}">
       <PageHeader
         icon={Grip}
-        title="Workspaces"
-        subtitle="Organize and manage your projects within workspaces"
+        title={t('workspaces.title')}
+        subtitle={t('workspaces.listSubtitle')}
       >
         {#snippet actions()}
           {#if canCreate}
             <Button
               variant="primary"
+              dataTestid="workspaces-create"
               icon={Plus}
               onclick={startCreate}
               keyboardHint={getShortcutDisplay('workspaces', 'addWorkspace')}
               hotkeyConfig={{ key: toHotkeyString('workspaces', 'addWorkspace'), guard: () => true }}
             >
-              Add Workspace
+              {t('workspaces.createWorkspace')}
             </Button>
           {/if}
         {/snippet}
@@ -130,12 +156,15 @@
     <div class="{noPadding ? '' : 'px-6 pb-6'}">
       <DataTable
         columns={workspaceColumns}
-        data={$workspacesStore.regularWorkspaces}
+        data={workspaceRows}
         keyField="id"
-        emptyMessage="No workspaces found. Create your first workspace to get started."
+        pagination={true}
+        pageSize={50}
+        emptyMessage={t('workspaces.empty')}
         emptyIcon={Circle}
         actionItems={buildWorkspaceDropdownItems}
         onRowClick={(workspace) => navigate(`/workspaces/${workspace.id}`)}
+        rowAttrs={(workspace) => ({ 'data-testid': `workspace-row-${workspace.id}` })}
       >
     {#snippet name(workspace)}
       {@const WorkspaceIcon = iconMap[workspace.icon] || Grip}
@@ -157,8 +186,17 @@
           <div class="flex items-center gap-2">
             <div style="color: var(--ds-text);">{workspace.name}</div>
             {#if workspace.is_personal}
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-800">
-                Personal
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-ds-accent-purple-subtle text-ds-text-accent-purple">
+                {t('workspaces.personal')}
+              </span>
+            {/if}
+            {#if workspace.is_template}
+              <span
+                data-testid={`workspace-template-badge-${workspace.id}`}
+                class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
+                style="background-color: var(--ds-accent-blue-subtle); color: var(--ds-text-accent-blue);"
+              >
+                {t('workspaces.template')}
               </span>
             {/if}
           </div>
@@ -171,6 +209,22 @@
 
     {#snippet status(workspace)}
       <Lozenge color={workspace.active ? 'green' : 'gray'} text={workspace.active ? 'Active' : 'Inactive'} />
+    {/snippet}
+
+    {#snippet visibility(workspace)}
+      {#if workspace.is_restricted}
+        <Lozenge
+          color="orange"
+          text={t('workspaces.restricted')}
+          dataTestid={`workspace-restricted-badge-${workspace.id}`}
+        />
+      {:else}
+        <Lozenge
+          color="gray"
+          text={t('workspaces.open')}
+          dataTestid={`workspace-open-${workspace.id}`}
+        />
+      {/if}
     {/snippet}
   </DataTable>
     </div>

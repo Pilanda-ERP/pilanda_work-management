@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -24,7 +25,7 @@ func NewMilestoneAttachRepository(db database.Database) *MilestoneAttachReposito
 // ListForItem returns the milestones currently attached to an item, ordered by name.
 func (r *MilestoneAttachRepository) ListForItem(itemID int) ([]models.Milestone, error) {
 	rows, err := r.db.Query(`
-		SELECT m.id, m.name, m.description, m.target_date, m.status,
+		SELECT m.id, m.name, COALESCE(m.description, ''), m.target_date, m.status,
 		       m.category_id, m.is_global, m.workspace_id, m.created_at, m.updated_at
 		FROM item_milestones im
 		JOIN milestones m ON im.milestone_id = m.id
@@ -37,6 +38,21 @@ func (r *MilestoneAttachRepository) ListForItem(itemID int) ([]models.Milestone,
 	defer func() { _ = rows.Close() }()
 
 	return scanMilestoneAttachRows(rows)
+}
+
+// MilestoneIDsForItem returns the IDs of the milestones attached to an item,
+// in the same name order as ListForItem. Used by action conditions, which
+// compare attachment as a CSV of ids.
+func (r *MilestoneAttachRepository) MilestoneIDsForItem(itemID int) ([]int, error) {
+	milestones, err := r.ListForItem(itemID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int, 0, len(milestones))
+	for _, milestone := range milestones {
+		ids = append(ids, milestone.ID)
+	}
+	return ids, nil
 }
 
 // ReplaceItemMilestones swaps the milestone set for an item atomically: deletes
@@ -63,6 +79,21 @@ func (r *MilestoneAttachRepository) ReplaceItemMilestones(itemID int, milestoneI
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit replace item milestones: %w", err)
+	}
+	return nil
+}
+
+// ReplaceItemMilestonesTx swaps an item's milestones inside the caller's transaction.
+func (r *MilestoneAttachRepository) ReplaceItemMilestonesTx(ctx context.Context, tx database.Tx, itemID int, milestoneIDs []int) error {
+	if _, err := tx.ExecContext(ctx, "DELETE FROM item_milestones WHERE item_id = ?", itemID); err != nil {
+		return fmt.Errorf("delete milestones for item %d: %w", itemID, err)
+	}
+	for _, milestoneID := range milestoneIDs {
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO item_milestones (item_id, milestone_id, created_at) VALUES (?, ?, ?)",
+			itemID, milestoneID, time.Now()); err != nil {
+			return fmt.Errorf("attach milestone %d to item %d: %w", milestoneID, itemID, err)
+		}
 	}
 	return nil
 }
@@ -99,11 +130,16 @@ func (r *MilestoneAttachRepository) RemoveItemMilestone(itemID, milestoneID int)
 // them to each item's Milestones field. Used by the item-list endpoints to
 // avoid an N+1 lookup.
 func (r *MilestoneAttachRepository) LoadForItems(items []models.Item) error {
+	return r.LoadForItemsContext(context.Background(), items)
+}
+
+// LoadForItemsContext is the request-aware form of LoadForItems.
+func (r *MilestoneAttachRepository) LoadForItemsContext(ctx context.Context, items []models.Item) error {
 	if len(items) == 0 {
 		return nil
 	}
 
-	itemIDs := make([]interface{}, len(items))
+	itemIDs := make([]any, len(items))
 	placeholders := make([]string, len(items))
 	for i, item := range items {
 		itemIDs[i] = item.ID
@@ -111,7 +147,7 @@ func (r *MilestoneAttachRepository) LoadForItems(items []models.Item) error {
 	}
 
 	query := fmt.Sprintf(`
-		SELECT im.item_id, m.id, m.name, m.description, m.target_date, m.status,
+		SELECT im.item_id, m.id, m.name, COALESCE(m.description, ''), m.target_date, m.status,
 		       m.category_id, m.is_global, m.workspace_id, m.created_at, m.updated_at
 		FROM item_milestones im
 		JOIN milestones m ON im.milestone_id = m.id
@@ -119,7 +155,7 @@ func (r *MilestoneAttachRepository) LoadForItems(items []models.Item) error {
 		ORDER BY m.name
 	`, strings.Join(placeholders, ","))
 
-	rows, err := r.db.Query(query, itemIDs...)
+	rows, err := r.db.QueryContext(ctx, query, itemIDs...)
 	if err != nil {
 		return fmt.Errorf("load milestones for items: %w", err)
 	}

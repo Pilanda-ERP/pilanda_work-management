@@ -23,6 +23,7 @@ export default {
     addTestPlan: 'Testplan hinzufügen',
     createFirstTestPlan: 'Erstellen Sie Ihren ersten Testplan, um Testfälle zu organisieren',
     lastRun: 'Letzter Lauf',
+    neverRun: 'Noch nie ausgeführt',
     deleteFolder: 'Ordner löschen',
     deleteStep: 'Schritt löschen',
     steps: 'Schritte',
@@ -78,6 +79,7 @@ export default {
       'Sind Sie sicher, dass Sie diesen Testfall löschen möchten? Diese Aktion kann nicht rückgängig gemacht werden.',
     noTestCasesFound: 'Keine Testfälle gefunden',
     noTestCasesWithLabel: 'Keine Testfälle mit dem ausgewählten Label-Filter gefunden.',
+    searchTestCases: 'Testfälle durchsuchen...',
     createFirstTestCase:
       "Klicken Sie auf 'Testfall hinzufügen', um Ihren ersten Testfall in diesem Ordner zu erstellen.",
     allLabels: 'Alle Labels',
@@ -105,7 +107,7 @@ export default {
       'Beschreiben Sie die Bedingungen, die erfüllt sein müssen, bevor dieser Testfall ausgeführt wird...',
     testCaseStepsInfo:
       'Nach dem Erstellen dieses Testfalls können Sie einzelne Testschritte mit spezifischen Aktionen, Daten und erwarteten Ergebnissen für eine präzise Testausführung hinzufügen.',
-    pressToOpenSteps: 'Drücken Sie 1-9, um Schritte zu öffnen',
+    pressToOpenSteps: 'Drücken Sie eine hervorgehobene Taste, um Schritte zu öffnen',
     manageLabels: 'Labels verwalten',
     clickLabelsToAssign: 'Klicken Sie auf Labels, um sie diesem Testfall zuzuweisen/zu entfernen',
     closeLabelsModal: 'Label-Dialog schließen',
@@ -318,8 +320,11 @@ export default {
     executed: 'Executed',
     duration: 'Duration',
     failedToLoadSummary: 'Failed to load test summary',
+    testRunSummary: 'Testlauf-Zusammenfassung',
+    printLoading: 'Testlauf-Zusammenfassung wird für den Druck vorbereitet…',
+    backToRun: 'Zurück zum Testlauf',
     noResultsForExport: 'No results available for export',
-    stepsNotExecuted: '{count} step(s) were not individually executed',
+    stepsNotExecuted: '{count} Schritte wurden nicht einzeln ausgeführt',
   },
 
   testCase: {

@@ -14,23 +14,9 @@ import (
 	"windshift/internal/services"
 )
 
-// Storage contract: item_diagrams.diagram_data is opaque TEXT. Existing rows
-// hold a JSON-serialized Excalidraw scene ({elements, appState, files}).
-// Agent-facing tools may also write a tiny seed wrapper:
-//
-//	{"type":"mermaid","source":"graph TD; A-->B"}
-//
-// DiagramModal.svelte detects the wrapper on open, calls
-// parseMermaidToExcalidraw + convertToExcalidrawElements client-side, and
-// uses the result as the editor's initialData. Saving the editor replaces
-// the wrapper with the converted Excalidraw scene; the source string is
-// not preserved — the seed is one-shot, matching how Excalidraw's own
-// mermaid panel behaves and avoiding dual-write complexity.
-
-const (
-	diagramKindMermaid    = "mermaid"
-	diagramKindExcalidraw = "excalidraw"
-)
+// item_diagrams.diagram_data stores Excalidraw JSON or a one-shot Mermaid
+// seed wrapper. The editor converts and replaces seeds on first save, avoiding
+// dual source/scene persistence.
 
 type diagramSummaryDTO struct {
 	ID        int    `json:"id"`
@@ -82,44 +68,13 @@ type deleteDiagramArgs struct {
 // string to persist in diagram_data plus a kind label. Exactly one of the
 // two inputs must be set; both empty or both populated is a tool error.
 func buildDiagramData(mermaid string, excalidraw json.RawMessage) (data, kind string, err error) {
-	mermaidSet := strings.TrimSpace(mermaid) != ""
-	excalidrawSet := len(excalidraw) > 0 && string(excalidraw) != "null"
-	switch {
-	case mermaidSet && excalidrawSet:
-		return "", "", errors.New("provide either mermaid or excalidraw, not both")
-	case mermaidSet:
-		wrapper, mErr := json.Marshal(map[string]string{
-			"type":   diagramKindMermaid,
-			"source": strings.TrimSpace(mermaid),
-		})
-		if mErr != nil {
-			return "", "", fmt.Errorf("encode mermaid wrapper: %w", mErr)
-		}
-		return string(wrapper), diagramKindMermaid, nil
-	case excalidrawSet:
-		// json.RawMessage is already valid JSON because it came through the
-		// adapter's Unmarshal. Reject the explicit `null` literal above.
-		return string(excalidraw), diagramKindExcalidraw, nil
-	default:
-		return "", "", errors.New("provide either mermaid or excalidraw")
-	}
+	return services.BuildDiagramPayload(mermaid, excalidraw)
 }
 
 // detectKind classifies an existing diagram_data string. Used in responses so
 // callers can tell whether a row is still a seed or has been converted.
 func detectKind(data string) string {
-	if data == "" {
-		return diagramKindExcalidraw
-	}
-	var probe struct {
-		Type   string `json:"type"`
-		Source string `json:"source"`
-	}
-	if err := json.Unmarshal([]byte(data), &probe); err == nil &&
-		probe.Type == diagramKindMermaid && probe.Source != "" {
-		return diagramKindMermaid
-	}
-	return diagramKindExcalidraw
+	return services.DetectDiagramKind([]byte(data))
 }
 
 func diagramToSummary(d *models.ItemDiagram) diagramSummaryDTO {
@@ -159,6 +114,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[listDiagramsArgs]{
 		Name:        "list_diagrams",
+		Group:       CapabilityKnowledgeDiagrams,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "List diagrams attached to a work item. Returns summaries (id, name, kind, timestamps); use get_diagram to fetch the full Excalidraw/mermaid payload.",
 		Scopes:      []string{auth.ScopeItemsRead},
 		Run: func(_ context.Context, env *Env, args listDiagramsArgs) (any, error) {
@@ -190,6 +148,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[getDiagramArgs]{
 		Name:        "get_diagram",
+		Group:       CapabilityKnowledgeDiagrams,
+		Access:      AccessRead,
+		Risk:        RiskLow,
 		Description: "Get a single diagram by ID, including its full diagram_data payload (an Excalidraw scene JSON or a {type:mermaid,source} seed wrapper).",
 		Scopes:      []string{auth.ScopeItemsRead},
 		Run: func(_ context.Context, env *Env, args getDiagramArgs) (any, error) {
@@ -230,6 +191,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[createDiagramArgs]{
 		Name:        "create_diagram",
+		Group:       CapabilityKnowledgeDiagrams,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Attach a new diagram to a work item. Provide either `mermaid` (a mermaid source string, stored as a seed and converted on first open) or `excalidraw` (a fully-formed Excalidraw scene JSON, stored as-is).",
 		Scopes:      []string{auth.ScopeItemsWrite},
 		Run: func(_ context.Context, env *Env, args createDiagramArgs) (any, error) {
@@ -259,7 +223,7 @@ func init() {
 				return nil, err
 			}
 			if herr := repo.RecordHistory(itemID, env.UserID, "diagram_created", nil,
-				fmt.Sprintf("diagram:%d:%s", id, name)); herr != nil {
+				fmt.Sprintf("diagram:%d:%s", id, name), env.Source, env.historyRunID()); herr != nil {
 				// History is best-effort, mirroring the handler.
 				_ = herr
 			}
@@ -280,6 +244,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[updateDiagramArgs]{
 		Name:        "update_diagram",
+		Group:       CapabilityKnowledgeDiagrams,
+		Access:      AccessWrite,
+		Risk:        RiskMedium,
 		Description: "Update a diagram. Each of name / mermaid / excalidraw is optional; omit to keep the existing value. Mermaid and excalidraw are mutually exclusive.",
 		Scopes:      []string{auth.ScopeItemsWrite},
 		Run: func(_ context.Context, env *Env, args updateDiagramArgs) (any, error) {
@@ -343,7 +310,7 @@ func init() {
 				oldName = &old
 			}
 			_ = repo.RecordHistory(existing.ItemID, env.UserID, "diagram_updated", oldName,
-				fmt.Sprintf("diagram:%d:%s", args.ID, newName))
+				fmt.Sprintf("diagram:%d:%s", args.ID, newName), env.Source, env.historyRunID())
 			env.AuditWrite(resourceDiagram, args.ID, "update_diagram", newName)
 
 			return diagramSummaryDTO{
@@ -360,6 +327,9 @@ func init() {
 	// ------------------------------------------------------------------------
 	Register(Default, Tool[deleteDiagramArgs]{
 		Name:        "delete_diagram",
+		Group:       CapabilityKnowledgeDiagrams,
+		Access:      AccessDestructive,
+		Risk:        RiskHigh,
 		Description: "Delete a diagram by ID.",
 		Scopes:      []string{auth.ScopeItemsWrite}, // matches v1 DELETE /diagrams/{id} (items:write, not items:delete)
 		Run: func(_ context.Context, env *Env, args deleteDiagramArgs) (any, error) {
@@ -388,7 +358,7 @@ func init() {
 			if !canEdit {
 				return map[string]string{"error": "permission denied"}, nil
 			}
-			_ = repo.RecordHistory(itemID, env.UserID, "diagram_deleted", &name, name)
+			_ = repo.RecordHistory(itemID, env.UserID, "diagram_deleted", &name, name, env.Source, env.historyRunID())
 			if err := repo.Delete(args.ID); err != nil {
 				if errors.Is(err, repository.ErrNotFound) {
 					return map[string]string{"error": "diagram not found"}, nil

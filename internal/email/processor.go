@@ -7,26 +7,35 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/mail"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/sanitize"
 	"windshift/internal/services"
 
-	"github.com/google/uuid"
+	"uuid"
 )
+
+// IntakeConfirmationSender emails the sender a receipt after an intake creates
+// a new item. EmailReplyService implements it; tests substitute fakes.
+type IntakeConfirmationSender interface {
+	SendIntakeConfirmation(itemID, customerID int) error
+}
 
 // Processor handles email-to-item/comment conversion
 type Processor struct {
-	db               database.Database
-	attachmentPath   string
-	commentService   *services.CommentService
-	eventCoordinator *services.EventCoordinator
+	db                 database.Database
+	attachmentPath     string
+	commentService     *services.CommentService
+	eventCoordinator   *services.EventCoordinator
+	confirmationSender IntakeConfirmationSender
 }
 
 // NewProcessor creates a new email processor
@@ -50,6 +59,12 @@ func (p *Processor) SetEventCoordinator(ec *services.EventCoordinator) {
 	p.eventCoordinator = ec
 }
 
+// SetConfirmationSender wires the sender used for the optional intake receipt
+// email. Nil disables receipts.
+func (p *Processor) SetConfirmationSender(s IntakeConfirmationSender) {
+	p.confirmationSender = s
+}
+
 // ProcessEmail processes a single email, creating an item or comment.
 // uidValidity is the IMAP UIDVALIDITY observed by the scheduler when this
 // message was fetched; it lets us synthesize a stable dedup key for
@@ -69,18 +84,54 @@ func (p *Processor) ProcessEmail(
 	uidValidity uint32,
 	config *models.ChannelConfig,
 ) (*ProcessingResult, error) {
-	dedupKey := dedupKeyFor(email, channelID, uidValidity)
+	return p.ProcessEmailWithIntake(ctx, email, channelID, uidValidity, config, nil)
+}
+
+// ProcessEmailWithIntake is ProcessEmail for a specific intake. The intake id
+// is stamped on the tracking row for per-intake rate limiting and selects the
+// optional receipt; dedup stays mailbox-scoped on channelID. A nil intake (or
+// one with ID 0) is the legacy channel-level path.
+func (p *Processor) ProcessEmailWithIntake(
+	ctx context.Context,
+	email *ParsedEmail,
+	channelID int,
+	uidValidity uint32,
+	config *models.ChannelConfig,
+	intake *models.Intake,
+) (*ProcessingResult, error) {
+	if email == nil {
+		return nil, fmt.Errorf("email is required")
+	}
+	var intakeID *int
+	if intake != nil && intake.ID > 0 {
+		id := intake.ID
+		intakeID = &id
+	}
+	sender := strings.TrimSpace(email.From.Address)
+	parsedSender, senderErr := mail.ParseAddress(sender)
+	if senderErr != nil || parsedSender.Address == "" {
+		return nil, fmt.Errorf("email has no valid sender address")
+	}
+	if config == nil {
+		return nil, fmt.Errorf("channel config is required")
+	}
+	email.From.Address = parsedSender.Address
+	dedupKey := dedupKeyFor(email, channelID, uidValidity, intakeID)
 
 	// 1. Preclaim tracking row. INSERT ... ON CONFLICT DO NOTHING reports 0
 	// rows affected when this dedup_key is already taken — that's our dedup
 	// signal, replacing the older "isAlreadyProcessed" SELECT pre-check.
-	claimed, err := p.preclaimTracking(ctx, email, channelID, dedupKey)
+	claim, err := p.preclaimTracking(ctx, email, channelID, intakeID, dedupKey, uidValidity)
 	if err != nil {
 		return nil, fmt.Errorf("failed to claim tracking row: %w", err)
 	}
-	if !claimed {
+	if claim == trackingClaimCompleted {
 		slog.Debug("email already processed", "message_id", email.MessageID, "dedup_key", dedupKey)
 		return &ProcessingResult{Action: ActionAlreadyExists}, nil
+	}
+	if claim == trackingClaimInProgress {
+		slog.Debug("email tracking claim is still in progress", "message_id", email.MessageID, "dedup_key", dedupKey)
+		return &ProcessingResult{Action: ActionDeferred}, nil
 	}
 
 	// 2. Find or create portal customer by email
@@ -90,20 +141,35 @@ func (p *Processor) ProcessEmail(
 		return nil, fmt.Errorf("failed to find/create portal customer: %w", err)
 	}
 
-	// 3. Check if this is a reply (find parent item by In-Reply-To/References)
+	// 3. Check if this is a reply (find parent item by In-Reply-To/References).
+	// Matching is item-scoped on purpose: a reply quoting a portal ticket's
+	// Message-IDs lands on the email channel while the ticket lives on the
+	// portal channel (WI-1546). The participant guard is the security boundary.
 	var parentItemID *int
 	if email.IsReply() {
-		parentItemID = p.findParentItem(ctx, channelID, email)
+		parentItemID = p.findParentItem(ctx, email)
+	}
+
+	// Flood protection gates NEW conversations only; replies keep flowing.
+	if parentItemID == nil && p.senderIsRateLimited(ctx, channelID, intakeID, config, email.From.Address) {
+		p.markRateLimited(ctx, channelID, dedupKey)
+		slog.Info("rate-limited new ticket from sender",
+			"channel_id", channelID,
+			"from", email.From.Address,
+			"message_id", email.MessageID,
+			"uid", email.UID,
+		)
+		return &ProcessingResult{Action: ActionRateLimited}, nil
 	}
 
 	// 4. Create item or add comment
 	var result *ProcessingResult
 	if parentItemID != nil {
 		// This is a reply - add comment to existing item
-		result, err = p.addCommentFromReply(ctx, email, *parentItemID, customerID)
+		result, err = p.addCommentFromReply(email, *parentItemID, customerID)
 	} else {
 		// This is a new conversation - create item
-		result, err = p.createItemFromEmail(ctx, email, channelID, config, customerID)
+		result, err = p.createItemFromEmail(ctx, email, channelID, config, customerID, intakeID)
 	}
 
 	if err != nil {
@@ -126,7 +192,22 @@ func (p *Processor) ProcessEmail(
 		)
 	}
 
-	// 6. Handle attachments if item was created. Surface partial-ingestion
+	// 6. Optional receipt for a newly created item. Auto-generated mail is
+	// skipped so an auto-responder cannot bounce receipts back and forth.
+	// Best-effort: a delivery failure must not fail ingestion or reopen the
+	// tracking claim.
+	if result.Action == ActionItemCreated && result.ItemID != nil && intake != nil && intake.SendConfirmation && p.confirmationSender != nil && !isAutomatedEmail(email) {
+		if err := p.confirmationSender.SendIntakeConfirmation(*result.ItemID, customerID); err != nil {
+			slog.Warn("failed to send intake confirmation email",
+				"error", err,
+				"channel_id", channelID,
+				"intake_id", intake.ID,
+				"item_id", *result.ItemID,
+			)
+		}
+	}
+
+	// 7. Handle attachments if item was created. Surface partial-ingestion
 	// status on the tracking row so operators can see when attachments were
 	// dropped — the item itself stays in place either way.
 	if result.ItemID != nil && len(email.Attachments) > 0 {
@@ -149,23 +230,121 @@ func (p *Processor) ProcessEmail(
 	return result, nil
 }
 
-// dedupKeyFor returns the stable per-channel dedup key for an email. When
-// MessageID is non-empty we use it directly so a server re-delivery (same
-// Message-ID, new UID) still matches. When it's empty we synthesize a
-// channel-scoped key from UIDVALIDITY+UID — IMAP guarantees uniqueness of
-// (uidvalidity, uid) within a mailbox, so this distinguishes Message-ID-less
-// emails from each other and survives normal polling. A UIDVALIDITY reset or
-// mailbox restore will change the synth key and cause the message to be
-// reprocessed; that is acceptable because we can't tell synthetically-keyed
-// emails apart across UID-space resets.
-func dedupKeyFor(email *ParsedEmail, channelID int, uidValidity uint32) string {
-	if email.MessageID != "" {
-		return email.MessageID
+// isAutomatedEmail reports whether a message declares itself auto-generated,
+// either with an RFC 3834 Auto-Submitted value other than "no" or a
+// bulk/list Precedence. Intake receipts are suppressed for these senders so an
+// auto-responder cannot loop with the mailbox.
+func isAutomatedEmail(email *ParsedEmail) bool {
+	if email == nil {
+		return false
 	}
-	return fmt.Sprintf("synth:%d:%d:%d", channelID, uidValidity, email.UID)
+	for key, values := range email.RawHeaders {
+		switch strings.ToLower(key) {
+		case "auto-submitted":
+			if len(values) > 0 {
+				value := strings.ToLower(strings.TrimSpace(values[0]))
+				if value != "" && value != "no" {
+					return true
+				}
+			}
+		case "precedence":
+			if len(values) > 0 {
+				switch strings.ToLower(strings.TrimSpace(values[0])) {
+				case "bulk", "junk", "list":
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
-// findOrCreatePortalCustomer finds an existing portal customer or creates a new one
+// dedupKeyFor uses stable bare Message-IDs or folder-scoped synthetic keys.
+// IMAP UID is mailbox/folder-scoped, so the synthetic key includes the intake;
+// two Message-ID-less messages with the same UIDVALIDITY/UID in different
+// folders must not collide. UID resets can reprocess Message-ID-less mail,
+// which cannot otherwise be distinguished across UID spaces.
+func dedupKeyFor(email *ParsedEmail, channelID int, uidValidity uint32, intakeID *int) string {
+	if email.MessageID != "" {
+		// Preserve legacy bare keys while canonicalizing Message-ID elsewhere.
+		return bareMessageID(email.MessageID)
+	}
+	intake := 0
+	if intakeID != nil {
+		intake = *intakeID
+	}
+	return fmt.Sprintf("synth:%d:%d:%d:%d", channelID, intake, uidValidity, email.UID)
+}
+
+// DefaultEmailRateLimitPerHour caps new tickets per sender per rolling hour
+// when a channel does not configure email_rate_limit_per_hour. Generous for
+// any legitimate correspondent, tight enough to contain responder loops and
+// mail bombs.
+const DefaultEmailRateLimitPerHour = 100
+
+// emailRateLimitWindow is the rolling window sender counts are measured in.
+const emailRateLimitWindow = time.Hour
+
+// ResolveEmailRateLimitPerHour returns the channel's effective per-sender
+// hourly cap on new tickets. 0 means unlimited; negative or unreadable
+// configs fall back to the default.
+func ResolveEmailRateLimitPerHour(config *models.ChannelConfig) int {
+	if config == nil || config.EmailRateLimitPerHour == nil || *config.EmailRateLimitPerHour < 0 {
+		return DefaultEmailRateLimitPerHour
+	}
+	return *config.EmailRateLimitPerHour
+}
+
+// senderIsRateLimited reports whether senderEmail has reached the intake's
+// per-sender cap on newly created tickets within the rolling window. The cap
+// is per intake (folder/target), so one mailbox feeding two targets keeps
+// independent quotas. Legacy callers without an intake fall back to the
+// channel. Replies to existing threads are checked before this runs. A
+// transient count failure fails open: the rate limit is a safety valve, not a
+// gate that should drop customer mail.
+func (p *Processor) senderIsRateLimited(ctx context.Context, channelID int, intakeID *int, config *models.ChannelConfig, senderEmail string) bool {
+	limit := ResolveEmailRateLimitPerHour(config)
+	if limit <= 0 {
+		return false
+	}
+	var recent int
+	var err error
+	if intakeID != nil {
+		err = p.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM email_message_tracking
+			WHERE intake_id = ? AND LOWER(from_email) = ? AND direction = 'inbound'
+			  AND item_id IS NOT NULL AND comment_id IS NULL AND processed_at > ?
+		`, *intakeID, strings.ToLower(senderEmail), time.Now().Add(-emailRateLimitWindow)).Scan(&recent)
+	} else {
+		err = p.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM email_message_tracking
+			WHERE channel_id = ? AND LOWER(from_email) = ? AND direction = 'inbound'
+			  AND item_id IS NOT NULL AND comment_id IS NULL AND processed_at > ?
+		`, channelID, strings.ToLower(senderEmail), time.Now().Add(-emailRateLimitWindow)).Scan(&recent)
+	}
+	if err != nil {
+		slog.Warn("failed to count recent sender tickets; skipping rate limit",
+			"error", err, "channel_id", channelID)
+		return false
+	}
+	return recent >= limit
+}
+
+// markRateLimited stamps the claimed tracking row so the declined message
+// stays visible in the channel email log and can be requeued by an operator.
+// The row's uid/uid_validity were recorded by the preclaim.
+func (p *Processor) markRateLimited(ctx context.Context, channelID int, dedupKey string) {
+	if _, err := p.db.ExecWriteContext(ctx, `
+		UPDATE email_message_tracking
+		SET rate_limited_at = CURRENT_TIMESTAMP
+		WHERE channel_id = ? AND dedup_key = ?
+	`, channelID, dedupKey); err != nil {
+		slog.Warn("failed to mark email rate limited", "error", err, "channel_id", channelID, "dedup_key", dedupKey)
+	}
+}
+
+// findOrCreatePortalCustomer resolves the sender to a portal customer by
+// email, creating one on first contact, and grants channel access.
 func (p *Processor) findOrCreatePortalCustomer(
 	ctx context.Context,
 	email, name string,
@@ -183,51 +362,17 @@ func (p *Processor) findOrCreatePortalCustomer(
 		}
 	}
 
-	// Try to find existing customer by email
-	var customerID int
-	err := p.db.QueryRow(`
-		SELECT id FROM portal_customers WHERE LOWER(email) = ?
-	`, email).Scan(&customerID)
-
-	if err == nil {
-		// Customer exists
-		p.grantChannelAccess(ctx, customerID, channelID, email, config)
-		return customerID, nil
-	}
-
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("failed to query portal customer: %w", err)
-	}
-
-	// Create new customer. Use ON CONFLICT DO NOTHING RETURNING id so a
-	// concurrent inserter (another process in a multi-instance deployment, or
-	// an admin creating a customer with the same address) doesn't make us fail
-	// with a unique-constraint error — instead we fall through and re-select
-	// the row the winner created.
-	var id int64
-	err = p.db.QueryRow(`
-		INSERT INTO portal_customers (name, email, created_at, updated_at)
-		VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-		ON CONFLICT DO NOTHING
-		RETURNING id
-	`, name, email).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		// Lost the race; another inserter committed first. Re-read their row.
-		if err = p.db.QueryRow(`SELECT id FROM portal_customers WHERE LOWER(email) = ?`, email).Scan(&customerID); err != nil {
-			return 0, fmt.Errorf("failed to re-select portal customer after conflict: %w", err)
-		}
-		p.grantChannelAccess(ctx, customerID, channelID, email, config)
-		return customerID, nil
-	}
+	customerID, created, err := repository.NewPortalCustomerRepository(p.db).FindOrCreateByEmail(ctx, name, email, models.CustomerCreatedViaEmailIntake)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create portal customer: %w", err)
+		return 0, err
+	}
+	if created {
+		slog.Info("created portal customer from email", "customer_id", customerID, "email", email)
 	}
 
-	customerID = int(id)
-	p.grantChannelAccess(ctx, customerID, channelID, email, config)
-
-	slog.Info("created portal customer from email", "customer_id", customerID, "email", email)
-
+	if err := p.grantChannelAccess(ctx, customerID, channelID, email, config); err != nil {
+		return 0, err
+	}
 	return customerID, nil
 }
 
@@ -237,16 +382,15 @@ func (p *Processor) findOrCreatePortalCustomer(
 // PortalRegistrationMode so email ingestion can't bypass portal-side policy
 // (e.g. a "manual registration only" portal must not auto-admit arbitrary
 // senders just because they emailed the ingest channel).
-func (p *Processor) grantChannelAccess(ctx context.Context, customerID, channelID int, senderEmail string, config *models.ChannelConfig) {
+func (p *Processor) grantChannelAccess(ctx context.Context, customerID, channelID int, senderEmail string, config *models.ChannelConfig) error {
+	repo := repository.NewPortalCustomerRepository(p.db)
 	// Grant access to email channel
-	_, _ = p.db.ExecWriteContext(ctx, `
-		INSERT INTO portal_customer_channels (portal_customer_id, channel_id)
-		VALUES (?, ?)
-		ON CONFLICT DO NOTHING
-	`, customerID, channelID)
+	if _, err := repo.EnsureChannelAccess(customerID, channelID); err != nil {
+		return fmt.Errorf("grant customer access to email channel: %w", err)
+	}
 
 	if config.EmailConnectedPortalID == nil {
-		return
+		return nil
 	}
 	portalID := *config.EmailConnectedPortalID
 	if !p.connectedPortalAdmitsEmail(ctx, portalID, senderEmail) {
@@ -255,13 +399,12 @@ func (p *Processor) grantChannelAccess(ctx context.Context, customerID, channelI
 			"portal_channel_id", portalID,
 			"sender", senderEmail,
 		)
-		return
+		return nil
 	}
-	_, _ = p.db.ExecWriteContext(ctx, `
-		INSERT INTO portal_customer_channels (portal_customer_id, channel_id)
-		VALUES (?, ?)
-		ON CONFLICT DO NOTHING
-	`, customerID, portalID)
+	if _, err := repo.EnsureChannelAccess(customerID, portalID); err != nil {
+		return fmt.Errorf("grant customer access to connected portal: %w", err)
+	}
+	return nil
 }
 
 // connectedPortalAdmitsEmail returns true when the connected portal's policy
@@ -304,6 +447,12 @@ func (p *Processor) connectedPortalAdmitsEmail(ctx context.Context, portalChanne
 		}
 	}
 
+	// Unknown registration modes fail closed; empty is the legacy spelling of
+	// open. A typo must never auto-register an email sender.
+	if pCfg.PortalRegistrationMode != "" && pCfg.PortalRegistrationMode != "open" && pCfg.PortalRegistrationMode != "manual" {
+		return false
+	}
+
 	// Manual registration: only existing portal_customer_channels rows admit.
 	if pCfg.PortalRegistrationMode == "manual" {
 		var hasAccess bool
@@ -326,28 +475,38 @@ func (p *Processor) connectedPortalAdmitsEmail(ctx context.Context, portalChanne
 
 // findParentItem looks up the original item from In-Reply-To or References headers.
 //
+// Matching is item-scoped across channels: Message-IDs are globally unique,
+// and a conversation must survive its customer switching channels (portal
+// ticket, reply by email). Channel scoping would permanently silo the
+// customer's reply on the intake channel (WI-1547).
+//
 // Thread-hijack defense: the In-Reply-To / References headers are entirely
 // attacker-controlled. If we trusted them naively, anyone who leaks or guesses
-// a Message-ID used on a channel could post a "reply" onto that item from a
-// new email address, exposing private conversations to a third party. We match
-// only when the sender is demonstrably part of the thread — either a prior
-// participant on that tracked thread (their address appeared as from_email
-// on an earlier tracked message for the same item) or the original creator
-// of the item via the portal_customer linkage.
-func (p *Processor) findParentItem(ctx context.Context, channelID int, email *ParsedEmail) *int {
+// a Message-ID used anywhere could post a "reply" onto that item from a new
+// email address, exposing private conversations to a third party. The
+// participant guard is the security boundary: we match only when the sender is
+// demonstrably part of the item's conversation — a prior participant on its
+// tracked thread (any channel) or the original creator via the portal-customer
+// linkage.
+func (p *Processor) findParentItem(ctx context.Context, email *ParsedEmail) *int {
 	threadIDs := email.GetThreadIDs()
 	senderEmail := normalizedEmail(email.From.Address)
 
 	for _, messageID := range threadIDs {
 		var itemID int
+		canonicalID := canonicalMessageID(messageID)
+		bareID := bareMessageID(messageID)
+		if canonicalID == "" {
+			continue
+		}
 		err := p.db.QueryRowContext(ctx, `
 			SELECT item_id FROM email_message_tracking
-			WHERE channel_id = ? AND message_id = ? AND item_id IS NOT NULL
-		`, channelID, messageID).Scan(&itemID)
+			WHERE message_id IN (?, ?) AND item_id IS NOT NULL
+		`, canonicalID, bareID).Scan(&itemID)
 		if err != nil {
 			continue
 		}
-		if !p.senderIsThreadParticipant(ctx, itemID, channelID, senderEmail) {
+		if !p.senderIsThreadParticipant(ctx, itemID, senderEmail) {
 			slog.Warn("ignoring reply: sender is not a known thread participant",
 				"item_id", itemID,
 				"message_id", messageID,
@@ -363,24 +522,39 @@ func (p *Processor) findParentItem(ctx context.Context, channelID int, email *Pa
 }
 
 // senderIsThreadParticipant reports whether senderEmail is allowed to post
-// onto the given item via an email reply.
-func (p *Processor) senderIsThreadParticipant(ctx context.Context, itemID, channelID int, senderEmail string) bool {
+// onto the given item via an email reply. The checks are item-scoped: the
+// original creator, a current external request participant (WI-1136, including
+// a re-added one), or a prior sender on the thread. An explicit participant
+// removal revokes the implicit thread-membership grant so removing someone is
+// not undone by an old reply in their mailbox. The anchor rows minted for
+// portal tickets carry from_email=” so they can never satisfy the
+// prior-participant clause implicitly.
+func (p *Processor) senderIsThreadParticipant(ctx context.Context, itemID int, senderEmail string) bool {
 	if senderEmail == "" {
 		return false
 	}
-	// Prior participant on this thread (inbound or outbound).
+	// Original creator via portal customer.
+	if creatorEmail, err := repository.NewItemRepository(p.db).GetPortalCustomerEmailForItem(itemID); err == nil {
+		if normalizedEmail(creatorEmail) == senderEmail {
+			return true
+		}
+	}
+	// Explicit external request participant, including a re-added one.
+	participants := repository.NewItemParticipantRepository(p.db)
+	if isParticipant, err := participants.IsParticipantEmail(itemID, senderEmail); err == nil && isParticipant {
+		return true
+	}
+	// An explicit removal revokes implicit thread membership.
+	if removed, err := participants.WasParticipantRemoved(itemID, senderEmail); err == nil && removed {
+		return false
+	}
+	// Prior participant on this item's thread (inbound or outbound, any channel).
 	var priorCount int
 	if err := p.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM email_message_tracking
 		WHERE item_id = ? AND LOWER(from_email) = ?
 	`, itemID, senderEmail).Scan(&priorCount); err == nil && priorCount > 0 {
 		return true
-	}
-	// Original creator via portal customer.
-	if creatorEmail, err := repository.NewItemRepository(p.db).GetPortalCreatorEmail(itemID, channelID); err == nil {
-		if normalizedEmail(creatorEmail) == senderEmail {
-			return true
-		}
 	}
 	return false
 }
@@ -398,40 +572,50 @@ func (p *Processor) createItemFromEmail( //nolint:unparam // ctx reserved for fu
 	channelID int,
 	config *models.ChannelConfig,
 	customerID int,
+	intakeID *int,
 ) (*ProcessingResult, error) {
 	_ = ctx
-	if config.EmailWorkspaceID == 0 {
-		return nil, fmt.Errorf("no workspace configured for email channel")
-	}
 
-	// Validate item type is configured
-	if config.EmailItemTypeID == nil || *config.EmailItemTypeID == 0 {
-		return nil, fmt.Errorf("no item type configured for email channel: EmailItemTypeID is required")
+	workspaceID, itemTypeID, requestTypeID, err := p.resolveEmailIntakeTarget(config)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify the item type is allowed in this workspace's configuration set.
 	// This mirrors the REST handler (restapi/v1/handlers/items.go) so email-
 	// created items go through the same validation as API-created ones.
-	allowed, err := services.IsItemTypeAllowedInWorkspace(p.db, config.EmailWorkspaceID, *config.EmailItemTypeID)
+	allowed, err := services.IsItemTypeAllowedInWorkspace(p.db, workspaceID, *itemTypeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check item type restriction: %w", err)
 	}
 	if !allowed {
-		return nil, fmt.Errorf("item type %d is not allowed in workspace %d", *config.EmailItemTypeID, config.EmailWorkspaceID)
+		return nil, fmt.Errorf("item type %d is not allowed in workspace %d", *itemTypeID, workspaceID)
+	}
+	if config.EmailDefaultPriorityID != nil {
+		allowed, err := services.IsPriorityAllowedInWorkspace(p.db, workspaceID, *config.EmailDefaultPriorityID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check priority restriction: %w", err)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("priority %d is not allowed in workspace %d", *config.EmailDefaultPriorityID, workspaceID)
+		}
 	}
 
-	// Build item parameters. Leave StatusID/PriorityID nil so services.CreateItem
-	// resolves them from the workspace's workflow and default-priority config —
-	// the same path the REST API uses. A prior implementation tried to resolve
-	// these here with a global query, which failed for custom workflows.
+	// Build item parameters. Leave StatusID nil so services.CreateItem resolves
+	// it from the workspace workflow. PriorityID is supplied only when the
+	// channel explicitly configured a workspace-valid override; otherwise the
+	// shared service resolves the workspace default.
 	params := services.ItemCreationParams{
-		WorkspaceID:             config.EmailWorkspaceID,
+		WorkspaceID:             workspaceID,
 		Title:                   sanitize.PlainTextField.Sanitize(email.GetSubjectForItem()),
 		Description:             sanitize.Comment.Sanitize(StripSignature(email.GetBodyText())),
-		ItemTypeID:              config.EmailItemTypeID,
+		ItemTypeID:              itemTypeID,
 		PriorityID:              config.EmailDefaultPriorityID,
+		RequestTypeID:           requestTypeID,
+		IntakeID:                intakeID,
 		CreatorPortalCustomerID: &customerID,
 		ChannelID:               &channelID,
+		EventMetadata:           itemevents.PortalCustomer(customerID, "email"),
 	}
 
 	// Create the item via the shared service entry point.
@@ -469,9 +653,39 @@ func (p *Processor) createItemFromEmail( //nolint:unparam // ctx reserved for fu
 	}, nil
 }
 
+// resolveEmailIntakeTarget returns the workspace, item type, and (for a portal-
+// linked intake) the generic system Email request type a new item is created
+// under.
+//
+// Routing is always the intake's workspace and item type. A portal link only
+// adds the portal's system Email request type as the "this arrived by email"
+// marker used by portal display, SLA, and support metrics; the request type's
+// own workspace and item type are not authoritative here.
+func (p *Processor) resolveEmailIntakeTarget(config *models.ChannelConfig) (workspaceID int, itemTypeID, requestTypeID *int, err error) {
+	if config.EmailWorkspaceID == 0 {
+		return 0, nil, nil, fmt.Errorf("no workspace configured for email channel")
+	}
+	if config.EmailItemTypeID == nil || *config.EmailItemTypeID <= 0 {
+		return 0, nil, nil, fmt.Errorf("no item type configured for email channel: EmailItemTypeID is required")
+	}
+	if config.EmailConnectedPortalID == nil {
+		return config.EmailWorkspaceID, config.EmailItemTypeID, nil, nil
+	}
+
+	rtID, err := services.EnsureEmailRequestType(
+		p.db,
+		*config.EmailConnectedPortalID,
+		config.EmailWorkspaceID,
+		config.EmailItemTypeID,
+	)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("resolve portal email request type: %w", err)
+	}
+	return config.EmailWorkspaceID, config.EmailItemTypeID, &rtID, nil
+}
+
 // addCommentFromReply adds a comment to an existing item from an email reply
 func (p *Processor) addCommentFromReply(
-	ctx context.Context,
 	email *ParsedEmail,
 	itemID int,
 	customerID int,
@@ -487,27 +701,19 @@ func (p *Processor) addCommentFromReply(
 		}, nil
 	}
 
-	// Get user ID from portal customer (if linked)
-	var linkedUserID int
-	err := p.db.QueryRowContext(ctx, `
-		SELECT user_id FROM portal_customers WHERE id = ? AND user_id IS NOT NULL
-	`, customerID).Scan(&linkedUserID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		slog.Warn("failed to get user_id for portal customer", "error", err)
-	}
-
 	// All comment writes go through CommentService (notifications, mentions,
 	// webhooks, email reply handling, and the item-change publish). It is always
-	// wired in production; treat a nil service as a misconfiguration rather than
-	// writing SQL here.
+	// wired in production. Inbound From is not an authentication credential, so
+	// even a portal customer linked to a user remains a portal identity here.
 	if p.commentService == nil {
 		return nil, fmt.Errorf("comment service not configured")
 	}
 	result, err := p.commentService.Create(services.CreateCommentParams{
 		ItemID:           itemID,
-		AuthorID:         linkedUserID,
+		AuthorID:         0,
 		PortalCustomerID: &customerID,
 		Content:          content,
+		EventMetadata:    itemevents.PortalCustomer(customerID, "email"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create comment: %w", err)
@@ -570,7 +776,26 @@ func (p *Processor) handleAttachments(ctx context.Context, attachments []Attachm
 		_ = json.Unmarshal([]byte(allowedMimeJSON), &allowedTypes)
 	}
 
+	// Abuse bound (WI-1142): a single message cannot flood the ticket with
+	// more files than this. Excess attachments are dropped; the tracking row
+	// still records the message with whatever fit.
+	const maxAttachmentsPerEmail = 25
+	accepted := 0
+
 	for _, att := range attachments {
+		if accepted >= maxAttachmentsPerEmail {
+			slog.Warn("skipping attachment: per-message attachment limit reached",
+				"item_id", itemID,
+				"filename", att.Filename,
+				"limit", maxAttachmentsPerEmail,
+			)
+			continue
+		}
+		// Check size limit
+		if att.Size > maxFileSize {
+			slog.Debug("skipping attachment: exceeds max size", "filename", att.Filename, "size", att.Size)
+			continue
+		}
 		// Check size limit
 		if att.Size > maxFileSize {
 			slog.Debug("skipping attachment: exceeds max size", "filename", att.Filename, "size", att.Size)
@@ -631,6 +856,7 @@ func (p *Processor) handleAttachments(ctx context.Context, attachments []Attachm
 
 		slog.Debug("saved attachment", "filename", att.Filename, "item_id", itemID)
 		out.saved++
+		accepted++
 	}
 
 	return out, nil
@@ -690,39 +916,97 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
+const trackingClaimStaleAfter = 5 * time.Minute
+
+type trackingClaimState uint8
+
+const (
+	trackingClaimAcquired trackingClaimState = iota
+	trackingClaimCompleted
+	trackingClaimInProgress
+)
+
 // preclaimTracking inserts the tracking row up front (NULL item_id/comment_id)
-// so duplicate detection happens before item creation, not after. Returns true
-// when this caller owns the claim and should proceed; false when the row
-// already existed (i.e. another worker or a prior run already tracked it).
+// so duplicate detection happens before item creation, not after. A process
+// crash can leave that preclaim behind forever, so an incomplete claim older
+// than the processing lease + request budget is atomically reclaimed. The
+// result distinguishes ownership from a completed duplicate and a live
+// unfinished claim so callers do not advance the mailbox watermark too early.
+// A finalized row is recognized by completed_at as well as item_id/comment_id,
+// so deleting the created ticket does not reopen it for reprocessing.
+// uid/uid_validity are stamped here so rate-limited rows can be requeued
+// surgically within the right IMAP epoch.
 func (p *Processor) preclaimTracking(
 	ctx context.Context,
 	email *ParsedEmail,
 	channelID int,
+	intakeID *int,
 	dedupKey string,
-) (bool, error) {
+	uidValidity uint32,
+) (trackingClaimState, error) {
 	res, err := p.db.ExecWriteContext(ctx, `
 		INSERT INTO email_message_tracking (
-			channel_id, message_id, dedup_key, in_reply_to, from_email, from_name, subject,
-			item_id, comment_id, direction, processed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'inbound', CURRENT_TIMESTAMP)
-		ON CONFLICT DO NOTHING
+			channel_id, intake_id, message_id, dedup_key, in_reply_to, from_email, from_name, subject,
+			item_id, comment_id, direction, uid, uid_validity, processed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'inbound', ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(channel_id, dedup_key) DO UPDATE SET
+			-- Keep the intake that first claimed the message so a duplicate seen in
+			-- another folder cannot shift its per-intake rate-limit attribution.
+			intake_id = COALESCE(email_message_tracking.intake_id, excluded.intake_id),
+			message_id = excluded.message_id,
+			in_reply_to = excluded.in_reply_to,
+			from_email = excluded.from_email,
+			from_name = excluded.from_name,
+			subject = excluded.subject,
+			uid = excluded.uid,
+			uid_validity = excluded.uid_validity,
+			processed_at = CURRENT_TIMESTAMP
+		WHERE email_message_tracking.item_id IS NULL
+		  AND email_message_tracking.comment_id IS NULL
+		  AND email_message_tracking.completed_at IS NULL
+		  AND email_message_tracking.processed_at < ?
 	`,
 		channelID,
+		intakeID,
 		email.MessageID,
 		dedupKey,
 		nullString(email.InReplyTo),
 		email.From.Address,
 		nullString(email.From.Name),
 		nullString(email.Subject),
+		int64(email.UID),
+		int64(uidValidity),
+		time.Now().Add(-trackingClaimStaleAfter),
 	)
 	if err != nil {
-		return false, err
+		return trackingClaimInProgress, err
 	}
 	rows, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return trackingClaimInProgress, err
 	}
-	return rows > 0, nil
+	if rows > 0 {
+		return trackingClaimAcquired, nil
+	}
+
+	var itemID, commentID sql.NullInt64
+	var completedAt sql.NullTime
+	if err := p.db.QueryRowContext(ctx, `
+		SELECT item_id, comment_id, completed_at
+		FROM email_message_tracking
+		WHERE channel_id = ? AND dedup_key = ?
+	`, channelID, dedupKey).Scan(&itemID, &commentID, &completedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return trackingClaimInProgress, nil
+		}
+		return trackingClaimInProgress, err
+	}
+	// completed_at survives the created item/comment being deleted, so a
+	// deleted ticket stays deduplicated even though its FKs are nulled.
+	if itemID.Valid || commentID.Valid || completedAt.Valid {
+		return trackingClaimCompleted, nil
+	}
+	return trackingClaimInProgress, nil
 }
 
 // releaseTrackingClaim removes a preclaim row whose downstream item/comment
@@ -733,14 +1017,16 @@ func (p *Processor) releaseTrackingClaim(ctx context.Context, channelID int, ded
 	if _, err := p.db.ExecWriteContext(ctx, `
 		DELETE FROM email_message_tracking
 		WHERE channel_id = ? AND dedup_key = ? AND item_id IS NULL AND comment_id IS NULL
+		  AND completed_at IS NULL
 	`, channelID, dedupKey); err != nil {
 		slog.Warn("failed to release tracking claim", "error", err, "channel_id", channelID, "dedup_key", dedupKey)
 	}
 }
 
 // finalizeTrackingClaim sets the item_id/comment_id on a preclaim row once the
-// downstream create has succeeded. The WHERE constrains by NULL refs to avoid
-// stomping a row another worker may have completed first.
+// downstream create has succeeded, clearing any rate_limited_at marker so a
+// recovered message no longer counts as waiting for requeue. The WHERE
+// constrains by NULL refs to avoid stomping a row another worker completed.
 func (p *Processor) finalizeTrackingClaim(
 	ctx context.Context,
 	channelID int,
@@ -749,14 +1035,14 @@ func (p *Processor) finalizeTrackingClaim(
 ) error {
 	_, err := p.db.ExecWriteContext(ctx, `
 		UPDATE email_message_tracking
-		SET item_id = ?, comment_id = ?
+		SET item_id = ?, comment_id = ?, rate_limited_at = NULL, completed_at = CURRENT_TIMESTAMP
 		WHERE channel_id = ? AND dedup_key = ? AND item_id IS NULL AND comment_id IS NULL
 	`, itemID, commentID, channelID, dedupKey)
 	return err
 }
 
 // nullString returns nil for empty strings
-func nullString(s string) interface{} {
+func nullString(s string) any {
 	if s == "" {
 		return nil
 	}

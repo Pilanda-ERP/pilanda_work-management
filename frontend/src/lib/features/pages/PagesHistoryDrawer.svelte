@@ -10,19 +10,10 @@
   import EmptyState from '../../components/EmptyState.svelte';
   import Badge from '../../components/Badge.svelte';
   import { IconX, IconHistory, IconRestore } from '@tabler/icons-svelte-runes';
+  import { loadPageHistory, pageRevisionAuthorName } from './pageHistoryData.js';
 
-  /**
-   * Right-side slide-in drawer that lists the revision history for a
-   * page. Each row can expand inline to render the revision's body
-   * (read-only Milkdown), and revisions other than the active one
-   * carry a Restore button that POSTs to the existing
-   * /history/{revId}/restore endpoint and asks the parent to reload.
-   *
-   * Mounted persistently next to PagesView's editor — the drawer
-   * toggles via the `open` prop rather than mounting / unmounting on
-   * every open. That preserves the loaded history + per-revision
-   * preview state across opens of the same page.
-   */
+  /** Persistent page-revision drawer with read-only previews and restore. It
+   * toggles via `open` to preserve loaded history and preview state. */
   let {
     workspaceId,
     pageId = null,
@@ -38,12 +29,7 @@
   let error = $state('');
   let expandedRevisionId = $state(/** @type {number|null} */ (null));
   let pendingRestoreId = $state(/** @type {number|null} */ (null));
-  // Per-user-id cache so we don't refetch the same author N times.
-  let userCache = $state(/** @type {Record<number, any>} */ ({}));
-
-  // Reload when the drawer opens against a new page, or transitions
-  // from closed → open. Skipping the load while closed keeps the
-  // history request out of the hot path for users who never open it.
+  // Load only when opened for a new page.
   let lastLoadedFor = $state(/** @type {{wsId:any,pageId:any}|null} */ (null));
   $effect(() => {
     if (!open || pageId == null) return;
@@ -57,45 +43,13 @@
     loading = true;
     error = '';
     try {
-      const rows = await api.pages.getHistory(workspaceId, pageId, { limit: 50 });
-      // Cookie-auth returns { revisions }, v1 returns { items }. Accept both
-      // shapes because this drawer sits on the cookie surface while the CLI
-      // shares the same api/pages helper conventions.
-      history = Array.isArray(rows?.revisions)
-        ? rows.revisions
-        : Array.isArray(rows?.items)
-          ? rows.items
-          : Array.isArray(rows)
-            ? rows
-            : [];
-      void prefetchAuthors(history);
+      history = await loadPageHistory(api, workspaceId, pageId, { limit: 50 });
     } catch (e) {
       error = e?.message || t('pages.history.loadError');
       history = [];
     } finally {
       loading = false;
     }
-  }
-
-  async function prefetchAuthors(rows) {
-    const seen = new Set();
-    for (const r of rows) {
-      const uid = r?.created_by;
-      if (uid == null || seen.has(uid) || uid in userCache) continue;
-      seen.add(uid);
-      try {
-        const u = await api.getUser(uid);
-        userCache = { ...userCache, [uid]: u };
-      } catch {
-        userCache = { ...userCache, [uid]: null };
-      }
-    }
-  }
-
-  function authorName(uid) {
-    const u = userCache[uid];
-    if (!u) return uid != null ? `#${uid}` : '—';
-    return u.full_name || u.username || u.email || `#${uid}`;
   }
 
   function changeTypeColor(t) {
@@ -187,7 +141,7 @@
               >
                 <span class="rev-number">#{rev.revision_number}</span>
                 <Badge variant={changeTypeColor(rev.change_type)}>{rev.change_type}</Badge>
-                <span class="rev-author">{authorName(rev.created_by)}</span>
+                <span class="rev-author">{pageRevisionAuthorName(rev)}</span>
                 <span class="rev-time" title={rev.created_at}>{formatRelativeTime(rev.created_at)}</span>
               </button>
 
@@ -266,7 +220,7 @@
     padding: 4px;
     border-radius: 4px;
   }
-  .icon-btn:hover { background: var(--ds-surface-hover, #f3f4f6); }
+  .icon-btn:hover { background: var(--ds-surface-hovered, #f3f4f6); }
   .drawer-body {
     flex: 1;
     overflow-y: auto;
@@ -308,7 +262,7 @@
     color: inherit;
     border-radius: 6px;
   }
-  .rev-header:hover { background: var(--ds-surface-hover, #f3f4f6); }
+  .rev-header:hover { background: var(--ds-surface-hovered, #f3f4f6); }
   .rev-number {
     font-variant-numeric: tabular-nums;
     font-weight: 600;
@@ -356,6 +310,6 @@
     cursor: pointer;
     font: inherit;
   }
-  .restore-btn:hover:not(:disabled) { background: var(--ds-surface-hover, #f3f4f6); }
+  .restore-btn:hover:not(:disabled) { background: var(--ds-surface-hovered, #f3f4f6); }
   .restore-btn:disabled { opacity: 0.6; cursor: progress; }
 </style>

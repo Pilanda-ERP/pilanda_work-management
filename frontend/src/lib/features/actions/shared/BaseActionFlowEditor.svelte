@@ -293,13 +293,13 @@
   }
 </script>
 
-<div class="flex h-full action-flow-editor">
+<div class="flex h-full w-full min-w-0 action-flow-editor">
   <!-- Node Palette -->
-  <div class="w-64 sidebar border-r flex flex-col py-4 overflow-y-auto flex-shrink-0">
+  <div class="action-palette sidebar border-r flex flex-col py-4 overflow-y-auto flex-shrink-0">
     <div class="px-4 mb-4 pb-4 border-b" style="border-color: var(--ds-border);">
       <div class="flex items-center gap-3">
         <div class="flex items-center justify-center w-10 h-10 flex-shrink-0">
-          <div class="w-8 h-8 rounded-md flex items-center justify-center bg-amber-500">
+          <div class="w-8 h-8 rounded-md flex items-center justify-center bg-ds-warning">
             <Zap size={18} color="white" />
           </div>
         </div>
@@ -347,7 +347,11 @@
   </div>
 
   <!-- Svelte Flow Canvas -->
-  <div class="flex-1 relative" bind:this={flowContainer}>
+  <div
+    class="flex-1 min-w-0 relative overflow-hidden"
+    bind:this={flowContainer}
+    data-testid="action-editor-canvas"
+  >
     <SvelteFlow
       bind:nodes
       bind:edges
@@ -388,15 +392,15 @@
     </div>
 
     <!-- Action info header -->
-    <div class="absolute top-4 left-4 z-10 flex items-start gap-2">
-      <div class="action-header px-3 py-2 rounded-lg border">
-        <div class="text-sm font-medium">{action?.name || newActionLabel}</div>
-        <div class="text-xs sidebar-subtitle">
+    <div class="absolute top-4 left-4 right-64 z-10 flex min-w-0 items-start gap-2">
+      <div class="action-header min-w-0 px-3 py-2 rounded-lg border">
+        <div class="truncate text-sm font-medium" title={action?.name || newActionLabel}>{action?.name || newActionLabel}</div>
+        <div class="truncate text-xs sidebar-subtitle">
           {triggerTypes.find(tt => tt.value === flowStore.triggerType)?.label || flowStore.triggerType || action?.trigger_type}
         </div>
       </div>
       <button
-        class="direction-toggle rounded-lg border p-2"
+        class="direction-toggle flex-shrink-0 rounded-lg border p-2"
         onclick={() => flowStore.toggleDirection()}
         title={flowStore.direction === 'horizontal' ? switchToVerticalLabel : switchToHorizontalLabel}
       >
@@ -412,11 +416,11 @@
   <!-- Config Panel (shown when node is selected) -->
   {#if selectedNode}
     {#key selectedNode.id}
-      <div class="w-80 sidebar border-l p-4 overflow-y-auto flex-shrink-0">
+      <div class="action-config sidebar border-l p-4 overflow-y-auto flex-shrink-0">
         <div class="flex items-center justify-between mb-4">
           <h3 class="text-sm font-medium sidebar-title">{nodeConfigLabel}</h3>
           <button
-            class="text-sm text-gray-500 hover:text-gray-700"
+            class="text-sm text-ds-text-subtle hover:text-ds-text"
             onclick={handleClearSelection}
           >
             &times;
@@ -443,6 +447,18 @@
   .sidebar {
     background-color: var(--ds-surface-raised);
     border-color: var(--ds-border);
+  }
+
+  .action-palette {
+    width: 16rem;
+    min-width: 16rem;
+    max-width: 16rem;
+  }
+
+  .action-config {
+    width: 20rem;
+    min-width: 20rem;
+    max-width: 20rem;
   }
 
   .sidebar-title {

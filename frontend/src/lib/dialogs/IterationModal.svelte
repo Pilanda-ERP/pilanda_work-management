@@ -6,9 +6,12 @@
   import Button from '../components/Button.svelte';
   import Input from '../components/Input.svelte';
   import Select from '../components/Select.svelte';
-  import Textarea from '../components/Textarea.svelte';
   import Label from '../components/Label.svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import { canChangePlanningScope } from '../utils/planningScope.js';
+	import SelectField from '../components/SelectField.svelte';
+	import TextareaField from '../components/TextareaField.svelte';
+	import TextField from '../components/TextField.svelte';
 
   let {
     iteration = null,
@@ -38,7 +41,9 @@
   const statusOptions = $derived([
     { value: 'planned', label: t('iterations.statusPlanned') },
     { value: 'active', label: t('iterations.statusActive') },
-    { value: 'completed', label: t('iterations.statusCompleted') },
+    ...(formData.status === 'completed'
+      ? [{ value: 'completed', label: t('iterations.statusCompleted') }]
+      : []),
     { value: 'cancelled', label: t('iterations.statusCancelled') }
   ]);
 
@@ -47,6 +52,8 @@
   }
 
   async function handleSave() {
+    if (saving) return;
+
     error = '';
 
     // Validation
@@ -83,11 +90,12 @@
       dataToSave.workspace_id = workspaceId ? parseInt(workspaceId) : null;
     }
 
+    saving = true;
     try {
-      saving = true;
-      onsave(dataToSave);
+      await onsave(dataToSave);
     } catch (err) {
       error = err.message || t('iterations.failedToSaveIteration');
+    } finally {
       saving = false;
     }
   }
@@ -101,7 +109,7 @@
     }
   }
 
-  let canToggleGlobal = $derived(canManageGlobal && (!iteration || iteration.is_global));
+  let canToggleGlobal = $derived(canChangePlanningScope(canManageGlobal, iteration));
 </script>
 
 <Modal
@@ -120,8 +128,11 @@
     <form onsubmit={(e) => { e.preventDefault(); handleSave(); }} class="space-y-4">
       <!-- Error Message -->
       {#if error}
-        <div class="p-3 rounded" style="background-color: #fee; border: 1px solid #fcc;">
-          <p class="text-sm" style="color: #c33;">{error}</p>
+        <div
+          class="p-3 rounded"
+          style="background-color: var(--ds-danger-subtle); border: 1px solid var(--ds-border-danger);"
+        >
+          <p class="text-sm" style="color: var(--ds-text-danger);">{error}</p>
         </div>
       {/if}
 
@@ -160,22 +171,24 @@
 
       <!-- Name -->
       <div>
-        <Label color="default" required class="mb-1.5">{t('common.name')}</Label>
-        <Input
+        <TextField
+          label={t('common.name')}
           id="iteration-name-input"
-          bind:value={formData.name}
-          placeholder={t('iterations.iterationNamePlaceholder')}
           required
+          labelColor="default"
+          placeholder={t('iterations.iterationNamePlaceholder')}
+          bind:value={formData.name}
         />
       </div>
 
       <!-- Description -->
       <div>
-        <Label color="default" class="mb-1.5">{t('common.description')}</Label>
-        <Textarea
-          bind:value={formData.description}
+        <TextareaField
+          label={t('common.description')}
+          labelColor="default"
           placeholder={t('iterations.iterationDescriptionPlaceholder')}
           rows={3}
+          bind:value={formData.description}
         />
       </div>
 
@@ -209,8 +222,13 @@
 
       <!-- Status -->
       <div>
-        <Label color="default" class="mb-1.5">{t('common.status')}</Label>
-        <Select id="iteration-status-select" bind:value={formData.status} options={statusOptions.map(status => ({ value: status.value, label: status.label }))} />
+        <SelectField
+          label={t('common.status')}
+          id="iteration-status-select"
+          labelColor="default"
+          options={statusOptions.map(status => ({ value: status.value, label: status.label }))}
+          bind:value={formData.status}
+        />
       </div>
 
     </form>

@@ -13,26 +13,34 @@
 -->
 <script>
   import { onMount } from 'svelte';
-  import { Plus, Edit, Trash2, KeyRound, Power, PowerOff } from '@lucide/svelte';
+  import StateDisplay from '../components/StateDisplay.svelte';
+  import { Plus, Edit, Trash2, KeyRound } from '@lucide/svelte';
   import { api } from '../api.js';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
   import Button from '../components/Button.svelte';
+  import Checkbox from '../components/Checkbox.svelte';
+  import WorkspaceCheckboxList from '../components/WorkspaceCheckboxList.svelte';
+  import Radio from '../components/Radio.svelte';
+  import Input from '../components/Input.svelte';
+  import Textarea from '../components/Textarea.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
-  import Modal from '../dialogs/Modal.svelte';
-  import ModalHeader from '../dialogs/ModalHeader.svelte';
-  import Spinner from '../components/Spinner.svelte';
   import Lozenge from '../components/Lozenge.svelte';
   import Select from '../components/Select.svelte';
   import DataTable from '../components/DataTable.svelte';
   import { successToast, errorToast } from '../stores/toasts.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+  import { t } from '../stores/i18n.svelte.js';
+  import EnabledStatus from './EnabledStatus.svelte';
+  import EntityFormModal from './EntityFormModal.svelte';
+  import EntityRowActions from './EntityRowActions.svelte';
 
-  const CREDENTIAL_TYPES = [
-    { value: 'bearer_token', label: 'Bearer token' },
-    { value: 'api_key', label: 'API key' },
-    { value: 'basic_auth', label: 'Basic auth (user:password)' },
-    { value: 'custom_header', label: 'Custom header value' },
-  ];
+  const CREDENTIAL_TYPES = $derived([
+    { value: 'bearer_token', label: t('settings.adminOperations.actionCredentials.bearerToken') },
+    { value: 'api_key', label: t('settings.adminOperations.actionCredentials.apiKey') },
+    { value: 'basic_auth', label: t('settings.adminOperations.actionCredentials.basicAuth') },
+    { value: 'custom_header', label: t('settings.adminOperations.actionCredentials.customHeader') },
+  ]);
 
   let credentials = $state([]);
   let workspaces = $state([]);
@@ -86,13 +94,13 @@
       credentials = (await api.actionCredentials.getAllGlobal()) || [];
     } catch (err) {
       console.error('Failed to load action credentials:', err);
-      errorToast(err.message || 'Failed to load action credentials');
+      errorToast(err.message || t('settings.adminOperations.actionCredentials.loadFailed'));
     }
   }
 
   async function loadWorkspaces() {
     try {
-      workspaces = (await api.workspaces.getAll()) || [];
+      workspaces = (await workspacesStore.load()) || [];
     } catch (err) {
       console.error('Failed to load workspaces:', err);
     }
@@ -143,11 +151,11 @@
 
   async function handleCreate() {
     if (!form.name || !form.secret) {
-      errorToast('Name and secret are required');
+      errorToast(t('settings.adminOperations.actionCredentials.nameSecretRequired'));
       return;
     }
     if (workspaceScopeInvalid()) {
-      errorToast('Select at least one workspace, or switch to "Available in all workspaces"');
+      errorToast(t('settings.adminOperations.actionCredentials.workspaceRequired'));
       return;
     }
     saving = true;
@@ -161,11 +169,11 @@
         applies_to_all_workspaces: form.applies_to_all_workspaces,
         workspace_ids: form.applies_to_all_workspaces ? [] : form.workspace_ids,
       });
-      successToast(`Credential created (${created.secret_prefix || 'masked'})`);
+      successToast(t('settings.adminOperations.actionCredentials.created', { prefix: created.secret_prefix || t('settings.adminOperations.actionCredentials.masked') }));
       closeAndClearSecret();
       await loadCredentials();
     } catch (err) {
-      errorToast(err.message || 'Failed to create credential');
+      errorToast(err.message || t('settings.adminOperations.actionCredentials.createFailed'));
     } finally {
       saving = false;
     }
@@ -174,7 +182,7 @@
   async function handleUpdate() {
     if (!editing) return;
     if (workspaceScopeInvalid()) {
-      errorToast('Select at least one workspace, or switch to "Available in all workspaces"');
+      errorToast(t('settings.adminOperations.actionCredentials.workspaceRequired'));
       return;
     }
     saving = true;
@@ -186,11 +194,11 @@
         applies_to_all_workspaces: form.applies_to_all_workspaces,
         workspace_ids: form.applies_to_all_workspaces ? [] : form.workspace_ids,
       });
-      successToast('Credential updated');
+      successToast(t('settings.adminOperations.actionCredentials.updated'));
       closeAndClearSecret();
       await loadCredentials();
     } catch (err) {
-      errorToast(err.message || 'Failed to update credential');
+      errorToast(err.message || t('settings.adminOperations.actionCredentials.updateFailed'));
     } finally {
       saving = false;
     }
@@ -201,11 +209,11 @@
     saving = true;
     try {
       const updated = await api.actionCredentials.rotateGlobal(rotating.id, form.secret);
-      successToast(`Secret rotated (${updated.secret_prefix || 'masked'})`);
+      successToast(t('settings.adminOperations.actionCredentials.rotated', { prefix: updated.secret_prefix || t('settings.adminOperations.actionCredentials.masked') }));
       closeAndClearSecret();
       await loadCredentials();
     } catch (err) {
-      errorToast(err.message || 'Failed to rotate secret');
+      errorToast(err.message || t('settings.adminOperations.actionCredentials.rotateFailed'));
     } finally {
       saving = false;
     }
@@ -213,29 +221,29 @@
 
   async function deleteCredential(cred) {
     const ok = await confirm({
-      title: 'Delete credential',
-      message: `Delete ${cred.name}? Any capability still referencing it will fail at runtime.`,
-      confirmText: 'Delete',
+      title: t('settings.adminOperations.actionCredentials.deleteTitle'),
+      message: t('settings.adminOperations.actionCredentials.deleteMessage', { name: cred.name }),
+      confirmText: t('common.delete'),
       variant: 'danger',
     });
     if (!ok) return;
     try {
       await api.actionCredentials.deleteGlobal(cred.id);
-      successToast('Credential deleted');
+      successToast(t('settings.adminOperations.actionCredentials.deleted'));
       await loadCredentials();
     } catch (err) {
-      errorToast(err.message || 'Failed to delete credential');
+      errorToast(err.message || t('settings.adminOperations.actionCredentials.deleteFailed'));
     }
   }
 
-  const columns = [
-    { key: 'name', label: 'Name' },
-    { key: 'type', label: 'Type' },
-    { key: 'prefix', label: 'Secret' },
-    { key: 'scope', label: 'Scope' },
-    { key: 'status', label: 'Status' },
+  const columns = $derived([
+    { key: 'name', label: t('common.name') },
+    { key: 'type', label: t('common.type') },
+    { key: 'prefix', label: t('settings.adminOperations.actionCredentials.secret') },
+    { key: 'scope', label: t('settings.adminOperations.actionCredentials.scope') },
+    { key: 'status', label: t('common.status') },
     { key: 'actions', label: '', align: 'right' },
-  ];
+  ]);
 
   function workspaceNames(ids) {
     if (!Array.isArray(ids) || ids.length === 0) return '';
@@ -248,8 +256,8 @@
 
 <div class="space-y-4">
   <PageHeader
-    title="Action credentials"
-    subtitle="Encrypted API tokens that HTTP capabilities reference instead of storing tokens inline. Secret values are write-only — once entered, they cannot be read back."
+    title={t('settings.adminOperations.actionCredentials.title')}
+    subtitle={t('settings.adminOperations.actionCredentials.subtitle')}
   >
     {#snippet actions()}
       <Button
@@ -259,19 +267,19 @@
         keyboardHint="A"
         hotkeyConfig={{ key: toHotkeyString('actionCredentials', 'add') }}
       >
-        Add credential
+        {t('settings.adminOperations.actionCredentials.add')}
       </Button>
     {/snippet}
   </PageHeader>
 
   {#if loading}
-    <div class="flex items-center justify-center py-12"><Spinner /></div>
+    <StateDisplay type="loading" />
   {:else if credentials.length === 0}
     <div
       class="flex flex-col items-center py-12 gap-3 rounded-lg border"
       style="border-color: var(--ds-border); background: var(--ds-surface-raised);"
     >
-      <p class="text-sm" style="color: var(--ds-text-subtle);">No credentials yet.</p>
+      <p class="text-sm" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCredentials.empty')}</p>
       <Button
         variant="secondary"
         onclick={openCreate}
@@ -279,7 +287,7 @@
         keyboardHint="A"
         hotkeyConfig={{ key: toHotkeyString('actionCredentials', 'add') }}
       >
-        Add the first credential
+        {t('settings.adminOperations.actionCredentials.addFirst')}
       </Button>
     </div>
   {:else}
@@ -295,63 +303,32 @@
           <code
             class="text-xs font-mono"
             style="color: var(--ds-text-subtle);"
-            title="Stored — never displayed in full"
+            title={t('settings.adminOperations.actionCredentials.storedSecret')}
           >
             {cred.secret_prefix || '••••••••'}
           </code>
         {:else}
-          <span class="text-xs italic" style="color: var(--ds-text-danger);">no secret</span>
+          <span class="text-xs italic" style="color: var(--ds-text-danger);">{t('settings.adminOperations.actionCredentials.noSecret')}</span>
         {/if}
       {/snippet}
       {#snippet scope(cred)}
         {#if cred.applies_to_all_workspaces}
-          <Lozenge appearance="success" size="sm">All workspaces</Lozenge>
+          <Lozenge appearance="success" size="sm">{t('settings.adminOperations.actionCredentials.allWorkspaces')}</Lozenge>
         {:else}
           <span class="text-xs" style="color: var(--ds-text-subtle);" title={workspaceNames(cred.workspace_ids)}>
-            {(cred.workspace_ids || []).length} workspace{(cred.workspace_ids || []).length === 1 ? '' : 's'}
+            {t('settings.adminOperations.actionCredentials.workspaceCount', { count: (cred.workspace_ids || []).length })}
           </span>
         {/if}
       {/snippet}
       {#snippet status(cred)}
-        {#if cred.is_enabled}
-          <div class="flex items-center gap-1">
-            <Power size={14} style="color: var(--ds-icon-success);" />
-            <span class="text-xs" style="color: var(--ds-text-success);">Enabled</span>
-          </div>
-        {:else}
-          <div class="flex items-center gap-1">
-            <PowerOff size={14} style="color: var(--ds-text-subtle);" />
-            <span class="text-xs" style="color: var(--ds-text-subtle);">Disabled</span>
-          </div>
-        {/if}
+        <EnabledStatus enabled={cred.is_enabled} />
       {/snippet}
       {#snippet actions(cred)}
-        <div class="flex items-center justify-end gap-1">
-          <button
-            class="p-1.5 rounded hover:opacity-80"
-            style="color: var(--ds-text-subtle);"
-            title="Rotate secret"
-            onclick={() => openRotate(cred)}
-          >
-            <KeyRound size={14} />
-          </button>
-          <button
-            class="p-1.5 rounded hover:opacity-80"
-            style="color: var(--ds-text-subtle);"
-            title="Edit"
-            onclick={() => openEdit(cred)}
-          >
-            <Edit size={14} />
-          </button>
-          <button
-            class="p-1.5 rounded hover:opacity-80"
-            style="color: var(--ds-text-danger);"
-            title="Delete"
-            onclick={() => deleteCredential(cred)}
-          >
-            <Trash2 size={14} />
-          </button>
-        </div>
+        <EntityRowActions actions={[
+          { id: 'rotate', icon: KeyRound, title: t('settings.adminOperations.actionCredentials.rotateSecret'), onclick: () => openRotate(cred) },
+          { id: 'edit', icon: Edit, title: t('common.edit'), onclick: () => openEdit(cred) },
+          { id: 'delete', icon: Trash2, title: t('common.delete'), danger: true, onclick: () => deleteCredential(cred) },
+        ]} />
       {/snippet}
     </DataTable>
   {/if}
@@ -359,50 +336,40 @@
 
 {#snippet scopeFields()}
   <div class="space-y-2 pt-2 border-t" style="border-color: var(--ds-border);">
-    <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">Workspace scope</div>
+    <div class="block text-xs font-medium" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCredentials.workspaceScope')}</div>
     <label class="flex items-start gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-      <input
-        type="radio"
+      <Radio
         name="cred-scope"
         checked={form.applies_to_all_workspaces}
         onchange={() => { form.applies_to_all_workspaces = true; }}
         class="mt-0.5"
       />
       <div>
-        <div>Available in all workspaces</div>
-        <div class="text-xs" style="color: var(--ds-text-subtle);">Any workspace can resolve this credential.</div>
+        <div>{t('settings.adminOperations.actionCredentials.availableAll')}</div>
+        <div class="text-xs" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCredentials.availableAllHelp')}</div>
       </div>
     </label>
     <label class="flex items-start gap-2 text-sm cursor-pointer" style="color: var(--ds-text);">
-      <input
-        type="radio"
+      <Radio
         name="cred-scope"
         checked={!form.applies_to_all_workspaces}
         onchange={() => { form.applies_to_all_workspaces = false; }}
         class="mt-0.5"
       />
       <div>
-        <div>Restrict to specific workspaces</div>
-        <div class="text-xs" style="color: var(--ds-text-subtle);">Only the workspaces selected below can resolve this credential.</div>
+        <div>{t('settings.adminOperations.actionCredentials.restrict')}</div>
+        <div class="text-xs" style="color: var(--ds-text-subtle);">{t('settings.adminOperations.actionCredentials.restrictHelp')}</div>
       </div>
     </label>
 
     {#if !form.applies_to_all_workspaces}
-      <div class="ml-6 mt-1 max-h-40 overflow-auto rounded-md border p-2" style="border-color: var(--ds-border); background: var(--ds-surface);">
-        {#if workspaces.length === 0}
-          <p class="text-xs" style="color: var(--ds-text-subtle);">No workspaces available.</p>
-        {:else}
-          {#each workspaces as ws}
-            <label class="flex items-center gap-2 text-sm py-1 cursor-pointer" style="color: var(--ds-text);">
-              <input
-                type="checkbox"
-                checked={form.workspace_ids.includes(ws.id)}
-                onchange={() => toggleWorkspaceScope(ws.id)}
-              />
-              {ws.name}
-            </label>
-          {/each}
-        {/if}
+      <div class="ml-6 mt-1">
+        <WorkspaceCheckboxList
+          workspaces={workspaces}
+          selected={form.workspace_ids}
+          onToggle={toggleWorkspaceScope}
+          emptyMessage={t('settings.adminOperations.actionCredentials.noWorkspaces')}
+        />
       </div>
     {/if}
   </div>
@@ -410,151 +377,125 @@
 
 <!-- Create modal -->
 {#if showCreateModal}
-  <Modal isOpen={true} onclose={closeAndClearSecret} onSubmit={handleCreate} submitDisabled={saving || !form.name || !form.secret || workspaceScopeInvalid()}>
-    {#snippet children(submitHint)}
-      <ModalHeader title="Add credential" onclose={closeAndClearSecret} />
-      <div class="p-4 space-y-4">
+  <EntityFormModal
+    title={t('settings.adminOperations.actionCredentials.add')}
+    onclose={closeAndClearSecret}
+    onsubmit={handleCreate}
+    disabled={!form.name || !form.secret || workspaceScopeInvalid()}
+    {saving}
+    confirmLabel={t('common.create')}
+  >
+    {#snippet fields()}
         <label class="block">
-          <span class="text-sm font-medium" style="color: var(--ds-text);">Name</span>
-          <input
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('common.name')}</span>
+          <Input
             type="text"
-            class="mt-1 w-full px-3 py-2 text-sm rounded border bg-transparent"
-            style="border-color: var(--ds-border); color: var(--ds-text);"
+            class="mt-1"
             bind:value={form.name}
-            placeholder="GitHub PAT"
+            placeholder={t('settings.adminOperations.actionCredentials.namePlaceholder')}
             required
           />
         </label>
         <label class="block">
-          <span class="text-sm font-medium" style="color: var(--ds-text);">Type</span>
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('common.type')}</span>
           <Select bind:value={form.credential_type} options={CREDENTIAL_TYPES} class="mt-1" />
         </label>
         <label class="block">
-          <span class="text-sm font-medium" style="color: var(--ds-text);">Secret</span>
-          <input
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('settings.adminOperations.actionCredentials.secret')}</span>
+          <Input
             id="action-credential-secret"
             type="password"
             autocomplete="new-password"
-            class="mt-1 w-full px-3 py-2 text-sm rounded border bg-transparent font-mono"
-            style="border-color: var(--ds-border); color: var(--ds-text);"
+            class="mt-1 font-mono"
             bind:value={form.secret}
-            placeholder="Enter token, API key, or user:password"
+            placeholder={t('settings.adminOperations.actionCredentials.secretPlaceholder')}
             required
           />
           <p class="text-xs mt-1" style="color: var(--ds-text-subtle);">
-            Stored encrypted. You will never see this value again — write it down or rotate
-            later if you need it.
+            {t('settings.adminOperations.actionCredentials.secretHelp')}
           </p>
         </label>
         <label class="block">
-          <span class="text-sm font-medium" style="color: var(--ds-text);">Metadata (JSON, optional)</span>
-          <textarea
-            class="mt-1 w-full px-3 py-2 text-sm rounded border bg-transparent font-mono"
-            style="border-color: var(--ds-border); color: var(--ds-text);"
-            rows="3"
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('settings.adminOperations.actionCredentials.metadata')}</span>
+          <Textarea
+            class="mt-1 font-mono"
+            rows={3}
             bind:value={form.secret_metadata}
             placeholder={'{"provider":"github","scope":"repo"}'}
-          ></textarea>
+          />
           <p class="text-xs mt-1" style="color: var(--ds-text-subtle);">
-            Non-sensitive metadata only. Keys like <code>token</code>, <code>secret</code>, <code>password</code> are rejected.
+            {t('settings.adminOperations.actionCredentials.metadataHelp')}
           </p>
         </label>
-        <label class="flex items-center gap-2">
-          <input type="checkbox" bind:checked={form.is_enabled} />
-          <span class="text-sm" style="color: var(--ds-text);">Enabled</span>
-        </label>
+        <Checkbox bind:checked={form.is_enabled} label={t('common.enabled')} />
         {@render scopeFields()}
-        <div class="flex justify-end gap-2 pt-2 border-t" style="border-color: var(--ds-border);">
-          <Button variant="secondary" onclick={closeAndClearSecret} keyboardHint="Esc">Cancel</Button>
-          <Button
-            variant="primary"
-            onclick={handleCreate}
-            loading={saving}
-            disabled={saving || !form.name || !form.secret || workspaceScopeInvalid()}
-            keyboardHint={submitHint}
-          >
-            Create
-          </Button>
-        </div>
-      </div>
     {/snippet}
-  </Modal>
+  </EntityFormModal>
 {/if}
 
 <!-- Edit (metadata only) modal -->
 {#if showEditModal && editing}
-  <Modal isOpen={true} onclose={closeAndClearSecret} onSubmit={handleUpdate} submitDisabled={saving || !form.name || workspaceScopeInvalid()}>
-    {#snippet children(submitHint)}
-      <ModalHeader title="Edit credential" onclose={closeAndClearSecret} />
-      <div class="p-4 space-y-4">
+  <EntityFormModal
+    title={t('settings.adminOperations.actionCredentials.edit')}
+    onclose={closeAndClearSecret}
+    onsubmit={handleUpdate}
+    disabled={!form.name || workspaceScopeInvalid()}
+    {saving}
+  >
+    {#snippet fields()}
         <label class="block">
-          <span class="text-sm font-medium" style="color: var(--ds-text);">Name</span>
-          <input
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('common.name')}</span>
+          <Input
             type="text"
-            class="mt-1 w-full px-3 py-2 text-sm rounded border bg-transparent"
-            style="border-color: var(--ds-border); color: var(--ds-text);"
+            class="mt-1"
             bind:value={form.name}
             required
           />
         </label>
         <div>
-          <span class="text-sm font-medium" style="color: var(--ds-text);">Secret</span>
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('settings.adminOperations.actionCredentials.secret')}</span>
           <p class="mt-1 text-xs" style="color: var(--ds-text-subtle);">
-            Stored (<code>{editing.secret_prefix || '••••••••'}</code>) — use "Rotate" to replace.
+            {t('settings.adminOperations.actionCredentials.storedRotate', { prefix: editing.secret_prefix || '••••••••' })}
           </p>
         </div>
         <label class="block">
-          <span class="text-sm font-medium" style="color: var(--ds-text);">Metadata (JSON, optional)</span>
-          <textarea
-            class="mt-1 w-full px-3 py-2 text-sm rounded border bg-transparent font-mono"
-            style="border-color: var(--ds-border); color: var(--ds-text);"
-            rows="3"
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('settings.adminOperations.actionCredentials.metadata')}</span>
+          <Textarea
+            class="mt-1 font-mono"
+            rows={3}
             bind:value={form.secret_metadata}
-          ></textarea>
+          />
         </label>
-        <label class="flex items-center gap-2">
-          <input type="checkbox" bind:checked={form.is_enabled} />
-          <span class="text-sm" style="color: var(--ds-text);">Enabled</span>
-        </label>
+        <Checkbox bind:checked={form.is_enabled} label={t('common.enabled')} />
         {@render scopeFields()}
-        <div class="flex justify-end gap-2 pt-2 border-t" style="border-color: var(--ds-border);">
-          <Button variant="secondary" onclick={closeAndClearSecret} keyboardHint="Esc">Cancel</Button>
-          <Button variant="primary" onclick={handleUpdate} loading={saving} disabled={saving || workspaceScopeInvalid()} keyboardHint={submitHint}>
-            Save
-          </Button>
-        </div>
-      </div>
     {/snippet}
-  </Modal>
+  </EntityFormModal>
 {/if}
 
 <!-- Rotate modal -->
 {#if showRotateModal && rotating}
-  <Modal isOpen={true} onclose={closeAndClearSecret} onSubmit={handleRotate} submitDisabled={saving || !form.secret}>
-    {#snippet children(submitHint)}
-      <ModalHeader title={`Rotate secret — ${rotating.name}`} onclose={closeAndClearSecret} />
-      <div class="p-4 space-y-4">
+  <EntityFormModal
+    title={t('settings.adminOperations.actionCredentials.rotateTitle', { name: rotating.name })}
+    onclose={closeAndClearSecret}
+    onsubmit={handleRotate}
+    disabled={!form.secret}
+    {saving}
+    confirmLabel={t('settings.adminOperations.actionCredentials.rotate')}
+  >
+    {#snippet fields()}
         <p class="text-sm" style="color: var(--ds-text-subtle);">
-          Enter the new secret value. The old value will be replaced immediately and cannot be recovered.
+          {t('settings.adminOperations.actionCredentials.rotateHelp')}
         </p>
         <label class="block">
-          <span class="text-sm font-medium" style="color: var(--ds-text);">New secret</span>
-          <input
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('settings.adminOperations.actionCredentials.newSecret')}</span>
+          <Input
             type="password"
             autocomplete="new-password"
-            class="mt-1 w-full px-3 py-2 text-sm rounded border bg-transparent font-mono"
-            style="border-color: var(--ds-border); color: var(--ds-text);"
+            class="mt-1 font-mono"
             bind:value={form.secret}
             required
           />
         </label>
-        <div class="flex justify-end gap-2 pt-2 border-t" style="border-color: var(--ds-border);">
-          <Button variant="secondary" onclick={closeAndClearSecret} keyboardHint="Esc">Cancel</Button>
-          <Button variant="primary" onclick={handleRotate} loading={saving} disabled={saving || !form.secret} keyboardHint={submitHint}>
-            Rotate
-          </Button>
-        </div>
-      </div>
     {/snippet}
-  </Modal>
+  </EntityFormModal>
 {/if}

@@ -20,7 +20,9 @@ const (
 // on the fixed runner image); action_container + ci_task run an admin-chosen
 // image on the same runner substrate (WI-146).
 const (
+	JobKindGeneralAgent    = "general_agent"
 	JobKindCodingAgent     = "coding_agent"
+	JobKindStandardAgent   = "standard_agent"
 	JobKindActionContainer = "action_container"
 	JobKindCITask          = "ci_task"
 )
@@ -81,6 +83,10 @@ type AgentRun struct {
 	// (action_container / ci_task), empty for coding_agent.
 	JobKind  string `json:"job_kind,omitempty"`
 	JobImage string `json:"job_image,omitempty"`
+	// IsEphemeral marks private verification runs. Remote and local execution
+	// may read repositories and call the configured model, but must not push,
+	// create a PR, or invoke any post-run mutation hook.
+	IsEphemeral bool `json:"is_ephemeral,omitempty"`
 	// TriggeredByUserID is who caused the run: the user whose assignment
 	// fired the binding trigger, or the admin who started a test run. On
 	// OAuth SCM connections this user's personal token is the credential
@@ -88,6 +94,21 @@ type AgentRun struct {
 	// queued before the column existed — those use the connection-level
 	// credential.
 	TriggeredByUserID *int `json:"triggered_by_user_id,omitempty"`
+	// Standard-agent identity and lineage are immutable execution snapshots.
+	// ActingUserID is the profile identity whose permissions every tool uses;
+	// RootInitiatorUserID is the human at the start of an agent chain;
+	// ImmediateTriggerUserID is the human/agent that directly queued this run.
+	ActingUserID           *int   `json:"acting_user_id,omitempty"`
+	RootInitiatorUserID    *int   `json:"root_initiator_user_id,omitempty"`
+	ImmediateTriggerUserID *int   `json:"immediate_trigger_user_id,omitempty"`
+	ParentRunID            *int   `json:"parent_run_id,omitempty"`
+	ChainDepth             int    `json:"chain_depth,omitempty"`
+	SessionID              string `json:"session_id,omitempty"`
+	ProfileVersion         int    `json:"profile_version,omitempty"`
+	// GrantsJSON contains admitted capabilities and immutable run inputs. ProfileSnapshotJSON
+	// contains the immutable Standard profile inputs used by the run.
+	GrantsJSON          string `json:"grants_json,omitempty"`
+	ProfileSnapshotJSON string `json:"profile_snapshot_json,omitempty"`
 	// Trigger is the run's trigger context + free-form instruction, persisted
 	// as JSON (agent_runs.trigger_json). Holding it in one JSON blob keeps new
 	// instruction shapes migration-free. Nil for runs created before the
@@ -113,23 +134,17 @@ type RunTrigger struct {
 	// AuthorID is the user who wrote the triggering comment (0 if none).
 	AuthorID int `json:"author_id,omitempty"`
 
-	// Continuation target. When ContinueHeadBranch is set the run does NOT cut a
-	// fresh agent-runs/run-{id} branch: it checks out this existing PR head
-	// branch and pushes commits back to it, so the existing PR grows rather than
-	// a competing one opening (review-iteration, resume, build-on-another-agent's
-	// PR — all the same mechanism). ContinuePRNumber/ContinueRepoSlug identify the
-	// PR for the post-run hook (which comments instead of opening a PR) and for
-	// the SCM-comment poller's per-PR idempotency. The head branch is resolved
-	// once when the trigger is built and persisted here, so both the local and
-	// remote (queue→claim) paths read it without another SCM round-trip.
+	// Continuations reuse the resolved PR head branch, so runs extend rather than
+	// compete with its PR. Persisted PR fields support post-run comments and
+	// poller idempotency across local and remote claim paths.
 	ContinuePRNumber   int    `json:"continue_pr_number,omitempty"`
 	ContinueRepoSlug   string `json:"continue_repo_slug,omitempty"`
 	ContinueHeadBranch string `json:"continue_head_branch,omitempty"`
-	// ContinueCommentID is the SCM (not Windshift) comment id that triggered a
-	// poller-driven continuation, 0 otherwise. Persisted so the poller's
-	// per-comment idempotency survives restarts and never re-fires the same
-	// comment. Distinct from CommentID, which is a Windshift comment.
+	// ContinueCommentID is the SCM trigger comment, persisted for restart-safe
+	// poller idempotency and distinct from Windshift CommentID.
 	ContinueCommentID int64 `json:"continue_comment_id,omitempty"`
+	// ContinueEventID provides one terminal PR response and shared deduplication.
+	ContinueEventID int64 `json:"continue_event_id,omitempty"`
 }
 
 // HasInstruction reports whether the trigger carries a non-empty instruction.

@@ -2,7 +2,6 @@ package logbookapi
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,7 +14,7 @@ import (
 	"windshift/internal/models"
 	"windshift/internal/restapi"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // Handlers holds all HTTP handlers for the logbook system.
@@ -103,6 +102,18 @@ func respondInternalError(w http.ResponseWriter, r *http.Request, err error) {
 	restapi.RespondError(w, r, restapi.ErrInternalError)
 }
 
+func decodeJSONOrRespond(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if err := restapi.DecodeJSONBody(w, r, dst); err != nil {
+		if restapi.IsRequestBodyTooLarge(err) {
+			restapi.RespondErrorWithMessage(w, r, http.StatusRequestEntityTooLarge, restapi.ErrCodeRequestTooLarge, "Request body too large")
+			return false
+		}
+		restapi.RespondErrorWithMessage(w, r, http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body")
+		return false
+	}
+	return true
+}
+
 func (h *Handlers) requireDocumentPermission(w http.ResponseWriter, r *http.Request, permission string) (*LogbookUser, *models.LogbookDocument, bool) {
 	lbUser, ok := requireLogbookAuth(w, r)
 	if !ok {
@@ -125,13 +136,7 @@ func (h *Handlers) requireDocumentPermission(w http.ResponseWriter, r *http.Requ
 		return nil, nil, false
 	}
 
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, doc.BucketID, permission)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return nil, nil, false
-	}
-	if !has {
-		respondNotFound(w, r)
+	if !requireBucketAccessForUser(w, r, h.permService, lbUser, doc.BucketID, permission) {
 		return nil, nil, false
 	}
 
@@ -142,14 +147,8 @@ func (h *Handlers) requireDocumentPermission(w http.ResponseWriter, r *http.Requ
 
 // GetBuckets lists buckets the current user can view.
 func (h *Handlers) GetBuckets(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	ids, ok := requireAccessibleBuckets(w, r, h.permService)
 	if !ok {
-		return
-	}
-
-	ids, err := h.permService.GetAccessibleBucketIDs(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs)
-	if err != nil {
-		respondInternalError(w, r, err)
 		return
 	}
 
@@ -164,19 +163,13 @@ func (h *Handlers) GetBuckets(w http.ResponseWriter, r *http.Request) {
 
 // CreateBucket creates a new bucket. Requires system admin.
 func (h *Handlers) CreateBucket(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	lbUser, ok := requireSystemAdmin(w, r)
 	if !ok {
 		return
 	}
 
-	if !lbUser.IsAdmin {
-		restapi.RespondError(w, r, restapi.ErrAdminRequired)
-		return
-	}
-
 	var req models.LogbookBucketCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		restapi.RespondErrorWithMessage(w, r, http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body")
+	if !decodeJSONOrRespond(w, r, &req) {
 		return
 	}
 
@@ -196,24 +189,8 @@ func (h *Handlers) CreateBucket(w http.ResponseWriter, r *http.Request) {
 
 // GetBucket returns a single bucket. Returns 404 on unauthorized (security policy).
 func (h *Handlers) GetBucket(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	_, bucketID, ok := requireBucketView(w, r, h.permService)
 	if !ok {
-		return
-	}
-
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketView)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r) // 404 not 403 — prevents bucket existence leakage
 		return
 	}
 
@@ -232,30 +209,13 @@ func (h *Handlers) GetBucket(w http.ResponseWriter, r *http.Request) {
 
 // UpdateBucket updates a bucket. Requires bucket.admin.
 func (h *Handlers) UpdateBucket(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	_, bucketID, ok := requireBucketAdmin(w, r, h.permService)
 	if !ok {
 		return
 	}
 
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketAdmin)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
-		return
-	}
-
 	var req models.LogbookBucketUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		restapi.RespondErrorWithMessage(w, r, http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body")
+	if !decodeJSONOrRespond(w, r, &req) {
 		return
 	}
 
@@ -280,24 +240,8 @@ func (h *Handlers) UpdateBucket(w http.ResponseWriter, r *http.Request) {
 
 // DeleteBucket deletes a bucket. Requires bucket.admin.
 func (h *Handlers) DeleteBucket(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	_, bucketID, ok := requireBucketAdmin(w, r, h.permService)
 	if !ok {
-		return
-	}
-
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketAdmin)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
 		return
 	}
 
@@ -313,24 +257,8 @@ func (h *Handlers) DeleteBucket(w http.ResponseWriter, r *http.Request) {
 
 // GetBucketPermissions lists permissions for a bucket. Requires bucket.admin.
 func (h *Handlers) GetBucketPermissions(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	_, bucketID, ok := requireBucketAdmin(w, r, h.permService)
 	if !ok {
-		return
-	}
-
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketAdmin)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
 		return
 	}
 
@@ -345,30 +273,13 @@ func (h *Handlers) GetBucketPermissions(w http.ResponseWriter, r *http.Request) 
 
 // SetBucketPermissions replaces all permissions for a bucket. Requires bucket.admin.
 func (h *Handlers) SetBucketPermissions(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	_, bucketID, ok := requireBucketAdmin(w, r, h.permService)
 	if !ok {
 		return
 	}
 
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketAdmin)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
-		return
-	}
-
 	var req models.LogbookSetPermissionsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		restapi.RespondErrorWithMessage(w, r, http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body")
+	if !decodeJSONOrRespond(w, r, &req) {
 		return
 	}
 
@@ -405,24 +316,8 @@ func (h *Handlers) SetBucketPermissions(w http.ResponseWriter, r *http.Request) 
 
 // UploadDocument handles multipart file upload. Returns 202 Accepted.
 func (h *Handlers) UploadDocument(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	lbUser, bucketID, ok := requireBucketEdit(w, r, h.permService)
 	if !ok {
-		return
-	}
-
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketEdit)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
 		return
 	}
 
@@ -528,30 +423,13 @@ func (h *Handlers) UploadDocument(w http.ResponseWriter, r *http.Request) {
 
 // CreateNote creates a text note document. Returns 202 Accepted.
 func (h *Handlers) CreateNote(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	lbUser, bucketID, ok := requireBucketEdit(w, r, h.permService)
 	if !ok {
 		return
 	}
 
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketEdit)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
-		return
-	}
-
 	var req models.LogbookNoteCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		restapi.RespondErrorWithMessage(w, r, http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body")
+	if !decodeJSONOrRespond(w, r, &req) {
 		return
 	}
 
@@ -604,8 +482,7 @@ func (h *Handlers) UpdateDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req models.LogbookDocumentUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		restapi.RespondErrorWithMessage(w, r, http.StatusBadRequest, restapi.ErrCodeInvalidInput, "Invalid request body")
+	if !decodeJSONOrRespond(w, r, &req) {
 		return
 	}
 
@@ -691,24 +568,8 @@ func (h *Handlers) purgeDocumentFiles(doc *models.LogbookDocument) {
 
 // ListDocuments returns paginated documents for a bucket.
 func (h *Handlers) ListDocuments(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	_, bucketID, ok := requireBucketView(w, r, h.permService)
 	if !ok {
-		return
-	}
-
-	bucketID := r.PathValue("bucketID")
-	if !isValidUUID(bucketID) {
-		respondNotFound(w, r)
-		return
-	}
-
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, bucketID, models.LogbookPermissionBucketView)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
 		return
 	}
 
@@ -725,14 +586,8 @@ func (h *Handlers) ListDocuments(w http.ResponseWriter, r *http.Request) {
 
 // ListAllDocuments returns paginated documents across all accessible buckets.
 func (h *Handlers) ListAllDocuments(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	ids, ok := requireAccessibleBuckets(w, r, h.permService)
 	if !ok {
-		return
-	}
-
-	ids, err := h.permService.GetAccessibleBucketIDs(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs)
-	if err != nil {
-		respondInternalError(w, r, err)
 		return
 	}
 
@@ -769,7 +624,7 @@ func (h *Handlers) ListAllDocuments(w http.ResponseWriter, r *http.Request) {
 
 // KeywordSearch performs full-text search across accessible buckets.
 func (h *Handlers) KeywordSearch(w http.ResponseWriter, r *http.Request) {
-	lbUser, ok := requireLogbookAuth(w, r)
+	ids, ok := requireAccessibleBuckets(w, r, h.permService)
 	if !ok {
 		return
 	}
@@ -777,12 +632,6 @@ func (h *Handlers) KeywordSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if strings.TrimSpace(query) == "" {
 		restapi.RespondErrorWithMessage(w, r, http.StatusBadRequest, restapi.ErrCodeValidationFailed, "Search query 'q' is required")
-		return
-	}
-
-	ids, err := h.permService.GetAccessibleBucketIDs(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs)
-	if err != nil {
-		respondInternalError(w, r, err)
 		return
 	}
 
@@ -939,7 +788,7 @@ func (h *Handlers) UploadAttachment(w http.ResponseWriter, r *http.Request) {
 	att.ID = attID
 	att.DownloadURL = fmt.Sprintf("/api/logbook/attachments/%s/download", attID)
 
-	restapi.RespondJSON(w, http.StatusCreated, map[string]interface{}{
+	restapi.RespondJSON(w, http.StatusCreated, map[string]any{
 		"success":    true,
 		"attachment": att,
 	})
@@ -968,13 +817,7 @@ func (h *Handlers) DownloadAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	has, err := h.permService.HasBucketPermission(lbUser.ID, lbUser.IsAdmin, lbUser.GroupIDs, att.BucketID, models.LogbookPermissionBucketView)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-	if !has {
-		respondNotFound(w, r)
+	if !requireBucketAccessForUser(w, r, h.permService, lbUser, att.BucketID, models.LogbookPermissionBucketView) {
 		return
 	}
 

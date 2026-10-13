@@ -2,6 +2,7 @@ package repository
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -65,6 +66,55 @@ func (r *CustomFieldRepository) FindByID(id int) (*models.CustomFieldDefinition,
 	return &cf, nil
 }
 
+// FindByName returns a case-insensitive exact-name match, or ErrNotFound.
+func (r *CustomFieldRepository) FindByName(name string) (*models.CustomFieldDefinition, error) {
+	row := r.db.QueryRow(customFieldDefinitionSelect+` WHERE LOWER(name) = LOWER(?)`, name)
+	field, err := scanCustomFieldDefinitionRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find custom field %q: %w", name, err)
+	}
+	return &field, nil
+}
+
+// FindByNameAndType returns a case-insensitive exact-name match with the
+// requested field type, or ErrNotFound.
+func (r *CustomFieldRepository) FindByNameAndType(name, fieldType string) (*models.CustomFieldDefinition, error) {
+	row := r.db.QueryRow(
+		customFieldDefinitionSelect+` WHERE LOWER(name) = LOWER(?) AND field_type = ?`,
+		name,
+		fieldType,
+	)
+	field, err := scanCustomFieldDefinitionRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find custom field %q by type: %w", name, err)
+	}
+	return &field, nil
+}
+
+// FindPreferredByName returns a case-insensitive name match, preferring the
+// requested type and then the legacy milestone type.
+func (r *CustomFieldRepository) FindPreferredByName(name, preferredType string) (*models.CustomFieldDefinition, error) {
+	row := r.db.QueryRow(customFieldDefinitionSelect+`
+		WHERE LOWER(name) = LOWER(?)
+		ORDER BY CASE WHEN field_type = ? THEN 0 WHEN field_type = 'milestone' THEN 1 ELSE 2 END, id
+		LIMIT 1
+	`, name, preferredType)
+	field, err := scanCustomFieldDefinitionRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find preferred custom field %q: %w", name, err)
+	}
+	return &field, nil
+}
+
 // CustomFieldDeleteInfo is the subset of fields needed by Delete flows for
 // audit logs and cascade decisions.
 type CustomFieldDeleteInfo struct {
@@ -113,6 +163,7 @@ func (r *CustomFieldRepository) FindOptions(id int) (string, error) {
 
 // Create inserts a new custom field definition and returns its id.
 func (r *CustomFieldRepository) Create(cf *models.CustomFieldDefinition, now time.Time) (int64, error) {
+	cf.FieldType = models.CanonicalCustomFieldType(cf.FieldType)
 	var id int64
 	//nolint:misspell // database uses British spelling (applies_to_customer_organisations)
 	err := r.db.QueryRow(`
@@ -147,6 +198,7 @@ func (r *CustomFieldRepository) CreateMirror(name, optionsJSON string, now time.
 
 // Update overwrites the editable fields of a custom field definition.
 func (r *CustomFieldRepository) Update(id int, cf *models.CustomFieldDefinition, now time.Time) error {
+	cf.FieldType = models.CanonicalCustomFieldType(cf.FieldType)
 	//nolint:misspell // customer_organisations is a database table column
 	_, err := r.db.ExecWrite(`
 		UPDATE custom_field_definitions
@@ -173,13 +225,155 @@ func (r *CustomFieldRepository) UpdateOptions(id int64, optionsJSON string) erro
 	return nil
 }
 
-// Delete removes the custom field definition row.
+// Delete removes the custom field definition and its layout references in one
+// transaction. screen_fields stores custom field IDs as text, while board
+// configurations keep them inside JSON, so neither can rely on a foreign-key
+// cascade from custom_field_definitions.
 func (r *CustomFieldRepository) Delete(id int) error {
-	_, err := r.db.ExecWrite("DELETE FROM custom_field_definitions WHERE id = ?", id)
+	return database.WithTx(r.db, func(tx database.Tx) error {
+		if _, err := tx.ExecWrite(`
+			DELETE FROM screen_fields
+			WHERE field_type = 'custom' AND field_identifier = ?
+		`, strconv.Itoa(id)); err != nil {
+			return fmt.Errorf("delete custom field screen references: %w", err)
+		}
+
+		if err := removeCustomFieldBoardReferences(tx, id); err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecWrite("DELETE FROM custom_field_definitions WHERE id = ?", id); err != nil {
+			return fmt.Errorf("delete custom field: %w", err)
+		}
+		return nil
+	})
+}
+
+type customFieldBoardReferenceRow struct {
+	id            int
+	listColumns   sql.NullString
+	cardFields    sql.NullString
+	roadmapConfig sql.NullString
+}
+
+func removeCustomFieldBoardReferences(tx database.Tx, fieldID int) error {
+	rows, err := tx.Query(`
+		SELECT id, list_columns, card_fields, roadmap_config
+		FROM board_configurations
+	`)
 	if err != nil {
-		return fmt.Errorf("delete custom field: %w", err)
+		return fmt.Errorf("list board configurations for custom field cleanup: %w", err)
 	}
+
+	var configs []customFieldBoardReferenceRow
+	for rows.Next() {
+		var config customFieldBoardReferenceRow
+		if err := rows.Scan(&config.id, &config.listColumns, &config.cardFields, &config.roadmapConfig); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan board configuration for custom field cleanup: %w", err)
+		}
+		configs = append(configs, config)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate board configurations for custom field cleanup: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close board configurations for custom field cleanup: %w", err)
+	}
+
+	for _, config := range configs {
+		listColumns, listChanged := removeCustomFieldListEntries(config.listColumns, fieldID)
+		cardFields, cardsChanged := removeCustomFieldListEntries(config.cardFields, fieldID)
+		roadmapConfig, roadmapChanged := removeCustomFieldRoadmapEntries(config.roadmapConfig, fieldID)
+		if !listChanged && !cardsChanged && !roadmapChanged {
+			continue
+		}
+
+		if _, err := tx.ExecWrite(`
+			UPDATE board_configurations
+			SET list_columns = ?, card_fields = ?, roadmap_config = ?, updated_at = ?
+			WHERE id = ?
+		`, listColumns, cardFields, roadmapConfig, time.Now(), config.id); err != nil {
+			return fmt.Errorf("update board configuration %d for custom field cleanup: %w", config.id, err)
+		}
+	}
+
 	return nil
+}
+
+func removeCustomFieldListEntries(raw sql.NullString, fieldID int) (sql.NullString, bool) {
+	if !raw.Valid || raw.String == "" {
+		return raw, false
+	}
+
+	var entries []json.RawMessage
+	if err := json.Unmarshal([]byte(raw.String), &entries); err != nil {
+		return raw, false
+	}
+
+	kept := make([]json.RawMessage, 0, len(entries))
+	removed := false
+	for _, entry := range entries {
+		var reference struct {
+			FieldIdentifier string `json:"field_identifier"`
+			FieldType       string `json:"field_type"`
+		}
+		if err := json.Unmarshal(entry, &reference); err == nil &&
+			reference.FieldType == "custom" &&
+			isCustomFieldConfigIdentifier(reference.FieldIdentifier, fieldID) {
+			removed = true
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if !removed {
+		return raw, false
+	}
+
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return raw, false
+	}
+	return sql.NullString{String: string(encoded), Valid: true}, true
+}
+
+func removeCustomFieldRoadmapEntries(raw sql.NullString, fieldID int) (sql.NullString, bool) {
+	if !raw.Valid || raw.String == "" {
+		return raw, false
+	}
+
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw.String), &config); err != nil {
+		return raw, false
+	}
+
+	changed := false
+	for _, key := range []string{"start_field_id", "end_field_id"} {
+		encoded, ok := config[key]
+		if !ok {
+			continue
+		}
+		var identifier string
+		if err := json.Unmarshal(encoded, &identifier); err == nil && isCustomFieldConfigIdentifier(identifier, fieldID) {
+			config[key] = json.RawMessage(`""`)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return raw, false
+	}
+	return sql.NullString{String: string(encoded), Valid: true}, true
+}
+
+func isCustomFieldConfigIdentifier(identifier string, fieldID int) bool {
+	id := strconv.Itoa(fieldID)
+	return identifier == id || identifier == "custom_field_"+id || identifier == "cf_"+id
 }
 
 // --- asset_type_fields ------------------------------------------------------
@@ -188,6 +382,7 @@ func (r *CustomFieldRepository) Delete(id int) error {
 // type (and which management set) references which custom_field_id.
 type AssetTypeUsageRow struct {
 	CustomFieldID int
+	SetID         int
 	AssetTypeName string
 	SetName       string
 }
@@ -196,7 +391,7 @@ type AssetTypeUsageRow struct {
 // ordered by custom_field_id, set name, asset type name.
 func (r *CustomFieldRepository) ListAssetTypeUsages() ([]AssetTypeUsageRow, error) {
 	rows, err := r.db.Query(`
-		SELECT atf.custom_field_id, at.name, s.name
+		SELECT atf.custom_field_id, s.id, at.name, s.name
 		FROM asset_type_fields atf
 		JOIN asset_types at ON atf.asset_type_id = at.id
 		JOIN asset_management_sets s ON at.set_id = s.id
@@ -209,7 +404,7 @@ func (r *CustomFieldRepository) ListAssetTypeUsages() ([]AssetTypeUsageRow, erro
 	var results []AssetTypeUsageRow
 	for rows.Next() {
 		var row AssetTypeUsageRow
-		if err := rows.Scan(&row.CustomFieldID, &row.AssetTypeName, &row.SetName); err != nil {
+		if err := rows.Scan(&row.CustomFieldID, &row.SetID, &row.AssetTypeName, &row.SetName); err != nil {
 			return nil, fmt.Errorf("scan asset type usage: %w", err)
 		}
 		results = append(results, row)
@@ -362,45 +557,45 @@ func (r *CustomFieldRepository) DriverName() string {
 	return r.db.GetDriverName()
 }
 
-// CountRowsUsingField returns how many records currently hold a value for the
-// given custom field, across all three storage surfaces: items, assets, and the
-// portal custom_field_values table. It backs the pre-delete in-use guard in
-// CustomFieldHandler.Delete (mirrors the item-type guard) so a field still
-// holding live data can't be deleted out from under it.
-//
-// For items/assets it reuses the exact cross-driver matcher the async scrubber
-// trusts (see ListRowsWithCustomFieldsPageByKey): the field key is the
-// stringified field ID and values are stored as JSON keyed by it, so a row is
-// "using" the field iff its custom_field_values text mentions `"<id>"`. The
-// CAST(... AS TEXT) is required so the LIKE works on both SQLite (TEXT column)
-// and Postgres (JSONB column — a bare LIKE errors with "jsonb ~~"). Matching the
-// scrubber's prefilter keeps the guard and the cleanup in agreement: we block a
-// delete iff the cleanup would have had something to scrub. The prefilter can
-// over-count if a user value literally contains the quoted substring `"<id>"`,
-// but over-blocking is the safe failure mode for a delete guard.
+// CountRowsUsingField powers the delete guard across item, asset, and portal
+// values. Keys are matched exactly against the CFV JSON object (engine-aware:
+// json_each on SQLite, jsonb_exists on Postgres) — the old quoted-ID LIKE
+// prefilter also matched string VALUES equal to the field id, which blocked
+// deleting the field indefinitely (WI-1160). The async scrubber keeps the
+// cheap LIKE prefilter; false positives there only waste IO.
+// CountRowsUsingField powers the delete guard across item, asset, and portal
+// values. Keys are matched exactly against the CFV JSON object (engine-aware:
+// json_each on SQLite, jsonb_exists on Postgres) — the old quoted-ID LIKE
+// prefilter also matched string VALUES equal to the field id, which blocked
+// deleting the field indefinitely (WI-1160). The async scrubber keeps the
+// cheap LIKE prefilter; false positives there only waste IO.
 func (r *CustomFieldRepository) CountRowsUsingField(fieldID int) (int, error) {
 	fieldKey := strconv.Itoa(fieldID)
-	likePattern := `%"` + fieldKey + `"%`
+	isPostgres := r.db.GetDriverName() == "postgres"
 
 	total := 0
 	for _, table := range []string{"items", "assets"} {
 		var count int
-		err := r.db.QueryRow(fmt.Sprintf(
-			`SELECT COUNT(*) FROM %s
+		var query string
+		if isPostgres {
+			query = fmt.Sprintf(`SELECT COUNT(*) FROM %s
+			  WHERE custom_field_values IS NOT NULL
+			    AND jsonb_exists(custom_field_values, ?)`, table)
+		} else {
+			query = fmt.Sprintf(`SELECT COUNT(*) FROM %s
 			  WHERE custom_field_values IS NOT NULL
 			    AND CAST(custom_field_values AS TEXT) != ''
-			    AND CAST(custom_field_values AS TEXT) LIKE ?`, table),
-			likePattern,
-		).Scan(&count)
+			    AND json_valid(CAST(custom_field_values AS TEXT))
+			    AND EXISTS (SELECT 1 FROM json_each(CAST(custom_field_values AS TEXT)) WHERE json_each.key = ?)`, table)
+		}
+		err := r.db.QueryRow(query, fieldKey).Scan(&count)
 		if err != nil {
 			return 0, fmt.Errorf("count %s using custom field: %w", table, err)
 		}
 		total += count
 	}
 
-	// Portal/org values live in a separate custom_field_values table keyed by a
-	// real column. The table may not exist on every deployment; tolerate a query
-	// error as "nothing here", the same convention the portal scrubber uses.
+	// Optional portal storage follows the scrubber's missing-table convention.
 	var portalCount int
 	if err := r.db.QueryRow(
 		`SELECT COUNT(*) FROM custom_field_values
@@ -459,21 +654,52 @@ func (r *CustomFieldRepository) ListRowsWithCustomFieldsPageByKey(tableName stri
 	return results, rows.Err()
 }
 
-// UpdateRowCustomFields overwrites custom_field_values for a single row in
-// items or assets. tableName must be one of the trusted names "items" or
-// "assets".
-func (r *CustomFieldRepository) UpdateRowCustomFields(tableName string, id int, newVal string) error {
+// CompareAndSwapRowCustomFields updates custom_field_values only when it still
+// matches oldVal. This prevents asynchronous cleanup from overwriting a newer
+// user edit. tableName must be one of the trusted names "items" or "assets".
+func (r *CustomFieldRepository) CompareAndSwapRowCustomFields(tableName string, id int, oldVal, newVal string) (bool, error) {
 	if tableName != "items" && tableName != "assets" {
-		return fmt.Errorf("invalid table for custom field values: %q", tableName)
+		return false, fmt.Errorf("invalid table for custom field values: %q", tableName)
 	}
-	_, err := r.db.ExecWrite(
-		fmt.Sprintf(`UPDATE %s SET custom_field_values = ? WHERE id = ?`, tableName),
-		newVal, id,
+	var (
+		result sql.Result
+		err    error
 	)
-	if err != nil {
-		return fmt.Errorf("update cfv row: %w", err)
+	if newVal == "" {
+		result, err = r.db.ExecWrite(
+			fmt.Sprintf(`UPDATE %s SET custom_field_values = NULL WHERE id = ? AND custom_field_values = ?`, tableName),
+			id, oldVal,
+		)
+	} else {
+		result, err = r.db.ExecWrite(
+			fmt.Sprintf(`UPDATE %s SET custom_field_values = ? WHERE id = ? AND custom_field_values = ?`, tableName),
+			newVal, id, oldVal,
+		)
 	}
-	return nil
+	if err != nil {
+		return false, fmt.Errorf("compare and swap cfv row: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read cfv compare-and-swap result: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// FindRowCustomFields returns the current custom_field_values value for a row.
+func (r *CustomFieldRepository) FindRowCustomFields(tableName string, id int) (currentValue string, found bool, err error) {
+	if tableName != "items" && tableName != "assets" {
+		return "", false, fmt.Errorf("invalid table for custom field values: %q", tableName)
+	}
+	var value sql.NullString
+	err = r.db.QueryRow(fmt.Sprintf(`SELECT custom_field_values FROM %s WHERE id = ?`, tableName), id).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("find cfv row: %w", err)
+	}
+	return value.String, true, nil
 }
 
 // --- portal custom_field_values -------------------------------------------
@@ -537,7 +763,7 @@ func (r *CustomFieldRepository) UpdatePortalCFV(id int, newVal string) error {
 
 // rowScanner mirrors the Scan methods of *sql.Row and *sql.Rows.
 type rowScanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }
 
 func scanCustomFieldDefinition(rows *sql.Rows) (models.CustomFieldDefinition, error) {

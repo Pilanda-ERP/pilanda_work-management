@@ -320,27 +320,15 @@ func (r *AssetActionRepository) CreateEdge(edge models.AssetActionEdge) (int, er
 
 // SaveActionWithNodesAndEdges saves an asset action with its nodes and edges in a transaction
 func (r *AssetActionRepository) SaveActionWithNodesAndEdges(action *models.AssetAction, nodes []models.AssetActionNode, edges []models.AssetActionEdge) error {
-	flowNodes := make([]actionutil.FlowNode, len(nodes))
-	for i, n := range nodes {
-		flowNodes[i] = actionutil.FlowNode{
-			ID: n.ID, ActionID: n.ActionID, NodeType: string(n.NodeType),
-			NodeConfig: n.NodeConfig, PositionX: n.PositionX, PositionY: n.PositionY,
-		}
-	}
-	flowEdges := make([]actionutil.FlowEdge, len(edges))
-	for i, e := range edges {
-		flowEdges[i] = actionutil.FlowEdge{
-			ID: e.ID, SourceNodeID: e.SourceNodeID, TargetNodeID: e.TargetNodeID,
-			EdgeType: e.EdgeType, SourceHandle: e.SourceHandle, TargetHandle: e.TargetHandle,
-		}
-	}
+	flowNodes := actionutil.ToFlowNodes(nodes)
+	flowEdges := actionutil.ToFlowEdges(edges)
 
 	const updateSQL = `
 		UPDATE asset_actions SET
 			name = ?, description = ?, is_enabled = ?, trigger_type = ?, trigger_config = ?, updated_at = ?
 		WHERE id = ?
 	`
-	args := []interface{}{
+	args := []any{
 		action.Name, action.Description, action.IsEnabled, action.TriggerType, action.TriggerConfig,
 		time.Now(), action.ID,
 	}
@@ -358,16 +346,51 @@ func (r *AssetActionRepository) SaveActionWithNodesAndEdges(action *models.Asset
 func (r *AssetActionRepository) CreateExecutionLog(log *models.AssetActionExecutionLog) (int, error) {
 	var id int
 	err := r.db.QueryRow(`
-		INSERT INTO asset_action_execution_logs (action_id, asset_id, trigger_event, status, started_at)
-		VALUES (?, ?, ?, ?, ?) RETURNING id
+		INSERT INTO asset_action_execution_logs (action_id, asset_id, trigger_event, status, started_at, durable_event_key)
+		VALUES (?, ?, ?, ?, ?, ?) RETURNING id
 	`,
-		log.ActionID, log.AssetID, log.TriggerEvent, log.Status, time.Now(),
+		log.ActionID, log.AssetID, log.TriggerEvent, log.Status, time.Now(), durableEventKeyValue(log.DurableEventKey),
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create asset action execution log: %w", err)
 	}
 
 	return id, nil
+}
+
+// GetExecutionLogByDurableTarget returns the stable log for one durable event
+// and frozen asset-action target.
+func (r *AssetActionRepository) GetExecutionLogByDurableTarget(eventKey string, actionID int) (*models.AssetActionExecutionLog, error) {
+	log := &models.AssetActionExecutionLog{}
+	var assetID sql.NullInt64
+	var completedAt sql.NullTime
+	var errorMessage, executionTrace sql.NullString
+	err := r.db.QueryRow(`
+		SELECT id, action_id, asset_id, trigger_event, status, started_at,
+		       completed_at, error_message, execution_trace, durable_event_key
+		FROM asset_action_execution_logs
+		WHERE durable_event_key = ? AND action_id = ?
+	`, eventKey, actionID).Scan(
+		&log.ID, &log.ActionID, &assetID, &log.TriggerEvent, &log.Status, &log.StartedAt,
+		&completedAt, &errorMessage, &executionTrace, &log.DurableEventKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if assetID.Valid {
+		value := int(assetID.Int64)
+		log.AssetID = &value
+	}
+	if completedAt.Valid {
+		log.CompletedAt = &completedAt.Time
+	}
+	if errorMessage.Valid {
+		log.ErrorMessage = errorMessage.String
+	}
+	if executionTrace.Valid {
+		log.ExecutionTrace = executionTrace.String
+	}
+	return log, nil
 }
 
 // UpdateExecutionLog updates an asset action execution log entry

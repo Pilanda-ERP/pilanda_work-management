@@ -6,9 +6,19 @@
   import { hubStore, gradients } from '../stores/hub.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import LogoUploader from '../components/LogoUploader.svelte';
+  import Input from '../components/Input.svelte';
+  import Textarea from '../components/Textarea.svelte';
   import ModalBackdrop from '../components/ModalBackdrop.svelte';
+  import TabStrip from '../components/TabStrip.svelte';
 
   let showCustomizePanelHover = $state(false);
+
+  function handleSectionChange(section) {
+    hubStore.activeSection = section;
+    if (section === 'sections') {
+      hubStore.isEditing = true;
+    }
+  }
 </script>
 
 <!-- Customization Panel Overlay (hide when editing sections so sections are visible) -->
@@ -41,24 +51,15 @@
     </div>
 
     <!-- Section Navigation -->
-    <div class="border-b flex" style="border-color: var(--ds-border);">
-      <button
-        onclick={() => hubStore.activeSection = 'hero-gradient'}
-        class="flex-1 p-3 text-sm font-medium flex items-center justify-center gap-2 border-b-2 transition-colors"
-        style="border-color: {hubStore.activeSection === 'hero-gradient' ? 'var(--ds-border-focused)' : 'transparent'}; color: {hubStore.activeSection === 'hero-gradient' ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-      >
-        <Palette class="w-4 h-4" />
-        <span>{t('portal.theme', 'Theme')}</span>
-      </button>
-      <button
-        onclick={() => { hubStore.activeSection = 'sections'; hubStore.isEditing = true; }}
-        class="flex-1 p-3 text-sm font-medium flex items-center justify-center gap-2 border-b-2 transition-colors"
-        style="border-color: {hubStore.activeSection === 'sections' ? 'var(--ds-border-focused)' : 'transparent'}; color: {hubStore.activeSection === 'sections' ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-      >
-        <Navigation class="w-4 h-4" />
-        <span>{t('hub.sections', 'Sections')}</span>
-      </button>
-    </div>
+    <TabStrip
+      tabs={[
+        { id: 'hero-gradient', label: t('portal.theme', 'Theme'), icon: Palette },
+        { id: 'sections', label: t('hub.sections', 'Sections'), icon: Navigation }
+      ]}
+      activeTab={hubStore.activeSection}
+      onTabChange={handleSectionChange}
+      fill
+    />
 
     <!-- Panel Content -->
     <div class="flex-1 overflow-y-auto p-4">
@@ -71,22 +72,20 @@
               <TextCursorInput class="w-4 h-4 inline mr-1" />
               {t('hub.heroContent', 'Hero Content')}
             </span>
-            <input
+            <Input
               type="text"
               value={hubStore.editableTitle}
               oninput={(e) => { hubStore.editableTitle = e.currentTarget.value; hubStore.saveCustomizations(); }}
-              class="w-full px-3 py-2 rounded border text-sm mb-2"
-              style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text);"
+              class="mb-2"
               placeholder="Hub title"
             />
-            <textarea
+            <Textarea
               value={hubStore.editableDescription}
               oninput={(e) => { hubStore.editableDescription = e.currentTarget.value; hubStore.saveCustomizations(); }}
-              class="w-full px-3 py-2 rounded border text-sm resize-none"
-              style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text);"
               placeholder="Hub description (optional)"
-              rows="2"
-            ></textarea>
+              rows={2}
+              size="small"
+            />
           </div>
 
           <!-- Gradient Selection -->
@@ -109,7 +108,7 @@
                   {#if hubStore.selectedGradient === index}
                     <div class="absolute inset-0 flex items-center justify-center">
                       <div class="w-6 h-6 rounded-full bg-white flex items-center justify-center shadow-lg">
-                        <Check class="w-4 h-4 text-gray-800" />
+                        <Check class="w-4 h-4 text-ds-text" />
                       </div>
                     </div>
                   {/if}
@@ -123,21 +122,18 @@
             <label for="hub-search-box" class="block text-sm font-medium mb-2" style="color: var(--ds-text);">
               {t('portal.searchBox', 'Search Box')}
             </label>
-            <input
+            <Input
               id="hub-search-box"
               type="text"
               value={hubStore.editableSearchPlaceholder}
               oninput={(e) => { hubStore.editableSearchPlaceholder = e.currentTarget.value; hubStore.saveCustomizations(); }}
-              class="w-full px-3 py-2 rounded border text-sm mb-2"
-              style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text);"
+              class="mb-2"
               placeholder="Search placeholder"
             />
-            <input
+            <Input
               type="text"
               value={hubStore.editableSearchHint}
               oninput={(e) => { hubStore.editableSearchHint = e.currentTarget.value; hubStore.saveCustomizations(); }}
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text);"
               placeholder="Search hint text"
             />
           </div>
@@ -170,17 +166,17 @@
               style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
             >
               <div class="flex items-center justify-between mb-2">
-                <input
+                <Input
                   type="text"
                   value={section.title}
                   oninput={(e) => hubStore.updateSection(section.id, 'title', e.currentTarget.value)}
-                  class="flex-1 text-sm font-medium bg-transparent focus:outline-none"
-                  style="color: var(--ds-text);"
+                  class="flex-1 font-medium"
+                  size="small"
                   placeholder="Section title"
                 />
                 <button
                   onclick={() => hubStore.deleteSection(section.id)}
-                  class="p-1 rounded hover:bg-red-100 text-red-600"
+                  class="p-1 rounded hover:bg-ds-danger-subtle text-ds-text-danger"
                 >
                   <Trash2 class="w-4 h-4" />
                 </button>

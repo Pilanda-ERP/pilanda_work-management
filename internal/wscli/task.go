@@ -23,7 +23,7 @@ var (
 var taskSearchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "Search work items by text or CQL filter",
-	Long: `Search items the caller can view via the v1 search endpoint.
+	Long: `Search items the caller can view via the v2 API.
 Multiple arguments are joined into a single query string. This is the same
 search as the top-level "ws search", scoped under "task" for discoverability;
 when a workspace is configured the results are filtered to it client-side.
@@ -73,7 +73,9 @@ Examples:
 			return err
 		}
 
-		applyStatusFilter(filters, statusFilter, client)
+		if err := applyStatusFilter(filters, statusFilter, client); err != nil {
+			return err
+		}
 
 		// Add date filters
 		if err := applyDateFilters(filters, createdFilter, updatedFilter); err != nil {
@@ -130,7 +132,11 @@ var taskListCmd = &cobra.Command{
 	Long: `List tasks with optional filtering.
 
 Examples:
-  ws task ls                              # List all accessible tasks
+  ws task ls                             # First page of accessible tasks
+  ws task ls --all                        # Load all matching pages
+  ws task ls --page 2 --limit 25           # Select a page
+  ws task ls -w PROJ -s "In Progress"      # Workspace status name
+  ws task ls -w PROJ --milestone "Q4"      # Exact milestone name or ID
   ws task ls -s 1                         # Filter by status ID
   ws task ls -s ~done                     # Exclude done status (negation)
   ws task ls --assignee 5                 # Filter by assignee ID
@@ -148,7 +154,23 @@ Examples:
 			return err
 		}
 
-		applyStatusFilter(filters, statusFilter, client)
+		if err := applyStatusFilter(filters, statusFilter, client); err != nil {
+			return err
+		}
+		if taskListMilestone != "" {
+			workspaceID, err := resolveOptionalWorkspace(client)
+			if err != nil {
+				return err
+			}
+			id, err := resolveTaskMilestone(client, taskListMilestone, workspaceID)
+			if err != nil {
+				return err
+			}
+			if id <= 0 {
+				return fmt.Errorf("milestone ID must be positive")
+			}
+			filters["milestone_id"] = strconv.Itoa(id)
+		}
 
 		if assigneeFilter != "" {
 			filters["assignee_id"] = assigneeFilter
@@ -165,7 +187,7 @@ Examples:
 			return err
 		}
 
-		items, err := client.ListItems(filters)
+		items, err := listTaskPage(client, filters, taskListPage, taskListLimit, taskListAll)
 		if err != nil {
 			return fmt.Errorf("failed to list items: %w", err)
 		}
@@ -280,7 +302,7 @@ Examples:
 
 		// Set optional fields
 		if createType != "" {
-			typeID, err := resolveItemTypeID(client, createType)
+			typeID, err := resolveItemTypeID(client, createType, &wsID)
 			if err != nil {
 				return err
 			}
@@ -308,8 +330,14 @@ Examples:
 		if createAssigneeID > 0 {
 			req.AssigneeID = &createAssigneeID
 		}
-		if createParentID > 0 {
-			req.ParentID = &createParentID
+		if cmd.Flags().Changed("parent") {
+			parentID, err := resolveParentID(client, createParent)
+			if err != nil {
+				return err
+			}
+			if parentID > 0 {
+				req.ParentID = &parentID
+			}
 		}
 		if createDueDate != "" {
 			d, err := parseDateFlag("due-date", createDueDate)
@@ -523,6 +551,13 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("failed to resolve item: %w", err)
 		}
+		var itemForScope *Item
+		if !clearMilestone {
+			itemForScope, err = client.GetItem(itemID, "")
+			if err != nil {
+				return fmt.Errorf("failed to get item: %w", err)
+			}
+		}
 
 		// With multi-milestone the typed request carries milestone_ids as a
 		// pointer-to-slice: nil = "leave alone", non-nil empty slice =
@@ -540,15 +575,7 @@ Examples:
 			if len(args) < 2 {
 				return fmt.Errorf("milestone argument required (or use --clear to remove)")
 			}
-			var wsID *int
-			if wsKey := cfg.GetEffectiveWorkspace(); wsKey != "" {
-				id, err := client.ResolveWorkspaceID(wsKey)
-				if err != nil {
-					return fmt.Errorf("failed to resolve workspace: %w", err)
-				}
-				wsID = &id
-			}
-			id, err := client.ResolveMilestoneID(args[1], wsID)
+			id, err := client.ResolveMilestoneID(args[1], &itemForScope.WorkspaceID)
 			if err != nil {
 				return fmt.Errorf("failed to resolve milestone: %w", err)
 			}
@@ -647,7 +674,9 @@ Examples:
 			return err
 		}
 
-		applyStatusFilter(filters, childStatusFilter, client)
+		if err := applyStatusFilter(filters, childStatusFilter, client); err != nil {
+			return err
+		}
 		if childTypeFilter != "" {
 			filters["item_type_id"] = childTypeFilter
 		}
@@ -736,6 +765,14 @@ Examples:
 		if err != nil {
 			return fmt.Errorf("failed to resolve item: %w", err)
 		}
+		needsWorkspaceContext := cmd.Flags().Changed("type") || cmd.Flags().Changed("iteration")
+		var itemForScope *Item
+		if needsWorkspaceContext {
+			itemForScope, err = client.GetItem(itemID, "")
+			if err != nil {
+				return fmt.Errorf("failed to get item: %w", err)
+			}
+		}
 
 		req := ItemUpdateRequest{}
 		hasChanges := false
@@ -759,7 +796,15 @@ Examples:
 			hasChanges = true
 		}
 		if cmd.Flags().Changed("parent") {
-			req.ParentID = &editParentID
+			parentID, err := resolveParentID(client, editParent)
+			if err != nil {
+				return err
+			}
+			var parent *int
+			if parentID > 0 {
+				parent = &parentID
+			}
+			req.ParentID = &parent
 			hasChanges = true
 		}
 		if cmd.Flags().Changed("due-date") {
@@ -795,15 +840,7 @@ Examples:
 			hasChanges = true
 		}
 		if cmd.Flags().Changed("iteration") {
-			var wsID *int
-			if wsKey := cfg.GetEffectiveWorkspace(); wsKey != "" {
-				id, err := client.ResolveWorkspaceID(wsKey)
-				if err != nil {
-					return fmt.Errorf("failed to resolve workspace: %w", err)
-				}
-				wsID = &id
-			}
-			id, err := client.ResolveIterationID(editIteration, wsID)
+			id, err := client.ResolveIterationID(editIteration, &itemForScope.WorkspaceID)
 			if err != nil {
 				return fmt.Errorf("failed to resolve iteration: %w", err)
 			}
@@ -831,7 +868,7 @@ Examples:
 			}
 		}
 		if typeChanged {
-			typeID, err := resolveItemTypeID(client, editType)
+			typeID, err := resolveItemTypeID(client, editType, &itemForScope.WorkspaceID)
 			if err != nil {
 				return err
 			}
@@ -869,7 +906,7 @@ func parseDateFlag(flagName, value string) (*time.Time, error) {
 
 // resolveItemTypeID resolves an item type given as a numeric ID or a name.
 // Names match case-insensitively, exact first, then unique substring.
-func resolveItemTypeID(client *Client, input string) (int, error) {
+func resolveItemTypeID(client *Client, input string, workspaceID *int) (int, error) {
 	if id, err := strconv.Atoi(input); err == nil {
 		if id <= 0 {
 			return 0, fmt.Errorf("item type ID must be positive")
@@ -877,7 +914,13 @@ func resolveItemTypeID(client *Client, input string) (int, error) {
 		return id, nil
 	}
 
-	types, err := client.ListItemTypes()
+	var types []ItemType
+	var err error
+	if workspaceID != nil {
+		types, err = client.GetWorkspaceItemTypes(*workspaceID)
+	} else {
+		types, err = client.ListItemTypes()
+	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to list item types: %w", err)
 	}
@@ -913,11 +956,11 @@ func resolveItemTypeID(client *Client, input string) (int, error) {
 
 // parseCustomFieldFlags turns repeated --custom-field <field>=<value> flags
 // into the custom_fields wire map. Keys are resolved to custom-field IDs
-// (numeric input passes through; names resolve via the v1 custom-fields
+// (numeric input passes through; names resolve via the v2 custom-fields
 // read endpoint). Values pass through as strings — the server validates
 // them against the field type.
-func parseCustomFieldFlags(client *Client, pairs []string) (map[string]interface{}, error) {
-	fields := make(map[string]interface{}, len(pairs))
+func parseCustomFieldFlags(client *Client, pairs []string) (map[string]any, error) {
+	fields := make(map[string]any, len(pairs))
 	var defs []CustomField // lazily loaded, only when a non-numeric key shows up
 	for _, pair := range pairs {
 		key, value, found := strings.Cut(pair, "=")
@@ -983,13 +1026,13 @@ func resolveCustomFieldID(name string, defs []CustomField) (int, error) {
 	return 0, fmt.Errorf("unknown custom field %q. Available fields:\n  - %s", name, strings.Join(available, "\n  - "))
 }
 
-// parseProjectFlag parses the --project flag. The v1 API has no project
+// parseProjectFlag parses the --project flag. The v2 item API has no project
 // listing endpoint, so only numeric project IDs are accepted — no
 // name-based resolution.
 func parseProjectFlag(value string) (int, error) {
 	id, err := strconv.Atoi(value)
 	if err != nil || id <= 0 {
-		return 0, fmt.Errorf("invalid --project %q: expected a numeric project ID (the v1 API exposes no project listing, so names cannot be resolved)", value)
+		return 0, fmt.Errorf("invalid --project %q: expected a numeric project ID", value)
 	}
 	return id, nil
 }
@@ -1049,7 +1092,7 @@ var (
 	createPriorityID   int
 	createStatusID     int
 	createAssigneeID   int
-	createParentID     int
+	createParent       string
 	createDueDate      string
 	createStartDate    string
 	createEndDate      string
@@ -1063,7 +1106,7 @@ var (
 	editTypeStatusID int
 	editPriorityID   int
 	editAssigneeID   int
-	editParentID     int
+	editParent       string
 	editDueDate      string
 	editStartDate    string
 	editEndDate      string
@@ -1088,6 +1131,11 @@ func init() {
 	taskCmd.AddCommand(taskHistoryCmd)
 
 	// List filters
+	taskListCmd.Flags().IntVar(&taskListPage, "page", 1, "result page (starts at 1)")
+	taskListCmd.Flags().IntVar(&taskListLimit, "limit", 50, "results per page (1-100)")
+	taskListCmd.Flags().BoolVar(&taskListAll, "all", false, "fetch every result page")
+	taskListCmd.Flags().StringVar(&taskListMilestone, "milestone", "", "filter by milestone name or ID")
+	taskListCmd.MarkFlagsMutuallyExclusive("all", "page")
 	taskMineCmd.Flags().StringVarP(&statusFilter, "status", "s", "", "filter by status (use ~status to exclude)")
 	taskMineCmd.Flags().StringVar(&createdFilter, "created", "", "filter by creation date (today, week, month, year, or -Nd)")
 	taskMineCmd.Flags().StringVar(&updatedFilter, "updated", "", "filter by update date (today, week, month, year, or -Nd)")
@@ -1123,13 +1171,13 @@ func init() {
 	taskEditCmd.Flags().IntVar(&editTypeStatusID, "type-status", 0, "target status ID when changing to a type with a different workflow")
 	taskEditCmd.Flags().IntVar(&editPriorityID, "priority", 0, "priority ID")
 	taskEditCmd.Flags().IntVar(&editAssigneeID, "assignee", 0, "assignee user ID")
-	taskEditCmd.Flags().IntVar(&editParentID, "parent", 0, "parent item ID")
+	taskEditCmd.Flags().StringVar(&editParent, "parent", "", "parent item key or ID (0 clears parent)")
 	taskEditCmd.Flags().StringVar(&editDueDate, "due-date", "", "due date (YYYY-MM-DD)")
 	taskEditCmd.Flags().StringVar(&editStartDate, "start-date", "", "start date (YYYY-MM-DD)")
 	taskEditCmd.Flags().StringVar(&editEndDate, "end-date", "", "end date (YYYY-MM-DD)")
 	taskEditCmd.Flags().StringArrayVar(&editCustomFields, "custom-field", nil, "custom field value as <field>=<value> (repeatable; field is a name or numeric ID)")
 	taskEditCmd.Flags().StringVar(&editIteration, "iteration", "", "iteration (name or numeric ID)")
-	taskEditCmd.Flags().StringVar(&editProject, "project", "", "project ID (numeric only — the v1 API has no project listing endpoint)")
+	taskEditCmd.Flags().StringVar(&editProject, "project", "", "project ID (numeric only)")
 
 	// Create flags
 	taskCreateCmd.Flags().StringVarP(&createTitle, "title", "t", "", "task title (required)")
@@ -1139,11 +1187,11 @@ func init() {
 	taskCreateCmd.Flags().IntVar(&createPriorityID, "priority", 0, "priority ID")
 	taskCreateCmd.Flags().IntVar(&createStatusID, "status", 0, "status ID")
 	taskCreateCmd.Flags().IntVar(&createAssigneeID, "assignee", 0, "assignee user ID")
-	taskCreateCmd.Flags().IntVar(&createParentID, "parent", 0, "parent item ID")
+	taskCreateCmd.Flags().StringVar(&createParent, "parent", "", "parent item key or ID")
 	taskCreateCmd.Flags().StringVar(&createDueDate, "due-date", "", "due date (YYYY-MM-DD)")
 	taskCreateCmd.Flags().StringVar(&createStartDate, "start-date", "", "start date (YYYY-MM-DD)")
 	taskCreateCmd.Flags().StringVar(&createEndDate, "end-date", "", "end date (YYYY-MM-DD)")
 	taskCreateCmd.Flags().StringArrayVar(&createCustomFields, "custom-field", nil, "custom field value as <field>=<value> (repeatable; field is a name or numeric ID)")
 	taskCreateCmd.Flags().StringVar(&createIteration, "iteration", "", "iteration (name or numeric ID)")
-	taskCreateCmd.Flags().StringVar(&createProject, "project", "", "project ID (numeric only — the v1 API has no project listing endpoint)")
+	taskCreateCmd.Flags().StringVar(&createProject, "project", "", "project ID (numeric only)")
 }

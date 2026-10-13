@@ -4,24 +4,83 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
+	"strings"
 
 	"windshift/internal/database"
 	"windshift/internal/models"
 )
 
-// StatusRepository serves the legacy /api/statuses CRUD surface and the
-// shared "non-done status IDs" lookup. Production traffic uses the v1
-// status handler; this repo backs the overlay-only legacy handler so
-// behavior keeps round-tripping through the layering rules.
+// StatusRepository provides status data used by workspace and workflow services.
 type StatusRepository struct {
 	db database.Database
+}
+
+// ListForWorkspaces returns the union of statuses available through each
+// workspace's effective workflows. An empty list returns the global catalog.
+func (r *StatusRepository) ListForWorkspaces(workspaceIDs []int) ([]models.Status, error) {
+	if len(workspaceIDs) == 0 {
+		return r.List()
+	}
+	placeholders := make([]string, len(workspaceIDs))
+	args := make([]any, len(workspaceIDs))
+	for i, workspaceID := range workspaceIDs {
+		placeholders[i] = "?"
+		args[i] = workspaceID
+	}
+	rows, err := r.db.Query(fmt.Sprintf(`
+		WITH target_workspaces AS (
+			SELECT id, is_personal FROM workspaces WHERE id IN (%s)
+		), effective_workflows AS (
+			SELECT target.id AS workspace_id, target.is_personal,
+			       COALESCE(csit.workflow_id, cs.workflow_id,
+			         (SELECT id FROM workflows WHERE is_default = true ORDER BY id LIMIT 1)) AS workflow_id
+			FROM target_workspaces target
+			LEFT JOIN workspace_configuration_sets wcs ON wcs.workspace_id = target.id
+			LEFT JOIN configuration_sets cs
+			  ON cs.id = COALESCE(wcs.configuration_set_id,
+			    (SELECT id FROM configuration_sets WHERE is_default = true ORDER BY id LIMIT 1))
+			LEFT JOIN configuration_set_item_types csit ON csit.configuration_set_id = cs.id
+		), available_statuses AS (
+			SELECT wt.from_status_id AS status_id FROM effective_workflows ew
+			JOIN workflow_transitions wt ON wt.workflow_id = ew.workflow_id WHERE wt.from_status_id IS NOT NULL
+			UNION
+			SELECT wt.to_status_id AS status_id FROM effective_workflows ew
+			JOIN workflow_transitions wt ON wt.workflow_id = ew.workflow_id
+		)
+		SELECT DISTINCT s.id, COALESCE(s.builtin_key, ''), s.name, s.description, s.category_id, s.is_default,
+		       sc.name, COALESCE(sc.builtin_key, ''), sc.color, sc.is_completed
+		FROM statuses s
+		JOIN status_categories sc ON s.category_id = sc.id
+		WHERE s.id IN (SELECT status_id FROM available_statuses)
+		   OR EXISTS (SELECT 1 FROM target_workspaces WHERE is_personal = true)
+		ORDER BY s.category_id, s.name
+	`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list statuses for workspaces: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]models.Status, 0)
+	for rows.Next() {
+		var status models.Status
+		var description sql.NullString
+		if err := rows.Scan(&status.ID, &status.BuiltinKey, &status.Name, &description, &status.CategoryID,
+			&status.IsDefault, &status.CategoryName, &status.CategoryBuiltinKey, &status.CategoryColor, &status.IsCompleted); err != nil {
+			return nil, fmt.Errorf("scan workspace status: %w", err)
+		}
+		status.Description = description.String
+		out = append(out, status)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workspace statuses: %w", err)
+	}
+	return out, nil
 }
 
 // StatusTransitionOption is a status option exposed by a workflow transition.
 type StatusTransitionOption struct {
 	TransitionID  int
 	StatusID      int
+	BuiltinKey    string
 	StatusName    string
 	CategoryColor *string
 }
@@ -32,8 +91,8 @@ func NewStatusRepository(db database.Database) *StatusRepository {
 }
 
 const statusJoinedSelect = `
-	SELECT s.id, s.name, s.description, s.category_id, s.is_default, s.created_at, s.updated_at,
-	       sc.name as category_name, sc.color as category_color
+	SELECT s.id, COALESCE(s.builtin_key, ''), s.name, COALESCE(s.description, ''), s.category_id, s.is_default, s.created_at, s.updated_at,
+	       sc.name as category_name, COALESCE(sc.builtin_key, ''), sc.color as category_color, sc.is_completed
 	FROM statuses s
 	JOIN status_categories sc ON s.category_id = sc.id`
 
@@ -63,6 +122,34 @@ func (r *StatusRepository) List() ([]models.Status, error) {
 	return statuses, nil
 }
 
+// ListForWorkflow returns statuses participating in a workflow.
+func (r *StatusRepository) ListForWorkflow(workflowID int) ([]models.Status, error) {
+	rows, err := r.db.Query(statusJoinedSelect+`
+		WHERE s.id IN (
+			SELECT to_status_id FROM workflow_transitions WHERE workflow_id = ?
+			UNION
+			SELECT from_status_id FROM workflow_transitions WHERE workflow_id = ? AND from_status_id IS NOT NULL
+		)
+		ORDER BY s.is_default DESC, s.name
+	`, workflowID, workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("list statuses for workflow %d: %w", workflowID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	statuses := []models.Status{}
+	for rows.Next() {
+		status, err := scanStatusJoined(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan workflow status: %w", err)
+		}
+		statuses = append(statuses, status)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workflow statuses: %w", err)
+	}
+	return statuses, nil
+}
+
 // GetByID returns a single status with category fields. ErrNotFound when missing.
 func (r *StatusRepository) GetByID(id int) (*models.Status, error) {
 	row := r.db.QueryRow(statusJoinedSelect+" WHERE s.id = ?", id)
@@ -74,6 +161,35 @@ func (r *StatusRepository) GetByID(id int) (*models.Status, error) {
 		return nil, fmt.Errorf("get status %d: %w", id, err)
 	}
 	return &s, nil
+}
+
+// FindByName returns the status with the exact name, or ErrNotFound.
+func (r *StatusRepository) FindByName(name string) (*models.Status, error) {
+	row := r.db.QueryRow(statusJoinedSelect+" WHERE s.name = ?", name)
+	status, err := scanStatusJoined(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find status %q: %w", name, err)
+	}
+	return &status, nil
+}
+
+// CategoryIDs returns status category IDs keyed by status ID.
+func (r *StatusRepository) CategoryIDs(statusIDs []int) (map[int]int, error) {
+	result := make(map[int]int, len(statusIDs))
+	for _, statusID := range statusIDs {
+		var categoryID int
+		if err := r.db.QueryRow(`SELECT category_id FROM statuses WHERE id = ?`, statusID).Scan(&categoryID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return nil, fmt.Errorf("get status %d category: %w", statusID, err)
+		}
+		result[statusID] = categoryID
+	}
+	return result, nil
 }
 
 // GetName returns a status name. Missing statuses return an empty name for
@@ -92,11 +208,11 @@ func (r *StatusRepository) GetTransitionOption(statusID int64) (*StatusTransitio
 	var option StatusTransitionOption
 	var categoryColor sql.NullString
 	err := r.db.QueryRow(`
-		SELECT s.id, s.name, sc.color
+		SELECT s.id, COALESCE(s.builtin_key, ''), s.name, sc.color
 		FROM statuses s
 		LEFT JOIN status_categories sc ON s.category_id = sc.id
 		WHERE s.id = ?
-	`, statusID).Scan(&option.StatusID, &option.StatusName, &categoryColor)
+	`, statusID).Scan(&option.StatusID, &option.BuiltinKey, &option.StatusName, &categoryColor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -109,15 +225,27 @@ func (r *StatusRepository) GetTransitionOption(statusID int64) (*StatusTransitio
 	return &option, nil
 }
 
-// ListAvailableTransitionOptions returns direct workflow transitions from a status.
+// ListAvailableTransitionOptions returns the workflow transitions usable from
+// a status: direct edges plus from-all rows targeting statuses without a
+// direct edge from this status.
 func (r *StatusRepository) ListAvailableTransitionOptions(workflowID int, fromStatusID int64) ([]StatusTransitionOption, error) {
 	rows, err := r.db.Query(`
-		SELECT wt.id, s.id, s.name, sc.color
+		SELECT wt.id, s.id, COALESCE(s.builtin_key, ''), s.name, sc.color
 		FROM workflow_transitions wt
 		JOIN statuses s ON wt.to_status_id = s.id
 		LEFT JOIN status_categories sc ON s.category_id = sc.id
-		WHERE wt.workflow_id = ? AND wt.from_status_id = ?
-	`, workflowID, fromStatusID)
+		WHERE wt.workflow_id = ?
+		  AND (
+			wt.from_status_id = ?
+			OR (
+				wt.from_all_statuses = TRUE
+				AND wt.to_status_id NOT IN (
+					SELECT to_status_id FROM workflow_transitions WHERE workflow_id = ? AND from_status_id = ?
+				)
+			)
+		  )
+		ORDER BY CASE WHEN wt.from_all_statuses THEN 1 ELSE 0 END, wt.display_order
+	`, workflowID, fromStatusID, workflowID, fromStatusID)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +255,7 @@ func (r *StatusRepository) ListAvailableTransitionOptions(workflowID int, fromSt
 	for rows.Next() {
 		var option StatusTransitionOption
 		var categoryColor sql.NullString
-		if err := rows.Scan(&option.TransitionID, &option.StatusID, &option.StatusName, &categoryColor); err != nil {
+		if err := rows.Scan(&option.TransitionID, &option.StatusID, &option.BuiltinKey, &option.StatusName, &categoryColor); err != nil {
 			continue
 		}
 		if categoryColor.Valid {
@@ -141,90 +269,7 @@ func (r *StatusRepository) ListAvailableTransitionOptions(workflowID int, fromSt
 	return options, nil
 }
 
-// Create inserts a status row and returns the new id and timestamp it stamped.
-// Sanitization is the caller's responsibility.
-func (r *StatusRepository) Create(s *models.Status) (int64, time.Time, error) {
-	now := time.Now()
-	var id int64
-	err := r.db.QueryRow(`
-		INSERT INTO statuses (name, description, category_id, is_default, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?) RETURNING id
-	`, s.Name, s.Description, s.CategoryID, s.IsDefault, now, now).Scan(&id)
-	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("create status: %w", err)
-	}
-	return id, now, nil
-}
-
-// Update replaces the editable fields of an existing status.
-func (r *StatusRepository) Update(id int, s *models.Status) error {
-	_, err := r.db.ExecWrite(`
-		UPDATE statuses
-		SET name = ?, description = ?, category_id = ?, is_default = ?, updated_at = ?
-		WHERE id = ?
-	`, s.Name, s.Description, s.CategoryID, s.IsDefault, time.Now(), id)
-	if err != nil {
-		return fmt.Errorf("update status %d: %w", id, err)
-	}
-	return nil
-}
-
-// Delete removes a status row. Caller must enforce the system-critical and
-// referential checks (CategoryExists, NameExists, CountTransitionsUsing,
-// item count) before calling.
-func (r *StatusRepository) Delete(id int) error {
-	if _, err := r.db.ExecWrite("DELETE FROM statuses WHERE id = ?", id); err != nil {
-		return fmt.Errorf("delete status %d: %w", id, err)
-	}
-	return nil
-}
-
-// CategoryExists reports whether a status_category with the given id exists.
-// Used by the handler's pre-write validation.
-func (r *StatusRepository) CategoryExists(categoryID int) (bool, error) {
-	var ok bool
-	if err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM status_categories WHERE id = ?)", categoryID).Scan(&ok); err != nil {
-		return false, fmt.Errorf("check status_category %d: %w", categoryID, err)
-	}
-	return ok, nil
-}
-
-// NameExists reports whether another status row already uses the given name.
-// excludeID > 0 excludes that row from the check (so an Update doesn't
-// collide with itself).
-func (r *StatusRepository) NameExists(name string, excludeID int) (bool, error) {
-	var ok bool
-	var err error
-	if excludeID > 0 {
-		err = r.db.QueryRow(
-			"SELECT EXISTS(SELECT 1 FROM statuses WHERE name = ? AND id != ?)",
-			name, excludeID,
-		).Scan(&ok)
-	} else {
-		err = r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM statuses WHERE name = ?)", name).Scan(&ok)
-	}
-	if err != nil {
-		return false, fmt.Errorf("check status name %q: %w", name, err)
-	}
-	return ok, nil
-}
-
-// CountTransitionsUsing returns the number of workflow_transitions whose
-// from_status_id or to_status_id references the given status. The handler
-// uses this to refuse a delete that would orphan transitions.
-func (r *StatusRepository) CountTransitionsUsing(statusID int) (int, error) {
-	var n int
-	if err := r.db.QueryRow(
-		"SELECT COUNT(*) FROM workflow_transitions WHERE from_status_id = ? OR to_status_id = ?",
-		statusID, statusID,
-	).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count transitions using status %d: %w", statusID, err)
-	}
-	return n, nil
-}
-
-// ListNonDoneIDs returns the IDs of statuses whose category is NOT marked
-// completed. Backs the GET /api/statuses/non-done-ids endpoint.
+// ListNonDoneIDs returns the IDs of statuses whose category is not completed.
 func (r *StatusRepository) ListNonDoneIDs() ([]int, error) {
 	rows, err := r.db.Query(`
 		SELECT s.id
@@ -260,9 +305,9 @@ func scanStatusJoined(scanner interface {
 }) (models.Status, error) {
 	var s models.Status
 	if err := scanner.Scan(
-		&s.ID, &s.Name, &s.Description, &s.CategoryID, &s.IsDefault,
+		&s.ID, &s.BuiltinKey, &s.Name, &s.Description, &s.CategoryID, &s.IsDefault,
 		&s.CreatedAt, &s.UpdatedAt,
-		&s.CategoryName, &s.CategoryColor,
+		&s.CategoryName, &s.CategoryBuiltinKey, &s.CategoryColor, &s.IsCompleted,
 	); err != nil {
 		return s, err
 	}

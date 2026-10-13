@@ -2,12 +2,10 @@ package repository
 
 import "windshift/internal/database"
 
-// GetAccessibleWorkspaceIDs returns all workspace IDs the user can access based
-// on direct role assignments, group memberships, active status, and personal ownership.
-// This is the single-query implementation that resolves access in SQL.
-func GetAccessibleWorkspaceIDs(db database.Database, userID int) ([]int, error) {
-	rows, err := db.Query(`
-		SELECT DISTINCT w.id
+// legacyUngatedWorkspaceAccessJoin is a compatibility fallback for callers
+// without PermissionService. It is not an authorization primitive because it
+// admits every active non-personal workspace.
+const legacyUngatedWorkspaceAccessJoin = `
 		FROM workspaces w
 		LEFT JOIN user_workspace_roles uwr ON w.id = uwr.workspace_id AND uwr.user_id = ?
 		LEFT JOIN (
@@ -20,7 +18,13 @@ func GetAccessibleWorkspaceIDs(db database.Database, userID int) ([]int, error) 
 		   OR (w.active = false AND uwr.role_id IS NOT NULL)
 		   OR (w.active = false AND grp.workspace_id IS NOT NULL)
 		   OR (w.is_personal = true AND w.owner_id = ?)
-	`, userID, userID, userID)
+	`
+
+// GetAccessibleWorkspaceIDs returns all workspace IDs the user can access based
+// on direct role assignments, group memberships, active status, and personal ownership.
+// This is the single-query implementation that resolves access in SQL.
+func GetAccessibleWorkspaceIDs(db database.Database, userID int) ([]int, error) {
+	rows, err := db.Query("SELECT DISTINCT w.id"+legacyUngatedWorkspaceAccessJoin, userID, userID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -37,16 +41,14 @@ func GetAccessibleWorkspaceIDs(db database.Database, userID int) ([]int, error) 
 	return ids, rows.Err()
 }
 
-// FilterSharedWorkspaceIDs returns ids with personal workspaces removed.
-// Backs the v1 API's exclude_personal query parameter: integration surfaces
-// (e.g. embedding items in shared documents) must not expose the caller's
-// personal-workspace items even though the caller themselves can see them.
+// FilterSharedWorkspaceIDs removes personal workspaces from accessible IDs
+// when integrations opt out of personal items with exclude_personal.
 func FilterSharedWorkspaceIDs(db database.Database, ids []int) ([]int, error) {
 	if len(ids) == 0 {
 		return ids, nil
 	}
 	placeholders := make([]byte, 0, len(ids)*2)
-	args := make([]interface{}, 0, len(ids))
+	args := make([]any, 0, len(ids))
 	for i, id := range ids {
 		if i > 0 {
 			placeholders = append(placeholders, ',')

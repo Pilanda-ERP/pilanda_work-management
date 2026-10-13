@@ -1,27 +1,341 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"windshift/internal/database"
 	"windshift/internal/models"
 )
 
-// TimeWorklogRepository persists rows in the time_worklogs table. The AI
-// log_time tool routes through here; the HTTP TimeWorklogHandler.Create and
-// the timer-stop path (ActiveTimerRepository.CreateWorklog) still inline the
-// same INSERT and are follow-up candidates for migrating here.
+// TimeWorklogRepository persists rows in the time_worklogs table for both the
+// cookie-auth and bearer-token HTTP surfaces. The timer-stop path performs its
+// insert in ActiveTimerRepository because it must commit atomically with timer
+// deletion.
 type TimeWorklogRepository struct {
 	db database.Database
+}
+
+type BriefingWorklog struct {
+	Description     string
+	DurationMinutes int
+	ProjectName     string
+}
+
+type CaptureWorklog struct {
+	ID              int
+	AuthorUsername  string
+	DurationMinutes int
+	StartedUnix     int64
+}
+
+// ListCaptureWorklogs returns mapped worklogs that still belong to the item.
+func (r *TimeWorklogRepository) ListCaptureWorklogs(itemID int, worklogIDs []int) ([]CaptureWorklog, error) {
+	if len(worklogIDs) == 0 {
+		return []CaptureWorklog{}, nil
+	}
+	placeholders, idArgs := inPlaceholders(worklogIDs)
+	args := append([]any{itemID}, idArgs...)
+	rows, err := r.db.Query(`
+		SELECT w.id, COALESCE(u.username, ''), COALESCE(w.duration_minutes, 0), COALESCE(w.start_time, 0)
+		FROM time_worklogs w
+		LEFT JOIN users u ON u.id = w.user_id
+		WHERE w.item_id = ? AND w.id IN (`+placeholders+`)
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list capture worklogs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := []CaptureWorklog{}
+	for rows.Next() {
+		var worklog CaptureWorklog
+		if err := rows.Scan(&worklog.ID, &worklog.AuthorUsername, &worklog.DurationMinutes, &worklog.StartedUnix); err != nil {
+			return nil, fmt.Errorf("scan capture worklog: %w", err)
+		}
+		out = append(out, worklog)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate capture worklogs: %w", err)
+	}
+	return out, nil
+}
+
+// ListBriefingWorklogs returns a user's worklogs overlapping a half-open time
+// window. Overlap is measured against the stored start/end timestamps so
+// entries that cross local midnight count toward the day they cover.
+func (r *TimeWorklogRepository) ListBriefingWorklogs(userID int, start, end time.Time) ([]BriefingWorklog, error) {
+	rows, err := r.db.Query(`
+		SELECT tw.description, tw.duration_minutes, tp.name
+		FROM time_worklogs tw
+		JOIN time_projects tp ON tw.project_id = tp.id
+		WHERE tw.user_id = ? AND tw.start_time < ? AND tw.end_time > ?
+		ORDER BY tw.start_time DESC
+	`, userID, end.Unix(), start.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("list briefing worklogs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]BriefingWorklog, 0)
+	for rows.Next() {
+		var worklog BriefingWorklog
+		if err := rows.Scan(&worklog.Description, &worklog.DurationMinutes, &worklog.ProjectName); err != nil {
+			return nil, fmt.Errorf("scan briefing worklog: %w", err)
+		}
+		out = append(out, worklog)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate briefing worklogs: %w", err)
+	}
+	return out, nil
 }
 
 // NewTimeWorklogRepository creates a TimeWorklogRepository.
 func NewTimeWorklogRepository(db database.Database) *TimeWorklogRepository {
 	return &TimeWorklogRepository{db: db}
+}
+
+const worklogDetailSelect = `SELECT w.id, w.project_id, w.customer_id, w.item_id, w.description, w.date, w.start_time,
+       w.end_time, w.duration_minutes, w.created_at, w.updated_at,
+       c.name, p.name, i.title, ws.id, ws.key, i.workspace_item_number,
+       p.settings,
+       (SELECT COALESCE(SUM(duration_minutes), 0) / 60.0 FROM time_worklogs WHERE project_id = w.project_id),
+       w.user_id, COALESCE(u.first_name || ' ' || u.last_name, '')
+FROM time_worklogs w
+JOIN customer_organisations c ON w.customer_id = c.id
+JOIN time_projects p ON w.project_id = p.id
+LEFT JOIN items i ON w.item_id = i.id
+LEFT JOIN workspaces ws ON i.workspace_id = ws.id
+LEFT JOIN users u ON w.user_id = u.id`
+
+type worklogDetailScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanWorklogDetail(scanner worklogDetailScanner) (models.Worklog, error) {
+	var worklog models.Worklog
+	var itemTitle, workspaceKey, projectSettings, userName sql.NullString
+	var workspaceID, workspaceItemNumber, userID sql.NullInt64
+	var projectTotalHours sql.NullFloat64
+
+	err := scanner.Scan(
+		&worklog.ID, &worklog.ProjectID, &worklog.CustomerID, &worklog.ItemID, &worklog.Description,
+		&worklog.Date, &worklog.StartTime, &worklog.EndTime, &worklog.DurationMins,
+		&worklog.CreatedAt, &worklog.UpdatedAt, &worklog.CustomerName, &worklog.ProjectName, &itemTitle,
+		&workspaceID, &workspaceKey, &workspaceItemNumber, &projectSettings, &projectTotalHours,
+		&userID, &userName,
+	)
+	if err != nil {
+		return models.Worklog{}, err
+	}
+
+	worklog.ItemTitle = itemTitle.String
+	if workspaceID.Valid {
+		id := int(workspaceID.Int64)
+		worklog.WorkspaceID = &id
+	}
+	worklog.WorkspaceKey = workspaceKey.String
+	worklog.WorkspaceItemNumber = int(workspaceItemNumber.Int64)
+	if projectTotalHours.Valid {
+		worklog.ProjectTotalHours = &projectTotalHours.Float64
+	}
+	if userID.Valid {
+		id := int(userID.Int64)
+		worklog.UserID = &id
+	}
+	worklog.UserName = userName.String
+	if projectSettings.Valid && projectSettings.String != "" {
+		var settings map[string]any
+		if err := json.Unmarshal([]byte(projectSettings.String), &settings); err == nil {
+			if maxHours, ok := settings["max_hours"].(float64); ok && maxHours > 0 {
+				worklog.ProjectMaxHours = &maxHours
+			}
+		}
+	}
+	return worklog, nil
+}
+
+// WorklogDetailFilter narrows cookie-auth worklog list endpoints. A nil
+// AccessibleProjectIDs slice means unrestricted access; an empty non-nil
+// slice returns no rows. Date bounds are interval overlaps against the
+// stored start/end timestamps, so entries that span a range boundary count
+// toward the days they cover. The upper bound is exclusive.
+type WorklogDetailFilter struct {
+	// ViewerID limits ordinary readers to their own entries; managed projects are exempt.
+	ViewerID             *int
+	ManagedProjectIDs    []int
+	AccessibleProjectIDs []int
+	CustomerID           *int
+	ProjectID            *int
+	ItemID               *int
+	DateFromUnix         *int64
+	DateToExclusiveUnix  *int64
+	Limit                int
+	Offset               int
+}
+
+// WorklogAggregateInput is the slim projection feeding server-side report
+// aggregation: no description, item, or label columns.
+type WorklogAggregateInput struct {
+	StartTimeUnix   int64
+	EndTimeUnix     int64
+	DurationMinutes int
+	UserID          int
+	UserName        string
+	ProjectID       int
+	ProjectName     string
+	CustomerID      int
+	CustomerName    string
+}
+
+// StreamAggregateInputs invokes fn for every worklog matching the filter,
+// ordered for deterministic aggregation, without materializing the whole
+// result set. The query runs under ctx, so a canceled report request stops
+// the scan (WI-1598).
+func (r *TimeWorklogRepository) StreamAggregateInputs(ctx context.Context, filter WorklogDetailFilter, fn func(*WorklogAggregateInput) error) error {
+	if filter.AccessibleProjectIDs != nil && len(filter.AccessibleProjectIDs) == 0 {
+		return nil
+	}
+	where, args := worklogDetailWhere(filter)
+	query := `SELECT w.start_time, w.end_time, w.duration_minutes,
+	       w.user_id, COALESCE(u.first_name || ' ' || u.last_name, ''),
+	       w.project_id, p.name, w.customer_id, c.name
+	FROM time_worklogs w
+	JOIN customer_organisations c ON w.customer_id = c.id
+	JOIN time_projects p ON w.project_id = p.id
+	LEFT JOIN users u ON w.user_id = u.id
+	` + where + "\n ORDER BY w.start_time ASC, w.id ASC"
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("stream worklog aggregate inputs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var item WorklogAggregateInput
+		if scanErr := rows.Scan(&item.StartTimeUnix, &item.EndTimeUnix, &item.DurationMinutes,
+			&item.UserID, &item.UserName, &item.ProjectID, &item.ProjectName,
+			&item.CustomerID, &item.CustomerName); scanErr != nil {
+			return fmt.Errorf("scan worklog aggregate input: %w", scanErr)
+		}
+		if err := fn(&item); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// ListDetails returns joined worklogs ordered newest-first.
+func (r *TimeWorklogRepository) ListDetails(filter WorklogDetailFilter) ([]models.Worklog, error) {
+	if filter.AccessibleProjectIDs != nil && len(filter.AccessibleProjectIDs) == 0 {
+		return []models.Worklog{}, nil
+	}
+	where, args := worklogDetailWhere(filter)
+	query := worklogDetailSelect + "\n" + where
+	query += " ORDER BY w.start_time DESC, w.id DESC"
+	if filter.Limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, filter.Limit, max(filter.Offset, 0))
+	}
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list worklog details: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	worklogs := make([]models.Worklog, 0)
+	for rows.Next() {
+		worklog, err := scanWorklogDetail(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan worklog details: %w", err)
+		}
+		worklogs = append(worklogs, worklog)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read worklog details: %w", err)
+	}
+	return worklogs, nil
+}
+
+// ListDetailsPage returns a repository-bounded page and its matching total.
+func (r *TimeWorklogRepository) ListDetailsPage(filter WorklogDetailFilter) ([]models.Worklog, int, error) {
+	if filter.Limit <= 0 {
+		return nil, 0, errors.New("worklog page limit must be positive")
+	}
+	if filter.AccessibleProjectIDs != nil && len(filter.AccessibleProjectIDs) == 0 {
+		return []models.Worklog{}, 0, nil
+	}
+	where, args := worklogDetailWhere(filter)
+	var total int
+	if err := r.db.QueryRow("SELECT COUNT(*) FROM time_worklogs w "+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count worklog details: %w", err)
+	}
+	items, err := r.ListDetails(filter)
+	return items, total, err
+}
+
+func worklogDetailWhere(filter WorklogDetailFilter) (query string, args []any) {
+	query = "WHERE 1=1"
+	if filter.ViewerID != nil {
+		query += " AND (w.user_id = ?"
+		args = append(args, *filter.ViewerID)
+		if len(filter.ManagedProjectIDs) > 0 {
+			placeholders := make([]string, len(filter.ManagedProjectIDs))
+			for i, id := range filter.ManagedProjectIDs {
+				placeholders[i] = "?"
+				args = append(args, id)
+			}
+			query += " OR w.project_id IN (" + strings.Join(placeholders, ",") + ")"
+		}
+		query += ")"
+	}
+	if filter.AccessibleProjectIDs != nil {
+		placeholders := make([]string, len(filter.AccessibleProjectIDs))
+		for i, id := range filter.AccessibleProjectIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query += " AND w.project_id IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	if filter.CustomerID != nil {
+		query += " AND w.customer_id = ?"
+		args = append(args, *filter.CustomerID)
+	}
+	if filter.ProjectID != nil {
+		query += " AND w.project_id = ?"
+		args = append(args, *filter.ProjectID)
+	}
+	if filter.ItemID != nil {
+		query += " AND w.item_id = ?"
+		args = append(args, *filter.ItemID)
+	}
+	if filter.DateFromUnix != nil {
+		query += " AND w.end_time > ?"
+		args = append(args, *filter.DateFromUnix)
+	}
+	if filter.DateToExclusiveUnix != nil {
+		query += " AND w.start_time < ?"
+		args = append(args, *filter.DateToExclusiveUnix)
+	}
+	return query, args
+}
+
+// GetDetail returns a joined worklog or ErrNotFound when it does not exist.
+func (r *TimeWorklogRepository) GetDetail(worklogID int) (*models.Worklog, error) {
+	worklog, err := scanWorklogDetail(r.db.QueryRow(worklogDetailSelect+"\nWHERE w.id = ?", worklogID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get worklog details: %w", err)
+	}
+	return &worklog, nil
 }
 
 // NewWorklog captures the fields needed to insert a worklog row. Date and
@@ -36,6 +350,66 @@ type NewWorklog struct {
 	StartTimeUnix   int64
 	EndTimeUnix     int64
 	DurationMinutes int
+}
+
+// ImportedWorklog preserves source timestamps and permits an unresolved user.
+type ImportedWorklog struct {
+	ProjectID       int
+	CustomerID      int64
+	UserID          *int
+	ItemID          int
+	Description     string
+	DateUnix        int64
+	StartTimeUnix   int64
+	EndTimeUnix     int64
+	DurationMinutes int
+	CreatedAtUnix   int64
+	UpdatedAtUnix   int64
+}
+
+// CreateImported inserts a worklog with source-system timestamps.
+func (r *TimeWorklogRepository) CreateImported(in ImportedWorklog) (int64, error) {
+	var id int64
+	err := r.db.QueryRow(`
+		INSERT INTO time_worklogs
+			(project_id, customer_id, user_id, item_id, description, date,
+			 start_time, end_time, duration_minutes, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+	`, in.ProjectID, in.CustomerID, in.UserID, in.ItemID, in.Description,
+		in.DateUnix, in.StartTimeUnix, in.EndTimeUnix, in.DurationMinutes,
+		in.CreatedAtUnix, in.UpdatedAtUnix).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("create imported worklog: %w", err)
+	}
+	return id, nil
+}
+
+// UpdateWorklog captures the mutable fields of an existing worklog.
+type UpdateWorklog struct {
+	ID              int
+	ProjectID       int
+	CustomerID      int
+	ItemID          *int
+	Description     string
+	DateUnix        int64
+	StartTimeUnix   int64
+	EndTimeUnix     int64
+	DurationMinutes int
+}
+
+// Update replaces a worklog's editable fields and stamps updated_at.
+func (r *TimeWorklogRepository) Update(in UpdateWorklog) error {
+	_, err := r.db.ExecWrite(`
+		UPDATE time_worklogs
+		SET project_id = ?, customer_id = ?, item_id = ?, description = ?, date = ?,
+		    start_time = ?, end_time = ?, duration_minutes = ?, updated_at = ?
+		WHERE id = ?
+	`, in.ProjectID, in.CustomerID, in.ItemID, in.Description, in.DateUnix,
+		in.StartTimeUnix, in.EndTimeUnix, in.DurationMinutes, time.Now().Unix(), in.ID)
+	if err != nil {
+		return fmt.Errorf("update worklog: %w", err)
+	}
+	return nil
 }
 
 // Create inserts a worklog row, stamping created_at/updated_at, and returns
@@ -56,14 +430,15 @@ func (r *TimeWorklogRepository) Create(in NewWorklog) (int64, error) {
 }
 
 // WorklogListFilter narrows ListForUser results. Nil pointer fields disable
-// the corresponding filter; date bounds are unix seconds (inclusive).
+// the corresponding filter. Date bounds are interval overlaps against the
+// stored start/end timestamps; the upper bound is exclusive.
 type WorklogListFilter struct {
-	UserID       int
-	DateFromUnix *int64
-	DateToUnix   *int64
-	ProjectID    *int
-	Limit        int
-	Offset       int
+	UserID              int
+	DateFromUnix        *int64
+	DateToExclusiveUnix *int64
+	ProjectID           *int
+	Limit               int
+	Offset              int
 }
 
 // ListForUser returns a page of the user's worklogs, newest first, with the
@@ -85,21 +460,21 @@ func (r *TimeWorklogRepository) ListForUser(f WorklogListFilter) ([]models.Workl
 	qa := []any{f.UserID}
 
 	if f.DateFromUnix != nil {
-		query += " AND w.date >= ?"
+		query += " AND w.end_time > ?"
 		qa = append(qa, *f.DateFromUnix)
 	}
-	if f.DateToUnix != nil {
-		query += " AND w.date <= ?"
-		qa = append(qa, *f.DateToUnix)
+	if f.DateToExclusiveUnix != nil {
+		query += " AND w.start_time < ?"
+		qa = append(qa, *f.DateToExclusiveUnix)
 	}
 	if f.ProjectID != nil {
 		query += " AND w.project_id = ?"
 		qa = append(qa, *f.ProjectID)
 	}
-	query += " ORDER BY w.date DESC"
+	query += " ORDER BY w.start_time DESC, w.id DESC"
 
 	var total int
-	if err := r.db.QueryRow("SELECT COUNT(*) FROM ("+query+")", qa...).Scan(&total); err != nil {
+	if err := r.db.QueryRow("SELECT COUNT(*) FROM ("+query+") AS filtered_worklogs", qa...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count worklogs: %w", err)
 	}
 
@@ -135,7 +510,7 @@ func (r *TimeWorklogRepository) ListForUser(f WorklogListFilter) ([]models.Workl
 			wl.ProjectTotalHours = &projectTotalHours.Float64
 		}
 		if projectSettings.Valid && projectSettings.String != "" {
-			var settings map[string]interface{}
+			var settings map[string]any
 			if err := json.Unmarshal([]byte(projectSettings.String), &settings); err == nil {
 				if maxHours, ok := settings["max_hours"].(float64); ok && maxHours > 0 {
 					wl.ProjectMaxHours = &maxHours

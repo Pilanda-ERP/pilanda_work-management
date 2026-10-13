@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from 'svelte';
+  import { untrack } from 'svelte';
   import { api } from '../api.js';
   import { useEventListener } from 'runed';
   import Avatar from '../components/Avatar.svelte';
@@ -15,6 +15,7 @@
     query = '',
     position = { x: 0, y: 0 },
     open = $bindable(false),
+    workspaceId = null,
     isPersonalWorkspace = false,
     onSelect = null,
     onCancel = null
@@ -23,21 +24,24 @@
   // State
   let users = $state([]);
   let loading = $state(false);
+  let loadedWorkspaceId = $state(undefined);
+  let loadRequest = 0;
   let highlightedIndex = $state(0);
   let containerElement = $state(null);
   // Measured menu size, used to keep the picker fully on-screen.
   let menuWidth = $state(0);
   let menuHeight = $state(0);
 
-  // Load users on mount
-  onMount(async () => {
-    await loadUsers();
+  // Editors keep the picker mounted while it is closed. Defer the user
+  // catalog until somebody actually types an @ mention; pages with several
+  // editors otherwise issue one identical roster request per editor.
+  $effect(() => {
+    const shouldLoad = open;
+    const requestedWorkspaceId = workspaceId;
+    if (shouldLoad) untrack(() => void loadUsers(requestedWorkspaceId));
   });
 
-  // Measure the rendered menu after each content change so the clamp below is
-  // accurate. The list height changes as results load and as the query narrows
-  // it, so re-run whenever those change. The picker is a transient popup, so a
-  // plain post-render measure is enough — no ResizeObserver needed.
+  // Re-measure after result changes so the transient menu clamp stays accurate.
   $effect(() => {
     if (!open || !containerElement) return;
     // Touch the reactive deps that change the menu's size.
@@ -48,21 +52,9 @@
     menuHeight = containerElement.offsetHeight;
   });
 
-  // Clamp the requested cursor position so the whole menu stays within the
-  // *visible* viewport, with a small margin from each edge (WI-431).
-  //
-  // Two things make the raw ProseMirror cursor coords unusable on mobile:
-  //  - On a narrow screen the cursor sits near the right edge, pushing a
-  //    fixed-position menu off the right side.
-  //  - When the on-screen keyboard is open the visible area shrinks, but
-  //    window.innerHeight stays the full window height. The mobile chat
-  //    composer is pinned to the bottom, so the cursor lands near the visible
-  //    bottom and an unclamped (or innerHeight-clamped) menu renders *behind
-  //    the keyboard* — invisible and unreachable. visualViewport reports the
-  //    real visible box (size + offset), so we clamp against that.
-  //
-  // The menu re-renders on every keystroke (position changes as you type), so
-  // reading the viewport at compute time is enough — no resize listeners.
+  // Clamp against visualViewport so narrow screens and mobile keyboards cannot
+  // place the fixed menu outside the visible viewport. Recompute while typing;
+  // no resize listener is needed.
   const EDGE_MARGIN = 8;
   const FALLBACK_W = 320; // .mention-picker max-width, before it is measured
   const FALLBACK_H = 300; // .mention-picker max-height, before it is measured
@@ -85,16 +77,8 @@
     };
   });
 
-  // Handle keyboard events using runed.
-  //
-  // Capture phase is required: the editor (ProseMirror) attaches its own
-  // bubble-phase keydown handler on its content element, which sits *below*
-  // document in the tree, so a bubble-phase document listener would fire
-  // last — after ProseMirror has already moved the cursor (Arrow keys) or
-  // inserted a newline (Enter). That cursor move then fires keyup ->
-  // checkForMentionTrigger, breaking the @-pattern and closing the picker.
-  // Capturing here lets us intercept and stopPropagation before ProseMirror
-  // ever sees these keys.
+  // Capture before ProseMirror handles arrows or Enter and invalidates the
+  // active @-pattern.
   useEventListener(
     () => document,
     'keydown',
@@ -102,16 +86,29 @@
     { capture: true }
   );
 
-  async function loadUsers() {
-    if (loading) return;
+  async function loadUsers(requestedWorkspaceId) {
+    const scopedWorkspaceId = requestedWorkspaceId || null;
+    if (users.length > 0 && loadedWorkspaceId === scopedWorkspaceId) return;
+
+    const request = ++loadRequest;
     try {
       loading = true;
-      users = await api.getUsers() || [];
+      const roster = scopedWorkspaceId
+        ? await api.getAssignableUsers(scopedWorkspaceId)
+        : await api.getUsers();
+      if (request !== loadRequest) return;
+
+      // The backend roster is shared with assignment and already enforces
+      // workspace access plus ready agent bindings.
+      users = roster || [];
+      loadedWorkspaceId = scopedWorkspaceId;
     } catch (err) {
+      if (request !== loadRequest) return;
+      if (err?.name === 'AbortError') return;
       console.error('Failed to load users:', err);
       users = [];
     } finally {
-      loading = false;
+      if (request === loadRequest) loading = false;
     }
   }
 
@@ -184,6 +181,7 @@
   <div
     bind:this={containerElement}
     class="mention-picker"
+    data-testid="mention-picker"
     style="top: {clampedPosition.y}px; left: {clampedPosition.x}px;"
     role="listbox"
     id={listboxId}
@@ -198,7 +196,9 @@
         <button
           type="button"
           class="mention-option"
+          data-testid="mention-option"
           class:highlighted={index === highlightedIndex}
+          onmousedown={(event) => event.preventDefault()}
           onclick={() => handleSelect(user)}
           onmouseenter={() => highlightedIndex = index}
           role="option"

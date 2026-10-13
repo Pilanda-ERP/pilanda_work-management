@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"windshift/internal/database"
@@ -12,6 +13,18 @@ import (
 
 type OnCallRepository struct {
 	db database.Database
+}
+
+// IncidentFilter limits incidents to teams and item workspaces visible to
+// the caller. AllTeams bypasses only the team filter. ItemID narrows to the
+// incidents of one work item.
+type IncidentFilter struct {
+	PolicyID     *int
+	Status       string
+	ItemID       *int
+	TeamIDs      []int
+	WorkspaceIDs []int
+	AllTeams     bool
 }
 
 func NewOnCallRepository(db database.Database) *OnCallRepository {
@@ -26,48 +39,55 @@ func nullTimePtr(n sql.NullTime) *time.Time {
 	return &n.Time
 }
 
-// incidentScanTargets holds nullable scan destinations for on-call incident queries.
-// Use scanArgs to get the targets for rows.Scan, then call populate to fill the model.
-type incidentScanTargets struct {
-	itemID             sql.NullInt64
-	acknowledgedAt     sql.NullTime
-	acknowledgedBy     sql.NullInt64
-	resolvedAt         sql.NullTime
-	resolvedBy         sql.NullInt64
-	policyName         sql.NullString
-	itemTitle          sql.NullString
-	acknowledgedByName sql.NullString
-	resolvedByName     sql.NullString
-}
+// incidentSelectBody is the shared projection for incident reads. It joins the
+// owning item so callers get title/key/workspace without a second query.
+const incidentSelectBody = `
+	SELECT inc.id, inc.item_id, inc.status, inc.urgency, inc.source,
+	       inc.escalation_policy_id, inc.triggered_at, inc.acknowledged_at, inc.acknowledged_by,
+	       inc.resolved_at, inc.resolved_by, inc.escalation_step, inc.escalation_repeat_count,
+	       inc.next_escalation_at, inc.created_at, inc.updated_at,
+	       COALESCE(p.name, '') AS policy_name,
+	       i.title AS item_title,
+	       w.key || '-' || i.workspace_item_number AS item_key,
+	       i.workspace_id, i.team_id, COALESCE(t.name, '') AS team_name,
+	       COALESCE(ack.first_name || ' ' || ack.last_name, '') AS acknowledged_by_name,
+	       COALESCE(res.first_name || ' ' || res.last_name, '') AS resolved_by_name
+	FROM incidents inc
+	JOIN items i ON i.id = inc.item_id
+	JOIN workspaces w ON w.id = i.workspace_id
+	LEFT JOIN teams t ON t.id = i.team_id
+	LEFT JOIN on_call_escalation_policies p ON p.id = inc.escalation_policy_id
+	LEFT JOIN users ack ON ack.id = inc.acknowledged_by
+	LEFT JOIN users res ON res.id = inc.resolved_by`
 
-// scanArgs returns scan destinations for the nullable incident columns.
-// The withNames parameter controls whether acknowledged_by_name and resolved_by_name
-// are included (used by GetIncidentByID but not GetActiveIncidents).
-func (t *incidentScanTargets) scanArgs(inc *models.OnCallIncident, withNames bool) []any {
-	args := []any{
-		&inc.ID, &inc.EscalationPolicyID, &t.itemID, &inc.Status,
-		&inc.TriggeredAt, &t.acknowledgedAt, &t.acknowledgedBy,
-		&t.resolvedAt, &t.resolvedBy,
-		&inc.CurrentEscalationStep, &inc.EscalationRepeatCount, &inc.CreatedAt,
-		&t.policyName, &t.itemTitle,
+// scanIncident scans one row of incidentSelectBody.
+func scanIncident(scanner rowScanner) (models.Incident, error) {
+	var inc models.Incident
+	var escalationPolicyID, acknowledgedBy, resolvedBy, teamID sql.NullInt64
+	var acknowledgedAt, resolvedAt, nextEscalationAt sql.NullTime
+	var acknowledgedByName, resolvedByName sql.NullString
+	err := scanner.Scan(
+		&inc.ID, &inc.ItemID, &inc.Status, &inc.Urgency, &inc.Source,
+		&escalationPolicyID, &inc.TriggeredAt, &acknowledgedAt, &acknowledgedBy,
+		&resolvedAt, &resolvedBy, &inc.EscalationStep, &inc.EscalationRepeatCount,
+		&nextEscalationAt, &inc.CreatedAt, &inc.UpdatedAt,
+		&inc.PolicyName, &inc.ItemTitle, &inc.ItemKey,
+		&inc.WorkspaceID, &teamID, &inc.TeamName,
+		&acknowledgedByName, &resolvedByName,
+	)
+	if err != nil {
+		return models.Incident{}, err
 	}
-	if withNames {
-		args = append(args, &t.acknowledgedByName, &t.resolvedByName)
-	}
-	return args
-}
-
-// populate assigns the scanned nullable values into the incident model fields.
-func (t *incidentScanTargets) populate(inc *models.OnCallIncident) {
-	inc.ItemID = nullIntPtr(t.itemID)
-	inc.AcknowledgedAt = nullTimePtr(t.acknowledgedAt)
-	inc.AcknowledgedBy = nullIntPtr(t.acknowledgedBy)
-	inc.ResolvedAt = nullTimePtr(t.resolvedAt)
-	inc.ResolvedBy = nullIntPtr(t.resolvedBy)
-	inc.PolicyName = t.policyName.String
-	inc.ItemTitle = t.itemTitle.String
-	inc.AcknowledgedByName = t.acknowledgedByName.String
-	inc.ResolvedByName = t.resolvedByName.String
+	inc.EscalationPolicyID = nullIntPtr(escalationPolicyID)
+	inc.AcknowledgedAt = nullTimePtr(acknowledgedAt)
+	inc.AcknowledgedBy = nullIntPtr(acknowledgedBy)
+	inc.ResolvedAt = nullTimePtr(resolvedAt)
+	inc.ResolvedBy = nullIntPtr(resolvedBy)
+	inc.NextEscalationAt = nullTimePtr(nextEscalationAt)
+	inc.TeamID = nullIntPtr(teamID)
+	inc.AcknowledgedByName = acknowledgedByName.String
+	inc.ResolvedByName = resolvedByName.String
+	return inc, nil
 }
 
 // swapRequestScanTargets holds nullable scan destinations for swap request queries.
@@ -144,7 +164,7 @@ func (r *OnCallRepository) GetScheduleByID(id int) (*models.OnCallSchedule, erro
 	return &s, nil
 }
 
-func (r *OnCallRepository) ListSchedulesForTeam(teamID int) ([]models.OnCallSchedule, error) {
+func (r *OnCallRepository) ListSchedulesForTeam(teamID int, includeRoster bool) ([]models.OnCallSchedule, error) {
 	rows, err := r.db.Query(`
 		SELECT s.id, s.team_id, s.name, s.description, s.timezone, s.is_active,
 			s.created_by, s.created_at, s.updated_at,
@@ -157,7 +177,6 @@ func (r *OnCallRepository) ListSchedulesForTeam(teamID int) ([]models.OnCallSche
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var schedules []models.OnCallSchedule
 	for rows.Next() {
@@ -171,14 +190,163 @@ func (r *OnCallRepository) ListSchedulesForTeam(teamID int) ([]models.OnCallSche
 			&createdByName,
 		)
 		if err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 
 		s.CreatedBy = nullIntPtr(createdBy)
 		s.CreatedByName = createdByName.String
+		s.Layers = []models.OnCallScheduleLayer{}
+		s.Overrides = []models.OnCallScheduleOverride{}
 		schedules = append(schedules, s)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(schedules) == 0 {
+		return schedules, nil
+	}
+
+	return r.hydrateSchedulesForTeam(teamID, schedules, includeRoster)
+}
+
+// hydrateSchedulesForTeam fills every schedule's layers. Authorized roster
+// views also receive members and active overrides in two additional queries.
+func (r *OnCallRepository) hydrateSchedulesForTeam(teamID int, schedules []models.OnCallSchedule, includeRoster bool) ([]models.OnCallSchedule, error) {
+	scheduleIndexes := make(map[int]int, len(schedules))
+	for i := range schedules {
+		scheduleIndexes[schedules[i].ID] = i
+	}
+
+	layerRows, err := r.db.Query(`
+		SELECT l.id, l.schedule_id, l.name, l.priority, l.rotation_type,
+		       l.rotation_interval_days, l.handoff_time, l.start_date, l.end_date,
+		       l.created_at, l.updated_at
+		FROM on_call_schedule_layers l
+		JOIN on_call_schedules s ON s.id = l.schedule_id
+		WHERE s.team_id = ?
+		ORDER BY l.schedule_id, l.priority
+	`, teamID)
+	if err != nil {
+		return nil, err
+	}
+	type layerLocation struct {
+		schedule int
+		layer    int
+	}
+	layerIndexes := make(map[int]layerLocation)
+	for layerRows.Next() {
+		var layer models.OnCallScheduleLayer
+		var endDate sql.NullString
+		if err := layerRows.Scan(
+			&layer.ID, &layer.ScheduleID, &layer.Name, &layer.Priority, &layer.RotationType,
+			&layer.RotationIntervalDays, &layer.HandoffTime, &layer.StartDate, &endDate,
+			&layer.CreatedAt, &layer.UpdatedAt,
+		); err != nil {
+			_ = layerRows.Close()
+			return nil, err
+		}
+		if endDate.Valid {
+			layer.EndDate = &endDate.String
+		}
+		layer.Members = []models.OnCallScheduleLayerMember{}
+		scheduleIndex, ok := scheduleIndexes[layer.ScheduleID]
+		if !ok {
+			continue
+		}
+		layerIndex := len(schedules[scheduleIndex].Layers)
+		schedules[scheduleIndex].Layers = append(schedules[scheduleIndex].Layers, layer)
+		layerIndexes[layer.ID] = layerLocation{schedule: scheduleIndex, layer: layerIndex}
+	}
+	if err := layerRows.Err(); err != nil {
+		_ = layerRows.Close()
+		return nil, err
+	}
+	if err := layerRows.Close(); err != nil {
+		return nil, err
+	}
+	if !includeRoster {
+		return schedules, nil
+	}
+
+	memberRows, err := r.db.Query(`
+		SELECT m.id, m.layer_id, m.user_id, m.position, m.created_at,
+		       u.first_name || ' ' || u.last_name AS user_name,
+		       u.email, COALESCE(u.avatar_url, '') AS avatar_url
+		FROM on_call_schedule_layer_members m
+		JOIN on_call_schedule_layers l ON l.id = m.layer_id
+		JOIN on_call_schedules s ON s.id = l.schedule_id
+		JOIN users u ON u.id = m.user_id
+		WHERE s.team_id = ?
+		ORDER BY l.schedule_id, l.priority, m.position
+	`, teamID)
+	if err != nil {
+		return nil, err
+	}
+	for memberRows.Next() {
+		var member models.OnCallScheduleLayerMember
+		if err := memberRows.Scan(
+			&member.ID, &member.LayerID, &member.UserID, &member.Position, &member.CreatedAt,
+			&member.UserName, &member.UserEmail, &member.UserAvatarURL,
+		); err != nil {
+			_ = memberRows.Close()
+			return nil, err
+		}
+		location, ok := layerIndexes[member.LayerID]
+		if !ok {
+			continue
+		}
+		layer := &schedules[location.schedule].Layers[location.layer]
+		layer.Members = append(layer.Members, member)
+	}
+	if err := memberRows.Err(); err != nil {
+		_ = memberRows.Close()
+		return nil, err
+	}
+	if err := memberRows.Close(); err != nil {
+		return nil, err
+	}
+
+	overrideRows, err := r.db.Query(`
+		SELECT o.id, o.schedule_id, o.user_id, o.override_user_id,
+		       o.start_time, o.end_time, o.reason, o.created_by, o.created_at,
+		       u.first_name || ' ' || u.last_name AS user_name,
+		       ou.first_name || ' ' || ou.last_name AS override_user_name,
+		       cb.first_name || ' ' || cb.last_name AS created_by_name
+		FROM on_call_schedule_overrides o
+		JOIN on_call_schedules s ON s.id = o.schedule_id
+		JOIN users u ON u.id = o.user_id
+		JOIN users ou ON ou.id = o.override_user_id
+		LEFT JOIN users cb ON cb.id = o.created_by
+		WHERE s.team_id = ? AND o.end_time > ?
+		ORDER BY o.schedule_id, o.start_time
+	`, teamID, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	defer overrideRows.Close()
+	for overrideRows.Next() {
+		var override models.OnCallScheduleOverride
+		var createdBy sql.NullInt64
+		var createdByName sql.NullString
+		if err := overrideRows.Scan(
+			&override.ID, &override.ScheduleID, &override.UserID, &override.OverrideUserID,
+			&override.StartTime, &override.EndTime, &override.Reason, &createdBy, &override.CreatedAt,
+			&override.UserName, &override.OverrideUserName, &createdByName,
+		); err != nil {
+			return nil, err
+		}
+		override.CreatedBy = nullIntPtr(createdBy)
+		override.CreatedByName = createdByName.String
+		if scheduleIndex, ok := scheduleIndexes[override.ScheduleID]; ok {
+			schedules[scheduleIndex].Overrides = append(schedules[scheduleIndex].Overrides, override)
+		}
+	}
+	if err := overrideRows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -258,6 +426,34 @@ func (r *OnCallRepository) GetLayersForSchedule(scheduleID int) ([]models.OnCall
 	}
 
 	return layers, nil
+}
+
+// GetLayerByID returns a single rotation layer (without members). Used by the
+// mutation handlers to verify the layer belongs to the authorized schedule
+// before acting on it.
+func (r *OnCallRepository) GetLayerByID(id int) (*models.OnCallScheduleLayer, error) {
+	var l models.OnCallScheduleLayer
+	var endDate sql.NullString
+	err := r.db.QueryRow(`
+		SELECT id, schedule_id, name, priority, rotation_type, rotation_interval_days,
+			handoff_time, start_date, end_date, created_at, updated_at
+		FROM on_call_schedule_layers
+		WHERE id = ?
+	`, id).Scan(
+		&l.ID, &l.ScheduleID, &l.Name, &l.Priority, &l.RotationType,
+		&l.RotationIntervalDays, &l.HandoffTime, &l.StartDate, &endDate,
+		&l.CreatedAt, &l.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if endDate.Valid {
+		l.EndDate = &endDate.String
+	}
+	return &l, nil
 }
 
 func (r *OnCallRepository) AddLayer(scheduleID int, name string, priority int, rotationType string, intervalDays int, handoffTime, startDate string, endDate *string) (int, error) {
@@ -476,6 +672,23 @@ func (r *OnCallRepository) GetPolicyByID(id int) (*models.OnCallEscalationPolicy
 	p.Rules = rules
 
 	return &p, nil
+}
+
+// GetActivePolicyForTeam returns the team's active escalation policy, if any.
+func (r *OnCallRepository) GetActivePolicyForTeam(teamID int) (*models.OnCallEscalationPolicy, error) {
+	var id int
+	err := r.db.QueryRow(`
+		SELECT id FROM on_call_escalation_policies
+		WHERE team_id = ? AND is_active = true
+		ORDER BY id LIMIT 1
+	`, teamID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.GetPolicyByID(id)
 }
 
 func (r *OnCallRepository) ListPoliciesForTeam(teamID int) ([]models.OnCallEscalationPolicy, error) {
@@ -699,73 +912,330 @@ func (r *OnCallRepository) UpdateSwapRequestStatus(id int, status string) error 
 
 // Incidents
 
-func (r *OnCallRepository) GetIncidentByID(id int) (*models.OnCallIncident, error) {
-	var inc models.OnCallIncident
-	var t incidentScanTargets
-
-	err := r.db.QueryRow(`
-		SELECT i.id, i.escalation_policy_id, i.item_id, i.status,
-			i.triggered_at, i.acknowledged_at, i.acknowledged_by,
-			i.resolved_at, i.resolved_by,
-			i.current_escalation_step, i.escalation_repeat_count, i.created_at,
-			p.name as policy_name,
-			it.title as item_title,
-			ack.first_name || ' ' || ack.last_name as acknowledged_by_name,
-			res.first_name || ' ' || res.last_name as resolved_by_name
-		FROM on_call_incidents i
-		LEFT JOIN on_call_escalation_policies p ON p.id = i.escalation_policy_id
-		LEFT JOIN items it ON it.id = i.item_id
-		LEFT JOIN users ack ON ack.id = i.acknowledged_by
-		LEFT JOIN users res ON res.id = i.resolved_by
-		WHERE i.id = ?
-	`, id).Scan(t.scanArgs(&inc, true)...)
+// GetIncidentByID loads one incident with its item and policy context.
+func (r *OnCallRepository) GetIncidentByID(id int) (*models.Incident, error) {
+	inc, err := scanIncident(r.db.QueryRow(incidentSelectBody+" WHERE inc.id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-
-	t.populate(&inc)
 	return &inc, nil
 }
 
-func (r *OnCallRepository) UpdateIncident(id int, status string, acknowledgedAt *time.Time, acknowledgedBy *int, resolvedAt *time.Time, resolvedBy *int, step, repeatCount int) error {
-	_, err := r.db.ExecWrite(`
-		UPDATE on_call_incidents
-		SET status = ?, acknowledged_at = ?, acknowledged_by = ?,
-			resolved_at = ?, resolved_by = ?,
-			current_escalation_step = ?, escalation_repeat_count = ?
-		WHERE id = ?
-	`, status, acknowledgedAt, acknowledgedBy, resolvedAt, resolvedBy, step, repeatCount, id)
+// GetIncidentForItem returns the incident the item currently points at.
+func (r *OnCallRepository) GetIncidentForItem(itemID int) (*models.Incident, error) {
+	inc, err := scanIncident(r.db.QueryRow(
+		incidentSelectBody+" WHERE i.id = ? AND i.incident_id = inc.id", itemID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &inc, nil
+}
+
+// CreateIncident inserts the incident and points the item at it atomically.
+// A partial unique index rejects a second open incident for the same item.
+func (r *OnCallRepository) CreateIncident(itemID int, policyID *int, urgency, source string) (int, error) {
+	var incidentID int
+	err := database.WithTx(r.db, func(tx database.Tx) error {
+		if err := tx.QueryRow(`
+			INSERT INTO incidents (item_id, status, urgency, source, escalation_policy_id, triggered_at, created_at, updated_at)
+			VALUES (?, 'triggered', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			RETURNING id
+		`, itemID, urgency, source, policyID).Scan(&incidentID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(
+			`UPDATE items SET incident_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			incidentID, itemID,
+		)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return incidentID, nil
+}
+
+// AcknowledgeIncident records the ack handshake and stops escalation. The
+// update is conditional so a resolve that commits first wins; the returned
+// count reports whether the ack landed.
+func (r *OnCallRepository) AcknowledgeIncident(id, userID int, now time.Time) (int64, error) {
+	res, err := r.db.ExecWrite(`
+		UPDATE incidents
+		SET status = 'acknowledged', acknowledged_at = ?, acknowledged_by = ?,
+			next_escalation_at = NULL, updated_at = ?
+		WHERE id = ? AND status != 'resolved'
+	`, now, userID, now, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// UnacknowledgeIncident returns an acknowledged incident to the triggered
+// state. Only an acknowledged incident can be unacknowledged; the returned
+// count reports whether the transition happened.
+func (r *OnCallRepository) UnacknowledgeIncident(id int, now time.Time) (int64, error) {
+	res, err := r.db.ExecWrite(`
+		UPDATE incidents
+		SET status = 'triggered', acknowledged_at = NULL, acknowledged_by = NULL,
+			resolved_at = NULL, resolved_by = NULL, updated_at = ?
+		WHERE id = ? AND status = 'acknowledged'
+	`, now, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ResolveIncident ends the incident and releases the item pointer in one
+// transaction, so readers never see a resolved incident as the item's current
+// one. The returned count reports whether the resolve landed; resolving an
+// already-resolved incident affects zero rows.
+func (r *OnCallRepository) ResolveIncident(id, userID int, now time.Time) (int64, error) {
+	var affected int64
+	err := database.WithTx(r.db, func(tx database.Tx) error {
+		res, err := tx.Exec(`
+			UPDATE incidents
+			SET status = 'resolved', resolved_at = ?, resolved_by = ?,
+				next_escalation_at = NULL, updated_at = ?
+			WHERE id = ? AND status != 'resolved'
+		`, now, userID, now, id)
+		if err != nil {
+			return err
+		}
+		affected, err = res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return nil
+		}
+		_, err = tx.Exec(
+			`UPDATE items SET incident_id = NULL, updated_at = ? WHERE incident_id = ?`,
+			now, id,
+		)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
+// SetIncidentEscalation persists the engine cursor: the current step, the
+// repeat count, and the next escalation deadline (nil when exhausted). The
+// update only applies while the incident is still triggered, so an
+// acknowledge that commits between the read and the write keeps its cleared
+// deadline; the returned count reports whether the write landed.
+func (r *OnCallRepository) SetIncidentEscalation(id, step, repeatCount int, next *time.Time) (int64, error) {
+	res, err := r.db.ExecWrite(`
+		UPDATE incidents
+		SET escalation_step = ?, escalation_repeat_count = ?, next_escalation_at = ?,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND status = 'triggered'
+	`, step, repeatCount, next, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// FindDueIncidentIDs returns triggered incidents whose escalation deadline has
+// passed, oldest first.
+func (r *OnCallRepository) FindDueIncidentIDs(now time.Time, limit int) ([]int, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.db.Query(`
+		SELECT id FROM incidents
+		WHERE status = 'triggered' AND next_escalation_at IS NOT NULL AND next_escalation_at <= ?
+		ORDER BY next_escalation_at
+		LIMIT ?
+	`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make([]int, 0, limit)
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// DeleteIncidentNotificationStates clears every pending scheduled notification
+// for an incident. Called when the incident is acked/resolved or escalates.
+func (r *OnCallRepository) DeleteIncidentNotificationStates(incidentID int) error {
+	_, err := r.db.ExecWrite(`DELETE FROM incident_notification_state WHERE incident_id = ?`, incidentID)
 	return err
 }
 
-func (r *OnCallRepository) GetActiveIncidents(policyID *int, status string) ([]models.OnCallIncident, error) {
-	query := `
-		SELECT i.id, i.escalation_policy_id, i.item_id, i.status,
-			i.triggered_at, i.acknowledged_at, i.acknowledged_by,
-			i.resolved_at, i.resolved_by,
-			i.current_escalation_step, i.escalation_repeat_count, i.created_at,
-			p.name as policy_name,
-			it.title as item_title
-		FROM on_call_incidents i
-		LEFT JOIN on_call_escalation_policies p ON p.id = i.escalation_policy_id
-		LEFT JOIN items it ON it.id = i.item_id
-		WHERE 1=1
-	`
-	args := []interface{}{}
+// CreateIncidentNotificationState schedules one delayed/repeated notification.
+func (r *OnCallRepository) CreateIncidentNotificationState(incidentID, escalationRuleID, notificationRuleID, repeatIndex int, nextAt time.Time) error {
+	_, err := r.db.ExecWrite(`
+		INSERT INTO incident_notification_state
+			(incident_id, escalation_rule_id, notification_rule_id, repeat_index, next_notification_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	`, incidentID, escalationRuleID, notificationRuleID, repeatIndex, nextAt)
+	return err
+}
 
-	if policyID != nil {
-		query += " AND i.escalation_policy_id = ?"
-		args = append(args, *policyID)
+// FindDueNotificationStateIDs returns scheduled notification rows due now.
+func (r *OnCallRepository) FindDueNotificationStateIDs(now time.Time, limit int) ([]int, error) {
+	if limit <= 0 {
+		limit = 50
 	}
-	if status != "" {
-		query += " AND i.status = ?"
-		args = append(args, status)
+	rows, err := r.db.Query(`
+		SELECT id FROM incident_notification_state
+		WHERE next_notification_at <= ?
+		ORDER BY next_notification_at
+		LIMIT ?
+	`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make([]int, 0, limit)
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// GetNotificationState loads a scheduled notification row.
+func (r *OnCallRepository) GetNotificationState(id int) (*models.IncidentNotificationState, error) {
+	var state models.IncidentNotificationState
+	err := r.db.QueryRow(`
+		SELECT id, incident_id, escalation_rule_id, notification_rule_id, repeat_index,
+		       next_notification_at, created_at, updated_at
+		FROM incident_notification_state WHERE id = ?
+	`, id).Scan(
+		&state.ID, &state.IncidentID, &state.EscalationRuleID, &state.NotificationRuleID,
+		&state.RepeatIndex, &state.NextNotificationAt, &state.CreatedAt, &state.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+// AdvanceNotificationState moves a scheduled notification to its next repeat,
+// or deletes it when the chain is finished.
+func (r *OnCallRepository) AdvanceNotificationState(id, nextRepeatIndex int, nextAt *time.Time) error {
+	if nextAt == nil {
+		return r.DeleteNotificationState(id)
+	}
+	_, err := r.db.ExecWrite(`
+		UPDATE incident_notification_state
+		SET repeat_index = ?, next_notification_at = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, nextRepeatIndex, *nextAt, id)
+	return err
+}
+
+// DeleteNotificationState removes a completed scheduled notification.
+func (r *OnCallRepository) DeleteNotificationState(id int) error {
+	_, err := r.db.ExecWrite(`DELETE FROM incident_notification_state WHERE id = ?`, id)
+	return err
+}
+
+// GetNotificationRuleByID loads one notification rule.
+func (r *OnCallRepository) GetNotificationRuleByID(id int) (*models.OnCallNotificationRule, error) {
+	var rule models.OnCallNotificationRule
+	var repeatInterval sql.NullInt64
+	err := r.db.QueryRow(`
+		SELECT id, escalation_rule_id, notification_type, delay_minutes,
+		       repeat_interval_minutes, repeat_count, created_at
+		FROM on_call_notification_rules WHERE id = ?
+	`, id).Scan(
+		&rule.ID, &rule.EscalationRuleID, &rule.NotificationType, &rule.DelayMinutes,
+		&repeatInterval, &rule.RepeatCount, &rule.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	rule.RepeatIntervalMinutes = nullIntPtr(repeatInterval)
+	return &rule, nil
+}
+
+// GetEscalationRuleByID loads one escalation rule.
+func (r *OnCallRepository) GetEscalationRuleByID(id int) (*models.OnCallEscalationRule, error) {
+	var rule models.OnCallEscalationRule
+	err := r.db.QueryRow(`
+		SELECT id, policy_id, step_order, escalation_delay_minutes, target_type, target_id, created_at
+		FROM on_call_escalation_rules WHERE id = ?
+	`, id).Scan(
+		&rule.ID, &rule.PolicyID, &rule.StepOrder, &rule.EscalationDelayMinutes,
+		&rule.TargetType, &rule.TargetID, &rule.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rule, nil
+}
+
+// ListIncidents returns incidents for the caller's teams/workspaces.
+func (r *OnCallRepository) ListIncidents(filter IncidentFilter) ([]models.Incident, error) {
+	if !filter.AllTeams && len(filter.TeamIDs) == 0 {
+		return []models.Incident{}, nil
 	}
 
-	query += " ORDER BY i.triggered_at DESC"
+	query := incidentSelectBody + " WHERE 1=1"
+	args := []any{}
+
+	if filter.PolicyID != nil {
+		query += " AND inc.escalation_policy_id = ?"
+		args = append(args, *filter.PolicyID)
+	}
+	if filter.Status != "" {
+		query += " AND inc.status = ?"
+		args = append(args, filter.Status)
+	}
+	if filter.ItemID != nil {
+		query += " AND inc.item_id = ?"
+		args = append(args, *filter.ItemID)
+	}
+	if !filter.AllTeams {
+		query += " AND i.team_id IN (" + strings.TrimSuffix(strings.Repeat("?,", len(filter.TeamIDs)), ",") + ")"
+		for _, teamID := range filter.TeamIDs {
+			args = append(args, teamID)
+		}
+	}
+	if len(filter.WorkspaceIDs) == 0 {
+		return []models.Incident{}, nil
+	}
+	query += " AND i.workspace_id IN (" + strings.TrimSuffix(strings.Repeat("?,", len(filter.WorkspaceIDs)), ",") + ")"
+	for _, workspaceID := range filter.WorkspaceIDs {
+		args = append(args, workspaceID)
+	}
+
+	query += " ORDER BY inc.triggered_at DESC, inc.id DESC"
 
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
@@ -773,22 +1243,16 @@ func (r *OnCallRepository) GetActiveIncidents(policyID *int, status string) ([]m
 	}
 	defer rows.Close()
 
-	var incidents []models.OnCallIncident
+	incidents := []models.Incident{}
 	for rows.Next() {
-		var inc models.OnCallIncident
-		var t incidentScanTargets
-
-		err := rows.Scan(t.scanArgs(&inc, false)...)
+		inc, err := scanIncident(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		t.populate(&inc)
 		incidents = append(incidents, inc)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-
 	return incidents, nil
 }

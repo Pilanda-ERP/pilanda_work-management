@@ -4,27 +4,35 @@
   import { writable } from 'svelte/store';
   import { confirm } from '../../composables/useConfirm.js';
   import { IconX, IconPackage, IconFileText, IconPlayerPlay } from '@tabler/icons-svelte-runes';
-  import { escapeHtml } from '../../utils/sanitize.ts';
   import { navigate } from '../../router.js';
   import Button from '../../components/Button.svelte';
-  import PageHeader from '../../layout/PageHeader.svelte';
   import Input from '../../components/Input.svelte';
   import Textarea from '../../components/Textarea.svelte';
   import MilestoneCombobox from '../../pickers/MilestoneCombobox.svelte';
   import Modal from '../../dialogs/Modal.svelte';
-  import Label from '../../components/Label.svelte';
   import FormField from '../../components/FormField.svelte';
   import DataTable from '../../components/DataTable.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
+  import Panel from '../../components/Panel.svelte';
+  import Badge from '../../components/Badge.svelte';
+  import Lozenge from '../../components/Lozenge.svelte';
+  import ModalHeader from '../../dialogs/ModalHeader.svelte';
+  import DialogFooter from '../../dialogs/DialogFooter.svelte';
   import TestCasePicker from '../../pickers/TestCasePicker.svelte';
-  import { renderStatusBadge, renderMilestoneBadge } from '../../utils/statusColors.js';
+  import { getStatusLabel, getTestStatusColor } from '../../utils/statusColors.js';
   import { t } from '../../stores/i18n.svelte.js';
+  import { workspacePermissions } from '../../stores/index.js';
   import { errorToast, successToast } from '../../stores/toasts.svelte.js';
-  import { useEventListener } from 'runed';
   import DescriptionText from '../../components/DescriptionText.svelte';
   import { formatDateSimple } from '../../utils/dateFormatter.js';
+  import TestManagementHeader from './TestManagementHeader.svelte';
 
-  let { workspaceId = null } = $props();
+  let { workspaceId = null, testSetId = null } = $props();
+
+  // Set mutations require test.manage; starting a run creates one, which
+  // requires test.execute (both denied server-side with 404 otherwise).
+  let canManageTests = $derived(workspacePermissions.canManageTests(workspaceId));
+  let canExecuteTests = $derived(workspacePermissions.canExecuteTests(workspaceId));
 
   const testSets = writable([]);
   const selectedSet = writable(null);
@@ -77,7 +85,7 @@
     try {
       const { description } = await api.ai.summarizeTestPlanDescription(set.id);
       const next = description ?? '';
-      await api.tests.testSets.update(workspaceId, set.id, {
+      await api.tests.testPlans.update(workspaceId, set.id, {
         name: set.name,
         description: next,
         milestone_id: set.milestone_id,
@@ -94,26 +102,22 @@
 
   onMount(async () => {
     await loadData();
-
-    // Check for URL parameters
-    const urlParams = new URLSearchParams(window.location.search);
-    const milestoneParam = urlParams.get('milestone');
-    if (milestoneParam) {
-      selectedMilestoneFilter = parseInt(milestoneParam);
+    if (testSetId) {
+      const directSet = $testSets.find((set) => String(set.id) === String(testSetId));
+      if (directSet) await manageSetTests(directSet);
     }
   });
 
-  useEventListener(() => document, 'keydown', (e) => {
-    if ((/** @type {HTMLElement} */ (e.target)).tagName === 'INPUT' || (/** @type {HTMLElement} */ (e.target)).tagName === 'TEXTAREA' || (/** @type {HTMLElement} */ (e.target)).tagName === 'SELECT') return;
-    if (e.key === 'a' || e.key === 'A') { e.preventDefault(); showAddForm(); }
-  });
-  useEventListener(() => window, 'trigger-test-plan-form', () => showAddForm());
+  function closeTestCaseSelector() {
+    showTestCaseSelector = false;
+    if (testSetId) navigate(testPath('/sets'));
+  }
 
   async function loadData() {
     try {
       const [sets, milestonesData] = await Promise.all([
-        api.tests.testSets.getAll(workspaceId),
-        api.milestones.getAll() // Get all milestones
+        api.tests.testPlans.getAll(workspaceId, { page_size: 200 }),
+        api.milestones.getAll({ workspace_id: workspaceId })
       ]);
       testSets.set(sets || []);
       milestones.set(milestonesData || []);
@@ -123,6 +127,7 @@
   }
 
   function showAddForm() {
+    if (!canManageTests) return;
     showForm = true;
     editingSet = null;
     formData = {
@@ -152,9 +157,9 @@
       const data = { ...formData };
 
       if (editingSet) {
-        await api.tests.testSets.update(workspaceId, editingSet.id, data);
+        await api.tests.testPlans.update(workspaceId, editingSet.id, data);
       } else {
-        await api.tests.testSets.create(workspaceId, data);
+        await api.tests.testPlans.create(workspaceId, data);
       }
       await loadData();
       showForm = false;
@@ -170,7 +175,7 @@
       // Create a test run for this plan
       const runName = `${$selectedSet.name} - ${formatDateSimple(new Date())}`;
       const newRun = await api.tests.testRuns.create(workspaceId, {
-        set_id: $selectedSet.id,
+        plan_id: $selectedSet.id,
         name: runName
       });
 
@@ -192,7 +197,7 @@
     });
     if (!ok) return;
     try {
-      await api.tests.testSets.delete(workspaceId, id);
+      await api.tests.testPlans.delete(workspaceId, id);
       await loadData();
     } catch (error) {
       console.error('Failed to delete test plan:', error);
@@ -207,7 +212,7 @@
 
   async function loadSetTestCases(setId) {
     try {
-      const cases = await api.tests.testSets.getTestCases(workspaceId, setId);
+      const cases = await api.tests.testPlans.getTestCases(workspaceId, setId);
       setTestCases = cases || [];
     } catch (error) {
       console.error('Failed to load set test cases:', error);
@@ -218,7 +223,7 @@
     if (!testCase || !testCase.id) return;
 
     try {
-      await api.tests.testSets.addTestCase(workspaceId, $selectedSet.id, testCase.id);
+      await api.tests.testPlans.addTestCase(workspaceId, $selectedSet.id, testCase.id);
       await loadSetTestCases($selectedSet.id);
     } catch (error) {
       console.error('Failed to add test case to set:', error);
@@ -228,7 +233,7 @@
 
   async function removeTestCaseFromSet(testCaseId) {
     try {
-      await api.tests.testSets.removeTestCase(workspaceId, $selectedSet.id, testCaseId);
+      await api.tests.testPlans.removeTestCase(workspaceId, $selectedSet.id, testCaseId);
       await loadSetTestCases($selectedSet.id);
     } catch (error) {
       console.error('Failed to remove test case from set:', error);
@@ -240,80 +245,28 @@
     ? $testSets.filter(set => set.milestone_id === selectedMilestoneFilter)
     : $testSets);
 
-  // Handle milestone selection and update URL
-  function handleMilestoneSelect(result) {
-    selectedMilestoneFilter = result.value;
-    updateURL();
-  }
-
-  function updateURL() {
-    const url = new URL(window.location.href);
-    if (selectedMilestoneFilter) {
-      url.searchParams.set('milestone', selectedMilestoneFilter.toString());
-    } else {
-      url.searchParams.delete('milestone');
-    }
-    window.history.replaceState({}, '', url);
-  }
-
   const workspaceTestBase = $derived.by(() => workspaceId ? `/workspaces/${workspaceId}/tests` : '/workspaces');
   const testSetColumns = $derived.by(() => [
     { key: 'id', label: t('common.id'), width: 'w-16' },
-    {
-      key: 'name',
-      label: t('common.name'),
-      html: true,
-      render: (set) => {
-        const description = set.description ? `<div class="text-xs mt-1" style="color: var(--ds-text-subtle);">${escapeHtml(set.description)}</div>` : '';
-        return `<div class="font-medium" style="color: var(--ds-text);">${escapeHtml(set.name)}</div>${description}`;
-      }
-    },
-    {
-      key: 'milestone',
-      label: t('milestones.milestone'),
-      html: true,
-      render: (set) => renderMilestoneBadge(set.milestone_name)
-    },
+    { key: 'name', label: t('common.name'), slot: 'nameCell' },
+    { key: 'milestone', label: t('milestones.milestone'), width: 'w-40', slot: 'milestoneCell' },
     {
       key: 'test_case_count',
       label: t('testing.testCases'),
-      html: true,
-      render: (set) => {
-        const count = set.test_case_count || 0;
-        return `<span style="color: var(--ds-text);">${count}</span>`;
-      }
+      width: 'w-24',
+      render: (set) => String(set.test_case_count || 0)
     },
-    {
-      key: 'total_runs',
-      label: t('testing.testRuns'),
-      html: true,
-      render: (set) => {
-        const total = set.total_runs || 0;
-        const success = set.successful_runs || 0;
-        const failed = set.failed_runs || 0;
-        const summary = total > 0
-          ? `<div class="text-xs"><span style="color: var(--ds-text-success);">${success} ✓</span>${failed > 0 ? `<span style="color: var(--ds-text-danger);" class="ml-1">${failed} ✗</span>` : ''}</div>`
-          : '';
-        return `<div class="flex items-center space-x-2"><span class="font-medium" style="color: var(--ds-text);">${total} ${t('common.total').toLowerCase()}</span>${summary}</div>`;
-      }
-    },
-    {
-      key: 'last_run_status',
-      label: t('testing.lastRun'),
-      html: true,
-      render: (set) => {
-        if (!set.last_run_status) return `<span style="color: var(--ds-text-subtle);">${t('testing.neverRun')}</span>`;
-        const datePart = set.last_run_date ? `<span class="text-xs mt-1" style="color: var(--ds-text-subtle);">${formatDateSimple(set.last_run_date)}</span>` : '';
-        return `<div class="flex flex-col">${renderStatusBadge(set.last_run_status)}${datePart}</div>`;
-      }
-    },
+    { key: 'total_runs', label: t('testing.testRuns'), width: 'w-32', slot: 'runsCell' },
+    { key: 'last_run_status', label: t('testing.lastRun'), width: 'w-36', slot: 'lastRunCell' },
     { key: 'actions', label: t('common.actions'), width: 'w-24', align: 'text-right' }
   ]);
 
   function testSetActions(set) {
+    if (!canManageTests) return [];
     return [
       {
         id: 'manage-tests',
+        testid: `test-set-manage-${set.id}`,
         title: t('testing.tests'),
         onClick: () => manageSetTests(set)
       },
@@ -332,31 +285,29 @@
   }
 </script>
 
-<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface-raised);">
-  <PageHeader
+<div class="min-h-screen flex flex-col p-6" style="background-color: var(--ds-surface);">
+  <TestManagementHeader
+    {workspaceId}
     title={t('testing.testPlans')}
     subtitle={t('testing.testPlansSubtitle')}
+    bind:milestoneFilter={selectedMilestoneFilter}
+    oncreate={showAddForm}
+    createEvent="trigger-test-plan-form"
   >
-    {#snippet actions()}
-      <div class="flex items-center gap-3">
-        <div class="w-48">
-          <MilestoneCombobox
-            bind:value={selectedMilestoneFilter}
-            placeholder={t('milestones.allMilestones')}
-            onSelect={handleMilestoneSelect}
-          />
-        </div>
+    {#snippet primaryAction()}
+      {#if canManageTests}
         <Button
           onclick={showAddForm}
           variant="primary"
           size="medium"
           keyboardHint="A"
+          dataTestid="test-set-create-button"
         >
           {t('testing.addTestPlan')}
         </Button>
-      </div>
+      {/if}
     {/snippet}
-  </PageHeader>
+  </TestManagementHeader>
 
   <!-- Add/Edit Test Plan Modal -->
   <Modal
@@ -367,20 +318,18 @@
     onclose={() => showForm = false}
   >
     {#snippet children(submitHint)}
-    <div class="p-6">
-      <h3 class="text-xl font-semibold mb-6" style="color: var(--ds-text);">
-        {editingSet ? t('testing.editTestPlan') : t('testing.addTestPlan')}
-      </h3>
-
+    <ModalHeader
+      title={editingSet ? t('testing.editTestPlan') : t('testing.addTestPlan')}
+      showCloseButton={false}
+    />
+    <div class="p-6 pb-2">
       <div class="space-y-4">
-        <div>
-          <Label color="default" class="mb-2">{t('common.name')}</Label>
-          <Input bind:value={formData.name} required />
-        </div>
+        <FormField label={t('common.name')} required>
+          <Input bind:value={formData.name} required dataTestid="test-set-name" />
+        </FormField>
 
-        <div>
-          <div class="flex items-center justify-between mb-2">
-            <Label color="default" class="mb-0">{t('common.description')}</Label>
+        <FormField label={t('common.description')}>
+          <div class="flex justify-end -mt-1 mb-2">
             {#if editingSet}
               <Button
                 type="button"
@@ -393,49 +342,44 @@
               </Button>
             {/if}
           </div>
-          <Textarea bind:value={formData.description} rows={3} />
-        </div>
+          <Textarea bind:value={formData.description} rows={3} data-testid="test-set-description" />
+        </FormField>
 
-        <div>
-          <Label color="default" class="mb-2">{t('testing.milestoneOptional')}</Label>
+        <FormField label={t('testing.milestoneOptional')}>
           <MilestoneCombobox
+            {workspaceId}
             bind:value={formData.milestone_id}
             placeholder={t('testing.noMilestone')}
           />
-        </div>
-      </div>
-
-      <div class="flex gap-2 justify-end mt-6">
-        <Button
-          type="button"
-          variant="outline"
-          onclick={() => showForm = false}
-          keyboardHint="Esc"
-        >
-          {t('common.cancel')}
-        </Button>
-        <Button
-          variant="primary"
-          onclick={handleSubmit}
-          disabled={!formData.name.trim()}
-          keyboardHint={submitHint}
-        >
-          {editingSet ? t('common.save') : t('common.create')}
-        </Button>
+        </FormField>
       </div>
     </div>
+    <DialogFooter
+      cancelLabel={t('common.cancel')}
+      confirmLabel={editingSet ? t('common.save') : t('common.create')}
+      onCancel={() => showForm = false}
+      onConfirm={handleSubmit}
+      disabled={!formData.name.trim()}
+      showKeyboardHint={true}
+      confirmKeyboardHint={submitHint}
+      confirmTestid="test-set-submit"
+    />
     {/snippet}
   </Modal>
 
   <Modal
     isOpen={showTestCaseSelector && $selectedSet}
     maxWidth="max-w-2xl"
-    onclose={() => showTestCaseSelector = false}
+    onSubmit={handleStartRun}
+    submitDisabled={setTestCases.length === 0}
+    onclose={closeTestCaseSelector}
   >
-    <div class="p-6 max-h-[80vh] overflow-y-auto">
-      <div class="flex justify-between items-center mb-6">
-        <h3 class="text-xl font-semibold" style="color: var(--ds-text);">{t('testing.manageTestCasesFor', { name: $selectedSet?.name })}</h3>
-        <div class="flex items-center gap-2">
+    <ModalHeader
+      title={t('testing.manageTestCasesFor', { name: $selectedSet?.name })}
+      onClose={closeTestCaseSelector}
+    />
+    <div class="p-6 max-h-[65vh] overflow-y-auto">
+      <div class="flex justify-end mb-4">
           <Button
             type="button"
             size="small"
@@ -445,32 +389,26 @@
           >
             {generating ? t('common.generating') : t('testing.generateWithAI')}
           </Button>
-          <button
-            onclick={() => showTestCaseSelector = false}
-            class="p-1 rounded transition-colors hover:bg-[var(--ds-background-neutral-hovered)]"
-            style="color: var(--ds-text-subtle);"
-          >
-            <IconX size={20} />
-          </button>
-        </div>
       </div>
 
       <!-- Add Test Case Picker -->
-      <FormField label={t('testing.addTestCase')} class="mb-6">
-        <TestCasePicker
-          {workspaceId}
-          excludeIds={setTestCases.map(tc => tc.id)}
-          onSelect={handleAddTestCase}
-          placeholder={t('testing.searchTestCasesToAdd')}
-        />
-      </FormField>
+      {#if canManageTests}
+        <FormField label={t('testing.addTestCase')} class="mb-6">
+          <TestCasePicker
+            {workspaceId}
+            excludeIds={setTestCases.map(tc => tc.id)}
+            onSelect={handleAddTestCase}
+            placeholder={t('testing.searchTestCasesToAdd')}
+          />
+        </FormField>
+      {/if}
 
       <!-- Assigned Test Cases List -->
       <div>
         <h4 class="font-medium mb-3" style="color: var(--ds-text);">
           {t('testing.assignedTestCases', { count: setTestCases.length })}
         </h4>
-        <div class="border rounded overflow-hidden" style="border-color: var(--ds-border);">
+        <Panel padding="none" class="overflow-hidden">
           {#if setTestCases.length === 0}
             <EmptyState
               icon={IconFileText}
@@ -481,6 +419,7 @@
             <div class="max-h-80 overflow-y-auto" style="background-color: var(--ds-surface);">
               {#each setTestCases as tc (tc.id)}
                 <div
+                  data-testid={`test-set-case-${tc.id}`}
                   class="flex justify-between items-center px-3 py-2.5 border-b transition-colors"
                   style="border-color: var(--ds-border);"
                 >
@@ -493,51 +432,90 @@
                       {/if}
                     </div>
                   </div>
-                  <button
-                    onclick={() => removeTestCaseFromSet(tc.id)}
-                    class="p-1.5 rounded transition-colors flex-shrink-0 hover:bg-[var(--ds-background-danger-hovered)] hover:text-[var(--ds-text-danger)]"
-                    style="color: var(--ds-text-subtle);"
-                    title={t('testing.removeTestCase')}
-                  >
-                    <IconX size={16} />
-                  </button>
+                  {#if canManageTests}
+                    <button
+                      onclick={() => removeTestCaseFromSet(tc.id)}
+                      class="p-1.5 rounded transition-colors flex-shrink-0 hover:bg-[var(--ds-background-danger-hovered)] hover:text-[var(--ds-text-danger)]"
+                      style="color: var(--ds-text-subtle);"
+                      title={t('testing.removeTestCase')}
+                    >
+                      <IconX size={16} />
+                    </button>
+                  {/if}
                 </div>
               {/each}
             </div>
           {/if}
-        </div>
-      </div>
-
-      <div class="mt-6 flex justify-end gap-3">
-        <Button
-          variant="ghost"
-          onclick={() => showTestCaseSelector = false}
-        >
-          {t('common.done')}
-        </Button>
-        <Button
-          variant="primary"
-          onclick={handleStartRun}
-          disabled={setTestCases.length === 0}
-          icon={IconPlayerPlay}
-        >
-          {t('testing.startRun')}
-        </Button>
+        </Panel>
       </div>
     </div>
+    <DialogFooter
+      cancelLabel={t('common.done')}
+      confirmLabel={t('testing.startRun')}
+      onCancel={closeTestCaseSelector}
+      onConfirm={canExecuteTests ? handleStartRun : null}
+      disabled={setTestCases.length === 0}
+      showKeyboardHint={Boolean(canExecuteTests)}
+      cancelTestid="test-set-manage-done"
+      confirmTestid="test-set-start-run"
+    />
   </Modal>
 
   <!-- Content wrapper -->
-  <div class="flex-1 -mx-6 -mb-6 px-10 py-6">
+  <div class="flex-1">
     <DataTable
       columns={testSetColumns}
       data={filteredTestSets}
       keyField="id"
       actionItems={testSetActions}
+      actionTriggerTestid={(set) => `test-set-actions-${set.id}`}
+      rowAttrs={(set) => ({ 'data-testid': `test-set-row-${set.id}` })}
       emptyMessage={t('testing.noTestPlansYet')}
       emptyDescription={t('testing.createFirstTestPlan')}
       emptyIcon={IconPackage}
-    />
+    >
+      {#snippet nameCell(set)}
+        <div class="font-medium" style="color: var(--ds-text);">{set.name}</div>
+        {#if set.description}
+          <DescriptionText>{set.description}</DescriptionText>
+        {/if}
+      {/snippet}
+
+      {#snippet milestoneCell(set)}
+        {#if set.milestone_name}
+          <Badge variant="info" class="whitespace-nowrap">{set.milestone_name}</Badge>
+        {:else}
+          <span style="color: var(--ds-text-subtle);">{t('testing.noMilestone')}</span>
+        {/if}
+      {/snippet}
+
+      {#snippet runsCell(set)}
+        {@const total = set.total_runs || 0}
+        <div class="flex flex-col items-start gap-1 whitespace-nowrap">
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{total} {t('common.total').toLowerCase()}</span>
+          {#if total > 0}
+            <div class="flex items-center gap-1">
+              <Badge variant="success" size="xs">{set.successful_runs || 0} ✓</Badge>
+              {#if (set.failed_runs || 0) > 0}
+                <Badge variant="danger" size="xs">{set.failed_runs} ✗</Badge>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      {/snippet}
+
+      {#snippet lastRunCell(set)}
+        {#if set.last_run_status}
+          <div class="flex flex-col items-start gap-1 whitespace-nowrap">
+            <Lozenge color={getTestStatusColor(set.last_run_status)} text={getStatusLabel(set.last_run_status)} />
+            {#if set.last_run_date}
+              <span class="text-xs" style="color: var(--ds-text-subtle);">{formatDateSimple(set.last_run_date)}</span>
+            {/if}
+          </div>
+        {:else}
+          <span style="color: var(--ds-text-subtle);">{t('testing.neverRun')}</span>
+        {/if}
+      {/snippet}
+    </DataTable>
   </div>
 </div>
-

@@ -1,11 +1,10 @@
 <script>
 	import { onMount, onDestroy, tick } from 'svelte';
+	import ColorDot from '../../components/ColorDot.svelte';
 	import { api } from '../../api.js';
 	import { authStore } from '../../stores';
 	import { subscribeToNewNotifications } from '../../stores/notifications.js';
 	import { useEventListener } from 'runed';
-	import { usePoller } from '../../composables/usePoller.svelte.js';
-	import { itemLiveUpdates } from '../../stores/itemLiveUpdates.svelte.js';
 	import MilkdownEditor from '../../editors/LazyMilkdownEditor.svelte';
 	import Button from '../../components/Button.svelte';
 	import Avatar from '../../components/Avatar.svelte';
@@ -18,11 +17,17 @@
 	import AlertBox from '../../components/AlertBox.svelte';
 	import Tooltip from '../../components/Tooltip.svelte';
 	import { Shield, Bot } from '@lucide/svelte';
+	import { agentOwnerName, loadAttributedComments } from './activityAttributionData.js';
+	import { isExpectedBackgroundSyncError } from '../../utils/backgroundSync.js';
+	import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
+	import CannedResponsePicker from '../support/CannedResponsePicker.svelte';
+
+	const COMMENT_PAGE_SIZE = 25;
 
 	// Get shortcut configuration (use same as description save)
 	const submitShortcut = getShortcut('description', 'save');
 
-	let { itemId, isPersonalWorkspace = false, isPortalRequest = false, enableInternalComments = false, onCommentsLoaded } = $props();
+	let { itemId, workspaceId = null, isPersonalWorkspace = false, isPortalRequest = false, isExternalRequest = false, enableInternalComments = false, onCommentsLoaded } = $props();
 
 	let comments = $state([]);
 	let newCommentContent = $state('');
@@ -30,6 +35,12 @@
 	let error = $state('');
 	let editorRef;
 	let isInternalComment = $state(false);
+	let hasMore = $state(false);
+	let isLoadingMore = $state(false);
+	let totalCount = $state(0);
+	let olderCursor = $state('');
+	let refreshCursor = $state('');
+	let reconciliationVersion = 0;
 
 	// Editing state
 	let editingCommentId = $state(null);
@@ -37,36 +48,32 @@
 	let isSavingEdit = $state(false);
 	let editEditorRef = $state(null);
 
+	// comment.edit_others holders may moderate foreign comments (mirrors
+	// requireCommentEdit in the v2 API).
+	const canEditOthersComments = $derived(workspacePermissions.canEditOthersComments(workspaceId));
+
 	// Sort state
 	let sortOrder = $state('oldest'); // 'oldest' | 'newest'
 
 	// Count of comments that arrived via polling and the user hasn't acknowledged.
 	let newCount = $state(0);
 
-	// Per-author cache of agent owner info, keyed by author_id. Populated
-	// lazily after comments load. A null entry means "we already asked and
-	// the requester isn't allowed to see this agent's owner" so the tooltip
-	// falls back to the generic message instead of re-fetching on every poll.
-	let agentOwnerCache = $state({});
-
-	async function ensureAgentOwnerLoaded(authorId) {
-		if (authorId == null || authorId in agentOwnerCache) return;
-		agentOwnerCache = { ...agentOwnerCache, [authorId]: undefined };
-		try {
-			const info = await api.getAgentOwner(authorId);
-			agentOwnerCache = { ...agentOwnerCache, [authorId]: info };
-		} catch {
-			// 403/404/network failure — keep null so the UI shows the generic
-			// "Authored by an AI agent" tooltip without retrying every poll.
-			agentOwnerCache = { ...agentOwnerCache, [authorId]: null };
-		}
+	// The notification bus (poll path) and the item SSE stream (reconcile path)
+	// both merge into `comments` and increment `newCount`. Run them one at a
+	// time so the second observes the first's merge instead of counting the
+	// same comment again.
+	let commentSyncPromise = Promise.resolve();
+	function serializeCommentSync(sync) {
+		const run = commentSyncPromise.then(sync, sync);
+		commentSyncPromise = run.catch(() => {});
+		return run;
 	}
 
 	function agentTooltipContent(comment) {
 		if (!comment.is_agent) return '';
-		const info = agentOwnerCache[comment.author_id];
-		if (info?.owner_name) {
-			return t('comments.agentOwnedBy', { owner: info.owner_name });
+		const owner = agentOwnerName(comment);
+		if (owner) {
+			return t('comments.agentOwnedBy', { owner });
 		}
 		return t('comments.agentAuthored');
 	}
@@ -75,12 +82,22 @@
 		return [...comments].sort((a, b) => {
 			const dateA = new Date(a.created_at).getTime();
 			const dateB = new Date(b.created_at).getTime();
-			return sortOrder === 'oldest' ? dateA - dateB : dateB - dateA;
+			const position = dateA - dateB || a.id - b.id;
+			return sortOrder === 'oldest' ? position : -position;
 		});
 	});
 
+	// DOM cap (WI-1451): each mounted comment carries a SafeMarkdown subtree,
+	// so long threads render a bounded window. "Load more" reveals already-
+	// fetched comments first, then fetches older pages from the server.
+	const RENDER_WINDOW_STEP = 100;
+	let renderedCommentLimit = $state(RENDER_WINDOW_STEP);
+	const visibleComments = $derived(sortedComments.slice(0, renderedCommentLimit));
+	const hiddenCommentCount = $derived(sortedComments.length - visibleComments.length);
+
 	function toggleSortOrder() {
 		sortOrder = sortOrder === 'oldest' ? 'newest' : 'oldest';
+		renderedCommentLimit = RENDER_WINDOW_STEP;
 	}
 
 	function dismissNewBadge() {
@@ -91,17 +108,12 @@
 		loadComments({ initial: true });
 	});
 
-	// Poll for new comments while viewing the item. Adaptive cadence via
-	// activityStore (30s active / 5m idle / hidden tab). Demoted while the item's
-	// SSE stream is healthy (WI-484); resumes automatically if it drops.
-	usePoller(() => loadComments(), { enabled: () => !itemLiveUpdates.isLive(itemId) });
-
 	// Instant path: a new 'comment' or 'mention' notification for the item
 	// currently open triggers a refresh without waiting for the next tick.
 	const unsubscribeFromBus = subscribeToNewNotifications((n) => {
 		if (n.type !== 'comment' && n.type !== 'mention') return;
 		if (!notificationTargetsThisItem(n)) return;
-		loadComments();
+		pollForNewComments();
 	});
 	onDestroy(() => unsubscribeFromBus?.());
 
@@ -112,7 +124,7 @@
 	useEventListener(() => window, 'reload-item-detail', (/** @type {CustomEvent<{itemId?: number|string}>} */ event) => {
 		const id = event?.detail?.itemId;
 		if (id == null || String(id) !== String(itemId)) return;
-		loadComments();
+		pollForNewComments();
 	});
 
 	// SSE comment events (WI-484) reach Comments via this lightweight event from
@@ -121,7 +133,7 @@
 	useEventListener(() => window, 'item-comments-changed', (/** @type {CustomEvent<{itemId?: number|string}>} */ event) => {
 		const id = event?.detail?.itemId;
 		if (id == null || String(id) !== String(itemId)) return;
-		loadComments();
+		reconcileLoadedComments();
 	});
 
 	function notificationTargetsThisItem(n) {
@@ -132,59 +144,219 @@
 	}
 
 	/**
-	 * Merge-load comments. The initial load replaces state; subsequent polls
-	 * dedupe by id, update edited rows, and append any new ones without
-	 * clobbering in-progress edits or the draft box.
+	 * Initial load of the newest comment page.
 	 */
 	async function loadComments({ initial = false } = {}) {
-		let next;
+		const version = ++reconciliationVersion;
+		let response;
 		try {
-			next = (await api.getComments(itemId)) || [];
+			response = await loadAttributedComments(api, itemId, { limit: COMMENT_PAGE_SIZE });
 		} catch (err) {
+			if (version !== reconciliationVersion) return;
+			// Navigation can unload the document while this request is in flight.
+			// That is expected lifecycle control flow, not a failed comment load.
+			if (isExpectedBackgroundSyncError(err)) return;
 			if (initial) {
 				console.error('Failed to load comments:', err);
 				error = t('comments.failedToLoad');
 				comments = [];
+				hasMore = false;
+				totalCount = 0;
+				renderedCommentLimit = RENDER_WINDOW_STEP;
 				onCommentsLoaded?.({ count: 0 });
 			} else {
 				console.warn('Comments poll failed:', err);
 			}
 			return;
 		}
+		if (version !== reconciliationVersion) return;
 
-		if (initial) {
-			comments = next;
-			prefetchAgentOwners(next);
-			onCommentsLoaded?.({ count: comments.length });
+		comments = response?.comments || [];
+		hasMore = Boolean(response?.has_more);
+		olderCursor = response?.next_cursor || '';
+		refreshCursor = response?.refresh_cursor || '';
+		totalCount = Number.isInteger(response?.total) ? response.total : comments.length;
+		onCommentsLoaded?.({ count: totalCount });
+	}
+
+	/**
+	 * Fetch only rows newer than the newest one already held. Merging by ID
+	 * preserves loaded older pages, the draft box, and any in-progress editor.
+	 */
+	function pollForNewComments() {
+		return serializeCommentSync(syncNewComments);
+	}
+
+	async function syncNewComments() {
+		let response;
+		try {
+			response = await loadAttributedComments(api, itemId, {
+				limit: COMMENT_PAGE_SIZE,
+				...(refreshCursor ? { cursor: refreshCursor } : {})
+			});
+		} catch (err) {
+			console.warn('Comments poll failed:', err);
 			return;
 		}
 
-		const existingIds = new Set(comments.map((c) => c.id));
+		const next = response?.comments || [];
+		const existingIds = new Set(comments.map((comment) => comment.id));
+		const added = next.filter((comment) => !existingIds.has(comment.id));
+		const hadRefreshCursor = Boolean(refreshCursor);
+		refreshCursor = response?.refresh_cursor || refreshCursor;
 		const currentUserId = authStore.currentUser?.id;
+		const arrived = added.filter((comment) => comment.author_id !== currentUserId).length;
 
-		// Count new comments from other authors so we can badge them.
-		let arrived = 0;
-		for (const c of next) {
-			if (!existingIds.has(c.id) && c.author_id !== currentUserId) arrived++;
+		comments = mergeCommentRows(comments, next);
+		if (!hadRefreshCursor) {
+			hasMore = Boolean(response?.has_more);
+			olderCursor = response?.next_cursor || '';
+			totalCount = Number.isInteger(response?.total) ? response.total : comments.length;
+		} else {
+			totalCount += added.length;
 		}
-
-		// Server is truth — picks up edits and deletes. The sort is derived from
-		// created_at so ordering is stable. Local-only state (editingCommentId,
-		// newCommentContent) is tracked separately and isn't touched.
-		comments = next;
-		prefetchAgentOwners(next);
 		if (arrived > 0) newCount += arrived;
-		onCommentsLoaded?.({ count: comments.length });
+		onCommentsLoaded?.({ count: totalCount });
 	}
 
-	function prefetchAgentOwners(list) {
-		const seen = new Set();
-		for (const c of list) {
-			if (!c.is_agent || c.author_id == null) continue;
-			if (seen.has(c.author_id)) continue;
-			seen.add(c.author_id);
-			ensureAgentOwnerLoaded(c.author_id);
+	/**
+	 * Re-fetch the same newest window the viewer has already loaded. Unlike the
+	 * created-at `since` cursor, this observes edits and rows that disappeared
+	 * after deletion. Paging to the current depth preserves the user's explicit
+	 * Load more state without reverting to an unbounded thread fetch.
+	 */
+	function reconcileLoadedComments() {
+		return serializeCommentSync(syncLoadedComments);
+	}
+
+	async function syncLoadedComments() {
+		const version = ++reconciliationVersion;
+		let targetCount = Math.max(COMMENT_PAGE_SIZE, comments.length);
+		const previousTotalCount = totalCount;
+		const previousNewest = feedBoundary(comments, 'newest');
+		const existingIds = new Set(comments.map((comment) => comment.id));
+		const fresh = [];
+		let cursor = '';
+		let firstResponse = null;
+		let lastResponse = null;
+
+		try {
+			while (fresh.length < targetCount) {
+				const isFirstPage = firstResponse === null;
+				const response = await loadAttributedComments(api, itemId, {
+					limit: Math.min(100, targetCount - fresh.length),
+					...(cursor ? { cursor } : {})
+				});
+				if (version !== reconciliationVersion) return;
+				firstResponse ??= response;
+				lastResponse = response;
+				if (isFirstPage && Number.isInteger(response?.total)) {
+					targetCount += Math.max(0, response.total - previousTotalCount);
+				}
+				const page = response?.comments || [];
+				fresh.push(...page);
+				if (!response?.has_more || page.length === 0) break;
+				cursor = response?.next_cursor || '';
+			}
+		} catch (err) {
+			if (version !== reconciliationVersion) return;
+			console.warn('Comments reconciliation failed:', err);
+			return;
 		}
+
+		const added = fresh.filter((comment) => !existingIds.has(comment.id));
+		const currentUserId = authStore.currentUser?.id;
+		const arrived = added.filter((comment) =>
+			comment.author_id !== currentUserId &&
+			(!previousNewest || compareFeedRows(comment, previousNewest) > 0)
+		).length;
+		comments = mergeCommentRows([], fresh);
+		totalCount = Number.isInteger(firstResponse?.total) ? firstResponse.total : comments.length;
+		hasMore = Boolean(lastResponse?.has_more);
+		olderCursor = lastResponse?.next_cursor || '';
+		refreshCursor = firstResponse?.refresh_cursor || refreshCursor;
+		if (editingCommentId && !comments.some((comment) => comment.id === editingCommentId)) {
+			editingCommentId = null;
+			editingContent = '';
+		}
+		if (arrived > 0) newCount += arrived;
+		onCommentsLoaded?.({ count: totalCount });
+	}
+
+	// Reveal already-fetched comments from the render window first, then
+	// fetch older pages from the server.
+	function showOlderComments() {
+		if (hiddenCommentCount > 0) {
+			renderedCommentLimit += RENDER_WINDOW_STEP;
+			return;
+		}
+		loadMoreComments();
+	}
+
+	async function loadMoreComments() {
+		if (isLoadingMore || !hasMore) return;
+		if (!olderCursor) return;
+
+		isLoadingMore = true;
+		error = '';
+		try {
+			const response = await loadAttributedComments(api, itemId, {
+				limit: COMMENT_PAGE_SIZE,
+				cursor: olderCursor
+			});
+			comments = mergeCommentRows(comments, response?.comments || []);
+			hasMore = Boolean(response?.has_more);
+			olderCursor = response?.next_cursor || '';
+			onCommentsLoaded?.({ count: totalCount });
+		} catch (err) {
+			console.error('Failed to load older comments:', err);
+			error = t('comments.failedToLoad');
+		} finally {
+			isLoadingMore = false;
+		}
+	}
+
+	function mergeCommentRows(current, incoming) {
+		const byId = new Map(current.map((comment) => [comment.id, comment]));
+		for (const comment of incoming) byId.set(comment.id, comment);
+		return [...byId.values()];
+	}
+
+	function feedBoundary(rows, direction) {
+		if (rows.length === 0) return null;
+		return rows.reduce((boundary, candidate) => {
+			const comparison = compareFeedRows(candidate, boundary);
+			if (direction === 'newest' ? comparison > 0 : comparison < 0) return candidate;
+			return boundary;
+		});
+	}
+
+	function compareFeedRows(left, right) {
+		const leftTime = new Date(left.created_at).getTime();
+		const rightTime = new Date(right.created_at).getTime();
+		return leftTime - rightTime || left.id - right.id;
+	}
+
+	// Insert a canned response (WI-1138) into the composer. Private snippets
+	// flip the composer to an internal note so they never reach customers.
+	// The markdown goes through the editor so the canvas and the bound
+	// content stay in sync.
+	function insertCannedResponse(response) {
+		if (!response?.body) return;
+		const text = newCommentContent.trim()
+			? `\n\n${response.body}`
+			: response.body;
+		if (editorRef?.insertMarkdown) {
+			editorRef.insertMarkdown(text);
+		} else {
+			newCommentContent = newCommentContent.trim()
+				? `${newCommentContent.trimEnd()}${text}`
+				: text;
+		}
+		if (response.is_private) {
+			isInternalComment = true;
+		}
+		editorRef?.focus();
 	}
 
 	async function submitComment() {
@@ -200,13 +372,18 @@
 				is_private: isInternalComment
 			});
 
-			comments = [...comments, newComment];
+			const alreadyLoaded = comments.some((comment) => comment.id === newComment.id);
+			comments = mergeCommentRows(comments, [newComment]);
+			// In oldest-first order a new comment lands beyond the render
+			// window; grow it so the freshly posted comment is visible.
+			if (sortOrder === 'oldest') renderedCommentLimit += 1;
+			if (!alreadyLoaded) totalCount++;
 			newCommentContent = '';
 			editorRef?.clear();
 			isInternalComment = false; // Reset toggle after posting
 			newCount = 0; // User engaged — clear the "new comments" badge.
 			// Update comment count
-			onCommentsLoaded?.({ count: comments.length });
+			onCommentsLoaded?.({ count: totalCount });
 		} catch (err) {
 			console.error('Failed to create comment:', err);
 			error = t('comments.failedToCreate');
@@ -238,8 +415,9 @@
 		try {
 			await api.deleteComment(commentId);
 			comments = comments.filter(c => c.id !== commentId);
+			totalCount = Math.max(0, totalCount - 1);
 			// Update comment count
-			onCommentsLoaded?.({ count: comments.length });
+			onCommentsLoaded?.({ count: totalCount });
 		} catch (err) {
 			console.error('Failed to delete comment:', err);
 			error = t('comments.failedToDelete');
@@ -307,7 +485,9 @@
 
 <div class="comments-section" data-testid="comments-section">
 	{#if error}
-		<AlertBox variant="error" message={error} class="mb-4" />
+		<div data-testid="comments-error">
+			<AlertBox variant="error" message={error} class="mb-4" />
+		</div>
 	{/if}
 
 	<!-- Sort Toggle + new-comments badge -->
@@ -322,13 +502,14 @@
 					style="background: var(--ds-info-bg, #dbeafe); color: var(--ds-info-text, #1e40af);"
 					title={t('common.close')}
 				>
-					<span class="w-1.5 h-1.5 rounded-full" style="background: currentColor;"></span>
+					<ColorDot size="xs" color="currentColor" />
 					{t('comments.newCommentsAvailable', { count: newCount })}
 				</button>
 			{/if}
 			{#if comments.length > 1}
 				<button
 					onclick={toggleSortOrder}
+					data-testid="comments-sort-toggle"
 					class="flex items-center gap-1.5 text-xs px-2 py-1 rounded transition-colors hover:bg-[var(--ds-bg-subtle)]"
 					style="color: var(--ds-text-subtle);"
 				>
@@ -341,9 +522,23 @@
 		</div>
 	{/if}
 
+	{#if hasMore || hiddenCommentCount > 0}
+		<div class="flex justify-center mb-4">
+			<Button
+				variant="secondary"
+				size="small"
+				dataTestid="comments-load-more"
+				onclick={showOlderComments}
+				disabled={isLoadingMore}
+			>
+				{isLoadingMore ? t('common.loading') : t('common.loadMore')}
+			</Button>
+		</div>
+	{/if}
+
 	<!-- Comments List -->
 	<div class="space-y-4">
-		{#each sortedComments as comment (comment.id)}
+		{#each visibleComments as comment (comment.id)}
 			<div class="flex items-start space-x-3 group" data-testid="comment-item" data-comment-id={comment.id}>
 				<div class="flex-shrink-0">
 					<Avatar
@@ -379,10 +574,11 @@
 									<Badge variant="warning" size="xs" class="uppercase">{t('comments.internal')}</Badge>
 								{/if}
 							</div>
-							{#if comment.source !== 'approval' && authStore.currentUser && comment.author_id === authStore.currentUser.id && editingCommentId !== comment.id}
-								<div class="flex items-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
+							{#if comment.source !== 'approval' && authStore.currentUser && (comment.author_id === authStore.currentUser.id || canEditOthersComments) && editingCommentId !== comment.id}
+								<div class="flex items-center space-x-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity" data-testid="comment-actions">
 									<button
 										onclick={() => startEdit(comment)}
+										data-testid="comment-edit"
 										class="text-[var(--ds-text-subtlest)] hover:text-[var(--ds-interactive)] transition-colors"
 										title={t('comments.editComment')}
 									>
@@ -392,6 +588,7 @@
 									</button>
 									<button
 										onclick={() => deleteComment(comment.id)}
+										data-testid="comment-delete"
 										class="text-[var(--ds-text-subtlest)] hover:text-[var(--ds-danger)] transition-colors"
 										title={t('comments.deleteComment')}
 									>
@@ -413,6 +610,7 @@
 									showToolbar={true}
 									compact={true}
 									{itemId}
+									{workspaceId}
 									{isPersonalWorkspace}
 								/>
 								<div class="flex items-center justify-between mt-3">
@@ -443,11 +641,7 @@
 						{:else}
 							<!-- Read Mode -->
 							<div class="comment-content text-sm" style="color: var(--ds-text);">
-								<MilkdownEditor
-									content={comment.content}
-									readonly={true}
-									showToolbar={false}
-								/>
+								<MilkdownEditor content={comment.content} readonly={true} showToolbar={false} compact={true} />
 							</div>
 						{/if}
 					</div>
@@ -469,34 +663,52 @@
 				/>
 			</div>
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="flex-1" onkeydown={handleCommentKeydown}>
-				<MilkdownEditor
-					bind:this={editorRef}
-					bind:content={newCommentContent}
-					placeholder={t('comments.writePlaceholder')}
-					showToolbar={true}
-					hideToolbarUntilFocus={true}
-					compact={true}
-					{itemId}
-					{isPersonalWorkspace}
-				/>
+			<div class="flex-1" onkeydown={handleCommentKeydown}>
+				<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+				<div data-testid="comment-editor" onclick={() => editorRef?.focus()}>
+					<MilkdownEditor
+						bind:this={editorRef}
+						bind:content={newCommentContent}
+						placeholder={t('comments.writePlaceholder')}
+						showToolbar={true}
+						hideToolbarUntilFocus={true}
+						compact={true}
+						testId="comment-composer"
+						{itemId}
+						{workspaceId}
+						{isPersonalWorkspace}
+						enablePageLinks={true}
+					/>
+				</div>
 				<div class="flex items-center justify-between mt-3">
 					<div class="flex items-center gap-4">
+						<!-- Canned responses are support-reply snippets, so they only
+						     belong on external requests. The picker hides itself when the
+						     workspace has none. -->
+						{#if workspaceId && !isPersonalWorkspace && isExternalRequest}
+							<CannedResponsePicker
+								{workspaceId}
+								onSelect={insertCannedResponse}
+							/>
+						{/if}
 						<div class="text-xs" style="color: var(--ds-text-subtle);">
 							{t('comments.markdownSupported')}
 						</div>
-						{#if isPortalRequest || enableInternalComments}
+						{#if isExternalRequest || isPortalRequest || enableInternalComments}
 							<Checkbox
 								bind:checked={isInternalComment}
+								dataTestid="comment-internal-note"
 								label={t('comments.internalNote')}
 								hint={isPortalRequest ? t('comments.internalNoteHint') : t('comments.internalNoteHintGeneral')}
 								size="small"
 							/>
 						{/if}
 					</div>
+					<!-- shortcut-guard-exempt: Cmd/Ctrl+Enter is handled by the form-scoped handleCommentKeydown handler. -->
 					<Button
 						variant="primary"
 						size="small"
+						dataTestid="comment-submit"
 						onclick={submitComment}
 						disabled={isSubmitting || !newCommentContent.trim()}
 						keyboardHint={getDisplayString(submitShortcut)}
@@ -508,4 +720,3 @@
 		</div>
 	</div>
 </div>
-

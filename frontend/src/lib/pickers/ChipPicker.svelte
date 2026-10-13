@@ -3,6 +3,7 @@
   import { ChevronDown, Check } from '@lucide/svelte';
   import { t } from '../stores/i18n.svelte.js';
   import { getVisibleColor } from '../utils/colorUtils.js';
+  import Input from '../components/Input.svelte';
 
   let {
     value = $bindable(null),
@@ -16,6 +17,7 @@
     required = false,
     searchable = false,
     searchFields = ['name'],
+    triggerSnippet = null,
     itemSnippet = null,
     onSelect = () => {},
     testId = null
@@ -28,6 +30,8 @@
     states: { open }
   } = createPopover({
     positioning: {
+      strategy: 'fixed',
+      fitViewport: true,
       placement: 'bottom-start',
       gutter: 4,
       flip: true
@@ -40,7 +44,11 @@
   let highlightedIndex = $state(0);
   let inputElement = $state(null);
   let listRef = $state(null);
-  let triggerRef = $state(null);
+
+  // Render cap (WI-1445): mount at most maxVisibleOptions rows and hint to
+  // narrow the search. ArrowDown past the end of the slice reveals more.
+  let maxVisibleOptions = 100;
+  let revealedCount = $state(maxVisibleOptions);
 
   // Derive display value from current value
   let selectedItem = $derived(
@@ -62,6 +70,15 @@
     );
   });
 
+  const visibleItems = $derived(filteredItems.slice(0, revealedCount));
+  const hiddenItemCount = $derived(filteredItems.length - visibleItems.length);
+
+  // New filter results collapse the reveal window back to the first page.
+  $effect(() => {
+    void filteredItems;
+    revealedCount = maxVisibleOptions;
+  });
+
   // Focus input when popover opens, reset state
   $effect(() => {
     if ($open) {
@@ -75,9 +92,9 @@
     }
   });
 
-  // Reset highlighted index when filtered items change
+  // Reset highlighted index when visible items change
   $effect(() => {
-    const len = filteredItems.length;
+    const len = visibleItems.length;
     if (highlightedIndex >= len) {
       highlightedIndex = Math.max(0, len - 1);
     }
@@ -85,7 +102,7 @@
 
   // Scroll highlighted item into view
   $effect(() => {
-    if ($open && listRef && filteredItems.length > 0) {
+    if ($open && listRef && visibleItems.length > 0) {
       const highlightedEl = listRef.children[highlightedIndex];
       if (highlightedEl) {
         highlightedEl.scrollIntoView({ block: 'nearest' });
@@ -93,35 +110,30 @@
     }
   });
 
-  // Close the menu and return focus to the in-modal trigger. While the menu is
-  // open, focus sits on the portalled list/search input (rendered under <body>,
-  // outside the dialog's focus trap). If we just close, Svelte tears that
-  // focused node down and focus falls to <body> — so the user's next Tab starts
-  // from behind the modal and escapes it (WI-455, e.g. selecting an assignee).
-  // Restoring focus to the trigger keeps the next Tab inside the dialog. The rAF
-  // lets the menu unmount first so the focus call isn't undone by the teardown.
-  function closeAndRestoreFocus() {
+  // Melt restores focus to the trigger after closing. Let that single delayed
+  // focus operation own the hand-off: focusing here as well creates a race
+  // where a fast Tab reaches the next control before Melt moves focus back.
+  function closePicker() {
     $open = false;
-    requestAnimationFrame(() => triggerRef?.focus());
   }
 
   function handleSelect(item) {
     value = getValue(item);
-    closeAndRestoreFocus();
+    closePicker();
     onSelect(item);
   }
 
   function handleKeyDown(e) {
-    const total = filteredItems.length;
+    const total = visibleItems.length;
 
     // Tab is intentionally left to native handling: when closed it moves to the
     // next field (no trap, WI-445); when open the user selects with Enter rather
-    // than tabbing out. Focus is kept in the modal via closeAndRestoreFocus on
-    // select/Escape, not by intercepting Tab.
+    // than tabbing out. Melt restores focus to the trigger on select/Escape;
+    // Tab itself is not intercepted.
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      closeAndRestoreFocus();
+      closePicker();
       return;
     }
 
@@ -130,7 +142,10 @@
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       e.stopPropagation();
-      highlightedIndex = (highlightedIndex + 1) % total;
+      if (highlightedIndex === total - 1 && hiddenItemCount > 0) {
+        revealedCount += maxVisibleOptions;
+      }
+      highlightedIndex = (highlightedIndex + 1) % visibleItems.length;
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       e.stopPropagation();
@@ -139,7 +154,7 @@
       e.preventDefault();
       e.stopPropagation();
       if (highlightedIndex >= 0 && highlightedIndex < total) {
-        handleSelect(filteredItems[highlightedIndex]);
+        handleSelect(visibleItems[highlightedIndex]);
       }
     }
   }
@@ -147,7 +162,6 @@
 
 <!-- Chip Trigger Button -->
 <button
-  bind:this={triggerRef}
   use:melt={$trigger}
   {disabled}
   data-testid={testId}
@@ -169,7 +183,9 @@
     e.currentTarget.style.backgroundColor = 'var(--ds-surface)';
   }}
 >
-  {#if Icon}
+  {#if triggerSnippet && selectedItem}
+    {@render triggerSnippet({ item: selectedItem })}
+  {:else if Icon}
     <Icon size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
   {/if}
   {#if colorDot}
@@ -185,7 +201,8 @@
 {#if $open}
   <div
     use:melt={$content}
-    class="z-50 rounded-lg shadow-lg overflow-hidden"
+    data-testid={testId ? `${testId}-dropdown` : undefined}
+    class="z-[70] rounded-lg shadow-lg flex flex-col overflow-hidden"
     style="
       background-color: var(--ds-surface-raised);
       border: 1px solid var(--ds-border);
@@ -195,21 +212,15 @@
   >
     <!-- Search Input (optional) -->
     {#if searchable}
-      <div class="p-2 border-b" style="border-color: var(--ds-border);">
-        <input
-          bind:this={inputElement}
+      <div class="p-2 border-b shrink-0" style="border-color: var(--ds-border);">
+        <Input
+          bind:inputRef={inputElement}
           bind:value={searchTerm}
+          dataTestid={testId ? `${testId}-search` : undefined}
           onkeydown={handleKeyDown}
           type="text"
           placeholder={t('pickers.search')}
-          class="w-full px-3 py-2 rounded text-sm outline-none"
-          style="
-            background-color: var(--ds-background-input);
-            border: 1px solid var(--ds-border);
-            color: var(--ds-text);
-          "
-          onfocus={(e) => e.currentTarget.style.borderColor = 'var(--ds-border-focused)'}
-          onblur={(e) => e.currentTarget.style.borderColor = 'var(--ds-border)'}
+          size="small"
         />
       </div>
     {/if}
@@ -217,24 +228,26 @@
     <!-- Items List -->
     <div
       bind:this={listRef}
-      class="max-h-48 overflow-y-auto"
+      data-testid={testId ? `${testId}-listbox` : undefined}
+      class="min-h-0 max-h-48 overflow-y-auto overscroll-contain"
       role="listbox"
       id={listboxId}
       tabindex="0"
       onkeydown={handleKeyDown}
       style="outline: none;"
     >
-      {#if filteredItems.length === 0}
+      {#if visibleItems.length === 0}
         <div class="p-4 text-center text-sm" style="color: var(--ds-text-subtle);">
           {t('pickers.noItemsFound')}
         </div>
       {:else}
-        {#each filteredItems as item, index}
+        {#each visibleItems as item, index (getValue(item))}
           {@const itemValue = getValue(item)}
           {@const isSelected = itemValue === value}
           {@const isHighlighted = highlightedIndex === index}
           <button
             type="button"
+            data-testid={testId ? `${testId}-option` : undefined}
             class="w-full flex items-center gap-2 px-3 py-2.5 text-left text-sm transition-colors"
             style="
               background-color: {isSelected ? 'var(--ds-background-selected)' : isHighlighted ? 'var(--ds-background-neutral-hovered)' : 'transparent'};
@@ -257,6 +270,11 @@
             {/if}
           </button>
         {/each}
+        {#if hiddenItemCount > 0}
+          <div data-testid="picker-more-hint" class="px-3 py-2 text-xs text-center" style="color: var(--ds-text-subtle);">
+            {t('pickers.showingOfTotal', { shown: visibleItems.length, total: filteredItems.length })}
+          </div>
+        {/if}
       {/if}
     </div>
   </div>

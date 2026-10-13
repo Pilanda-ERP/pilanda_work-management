@@ -1,18 +1,30 @@
 package scheduler
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/services"
+	"windshift/internal/validation"
 
 	"github.com/teambition/rrule-go"
 )
+
+// DefaultRecurrenceBatchSize is the maximum number of due rules processed by
+// one scheduler pass. Diagnostics use the same value when reporting backlog.
+const DefaultRecurrenceBatchSize = 100
+
+// MaxRecurrenceInstancesPerRulePass limits both recurrence expansion work and
+// item creation for one rule in one scheduler pass.
+const MaxRecurrenceInstancesPerRulePass = 100
 
 // RecurrenceScheduler handles periodic generation of recurring task instances
 type RecurrenceScheduler struct {
@@ -42,7 +54,7 @@ func NewRecurrenceScheduler(db database.Database, workflowService *services.Work
 		stopChan:        make(chan struct{}),
 		running:         false,
 		checkInterval:   5 * time.Minute,
-		batchSize:       100,
+		batchSize:       DefaultRecurrenceBatchSize,
 	}
 }
 
@@ -153,11 +165,10 @@ func (rs *RecurrenceScheduler) generateInstancesForRule(rule *models.RecurrenceR
 	// BYDAY=MO etc. resolve to "Monday in the user's timezone" instead of "Monday in
 	// whatever zone time.Time happened to be scanned in (typically UTC)". DST is
 	// then handled correctly by rrule-go's tz-aware expansion.
-	loc, err := time.LoadLocation(rule.Timezone)
-	if err != nil || loc == nil {
+	_, loc := services.ResolveTimezoneOrUTC(rule.Timezone)
+	if loc == time.UTC && rule.Timezone != "" && rule.Timezone != "UTC" {
 		slog.Warn("invalid rule timezone, falling back to UTC",
-			"rule_id", rule.ID, "tz", rule.Timezone, "error", err)
-		loc = time.UTC
+			"rule_id", rule.ID, "tz", rule.Timezone)
 	}
 	ruleOpt.Dtstart = rule.DtStart.In(loc)
 
@@ -179,10 +190,10 @@ func (rs *RecurrenceScheduler) generateInstancesForRule(rule *models.RecurrenceR
 		generateUntil = *rule.DtEnd
 	}
 
-	// Get occurrences in the window
-	occurrences := r.Between(startFrom, generateUntil, true)
-
-	if len(occurrences) == 0 {
+	// Expand incrementally so high-frequency rules never materialize an
+	// unbounded occurrence slice in memory.
+	nextOccurrence := r.After(startFrom, true)
+	if nextOccurrence.IsZero() || nextOccurrence.After(generateUntil) {
 		// No occurrences in window, update next check time
 		nextCheck := now.Add(24 * time.Hour)
 		_ = rs.recurrenceRepo.UpdateNextCheck(rule.ID, nextCheck)
@@ -195,8 +206,9 @@ func (rs *RecurrenceScheduler) generateInstancesForRule(rule *models.RecurrenceR
 		return 0, fmt.Errorf("template item not found: %w", err)
 	}
 
-	// Get existing instance dates to avoid duplicates
-	existingDates, err := rs.recurrenceRepo.GetExistingInstanceDates(rule.ID)
+	// Get existing instance dates inside the generation window to avoid
+	// duplicates without loading the rule's full instance history.
+	existingDates, err := rs.recurrenceRepo.GetExistingInstanceDates(rule.ID, startFrom, generateUntil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get existing dates: %w", err)
 	}
@@ -210,7 +222,11 @@ func (rs *RecurrenceScheduler) generateInstancesForRule(rule *models.RecurrenceR
 	lastOK := startFrom
 	var firstFailure error
 	generatedCount := 0
-	for _, occurrence := range occurrences {
+	examinedCount := 0
+	for !nextOccurrence.IsZero() && !nextOccurrence.After(generateUntil) && examinedCount < MaxRecurrenceInstancesPerRulePass {
+		occurrence := nextOccurrence
+		nextOccurrence = r.After(occurrence, false)
+		examinedCount++
 		dateKey := occurrence.Format("2006-01-02")
 		if existingDates[dateKey] {
 			if occurrence.After(lastOK) {
@@ -240,6 +256,9 @@ func (rs *RecurrenceScheduler) generateInstancesForRule(rule *models.RecurrenceR
 	if firstFailure != nil {
 		progressTo = lastOK
 		nextCheck = now.Add(rs.checkInterval)
+	} else if !nextOccurrence.IsZero() && !nextOccurrence.After(generateUntil) {
+		progressTo = lastOK
+		nextCheck = now.Add(rs.checkInterval)
 	}
 	_ = rs.recurrenceRepo.UpdateGenerationProgress(rule.ID, progressTo, nextCheck)
 
@@ -251,24 +270,6 @@ func (rs *RecurrenceScheduler) generateInstancesForRule(rule *models.RecurrenceR
 
 // createInstance creates a single recurring task instance
 func (rs *RecurrenceScheduler) createInstance(rule *models.RecurrenceRule, template *models.Item, scheduledDate time.Time) error {
-	tx, err := rs.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Get next workspace item number
-	nextNum, err := rs.itemRepo.GetNextWorkspaceItemNumber(tx, template.WorkspaceID)
-	if err != nil {
-		return fmt.Errorf("failed to get next item number: %w", err)
-	}
-
-	// Get next sequence number for this rule
-	seqNum, err := rs.recurrenceRepo.GetNextSequenceNumber(tx, rule.ID)
-	if err != nil {
-		return fmt.Errorf("failed to get sequence number: %w", err)
-	}
-
 	// Determine status. The user can pin one explicitly; otherwise resolve via the
 	// workspace's configuration set → workflow → initial transition (the same path
 	// used by handlers/portal.go and handlers/forms.go). The previous hard-coded
@@ -288,57 +289,77 @@ func (rs *RecurrenceScheduler) createInstance(rule *models.RecurrenceRule, templ
 		statusID = *resolved
 	}
 
-	// Build the new item, copying template fields per the rule's flags. Insert
-	// goes through ItemRepository so the items-table write lives in the
-	// repository layer (same path scm/issue_sync.go uses), not in the scheduler.
-	item := &models.Item{
-		WorkspaceID:         template.WorkspaceID,
-		WorkspaceItemNumber: nextNum,
-		ItemTypeID:          template.ItemTypeID,
-		Title:               template.Title,
-		StatusID:            &statusID,
-		DueDate:             &scheduledDate,
-		IsTask:              template.IsTask,
-		ParentID:            template.ParentID,
+	actorUserID := 0
+	if rule.CreatedBy != nil {
+		actorUserID = *rule.CreatedBy
+	}
+
+	// Build the instance through the shared creation API, copying template
+	// fields per the rule's flags. The recurrence instance row is written by the
+	// AfterCreate hook so it commits with the item.
+	params := services.ItemCreationParams{
+		WorkspaceID:           template.WorkspaceID,
+		ItemTypeID:            template.ItemTypeID,
+		ValidatingUserID:      actorUserID,
+		Title:                 template.Title,
+		StatusID:              &statusID,
+		DueDate:               &scheduledDate,
+		IsTask:                template.IsTask,
+		ParentID:              template.ParentID,
+		CreatorID:             rule.CreatedBy,
+		SkipMandatoryTemplate: true,
+		SkipAssigneeTrigger:   true,
+		SkipPublish:           true,
 	}
 	if rule.CopyDescription {
-		item.Description = template.Description
+		params.Description = template.Description
 	}
 	if rule.CopyAssignee {
-		item.AssigneeID = template.AssigneeID
+		params.AssigneeID = template.AssigneeID
 	}
 	if rule.CopyPriority {
-		item.PriorityID = template.PriorityID
+		params.PriorityID = template.PriorityID
 	}
-	if rule.CopyCustomFields {
-		item.CustomFieldValues = template.CustomFieldValues
+	if rule.CopyCustomFields && len(template.CustomFieldValues) > 0 {
+		encoded, err := json.Marshal(template.CustomFieldValues)
+		if err != nil {
+			return fmt.Errorf("encode recurring custom fields: %w", err)
+		}
+		params.CustomFieldValuesJSON = string(encoded)
+	}
+	if err := validation.ValidateTaskState(rs.db, params.WorkspaceID, actorUserID, params.IsTask, params.StatusID); err != nil {
+		return fmt.Errorf("validate recurring item: %w", err)
+	}
+	metadata := itemevents.System("recurrence")
+	if rule.CreatedBy != nil {
+		metadata = itemevents.User(*rule.CreatedBy, "recurrence")
+	}
+	params.EventMetadata = metadata
+	params.AfterCreate = func(_ context.Context, tx database.Tx, itemID int) error {
+		seqNum, err := rs.recurrenceRepo.GetNextSequenceNumber(tx, rule.ID)
+		if err != nil {
+			return fmt.Errorf("get next recurrence sequence number: %w", err)
+		}
+		return rs.recurrenceRepo.CreateInstance(tx, &models.RecurrenceInstance{
+			RecurrenceRuleID: rule.ID,
+			InstanceItemID:   itemID,
+			ScheduledDate:    scheduledDate,
+			SequenceNumber:   seqNum,
+		})
 	}
 
-	itemID, err := rs.itemRepo.Create(tx, item)
+	itemID64, err := services.CreateItem(rs.db, params)
 	if err != nil {
-		return fmt.Errorf("failed to create item: %w", err)
+		return fmt.Errorf("create recurring item: %w", err)
 	}
-
-	// Create the instance record
-	err = rs.recurrenceRepo.CreateInstance(tx, &models.RecurrenceInstance{
-		RecurrenceRuleID: rule.ID,
-		InstanceItemID:   itemID,
-		ScheduledDate:    scheduledDate,
-		SequenceNumber:   seqNum,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create instance record: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return err
-	}
+	itemID := int(itemID64)
 
 	// Live-update publish (WI-483): the recurrence instance committed. Announce
 	// the new item and refresh the template parent's child list if any.
-	services.PublishItemChange(itemID, services.ItemChangeCreated)
-	if item.ParentID != nil {
-		services.PublishItemChange(*item.ParentID, services.ItemChangeUpdated)
+	services.PublishItemChange(itemID)
+	services.PublishWorkspaceChange(params.WorkspaceID)
+	if params.ParentID != nil {
+		services.PublishItemChange(*params.ParentID)
 	}
 	return nil
 }

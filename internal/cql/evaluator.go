@@ -2,7 +2,9 @@ package cql
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 )
 
 // Evaluator evaluates QL queries against SQL database
@@ -20,7 +22,7 @@ func NewEvaluator(workspaceMap map[string]int, customFieldMap CustomFieldMap, db
 
 // evaluateQL tokenizes and parses a CQL query, then generates SQL using the given generator.
 // This is the shared pipeline for both item and asset evaluators.
-func evaluateQL(cqlQuery string, gen *SQLGenerator) (string, []interface{}, error) { //nolint:gocritic // unnamedResult
+func evaluateQLAt(cqlQuery string, gen *SQLGenerator, evaluationTime time.Time) (string, []any, error) { //nolint:gocritic // unnamedResult
 	if strings.TrimSpace(cqlQuery) == "" {
 		return "", nil, nil
 	}
@@ -40,7 +42,7 @@ func evaluateQL(cqlQuery string, gen *SQLGenerator) (string, []interface{}, erro
 	}
 
 	// Generate SQL
-	sqlStr, args, err := gen.GenerateSQL(ast)
+	sqlStr, args, err := gen.GenerateSQLAt(ast, evaluationTime)
 	if err != nil {
 		return "", nil, fmt.Errorf("SQL generation error: %w", err)
 	}
@@ -48,8 +50,12 @@ func evaluateQL(cqlQuery string, gen *SQLGenerator) (string, []interface{}, erro
 	return sqlStr, args, nil
 }
 
+func evaluateQL(cqlQuery string, gen *SQLGenerator) (string, []any, error) { //nolint:gocritic // unnamedResult
+	return evaluateQLAt(cqlQuery, gen, time.Now().UTC())
+}
+
 // EvaluateToSQL converts a QL query string to SQL WHERE clause
-func (e *Evaluator) EvaluateToSQL(cqlQuery string) (string, []interface{}, error) { //nolint:gocritic // unnamedResult
+func (e *Evaluator) EvaluateToSQL(cqlQuery string) (string, []any, error) { //nolint:gocritic // unnamedResult
 	return evaluateQL(cqlQuery, e.sqlGenerator)
 }
 
@@ -57,6 +63,15 @@ func (e *Evaluator) EvaluateToSQL(cqlQuery string) (string, []interface{}, error
 type AssetEvaluator struct {
 	sqlGenerator *SQLGenerator
 	workspaceMap map[string]int // For linkedOf() inner queries against items
+}
+
+// WithItemWorkspaceScope restricts all inner item queries, including nested
+// functions. An empty scope permits no items. The original evaluator is unchanged.
+func (e *AssetEvaluator) WithItemWorkspaceScope(workspaceIDs []int) *AssetEvaluator {
+	local := *e.sqlGenerator
+	local.itemWorkspaceScoped = true
+	local.itemWorkspaceScope = slices.Clone(workspaceIDs)
+	return &AssetEvaluator{sqlGenerator: &local, workspaceMap: e.workspaceMap}
 }
 
 // NewAssetEvaluator creates a new QL evaluator for assets. Supported call
@@ -69,7 +84,7 @@ type AssetEvaluator struct {
 // assetCustomFieldMap covers asset-side custom fields; itemCustomFieldMap is
 // passed through to inner item queries spawned by linkedOf() and may be nil if
 // those are not expected to filter on item custom fields.
-func NewAssetEvaluator(setMap, workspaceMap map[string]int, args ...interface{}) *AssetEvaluator {
+func NewAssetEvaluator(setMap, workspaceMap map[string]int, args ...any) *AssetEvaluator {
 	assetCustomFieldMap, itemCustomFieldMap, dbDriver := parseAssetEvaluatorArgs(args...)
 	gen := NewAssetSQLGenerator(setMap, assetCustomFieldMap, itemCustomFieldMap, dbDriver)
 	gen.EnableLegacyCustomFieldNameFallback()
@@ -79,7 +94,7 @@ func NewAssetEvaluator(setMap, workspaceMap map[string]int, args ...interface{})
 	}
 }
 
-func parseAssetEvaluatorArgs(args ...interface{}) (assetCustomFieldMap, itemCustomFieldMap CustomFieldMap, dbDriver string) {
+func parseAssetEvaluatorArgs(args ...any) (assetCustomFieldMap, itemCustomFieldMap CustomFieldMap, dbDriver string) {
 	switch len(args) {
 	case 0:
 		return nil, nil, ""
@@ -95,7 +110,7 @@ func parseAssetEvaluatorArgs(args ...interface{}) (assetCustomFieldMap, itemCust
 	}
 }
 
-func toCustomFieldMap(v interface{}) CustomFieldMap {
+func toCustomFieldMap(v any) CustomFieldMap {
 	switch m := v.(type) {
 	case nil:
 		return nil
@@ -114,7 +129,7 @@ func toCustomFieldMap(v interface{}) CustomFieldMap {
 	}
 }
 
-func stringArg(v interface{}) string {
+func stringArg(v any) string {
 	if s, ok := v.(string); ok {
 		return s
 	}
@@ -122,8 +137,8 @@ func stringArg(v interface{}) string {
 }
 
 // EvaluateToSQL converts a QL query string to SQL WHERE clause for assets
-func (e *AssetEvaluator) EvaluateToSQL(cqlQuery string) (string, []interface{}, error) { //nolint:gocritic // unnamedResult
-	// Inject workspace map for linkedOf() inner queries
-	e.sqlGenerator.workspaceMap = e.workspaceMap
-	return evaluateQL(cqlQuery, e.sqlGenerator)
+func (e *AssetEvaluator) EvaluateToSQL(cqlQuery string) (string, []any, error) { //nolint:gocritic // unnamedResult
+	local := *e.sqlGenerator
+	local.workspaceMap = e.workspaceMap
+	return evaluateQL(cqlQuery, &local)
 }

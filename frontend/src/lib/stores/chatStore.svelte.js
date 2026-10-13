@@ -9,6 +9,198 @@ let connectionId = $state(0);
 let connections = $state([]);
 let connectionsLoaded = $state(false);
 let itemKeyMap = $state({});
+let sessionId = $state(0);
+let sessionType = $state('general');
+let sessionWorkspaceId = $state(0);
+let agentProfileId = $state(0);
+let sessions = $state([]);
+let availableAgents = $state([]);
+let conversationLoading = $state(false);
+let workspaceOptionsKey = '';
+let historyLoaded = $state(false);
+let historyPromise = null;
+let historyAfterMessageId = $state(0);
+
+function messageID(messagesToInspect) {
+  return messagesToInspect.reduce(
+    (highest, message) => Math.max(highest, Number(message.id) || 0),
+    0
+  );
+}
+
+function applyGeneralSession(session, storedMessages, afterMessageId = 0) {
+  sessionId = session?.id || 0;
+  sessionType = 'general';
+  sessionWorkspaceId = 0;
+  agentProfileId = 0;
+  messages = (Array.isArray(storedMessages) ? storedMessages : []).map(toChatMessage);
+  historyAfterMessageId = afterMessageId;
+}
+
+/**
+ * Normalize a stored or live message into the shape the panel renders. Model
+ * and usage are carried through so a turn's metering survives a reload — the
+ * fields are absent on user turns, which is why this maps defensively rather
+ * than spreading.
+ */
+function toChatMessage(message) {
+  const normalized = {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+  };
+  if (message.model) normalized.model = message.model;
+  if (message.usage) normalized.usage = message.usage;
+  return normalized;
+}
+
+async function loadGeneralHistory() {
+  if (historyLoaded && sessionType === 'general') return;
+  if (historyPromise) return historyPromise;
+  historyPromise = (async () => {
+    try {
+      const session = await api.ai.getGeneralSession();
+      let stored = [];
+      if (session?.id) {
+        stored = await api.ai.getSessionMessages(session.id);
+      }
+      applyGeneralSession(session, stored);
+      historyLoaded = true;
+    } catch (err) {
+      console.error('Failed to load agent conversation:', err);
+    } finally {
+      historyPromise = null;
+    }
+  })();
+  return historyPromise;
+}
+
+async function startNewGeneralChat() {
+  if (conversationLoading) return;
+  conversationLoading = true;
+  try {
+    const session = await api.ai.getGeneralSession();
+    const stored = session?.id ? await api.ai.getSessionMessages(session.id) : [];
+    applyGeneralSession(session, stored, messageID(Array.isArray(stored) ? stored : []));
+    messages = [];
+    error = '';
+    itemKeyMap = {};
+    historyLoaded = true;
+  } catch (err) {
+    error = err.message || 'Conversation could not be started';
+  } finally {
+    conversationLoading = false;
+  }
+}
+
+async function loadSession(session) {
+  if (!session?.id) return;
+  conversationLoading = true;
+  historyLoaded = false;
+  try {
+    const stored = await api.ai.getSessionMessages(session.id);
+    sessionId = session.id;
+    sessionType = session.session_type || 'standard';
+    sessionWorkspaceId = session.workspace_id || 0;
+    agentProfileId = session.agent_profile_id || 0;
+    historyAfterMessageId = 0;
+    messages = (Array.isArray(stored) ? stored : []).map(toChatMessage);
+    error = '';
+    itemKeyMap = {};
+    historyLoaded = true;
+  } catch (err) {
+    error = err.message || 'Conversation could not be loaded';
+  } finally {
+    conversationLoading = false;
+  }
+}
+
+async function prepareWorkspaceOptions(workspaceId, allowStandard) {
+  const normalizedWorkspaceId = Number(workspaceId) || 0;
+  const key = allowStandard && normalizedWorkspaceId ? String(normalizedWorkspaceId) : 'general';
+  if (workspaceOptionsKey === key) return;
+  workspaceOptionsKey = key;
+
+  if (!allowStandard || !normalizedWorkspaceId) {
+    sessions = [];
+    availableAgents = [];
+    if (sessionType === 'standard') {
+      await loadGeneralHistory();
+    }
+    return;
+  }
+
+  try {
+    const [sessionResult, agentResult] = await Promise.all([
+      api.ai.listSessions(),
+      api.ai.listAvailableStandardAgents(normalizedWorkspaceId),
+    ]);
+    sessions = (Array.isArray(sessionResult) ? sessionResult : []).filter(
+      (session) =>
+        session.session_type === 'standard' &&
+        Number(session.workspace_id) === normalizedWorkspaceId &&
+        !session.archived_at
+    );
+    availableAgents = Array.isArray(agentResult) ? agentResult : [];
+  } catch (err) {
+    console.error('Failed to load workspace agent conversations:', err);
+    sessions = [];
+    availableAgents = [];
+  }
+}
+
+async function selectConversation(value, workspaceId) {
+  if (value === 'general') {
+    historyLoaded = false;
+    return loadGeneralHistory();
+  }
+  if (String(value).startsWith('session:')) {
+    const id = Number(String(value).slice('session:'.length));
+    const session = sessions.find((candidate) => candidate.id === id);
+    if (session) return loadSession(session);
+    return;
+  }
+  if (String(value).startsWith('new:')) {
+    const profileId = Number(String(value).slice('new:'.length));
+    return startStandardConversation(workspaceId, profileId);
+  }
+}
+
+async function startStandardConversation(workspaceId, profileId = agentProfileId) {
+  const normalizedWorkspaceId = Number(workspaceId) || 0;
+  const normalizedProfileId = Number(profileId) || 0;
+  if (!normalizedWorkspaceId || !normalizedProfileId || conversationLoading) return;
+  conversationLoading = true;
+  try {
+    const agent = availableAgents.find((candidate) => candidate.id === normalizedProfileId);
+    const session = await api.ai.createStandardSession(normalizedWorkspaceId, {
+      agent_profile_id: normalizedProfileId,
+      ...(agent?.name ? { title: agent.name } : {}),
+    });
+    sessions = [session, ...sessions.filter((candidate) => candidate.id !== session.id)];
+    await loadSession(session);
+  } catch (err) {
+    error = err.message || 'Conversation could not be created';
+  } finally {
+    conversationLoading = false;
+  }
+}
+
+async function archiveCurrentSession() {
+  if (sessionType !== 'standard' || !sessionId || conversationLoading) return;
+  conversationLoading = true;
+  const archivedID = sessionId;
+  try {
+    await api.ai.archiveSession(archivedID);
+    sessions = sessions.filter((session) => session.id !== archivedID);
+    historyLoaded = false;
+    await loadGeneralHistory();
+  } catch (err) {
+    error = err.message || 'Conversation could not be archived';
+  } finally {
+    conversationLoading = false;
+  }
+}
 
 async function loadConnections() {
   if (connectionsLoaded) return;
@@ -26,12 +218,18 @@ function toggle() {
   if (open && !connectionsLoaded) {
     loadConnections();
   }
+  if (open && !historyLoaded) {
+    loadGeneralHistory();
+  }
 }
 
 function show() {
   open = true;
   if (!connectionsLoaded) {
     loadConnections();
+  }
+  if (!historyLoaded) {
+    loadGeneralHistory();
   }
 }
 
@@ -41,19 +239,29 @@ function hide() {
 
 async function sendMessage(text, context) {
   if (!text.trim() || loading) return;
+  if (!historyLoaded) {
+    await loadGeneralHistory();
+  }
 
   const userMsg = { role: 'user', content: text };
-  const previousMessages = messages;
   messages = [...messages, userMsg];
   loading = true;
   error = '';
 
   try {
-    const history = previousMessages
-      .filter((m) => !m.error)
-      .map((m) => ({ role: m.role, content: m.content }));
-    const result = await api.ai.chat(text, connectionId || undefined, history, context);
+    const result =
+      sessionType === 'general'
+        ? await api.ai.chat(
+            text,
+            connectionId || undefined,
+            sessionId || undefined,
+            context,
+            historyAfterMessageId
+          )
+        : await api.ai.chat(text, undefined, sessionId || undefined, context);
+    sessionId = result.session_id || sessionId;
     const assistantMsg = {
+      id: result.message_id,
       role: 'assistant',
       content: result.answer || '',
       toolCalls: result.tool_calls || [],
@@ -62,6 +270,8 @@ async function sendMessage(text, context) {
       stopReason: result.stop_reason || '',
       needsReview: result.needs_review || false,
       reviewReasons: result.review_reasons || [],
+      model: result.model || '',
+      usage: result.usage || null,
     };
     messages = [...messages, assistantMsg];
     extractItemKeys(assistantMsg.toolCalls);
@@ -124,9 +334,26 @@ function retryLastMessage() {
 }
 
 function clearHistory() {
+  if (sessionType === 'general') {
+    historyAfterMessageId = Math.max(historyAfterMessageId, messageID(messages));
+    historyLoaded = true;
+  } else {
+    historyLoaded = false;
+  }
   messages = [];
   error = '';
   itemKeyMap = {};
+}
+
+// Rewrite bare item keys (ACME-123) into markdown links when a prior item
+// search resolved the key, so read-only chat rendering links them.
+export function preprocessItemKeys(text) {
+  if (!text) return '';
+  return text.replace(/\b([A-Z]{2,10}-\d+)\b/g, (_match, key) => {
+    const item = itemKeyMap?.[key];
+    const href = item ? `/workspaces/${item.workspaceId}/items/${item.id}` : '#';
+    return `[${key}](${href})`;
+  });
 }
 
 export const chatStore = {
@@ -154,6 +381,27 @@ export const chatStore = {
   get itemKeyMap() {
     return itemKeyMap;
   },
+  get sessionId() {
+    return sessionId;
+  },
+  get sessionType() {
+    return sessionType;
+  },
+  get sessionWorkspaceId() {
+    return sessionWorkspaceId;
+  },
+  get agentProfileId() {
+    return agentProfileId;
+  },
+  get sessions() {
+    return sessions;
+  },
+  get availableAgents() {
+    return availableAgents;
+  },
+  get conversationLoading() {
+    return conversationLoading;
+  },
   toggle,
   show,
   hide,
@@ -161,4 +409,10 @@ export const chatStore = {
   retryLastMessage,
   clearHistory,
   loadConnections,
+  loadGeneralHistory,
+  startNewGeneralChat,
+  prepareWorkspaceOptions,
+  selectConversation,
+  startStandardConversation,
+  archiveCurrentSession,
 };

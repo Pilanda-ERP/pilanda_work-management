@@ -2,11 +2,22 @@ package routes
 
 import "net/http"
 
-// RegisterAdminRoutes registers admin-related routes (audit, security, themes, plugins, jira import).
+// RegisterAdminRoutes registers admin routes.
 func RegisterAdminRoutes(deps *Deps) {
 	api := deps.API
 	auth := deps.AuthMiddleware.RequireAuth
 	admin := deps.PermissionMiddleware.RequireSystemAdmin()
+
+	if deps.Admin.ObjectTranslation != nil {
+		translations := deps.Admin.ObjectTranslation
+		api.HandleH("GET /admin/object-translations/definitions", admin(http.HandlerFunc(translations.ListDefinitions)))
+		api.HandleH("POST /admin/object-translations/resolve", admin(http.HandlerFunc(translations.Resolve)))
+		api.HandleH("GET /admin/object-translations/orphans", admin(http.HandlerFunc(translations.FindOrphans)))
+		api.HandleH("GET /admin/object-translations/canonical-differences", admin(http.HandlerFunc(translations.FindCanonicalDifferences)))
+		api.HandleH("GET /admin/object-translations/{object_type}/{object_id}", admin(http.HandlerFunc(translations.List)))
+		api.HandleH("PUT /admin/object-translations/{object_type}/{object_id}/{field}/{locale}", admin(http.HandlerFunc(translations.Upsert)))
+		api.HandleH("DELETE /admin/object-translations/{object_type}/{object_id}/{field}/{locale}", admin(http.HandlerFunc(translations.Delete)))
+	}
 
 	// Admin security settings
 	api.HandleH("GET /admin/security-settings", admin(http.HandlerFunc(deps.Admin.SecuritySettings.GetSecuritySettings)))
@@ -26,14 +37,28 @@ func RegisterAdminRoutes(deps *Deps) {
 	api.HandleH("GET /admin/diagnostics/action-logs", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetActionLogs)))
 	api.HandleH("GET /admin/diagnostics/webhook-deliveries", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetWebhookDeliveries)))
 	api.HandleH("GET /admin/diagnostics/webhook-stats", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetWebhookStats)))
+	api.HandleH("GET /admin/diagnostics/webhook-dispatch", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetWebhookDispatch)))
+	api.HandleH("GET /admin/diagnostics/transition-matrix", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetTransitionMatrix)))
+	api.HandleH("GET /admin/diagnostics/bulk-operations", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetBulkOperations)))
 	api.HandleH("POST /admin/diagnostics/webhook-deliveries/purge", admin(http.HandlerFunc(deps.Admin.Diagnostics.PurgeWebhookDeliveries)))
 	api.HandleH("GET /admin/diagnostics/scheduler-runs", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetSchedulerRuns)))
 	api.HandleH("GET /admin/diagnostics/scheduler-stats", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetSchedulerStats)))
 	api.HandleH("POST /admin/diagnostics/scheduler-runs/purge", admin(http.HandlerFunc(deps.Admin.Diagnostics.PurgeSchedulerRuns)))
 	api.HandleH("GET /admin/diagnostics/frac-index", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetFracIndexState)))
+	api.HandleH("POST /admin/diagnostics/frac-index/migration", admin(http.HandlerFunc(deps.Admin.Diagnostics.ControlGlobalRankMigration)))
 	api.HandleH("GET /admin/diagnostics/llm-providers", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetLLMProviderStatus)))
 	api.HandleH("GET /admin/diagnostics/briefing-failures", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetBriefingFailures)))
+	api.HandleH("GET /admin/diagnostics/briefing-health", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetBriefingHealth)))
 	api.HandleH("GET /admin/diagnostics/runner-pools", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetRunnerPools)))
+	api.HandleH("GET /admin/diagnostics/database-pool", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetDatabasePool)))
+	api.HandleH("GET /admin/diagnostics/cache-memory", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetCacheMemory)))
+	api.HandleH("GET /admin/diagnostics/session-validation-cache", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetSessionValidationCache)))
+	api.HandleH("GET /admin/diagnostics/recurrence-volume", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetRecurrenceVolume)))
+	api.HandleH("PUT /admin/diagnostics/recurrence-volume", admin(http.HandlerFunc(deps.Admin.Diagnostics.UpdateRecurrenceVolumeSettings)))
+	api.HandleH("GET /admin/diagnostics/domain-events", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetDomainEvents)))
+	api.HandleH("GET /admin/diagnostics/scm-connections", admin(http.HandlerFunc(deps.Admin.Diagnostics.GetSCMConnections)))
+	api.HandleH("POST /admin/diagnostics/domain-events/{eventID}/{consumerKey}/replay", admin(http.HandlerFunc(deps.Admin.Diagnostics.ReplayDomainEvent)))
+	api.HandleH("POST /admin/diagnostics/domain-events/{eventID}/{consumerKey}/skip", admin(http.HandlerFunc(deps.Admin.Diagnostics.SkipDomainEvent)))
 
 	// Authentication policy endpoints (admin only)
 	api.HandleH("GET /admin/auth-policy", admin(http.HandlerFunc(deps.Admin.AuthPolicy.GetAuthPolicy)))
@@ -52,10 +77,6 @@ func RegisterAdminRoutes(deps *Deps) {
 	api.HandleH("DELETE /themes/{id}", admin(http.HandlerFunc(deps.Admin.Theme.DeleteTheme)))
 	api.HandleH("POST /themes/{id}/activate", admin(http.HandlerFunc(deps.Admin.Theme.ActivateTheme)))
 
-	// User preferences routes
-	api.HandleH("GET /user/preferences", auth(http.HandlerFunc(deps.Admin.UserPreferences.GetUserPreferences)))
-	api.HandleH("PUT /user/preferences", auth(http.HandlerFunc(deps.Admin.UserPreferences.UpdateUserPreferences)))
-
 	// Personal dashboard layout (per-user)
 	api.HandleH("GET /user/dashboard-layout", auth(http.HandlerFunc(deps.Admin.UserPreferences.GetDashboardLayout)))
 	api.HandleH("PUT /user/dashboard-layout", auth(http.HandlerFunc(deps.Admin.UserPreferences.UpdateDashboardLayout)))
@@ -67,6 +88,7 @@ func RegisterAdminRoutes(deps *Deps) {
 	api.HandleH("GET /plugins/{name}/assets/{asset...}", http.HandlerFunc(deps.Admin.Plugin.GetAsset))
 	api.HandleH("PUT /plugins/{name}/toggle", admin(http.HandlerFunc(deps.Admin.Plugin.TogglePlugin)))
 	api.HandleH("DELETE /plugins/{name}", admin(http.HandlerFunc(deps.Admin.Plugin.DeletePlugin)))
+	api.HandleH("GET /plugins/instance-id", admin(http.HandlerFunc(deps.Admin.Plugin.GetInstanceID)))
 	api.HandleH("POST /plugins/{name}/reload", admin(http.HandlerFunc(deps.Admin.Plugin.ReloadPlugin)))
 
 	// Admin API token management
@@ -79,6 +101,7 @@ func RegisterAdminRoutes(deps *Deps) {
 	api.HandleH("GET /admin/audit-logs/since", admin(http.HandlerFunc(deps.Admin.AuditLog.StreamAuditLogsSince)))
 	api.HandleH("GET /admin/audit-logs/action-types", admin(http.HandlerFunc(deps.Admin.AuditLog.GetAuditLogActionTypes)))
 	api.HandleH("GET /admin/audit-logs/resource-types", admin(http.HandlerFunc(deps.Admin.AuditLog.GetAuditLogResourceTypes)))
+	api.HandleH("GET /admin/audit-logs/{id}/agent-transcript", admin(http.HandlerFunc(deps.Admin.AuditLog.GetAgentTranscript)))
 
 	// OAuth client management (admin-only). Backs the generic OAuth 2.0
 	// authorization-code-with-PKCE server: admins register third-party apps
@@ -92,6 +115,17 @@ func RegisterAdminRoutes(deps *Deps) {
 		api.HandleH("PUT /admin/oauth-clients/{id}", admin(http.HandlerFunc(deps.Admin.OAuthClients.UpdateClient)))
 		api.HandleH("POST /admin/oauth-clients/{id}/rotate-secret", admin(http.HandlerFunc(deps.Admin.OAuthClients.RotateSecret)))
 		api.HandleH("DELETE /admin/oauth-clients/{id}", admin(http.HandlerFunc(deps.Admin.OAuthClients.DeleteClient)))
+	}
+
+	// Agent template catalog (WI-922): system-admin overrides for the Agent
+	// Studio creation catalog. The handler is always available.
+	if deps.Admin.AgentTemplateCatalog != nil {
+		api.HandleH("GET /admin/agent-templates", admin(http.HandlerFunc(deps.Admin.AgentTemplateCatalog.ListTemplates)))
+		api.HandleH("POST /admin/agent-templates", admin(http.HandlerFunc(deps.Admin.AgentTemplateCatalog.CreateTemplate)))
+		api.HandleH("GET /admin/agent-templates/defaults", admin(http.HandlerFunc(deps.Admin.AgentTemplateCatalog.DefaultTemplates)))
+		api.HandleH("GET /admin/agent-templates/{id}", admin(http.HandlerFunc(deps.Admin.AgentTemplateCatalog.GetTemplate)))
+		api.HandleH("PUT /admin/agent-templates/{id}", admin(http.HandlerFunc(deps.Admin.AgentTemplateCatalog.UpdateTemplate)))
+		api.HandleH("DELETE /admin/agent-templates/{id}", admin(http.HandlerFunc(deps.Admin.AgentTemplateCatalog.DeleteTemplate)))
 	}
 
 	// LDAP directory management endpoints (admin-only)
@@ -110,8 +144,11 @@ func RegisterAdminRoutes(deps *Deps) {
 	if deps.Admin.Features != nil {
 		api.HandleH("GET /features", http.HandlerFunc(deps.Admin.Features.GetFeatures))
 	}
+	if deps.Admin.ShellBootstrap != nil {
+		api.HandleH("GET /shell-bootstrap", auth(http.HandlerFunc(deps.Admin.ShellBootstrap.Get)))
+	}
 
-	// Jira Import endpoints
+	// Jira import.
 	api.HandleH("GET /admin/jira-import/connections", admin(http.HandlerFunc(deps.Admin.JiraImport.GetConnections)))
 	api.HandleH("DELETE /admin/jira-import/connections/{connectionId}", admin(http.HandlerFunc(deps.Admin.JiraImport.DeleteConnection)))
 	api.HandleH("POST /admin/jira-import/connect", admin(http.HandlerFunc(deps.Admin.JiraImport.Connect)))

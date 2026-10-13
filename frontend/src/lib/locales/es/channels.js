@@ -1,15 +1,3 @@
-/**
- * Spanish (es) - Channels, Notifications, Portal, and Request Form translations
- *
- * This module contains translations for:
- * - notifications: Notification UI and email verification
- * - channels: Channel management and integration settings
- * - channel: Channel configuration (portal, webhook, email)
- * - portal: Customer portal settings and request types
- * - requestForm: Portal request submission form
- * - requestTypeFields: Field configuration for request types
- */
-
 export default {
   notifications: {
     title: 'Notificaciones',
@@ -72,6 +60,18 @@ export default {
     channelDeleted: 'Canal eliminado correctamente',
     cannotDeleteDefault: 'No se puede eliminar el canal de notificación predeterminado',
     searchChannels: 'Buscar canales...',
+    manager: {
+      subtitle: 'Gestiona los canales bajo tu responsabilidad',
+      purpose: 'Finalidad',
+      publishedAt: 'Publicado en {path}',
+      deliversTo: 'Entrega solicitudes a {workspace}',
+      outboundNotifications: 'Envía notificaciones salientes',
+      outboundEvents: 'Entrega eventos salientes',
+      operational: 'Canal operativo',
+      noChannels: 'No hay canales gestionados',
+      noChannelsDescription: 'Los canales que te asignen aparecerán aquí.',
+      loadFailed: 'No se pudieron cargar los canales',
+    },
     testWebhook: 'Probar webhook',
     webhookSent: '¡Webhook de prueba enviado correctamente!',
     webhookFailed: 'Prueba de webhook fallida',
@@ -259,6 +259,9 @@ export default {
     smtpFromName: 'Nombre del remitente',
     smtpFromNamePlaceholder: 'Nombre para mostrar en correos salientes',
     smtpEncryption: 'Cifrado',
+    smtpSkipTlsVerify: 'Omitir la verificación del certificado',
+    smtpSkipTlsVerifyDescription: 'Permite certificados autofirmados o no confiables solo para este servidor SMTP. Esto reduce la seguridad de la conexión.',
+    smtpNoEncryptionWarning: 'El contenido del correo y los metadatos de entrega se enviarán sin cifrar. Use esta opción solo con un relé SMTP local de confianza.',
     noEncryption: 'Ninguno (no recomendado)',
     authentication: 'Autenticación',
     senderSettings: 'Configuración del remitente',
@@ -587,6 +590,7 @@ export default {
     settings: {
       title: 'Form Settings',
       requireAuth: 'Require authentication',
+      allowAttachments: 'Permitir archivos adjuntos',
       submitButton: 'Submit Button Text',
       successMessage: 'Success Message',
       successMessagePlaceholder: 'Thank you for your submission!',

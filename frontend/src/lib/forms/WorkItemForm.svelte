@@ -1,37 +1,37 @@
 <script>
-  import { MoreHorizontal, Calendar, Flag, User, Layers, ChevronDown, FileText, Briefcase, Hash, Clock } from '@lucide/svelte';
-  import { itemTypeIconMap } from '../utils/icons.js';
+  import { MoreHorizontal, Calendar, Flag, User, Users, Layers, ChevronDown, FileText, Briefcase, Hash, Clock } from '@lucide/svelte';
+  import ItemTypeIcon from '../components/ItemTypeIcon.svelte';
   import { workItemFormStore } from '../stores/workItemFormStore.svelte.js';
-  import { workspacesStore } from '../stores';
+  import { workspacesStore, workspacePermissions } from '../stores';
   import { t } from '../stores/i18n.svelte.js';
-  import { formatDateWithOptions } from '../utils/dateFormatter.js';
+  import { formatDateOnly, formatDueDate } from '../utils/dateFormatter.js';
   import MilkdownEditor from '../editors/LazyMilkdownEditor.svelte';
   import ChipPicker from '../pickers/ChipPicker.svelte';
   import CustomFieldRenderer from '../features/items/CustomFieldRenderer.svelte';
   import PriorityPicker from '../pickers/PriorityPicker.svelte';
   import MilestoneCombobox from '../pickers/MilestoneCombobox.svelte';
   import UserPicker from '../pickers/UserPicker.svelte';
-  import PersonalLabelCombobox from '../pickers/PersonalLabelCombobox.svelte';
+  import TeamPicker from '../pickers/TeamPicker.svelte';
+  import WorkspaceLabelCombobox from '../pickers/WorkspaceLabelCombobox.svelte';
   import Label from '../components/Label.svelte';
+  import Input from '../components/Input.svelte';
+  import NativeSelect from '../components/NativeSelect.svelte';
   import AlertBox from '../components/AlertBox.svelte';
   import { createPopover, melt } from '@melt-ui/svelte'; // used for dueDateTrigger/dueDateContent
   import { Milestone as MilestoneIcon } from '@lucide/svelte';
 
   let {
-    nameInputRef = $bindable(null)
+    nameInputRef = $bindable(null),
+    formStore = workItemFormStore,
   } = $props();
 
   // Use the store
-  const store = workItemFormStore;
+  let store = $derived(formStore);
 
   // Track priority object for display (not persisted)
   let selectedPriorityObj = $state(null);
 
   // Derived state for UI
-  let selectedItemTypeIcon = $derived(
-    store.selectedItemType?.icon ? itemTypeIconMap[store.selectedItemType.icon] : Layers
-  );
-
   // Additional fields toggle
   let showAdditionalFields = $state(false);
 
@@ -65,17 +65,17 @@
     forceVisible: true
   });
 
-  // Helper functions
-  function formatDueDate(dateStr) {
-    if (!dateStr) return null;
-    const date = new Date(dateStr);
-    const today = new Date();
-    const diffDays = Math.ceil((date.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-    if (diffDays === 0) return t('common.today');
-    if (diffDays === 1) return t('common.tomorrow');
-    if (diffDays === -1) return t('common.yesterday');
-    if (diffDays > 0 && diffDays <= 7) return `${diffDays} days`;
-    return formatDateWithOptions(date, { month: 'short', day: 'numeric' });
+  // Optional dates are presented as chips. Open the browser's native calendar
+  // as soon as the chip mounts its input so setting a date remains a one-click
+  // interaction. The focused, visible input is the fallback when showPicker is
+  // unavailable or the browser declines the programmatic picker request.
+  function focusAndShowDatePicker(node) {
+    node.focus();
+    try {
+      node.showPicker?.();
+    } catch {
+      // Keep the focused input available for manual entry.
+    }
   }
 
   // Reactive effects for data loading based on form state
@@ -109,10 +109,12 @@
     }
   });
 
-  // Apply stored workspace when workspaces are available
+  // Apply stored workspace when workspaces are available, restricted to
+  // workspaces where item.create is held (the create endpoint denies the
+  // rest with 404).
   $effect(() => {
     if (!store.formData.workspace_id && store.storedWorkspaceId && $workspacesStore.regularWorkspaces.length > 0) {
-      store.applyStoredWorkspace($workspacesStore.regularWorkspaces);
+      store.applyStoredWorkspace($workspacesStore.regularWorkspaces.filter((workspace) => workspacePermissions.canCreate(workspace.id)));
     }
   });
 
@@ -179,12 +181,13 @@
   {/if}
 
   <!-- Title Input -->
-  <input
-    bind:this={nameInputRef}
+  <Input
+    bind:inputRef={nameInputRef}
     bind:value={store.formData.name}
     type="text"
     id="work-item-title"
-    aria-label={t('createModal.issueTitle')}
+    ariaLabel={t('createModal.issueTitle')}
+    variant="ghost"
     class="w-full text-lg font-medium border-0 outline-none bg-transparent"
     style="color: var(--ds-text);"
     placeholder={t('createModal.issueTitle')}
@@ -213,19 +216,26 @@
   <div class="flex flex-wrap items-center gap-2 pt-2 border-t" style="border-color: var(--ds-border);">
     <!-- Item Type Chip -->
     {#if store.availableItemTypes.length >= 1}
+      <!-- Keep the picker inert until the workspace's config set resolves:
+           applying its item-type restrictions late re-renders the option list
+           (and can switch the selection), which hijacks an in-flight click
+           onto the wrong option. -->
       <ChipPicker
         value={store.formData.item_type_id}
         items={store.availableItemTypes}
         getValue={(t) => t.id}
         getLabel={(t) => t.name}
-        icon={selectedItemTypeIcon}
+        icon={Layers}
         placeholder={t('createModal.type')}
         testId="create-item-type-chip"
+        disabled={!!store.formData.workspace_id && store.configSetLoadedForWorkspace !== store.formData.workspace_id}
         onSelect={(itemType) => store.setItemType(itemType.id)}
       >
+        {#snippet triggerSnippet({ item })}
+          <ItemTypeIcon itemType={item} />
+        {/snippet}
         {#snippet itemSnippet({ item })}
-          {@const TypeIcon = item.icon ? itemTypeIconMap[item.icon] : Layers}
-          <TypeIcon size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
+          <ItemTypeIcon itemType={item} />
           <span>{item.name}</span>
         {/snippet}
       </ChipPicker>
@@ -276,10 +286,8 @@
             <div
               role="button"
               tabindex="0"
-              class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-              style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: {store.formData.priority_id ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-              onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-              onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-surface)'}
+              class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+              style="color: {store.formData.priority_id ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
             >
               <Flag size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
               <span class="truncate max-w-[120px]">{selectedPriorityObj?.name || t('createModal.priority')}</span>
@@ -312,10 +320,8 @@
           <div
             role="button"
             tabindex="0"
-            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-            style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: {store.formData.assignee_id ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-surface)'}
+            class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+            style="color: {store.formData.assignee_id ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
           >
             <User size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
             <span class="truncate max-w-[120px]">{store.selectedAssignee?.name || store.selectedAssignee?.email || t('createModal.assignee')}</span>
@@ -325,14 +331,34 @@
       </UserPicker>
     {/if}
 
+    <!-- Team Chip -->
+    {#if store.isFieldConfigured('team') && !store.isFieldRequired('team')}
+      <TeamPicker bind:value={store.formData.team_id} placeholder={t('createModal.team')}>
+        {#snippet children()}
+          <!-- svelte-ignore a11y_no_static_element_interactions a11y_no_noninteractive_element_to_interactive_role -->
+          <div
+            role="button"
+            tabindex="0"
+            data-testid="create-team-chip"
+            class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+            style="color: {store.formData.team_id ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
+          >
+            <Users size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
+            <span class="truncate max-w-[120px]">{store.selectedTeam?.name || t('createModal.team')}</span>
+            <ChevronDown size={12} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
+          </div>
+        {/snippet}
+      </TeamPicker>
+    {/if}
+
     <!-- Due Date Chip -->
     {#if store.isFieldConfigured('due_date') && !store.isFieldRequired('due_date')}
       <button
         use:melt={$dueDateTrigger}
-        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-        style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: {store.formData.due_date ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-        onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-        onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-surface)'}
+        data-testid="create-due-date-chip"
+        data-value={store.formData.due_date}
+        class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+        style="color: {store.formData.due_date ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
       >
         <Calendar size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
         <span class="truncate max-w-[120px]">{store.formData.due_date ? formatDueDate(store.formData.due_date) : t('createModal.dueDate')}</span>
@@ -342,16 +368,17 @@
       {#if $dueDateOpen}
         <div
           use:melt={$dueDateContent}
-          class="z-50 rounded-lg shadow-lg p-3"
+          class="z-[70] rounded-lg shadow-lg p-3"
           style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);"
         >
           <input
             type="date"
+            data-testid="create-due-date-input"
             bind:value={store.formData.due_date}
+            use:focusAndShowDatePicker
             aria-label={t('createModal.dueDate')}
             class="w-full px-3 py-2 rounded border text-sm"
             style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            onchange={() => $dueDateOpen = false}
           />
         </div>
       {/if}
@@ -361,29 +388,29 @@
     {#if store.isFieldConfigured('start_date') && !store.isFieldRequired('start_date')}
       <button
         use:melt={$startDateTrigger}
-        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-        style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: {store.formData.start_date ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-        onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-        onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-surface)'}
+        data-testid="create-start-date-chip"
+        class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+        style="color: {store.formData.start_date ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
       >
         <Calendar size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
-        <span class="truncate max-w-[120px]">{store.formData.start_date ? formatDueDate(store.formData.start_date) : t('common.startDate')}</span>
+        <span class="truncate max-w-[120px]">{store.formData.start_date ? formatDateOnly(store.formData.start_date) : t('common.startDate')}</span>
         <ChevronDown size={12} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
       </button>
 
       {#if $startDateOpen}
         <div
           use:melt={$startDateContent}
-          class="z-50 rounded-lg shadow-lg p-3"
+          class="z-[70] rounded-lg shadow-lg p-3"
           style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);"
         >
           <input
             type="date"
+            data-testid="create-start-date-input"
             bind:value={store.formData.start_date}
+            use:focusAndShowDatePicker
             aria-label={t('common.startDate')}
             class="w-full px-3 py-2 rounded border text-sm"
             style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            onchange={() => $startDateOpen = false}
           />
         </div>
       {/if}
@@ -393,29 +420,29 @@
     {#if store.isFieldConfigured('end_date') && !store.isFieldRequired('end_date')}
       <button
         use:melt={$endDateTrigger}
-        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-        style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: {store.formData.end_date ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-        onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-        onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-surface)'}
+        data-testid="create-end-date-chip"
+        class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+        style="color: {store.formData.end_date ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
       >
         <Calendar size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
-        <span class="truncate max-w-[120px]">{store.formData.end_date ? formatDueDate(store.formData.end_date) : t('common.endDate')}</span>
+        <span class="truncate max-w-[120px]">{store.formData.end_date ? formatDateOnly(store.formData.end_date) : t('common.endDate')}</span>
         <ChevronDown size={12} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
       </button>
 
       {#if $endDateOpen}
         <div
           use:melt={$endDateContent}
-          class="z-50 rounded-lg shadow-lg p-3"
+          class="z-[70] rounded-lg shadow-lg p-3"
           style="background-color: var(--ds-surface-raised); border: 1px solid var(--ds-border);"
         >
           <input
             type="date"
+            data-testid="create-end-date-input"
             bind:value={store.formData.end_date}
+            use:focusAndShowDatePicker
             aria-label={t('common.endDate')}
             class="w-full px-3 py-2 rounded border text-sm"
             style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            onchange={() => $endDateOpen = false}
           />
         </div>
       {/if}
@@ -454,19 +481,20 @@
     <!-- Story Points Chip -->
     {#if store.isFieldConfigured('story_points') && !store.isFieldRequired('story_points')}
       <label
-        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-        style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text-subtle);"
+        class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+        style="color: var(--ds-text-subtle);"
       >
         <Hash size={14} style="flex-shrink: 0;" />
-        <input
+        <Input
           type="number"
           min="0"
           step="0.5"
           bind:value={store.formData.story_points}
+          variant="ghost"
           class="w-20 bg-transparent outline-none text-sm"
           style="color: var(--ds-text);"
           placeholder={t('items.storyPoints')}
-          aria-label={t('items.storyPoints')}
+          ariaLabel={t('items.storyPoints')}
         />
       </label>
     {/if}
@@ -474,17 +502,18 @@
     <!-- Estimate Chip -->
     {#if store.isFieldConfigured('estimate') && !store.isFieldRequired('estimate')}
       <label
-        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-        style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text-subtle);"
+        class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+        style="color: var(--ds-text-subtle);"
       >
         <Clock size={14} style="flex-shrink: 0;" />
-        <input
+        <Input
           type="text"
           bind:value={store.formData.estimate}
+          variant="ghost"
           class="w-20 bg-transparent outline-none text-sm"
           style="color: var(--ds-text);"
           placeholder={t('items.estimate') || 'Estimate'}
-          aria-label={t('items.estimate') || 'Estimate'}
+          ariaLabel={t('items.estimate') || 'Estimate'}
         />
       </label>
     {/if}
@@ -495,31 +524,33 @@
         multiple={true}
         bind:value={store.formData.milestone_ids}
         workspaceId={store.selectedWorkspace?.id}
+        milestones={store.milestones}
+        loading={store.milestonesLoading}
         placeholder={t('createModal.noMilestone')}
       >
         {#snippet children()}
+          {@const selectedIds = Array.isArray(store.formData.milestone_ids) ? store.formData.milestone_ids : []}
           {@const selected = store.selectedMilestones}
           <!-- svelte-ignore a11y_no_static_element_interactions a11y_no_noninteractive_element_to_interactive_role -->
           <div
             role="button"
             tabindex="0"
-            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
-            style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: {selected.length > 0 ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
-            onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-            onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-surface)'}
+            data-testid="create-milestone-chip"
+            class="chip inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-sm transition-colors"
+            style="color: {selectedIds.length > 0 ? 'var(--ds-text)' : 'var(--ds-text-subtle)'};"
           >
-            {#if selected.length > 0 && selected[0].category_color}
+            {#if selectedIds.length === 1 && selected[0]?.category_color}
               <div class="w-2 h-2 rounded-full flex-shrink-0" style="background-color: {selected[0].category_color};"></div>
             {:else}
               <MilestoneIcon size={14} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
             {/if}
             <span class="truncate max-w-[160px]">
-              {#if selected.length === 0}
+              {#if selectedIds.length === 0}
                 {t('createModal.milestoneField')}
-              {:else if selected.length === 1}
+              {:else if selectedIds.length === 1 && selected[0]?.name}
                 {selected[0].name}
               {:else}
-                {selected[0].name} +{selected.length - 1}
+                {t('pickers.milestonesSelected', { count: selectedIds.length })}
               {/if}
             </span>
             <ChevronDown size={12} style="color: var(--ds-text-subtle); flex-shrink: 0;" />
@@ -532,6 +563,8 @@
     {#if store.nonRequiredFullSystemFields.length > 0 || store.nonRequiredCustomFields.length > 0}
       <button
         onclick={() => showAdditionalFields = !showAdditionalFields}
+        aria-label={t('createModal.additionalFields')}
+        data-testid="create-additional-fields-toggle"
         class="inline-flex items-center px-2 py-1 rounded-full text-sm transition-colors"
         style="background-color: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text-subtle);"
         onmouseover={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
@@ -554,28 +587,34 @@
         {#if field.field_identifier === 'labels'}
           <div class="space-y-1">
             <Label color="default">{t('items.labels') || 'Labels'}</Label>
-            <PersonalLabelCombobox
-              bind:value={store.formData.personal_label_names}
+            <WorkspaceLabelCombobox
+              id="create-label-picker-input"
+              testidPrefix="create-label-picker"
+              workspaceId={store.formData.workspace_id}
+              bind:value={store.formData.label_names}
               placeholder={t('items.selectOrCreateLabels') || 'Select or create labels...'}
               onSelect={(result) => {
-                store.formData.personal_label_names = result?.value || [];
-                store.selectedPersonalLabels = result?.labels || [];
+                store.formData.label_names = result?.value || [];
+                store.selectedLabels = result?.labels || [];
               }}
             />
           </div>
         {/if}
       {/each}
       {#each store.nonRequiredCustomFields as field}
-        <CustomFieldRenderer
-          {field}
-          bind:value={store.customFieldValues[field.id]}
-          readonly={false}
-          onChange={(val) => store.customFieldValues[field.id] = val}
-          milestones={store.milestones}
-          iterations={store.iterations}
-          isDarkMode={false}
-          autoOpenPickers={false}
-        />
+        <div class="space-y-1">
+          <Label color="default">{field.name}</Label>
+          <CustomFieldRenderer
+            {field}
+            bind:value={store.customFieldValues[field.id]}
+            readonly={false}
+            onChange={(val) => store.customFieldValues[field.id] = val}
+            milestones={store.milestones}
+            iterations={store.iterations}
+            isDarkMode={false}
+            autoOpenPickers={false}
+          />
+        </div>
       {/each}
     </div>
   {/if}
@@ -608,12 +647,11 @@
             <Label color="default" for="work-item-due-date-required">
               {t('createModal.dueDate')} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <input
+            <Input
               type="date"
               id="work-item-due-date-required"
               bind:value={store.formData.due_date}
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+              size="medium"
             />
           </div>
         {:else if field.field_identifier === 'start_date'}
@@ -621,12 +659,11 @@
             <Label color="default" for="work-item-start-date-required">
               {t('common.startDate')} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <input
+            <Input
               type="date"
               id="work-item-start-date-required"
               bind:value={store.formData.start_date}
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+              size="medium"
             />
           </div>
         {:else if field.field_identifier === 'end_date'}
@@ -634,12 +671,11 @@
             <Label color="default" for="work-item-end-date-required">
               {t('common.endDate')} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <input
+            <Input
               type="date"
               id="work-item-end-date-required"
               bind:value={store.formData.end_date}
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+              size="medium"
             />
           </div>
         {:else if field.field_identifier === 'milestone'}
@@ -651,6 +687,8 @@
               multiple={true}
               bind:value={store.formData.milestone_ids}
               workspaceId={store.selectedWorkspace?.id}
+              milestones={store.milestones}
+              loading={store.milestonesLoading}
               placeholder={t('createModal.noMilestone')}
             />
           </div>
@@ -665,51 +703,53 @@
               workspaceId={store.formData.workspace_id}
             />
           </div>
+        {:else if field.field_identifier === 'team'}
+          <div class="space-y-1">
+            <Label color="default">
+              {t('createModal.team')} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
+            </Label>
+            <TeamPicker bind:value={store.formData.team_id} placeholder={t('items.noTeam')} />
+          </div>
         {:else if field.field_identifier === 'iteration'}
           <div class="space-y-1">
             <Label color="default" for="work-item-iteration-required">
               {t('items.iteration')} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <select
+            <NativeSelect
               id="work-item-iteration-required"
-              bind:value={store.formData.iteration_id}
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            >
-              <option value={null}>{t('items.selectIteration')}</option>
-              {#each store.iterations as iteration}
-                <option value={iteration.id}>{iteration.name}</option>
-              {/each}
-            </select>
+              value={store.formData.iteration_id == null ? '' : String(store.formData.iteration_id)}
+              options={store.iterations.map((iteration) => ({ value: String(iteration.id), label: iteration.name }))}
+              placeholder={t('items.selectIteration')}
+              onchange={(value) => store.formData.iteration_id = value ? Number(value) : null}
+            />
           </div>
         {:else if field.field_identifier === 'project'}
           <div class="space-y-1">
             <Label color="default" for="work-item-project-required">
               {t('items.project')} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <select
+            <NativeSelect
               id="work-item-project-required"
-              bind:value={store.formData.project_id}
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            >
-              <option value={null}>{t('pickers.selectProject')}</option>
-              {#each store.timeProjects as project}
-                <option value={project.id}>{project.name}</option>
-              {/each}
-            </select>
+              value={store.formData.project_id == null ? '' : String(store.formData.project_id)}
+              options={store.timeProjects.map((project) => ({ value: String(project.id), label: project.name }))}
+              placeholder={t('pickers.selectProject')}
+              onchange={(value) => store.formData.project_id = value ? Number(value) : null}
+            />
           </div>
         {:else if field.field_identifier === 'labels'}
           <div class="space-y-1">
             <Label color="default">
               {t('items.labels') || 'Labels'} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <PersonalLabelCombobox
-              bind:value={store.formData.personal_label_names}
+            <WorkspaceLabelCombobox
+              id="create-label-picker-input"
+              testidPrefix="create-label-picker"
+              workspaceId={store.formData.workspace_id}
+              bind:value={store.formData.label_names}
               placeholder={t('items.selectOrCreateLabels') || 'Select or create labels...'}
               onSelect={(result) => {
-                store.formData.personal_label_names = result?.value || [];
-                store.selectedPersonalLabels = result?.labels || [];
+                store.formData.label_names = result?.value || [];
+                store.selectedLabels = result?.labels || [];
               }}
             />
           </div>
@@ -718,14 +758,13 @@
             <Label color="default" for="work-item-story-points-required">
               {t('items.storyPoints')} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <input
+            <Input
               id="work-item-story-points-required"
               type="number"
               min="0"
               step="0.5"
               bind:value={store.formData.story_points}
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+              size="medium"
             />
           </div>
         {:else if field.field_identifier === 'estimate' || field.field_identifier === 'estimate_minutes'}
@@ -733,13 +772,12 @@
             <Label color="default" for="work-item-estimate-required">
               {t('items.estimate') || 'Estimate'} <span style="color: var(--ds-text-danger, #ef4444);">*</span>
             </Label>
-            <input
+            <Input
               id="work-item-estimate-required"
               type="text"
               bind:value={store.formData.estimate}
               placeholder="3d 4h"
-              class="w-full px-3 py-2 rounded border text-sm"
-              style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
+              size="medium"
             />
           </div>
         {/if}
@@ -769,3 +807,15 @@
     </div>
   {/if}
 </div>
+
+<style>
+  /* Form chips: neutral surface chip that lifts on hover. */
+  .chip {
+    background-color: var(--ds-surface);
+    border: 1px solid var(--ds-border);
+  }
+
+  .chip:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+</style>

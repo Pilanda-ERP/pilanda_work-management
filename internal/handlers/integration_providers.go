@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"windshift/internal/integrations"
 	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
@@ -12,7 +13,7 @@ import (
 	"windshift/internal/sso"
 	"windshift/internal/utils"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // IntegrationProviderHandler handles admin CRUD for integration providers
@@ -101,13 +102,10 @@ func (h *IntegrationProviderHandler) CreateProvider(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Validate provider type
-	validTypes := map[string]bool{
-		string(models.IntegrationProviderNotion):  true,
-		string(models.IntegrationProviderTodoist): true,
-	}
-	if !validTypes[req.ProviderType] {
-		respondBadRequest(w, r, "Invalid provider type. Supported: notion, todoist")
+	// Provider capabilities are declared centrally so adding a provider does
+	// not require another hardcoded allowlist in this handler.
+	if !integrations.SupportsAdminProviderCRUD(models.IntegrationProviderType(req.ProviderType)) {
+		respondBadRequest(w, r, "Provider type is not managed by this endpoint")
 		return
 	}
 
@@ -264,7 +262,7 @@ func (h *IntegrationProviderHandler) audit(r *http.Request, action string, p *re
 	if user == nil {
 		return
 	}
-	h.auditor.LogWithDetails(r, user, action, logger.ResourceIntegrationProvider, nil, p.Name, map[string]interface{}{
+	h.auditor.LogWithDetails(r, user, action, logger.ResourceIntegrationProvider, nil, p.Name, map[string]any{
 		"provider_id":     p.ID,
 		"slug":            p.Slug,
 		"provider_type":   p.ProviderType,

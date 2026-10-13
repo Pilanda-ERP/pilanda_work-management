@@ -1,16 +1,13 @@
-// Package aitools holds the canonical implementations of every tool exposed
-// to AI agents. Both the in-app LLM agent (internal/handlers/ai_tools.go)
-// and the external MCP server (internal/mcp) are thin adapters over this
-// package — they translate protocol-specific request shapes into an Env +
-// typed Args, dispatch through the Registry, and translate the returned
-// value back to their protocol's response shape. A new tool registers in
-// one place here and is automatically available on both surfaces.
+// Package aitools provides canonical agent tools shared by in-app chat and MCP
+// adapters through one registry.
 package aitools
 
 import (
+	"fmt"
 	"log/slog"
 
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/logger"
 	"windshift/internal/services"
 )
@@ -19,31 +16,44 @@ import (
 // to tag audit-log entries so cookie-auth writes (HTTP handlers) can be
 // distinguished from agent-driven writes (chat / MCP).
 const (
-	SourceAIChat = "ai_chat"
-	SourceMCP    = "mcp"
+	SourceAIChat        = "ai_chat"
+	SourceMCP           = "mcp"
+	SourceStandardAgent = "standard_agent"
 )
 
-// Env carries everything a tool's Run function needs: the database handle,
-// the calling user, their accessible workspace IDs (pre-computed by the
-// adapter), and the services it might call into.
-//
-// AccessibleWorkspaceIDs is the canonical permission gate — tools that
-// touch workspace-scoped data must check membership against this set
-// before returning anything. The list is populated differently per
-// adapter (LLM pre-computes once at chat-start; MCP loads per-call from
-// context) but the contract is the same: only IDs the caller can read.
+// Env provides tools their caller, services, and readable workspaces. Tools
+// must gate workspace data through AccessibleWorkspaceIDs regardless of adapter.
 type Env struct {
-	DB                     database.Database
-	UserID                 int
-	Username               string // Cached at Env-construction time for audit logs
-	Source                 string // SourceAIChat | SourceMCP — for audit trail
+	DB       database.Database
+	UserID   int
+	Username string // Cached at Env-construction time for audit logs
+	Timezone string // Validated IANA timezone for the acting user
+	Source   string // SourceAIChat | SourceMCP — for audit trail
+	// RunID is the agent_runs row this invocation belongs to, when the caller
+	// has one (the chat, the coding agent). It is what lets a resulting change
+	// name the turn that caused it — the model and cost behind the edit. Zero
+	// for surfaces with no run to point at, such as MCP.
+	RunID                  int
 	AccessibleWorkspaceIDs []int
+	// AuditDetails contains adapter-supplied correlation identifiers only.
+	// Raw tool arguments and results must never be placed here.
+	AuditDetails map[string]any
 
 	PermService     *services.PermissionService
 	TimePermService *services.TimePermissionService
 	TimerService    *services.TimerService
 	CommentService  *services.CommentService
 	ApprovalService *services.ApprovalService
+	// ItemDeletionService is the fully wired user-facing destructive pipeline.
+	// MCP receives the instance shared with cookie and REST v1; chat embeddings
+	// may leave it nil and tools construct a side-effect-light fallback.
+	ItemDeletionService *services.ItemDeletionApplicationService
+	// PageApplicationService is the shared permission-aware page mutation
+	// pipeline. MCP receives the production instance used by both HTTP
+	// surfaces; chat embeddings may use the nil-safe fallback in pages.go.
+	PageApplicationService *services.PageApplicationService
+	// PageDiagramService owns immutable Page-diagram attachment mutations.
+	PageDiagramService *services.PageDiagramService
 	// ActionService is the optional cache-invalidation hook for tools that
 	// create or mutate actions. Nil-safe: tools must check before calling
 	// InvalidateWorkspaceCache so they degrade to "next periodic refresh"
@@ -55,7 +65,6 @@ type Env struct {
 // Resource* constant for (their HTTP surfaces don't write central audit rows
 // yet). Kept here so every aitools call site spells them identically.
 const (
-	resourcePage        = "page"
 	resourceDiagram     = "diagram"
 	resourceItemLink    = "item_link"
 	resourceTimeWorklog = "time_worklog"
@@ -81,9 +90,12 @@ func (e *Env) AuditWrite(entityType string, entityID int, toolName, summary stri
 // actions.go's emitActionAudit both funnel through it. IP/UserAgent are
 // empty by design: the call originates from the chat/MCP adapter, not a
 // direct HTTP request.
-func (e *Env) audit(actionType, resourceType string, resourceID int, resourceName string, details map[string]interface{}) {
+func (e *Env) audit(actionType, resourceType string, resourceID int, resourceName string, details map[string]any) {
 	if details == nil {
-		details = map[string]interface{}{}
+		details = map[string]any{}
+	}
+	for key, value := range e.AuditDetails {
+		details[key] = value
 	}
 	source := e.Source
 	if source == "" {
@@ -120,4 +132,34 @@ func (e *Env) HasWorkspaceAccess(workspaceID int) bool {
 		}
 	}
 	return false
+}
+
+// eventMetadata describes this adapter's writes as agent-actor provenance, so
+// the durable event store and the item-history feed can both answer "an agent
+// did this on the user's behalf, through which surface?". ActorRef carries the
+// human the agent acts as — the identity every tool's permission check already
+// used, so the audit trail attributes the change to the same principal.
+//
+// Source falls back to "agent" when an embedder left it unset: writing
+// "application" would be a lie (this is not a direct UI click) and would make
+// the history feed's source column non-empty but unmatchable.
+func (e *Env) eventMetadata() itemevents.Metadata {
+	source := e.Source
+	if source == "" {
+		source = "agent"
+	}
+	metadata := itemevents.Agent(fmt.Sprintf("user:%d", e.UserID), source)
+	metadata.AgentRunID = e.RunID
+	return metadata
+}
+
+// historyRunID is the agent run to attribute a history row to, or nil when this
+// surface has no run to point at (MCP) — a row must not claim a turn that does
+// not exist.
+func (e *Env) historyRunID() *int {
+	if e.RunID <= 0 {
+		return nil
+	}
+	runID := e.RunID
+	return &runID
 }

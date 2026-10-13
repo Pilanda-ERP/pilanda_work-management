@@ -5,6 +5,7 @@
   import { api } from '../../api.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast, successToast } from '../../stores/toasts.svelte.js';
+  import { isSystemAdmin } from '../../stores/permissions.svelte.js';
   import { channelCategoriesStore } from '../../stores/channelCategories.js';
   import { formBuilderStore } from '../../stores/formBuilderStore.svelte.js';
   import ChannelAdminShell from './ChannelAdminShell.svelte';
@@ -14,13 +15,19 @@
   import FormIntegrationPanel from './FormIntegrationPanel.svelte';
   import ChannelManagersTab from '../../settings/ChannelManagersTab.svelte';
   import CreateFormModal from './CreateFormModal.svelte';
-  import { channelBasicFormData, parseChannelConfig, saveChannelSettings } from './channelAdmin.js';
+  import {
+    channelBasicFormData,
+    parseChannelConfig,
+    prepareFormChannelForWorkspace,
+    saveChannelSettings,
+  } from './channelAdmin.js';
 
   let channel = $state(null);
   let loading = $state(true);
   let saving = $state(false);
   let activeTab = $state('forms');
   let showCreateModal = $state(false);
+  let loadSequence = 0;
 
   let formConfigRef = $state(null);
 
@@ -44,23 +51,34 @@
   let channelId = $derived(parseInt($currentRoute.path.match(/\/admin\/channels\/(\d+)\/forms/)?.[1]));
 
   onMount(async () => {
-    formBuilderStore.reset();
     await channelCategoriesStore.init();
-    await loadChannel();
+  });
+
+  $effect(() => {
+    const id = channelId;
+    if (Number.isInteger(id) && id > 0) {
+      formBuilderStore.reset();
+      void loadChannel(id);
+    }
   });
 
   onDestroy(() => {
     formBuilderStore.reset();
   });
 
-  async function loadChannel() {
+  async function loadChannel(id) {
+    const requestSequence = ++loadSequence;
     try {
       loading = true;
-      channel = await api.channels.get(channelId);
+      const loadedChannel = await api.channels.get(id);
+      if (loadedChannel.type !== 'form' || loadedChannel.direction !== 'inbound') {
+        throw new Error('This route requires an inbound form channel');
+      }
+      const config = parseChannelConfig(loadedChannel.config);
+      if (requestSequence !== loadSequence) return;
+      channel = loadedChannel;
 
       channelFormData = channelBasicFormData(channel);
-
-      const config = parseChannelConfig(channel.config);
       formChannelFormData = {
         slug: config.form_slug || '',
         workspace_ids: config.form_workspace_ids || [],
@@ -72,10 +90,12 @@
         redirect_url: config.form_redirect_url || '',
       };
     } catch (err) {
+      if (requestSequence !== loadSequence) return;
       console.error('Failed to load channel:', err);
-      errorToast('Failed to load channel');
+      channel = null;
+      errorToast(err.message || 'Failed to load channel');
     } finally {
-      loading = false;
+      if (requestSequence === loadSequence) loading = false;
     }
   }
 
@@ -100,7 +120,7 @@
         enabled: formChannelFormData.enabled,
       });
 
-      channel = await api.channels.get(channelId);
+      await loadChannel(channelId);
       successToast(t('common.saved'));
     } catch (err) {
       console.error('Failed to save:', err);
@@ -114,12 +134,27 @@
     formBuilderStore.loadForms(channelId);
   }
 
-  const tabs = [
+  async function prepareFormCreation(workspaceId) {
+    const prepared = await prepareFormChannelForWorkspace({
+      channel,
+      workspaceIds: formChannelFormData.workspace_ids,
+      workspaceId,
+    });
+    formChannelFormData.workspace_ids = prepared.workspaceIds;
+    formChannelFormData.enabled = prepared.status === 'enabled';
+    channel = { ...channel, status: prepared.status };
+  }
+
+  let tabs = $derived([
     { id: 'forms', label: () => t('forms.title'), icon: IconForms },
     { id: 'settings', label: () => t('channel.configuration'), icon: IconSettings },
-    { id: 'integration', label: () => t('forms.integration.title'), icon: IconCode },
-    { id: 'managers', label: () => t('channel.managers'), icon: IconUsers },
-  ];
+    ...(formBuilderStore.forms.length > 0
+      ? [{ id: 'integration', label: () => t('forms.integration.title'), icon: IconCode }]
+      : []),
+    ...($isSystemAdmin
+      ? [{ id: 'managers', label: () => t('channel.managers'), icon: IconUsers }]
+      : []),
+  ]);
 </script>
 
 <ChannelAdminShell
@@ -136,8 +171,12 @@
       <div class="px-16 py-8">
         <FormBuilder
           {channelId}
+          channelSlug={formChannelFormData.slug}
+          channelBrandColor={formChannelFormData.brand_color}
+          channelWorkspaceIds={formChannelFormData.workspace_ids}
           onBack={() => navigate('/admin/channels')}
           onCreateForm={() => showCreateModal = true}
+          onOpenSettings={() => activeTab = 'settings'}
           embedded={false}
         />
       </div>
@@ -161,7 +200,7 @@
           </div>
         {/if}
       </div>
-    {:else if tabId === 'managers'}
+    {:else if tabId === 'managers' && $isSystemAdmin}
       <div class="px-16 py-8">
         <ChannelManagersTab
           channelId={channel.id}
@@ -176,7 +215,7 @@
     <CreateFormModal
       bind:isOpen={showCreateModal}
       channelId={channelId}
-      channelWorkspaceIds={formChannelFormData.workspace_ids}
+      onPrepare={prepareFormCreation}
       onCreated={handleFormCreated}
       onClose={() => showCreateModal = false}
     />

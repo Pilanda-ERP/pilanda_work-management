@@ -9,7 +9,22 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"windshift/internal/utils"
 )
+
+const maxOAuthResponseBytes = 1 << 20
+
+func readOAuthResponseBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxOAuthResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxOAuthResponseBytes {
+		return nil, fmt.Errorf("OAuth response exceeds %d bytes", maxOAuthResponseBytes)
+	}
+	return data, nil
+}
 
 // fetchOAuthJSON performs an authenticated GET request using a bearer token and
 // decodes the JSON response into the provided target. This is the common pattern
@@ -21,22 +36,22 @@ func fetchOAuthJSON(ctx context.Context, endpoint, accessToken string, target an
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := utils.NewHTTPClient(30 * time.Second)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("user info request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, readErr := readOAuthResponseBody(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("failed to read user info response: %w", readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return fmt.Errorf("user info request failed with status %d; failed to read response body: %w", resp.StatusCode, readErr)
-		}
 		return fmt.Errorf("user info request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+	if err := json.Unmarshal(body, target); err != nil {
 		return fmt.Errorf("failed to parse user info: %w", err)
 	}
 
@@ -52,14 +67,14 @@ func exchangeOAuthToken(ctx context.Context, tokenURL string, params url.Values)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := utils.NewHTTPClient(30 * time.Second)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readOAuthResponseBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
@@ -83,6 +98,9 @@ func exchangeOAuthToken(ctx context.Context, tokenURL string, params url.Values)
 
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return nil, fmt.Errorf("token response did not include an access token")
 	}
 
 	tokens := &OAuthTokens{

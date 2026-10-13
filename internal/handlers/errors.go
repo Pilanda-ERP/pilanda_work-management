@@ -1,13 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 
 	"windshift/internal/jira"
 	"windshift/internal/restapi"
-	"windshift/internal/services"
 )
 
 // Error response helpers for legacy handlers
@@ -85,9 +85,22 @@ func respondValidationError(w http.ResponseWriter, r *http.Request, message stri
 	restapi.RespondError(w, r, err)
 }
 
-// respondInternalError logs the error and writes a 500 Internal Server Error JSON response
-// The actual error message is logged but not exposed to the client
+// respondInternalError logs the error and writes a 500 Internal Server Error
+// JSON response. A canceled request context is expected client control flow, so
+// it is logged at debug level and answered with 408 instead. The actual error
+// message is logged but not exposed to the client.
 func respondInternalError(w http.ResponseWriter, r *http.Request, err error) {
+	// A canceled context means the client went away while the request was in
+	// flight (navigation or reload). That is expected control flow, not a server
+	// fault, so it must not be logged as an internal error.
+	if errors.Is(err, context.Canceled) {
+		slog.Debug("request canceled by client",
+			slog.String("path", r.URL.Path),
+			slog.String("method", r.Method),
+		)
+		restapi.RespondError(w, r, restapi.NewAPIError(http.StatusRequestTimeout, "REQUEST_CANCELED", "Request was canceled"))
+		return
+	}
 	slog.Error("internal server error",
 		slog.Any("error", err),
 		slog.String("path", r.URL.Path),
@@ -96,14 +109,9 @@ func respondInternalError(w http.ResponseWriter, r *http.Request, err error) {
 	restapi.RespondError(w, r, restapi.ErrInternalError)
 }
 
-// respondJiraUpstreamError returns 502 Bad Gateway with a stable code/message
-// pair the frontend can branch on for upstream Jira failures.
-//
-// We intentionally avoid 401 because the frontend's fetchAPI treats every 401
-// as "Windshift session expired" and force-logs the user out — a revoked Jira
-// token is an *upstream* problem, not a session one. 502 captures that
-// distinction and lets the wizard show a "Reconnect" CTA without touching
-// the user's Windshift auth.
+// respondJiraUpstreamError uses stable 502 codes. It must not return 401,
+// which fetchAPI interprets as a Windshift-session expiry rather than a Jira
+// reconnection problem.
 func respondJiraUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
 	code := "JIRA_UPSTREAM_ERROR"
 	message := "Jira request failed."
@@ -138,27 +146,6 @@ func respondConflict(w http.ResponseWriter, r *http.Request, message string) {
 	restapi.RespondError(w, r, err)
 }
 
-// respondTransitionRejection maps a TransitionRejection to an HTTP error,
-// preserving the rejection Code and structured Details (e.g.
-// approval_request_id) in the response body. Approval-related codes map to
-// 409 Conflict (state conflict); workflow/condition codes map to 400.
-func respondTransitionRejection(w http.ResponseWriter, r *http.Request, rej *services.TransitionRejection) {
-	status := http.StatusBadRequest
-	code := restapi.ErrCodeValidationFailed
-	switch rej.Code {
-	case "approval_must_decide", "approval_pending", "approval_rejected":
-		status = http.StatusConflict
-		code = restapi.ErrCodeConflict
-	}
-	apiErr := restapi.NewAPIError(status, code, rej.Message)
-	details := map[string]any{"transition_code": rej.Code}
-	for k, v := range rej.Details {
-		details[k] = v
-	}
-	apiErr.WithDetails(details)
-	restapi.RespondError(w, r, apiErr)
-}
-
 // respondTooManyRequests writes a 429 Too Many Requests JSON response
 func respondTooManyRequests(w http.ResponseWriter, r *http.Request, message string) {
 	err := restapi.NewAPIError(http.StatusTooManyRequests, restapi.ErrCodeRateLimited, message)
@@ -181,5 +168,16 @@ func respondGone(w http.ResponseWriter, r *http.Request, message string) {
 // respondServiceUnavailable writes a 503 Service Unavailable JSON response
 func respondServiceUnavailable(w http.ResponseWriter, r *http.Request, message string) {
 	err := restapi.NewAPIError(http.StatusServiceUnavailable, restapi.ErrCodeServiceUnavailable, message)
+	restapi.RespondError(w, r, err)
+}
+
+// respondUpgradeRequired writes a 426 Upgrade Required JSON response. Used by
+// the llm-proxy broker when a coding-agent client presents a missing or
+// mismatched protocol version, so an out-of-step agent fails loudly with a
+// diagnostic signal instead of misparsing the response (WI-921). The caller
+// advertises the supported version in the X-Protocol-Version response header.
+func respondUpgradeRequired(w http.ResponseWriter, r *http.Request) {
+	err := restapi.NewAPIError(http.StatusUpgradeRequired, "PROTOCOL_VERSION_MISMATCH",
+		"coding-agent protocol version is out of date; the agent image must match the server version")
 	restapi.RespondError(w, r, err)
 }

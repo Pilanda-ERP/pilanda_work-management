@@ -1,15 +1,17 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { api } from '../api.js';
-  import { User, Blocks, ClipboardList, AlertCircle } from '@lucide/svelte';
+  import { User, Blocks, ClipboardList, AlertCircle, Languages } from '@lucide/svelte';
   import Modal from '../dialogs/Modal.svelte';
   import Button from '../components/Button.svelte';
-  import Label from '../components/Label.svelte';
   import Seagulls from '../components/Seagulls.svelte';
   import WaveBackground from '../components/WaveBackground.svelte';
   import { APP_NAME } from '../constants.js';
   import Toggle from '../components/Toggle.svelte';
-  import { t } from '../stores/i18n.svelte.js';
+  import Progress from '../components/Progress.svelte';
+  import { i18n, SUPPORTED_LOCALES, t } from '../stores/i18n.svelte.js';
+	import TextField from '../components/TextField.svelte';
+	import SelectField from '../components/SelectField.svelte';
 
   let {
     isOpen = $bindable(true),
@@ -17,9 +19,14 @@
   } = $props();
 
   let currentStep = $state(1);
-  let totalSteps = 2;
+  const totalSteps = 3;
   let submitting = $state(false);
   let error = $state('');
+  let selectedLanguage = $state(i18n.locale);
+  const languageOptions = SUPPORTED_LOCALES.map(locale => ({
+    value: locale.code,
+    label: locale.name
+  }));
 
   // Form data
   let adminUser = $state({
@@ -44,9 +51,9 @@
   function handleKeyDown(event) {
     if (event.key === 'Enter') {
       event.preventDefault();
-      if (currentStep < 2) {
+      if (currentStep < totalSteps) {
         handleNext();
-      } else if (currentStep === 2 && !submitting) {
+      } else if (currentStep === totalSteps && !submitting) {
         completeSetup();
       }
     } else if (event.key === 'Escape') {
@@ -73,7 +80,7 @@
   function validateCurrentStep() {
     error = '';
 
-    if (currentStep === 1) {
+    if (currentStep === 2) {
       // Validate admin user form
       if (!adminUser.email || !adminUser.first_name || !adminUser.last_name || !adminUser.password) {
         error = t('setup.fillAllRequired');
@@ -98,6 +105,11 @@
     }
   }
 
+  async function handleLanguageChange(localeCode) {
+    selectedLanguage = localeCode;
+    await i18n.setLocale(localeCode);
+  }
+
   async function completeSetup() {
     if (!validateCurrentStep()) {
       return;
@@ -113,6 +125,7 @@
           username: adminUser.username,
           first_name: adminUser.first_name,
           last_name: adminUser.last_name,
+          language: selectedLanguage,
           password: adminUser.password
         },
         module_settings: moduleSettings
@@ -152,7 +165,7 @@
     <WaveBackground />
     <Seagulls />
   </div>
-  <Modal bind:isOpen={isOpen} maxWidth="max-w-2xl" preventClose={true} noBackdrop={true} zIndexClass="z-50 !items-center !pt-0 setup-modal">
+  <Modal bind:isOpen={isOpen} maxWidth="max-w-2xl" preventClose={true} noBackdrop={true} zIndexClass="z-50 !items-center !pt-0 setup-modal" dataTestid="setup-modal">
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div bind:this={keyboardDiv} role="dialog" tabindex="0" onkeydown={handleKeyDown} class="outline-none">
     <div class="px-6 py-8">
@@ -171,124 +184,144 @@
           <span class="text-sm font-medium" style="color: var(--ds-text);">{t('setup.setupProgress')}</span>
           <span class="text-sm" style="color: var(--ds-text-subtle);">{t('setup.step')} {currentStep} {t('setup.of')} {totalSteps}</span>
         </div>
-        <div class="w-full rounded-full h-2" style="background-color: var(--ds-surface);">
-          <div
-            class="h-2 rounded-full transition-all duration-300"
-            style="width: {progressPercentage}%; background: linear-gradient(90deg, #1388E7 0%, #1AB1BC 100%);"
-          ></div>
-        </div>
+        <Progress value={progressPercentage} />
       </div>
 
       <!-- Error Message -->
       {#if error}
-        <div class="mb-6 p-4 rounded flex items-center gap-2" style="background-color: var(--ds-danger-subtle); border: 1px solid var(--ds-border-danger); color: var(--ds-text-danger);">
+        <div data-testid="setup-validation-error" class="mb-6 p-4 rounded flex items-center gap-2" style="background-color: var(--ds-danger-subtle); border: 1px solid var(--ds-border-danger); color: var(--ds-text-danger);">
           <AlertCircle class="w-5 h-5 flex-shrink-0" />
           <span>{error}</span>
         </div>
       {/if}
 
-      <!-- Step 1: Create Admin Account -->
+      <!-- Step 1: Choose interface language -->
       {#if currentStep === 1}
+        <div class="space-y-6">
+          <div class="text-center">
+            <div class="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4" style="background-color: var(--ds-surface-information);">
+              <Languages class="w-6 h-6" style="color: var(--ds-icon-info);" />
+            </div>
+            <h2 class="text-xl font-semibold mb-2" style="color: var(--ds-text);">{t('setup.chooseLanguage')}</h2>
+            <p style="color: var(--ds-text-subtle);">{t('setup.chooseLanguageDesc')}</p>
+          </div>
+
+          <div class="max-w-sm mx-auto">
+            <SelectField
+              label={t('setup.language')}
+              id="setup-language"
+              labelColor="default"
+              options={languageOptions}
+              onchange={handleLanguageChange}
+              ariaLabel={t('setup.language')}
+              bind:value={selectedLanguage}
+            />
+          </div>
+        </div>
+      {/if}
+
+      <!-- Step 2: Create Admin Account -->
+      {#if currentStep === 2}
         <div class="space-y-6">
           <div class="text-center">
             <div class="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4" style="background-color: var(--ds-surface-information);">
               <User class="w-6 h-6" style="color: var(--ds-icon-info);" />
             </div>
-            <h2 class="text-xl font-semibold mb-2" style="color: var(--ds-text);">{t('setup.createAdminAccount')}</h2>
+            <h2 data-testid="setup-admin-heading" class="text-xl font-semibold mb-2" style="color: var(--ds-text);">{t('setup.createAdminAccount')}</h2>
             <p style="color: var(--ds-text-subtle);">{t('setup.adminAccountDesc', { appName: APP_NAME })}</p>
           </div>
 
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <Label for="first_name" color="default" required class="mb-2">{t('setup.firstName')}</Label>
-              <input
+              <TextField
+                label={t('setup.firstName')}
                 id="first_name"
-                type="text"
-                bind:value={adminUser.first_name}
-                class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-                placeholder="John"
                 required
+                labelColor="default"
+                type="text"
+                placeholder={t('setup.firstName')}
+                size="small"
+                bind:value={adminUser.first_name}
               />
             </div>
 
             <div>
-              <Label for="last_name" color="default" required class="mb-2">{t('setup.lastName')}</Label>
-              <input
+              <TextField
+                label={t('setup.lastName')}
                 id="last_name"
-                type="text"
-                bind:value={adminUser.last_name}
-                class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-                placeholder="Doe"
                 required
+                labelColor="default"
+                type="text"
+                placeholder={t('setup.lastName')}
+                size="small"
+                bind:value={adminUser.last_name}
               />
             </div>
           </div>
 
           <div>
-            <Label for="email" color="default" required class="mb-2">{t('setup.emailAddress')}</Label>
-            <input
+            <TextField
+              label={t('setup.emailAddress')}
               id="email"
-              type="email"
-              bind:value={adminUser.email}
-              class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-              placeholder="admin@example.com"
               required
+              labelColor="default"
+              type="email"
+              placeholder={t('setup.emailAddress')}
+              size="small"
+              bind:value={adminUser.email}
             />
           </div>
 
           <div>
-            <Label for="username" color="default" class="mb-2">{t('setup.username')}</Label>
-            <input
+            <TextField
+              label={t('setup.username')}
               id="username"
+              labelColor="default"
               type="text"
+              placeholder={t('setup.username')}
+              size="small"
               bind:value={adminUser.username}
-              class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-              placeholder="admin"
             />
           </div>
 
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <Label for="password" color="default" required class="mb-2">{t('setup.password')}</Label>
-              <input
+              <TextField
+                label={t('setup.password')}
                 id="password"
-                type="password"
-                bind:value={adminUser.password}
-                class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-                placeholder="••••••••"
                 required
+                labelColor="default"
+                type="password"
+                placeholder="••••••••"
+                size="small"
+                bind:value={adminUser.password}
               />
             </div>
 
             <div>
-              <Label for="confirm_password" color="default" required class="mb-2">{t('setup.confirmPassword')}</Label>
-              <input
+              <TextField
+                label={t('setup.confirmPassword')}
                 id="confirm_password"
-                type="password"
-                bind:value={adminUser.confirmPassword}
-                class="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-                placeholder="••••••••"
                 required
+                labelColor="default"
+                type="password"
+                placeholder="••••••••"
+                size="small"
+                bind:value={adminUser.confirmPassword}
               />
             </div>
           </div>
         </div>
       {/if}
 
-      <!-- Step 2: Configure Modules -->
-      {#if currentStep === 2}
+      <!-- Step 3: Configure Modules -->
+      {#if currentStep === 3}
         <div class="space-y-6">
           <div class="text-center">
             <div class="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-4" style="background-color: var(--ds-surface-information);">
               <Blocks class="w-6 h-6" style="color: var(--ds-icon-info);" />
             </div>
-            <h2 class="text-xl font-semibold mb-2" style="color: var(--ds-text);">{t('setup.configureModules')}</h2>
+            <h2 data-testid="setup-modules-heading" class="text-xl font-semibold mb-2" style="color: var(--ds-text);">{t('setup.configureModules')}</h2>
             <p style="color: var(--ds-text-subtle);">{t('setup.configureModulesDesc')}</p>
           </div>
 
@@ -304,7 +337,7 @@
                     <p class="text-sm" style="color: var(--ds-text-subtle);">{t('setup.testManagementDesc')}</p>
                   </div>
                 </div>
-<Toggle bind:checked={moduleSettings.test_management_enabled} />
+<Toggle bind:checked={moduleSettings.test_management_enabled} dataTestid="setup-test-management" />
               </div>
             </div>
           </div>
@@ -329,16 +362,17 @@
         </div>
 
         <div class="flex gap-3">
-          {#if currentStep < 2}
+          {#if currentStep < totalSteps}
             <Button
               variant="primary"
               onclick={handleNext}
               title={t('setup.continueNextStepEnter')}
               keyboardHint="↵"
+              dataTestid="setup-next"
             >
               {t('setup.next')}
             </Button>
-          {:else if currentStep === 2}
+          {:else if currentStep === totalSteps}
             <Button
               variant="primary"
               onclick={completeSetup}
@@ -346,6 +380,7 @@
               loading={submitting}
               title={t('setup.completeSetupEnter')}
               keyboardHint={submitting ? null : '↵'}
+              dataTestid="setup-complete"
             >
               {#if submitting}
                 {t('setup.settingUp')}

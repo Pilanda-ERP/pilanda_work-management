@@ -1,17 +1,36 @@
 <script>
+  import { onDestroy } from 'svelte';
   import { ChevronLeft, Search, X } from '@lucide/svelte';
   import { api } from '../api.js';
   import { navigate } from '../router.js';
+  import { workspacesStore } from '../stores';
   import { formatItemKey } from '../utils/itemKey.js';
   import MobileItemRow from './MobileItemRow.svelte';
+  import Input from '../components/Input.svelte';
+  import { searchPagesAcrossWorkspaces } from './mobilePagesData.js';
+  import { t } from '../stores/i18n.svelte.js';
 
   let query = $state('');
   let results = $state([]);
+  let pageResults = $state([]);
   let loading = $state(false);
   let searched = $state(false);
   let inputEl = $state(null);
   let version = 0;
   let debounceTimer = null;
+  let controller = null;
+
+  // Supersede the current generation: drop any queued debounce, abort the
+  // in-flight request and make its late resolution a no-op.
+  function invalidate() {
+    version += 1;
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+    controller?.abort();
+    controller = null;
+  }
 
   function back() {
     if (window.history.length > 1) window.history.back();
@@ -35,17 +54,33 @@
 
   async function run(q) {
     const trimmed = q.trim();
+    invalidate();
     if (!trimmed) {
       results = [];
+      pageResults = [];
       searched = false;
+      loading = false;
       return;
     }
-    const v = ++version;
+    const v = version;
+    const ac = new AbortController();
+    controller = ac;
     loading = true;
     try {
-      const res = await api.search.items({ query: trimmed, limit: 30 });
+      // Items and pages search in parallel; pages fan out per workspace and
+      // silently skip workspaces that fail (permission). MobileShell loads
+      // the workspace list eagerly, so it is already available here.
+      const workspaces = [
+        ...($workspacesStore.personalWorkspace ? [$workspacesStore.personalWorkspace] : []),
+        ...$workspacesStore.regularWorkspaces,
+      ];
+      const [itemsRes, pagesRes] = await Promise.allSettled([
+        api.search.items({ query: trimmed, limit: 30, signal: ac.signal }),
+        searchPagesAcrossWorkspaces(workspaces, trimmed, { signal: ac.signal }),
+      ]);
       if (v !== version) return;
-      results = normalize(res);
+      results = itemsRes.status === 'fulfilled' ? normalize(itemsRes.value) : [];
+      pageResults = pagesRes.status === 'fulfilled' ? (pagesRes.value ?? []) : [];
       searched = true;
     } catch (err) {
       if (v !== version) return;
@@ -53,21 +88,32 @@
       results = [];
       searched = true;
     } finally {
-      if (v === version) loading = false;
+      if (v === version) {
+        loading = false;
+        controller = null;
+      }
     }
   }
 
   function onInput() {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => run(query), 250);
+    invalidate();
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      void run(query);
+    }, 250);
   }
 
   function clear() {
+    invalidate();
     query = '';
     results = [];
+    pageResults = [];
     searched = false;
+    loading = false;
     inputEl?.focus();
   }
+
+  onDestroy(invalidate);
 
   $effect(() => {
     inputEl?.focus();
@@ -75,35 +121,53 @@
 </script>
 
 <header class="search-bar" data-testid="mobile-search-bar">
-  <button class="back" onclick={back} aria-label="Back" type="button">
+  <button class="back" onclick={back} aria-label={t('common.back')} type="button">
     <ChevronLeft size={24} />
   </button>
   <div class="field">
     <Search size={16} class="s-icon" />
-    <input
-      bind:this={inputEl}
+    <Input
+      bind:inputRef={inputEl}
       bind:value={query}
       oninput={onInput}
       type="search"
       enterkeyhint="search"
-      placeholder="Search work items…"
-      data-testid="mobile-search-input"
+      placeholder={t('mobile.search.placeholder')}
+      dataTestid="mobile-search-input"
       autocomplete="off"
+      class="mobile-search-input !p-0"
     />
     {#if query}
-      <button class="clear" onclick={clear} aria-label="Clear" type="button"><X size={16} /></button>
+      <button class="clear" onclick={clear} aria-label={t('common.clear')} data-testid="mobile-search-clear" type="button"><X size={16} /></button>
     {/if}
   </div>
 </header>
 
 <div class="results" data-testid="mobile-search-results">
-  {#if loading && results.length === 0}
-    <p class="msg">Searching…</p>
+  {#if loading && results.length === 0 && pageResults.length === 0}
+    <p class="msg">{t('common.searching')}</p>
   {:else if !query.trim()}
-    <p class="msg" data-testid="search-prompt">Search by title, key, or text across items you can see.</p>
-  {:else if searched && results.length === 0}
-    <p class="msg" data-testid="search-empty">No items match “{query.trim()}”.</p>
+    <p class="msg" data-testid="search-prompt">{t('mobile.search.help')}</p>
+  {:else if searched && results.length === 0 && pageResults.length === 0}
+    <p class="msg" data-testid="search-empty">{t('mobile.search.empty', { query: query.trim() })}</p>
   {:else}
+    {#if pageResults.length > 0}
+      <h2 class="section" data-testid="mobile-search-pages-header">{t('pages.treeHeading')}</h2>
+      <div class="page-rows" data-testid="mobile-search-page-results">
+        {#each pageResults as page (page.workspace_id + '-' + page.id)}
+          <button
+            class="page-row"
+            onclick={() => navigate(`/m/pages/${page.workspace_id}/${page.id}`)}
+            data-testid="mobile-search-page-row"
+            data-page-id={page.id}
+            type="button"
+          >
+            <span class="page-title">{page.title}</span>
+            <span class="page-ws">{page.workspace_name}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
     {#each results as row (row.itemId)}
       <MobileItemRow {...row} />
     {/each}
@@ -137,7 +201,7 @@
     padding: 0 0.5rem; height: 38px;
   }
   .field :global(.s-icon) { color: var(--ds-text-subtle); flex-shrink: 0; }
-  .field input {
+  .field :global(.mobile-search-input) {
     flex: 1 1 auto; min-width: 0; height: 100%;
     border: none; outline: none; background: transparent;
     color: var(--ds-text); font-size: 1rem; /* >=16px avoids iOS zoom-on-focus */
@@ -148,4 +212,42 @@
   }
 
   .msg { padding: 2rem 1.25rem; text-align: center; color: var(--ds-text-subtle); font-size: 0.875rem; }
+
+  .section {
+    padding: 0.6rem 0.875rem 0.3rem;
+    font-size: 0.75rem;
+    font-weight: var(--font-semibold, 600);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ds-text-subtle);
+    margin: 0;
+  }
+  .page-rows { display: flex; flex-direction: column; margin-bottom: 0.5rem; }
+  .page-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    width: 100%;
+    min-height: 48px;
+    padding: 0.4rem 0.875rem;
+    border: none;
+    border-bottom: 1px solid var(--ds-border);
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+  }
+  .page-row:active { background-color: var(--ds-background-neutral-hovered); }
+  .page-title {
+    font-size: 0.9375rem;
+    color: var(--ds-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .page-ws {
+    flex-shrink: 0;
+    font-size: 0.75rem;
+    color: var(--ds-text-subtlest, var(--ds-text-subtle));
+  }
 </style>

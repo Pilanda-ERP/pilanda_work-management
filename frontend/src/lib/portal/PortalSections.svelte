@@ -1,11 +1,16 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-  import { Plus, Trash2, X, Package } from '@lucide/svelte';
-  import { portalStore, iconMap } from '../stores/portal.svelte.js';
+  import { ChevronRight, Plus, Trash2, X, Package } from '@lucide/svelte';
+  import {
+    portalCatalogStore,
+    portalCustomizationStore as portalStore,
+  } from '../stores/portal.svelte.js';
+  import { iconMap } from '../stores/portalPresentation.js';
   import { t } from '../stores/i18n.svelte.js';
   import { confirm } from '../composables/useConfirm.js';
   import AssetReportTable from './AssetReportTable.svelte';
+  import Input from '../components/Input.svelte';
 
   let {
     onOpenRequestForm = () => {},
@@ -23,7 +28,7 @@
   function startEditingSection(sectionId, field) {
     editingSectionId = sectionId;
     editingSectionField = field;
-    const section = portalStore.portalSections.find(s => s.id === sectionId);
+    const section = portalCatalogStore.portalSections.find(s => s.id === sectionId);
     if (section) {
       editingSectionValue = field === 'title' ? section.title : section.subtitle;
     }
@@ -31,7 +36,7 @@
 
   function saveSection() {
     if (editingSectionId && editingSectionField) {
-      portalStore.updateSection(editingSectionId, editingSectionField, editingSectionValue);
+      portalCatalogStore.updateSection(editingSectionId, editingSectionField, editingSectionValue);
       cancelEditingSection();
     }
   }
@@ -43,7 +48,7 @@
   }
 
   function handleAddSection() {
-    const newSectionId = portalStore.addSection();
+    const newSectionId = portalCatalogStore.addSection();
     startEditingSection(newSectionId, 'title');
   }
 
@@ -75,9 +80,9 @@
         },
         onDrop: ({ source }) => {
           if (/** @type {any} */ (source.data).type === 'request-type') {
-            portalStore.addRequestTypeToSection(sectionId, /** @type {any} */ (source.data).requestType.id);
+            portalCatalogStore.addRequestTypeToSection(sectionId, /** @type {any} */ (source.data).requestType.id);
           } else if (/** @type {any} */ (source.data).type === 'asset-report') {
-            portalStore.addAssetReportToSection(sectionId, /** @type {any} */ (source.data).assetReport.id);
+            portalCatalogStore.addAssetReportToSection(sectionId, /** @type {any} */ (source.data).assetReport.id);
           }
           dropZoneStates.set(sectionId, { isOver: false });
           dropZoneStates = new Map(dropZoneStates);
@@ -100,7 +105,7 @@
   // Re-setup when sections change or edit mode changes
   $effect(() => {
     // Track dependencies
-    const currentIds = portalStore.portalSections.map(s => s.id).join(',');
+    const currentIds = portalCatalogStore.portalSections.map(s => s.id).join(',');
     const isActive = portalStore.isEditing ||
       (portalStore.showCustomizePanel && (portalStore.activeSection === 'request-types' || portalStore.activeSection === 'asset-reports'));
 
@@ -115,15 +120,33 @@
   });
 </script>
 
+<!-- Inline edit input for the section title/subtitle, sharing the save and
+     cancel key handlers. -->
+{#snippet sectionEditInput(className, styleAttr, placeholder)}
+  <Input
+    type="text"
+    bind:value={editingSectionValue}
+    onkeydown={(e) => {
+      if (e.key === 'Enter') saveSection();
+      if (e.key === 'Escape') cancelEditingSection();
+    }}
+    onblur={saveSection}
+    class={className}
+    style={styleAttr}
+    {placeholder}
+    autofocus
+  />
+{/snippet}
+
 <!-- Portal Sections -->
-<div class="space-y-12">
-  {#each portalStore.portalSections as section, sectionIndex}
-    {@const sectionRequestTypes = portalStore.getSectionRequestTypes(section, portalStore.isEditing || (portalStore.showCustomizePanel && portalStore.activeSection === 'request-types'))}
-    {@const sectionAssetReports = portalStore.getSectionAssetReports(section, portalStore.isEditing || (portalStore.showCustomizePanel && portalStore.activeSection === 'asset-reports'))}
+<div class="space-y-10">
+  {#each portalCatalogStore.portalSections as section, sectionIndex}
+    {@const sectionRequestTypes = portalCatalogStore.getSectionRequestTypes(section, portalStore.isEditing || (portalStore.showCustomizePanel && portalStore.activeSection === 'request-types'))}
+    {@const sectionAssetReports = portalCatalogStore.getSectionAssetReports(section, portalStore.isEditing || (portalStore.showCustomizePanel && portalStore.activeSection === 'asset-reports'))}
     {@const formAssetReports = sectionAssetReports.filter((r) => r.run_mode === 'form')}
     {@const directAssetReports = sectionAssetReports.filter((r) => r.run_mode !== 'form')}
     {@const gridItems = [...sectionRequestTypes.map((rt) => ({ kind: 'request', item: rt })), ...formAssetReports.map((ar) => ({ kind: 'asset-form', item: ar }))]}
-    {@const isDraggingItem = portalStore.draggedRequestType || portalStore.draggedAssetReport}
+    {@const isDraggingItem = portalCatalogStore.draggedRequestType || portalCatalogStore.draggedAssetReport}
     {@const isDropTarget = portalStore.isEditing || (portalStore.showCustomizePanel && (portalStore.activeSection === 'request-types' || portalStore.activeSection === 'asset-reports'))}
     <!-- Only show section in public view if it has a title, request types, or asset reports -->
     {#if portalStore.isEditing || section.title || gridItems.length > 0 || directAssetReports.length > 0}
@@ -132,7 +155,7 @@
           <!-- Edit Mode: Show section controls -->
           <div class="absolute -left-10 top-6 flex flex-col gap-1">
             <button
-              onclick={() => portalStore.moveSectionUp(sectionIndex)}
+              onclick={() => portalCatalogStore.moveSectionUp(sectionIndex)}
               disabled={sectionIndex === 0}
               class="p-1 rounded transition-all disabled:opacity-30 hover:bg-black/5"
               style="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};"
@@ -143,8 +166,8 @@
               </svg>
             </button>
             <button
-              onclick={() => portalStore.moveSectionDown(sectionIndex)}
-              disabled={sectionIndex === portalStore.portalSections.length - 1}
+              onclick={() => portalCatalogStore.moveSectionDown(sectionIndex)}
+              disabled={sectionIndex === portalCatalogStore.portalSections.length - 1}
               class="p-1 rounded transition-all disabled:opacity-30 hover:bg-black/5"
               style="color: {portalStore.isDarkMode ? '#94a3b8' : '#6b7280'};"
               title={t('layout.moveDown')}
@@ -162,7 +185,7 @@
                   cancelText: t('common.cancel'),
                   variant: 'danger'
                 });
-                if (confirmed) portalStore.deleteSection(section.id);
+                if (confirmed) portalCatalogStore.deleteSection(section.id);
               }}
               class="p-1 rounded transition-all hover-danger"
               style="color: var(--ds-text-danger);"
@@ -177,25 +200,15 @@
           <!-- Section Title -->
           {#if portalStore.isEditing}
             {#if editingSectionId === section.id && editingSectionField === 'title'}
-              <!-- svelte-ignore a11y_autofocus -->
-              <input
-                type="text"
-                bind:value={editingSectionValue}
-                onkeydown={(e) => {
-                  if (e.key === 'Enter') saveSection();
-                  if (e.key === 'Escape') cancelEditingSection();
-                }}
-                onblur={saveSection}
-                class="text-2xl font-semibold mb-2 bg-transparent border-b-2 focus:outline-none w-full"
-                style:border-color="var(--ds-border-focused)"
-                style="color: var(--ds-text);"
-                placeholder="Section title (click to edit)"
-                autofocus
-              />
+              {@render sectionEditInput(
+                'text-xl font-medium mb-1 bg-transparent border-b-2 focus:outline-none w-full',
+                'border-color: var(--ds-border-focused); color: var(--ds-text);',
+                'Section title (click to edit)'
+              )}
             {:else if section.title}
               <button
                 onclick={() => startEditingSection(section.id, 'title')}
-                class="text-2xl font-semibold mb-2 text-left w-full hover:opacity-70 transition-opacity"
+                class="text-xl font-medium mb-1 text-left w-full hover:opacity-70 transition-opacity"
                 style="color: var(--ds-text);"
               >
                 {section.title}
@@ -210,7 +223,7 @@
               </button>
             {/if}
           {:else if section.title}
-            <h2 class="text-2xl font-semibold mb-2" style="color: var(--ds-text);">
+            <h2 class="text-xl font-medium mb-1" style="color: var(--ds-text);">
               {section.title}
             </h2>
           {/if}
@@ -218,53 +231,46 @@
           <!-- Section Subtitle -->
           {#if portalStore.isEditing}
             {#if editingSectionId === section.id && editingSectionField === 'subtitle'}
-              <!-- svelte-ignore a11y_autofocus -->
-              <input
-                type="text"
-                bind:value={editingSectionValue}
-                onkeydown={(e) => {
-                  if (e.key === 'Enter') saveSection();
-                  if (e.key === 'Escape') cancelEditingSection();
-                }}
-                onblur={saveSection}
-                class="text-sm mb-6 bg-transparent border-b focus:outline-none w-full"
-                style:border-color="var(--ds-border-focused)"
-                style="color: var(--ds-text-subtle);"
-                placeholder="Subtitle (optional, click to edit)"
-                autofocus
-              />
+              {@render sectionEditInput(
+                'text-sm mb-4 bg-transparent border-b focus:outline-none w-full',
+                'border-color: var(--ds-border-focused); color: var(--ds-text-subtle);',
+                'Subtitle (optional, click to edit)'
+              )}
             {:else}
               <button
                 onclick={() => startEditingSection(section.id, 'subtitle')}
-                class="text-sm mb-6 text-left w-full hover:opacity-70 transition-opacity"
+                class="text-sm mb-4 text-left w-full hover:opacity-70 transition-opacity"
                 style="color: var(--ds-text-subtle);"
               >
                 {section.subtitle || '(Click to add subtitle)'}
               </button>
             {/if}
           {:else if section.subtitle}
-            <p class="text-sm mb-6" style="color: var(--ds-text-subtle);">
+            <p class="text-sm mb-4" style="color: var(--ds-text-subtle);">
               {section.subtitle}
             </p>
           {/if}
 
           <!-- Request Types Grid / Drop Zone -->
           <div
-            class="mt-6 {isDropTarget ? 'min-h-32' : ''} rounded transition-all"
+            class="mt-5 {isDropTarget ? 'min-h-32' : ''} rounded transition-all"
             class:border-2={isDraggingItem && isDropTarget}
             class:border-dashed={isDraggingItem && isDropTarget}
             style="{isDraggingItem && isDropTarget ? `border-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-status-info-solid)' : 'var(--ds-border)'}; background-color: ${dropZoneStates.get(section.id)?.isOver ? 'var(--ds-status-info-bg)' : 'transparent'}; padding: 0.5rem;` : ''}"
             data-section-drop-zone
             data-section-id={section.id}
+            data-testid="portal-section-drop-zone"
           >
             {#if gridItems.length > 0}
-              <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {#each gridItems as entry (entry.kind + ':' + entry.item.id)}
                   {@const Icon = iconMap[entry.item.icon] || Package}
                   {@const isAssetForm = entry.kind === 'asset-form'}
                   <button
                     type="button"
-                    class="appearance-none font-[inherit] text-[inherit] text-left w-full m-0 rounded p-6 border hover:shadow-md transition-shadow cursor-pointer relative group"
+                    data-testid={isAssetForm ? 'portal-asset-form-card' : 'portal-request-type-card'}
+                    id={isAssetForm ? `portal-asset-form-${entry.item.id}` : undefined}
+                    class="appearance-none font-[inherit] text-[inherit] text-left w-full m-0 rounded-md p-4 border transition-colors cursor-pointer relative group hover:border-[var(--ds-border-focused)]"
                     style="background-color: var(--ds-surface-card); border-color: var(--ds-border);"
                     onclick={() => isAssetForm ? onOpenAssetReportForm(entry.item) : onOpenRequestForm(entry.item)}
                   >
@@ -275,47 +281,55 @@
                         onclick={(e) => {
                           e.stopPropagation();
                           if (isAssetForm) {
-                            portalStore.removeAssetReportFromSection(section.id, entry.item.id);
+                            portalCatalogStore.removeAssetReportFromSection(section.id, entry.item.id);
                           } else {
-                            portalStore.removeRequestTypeFromSection(section.id, entry.item.id);
+                            portalCatalogStore.removeRequestTypeFromSection(section.id, entry.item.id);
                           }
                         }}
                         onkeydown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.stopPropagation();
                             if (isAssetForm) {
-                              portalStore.removeAssetReportFromSection(section.id, entry.item.id);
+                              portalCatalogStore.removeAssetReportFromSection(section.id, entry.item.id);
                             } else {
-                              portalStore.removeRequestTypeFromSection(section.id, entry.item.id);
+                              portalCatalogStore.removeRequestTypeFromSection(section.id, entry.item.id);
                             }
                           }
                         }}
-                        class="absolute top-2 right-2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                        class="absolute top-2 right-2 p-1 rounded opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity cursor-pointer"
                         style="background-color: var(--ds-danger-subtle); color: var(--ds-text-danger);"
                         title={t('portal.removeFromSection')}
                       >
                         <X class="w-3 h-3" />
                       </span>
                     {/if}
-                    <div class="w-12 h-12 rounded mb-4 flex items-center justify-center" style="background-color: {entry.item.color || '#6b7280'};">
-                      <Icon size={24} color="white" />
+                    <div class="flex items-start gap-3.5 pr-5">
+                      <div
+                        class="w-9 h-9 rounded-md flex items-center justify-center flex-none"
+                        style="color: {entry.item.color || 'var(--ds-text-subtle)'}; background-color: color-mix(in srgb, {entry.item.color || 'var(--ds-text-subtle)'} 12%, transparent);"
+                      >
+                        <Icon size={18} />
+                      </div>
+                      <div class="min-w-0 flex-1">
+                        <div class="text-sm font-medium leading-5 flex items-center gap-2" style="color: var(--ds-text);">
+                          {entry.item.name}
+                          {#if entry.item.is_active === false}
+                            <span
+                              class="px-1.5 py-0.5 text-[10px] font-medium rounded"
+                              style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);"
+                            >
+                              INACTIVE
+                            </span>
+                          {/if}
+                        </div>
+                        {#if entry.item.description}
+                          <p class="text-sm mt-1.5 line-clamp-2 leading-5" style="color: var(--ds-text-subtle);">
+                            {entry.item.description}
+                          </p>
+                        {/if}
+                      </div>
+                      <ChevronRight class="w-4 h-4 mt-2 flex-none" style="color: var(--ds-text-subtle);" />
                     </div>
-                    <div class="font-medium mb-2 flex items-center gap-2" style="color: var(--ds-text);">
-                      {entry.item.name}
-                      {#if !entry.item.is_active}
-                        <span
-                          class="px-1.5 py-0.5 text-[10px] font-medium rounded"
-                          style="background-color: {portalStore.isDarkMode ? 'rgba(156, 163, 175, 0.2)' : '#f3f4f6'}; color: {portalStore.isDarkMode ? '#9ca3af' : '#6b7280'};"
-                        >
-                          INACTIVE
-                        </span>
-                      {/if}
-                    </div>
-                    {#if entry.item.description}
-                      <p class="text-sm" style="color: var(--ds-text-subtle);">
-                        {entry.item.description}
-                      </p>
-                    {/if}
                   </button>
                 {/each}
               </div>
@@ -359,7 +373,7 @@
                   slug={portalStore.currentSlug}
                   sectionId={section.id}
                   isEditing={portalStore.isEditing || (portalStore.showCustomizePanel && portalStore.activeSection === 'asset-reports')}
-                  onRemove={(reportId) => portalStore.removeAssetReportFromSection(section.id, reportId)}
+                  onRemove={(reportId) => portalCatalogStore.removeAssetReportFromSection(section.id, reportId)}
                 />
               {/each}
             </div>
@@ -382,7 +396,7 @@
   {/if}
 
   <!-- Empty State (when no sections and not editing) -->
-  {#if portalStore.portalSections.length === 0 && !portalStore.isEditing}
+  {#if portalCatalogStore.portalSections.length === 0 && !portalStore.isEditing}
     <div class="text-center py-16">
       <p class="text-sm" style="color: var(--ds-text-subtle);">
         {t('portal.noContentSections')}

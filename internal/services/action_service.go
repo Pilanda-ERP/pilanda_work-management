@@ -3,6 +3,7 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,12 +24,14 @@ import (
 
 	"windshift/internal/database"
 	"windshift/internal/llm"
+	"windshift/internal/logger"
 	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/repository/actionutil"
 	"windshift/internal/utils"
 	"windshift/internal/validation"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // LLMConnectionResolver resolves an LLM connection ID to a client.
@@ -35,14 +39,15 @@ type LLMConnectionResolver interface {
 	Resolve(connectionID int) (llm.Client, error)
 }
 
-// AssetSetPermissionChecker checks per-asset-set RBAC. Asset sets have their
-// own role-based permission model independent of workspace membership, so a
-// workspace admin is NOT automatically allowed to write into an asset set.
-// Permission keys are the strings used by handlers/asset_handler.go:
-// "asset.view", "asset.create", "asset.edit", etc.
+// AssetSetPermissionChecker enforces asset-set RBAC, which is independent of
+// workspace membership.
 type AssetSetPermissionChecker interface {
 	HasAssetSetPermission(userID, setID int, permissionKey string) (bool, error)
 }
+
+// ErrActionCompletedWithFailedSteps means execution finished and its log
+// contains the actionable failure details.
+var ErrActionCompletedWithFailedSteps = errors.New("action completed with failed steps")
 
 // ActionServiceConfig represents configuration for the action service
 type ActionServiceConfig struct {
@@ -69,18 +74,17 @@ type ActionService struct {
 	actionCache map[int][]*models.Action
 	cacheMu     sync.RWMutex
 
-	// Event processing
-	eventChan chan *models.ActionEvent
-	stopChan  chan struct{}
-	wg        sync.WaitGroup
+	// Event admission and cache lifecycle.
+	durableIngress *DurableActionIngress
+	stopChan       chan struct{}
+	wg             sync.WaitGroup
 
 	// Dependencies for action execution
 	notificationService *NotificationService
 	commentService      *CommentService
-	assetActionService  AssetActionEventEmitter
-	eventCoordinator    *EventCoordinator
 	teamService         *TeamService
 	approvalService     *ApprovalService
+	itemUpdate          *ItemUpdateApplicationService
 
 	// AI/container dependencies
 	llmConnectionManager LLMConnectionResolver
@@ -90,10 +94,6 @@ type ActionService struct {
 	// (WI-146) when the node names a PoolCapabilityID; nil disables pool
 	// dispatch (container_run then requires containerService for local runs).
 	agentRuns *repository.AgentRunRepository
-
-	// Asset permission checker — consulted before create_asset / update_asset
-	// nodes mutate an asset set the action's actor may not control.
-	assetPermChecker AssetSetPermissionChecker
 
 	// Workspace permission service — consulted for item.edit / item.comment
 	// checks on nodes that mutate workspace items. The effective actor (see
@@ -127,24 +127,22 @@ func NewActionService(db database.Database, config ActionServiceConfig, chainSto
 		chainStore = NewExecutionChainStore()
 	}
 	service := &ActionService{
-		db:          db,
-		repo:        repository.NewActionRepository(db),
-		itemRepo:    repository.NewItemRepository(db),
-		config:      config,
-		actionCache: make(map[int][]*models.Action),
-		eventChan:   make(chan *models.ActionEvent, config.EventBufferSize),
-		stopChan:    make(chan struct{}),
-		chainStore:  chainStore,
+		db:             db,
+		repo:           repository.NewActionRepository(db),
+		itemRepo:       repository.NewItemRepository(db),
+		config:         config,
+		actionCache:    make(map[int][]*models.Action),
+		durableIngress: NewDurableActionIngress(db),
+		stopChan:       make(chan struct{}),
+		chainStore:     chainStore,
+		itemUpdate:     NewItemUpdateApplicationService(db, nil),
 	}
 
-	// Load initial cache
 	if err := service.refreshActionCache(); err != nil {
 		slog.Warn("failed to load initial action cache", slog.String("component", "actions"), slog.Any("error", err))
 	}
 
-	// Start background workers
-	service.wg.Add(2)
-	go service.eventProcessor()
+	service.wg.Add(1)
 	go service.cacheRefresher()
 
 	slog.Debug("action service initialized", slog.String("component", "actions"), slog.Duration("refresh_interval", config.RefreshInterval))
@@ -174,19 +172,25 @@ func (as *ActionService) SetCommentService(cs *CommentService) {
 	as.commentService = cs
 }
 
-// SetAssetActionService sets the asset action service for emitting asset events from create_asset/update_asset nodes.
-func (as *ActionService) SetAssetActionService(aas AssetActionEventEmitter) {
-	as.assetActionService = aas
-}
-
 // SetTeamService sets the team service for round-robin assignment actions
 func (as *ActionService) SetTeamService(ts *TeamService) {
 	as.teamService = ts
 }
 
-// SetEventCoordinator sets the event coordinator for emitting item events from create_item-like nodes.
+// SetEventCoordinator routes action-driven item updates through the shared
+// event pipeline.
 func (as *ActionService) SetEventCoordinator(ec *EventCoordinator) {
-	as.eventCoordinator = ec
+	if as.itemUpdate != nil {
+		as.itemUpdate.SetEmitter(ec)
+	}
+}
+
+// SetItemUpdateApplicationService shares the canonical item mutation pipeline
+// used by interactive and API updates with action execution.
+func (as *ActionService) SetItemUpdateApplicationService(service *ItemUpdateApplicationService) {
+	if service != nil {
+		as.itemUpdate = service
+	}
 }
 
 // SetLLMConnectionManager sets the LLM connection manager for AI node types.
@@ -205,10 +209,11 @@ func (as *ActionService) SetContainerService(cs *ContainerService) {
 	as.containerService = cs
 }
 
-// SetAssetPermissionChecker wires the asset-set RBAC check used by
-// create_asset / update_asset nodes.
-func (as *ActionService) SetAssetPermissionChecker(c AssetSetPermissionChecker) {
-	as.assetPermChecker = c
+// SetAssetNodeServices registers asset executors with the shared asset
+// mutation service and permission checker used by the asset API.
+func (as *ActionService) SetAssetNodeServices(assetService *AssetService, permissions AssetSetPermissionChecker) {
+	as.RegisterNodeExecutor(NewCreateAssetNodeExecutor(assetService, as.itemRepo, permissions, as))
+	as.RegisterNodeExecutor(NewUpdateAssetNodeExecutor(assetService, as.itemRepo, permissions, as))
 }
 
 // SetPermissionService wires the workspace permission service used by
@@ -216,29 +221,31 @@ func (as *ActionService) SetAssetPermissionChecker(c AssetSetPermissionChecker) 
 // the effective actor's rights on the target workspace.
 func (as *ActionService) SetPermissionService(ps *PermissionService) {
 	as.permissionService = ps
+	if as.itemUpdate != nil {
+		as.itemUpdate.SetPermissionService(ps)
+	}
 }
 
-// EmitActionEvent sends an event to be processed asynchronously (non-blocking)
+// EmitActionEvent durably admits an action trigger. Item compatibility events
+// stop at the recorded canonical cutover; SCM observations remain durable.
 func (as *ActionService) EmitActionEvent(event *models.ActionEvent) {
-	slog.Debug("queuing action event",
-		slog.String("component", "actions"),
-		slog.String("event_type", string(event.EventType)),
-		slog.Int("workspace_id", event.WorkspaceID),
-		slog.Int("item_id", event.ItemID),
-	)
-
-	select {
-	case as.eventChan <- event:
-		// Event queued successfully
-	default:
-		// Channel full, log warning but don't block
-		slog.Warn("action event channel full, dropping event",
+	if event == nil {
+		return
+	}
+	if err := as.durableIngress.Emit(context.Background(), event); err != nil {
+		slog.Error("failed to persist action event",
 			slog.String("component", "actions"),
 			slog.String("event_type", string(event.EventType)),
 			slog.Int("workspace_id", event.WorkspaceID),
+			slog.Any("error", err),
 		)
 		atomic.AddInt64(&as.errors, 1)
 	}
+}
+
+// EmitActionEventInTx admits an SCM observation with its source ledger row.
+func (as *ActionService) EmitActionEventInTx(ctx context.Context, tx database.Tx, event *models.ActionEvent) error {
+	return as.durableIngress.EmitInTx(ctx, tx, event)
 }
 
 // Stop gracefully shuts down the action service
@@ -259,42 +266,7 @@ func (as *ActionService) Stop() {
 	}
 }
 
-// eventProcessor runs in background and processes events from the channel
-func (as *ActionService) eventProcessor() {
-	defer as.wg.Done()
-
-	for {
-		select {
-		case event := <-as.eventChan:
-			if err := as.processEvent(event); err != nil {
-				slog.Error("failed to process action event",
-					slog.String("component", "actions"),
-					slog.String("event_type", string(event.EventType)),
-					slog.Any("error", err),
-				)
-				atomic.AddInt64(&as.errors, 1)
-			} else {
-				atomic.AddInt64(&as.eventsProcessed, 1)
-			}
-		case <-as.stopChan:
-			slog.Debug("stopping action event processor", slog.String("component", "actions"))
-			// Drain remaining events
-			for len(as.eventChan) > 0 {
-				event := <-as.eventChan
-				if err := as.processEvent(event); err != nil {
-					slog.Error("failed to process action event during shutdown",
-						slog.String("component", "actions"),
-						slog.String("event_type", string(event.EventType)),
-						slog.Any("error", err),
-					)
-				}
-			}
-			return
-		}
-	}
-}
-
-// cacheRefresher runs in background and periodically refreshes the action cache
+// cacheRefresher refreshes action definitions and prunes expired chains.
 func (as *ActionService) cacheRefresher() {
 	defer as.wg.Done()
 
@@ -307,7 +279,6 @@ func (as *ActionService) cacheRefresher() {
 			if err := as.refreshActionCache(); err != nil {
 				slog.Error("failed to refresh action cache", slog.String("component", "actions"), slog.Any("error", err))
 			}
-			// Also cleanup stale execution chains
 			as.cleanupChains()
 		case <-as.stopChan:
 			slog.Debug("stopping action cache refresher", slog.String("component", "actions"))
@@ -316,9 +287,9 @@ func (as *ActionService) cacheRefresher() {
 	}
 }
 
-// refreshActionCache reloads enabled actions from database
+// refreshActionCache rebuilds the enabled-action cache, retaining a workspace's
+// previous entry when its refresh query fails.
 func (as *ActionService) refreshActionCache() error {
-	// Get all workspaces with enabled actions
 	rows, err := as.db.Query(`
 		SELECT DISTINCT workspace_id FROM actions WHERE is_enabled = true
 	`)
@@ -341,14 +312,10 @@ func (as *ActionService) refreshActionCache() error {
 		return fmt.Errorf("iterate workspaces with actions: %w", err)
 	}
 
-	// Snapshot the previous cache so we can preserve entries whose refresh
-	// query fails this cycle. Dropping a workspace on a transient DB hiccup
-	// would silently disable its automations for up to one refresh interval.
 	as.cacheMu.RLock()
 	prevCache := as.actionCache
 	as.cacheMu.RUnlock()
 
-	// Load enabled actions for each workspace
 	for _, workspaceID := range workspaceIDs {
 		actions, err := as.repo.ListEnabledByWorkspace(workspaceID)
 		if err != nil {
@@ -398,11 +365,6 @@ func (as *ActionService) InvalidateWorkspaceCache(workspaceID int) {
 	as.cacheMu.Unlock()
 }
 
-// getChain retrieves an execution chain from the shared store by its ID.
-func (as *ActionService) getChain(chainID string) *ExecutionChain {
-	return as.chainStore.GetChain(chainID)
-}
-
 // createChain creates a new execution chain in the shared store.
 func (as *ActionService) createChain(chainID string) *ExecutionChain {
 	return as.chainStore.CreateChain(chainID)
@@ -413,101 +375,38 @@ func (as *ActionService) cleanupChains() {
 	as.chainStore.Cleanup()
 }
 
-// MaxCascadeDepth is the maximum depth of nested action triggers (safety limit)
+// MaxCascadeDepth bounds action-triggered mutation chains across consumers.
 const MaxCascadeDepth = 5
 
-// processEvent processes a single action event
-func (as *ActionService) processEvent(event *models.ActionEvent) error { //nolint:unparam // error return kept for API consistency
-	slog.Debug("processing action event",
-		slog.String("component", "actions"),
-		slog.String("event_type", string(event.EventType)),
-		slog.Int("workspace_id", event.WorkspaceID),
-		slog.Int("item_id", event.ItemID),
-		slog.Bool("triggered_by_action", event.TriggeredByAction),
-		slog.Int("cascade_depth", event.CascadeDepth),
-	)
-
-	// Check cascade depth limit (uses event's immutable depth)
-	if event.CascadeDepth >= MaxCascadeDepth {
-		slog.Warn("action execution depth limit reached",
-			slog.String("component", "actions"),
-			slog.String("chain_id", event.ExecutionChainID),
-			slog.Int("depth", event.CascadeDepth),
-		)
-		return nil
-	}
-
-	// Get chain state from cache for cycle detection (if cascaded event)
-	var chain *ExecutionChain
-	if event.ExecutionChainID != "" {
-		chain = as.getChain(event.ExecutionChainID)
-		if chain == nil {
-			slog.Warn("execution chain not found in cache",
-				slog.String("component", "actions"),
-				slog.String("chain_id", event.ExecutionChainID),
-			)
-			// Chain expired or missing - treat as new chain (safe default)
+func matchesStatusTransition(fromStatusID, toStatusID *int, oldValues, newValues map[string]any) bool {
+	if fromStatusID != nil {
+		oldStatusID := utils.InterfaceToIntPtr(oldValues["status_id"])
+		if oldStatusID == nil || *oldStatusID != *fromStatusID {
+			return false
 		}
 	}
-
-	// Get actions for this workspace from cache
-	as.cacheMu.RLock()
-	actions := as.actionCache[event.WorkspaceID]
-	as.cacheMu.RUnlock()
-
-	if len(actions) == 0 {
-		slog.Debug("no enabled actions for workspace",
-			slog.String("component", "actions"),
-			slog.Int("workspace_id", event.WorkspaceID),
-		)
-		return nil
-	}
-
-	// Find matching actions
-	for _, action := range actions {
-		// Cycle detection: skip if this action already ran in this chain
-		actionKey := fmt.Sprintf("workspace:%d", action.ID)
-		if chain != nil && chain.HasExecuted(actionKey) {
-			slog.Debug("skipping action - already executed in chain",
-				slog.String("component", "actions"),
-				slog.Int("action_id", action.ID),
-				slog.String("action_name", action.Name),
-				slog.String("chain_id", event.ExecutionChainID),
-			)
-			continue
-		}
-
-		if as.matchesTrigger(action, event) {
-			slog.Debug("action matches trigger, executing",
-				slog.String("component", "actions"),
-				slog.Int("action_id", action.ID),
-				slog.String("action_name", action.Name),
-			)
-
-			if err := as.executeAction(action, event, chain); err != nil {
-				slog.Error("failed to execute action",
-					slog.String("component", "actions"),
-					slog.Int("action_id", action.ID),
-					slog.Any("error", err),
-				)
-				// Continue with other actions even if one fails
-			} else {
-				atomic.AddInt64(&as.actionsExecuted, 1)
-			}
+	if toStatusID != nil {
+		newStatusID := utils.InterfaceToIntPtr(newValues["status_id"])
+		if newStatusID == nil || *newStatusID != *toStatusID {
+			return false
 		}
 	}
-
-	return nil
+	return true
 }
 
 // matchesTrigger checks if an action's trigger matches the event
 func (as *ActionService) matchesTrigger(action *models.Action, event *models.ActionEvent) bool {
-	// First check if trigger types match
 	if action.TriggerType != event.EventType {
 		return false
 	}
 
-	// Parse trigger config if present
+	// Targeted events carry the action they were emitted for (the inactivity
+	// sweeper evaluates each action's threshold separately) and match only
+	// that action.
+	if target := utils.InterfaceToIntPtr(event.NewValues["action_id"]); target != nil && *target != action.ID {
+		return false
+	}
+
 	var config models.ActionTriggerConfig
 	if action.TriggerConfig != "" {
 		if err := json.Unmarshal([]byte(action.TriggerConfig), &config); err != nil {
@@ -520,8 +419,6 @@ func (as *ActionService) matchesTrigger(action *models.Action, event *models.Act
 		}
 	}
 
-	// Check cascade control: if the event was triggered by another action,
-	// only process if this action has respond_to_cascades enabled
 	if event.TriggeredByAction && !config.RespondToCascades {
 		slog.Debug("skipping action - does not respond to cascades",
 			slog.String("component", "actions"),
@@ -531,133 +428,214 @@ func (as *ActionService) matchesTrigger(action *models.Action, event *models.Act
 		return false
 	}
 
-	// If no trigger config, any event of matching type triggers the action
 	if action.TriggerConfig == "" {
 		return true
 	}
 
 	switch event.EventType {
+	case models.ActionTriggerCommentCreated:
+		return matchesCommentCreatedTrigger(config, event)
+	case models.ActionTriggerItemInactive:
+		return matchesItemInactiveTrigger(config, event)
 	case models.ActionTriggerStatusTransition:
-		// Check from_status_id and to_status_id conditions
-		if config.FromStatusID != nil {
-			oldStatusID := utils.InterfaceToIntPtr(event.OldValues["status_id"])
-			if oldStatusID == nil || *oldStatusID != *config.FromStatusID {
-				return false
-			}
-		}
-		if config.ToStatusID != nil {
-			newStatusID := utils.InterfaceToIntPtr(event.NewValues["status_id"])
-			if newStatusID == nil || *newStatusID != *config.ToStatusID {
-				return false
-			}
-		}
-		// Category-based filter: matches when the destination status's
-		// category.is_completed equals the configured value. Lets templates
-		// say "fire on any terminal transition" without per-workflow IDs.
-		if config.ToStatusCategoryIsCompleted != nil {
-			newStatusID := utils.InterfaceToIntPtr(event.NewValues["status_id"])
-			if newStatusID == nil {
-				return false
-			}
-			st, err := NewStatusService(as.db).GetStatus(*newStatusID)
-			if err != nil || st == nil {
-				return false
-			}
-			if st.IsCompleted != *config.ToStatusCategoryIsCompleted {
-				return false
-			}
-		}
+		return matchesStatusTransition(config.FromStatusID, config.ToStatusID, event.OldValues, event.NewValues) &&
+			as.matchesDestinationStatusCategory(config.ToStatusCategoryIsCompleted, event.NewValues)
 
 	case models.ActionTriggerItemCreated, models.ActionTriggerItemUpdated:
-		// Check item_type_id filter. Events carry Item.ItemTypeID which is
-		// *int, so a raw `.(int)` assertion would always fail — route through
-		// InterfaceToIntPtr to unwrap *int / int / int64 / float64 uniformly.
-		if config.ItemTypeID != nil {
-			itemTypeID := utils.InterfaceToIntPtr(event.NewValues["item_type_id"])
-			if itemTypeID == nil || *itemTypeID != *config.ItemTypeID {
-				return false
-			}
-		}
-		// For item_updated, check field_name filter
-		if event.EventType == models.ActionTriggerItemUpdated && config.FieldName != "" {
-			if _, changed := event.NewValues[config.FieldName]; !changed {
-				return false
-			}
-		}
+		return matchesItemActionTrigger(config, event)
 
 	case models.ActionTriggerItemLinked:
-		// Check link_type_id filter — same unwrapping as item_type_id so this
-		// keeps working if the event emitter ever starts sending *int.
-		if config.LinkTypeID != nil {
-			linkTypeID := utils.InterfaceToIntPtr(event.NewValues["link_type_id"])
-			if linkTypeID == nil || *linkTypeID != *config.LinkTypeID {
-				return false
-			}
-		}
+		return matchesItemLinkTrigger(config.LinkTypeID, event.NewValues)
 
-	case models.ActionTriggerSCMPRLinked, models.ActionTriggerSCMPRMerged:
-		// Optional workspace repository filter.
-		if config.WorkspaceRepositoryID != nil {
-			repoID := utils.InterfaceToIntPtr(event.NewValues["repo.workspace_repository_id"])
-			if repoID == nil || *repoID != *config.WorkspaceRepositoryID {
-				return false
-			}
-		}
-		// Optional repository slug filter (case-insensitive).
-		if config.RepositoryFullName != "" {
-			fullName := fmt.Sprintf("%v", event.NewValues["repo.full_name"])
-			if !strings.EqualFold(fullName, config.RepositoryFullName) {
-				return false
-			}
-		}
+	case models.ActionTriggerSCMTagCreated, models.ActionTriggerSCMReleaseBranchCreated,
+		models.ActionTriggerSCMPRLinked, models.ActionTriggerSCMPRMerged:
+		return matchesSCMActionTrigger(config, event.NewValues)
 	}
 
 	return true
 }
 
+func (as *ActionService) matchesDestinationStatusCategory(isCompleted *bool, newValues map[string]any) bool {
+	if isCompleted == nil {
+		return true
+	}
+	newStatusID := utils.InterfaceToIntPtr(newValues["status_id"])
+	if newStatusID == nil {
+		return false
+	}
+	status, err := NewStatusService(as.db).GetStatus(*newStatusID)
+	return err == nil && status != nil && status.IsCompleted == *isCompleted
+}
+
+// matchesCommentCreatedTrigger narrows comment_created events by author
+// type. from_customer = true reacts only to customer replies (portal
+// customer or email-intake sender); false only to agent comments; nil to
+// any author.
+func matchesCommentCreatedTrigger(config models.ActionTriggerConfig, event *models.ActionEvent) bool {
+	if config.FromCustomer != nil {
+		fromCustomer, ok := event.NewValues["comment_from_customer"].(bool)
+		if !ok || fromCustomer != *config.FromCustomer {
+			return false
+		}
+	}
+	return true
+}
+
+// matchesItemInactiveTrigger narrows item_inactive events by item type.
+// inactive_hours drives the sweeper's query; the matcher only enforces that
+// a threshold is configured.
+func matchesItemInactiveTrigger(config models.ActionTriggerConfig, event *models.ActionEvent) bool {
+	if config.InactiveHours <= 0 {
+		return false
+	}
+	if config.ItemTypeID != nil {
+		if event.ItemTypeID == nil || *event.ItemTypeID != *config.ItemTypeID {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesItemActionTrigger(config models.ActionTriggerConfig, event *models.ActionEvent) bool {
+	if config.ItemTypeID != nil {
+		// item.updated events carry only changed fields in NewValues, so the
+		// item's type must come from the event itself. Fall back to NewValues
+		// for events persisted before ItemTypeID existed.
+		itemTypeID := event.ItemTypeID
+		if itemTypeID == nil {
+			itemTypeID = utils.InterfaceToIntPtr(event.NewValues["item_type_id"])
+		}
+		if itemTypeID == nil || *itemTypeID != *config.ItemTypeID {
+			return false
+		}
+	}
+	if event.EventType == models.ActionTriggerItemUpdated && config.FieldName != "" {
+		_, changed := event.NewValues[config.FieldName]
+		if !changed {
+			// Editors save filter spellings that differ from the event's change
+			// keys; normalize before giving up. Custom fields are keyed
+			// "cf_<id>" in change events while the editor saves the filter as
+			// "custom_field_<id>" (the spelling the condition and set_field
+			// executors resolve). Milestone changes are keyed "milestones".
+			if customFieldID, ok := strings.CutPrefix(config.FieldName, "custom_field_"); ok {
+				_, changed = event.NewValues["cf_"+customFieldID]
+			} else if config.FieldName == "milestone_id" || config.FieldName == "milestone_ids" {
+				_, changed = event.NewValues["milestones"]
+			}
+		}
+		return changed
+	}
+	return true
+}
+
+func matchesItemLinkTrigger(linkTypeID *int, newValues map[string]any) bool {
+	if linkTypeID == nil {
+		return true
+	}
+	eventLinkTypeID := utils.InterfaceToIntPtr(newValues["link_type_id"])
+	return eventLinkTypeID != nil && *eventLinkTypeID == *linkTypeID
+}
+
+func matchesSCMActionTrigger(config models.ActionTriggerConfig, newValues map[string]any) bool {
+	if config.WorkspaceRepositoryID != nil {
+		repositoryID := utils.InterfaceToIntPtr(newValues["repo.workspace_repository_id"])
+		if repositoryID == nil || *repositoryID != *config.WorkspaceRepositoryID {
+			return false
+		}
+	}
+	if config.RepositoryFullName == "" {
+		return true
+	}
+	return strings.EqualFold(fmt.Sprintf("%v", newValues["repo.full_name"]), config.RepositoryFullName)
+}
+
 // executeAction executes an action's flow
 func (as *ActionService) executeAction(action *models.Action, event *models.ActionEvent, chain *ExecutionChain) error {
+	return as.executeActionForEvent(context.Background(), action, event, chain, "")
+}
+
+func (as *ActionService) executeActionForEvent(executionCtx context.Context, action *models.Action, event *models.ActionEvent, chain *ExecutionChain, durableEventKey string) error {
+	if executionCtx == nil {
+		executionCtx = context.Background()
+	}
+	if err := executionCtx.Err(); err != nil {
+		return err
+	}
+	if action == nil {
+		return errors.New("action is required")
+	}
+	if !action.IsEnabled {
+		return fmt.Errorf("action %d is disabled", action.ID)
+	}
+	if event == nil {
+		return errors.New("action event is required")
+	}
 	startTime := time.Now()
 
-	// Get or create execution chain for cascade tracking
+	// Load or create the execution chain.
 	chainID := event.ExecutionChainID
 	if chainID == "" {
-		// First action in chain - create new chain
+		// Start a new chain when no chain ID was supplied.
 		chainID = uuid.New().String()
 		chain = as.createChain(chainID)
 	} else if chain == nil {
-		// Chain ID exists but chain not found (expired) - create new one
+		// Recreate an expired or missing chain.
 		chain = as.createChain(chainID)
 	}
 
-	// Mark this action as executed (for cycle detection)
 	actionKey := fmt.Sprintf("workspace:%d", action.ID)
 	chain.MarkExecuted(actionKey)
 
-	// Create execution log — both the trigger user and the user whose perms
-	// actually governed the run are recorded for the audit trail.
-	triggerUserID := event.ActorUserID
-	// Effective actor starts as the trigger user; action.ActorUserID may
-	// override it below.
+	// Record both the trigger user and effective permission actor.
+	// The action may override the triggering user below.
 	effectiveActorID := event.ActorUserID
+	var triggerUserID, effectiveActorUserID *int
+	if event.ActorUserID > 0 {
+		triggerValue := event.ActorUserID
+		effectiveValue := event.ActorUserID
+		triggerUserID = &triggerValue
+		effectiveActorUserID = &effectiveValue
+	}
+	var itemID *int
+	if event.ItemID > 0 {
+		value := event.ItemID
+		itemID = &value
+	}
 	log := &models.ActionExecutionLog{
 		ActionID:             action.ID,
-		ItemID:               &event.ItemID,
+		ItemID:               itemID,
 		TriggerEvent:         string(event.EventType),
 		Status:               models.ActionStatusRunning,
-		TriggerUserID:        &triggerUserID,
-		EffectiveActorUserID: &effectiveActorID,
+		TriggerUserID:        triggerUserID,
+		EffectiveActorUserID: effectiveActorUserID,
 		StartedAt:            startTime,
+		DurableEventKey:      durableEventKey,
 	}
-	logID, err := as.repo.CreateExecutionLog(log)
-	if err != nil {
-		slog.Warn("failed to create execution log",
-			slog.String("component", "actions"),
-			slog.Int("action_id", action.ID),
-			slog.Any("error", err),
-		)
+	if durableEventKey != "" {
+		existing, loadErr := as.repo.GetExecutionLogByDurableTarget(durableEventKey, action.ID)
+		if loadErr == nil {
+			if existing.Status == models.ActionStatusCompleted {
+				return nil
+			}
+			log.ID = existing.ID
+		} else if !errors.Is(loadErr, sql.ErrNoRows) {
+			return fmt.Errorf("load durable action execution: %w", loadErr)
+		}
 	}
-	log.ID = logID
+	if log.ID == 0 {
+		logID, err := as.repo.CreateExecutionLog(log)
+		if err != nil {
+			if durableEventKey != "" {
+				return fmt.Errorf("create durable execution log: %w", err)
+			}
+			slog.Warn("failed to create execution log",
+				slog.String("component", "actions"),
+				slog.Int("action_id", action.ID),
+				slog.Any("error", err),
+			)
+		}
+		log.ID = logID
+	}
 
 	// Resolve the effective actor: action.ActorUserID overrides the triggering
 	// user (subject to action.set_actor permission, enforced at CRUD time).
@@ -667,12 +645,7 @@ func (as *ActionService) executeAction(action *models.Action, event *models.Acti
 		log.EffectiveActorUserID = &effectiveActorID
 	}
 
-	// SCM lifecycle triggers (PR linked/merged) are emitted by the background
-	// sync loop and have no authenticated human actor. Without an override
-	// the action cannot perform workspace mutations, so fail fast with a
-	// clear audit message instead of letting permission checks reject it
-	// opaquely downstream.
-	if (action.TriggerType == models.ActionTriggerSCMPRLinked || action.TriggerType == models.ActionTriggerSCMPRMerged) && effectiveActorID <= 0 {
+	if isSCMActionTrigger(action.TriggerType) && effectiveActorID <= 0 {
 		log.Status = models.ActionStatusFailed
 		log.ErrorMessage = "SCM trigger requires an actor_user_id override because the sync loop has no authenticated user"
 		completedAt := time.Now()
@@ -681,19 +654,18 @@ func (as *ActionService) executeAction(action *models.Action, event *models.Acti
 		return fmt.Errorf("SCM trigger action %d requires an actor_user_id override", action.ID)
 	}
 
-	// Build execution context
 	ctx := &models.ExecutionContext{
+		Context:          executionCtx,
+		DurableEventKey:  durableEventKey,
 		Action:           action,
 		Event:            event,
 		EffectiveActorID: effectiveActorID,
-		Variables:        make(map[string]interface{}),
+		Variables:        make(map[string]any),
 		StepResults:      []models.StepResult{},
 		ChainID:          chainID,
 	}
 
-	// Populate initial variables from event. actor_user_id exposes the
-	// *effective* actor to downstream template expansion since that is the
-	// identity the action is impersonating.
+	// Expose the effective actor to template expansion.
 	ctx.Variables["item_id"] = event.ItemID
 	ctx.Variables["workspace_id"] = event.WorkspaceID
 	ctx.Variables["actor_user_id"] = effectiveActorID
@@ -704,110 +676,81 @@ func (as *ActionService) executeAction(action *models.Action, event *models.Acti
 	for k, v := range event.NewValues {
 		ctx.Variables["new_"+k] = v
 	}
-
-	// Get topologically sorted nodes
-	sortedNodes, err := as.topologicalSort(action.Nodes, action.Edges)
-	if err != nil {
+	ctx.TriggerCommentIsPrivate = event.TriggerCommentIsPrivate || eventValueIsTrue(event.NewValues["comment_is_private"])
+	if err := as.loadExecutionActor(ctx); err != nil {
 		log.Status = models.ActionStatusFailed
-		log.ErrorMessage = fmt.Sprintf("failed to sort nodes: %v", err)
+		log.ErrorMessage = err.Error()
 		completedAt := time.Now()
 		log.CompletedAt = &completedAt
 		if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
 			slog.Error("failed to update execution log", slog.Any("error", logErr), slog.Int("action_id", action.ID))
 		}
-		return fmt.Errorf("failed to topologically sort nodes: %w", err)
+		return err
 	}
 
-	// Execute nodes in order
-	executedNodes := make(map[int]bool)
-	for _, node := range sortedNodes {
-		// Skip trigger nodes - they're just entry points
-		if node.NodeType == models.ActionNodeTrigger {
-			executedNodes[node.ID] = true
-			continue
-		}
-
-		// Iterators consume their downstream body in one swoop: they execute
-		// the body subgraph once per emitted item with ctx.Item swapped, then
-		// mark every body node as executed in the outer map. This loop must
-		// not re-run those body nodes when it later visits them.
-		if executedNodes[node.ID] {
-			continue
-		}
-
-		// Check if all incoming edges allow execution
-		canExecute := as.canExecuteNode(node.ID, action.Edges, executedNodes, ctx)
-		if !canExecute {
-			continue
-		}
-
-		ctx.TotalSteps++
-		if ctx.TotalSteps > maxStepsPerFlow {
-			budgetStep := models.StepResult{
-				NodeID:       node.ID,
-				NodeType:     node.NodeType,
-				Status:       models.ActionStatusFailed,
-				StartedAt:    time.Now(),
-				ErrorMessage: errStepBudgetExceeded.Error(),
-			}
-			completedAt := time.Now()
-			budgetStep.CompletedAt = &completedAt
-			ctx.StepResults = append(ctx.StepResults, budgetStep)
-			slog.Warn("action step budget exceeded; aborting flow",
-				slog.String("component", "actions"),
-				slog.Int("action_id", action.ID),
-				slog.Int("steps", ctx.TotalSteps),
-			)
-			break
-		}
-
-		stepResult := models.StepResult{
-			NodeID:    node.ID,
-			NodeType:  node.NodeType,
-			Status:    models.ActionStatusRunning,
-			StartedAt: time.Now(),
-		}
-
+	run, err := actionutil.RunFlow(executionCtx, action.Nodes, action.Edges, actionutil.FlowOptions{
+		TriggerNodeType:   string(models.ActionNodeTrigger),
+		MaxSteps:          maxStepsPerFlow,
+		BudgetExceededErr: errStepBudgetExceeded,
+		TotalSteps:        &ctx.TotalSteps,
+		OnStep:            func(step *models.StepResult) { ctx.StepResults = append(ctx.StepResults, *step) },
+	}, func(node *models.ActionNode, step *models.StepResult, markExecuted func(int)) error {
 		var err error
-		nodeCopy := node
 		if node.NodeType.IsIterator() {
-			err = as.runIterator(&nodeCopy, ctx, &stepResult, action.Nodes, action.Edges, executedNodes)
+			err = as.runIterator(node, ctx, step, action.Nodes, action.Edges, markExecuted)
 		} else {
-			err = as.executeNode(&nodeCopy, ctx, &stepResult)
+			err = as.executeNode(node, ctx, step)
 		}
-		completedAt := time.Now()
-		stepResult.CompletedAt = &completedAt
-
 		if err != nil {
-			stepResult.Status = models.ActionStatusFailed
-			stepResult.ErrorMessage = err.Error()
-			ctx.StepResults = append(ctx.StepResults, stepResult)
-
-			// Log failure but continue - some failures are acceptable
 			slog.Warn("node execution failed",
 				slog.String("component", "actions"),
 				slog.Int("node_id", node.ID),
 				slog.String("node_type", string(node.NodeType)),
 				slog.Any("error", err),
 			)
-		} else {
-			stepResult.Status = models.ActionStatusCompleted
-			ctx.StepResults = append(ctx.StepResults, stepResult)
-			executedNodes[node.ID] = true
 		}
+		return err
+	})
+	if err != nil {
+		completedAt := time.Now()
+		if errors.Is(err, actionutil.ErrCycleDetected) {
+			log.Status = models.ActionStatusFailed
+			log.ErrorMessage = fmt.Sprintf("failed to sort nodes: %v", err)
+			log.CompletedAt = &completedAt
+			if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
+				slog.Error("failed to update execution log", slog.Any("error", logErr), slog.Int("action_id", action.ID))
+			}
+			return fmt.Errorf("failed to topologically sort nodes: %w", err)
+		}
+		// The execution context was canceled mid-step; the runner already
+		// recorded the in-flight step as failed.
+		as.cleanupActionContainers(ctx.StepResults)
+		log.Status = models.ActionStatusFailed
+		log.ErrorMessage = err.Error()
+		log.CompletedAt = &completedAt
+		if trace, marshalErr := json.Marshal(ctx.StepResults); marshalErr == nil {
+			log.ExecutionTrace = string(trace)
+		}
+		if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
+			slog.Error("failed to cancel action execution log", slog.Any("error", logErr), slog.Int("action_id", action.ID))
+		}
+		return err
+	}
+	if run.BudgetExceeded {
+		slog.Warn("action step budget exceeded; aborting flow",
+			slog.String("component", "actions"),
+			slog.Int("action_id", action.ID),
+			slog.Int("steps", ctx.TotalSteps),
+		)
 	}
 
-	// Tear down any containers started during this run — they exist only to
-	// service nodes inside this action, and the auto-teardown timeout is a
-	// coarse upper bound, not a cleanup signal.
+	// Clean up containers started by this action.
 	as.cleanupActionContainers(ctx.StepResults)
 
-	// Update execution log
 	completedAt := time.Now()
 	log.CompletedAt = &completedAt
 	log.Status = models.ActionStatusCompleted
 
-	// Check if any step failed
 	for _, result := range ctx.StepResults {
 		if result.Status == models.ActionStatusFailed {
 			log.Status = models.ActionStatusFailed
@@ -815,13 +758,15 @@ func (as *ActionService) executeAction(action *models.Action, event *models.Acti
 		}
 	}
 
-	// Serialize execution trace
 	if trace, err := json.Marshal(ctx.StepResults); err == nil {
 		log.ExecutionTrace = string(trace)
 	}
 
 	if logErr := as.repo.UpdateExecutionLog(log); logErr != nil {
 		slog.Error("failed to update execution log", slog.Any("error", logErr), slog.Int("action_id", action.ID))
+		if durableEventKey != "" {
+			return fmt.Errorf("complete durable action execution log: %w", logErr)
+		}
 	}
 
 	slog.Debug("action execution completed",
@@ -831,109 +776,31 @@ func (as *ActionService) executeAction(action *models.Action, event *models.Acti
 		slog.Duration("duration", time.Since(startTime)),
 	)
 
+	// Automation runs are audited (WI-1142): routing and assignment decisions
+	// made by rules must be reconstructable from the central audit trail.
+	emitServiceAudit(as.db, AuditActor{UserID: event.ActorUserID},
+		logger.ActionAutomationExecute, logger.ResourceAutomation, &action.ID, action.Name, map[string]any{
+			"item_id":          event.ItemID,
+			"trigger_event":    string(event.EventType),
+			"status":           string(log.Status),
+			"duration_ms":      time.Since(startTime).Milliseconds(),
+			"execution_log_id": log.ID,
+		})
+
+	if log.Status == models.ActionStatusFailed {
+		return fmt.Errorf("%w: action %d", ErrActionCompletedWithFailedSteps, action.ID)
+	}
 	return nil
 }
 
+func actionRequestContext(ctx *models.ExecutionContext) context.Context {
+	if ctx != nil && ctx.Context != nil {
+		return ctx.Context
+	}
+	return context.Background()
+}
+
 // topologicalSort sorts nodes in execution order using Kahn's algorithm
-func (as *ActionService) topologicalSort(nodes []models.ActionNode, edges []models.ActionEdge) ([]models.ActionNode, error) {
-	if len(nodes) == 0 {
-		return nil, nil
-	}
-
-	// Build adjacency list and in-degree map
-	nodeMap := make(map[int]*models.ActionNode)
-	inDegree := make(map[int]int)
-	adjacency := make(map[int][]int)
-
-	for i := range nodes {
-		nodeMap[nodes[i].ID] = &nodes[i]
-		inDegree[nodes[i].ID] = 0
-		adjacency[nodes[i].ID] = []int{}
-	}
-
-	for _, edge := range edges {
-		adjacency[edge.SourceNodeID] = append(adjacency[edge.SourceNodeID], edge.TargetNodeID)
-		inDegree[edge.TargetNodeID]++
-	}
-
-	// Find nodes with no incoming edges
-	queue := []int{}
-	for nodeID, degree := range inDegree {
-		if degree == 0 {
-			queue = append(queue, nodeID)
-		}
-	}
-
-	sorted := []models.ActionNode{}
-	for len(queue) > 0 {
-		nodeID := queue[0]
-		queue = queue[1:]
-
-		if node, ok := nodeMap[nodeID]; ok {
-			sorted = append(sorted, *node)
-		}
-
-		for _, targetID := range adjacency[nodeID] {
-			inDegree[targetID]--
-			if inDegree[targetID] == 0 {
-				queue = append(queue, targetID)
-			}
-		}
-	}
-
-	// Check for cycles
-	if len(sorted) != len(nodes) {
-		return nil, fmt.Errorf("cycle detected in action flow")
-	}
-
-	return sorted, nil
-}
-
-// canExecuteNode checks if a node can be executed based on incoming edges
-func (as *ActionService) canExecuteNode(nodeID int, edges []models.ActionEdge, executedNodes map[int]bool, ctx *models.ExecutionContext) bool {
-	return as.canExecuteNodeWithResults(nodeID, edges, executedNodes, ctx.StepResults, len(edges) == 0)
-}
-
-func (as *ActionService) canExecuteNodeWithResults(nodeID int, edges []models.ActionEdge, executedNodes map[int]bool, stepResults []models.StepResult, allowRoot bool) bool {
-	hasIncomingEdge := false
-	for _, edge := range edges {
-		if edge.TargetNodeID == nodeID {
-			hasIncomingEdge = true
-
-			// Check if source was executed
-			if !executedNodes[edge.SourceNodeID] {
-				return false
-			}
-
-			// For condition edges, check the edge type matches the condition result.
-			if edge.EdgeType == "true" || edge.EdgeType == "false" {
-				foundConditionResult := false
-				for _, result := range stepResults {
-					if result.NodeID != edge.SourceNodeID {
-						continue
-					}
-					foundConditionResult = true
-					condResult, ok := result.Output["condition_result"].(bool)
-					if !ok {
-						return false
-					}
-					if edge.EdgeType == "true" && !condResult {
-						return false
-					}
-					if edge.EdgeType == "false" && condResult {
-						return false
-					}
-				}
-				if !foundConditionResult {
-					return false
-				}
-			}
-		}
-	}
-
-	return hasIncomingEdge || allowRoot
-}
-
 // executeNode executes a single node. Registered NodeExecutors take
 // precedence over the legacy switch so new node types can ship without
 // touching this function.
@@ -952,10 +819,6 @@ func (as *ActionService) executeNode(node *models.ActionNode, ctx *models.Execut
 		return as.executeNotifyUser(node, ctx, stepResult)
 	case models.ActionNodeCondition:
 		return as.executeCondition(node, ctx, stepResult)
-	case models.ActionNodeUpdateAsset:
-		return as.executeUpdateAsset(node, ctx, stepResult)
-	case models.ActionNodeCreateAsset:
-		return as.executeCreateAsset(node, ctx, stepResult)
 	case models.ActionNodeRoundRobinAssign:
 		return as.executeRoundRobinAssign(node, ctx, stepResult)
 	case models.ActionNodeAIExtract:
@@ -993,95 +856,267 @@ func currentActionWorkspaceID(ctx *models.ExecutionContext) int {
 	return 0
 }
 
-func derefIntPtr(p *int) interface{} {
+// triggerCommentIsPrivate reports whether the execution descends from a
+// private/internal comment. Customer-visible nodes must stay internal or
+// skip when it is true.
+func triggerCommentIsPrivate(ctx *models.ExecutionContext) bool {
+	return ctx != nil && ctx.TriggerCommentIsPrivate
+}
+
+// eventValueIsTrue coerces a persisted event value to a bool. Durable events
+// round-trip through JSON, so the flag is normally a bool, but older rows may
+// carry strings.
+func eventValueIsTrue(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return v == "true" || v == "1"
+	case float64:
+		return v != 0
+	default:
+		return false
+	}
+}
+
+func (as *ActionService) updateItemFromAction(ctx *models.ExecutionContext, updateData map[string]any) (*UpdateItemResult, error) {
+	if as.itemUpdate == nil {
+		return nil, fmt.Errorf("item update application service not configured")
+	}
+	depth := 1
+	if ctx != nil && ctx.Event != nil {
+		depth = ctx.Event.CascadeDepth + 1
+	}
+	return as.itemUpdate.UpdateWithContext(
+		ctx.EffectiveActorID,
+		"",
+		currentActionItemID(ctx),
+		updateData,
+		ActionContext{
+			TriggeredByAction:       true,
+			ExecutionChainID:        ctx.ChainID,
+			CascadeDepth:            depth,
+			SourceApplication:       "workspace",
+			TriggerCommentIsPrivate: ctx.TriggerCommentIsPrivate,
+		},
+	)
+}
+
+func derefIntPtr(p *int) any {
 	if p == nil {
 		return nil
 	}
 	return *p
 }
 
-func derefFloatPtr(p *float64) interface{} {
+func derefFloatPtr(p *float64) any {
 	if p == nil {
 		return nil
 	}
 	return *p
 }
 
-func derefTimePtr(p *time.Time) interface{} {
+func derefTimePtr(p *time.Time) any {
 	if p == nil {
 		return nil
 	}
 	return *p
 }
 
-func (as *ActionService) currentItemFieldValue(ctx *models.ExecutionContext, fieldName string) interface{} {
+// loadExecutionActor resolves the identity whose permissions govern the action.
+func (as *ActionService) loadExecutionActor(ctx *models.ExecutionContext) error {
+	if ctx.EffectiveActorID > 0 {
+		actor, err := repository.NewUserRepository(as.db).GetByID(ctx.EffectiveActorID)
+		if err != nil {
+			return fmt.Errorf("load action actor: %w", err)
+		}
+		ctx.Actor = actor
+	}
+	return nil
+}
+
+func (as *ActionService) currentItemFieldValue(ctx *models.ExecutionContext, fieldName string) any {
+	value, _ := currentItemFieldValueResolved(as.itemRepo, ctx, fieldName)
+	return value
+}
+
+func currentItemFieldValue(itemRepo *repository.ItemRepository, ctx *models.ExecutionContext, fieldName string) any {
+	value, _ := currentItemFieldValueResolved(itemRepo, ctx, fieldName)
+	return value
+}
+
+// currentItemFieldValueResolved resolves a field against the execution item.
+// A "parent." prefix evaluates the field against the item's parent instead —
+// how automations express "transition the parent when all its children are
+// done" (parent.open_child_count eq 0). Only one parent hop is honored.
+func currentItemFieldValueResolved(itemRepo *repository.ItemRepository, ctx *models.ExecutionContext, fieldName string) (any, bool) {
 	if ctx == nil {
-		return nil
+		return nil, false
+	}
+	if rest, ok := strings.CutPrefix(fieldName, "parent."); ok && !strings.HasPrefix(rest, "parent.") {
+		return parentItemFieldValueResolved(itemRepo, ctx, rest)
+	}
+	return itemFieldValueResolved(itemRepo, ctx, currentActionItemID(ctx), ctx.Item, fieldName)
+}
+
+// parentItemFieldValueResolved resolves <field> against the current item's
+// parent. The parent is read with details so names, custom fields, and
+// aggregates resolve against fresh, mutated state.
+func parentItemFieldValueResolved(itemRepo *repository.ItemRepository, ctx *models.ExecutionContext, fieldName string) (any, bool) {
+	if itemRepo == nil {
+		return nil, false
 	}
 	itemID := currentActionItemID(ctx)
-	if ctx.Item != nil {
-		switch fieldName {
-		case "id", "item_id":
-			return ctx.Item.ID
-		case "workspace_id":
-			return ctx.Item.WorkspaceID
+	if itemID <= 0 {
+		return nil, false
+	}
+	lookupContext := ctx.Context
+	if lookupContext == nil {
+		lookupContext = context.Background()
+	}
+	item, err := itemRepo.FindByIDWithDetailsContext(lookupContext, itemID)
+	if err != nil || item == nil || item.ParentID == nil || *item.ParentID <= 0 {
+		return nil, false
+	}
+	parent, err := itemRepo.FindByIDWithDetailsContext(lookupContext, *item.ParentID)
+	if err != nil {
+		slog.Warn("failed to resolve action parent item",
+			slog.String("component", "actions"), slog.Int("item_id", itemID),
+			slog.Int("parent_id", *item.ParentID), slog.Any("error", err))
+		return nil, false
+	}
+	return itemFieldValueResolved(itemRepo, ctx, parent.ID, parent, fieldName)
+}
+
+// itemFieldValueResolved resolves fieldName for a specific item. item may be
+// a hydrated snapshot (iterator item or parent); when names or joined fields
+// are needed it is re-read fresh so later nodes observe mutations.
+func itemFieldValueResolved(itemRepo *repository.ItemRepository, ctx *models.ExecutionContext, itemID int, item *models.Item, fieldName string) (any, bool) {
+	switch fieldName {
+	case "id", "item_id":
+		if itemID > 0 {
+			return itemID, true
 		}
-		if strings.HasPrefix(fieldName, "custom_field_") {
-			customFieldID, err := strconv.Atoi(strings.TrimPrefix(fieldName, "custom_field_"))
-			if err == nil && customFieldID > 0 {
-				if val, readErr := as.itemRepo.GetItemCustomFieldValue(itemID, customFieldID); readErr == nil {
-					return val
-				}
+	case "workspace_id":
+		if workspaceID := currentActionWorkspaceID(ctx); workspaceID > 0 {
+			return workspaceID, true
+		}
+	case "open_child_count", "open_descendant_count":
+		// Aggregate pseudo-fields for condition nodes: lets an automation
+		// express "all children done" as open_child_count eq 0.
+		if itemRepo == nil || itemID <= 0 {
+			return 0, true
+		}
+		maxDepth := 1
+		if fieldName == "open_descendant_count" {
+			maxDepth = 0
+		}
+		if _, err := itemRepo.FindByID(itemID); err != nil {
+			// Unknown or deleted item: report no aggregate rather than a
+			// fabricated zero count.
+			return nil, false
+		}
+		count, err := itemRepo.CountOpenDescendants(itemID, maxDepth)
+		if err != nil {
+			slog.Warn("failed to count open children for action condition",
+				slog.String("component", "actions"), slog.Int("item_id", itemID),
+				slog.String("field", fieldName), slog.Any("error", err))
+			return nil, false
+		}
+		return count, true
+	case "milestone_ids", "milestone_id":
+		// Milestones live in a join table, so they never appear among the
+		// item columns. Conditions compare the attached IDs as CSV; an empty
+		// attachment renders as "" so is_empty/is_not_empty behave naturally.
+		if itemRepo == nil || itemID <= 0 {
+			return "", true
+		}
+		ids, err := itemRepo.GetMilestoneIDs(itemID)
+		if err != nil {
+			slog.Warn("failed to load milestones for action condition",
+				slog.String("component", "actions"), slog.Int("item_id", itemID), slog.Any("error", err))
+			return nil, false
+		}
+		return joinIntsCSV(ids), true
+	}
+	if strings.HasPrefix(fieldName, "custom_field_") {
+		key := strings.TrimPrefix(fieldName, "custom_field_")
+		customFieldID, err := strconv.Atoi(key)
+		if itemRepo != nil && itemID > 0 && err == nil && customFieldID > 0 {
+			if val, readErr := itemRepo.GetItemCustomFieldValue(itemID, customFieldID); readErr == nil {
+				return val, true
 			}
-			if ctx.Item.CustomFieldValues != nil {
-				return ctx.Item.CustomFieldValues[strings.TrimPrefix(fieldName, "custom_field_")]
-			}
+		}
+		if item != nil && item.CustomFieldValues != nil {
+			val, ok := item.CustomFieldValues[key]
+			return val, ok
 		}
 	}
-	if itemID != 0 && repository.IsAllowedItemColumn(fieldName) {
-		if val, err := as.itemRepo.GetAllowedColumnValue(itemID, fieldName); err == nil {
-			return val
+	if itemRepo != nil && itemID > 0 && repository.IsAllowedItemColumn(fieldName) {
+		if val, err := itemRepo.GetAllowedColumnValue(itemID, fieldName); err == nil {
+			return val, true
 		}
 	}
-	if ctx.Item != nil {
+	// Only joined names need hydration. Resolve them without pinning the
+	// passed snapshot: later nodes must see mutations, including inside
+	// iterator snapshots.
+	if (fieldName == "status" || fieldName == "priority") && itemRepo != nil && itemID > 0 {
+		lookupContext := ctx.Context
+		if lookupContext == nil {
+			lookupContext = context.Background()
+		}
+		hydrated, err := itemRepo.FindByIDWithDetailsContext(lookupContext, itemID)
+		if err != nil {
+			slog.Warn("failed to resolve action item name", slog.String("component", "actions"),
+				slog.Int("item_id", itemID), slog.String("field", fieldName), slog.Any("error", err))
+			// Do not silently substitute a stale iterator name after a failed read.
+			return nil, false
+		}
+		item = hydrated
+	}
+	if item != nil {
 		switch fieldName {
 		case "title":
-			return ctx.Item.Title
+			return item.Title, true
 		case "description":
-			return ctx.Item.Description
+			return item.Description, true
+		case "status":
+			return item.StatusName, true
+		case "priority":
+			return item.PriorityName, true
 		case "status_id":
-			return derefIntPtr(ctx.Item.StatusID)
+			return derefIntPtr(item.StatusID), true
 		case "priority_id":
-			return derefIntPtr(ctx.Item.PriorityID)
+			return derefIntPtr(item.PriorityID), true
 		case "assignee_id":
-			return derefIntPtr(ctx.Item.AssigneeID)
+			return derefIntPtr(item.AssigneeID), true
 		case "creator_id":
-			return derefIntPtr(ctx.Item.CreatorID)
+			return derefIntPtr(item.CreatorID), true
 		case "item_type_id":
-			return derefIntPtr(ctx.Item.ItemTypeID)
+			return derefIntPtr(item.ItemTypeID), true
 		case "iteration_id":
-			return derefIntPtr(ctx.Item.IterationID)
+			return derefIntPtr(item.IterationID), true
 		case "project_id":
-			return derefIntPtr(ctx.Item.ProjectID)
+			return derefIntPtr(item.ProjectID), true
 		case "parent_id":
-			return derefIntPtr(ctx.Item.ParentID)
+			return derefIntPtr(item.ParentID), true
 		case "story_points":
-			return derefFloatPtr(ctx.Item.StoryPoints)
+			return derefFloatPtr(item.StoryPoints), true
 		case "due_date":
-			return derefTimePtr(ctx.Item.DueDate)
+			return derefTimePtr(item.DueDate), true
 		case "start_date":
-			return derefTimePtr(ctx.Item.StartDate)
+			return derefTimePtr(item.StartDate), true
 		case "end_date":
-			return derefTimePtr(ctx.Item.EndDate)
+			return derefTimePtr(item.EndDate), true
 		}
 	}
 	if val, ok := ctx.Variables[fieldName]; ok {
-		return val
+		return val, true
 	}
 	if val, ok := ctx.Variables["new_"+fieldName]; ok {
-		return val
+		return val, true
 	}
-	return nil
+	return nil, false
 }
 
 // executeSetField executes a set_field node. It dispatches to either the
@@ -1095,17 +1130,28 @@ func (as *ActionService) executeSetField(node *models.ActionNode, ctx *models.Ex
 
 	value := as.substituteVariables(config.Value, ctx)
 
-	if config.Target == "custom_field" {
+	switch config.Target {
+	case "custom_field":
 		return as.executeSetFieldCustom(ctx, stepResult, config, value)
+	case "", "column":
+		// Continue below. Empty is the legacy representation for a column.
+	default:
+		return fmt.Errorf("set_field: unsupported target %q", config.Target)
 	}
 	if config.FieldName == "milestone_ids" || config.FieldName == "milestone_id" {
 		return as.executeSetFieldMilestones(ctx, stepResult, value)
+	}
+	if config.FieldName == "status_id" {
+		statusID, err := parsePositiveActionID("status_id", value)
+		if err != nil {
+			return fmt.Errorf("set_field: %w", err)
+		}
+		return as.executeSetStatusID(statusID, ctx, stepResult)
 	}
 	return as.executeSetFieldColumn(ctx, stepResult, config, value)
 }
 
 func (as *ActionService) executeSetFieldMilestones(ctx *models.ExecutionContext, stepResult *models.StepResult, value string) error {
-	itemID := currentActionItemID(ctx)
 	workspaceID := currentActionWorkspaceID(ctx)
 	if err := as.authorizeWorkspaceMutation(ctx.EffectiveActorID, workspaceID, models.PermissionItemEdit); err != nil {
 		return err
@@ -1116,12 +1162,7 @@ func (as *ActionService) executeSetFieldMilestones(ctx *models.ExecutionContext,
 		return fmt.Errorf("set_field milestones: %w", err)
 	}
 
-	updateService := NewItemUpdateService(as.db).WithPermissionService(as.permissionService)
-	result, err := updateService.UpdateItem(UpdateItemRequest{
-		ItemID:     itemID,
-		UpdateData: map[string]interface{}{"milestone_ids": ids},
-		UserID:     ctx.EffectiveActorID,
-	})
+	result, err := as.updateItemFromAction(ctx, map[string]any{"milestone_ids": ids})
 	if err != nil {
 		return err
 	}
@@ -1139,23 +1180,11 @@ func (as *ActionService) executeSetFieldMilestones(ctx *models.ExecutionContext,
 		newValue = joinIntsCSV(ids)
 	}
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"field_name": "milestones",
 		"old_value":  oldValue,
 		"new_value":  newValue,
 	}
-
-	as.EmitActionEvent(&models.ActionEvent{
-		EventType:         models.ActionTriggerItemUpdated,
-		WorkspaceID:       workspaceID,
-		ItemID:            itemID,
-		ActorUserID:       ctx.EffectiveActorID,
-		OldValues:         map[string]interface{}{"milestones": oldValue},
-		NewValues:         map[string]interface{}{"milestones": newValue},
-		TriggeredByAction: true,
-		ExecutionChainID:  ctx.ChainID,
-		CascadeDepth:      ctx.Event.CascadeDepth + 1,
-	})
 
 	return nil
 }
@@ -1166,7 +1195,7 @@ func parseActionMilestoneIDs(value string) ([]int, error) {
 		return []int{}, nil
 	}
 
-	var raw []interface{}
+	var raw []any
 	if err := json.Unmarshal([]byte(trimmed), &raw); err == nil {
 		ids := make([]int, 0, len(raw))
 		for _, v := range raw {
@@ -1201,11 +1230,10 @@ func parseActionMilestoneIDs(value string) ([]int, error) {
 func (as *ActionService) executeSetFieldColumn(ctx *models.ExecutionContext, stepResult *models.StepResult, config models.SetFieldNodeConfig, value string) error {
 	itemID := currentActionItemID(ctx)
 	workspaceID := currentActionWorkspaceID(ctx)
-	// Reject field names that aren't part of the items-table allowlist —
-	// config.FieldName is attacker-controlled (workspace admin writes node config),
-	// and it's interpolated into the SELECT below.
-	if !repository.IsAllowedItemColumn(config.FieldName) {
-		return fmt.Errorf("set_field: field %q is not a writable item column", config.FieldName)
+	fieldName := strings.TrimSpace(config.FieldName)
+	typedValue, err := parseActionSetFieldValue(fieldName, value)
+	if err != nil {
+		return err
 	}
 
 	if err := as.authorizeWorkspaceMutation(ctx.EffectiveActorID, workspaceID, models.PermissionItemEdit); err != nil {
@@ -1213,55 +1241,110 @@ func (as *ActionService) executeSetFieldColumn(ctx *models.ExecutionContext, ste
 	}
 
 	// Get current field value for event emission (best effort).
-	var oldValue interface{}
-	if val, err := as.itemRepo.GetAllowedColumnValue(itemID, config.FieldName); err == nil {
+	var oldValue any
+	if val, err := as.itemRepo.GetAllowedColumnValue(itemID, fieldName); err == nil {
 		oldValue = val
 	} else {
 		slog.Debug("failed to get current field value for cascade event",
 			slog.String("component", "actions"),
-			slog.String("field_name", config.FieldName),
+			slog.String("field_name", fieldName),
 			slog.Int("item_id", itemID),
 			slog.Any("error", err),
 		)
 	}
 
-	tx, err := as.db.BeginTx(context.Background(), nil)
+	// Route ordinary fields through the same domain service as interactive
+	// edits. This restores type/FK checks, hierarchy-cycle protection,
+	// sanitization, history, live updates, and assignment hooks that a raw
+	// items-table UPDATE bypassed.
+	result, err := as.updateItemFromAction(ctx, map[string]any{fieldName: typedValue})
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := as.itemRepo.UpdateFields(tx, itemID, map[string]interface{}{
-		config.FieldName: value,
-	}); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+
+	newValue := typedValue
+	if val, readErr := as.itemRepo.GetAllowedColumnValue(itemID, fieldName); readErr == nil {
+		newValue = val
+	}
+	for _, change := range result.FieldChanges {
+		if change.FieldName == fieldName {
+			oldValue = change.OldValue
+			newValue = change.NewValue
+		}
 	}
 
-	// Live-update publish (WI-483): this action writes an item field column
-	// directly, bypassing ItemUpdateService.
-	PublishItemChange(itemID, ItemChangeUpdated)
-
-	stepResult.Output = map[string]interface{}{
-		"field_name": config.FieldName,
+	stepResult.Output = map[string]any{
+		"field_name": fieldName,
 		"old_value":  oldValue,
-		"new_value":  value,
+		"new_value":  newValue,
 	}
-
-	as.EmitActionEvent(&models.ActionEvent{
-		EventType:         models.ActionTriggerItemUpdated,
-		WorkspaceID:       workspaceID,
-		ItemID:            itemID,
-		ActorUserID:       ctx.EffectiveActorID,
-		OldValues:         map[string]interface{}{config.FieldName: oldValue},
-		NewValues:         map[string]interface{}{config.FieldName: value},
-		TriggeredByAction: true,
-		ExecutionChainID:  ctx.ChainID,
-		CascadeDepth:      ctx.Event.CascadeDepth + 1,
-	})
 
 	return nil
+}
+
+func parseActionSetFieldValue(fieldName, value string) (any, error) {
+	trimmed := strings.TrimSpace(value)
+	isNull := trimmed == "" || strings.EqualFold(trimmed, "null")
+
+	switch fieldName {
+	case "title", "description":
+		return value, nil
+	case "priority_id", "iteration_id", "project_id", "time_project_id", "assignee_id", "creator_id", "parent_id", "related_work_item_id":
+		if isNull {
+			return nil, nil
+		}
+		return parsePositiveActionID(fieldName, trimmed)
+	case "due_date", "start_date", "end_date":
+		if isNull {
+			return nil, nil
+		}
+		return trimmed, nil
+	case "story_points":
+		if isNull {
+			return nil, nil
+		}
+		parsed, err := strconv.ParseFloat(trimmed, 64)
+		if err != nil {
+			return nil, fmt.Errorf("set_field: field %q requires a number: %w", fieldName, err)
+		}
+		return parsed, nil
+	case "estimate_minutes":
+		if isNull {
+			return nil, nil
+		}
+		parsed, err := strconv.Atoi(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("set_field: field %q requires an integer: %w", fieldName, err)
+		}
+		return parsed, nil
+	case "inherit_project", "is_task":
+		parsed, err := strconv.ParseBool(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("set_field: field %q requires true or false: %w", fieldName, err)
+		}
+		return parsed, nil
+	case "item_type_id":
+		return nil, fmt.Errorf("set_field: item_type_id must be changed through the item type change workflow")
+	case "status_id":
+		return nil, fmt.Errorf("set_field: status_id must be changed through the workflow transition path")
+	case "custom_field_values":
+		return nil, fmt.Errorf("set_field: use a custom_field target to change custom fields")
+	case "frac_index":
+		return nil, fmt.Errorf("set_field: frac_index must be changed through the item reorder workflow")
+	default:
+		return nil, fmt.Errorf("set_field: field %q is not a supported item field", fieldName)
+	}
+}
+
+func parsePositiveActionID(fieldName, value string) (int, error) {
+	id, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("field %q requires a positive integer: %w", fieldName, err)
+	}
+	if id <= 0 {
+		return 0, fmt.Errorf("field %q requires a positive integer", fieldName)
+	}
+	return id, nil
 }
 
 func (as *ActionService) executeSetFieldCustom(ctx *models.ExecutionContext, stepResult *models.StepResult, config models.SetFieldNodeConfig, value string) error {
@@ -1275,34 +1358,11 @@ func (as *ActionService) executeSetFieldCustom(ctx *models.ExecutionContext, ste
 		return err
 	}
 
-	// Substituted variables can carry user content — route the value
-	// through the WI-319 choke point before persisting: select/multiselect
-	// values are validated against the field's option set and text/textarea
-	// values sanitized (same path as the interactive item write surfaces).
-	// A validation failure fails this node instead of writing the raw value.
-	fieldKey := strconv.Itoa(config.CustomFieldID)
-	cfv := map[string]interface{}{fieldKey: value}
-	fieldTypes, err := validation.CustomFieldTypes(as.db, cfv)
+	normalized, err := as.normalizeSetFieldCustomValue(config.CustomFieldID, value)
 	if err != nil {
-		return fmt.Errorf("resolve custom field type: %w", err)
+		return err
 	}
-	switch fieldTypes[fieldKey] {
-	case "select":
-		// An empty substitution clears the field rather than failing
-		// option-id validation.
-		if strings.TrimSpace(value) == "" {
-			cfv[fieldKey] = nil
-		}
-	case "multiselect":
-		// Multiselect values arrive as the substituted string form of a
-		// JSON array ("[1,2]") or a CSV of option ids — decode before
-		// validation so each element is checked against the option set.
-		cfv[fieldKey] = parseActionMultiselectValue(value)
-	}
-	if err := validation.ValidateAndNormalizeCustomFieldValues(as.db, cfv); err != nil {
-		return fmt.Errorf("set_field: custom field %d: %w", config.CustomFieldID, err)
-	}
-	newValue := cfv[fieldKey]
+	newValue := normalized.value
 
 	oldValue, err := as.itemRepo.GetItemCustomFieldValue(itemID, config.CustomFieldID)
 	if err != nil {
@@ -1314,74 +1374,109 @@ func (as *ActionService) executeSetFieldCustom(ctx *models.ExecutionContext, ste
 		)
 	}
 
-	tx, err := as.db.BeginTx(context.Background(), nil)
+	item, err := as.itemRepo.FindByID(itemID)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return fmt.Errorf("load item custom fields: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-	if err := as.itemRepo.SetItemCustomFieldValue(tx, itemID, config.CustomFieldID, newValue); err != nil {
+	customFieldValues := make(map[string]any, len(item.CustomFieldValues)+1)
+	for key, existingValue := range item.CustomFieldValues {
+		customFieldValues[key] = existingValue
+	}
+	customFieldValues[normalized.key] = newValue
+	result, err := as.updateItemFromAction(ctx, map[string]any{
+		"custom_field_values": customFieldValues,
+	})
+	if err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+	if result.Item.CustomFieldValues != nil {
+		newValue = result.Item.CustomFieldValues[normalized.key]
 	}
 
 	key := "custom_field_" + strconv.Itoa(config.CustomFieldID)
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"field_name":      key,
 		"custom_field_id": config.CustomFieldID,
 		"old_value":       oldValue,
 		"new_value":       newValue,
 	}
 
-	as.EmitActionEvent(&models.ActionEvent{
-		EventType:         models.ActionTriggerItemUpdated,
-		WorkspaceID:       workspaceID,
-		ItemID:            itemID,
-		ActorUserID:       ctx.EffectiveActorID,
-		OldValues:         map[string]interface{}{key: oldValue},
-		NewValues:         map[string]interface{}{key: newValue},
-		TriggeredByAction: true,
-		ExecutionChainID:  ctx.ChainID,
-		CascadeDepth:      ctx.Event.CascadeDepth + 1,
-	})
-
 	return nil
+}
+
+type normalizedActionCustomField struct {
+	key   string
+	value any
+}
+
+func (as *ActionService) normalizeSetFieldCustomValue(customFieldID int, value string) (normalizedActionCustomField, error) {
+	fieldKey := strconv.Itoa(customFieldID)
+	values := map[string]any{fieldKey: value}
+	fieldTypes, err := validation.CustomFieldTypes(as.db, values)
+	if err != nil {
+		return normalizedActionCustomField{}, fmt.Errorf("resolve custom field type: %w", err)
+	}
+	fieldType, ok := fieldTypes[fieldKey]
+	if !ok {
+		return normalizedActionCustomField{}, fmt.Errorf("set_field: custom field %d does not exist", customFieldID)
+	}
+	switch fieldType {
+	case "select":
+		if strings.TrimSpace(value) == "" {
+			values[fieldKey] = nil
+		}
+	case "multiselect":
+		values[fieldKey] = parseActionMultiselectValue(value)
+	case models.CustomFieldTypeBoolean, models.CustomFieldTypeCheckbox:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "":
+			values[fieldKey] = nil
+		case "true":
+			values[fieldKey] = true
+		case "false":
+			values[fieldKey] = false
+		default:
+			return normalizedActionCustomField{}, fmt.Errorf("set_field: custom field %d requires true or false", customFieldID)
+		}
+	}
+	if err := validation.ValidateAndNormalizeCustomFieldValues(as.db, values); err != nil {
+		return normalizedActionCustomField{}, fmt.Errorf("set_field: custom field %d: %w", customFieldID, err)
+	}
+	return normalizedActionCustomField{key: fieldKey, value: values[fieldKey]}, nil
 }
 
 // parseActionMultiselectValue decodes a substituted multiselect set_field
 // value: a JSON array ("[1,2]") or a CSV of option ids ("1, 2"). An empty
 // string means "clear". Elements stay untyped — option-id coercion and
 // option-set validation happen in ValidateAndNormalizeCustomFieldValues.
-func parseActionMultiselectValue(value string) interface{} {
+func parseActionMultiselectValue(value string) any {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return nil
 	}
-	var arr []interface{}
+	var arr []any
 	if err := json.Unmarshal([]byte(trimmed), &arr); err == nil {
 		return arr
 	}
 	parts := strings.Split(trimmed, ",")
-	out := make([]interface{}, 0, len(parts))
+	out := make([]any, 0, len(parts))
 	for _, part := range parts {
 		out = append(out, strings.TrimSpace(part))
 	}
 	return out
 }
 
-// executeSetStatus executes a set_status node. The transition is routed
-// through WorkflowService.PerformTransition so workflow validity is enforced
-// and history is recorded. Condition-mode / validator-mode rules are still
-// skipped here — the effective actor's workspace-level item.edit permission
-// is the authorization gate; transition condition rules are a separate
-// user-interaction concern that doesn't apply to automation.
+// executeSetStatus uses WorkflowService for validity and history. Automations
+// skip interaction conditions but require the effective actor's item.edit access.
 func (as *ActionService) executeSetStatus(node *models.ActionNode, ctx *models.ExecutionContext, stepResult *models.StepResult) error {
 	var config models.SetStatusNodeConfig
 	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
 		return fmt.Errorf("failed to parse set_status config: %w", err)
 	}
+	return as.executeSetStatusID(config.StatusID, ctx, stepResult)
+}
 
+func (as *ActionService) executeSetStatusID(statusID int, ctx *models.ExecutionContext, stepResult *models.StepResult) error {
 	itemID := currentActionItemID(ctx)
 	workspaceID := currentActionWorkspaceID(ctx)
 	if err := as.authorizeWorkspaceMutation(ctx.EffectiveActorID, workspaceID, models.PermissionItemEdit); err != nil {
@@ -1389,10 +1484,11 @@ func (as *ActionService) executeSetStatus(node *models.ActionNode, ctx *models.E
 	}
 
 	workflowService := NewWorkflowService(as.db)
-	result, err := workflowService.PerformTransition(context.Background(), PerformTransitionRequest{
-		ItemID:      itemID,
-		ToStatusID:  config.StatusID,
-		ActorUserID: ctx.EffectiveActorID,
+	result, err := workflowService.PerformTransition(actionRequestContext(ctx), PerformTransitionRequest{
+		ItemID:        itemID,
+		ToStatusID:    statusID,
+		ActorUserID:   ctx.EffectiveActorID,
+		EventMetadata: itemEventMetadata(ctx.EffectiveActorID, "automation", actionContextFromExecution(ctx)),
 		// Automations skip conditions — empty modes enforces only workflow validity.
 		Modes: nil,
 	}, as.itemRepo, nil, as.approvalService)
@@ -1401,7 +1497,7 @@ func (as *ActionService) executeSetStatus(node *models.ActionNode, ctx *models.E
 			slog.Warn("set_status action rejected by workflow",
 				slog.String("component", "actions"),
 				slog.Int("item_id", itemID),
-				slog.Int("to_status_id", config.StatusID),
+				slog.Int("to_status_id", statusID),
 				slog.String("reason", rej.Code),
 				slog.String("message", rej.Message),
 			)
@@ -1414,12 +1510,12 @@ func (as *ActionService) executeSetStatus(node *models.ActionNode, ctx *models.E
 	if result.OldStatusID != nil {
 		oldStatusID = *result.OldStatusID
 	}
-	newStatusID := config.StatusID
+	newStatusID := statusID
 	if result.NewStatusID != nil {
 		newStatusID = *result.NewStatusID
 	}
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"old_status_id":   oldStatusID,
 		"new_status_id":   newStatusID,
 		"old_status_name": as.getStatusName(oldStatusID),
@@ -1429,26 +1525,24 @@ func (as *ActionService) executeSetStatus(node *models.ActionNode, ctx *models.E
 	// Emit cascade event if status actually changed.
 	if !result.NoOp {
 		as.EmitActionEvent(&models.ActionEvent{
-			EventType:         models.ActionTriggerStatusTransition,
-			WorkspaceID:       workspaceID,
-			ItemID:            itemID,
-			ActorUserID:       ctx.EffectiveActorID,
-			OldValues:         map[string]interface{}{"status_id": oldStatusID},
-			NewValues:         map[string]interface{}{"status_id": newStatusID},
-			TriggeredByAction: true,
-			ExecutionChainID:  ctx.ChainID,
-			CascadeDepth:      ctx.Event.CascadeDepth + 1,
+			EventType:               models.ActionTriggerStatusTransition,
+			WorkspaceID:             workspaceID,
+			ItemID:                  itemID,
+			ActorUserID:             ctx.EffectiveActorID,
+			OldValues:               map[string]any{"status_id": oldStatusID},
+			NewValues:               map[string]any{"status_id": newStatusID},
+			TriggeredByAction:       true,
+			ExecutionChainID:        ctx.ChainID,
+			CascadeDepth:            ctx.Event.CascadeDepth + 1,
+			TriggerCommentIsPrivate: ctx.TriggerCommentIsPrivate,
 		})
 	}
 
 	return nil
 }
 
-// executeTransitionItem transitions whichever item is currently in the
-// execution context (set by an iterator like related_items, or falling back
-// to the trigger event's item). Permission failures and already-matching
-// statuses are recorded as skips rather than errors so an iterator's other
-// items still get processed.
+// executeTransitionItem uses the iterator item or trigger item. Skips do not
+// abort remaining iterator items.
 func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *models.ExecutionContext, stepResult *models.StepResult) error {
 	var config models.TransitionItemNodeConfig
 	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
@@ -1468,7 +1562,7 @@ func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *mod
 	}
 
 	if item.StatusID == nil {
-		stepResult.Output = map[string]interface{}{
+		stepResult.Output = map[string]any{
 			"item_id": item.ID,
 			"skipped": true,
 			"reason":  "item has no current status",
@@ -1485,7 +1579,7 @@ func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *mod
 			return fmt.Errorf("permission check failed for item %d: %w", item.ID, err)
 		}
 		if !ok {
-			stepResult.Output = map[string]interface{}{
+			stepResult.Output = map[string]any{
 				"item_id":      item.ID,
 				"workspace_id": item.WorkspaceID,
 				"skipped":      true,
@@ -1500,7 +1594,7 @@ func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *mod
 		return err
 	}
 	if targetStatusID == 0 {
-		stepResult.Output = map[string]interface{}{
+		stepResult.Output = map[string]any{
 			"item_id": item.ID,
 			"skipped": true,
 			"reason":  "no target status could be resolved",
@@ -1516,7 +1610,7 @@ func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *mod
 		skipIfMatching = *config.SkipIfAlreadyMatching
 	}
 	if skipIfMatching && *item.StatusID == targetStatusID {
-		stepResult.Output = map[string]interface{}{
+		stepResult.Output = map[string]any{
 			"item_id":   item.ID,
 			"status_id": targetStatusID,
 			"skipped":   true,
@@ -1526,15 +1620,16 @@ func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *mod
 	}
 
 	workflowService := NewWorkflowService(as.db)
-	result, err := workflowService.PerformTransition(context.Background(), PerformTransitionRequest{
-		ItemID:      item.ID,
-		ToStatusID:  targetStatusID,
-		ActorUserID: ctx.EffectiveActorID,
-		Modes:       nil, // Automations are gated by workflow validity only.
+	result, err := workflowService.PerformTransition(actionRequestContext(ctx), PerformTransitionRequest{
+		ItemID:        item.ID,
+		ToStatusID:    targetStatusID,
+		ActorUserID:   ctx.EffectiveActorID,
+		EventMetadata: itemEventMetadata(ctx.EffectiveActorID, "automation", actionContextFromExecution(ctx)),
+		Modes:         nil, // Automations are gated by workflow validity only.
 	}, as.itemRepo, nil, as.approvalService)
 	if err != nil {
 		if rej := IsTransitionRejection(err); rej != nil {
-			stepResult.Output = map[string]interface{}{
+			stepResult.Output = map[string]any{
 				"item_id":           item.ID,
 				"target_status":     targetStatusID,
 				"skipped":           true,
@@ -1551,7 +1646,7 @@ func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *mod
 	if result.OldStatusID != nil {
 		oldStatusID = *result.OldStatusID
 	}
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"item_id":         item.ID,
 		"workspace_id":    item.WorkspaceID,
 		"old_status_id":   oldStatusID,
@@ -1565,15 +1660,16 @@ func (as *ActionService) executeTransitionItem(node *models.ActionNode, ctx *mod
 	// participate in the same chain-store loop prevention.
 	if !result.NoOp {
 		as.EmitActionEvent(&models.ActionEvent{
-			EventType:         models.ActionTriggerStatusTransition,
-			WorkspaceID:       item.WorkspaceID,
-			ItemID:            item.ID,
-			ActorUserID:       ctx.EffectiveActorID,
-			OldValues:         map[string]interface{}{"status_id": oldStatusID},
-			NewValues:         map[string]interface{}{"status_id": targetStatusID},
-			TriggeredByAction: true,
-			ExecutionChainID:  ctx.ChainID,
-			CascadeDepth:      ctx.Event.CascadeDepth + 1,
+			EventType:               models.ActionTriggerStatusTransition,
+			WorkspaceID:             item.WorkspaceID,
+			ItemID:                  item.ID,
+			ActorUserID:             ctx.EffectiveActorID,
+			OldValues:               map[string]any{"status_id": oldStatusID},
+			NewValues:               map[string]any{"status_id": targetStatusID},
+			TriggeredByAction:       true,
+			ExecutionChainID:        ctx.ChainID,
+			CascadeDepth:            ctx.Event.CascadeDepth + 1,
+			TriggerCommentIsPrivate: ctx.TriggerCommentIsPrivate,
 		})
 	}
 
@@ -1670,22 +1766,12 @@ func pickTerminalByCategoryName(terminals []StatusResult, categoryName string) i
 	return terminals[0].ID
 }
 
-// coerceInt extracts an int from a JSON-decoded interface{} (which may be
+// coerceInt extracts an int from a JSON-decoded any (which may be
 // float64 from json.Unmarshal, int from direct construction, or string).
-func coerceInt(v interface{}) (int, bool) {
-	switch n := v.(type) {
-	case int:
-		return n, true
-	case int32:
-		return int(n), true
-	case int64:
-		return int(n), true
-	case float64:
-		return int(n), true
-	case float32:
-		return int(n), true
-	}
-	return 0, false
+// Numeric handling is shared with all other update surfaces via
+// utils.CoerceInt.
+func coerceInt(v any) (int, bool) {
+	return utils.CoerceInt(v)
 }
 
 // executeAddComment executes an add_comment node
@@ -1708,12 +1794,23 @@ func (as *ActionService) executeAddComment(node *models.ActionNode, ctx *models.
 	// Substitute variables in content
 	content := as.substituteVariables(config.Content, ctx)
 
+	// A private/internal trigger comment must never produce a customer-visible
+	// comment; keep the configured content but post it as an internal note.
+	isPrivate := config.IsPrivate
+	privacyDowngraded := false
+	if triggerCommentIsPrivate(ctx) && !isPrivate {
+		isPrivate = true
+		privacyDowngraded = true
+	}
+
 	result, err := as.commentService.Create(CreateCommentParams{
-		ItemID:      itemID,
-		AuthorID:    ctx.EffectiveActorID,
-		Content:     content,
-		IsPrivate:   config.IsPrivate,
-		ActorUserID: ctx.EffectiveActorID,
+		ItemID:               itemID,
+		AuthorID:             ctx.EffectiveActorID,
+		Content:              content,
+		IsPrivate:            isPrivate,
+		ActorUserID:          ctx.EffectiveActorID,
+		SuppressActionEvents: true,
+		EventMetadata:        itemEventMetadata(ctx.EffectiveActorID, "automation", actionContextFromExecution(ctx)),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create comment via service: %w", err)
@@ -1721,10 +1818,13 @@ func (as *ActionService) executeAddComment(node *models.ActionNode, ctx *models.
 	commentID := result.CommentID
 
 	// Populate step result output with change details
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"content":    content,
-		"is_private": config.IsPrivate,
+		"is_private": isPrivate,
 		"comment_id": commentID,
+	}
+	if privacyDowngraded {
+		stepResult.Output["privacy_downgraded"] = true
 	}
 
 	return nil
@@ -1788,7 +1888,7 @@ func (as *ActionService) executeNotifyUser(node *models.ActionNode, ctx *models.
 	}
 
 	// Populate step result output with notification details
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"recipient_count": len(userIDs),
 		"recipient_ids":   userIDs,
 		"title":           title,
@@ -1840,7 +1940,7 @@ func (as *ActionService) executeCondition(node *models.ActionNode, ctx *models.E
 	result := as.evaluateCondition(fieldValue, config.Operator, config.Value)
 
 	// Populate step result output with condition details
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"condition_result": result,
 		"field_name":       config.FieldName,
 		"field_value":      fieldValue,
@@ -1852,22 +1952,12 @@ func (as *ActionService) executeCondition(node *models.ActionNode, ctx *models.E
 }
 
 // evaluateCondition evaluates a condition
-func (as *ActionService) evaluateCondition(value interface{}, operator, compareValue string) bool {
+func (as *ActionService) evaluateCondition(value any, operator, compareValue string) bool {
 	strValue := fmt.Sprintf("%v", value)
-
+	if result, handled := evaluateStringActionCondition(strValue, operator, compareValue); handled {
+		return result
+	}
 	switch operator {
-	case "eq", "==", "equals":
-		return strValue == compareValue
-	case "ne", "!=", "not_equals":
-		return strValue != compareValue
-	case "contains":
-		return strings.Contains(strValue, compareValue)
-	case "not_contains":
-		return !strings.Contains(strValue, compareValue)
-	case "starts_with":
-		return strings.HasPrefix(strValue, compareValue)
-	case "ends_with":
-		return strings.HasSuffix(strValue, compareValue)
 	case "gt", ">":
 		return compareNumericOrString(strValue, compareValue, func(a, b float64) bool { return a > b }, func(a, b string) bool { return a > b })
 	case "lt", "<":
@@ -1876,21 +1966,36 @@ func (as *ActionService) evaluateCondition(value interface{}, operator, compareV
 		return compareNumericOrString(strValue, compareValue, func(a, b float64) bool { return a >= b }, func(a, b string) bool { return a >= b })
 	case "lte", "<=":
 		return compareNumericOrString(strValue, compareValue, func(a, b float64) bool { return a <= b }, func(a, b string) bool { return a <= b })
-	case "is_empty":
-		return strValue == "" || strValue == "null" || strValue == "<nil>"
-	case "is_not_empty":
-		return strValue != "" && strValue != "null" && strValue != "<nil>"
 	default:
 		return false
 	}
 }
 
-// compareNumericOrString applies numCmp when BOTH sides parse as float, strCmp
-// when NEITHER side does, and returns false on a mixed numeric/non-numeric pair.
-// The mixed case used to fall through to lexicographic compare, which made
-// `evaluateCondition("high", "gt", "5")` return true (because 'h' > '5'
-// lexically) — a silent wrong answer for templates whose numeric custom field
-// happens to hold a label.
+func evaluateStringActionCondition(value, operator, compareValue string) (matched, handled bool) {
+	switch operator {
+	case "eq", "==", "equals":
+		return value == compareValue, true
+	case "ne", "!=", "not_equals":
+		return value != compareValue, true
+	case "contains":
+		return strings.Contains(value, compareValue), true
+	case "not_contains":
+		return !strings.Contains(value, compareValue), true
+	case "starts_with":
+		return strings.HasPrefix(value, compareValue), true
+	case "ends_with":
+		return strings.HasSuffix(value, compareValue), true
+	case "is_empty":
+		return value == "" || value == "null" || value == "<nil>", true
+	case "is_not_empty":
+		return value != "" && value != "null" && value != "<nil>", true
+	default:
+		return false, false
+	}
+}
+
+// compareNumericOrString compares only homogeneous numeric or string pairs;
+// mixed pairs are false to avoid misleading lexical comparisons.
 func compareNumericOrString(a, b string, numCmp func(float64, float64) bool, strCmp func(string, string) bool) bool {
 	aNum, aErr := strconv.ParseFloat(a, 64)
 	bNum, bErr := strconv.ParseFloat(b, 64)
@@ -1903,60 +2008,152 @@ func compareNumericOrString(a, b string, numCmp func(float64, float64) bool, str
 	return false
 }
 
-// substituteVariables replaces {{variable}} placeholders with actual values
+// nestedExecutionValue walks JSON-like maps and slices using dotted path
+// segments. The boolean distinguishes a present null value from a missing path.
+func nestedExecutionValue(value any, path []string) (any, bool) {
+	for _, segment := range path {
+		switch current := value.(type) {
+		case map[string]any:
+			var ok bool
+			value, ok = current[segment]
+			if !ok {
+				return nil, false
+			}
+		case map[string]string:
+			var ok bool
+			value, ok = current[segment]
+			if !ok {
+				return nil, false
+			}
+		case []any:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(current) {
+				return nil, false
+			}
+			value = current[index]
+		case []string:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(current) {
+				return nil, false
+			}
+			value = current[index]
+		default:
+			return nil, false
+		}
+	}
+	return value, true
+}
+
+func stringifyExecutionValue(value any, nilValue string) (string, error) {
+	if value == nil {
+		return nilValue, nil
+	}
+	switch value := value.(type) {
+	case map[string]any, map[string]string, []any, []string:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
+	case string:
+		return value, nil
+	default:
+		return fmt.Sprintf("%v", value), nil
+	}
+}
+
+// resolveExecutionValue resolves all action context paths from one place.
+// Exact variable names take precedence over dotted traversal so existing output
+// fields remain backward compatible.
+func (as *ActionService) resolveExecutionValue(ctx *models.ExecutionContext, path string) (any, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, false
+	}
+	if value, ok := ctx.Variables[path]; ok {
+		return value, true
+	}
+
+	parts := strings.Split(path, ".")
+	if len(parts) < 2 {
+		return nil, false
+	}
+
+	switch parts[0] {
+	case "item":
+		value, ok := currentItemFieldValueResolved(as.itemRepo, ctx, parts[1])
+		if !ok {
+			return nil, false
+		}
+		return nestedExecutionValue(value, parts[2:])
+	case "trigger":
+		if value, ok := ctx.Variables[parts[1]]; ok {
+			return nestedExecutionValue(value, parts[2:])
+		}
+		// {{trigger.<field>}} falls back to the new_<field> value so natural
+		// spellings like trigger.iteration_id resolve to what the trigger
+		// event just set.
+		if value, ok := ctx.Variables["new_"+parts[1]]; ok {
+			return nestedExecutionValue(value, parts[2:])
+		}
+		return nil, false
+	case "parent":
+		// {{parent.<field>}} mirrors the parent.-prefixed condition fields:
+		// e.g. {{parent.open_child_count}} in a comment or set_field value.
+		if len(parts) >= 2 {
+			return parentItemFieldValueResolved(as.itemRepo, ctx, strings.Join(parts[1:], "."))
+		}
+		return nil, false
+	case "old":
+		if value, ok := ctx.Variables["old_"+parts[1]]; ok {
+			return nestedExecutionValue(value, parts[2:])
+		}
+		return nil, false
+	case "user":
+		if ctx.Actor != nil && len(parts) == 2 {
+			switch parts[1] {
+			case "name":
+				return ctx.Actor.FirstName + " " + ctx.Actor.LastName, true
+			case "email":
+				return ctx.Actor.Email, true
+			case "id":
+				return ctx.Actor.ID, true
+			}
+		}
+		return nil, false
+	case "ref", "repo", "commits":
+		// SCM trigger payloads are stored with their dotted keys intact.
+		if value, ok := ctx.Variables["new_"+path]; ok {
+			return value, true
+		}
+		if value, ok := ctx.Variables["new_"+parts[0]]; ok {
+			return nestedExecutionValue(value, parts[1:])
+		}
+		return nil, false
+	}
+
+	if value, ok := ctx.Variables[parts[0]]; ok {
+		return nestedExecutionValue(value, parts[1:])
+	}
+	return nil, false
+}
+
+// substituteVariables replaces {{variable}} placeholders with actual values.
+// Missing values intentionally remain unchanged so templates stay tolerant.
 func (as *ActionService) substituteVariables(template string, ctx *models.ExecutionContext) string {
-	// Matches double-brace variable placeholders like {{variable_name}}
 	re := regexp.MustCompile(`\{\{([^}]+)\}\}`)
 
 	return re.ReplaceAllStringFunc(template, func(match string) string {
-		// Extract variable name (remove {{ and }})
-		varName := strings.TrimPrefix(strings.TrimSuffix(match, "}}"), "{{")
-		varName = strings.TrimSpace(varName)
-
-		// Check different variable sources
-		parts := strings.Split(varName, ".")
-		if len(parts) == 2 {
-			switch parts[0] {
-			case "item":
-				if val := as.currentItemFieldValue(ctx, parts[1]); val != nil {
-					return fmt.Sprintf("%v", val)
-				}
-			case "trigger":
-				if val, ok := ctx.Variables[parts[1]]; ok {
-					return fmt.Sprintf("%v", val)
-				}
-			case "old":
-				if val, ok := ctx.Variables["old_"+parts[1]]; ok {
-					return fmt.Sprintf("%v", val)
-				}
-			case "user":
-				if ctx.Actor != nil {
-					switch parts[1] {
-					case "name":
-						return ctx.Actor.FirstName + " " + ctx.Actor.LastName
-					case "email":
-						return ctx.Actor.Email
-					case "id":
-						return strconv.Itoa(ctx.Actor.ID)
-					}
-				}
-			case "ref", "repo", "commits":
-				// SCM trigger payload — emitted by SyncService into
-				// ActionEvent.NewValues with dotted keys like "ref.short".
-				// The event init code prefixes NewValues keys with "new_"
-				// when populating ctx.Variables, so look up there.
-				if val, ok := ctx.Variables["new_"+varName]; ok {
-					return fmt.Sprintf("%v", val)
-				}
+		varName := strings.TrimSpace(strings.TrimPrefix(strings.TrimSuffix(match, "}}"), "{{"))
+		if value, ok := as.resolveExecutionValue(ctx, varName); ok {
+			formatted, err := stringifyExecutionValue(value, "")
+			if err == nil {
+				return formatted
 			}
 		}
-
-		// Direct variable lookup
-		if val, ok := ctx.Variables[varName]; ok {
-			return fmt.Sprintf("%v", val)
-		}
-
-		// Return original if not found
 		return match
 	})
 }
@@ -1987,34 +2184,14 @@ func (as *ActionService) cleanupActionContainers(results []models.StepResult) {
 	}
 }
 
-// authorizeAssetMutation enforces asset-set RBAC before a create_asset /
-// update_asset node writes. The actor is the effective actor (see
-// ExecutionContext.EffectiveActorID) — either the action's configured actor
-// override or the triggering user. An actor of 0 (no user context) is denied
-// because we cannot prove authority. If no permission checker is wired, the
-// check is refused closed rather than silently skipped.
-func (as *ActionService) authorizeAssetMutation(actorUserID, setID int, permissionKey string) error {
-	if actorUserID <= 0 {
-		return fmt.Errorf("asset mutation requires an identified actor (set %d)", setID)
-	}
-	if as.assetPermChecker == nil {
-		return fmt.Errorf("asset mutation blocked: asset permission checker not configured")
-	}
-	ok, err := as.assetPermChecker.HasAssetSetPermission(actorUserID, setID, permissionKey)
-	if err != nil {
-		return fmt.Errorf("failed to check asset set %d permission: %w", setID, err)
-	}
-	if !ok {
-		return fmt.Errorf("user %d not authorized (%s) on asset set %d", actorUserID, permissionKey, setID)
-	}
-	return nil
+// AuthorizeWorkspaceMutation verifies the effective actor's workspace access
+// and is the NodeAPI surface for registered executors; it delegates to the
+// shared authorization helper, which fails closed when authorization is
+// unavailable.
+func (as *ActionService) AuthorizeWorkspaceMutation(actorUserID, workspaceID int, permission string) error {
+	return as.authorizeWorkspaceMutation(actorUserID, workspaceID, permission)
 }
 
-// authorizeWorkspaceMutation enforces workspace-scoped RBAC before a node
-// mutates items. The effective actor must hold the given permission on the
-// target workspace. If no permission service is wired, the check is refused
-// closed rather than silently skipped — the alternative would let an
-// impersonated identity take actions it could not perform interactively.
 func (as *ActionService) authorizeWorkspaceMutation(actorUserID, workspaceID int, permissionKey string) error {
 	if actorUserID <= 0 {
 		return fmt.Errorf("workspace mutation requires an identified actor (workspace %d)", workspaceID)
@@ -2040,367 +2217,6 @@ func (as *ActionService) getStatusName(statusID int) string {
 		return fmt.Sprintf("Status #%d", statusID)
 	}
 	return name
-}
-
-// executeUpdateAsset executes an update_asset node
-func (as *ActionService) executeUpdateAsset(node *models.ActionNode, ctx *models.ExecutionContext, stepResult *models.StepResult) error {
-	var config models.UpdateAssetNodeConfig
-	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
-		return fmt.Errorf("failed to parse update_asset config: %w", err)
-	}
-
-	// Skip if no field mappings configured
-	if len(config.FieldMappings) == 0 {
-		stepResult.Output = map[string]interface{}{
-			"skipped": true,
-			"reason":  "no field mappings configured",
-		}
-		return nil
-	}
-
-	itemID := currentActionItemID(ctx)
-	// Get the item's custom_field_values to find the asset reference
-	customFieldValuesJSON, err := as.itemRepo.GetCustomFieldValuesRaw(itemID)
-	if err != nil {
-		return fmt.Errorf("failed to get item custom_field_values: %w", err)
-	}
-
-	var customFieldValues map[string]interface{}
-	if customFieldValuesJSON.Valid && customFieldValuesJSON.String != "" {
-		if err = json.Unmarshal([]byte(customFieldValuesJSON.String), &customFieldValues); err != nil {
-			return fmt.Errorf("failed to parse item custom_field_values: %w", err)
-		}
-	}
-
-	// Extract asset ID from source field
-	assetFieldValue, exists := customFieldValues[config.SourceFieldID]
-	if !exists || assetFieldValue == nil {
-		stepResult.Output = map[string]interface{}{
-			"skipped": true,
-			"reason":  "no asset linked in source field",
-		}
-		return nil
-	}
-
-	// Handle both integer and object formats for asset field value
-	var assetID int
-	switch v := assetFieldValue.(type) {
-	case float64:
-		assetID = int(v)
-	case int:
-		assetID = v
-	case map[string]interface{}:
-		// Object format: { "id": 123, ... }
-		if idVal, ok := v["id"]; ok {
-			switch id := idVal.(type) {
-			case float64:
-				assetID = int(id)
-			case int:
-				assetID = id
-			}
-		}
-	}
-
-	if assetID == 0 {
-		stepResult.Output = map[string]interface{}{
-			"skipped": true,
-			"reason":  "invalid asset reference format",
-		}
-		return nil
-	}
-
-	// Get the asset and validate it exists with expected type/set
-	var asset struct {
-		ID                int
-		SetID             int
-		AssetTypeID       int
-		CustomFieldValues sql.NullString
-	}
-	err = as.db.QueryRow(`
-		SELECT id, set_id, asset_type_id, custom_field_values
-		FROM assets WHERE id = ?
-	`, assetID).Scan(&asset.ID, &asset.SetID, &asset.AssetTypeID, &asset.CustomFieldValues)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("asset not found: %d", assetID)
-		}
-		return fmt.Errorf("failed to get asset: %w", err)
-	}
-
-	// Validate asset type if specified
-	if config.AssetTypeID > 0 && asset.AssetTypeID != config.AssetTypeID {
-		return fmt.Errorf("asset type mismatch: expected %d, got %d", config.AssetTypeID, asset.AssetTypeID)
-	}
-
-	// Validate asset set if specified
-	if config.AssetSetID > 0 && asset.SetID != config.AssetSetID {
-		return fmt.Errorf("asset set mismatch: expected %d, got %d", config.AssetSetID, asset.SetID)
-	}
-
-	// Authorize the effective actor against the resolved set's RBAC. Without
-	// this, an action could mutate assets in a set where the actor has no
-	// role at all.
-	if err := as.authorizeAssetMutation(ctx.EffectiveActorID, asset.SetID, "asset.edit"); err != nil {
-		return err
-	}
-
-	// Parse existing asset custom_field_values
-	var assetCustomFields map[string]interface{}
-	if asset.CustomFieldValues.Valid && asset.CustomFieldValues.String != "" {
-		if err = json.Unmarshal([]byte(asset.CustomFieldValues.String), &assetCustomFields); err != nil {
-			assetCustomFields = make(map[string]interface{})
-		}
-	} else {
-		assetCustomFields = make(map[string]interface{})
-	}
-
-	// Track old values for logging
-	oldValues := make(map[string]interface{})
-	newValues := make(map[string]interface{})
-
-	// Apply field mappings
-	for _, mapping := range config.FieldMappings {
-		var sourceValue interface{}
-
-		switch mapping.SourceType {
-		case "variable":
-			// Substitute variables in the template
-			sourceValue = as.substituteVariables(mapping.SourceValue, ctx)
-		case "item_field":
-			// Get value from the current item, then its custom fields.
-			if val := as.currentItemFieldValue(ctx, mapping.SourceValue); val != nil {
-				sourceValue = val
-			} else if val, ok := customFieldValues[mapping.SourceValue]; ok {
-				sourceValue = val
-			}
-		case "literal":
-			sourceValue = mapping.SourceValue
-		default:
-			// Default to variable substitution
-			sourceValue = as.substituteVariables(mapping.SourceValue, ctx)
-		}
-
-		// Track changes
-		oldValues[mapping.TargetFieldID] = assetCustomFields[mapping.TargetFieldID]
-		newValues[mapping.TargetFieldID] = sourceValue
-
-		// Update the asset field
-		assetCustomFields[mapping.TargetFieldID] = sourceValue
-	}
-
-	// Substituted values can carry user content — bound text/textarea
-	// fields with the same sanitize pass the asset create/update
-	// surfaces apply (WI-319) before persisting. Other field types are
-	// unchanged.
-	if err := as.sanitizeAssetCustomFieldText(asset.AssetTypeID, assetCustomFields); err != nil {
-		return fmt.Errorf("failed to sanitize asset custom_field_values: %w", err)
-	}
-	for k := range newValues {
-		newValues[k] = assetCustomFields[k]
-	}
-
-	// Serialize updated custom_field_values
-	updatedJSON, err := json.Marshal(assetCustomFields)
-	if err != nil {
-		return fmt.Errorf("failed to serialize asset custom_field_values: %w", err)
-	}
-
-	// Update the asset
-	_, err = as.db.ExecWrite(`
-		UPDATE assets SET custom_field_values = ?, updated_at = ? WHERE id = ?
-	`, string(updatedJSON), time.Now(), assetID)
-	if err != nil {
-		return fmt.Errorf("failed to update asset: %w", err)
-	}
-
-	// Populate step result output
-	stepResult.Output = map[string]interface{}{
-		"asset_id":      assetID,
-		"old_values":    oldValues,
-		"new_values":    newValues,
-		"mapping_count": len(config.FieldMappings),
-	}
-
-	slog.Debug("updated asset via action",
-		slog.String("component", "actions"),
-		slog.Int("asset_id", assetID),
-		slog.Int("item_id", itemID),
-		slog.Any("mappings", len(config.FieldMappings)),
-	)
-
-	// Emit asset action event for cross-application cascade
-	if as.assetActionService != nil {
-		as.assetActionService.EmitAssetActionEvent(&models.AssetActionEvent{
-			EventType:         models.AssetTriggerAssetUpdated,
-			SetID:             asset.SetID,
-			AssetID:           assetID,
-			ActorUserID:       ctx.EffectiveActorID,
-			OldValues:         oldValues,
-			NewValues:         newValues,
-			TriggeredByAction: true,
-			ExecutionChainID:  ctx.ChainID,
-			CascadeDepth:      ctx.Event.CascadeDepth + 1,
-			SourceApplication: "workspace",
-		})
-	}
-
-	return nil
-}
-
-// sanitizeAssetCustomFieldText runs the asset-side text/textarea
-// custom-field sanitize pass (the one CreateAsset/UpdateAsset apply via
-// ValidateCustomFieldsSchema) over a values map, mutating it in place.
-// Used by the create_asset / update_asset action executors, which write
-// assets.custom_field_values directly instead of going through
-// AssetService.
-func (as *ActionService) sanitizeAssetCustomFieldText(assetTypeID int, values map[string]interface{}) error {
-	return NewAssetService(as.db, repository.NewAssetRepository(as.db)).SanitizeCustomFieldTextValues(assetTypeID, values)
-}
-
-// executeCreateAsset executes a create_asset node
-func (as *ActionService) executeCreateAsset(node *models.ActionNode, ctx *models.ExecutionContext, stepResult *models.StepResult) error {
-	var config models.CreateAssetNodeConfig
-	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
-		return fmt.Errorf("failed to parse create_asset config: %w", err)
-	}
-
-	// Validate required fields
-	if config.AssetSetID == 0 {
-		return fmt.Errorf("asset_set_id is required")
-	}
-	if config.AssetTypeID == 0 {
-		return fmt.Errorf("asset_type_id is required")
-	}
-
-	// Authorize the effective actor against the target set before we create anything.
-	if err := as.authorizeAssetMutation(ctx.EffectiveActorID, config.AssetSetID, "asset.create"); err != nil {
-		return err
-	}
-
-	// Substitute variables in title, description, and asset_tag.
-	// Substituted variables can carry user content — apply the same
-	// input policy the normal asset create path runs (WI-319) before
-	// anything reaches the INSERT.
-	title := as.substituteVariables(config.Title, ctx)
-	description := as.substituteVariables(config.Description, ctx)
-	assetTag := as.substituteVariables(config.AssetTag, ctx)
-	sanitizeAssetText(&title, &description, &assetTag)
-	if title == "" {
-		return fmt.Errorf("title is required and cannot be empty after substitution")
-	}
-
-	itemID := currentActionItemID(ctx)
-	// Get item's custom field values for field mapping
-	customFieldValuesJSON, err := as.itemRepo.GetCustomFieldValuesRaw(itemID)
-	if err != nil && !errors.Is(err, repository.ErrNotFound) {
-		return fmt.Errorf("failed to get item custom_field_values: %w", err)
-	}
-
-	var itemCustomFields map[string]interface{}
-	if customFieldValuesJSON.Valid && customFieldValuesJSON.String != "" {
-		if err = json.Unmarshal([]byte(customFieldValuesJSON.String), &itemCustomFields); err != nil {
-			itemCustomFields = make(map[string]interface{})
-		}
-	} else {
-		itemCustomFields = make(map[string]interface{})
-	}
-
-	// Build custom_field_values from field mappings
-	assetCustomFields := make(map[string]interface{})
-	for _, mapping := range config.FieldMappings {
-		var sourceValue interface{}
-
-		switch mapping.SourceType {
-		case "variable":
-			sourceValue = as.substituteVariables(mapping.SourceValue, ctx)
-		case "item_field":
-			if val := as.currentItemFieldValue(ctx, mapping.SourceValue); val != nil {
-				sourceValue = val
-			} else if val, ok := itemCustomFields[mapping.SourceValue]; ok {
-				sourceValue = val
-			}
-		case "literal":
-			sourceValue = mapping.SourceValue
-		default:
-			sourceValue = as.substituteVariables(mapping.SourceValue, ctx)
-		}
-
-		assetCustomFields[mapping.TargetFieldID] = sourceValue
-	}
-
-	// Same sanitize pass the asset create/update surfaces apply
-	// (WI-319): bound text/textarea values before the INSERT.
-	if err := as.sanitizeAssetCustomFieldText(config.AssetTypeID, assetCustomFields); err != nil {
-		return fmt.Errorf("failed to sanitize custom_field_values: %w", err)
-	}
-
-	// Serialize custom_field_values
-	customFieldsJSON, err := json.Marshal(assetCustomFields)
-	if err != nil {
-		return fmt.Errorf("failed to serialize custom_field_values: %w", err)
-	}
-
-	// Determine status_id - use config value or get default from asset set
-	var statusID int
-	if config.StatusID != nil {
-		statusID = *config.StatusID
-	} else {
-		// Get default status from asset set
-		err = as.db.QueryRow(`SELECT default_status_id FROM asset_sets WHERE id = ?`, config.AssetSetID).Scan(&statusID)
-		if err != nil {
-			slog.Warn("failed to get default status for asset set, using 0",
-				slog.String("component", "actions"),
-				slog.Int("asset_set_id", config.AssetSetID),
-				slog.Any("error", err),
-			)
-			statusID = 0
-		}
-	}
-
-	// Insert the new asset
-	now := time.Now()
-	var assetID int64
-	err = as.db.QueryRow(`
-		INSERT INTO assets (set_id, asset_type_id, title, description, asset_tag, category_id, status_id, custom_field_values, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
-	`, config.AssetSetID, config.AssetTypeID, title, description, assetTag, config.CategoryID, statusID, string(customFieldsJSON), now, now).Scan(&assetID)
-	if err != nil {
-		return fmt.Errorf("failed to create asset: %w", err)
-	}
-
-	// Populate step result output
-	stepResult.Output = map[string]interface{}{
-		"asset_id":      assetID,
-		"title":         title,
-		"description":   description,
-		"asset_tag":     assetTag,
-		"asset_set_id":  config.AssetSetID,
-		"asset_type_id": config.AssetTypeID,
-		"mapping_count": len(config.FieldMappings),
-	}
-
-	slog.Debug("created asset via action",
-		slog.String("component", "actions"),
-		slog.Int64("asset_id", assetID),
-		slog.Int("item_id", itemID),
-		slog.String("title", title),
-	)
-
-	// Emit asset action event for cross-application cascade
-	if as.assetActionService != nil {
-		as.assetActionService.EmitAssetActionEvent(&models.AssetActionEvent{
-			EventType:         models.AssetTriggerAssetCreated,
-			SetID:             config.AssetSetID,
-			AssetID:           int(assetID),
-			ActorUserID:       ctx.EffectiveActorID,
-			TriggeredByAction: true,
-			ExecutionChainID:  ctx.ChainID,
-			CascadeDepth:      ctx.Event.CascadeDepth + 1,
-			SourceApplication: "workspace",
-		})
-	}
-
-	return nil
 }
 
 // executeRoundRobinAssign executes a round_robin_assign node
@@ -2438,50 +2254,23 @@ func (as *ActionService) executeRoundRobinAssign(node *models.ActionNode, ctx *m
 		return fmt.Errorf("failed to get round-robin assignee: %w", err)
 	}
 
-	// Update the item's assignee
-	tx, txErr := as.db.BeginTx(context.Background(), nil)
-	if txErr != nil {
-		return fmt.Errorf("begin tx: %w", txErr)
+	_, err = as.updateItemFromAction(ctx, map[string]any{"assignee_id": assigneeID})
+	if err != nil {
+		return fmt.Errorf("failed to update item assignee: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-	if txErr = as.itemRepo.UpdateFields(tx, itemID, map[string]interface{}{
-		"assignee_id": assigneeID,
-	}); txErr != nil {
-		return fmt.Errorf("failed to update item assignee: %w", txErr)
-	}
-	if txErr = tx.Commit(); txErr != nil {
-		return fmt.Errorf("commit: %w", txErr)
-	}
-
-	// Live-update publish (WI-483): round-robin reassigns the item directly,
-	// bypassing ItemUpdateService.
-	PublishItemChange(itemID, ItemChangeUpdated)
 
 	// Populate step result
-	var oldVal interface{}
+	var oldVal any
 	if oldAssigneeID.Valid {
 		oldVal = int(oldAssigneeID.Int64)
 	}
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"field_name":  "assignee_id",
 		"old_value":   oldVal,
 		"new_value":   assigneeID,
 		"team_id":     config.TeamID,
 		"action_node": node.ID,
 	}
-
-	// Emit cascade event
-	as.EmitActionEvent(&models.ActionEvent{
-		EventType:         models.ActionTriggerItemUpdated,
-		WorkspaceID:       workspaceID,
-		ItemID:            itemID,
-		ActorUserID:       ctx.EffectiveActorID,
-		OldValues:         map[string]interface{}{"assignee_id": oldVal},
-		NewValues:         map[string]interface{}{"assignee_id": assigneeID},
-		TriggeredByAction: true,
-		ExecutionChainID:  ctx.ChainID,
-		CascadeDepth:      ctx.Event.CascadeDepth + 1,
-	})
 
 	return nil
 }
@@ -2498,6 +2287,21 @@ func (as *ActionService) GetStats() map[string]int64 {
 // ExecuteActionManually executes a specific action for a given item.
 // This bypasses the normal trigger matching and directly executes the action.
 func (as *ActionService) ExecuteActionManually(action *models.Action, itemID, actorUserID int) error {
+	if action == nil {
+		return fmt.Errorf("manual action execution requires an action")
+	}
+	if as.itemRepo == nil {
+		return fmt.Errorf("manual action execution requires an item repository")
+	}
+
+	itemWorkspaceID, err := as.itemRepo.GetWorkspaceID(itemID)
+	if err != nil {
+		return fmt.Errorf("resolve manual action item %d workspace: %w", itemID, err)
+	}
+	if itemWorkspaceID != action.WorkspaceID {
+		return fmt.Errorf("item %d belongs to workspace %d, not action workspace %d", itemID, itemWorkspaceID, action.WorkspaceID)
+	}
+
 	slog.Debug("executing action manually",
 		slog.String("component", "actions"),
 		slog.Int("action_id", action.ID),
@@ -2512,8 +2316,8 @@ func (as *ActionService) ExecuteActionManually(action *models.Action, itemID, ac
 		WorkspaceID:       action.WorkspaceID,
 		ItemID:            itemID,
 		ActorUserID:       actorUserID,
-		OldValues:         map[string]interface{}{},
-		NewValues:         map[string]interface{}{},
+		OldValues:         map[string]any{},
+		NewValues:         map[string]any{},
 		TriggeredByAction: false,
 		CascadeDepth:      0,
 	}
@@ -2533,13 +2337,8 @@ func (as *ActionService) ExecuteActionManually(action *models.Action, itemID, ac
 	return nil
 }
 
-// resolveCapability fetches and validates a capability by ID for the given
-// workspace. Beyond the existence + enabled + type checks, it gates access on
-// the capability's workspace scope: capabilities with applies_to_all_workspaces
-// can be used anywhere, otherwise the workspace must appear in the
-// action_capability_workspaces join table. workspaceID == 0 disables the
-// scope gate (used for admin-side hand-resolution); production callers always
-// pass the executing action's workspace.
+// resolveCapability requires an enabled matching type and workspace scope.
+// workspaceID zero bypasses scope only for admin-side resolution.
 func (as *ActionService) resolveCapability(workspaceID, capabilityID int, expectedType models.CapabilityType) (*models.ActionCapability, error) {
 	capability, err := as.repo.GetCapabilityByID(capabilityID)
 	if err != nil {
@@ -2593,12 +2392,15 @@ func (as *ActionService) executeAIExtract(node *models.ActionNode, ctx *models.E
 		return fmt.Errorf("failed to parse ai_extract config: %w", err)
 	}
 
-	// Get the untrusted input from execution context
-	inputRaw, ok := ctx.Variables[config.InputField]
+	// Get the untrusted input from execution context.
+	inputRaw, ok := as.resolveExecutionValue(ctx, config.InputField)
 	if !ok {
 		return fmt.Errorf("input field %q not found in execution context", config.InputField)
 	}
-	input := fmt.Sprintf("%v", inputRaw)
+	input, err := stringifyExecutionValue(inputRaw, "null")
+	if err != nil {
+		return fmt.Errorf("failed to encode input field %q: %w", config.InputField, err)
+	}
 
 	// Resolve LLM client (gated by the action's workspace scope)
 	client, err := as.resolveLLMClient(ctx.Event.WorkspaceID, config.CapabilityID)
@@ -2607,8 +2409,8 @@ func (as *ActionService) executeAIExtract(node *models.ActionNode, ctx *models.E
 	}
 
 	// Run sandboxed analysis (no tools, structured output only)
-	result, err := llm.RunSandboxedAnalysis[map[string]interface{}](
-		context.Background(),
+	result, err := llm.RunSandboxedAnalysis[map[string]any](
+		actionRequestContext(ctx),
 		client,
 		llm.SandboxedAnalysisRequest{
 			SystemPrompt: config.Prompt,
@@ -2625,7 +2427,7 @@ func (as *ActionService) executeAIExtract(node *models.ActionNode, ctx *models.E
 		ctx.Variables[config.OutputField] = *result
 	}
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"extracted": result,
 	}
 
@@ -2653,11 +2455,34 @@ func wrapUntrustedAgentInput(field, payload string) string {
 	return fmt.Sprintf(`<input field=%q trust="untrusted">%s</input>`, field, payload)
 }
 
+func (as *ActionService) buildAIAgentUserMessage(ctx *models.ExecutionContext, fields []string) (string, error) {
+	inputParts := make([]string, 0, len(fields))
+	for _, field := range fields {
+		value, ok := as.resolveExecutionValue(ctx, field)
+		if !ok {
+			return "", fmt.Errorf("input field %q not found in execution context", field)
+		}
+		valueJSON, err := json.Marshal(value)
+		if err != nil {
+			return "", fmt.Errorf("failed to encode input field %q: %w", field, err)
+		}
+		inputParts = append(inputParts, wrapUntrustedAgentInput(field, string(valueJSON)))
+	}
+	return strings.Join(inputParts, "\n\n"), nil
+}
+
 // executeAIAgent executes an ai_agent node — agentic LLM loop with scoped tools.
 func (as *ActionService) executeAIAgent(node *models.ActionNode, ctx *models.ExecutionContext, stepResult *models.StepResult) error {
 	var config models.AIAgentNodeConfig
 	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
 		return fmt.Errorf("failed to parse ai_agent config: %w", err)
+	}
+
+	// Build user message before resolving the client so invalid action input
+	// configuration fails clearly and does not start an empty agent run.
+	userMessage, err := as.buildAIAgentUserMessage(ctx, config.InputFields)
+	if err != nil {
+		return err
 	}
 
 	// Resolve LLM client (gated by the action's workspace scope)
@@ -2666,30 +2491,14 @@ func (as *ActionService) executeAIAgent(node *models.ActionNode, ctx *models.Exe
 		return err
 	}
 
-	// Build user message from input fields. Each value is wrapped in a
-	// trust-marked envelope so the agent can recognize it as untrusted data
-	// rather than instructions — item titles, comments, and HTTP responses
-	// have been a vector for indirect prompt injection.
-	var inputParts []string
-	for _, field := range config.InputFields {
-		if val, ok := ctx.Variables[field]; ok {
-			valJSON, _ := json.Marshal(val)
-			inputParts = append(inputParts, wrapUntrustedAgentInput(field, string(valJSON)))
-		}
-	}
-	userMessage := strings.Join(inputParts, "\n\n")
-
-	// Prepend the untrusted-input guardrail so action authors don't need to
-	// remember to include it themselves. Do not substitute execution variables
-	// into the system prompt: item/comment/HTTP fields are untrusted and must
-	// stay in the wrapped user-message input fields, not be promoted to system.
+	// Keep untrusted execution values in wrapped user input, never system prompts.
 	systemPrompt := aiAgentUntrustedInputGuardrail + "\n\n" + config.Prompt
 
 	// Build tool definitions from referenced capabilities. Each tool capability
 	// is workspace-scoped — capabilities not available to the action's workspace
 	// are filtered out before reaching the agent.
 	var tools []llm.ToolDefinition
-	toolExecutor := as.buildAgentToolExecutor(ctx, config.Tools)
+	toolExecutor := as.buildAgentToolExecutor(ctx, config.Tools, node.ID)
 
 	for _, toolCapID := range config.Tools {
 		toolDefs := as.buildToolDefinitions(ctx.Event.WorkspaceID, toolCapID)
@@ -2709,7 +2518,7 @@ func (as *ActionService) executeAIAgent(node *models.ActionNode, ctx *models.Exe
 
 	// Run agent loop
 	agentResult, err := llm.RunAgent(
-		context.Background(),
+		actionRequestContext(ctx),
 		client,
 		llm.AgentConfig{
 			SystemPrompt:     systemPrompt,
@@ -2726,15 +2535,27 @@ func (as *ActionService) executeAIAgent(node *models.ActionNode, ctx *models.Exe
 		return fmt.Errorf("ai_agent failed: %w", err)
 	}
 
+	stepResult.Output = map[string]any{
+		// Redacted like the http_request trace preview: the answer can echo
+		// tool-response content, and the execution trace is persisted.
+		"answer":      RedactString(agentResult.Answer),
+		"iterations":  agentResult.Iterations,
+		"tool_calls":  len(agentResult.ToolCalls),
+		"stop_reason": string(agentResult.StopReason),
+	}
+
+	// A budget-exhausted run ends in boilerplate ("I wasn't able to complete
+	// the task...") — other AI surfaces flag it as a warning, and posting it
+	// downstream as a real answer would be wrong. Fail the step so dependent
+	// nodes skip, leaving the partial output on the trace for diagnostics.
+	if agentResult.StopReason != llm.StopReasonDone {
+		return fmt.Errorf("ai_agent stopped early (%s) after %d iterations and %d tool calls",
+			agentResult.StopReason, agentResult.Iterations, len(agentResult.ToolCalls))
+	}
+
 	// Store the result
 	if config.OutputField != "" {
 		ctx.Variables[config.OutputField] = agentResult.Answer
-	}
-
-	stepResult.Output = map[string]interface{}{
-		"answer":     agentResult.Answer,
-		"iterations": agentResult.Iterations,
-		"tool_calls": len(agentResult.ToolCalls),
 	}
 
 	slog.Debug("ai_agent completed",
@@ -2804,7 +2625,7 @@ func (as *ActionService) buildToolDefinitions(workspaceID int, capIDStr string) 
 // Captures the action's workspace ID so the agent's tool calls re-validate
 // capability scope at execution time (defense in depth: tools were already
 // scope-filtered in buildToolDefinitions).
-func (as *ActionService) buildAgentToolExecutor(ctx *models.ExecutionContext, toolCapIDs []string) llm.ToolExecutorFunc {
+func (as *ActionService) buildAgentToolExecutor(ctx *models.ExecutionContext, toolCapIDs []string, nodeID int) llm.ToolExecutorFunc {
 	workspaceID := 0
 	if ctx != nil && ctx.Event != nil {
 		workspaceID = ctx.Event.WorkspaceID
@@ -2830,7 +2651,7 @@ func (as *ActionService) buildAgentToolExecutor(ctx *models.ExecutionContext, to
 				return "", fmt.Errorf("capability %d not in allowed tools", capID)
 			}
 
-			return as.executeAgentHTTPRequest(execCtx, workspaceID, capID, arguments)
+			return as.executeAgentHTTPRequest(execCtx, workspaceID, capID, arguments, durableActionIdempotencyKey(ctx, nodeID))
 		}
 
 		return "", fmt.Errorf("unknown tool: %s", name)
@@ -2838,7 +2659,7 @@ func (as *ActionService) buildAgentToolExecutor(ctx *models.ExecutionContext, to
 }
 
 // executeAgentHTTPRequest executes an HTTP request from within an agent tool call.
-func (as *ActionService) executeAgentHTTPRequest(ctx context.Context, workspaceID, capID int, arguments string) (string, error) {
+func (as *ActionService) executeAgentHTTPRequest(ctx context.Context, workspaceID, capID int, arguments, idempotencyKey string) (string, error) {
 	capability, err := as.resolveCapability(workspaceID, capID, models.CapabilityHTTPClient)
 	if err != nil {
 		return "", err
@@ -2865,24 +2686,25 @@ func (as *ActionService) executeAgentHTTPRequest(ctx context.Context, workspaceI
 
 	// Validate URL against allowed patterns
 	if !isURLAllowed(args.URL, httpConfig.AllowedURLPatterns) {
-		return "", fmt.Errorf("URL %q not allowed by capability %d", args.URL, capID)
+		return "", fmt.Errorf("URL %q not allowed by capability %d", redactHTTPURLForDiagnostics(args.URL), capID)
 	}
 
 	mergedHeaders, err := as.buildHTTPHeadersWithCredentials(ctx, &httpConfig, args.Headers, workspaceID, capID)
 	if err != nil {
 		return "", err
 	}
+	if method != "GET" && idempotencyKey != "" {
+		mergedHeaders["Idempotency-Key"] = idempotencyKey
+	}
 	return doHTTPRequest(ctx, method, args.URL, args.Body, mergedHeaders, nil, httpConfig.TimeoutSecs, httpConfig.AllowedURLPatterns)
 }
 
 func normalizeAgentHTTPMethod(method string) (string, error) {
-	method = strings.ToUpper(strings.TrimSpace(method))
-	switch method {
-	case "GET", "POST", "PUT", "DELETE", "PATCH":
-		return method, nil
-	default:
-		return "", fmt.Errorf("unsupported HTTP method %q", method)
+	normalized, ok := models.NormalizeActionHTTPMethod(method)
+	if !ok {
+		return "", fmt.Errorf("unsupported HTTP method %q", normalized)
 	}
+	return normalized, nil
 }
 
 func isMutatingAgentHTTPToolCall(name, arguments string) bool {
@@ -2930,7 +2752,7 @@ func (as *ActionService) executeContainerRun(node *models.ActionNode, ctx *model
 			return fmt.Errorf("container_run pool dispatch: %w", err)
 		}
 		pool := config.PoolCapabilityID
-		runID, derr := as.agentRuns.Insert(context.Background(), &models.AgentRun{
+		runID, derr := as.agentRuns.Insert(actionRequestContext(ctx), &models.AgentRun{
 			WorkspaceID:  ctx.Event.WorkspaceID,
 			Status:       models.AgentRunStatusQueued,
 			JobKind:      models.JobKindActionContainer,
@@ -2940,7 +2762,7 @@ func (as *ActionService) executeContainerRun(node *models.ActionNode, ctx *model
 		if derr != nil {
 			return fmt.Errorf("enqueue container run for pool %d: %w", pool, derr)
 		}
-		out := map[string]interface{}{"agent_run_id": runID, "dispatched": "pool", "pool_capability_id": pool}
+		out := map[string]any{"agent_run_id": runID, "dispatched": "pool", "pool_capability_id": pool}
 		if config.OutputField != "" {
 			ctx.Variables[config.OutputField] = out
 		}
@@ -2957,21 +2779,21 @@ func (as *ActionService) executeContainerRun(node *models.ActionNode, ctx *model
 	if as.containerService == nil {
 		return fmt.Errorf("container service not configured")
 	}
-	containerInfo, err := as.containerService.StartContainer(context.Background(), envConfig, config.TimeoutSecs)
+	containerInfo, err := as.containerService.StartContainer(actionRequestContext(ctx), envConfig, config.TimeoutSecs)
 	if err != nil {
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
 	// Store container info in execution context
 	if config.OutputField != "" {
-		ctx.Variables[config.OutputField] = map[string]interface{}{
+		ctx.Variables[config.OutputField] = map[string]any{
 			"container_id": containerInfo.ContainerID,
 			"host":         containerInfo.Host,
 			"port":         containerInfo.Port,
 		}
 	}
 
-	stepResult.Output = map[string]interface{}{
+	stepResult.Output = map[string]any{
 		"container_id": containerInfo.ContainerID,
 		"host":         containerInfo.Host,
 		"port":         containerInfo.Port,
@@ -2993,9 +2815,13 @@ func (as *ActionService) executeHTTPRequest(node *models.ActionNode, ctx *models
 	if err := json.Unmarshal([]byte(node.NodeConfig), &config); err != nil {
 		return fmt.Errorf("failed to parse http_request config: %w", err)
 	}
+	method, err := normalizeAgentHTTPMethod(config.Method)
+	if err != nil {
+		return fmt.Errorf("http_request: %w", err)
+	}
 
 	// Substitute variables in URL, body, and headers
-	url := as.substituteVariables(config.URLTemplate, ctx)
+	targetURL := as.substituteVariables(config.URLTemplate, ctx)
 	body := as.substituteVariables(config.Body, ctx)
 	headers := make(map[string]string)
 	for k, v := range config.Headers {
@@ -3018,16 +2844,22 @@ func (as *ActionService) executeHTTPRequest(node *models.ActionNode, ctx *models
 		return fmt.Errorf("failed to parse http_client config: %w", err)
 	}
 
-	if !isURLAllowed(url, httpConfig.AllowedURLPatterns) {
-		return fmt.Errorf("URL %q not allowed by capability %d", url, config.CapabilityID)
+	if !isURLAllowed(targetURL, httpConfig.AllowedURLPatterns) {
+		return fmt.Errorf("URL %q not allowed by capability %d", redactHTTPURLForDiagnostics(targetURL), config.CapabilityID)
 	}
 
-	mergedHeaders, err := as.buildHTTPHeadersWithCredentials(context.Background(), &httpConfig, headers, ctx.Event.WorkspaceID, config.CapabilityID)
+	requestCtx := actionRequestContext(ctx)
+	mergedHeaders, err := as.buildHTTPHeadersWithCredentials(requestCtx, &httpConfig, headers, ctx.Event.WorkspaceID, config.CapabilityID)
 	if err != nil {
 		return fmt.Errorf("http_request: %w", err)
 	}
+	if method != "GET" {
+		if idempotencyKey := durableActionIdempotencyKey(ctx, node.ID); idempotencyKey != "" {
+			mergedHeaders["Idempotency-Key"] = idempotencyKey
+		}
+	}
 
-	result, err := doHTTPRequest(context.Background(), config.Method, url, body, mergedHeaders, nil, httpConfig.TimeoutSecs, httpConfig.AllowedURLPatterns)
+	result, err := doHTTPRequest(requestCtx, method, targetURL, body, mergedHeaders, nil, httpConfig.TimeoutSecs, httpConfig.AllowedURLPatterns)
 	if err != nil {
 		return fmt.Errorf("http_request failed: %w", err)
 	}
@@ -3037,49 +2869,66 @@ func (as *ActionService) executeHTTPRequest(node *models.ActionNode, ctx *models
 		ctx.Variables[config.OutputField] = result
 	}
 
-	stepResult.Output = map[string]interface{}{
-		"response_preview": truncateString(result, 500),
+	stepResult.Output = map[string]any{
+		"response_preview": truncateString(RedactString(result), 500),
 	}
 
 	slog.Debug("http_request completed",
 		slog.String("component", "actions"),
 		slog.Int("node_id", node.ID),
-		slog.String("method", config.Method),
-		slog.String("url", url),
+		slog.String("method", method),
+		slog.String("url", redactHTTPURLForDiagnostics(targetURL)),
 	)
 
 	return nil
 }
 
-// buildHTTPHeadersWithCredentials resolves all credential references on an
-// http_client capability and returns the final request headers map ready to
-// pass into doHTTPRequest. Layering order (later wins):
-//  1. capability.DefaultHeaders (non-sensitive literals)
-//  2. capability.Auth (decrypts the referenced credential, applies scheme)
-//  3. capability.SecretHeaderRefs (per-header credential lookups)
-//  4. caller-supplied per-request headers (the action node's Headers map, or
-//     the agent tool's headers arg)
-//
-// Sensitive caller-supplied header names are rejected here — node validation
-// is the primary gate, but the runtime double-checks so a future code path
-// that bypasses validation can't slip a raw token through.
-//
-// Returns a freshly allocated map so caller-side header maps are not mutated.
+func durableActionIdempotencyKey(ctx *models.ExecutionContext, nodeID int) string {
+	if ctx == nil || ctx.Action == nil || ctx.DurableEventKey == "" || nodeID <= 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", ctx.DurableEventKey, ctx.Action.ID, nodeID)))
+	return fmt.Sprintf("windshift-%x", sum[:])
+}
+
+// buildHTTPHeadersWithCredentials merges defaults, auth, credential references,
+// then caller headers. Caller headers cannot override credential-backed fields or
+// supply sensitive names; the returned map never mutates caller input.
 func (as *ActionService) buildHTTPHeadersWithCredentials(ctx context.Context, httpConfig *models.HTTPClientConfig, callerHeaders map[string]string, workspaceID, capabilityID int) (map[string]string, error) {
 	merged := make(map[string]string, len(httpConfig.DefaultHeaders)+len(callerHeaders)+len(httpConfig.SecretHeaderRefs)+1)
-
-	// 1) default headers (non-sensitive literals).
-	for k, v := range httpConfig.DefaultHeaders {
-		if models.IsSensitiveHeaderName(k) {
-			// Validation should have caught this at save time. Drop silently
-			// at runtime as a belt-and-suspenders guard rather than letting
-			// a legacy inline token slip out.
-			continue
+	headerKeys := make(map[string]string, len(httpConfig.DefaultHeaders)+len(callerHeaders)+len(httpConfig.SecretHeaderRefs)+1)
+	credentialHeaderKeys := make(map[string]string, len(httpConfig.SecretHeaderRefs)+1)
+	setHeader := func(name, value string, rejectDuplicate bool) error {
+		name = strings.TrimSpace(name)
+		normalized := strings.ToLower(name)
+		if !models.IsValidHTTPHeaderName(name) {
+			return fmt.Errorf("invalid HTTP header name %q", name)
 		}
-		merged[k] = v
+		if previous, exists := headerKeys[normalized]; exists {
+			if rejectDuplicate {
+				return fmt.Errorf("HTTP headers %q and %q target the same header", previous, name)
+			}
+			delete(merged, previous)
+		}
+		canonical := http.CanonicalHeaderKey(name)
+		if canonical == "" {
+			canonical = name
+		}
+		headerKeys[normalized] = canonical
+		merged[canonical] = value
+		return nil
 	}
 
-	// 2) auth ref.
+	for k, v := range httpConfig.DefaultHeaders {
+		if models.IsSensitiveHeaderName(k) {
+			// Runtime defense for legacy inline secrets.
+			continue
+		}
+		if err := setHeader(k, v, true); err != nil {
+			return nil, fmt.Errorf("default_headers: %w", err)
+		}
+	}
+
 	if httpConfig.Auth != nil && httpConfig.Auth.CredentialID > 0 {
 		if as.credentialService == nil {
 			return nil, fmt.Errorf("http capability %d references a credential but no credential service is wired", capabilityID)
@@ -3092,16 +2941,20 @@ func (as *ActionService) buildHTTPHeadersWithCredentials(ctx context.Context, ht
 		if err != nil {
 			return nil, fmt.Errorf("format auth credential %d: %w", httpConfig.Auth.CredentialID, err)
 		}
-		headerName := httpConfig.Auth.HeaderName
+		headerName := strings.TrimSpace(httpConfig.Auth.HeaderName)
 		if strings.TrimSpace(headerName) == "" {
 			headerName = "Authorization"
 		}
-		merged[headerName] = value
+		if err := setHeader(headerName, value, true); err != nil {
+			return nil, fmt.Errorf("auth: %w", err)
+		}
+		credentialHeaderKeys[strings.ToLower(headerName)] = headerName
 	}
 
 	// 3) secret_header_refs — each entry decrypts independently.
 	for headerName, credentialID := range httpConfig.SecretHeaderRefs {
-		if credentialID <= 0 || strings.TrimSpace(headerName) == "" {
+		headerName = strings.TrimSpace(headerName)
+		if credentialID <= 0 || headerName == "" {
 			continue
 		}
 		if as.credentialService == nil {
@@ -3115,15 +2968,29 @@ func (as *ActionService) buildHTTPHeadersWithCredentials(ctx context.Context, ht
 		if err != nil {
 			return nil, fmt.Errorf("format secret_header_refs[%q] credential %d: %w", headerName, credentialID, err)
 		}
-		merged[headerName] = value
+		if err := setHeader(headerName, value, true); err != nil {
+			return nil, fmt.Errorf("secret_header_refs: %w", err)
+		}
+		credentialHeaderKeys[strings.ToLower(headerName)] = headerName
 	}
 
 	// 4) caller-supplied headers — non-sensitive only.
+	callerHeaderKeys := make(map[string]string, len(callerHeaders))
 	for k, v := range callerHeaders {
 		if models.IsSensitiveHeaderName(k) {
 			return nil, fmt.Errorf("header %q is sensitive — reference a credential instead of supplying a raw value", k)
 		}
-		merged[k] = v
+		normalized := strings.ToLower(strings.TrimSpace(k))
+		if previous, exists := callerHeaderKeys[normalized]; exists {
+			return nil, fmt.Errorf("request headers %q and %q target the same header", previous, k)
+		}
+		callerHeaderKeys[normalized] = k
+		if credentialHeader, exists := credentialHeaderKeys[normalized]; exists {
+			return nil, fmt.Errorf("header %q would override credential-backed header %q", k, credentialHeader)
+		}
+		if err := setHeader(k, v, false); err != nil {
+			return nil, fmt.Errorf("request headers: %w", err)
+		}
 	}
 	return merged, nil
 }
@@ -3139,6 +3006,9 @@ func formatCredentialHeaderValue(credType models.ActionCredentialType, scheme, p
 		if s == "" {
 			s = "Bearer"
 		}
+		if !models.IsValidHTTPAuthScheme(s) {
+			return "", errors.New("invalid HTTP auth scheme")
+		}
 		return s + " " + plaintext, nil
 	case models.CredentialBasicAuth:
 		// Stored secret is "username:password". Inject as RFC7617.
@@ -3151,22 +3021,74 @@ func formatCredentialHeaderValue(credType models.ActionCredentialType, scheme, p
 
 // isURLAllowed checks if a URL matches any of the allowed patterns.
 // Patterns support wildcards: * matches any sequence of non-/ characters,
-// ** matches any sequence including /.
-func isURLAllowed(url string, patterns []string) bool {
+// ** matches any sequence including /. The URL is parsed and matched
+// component-wise instead of as a raw string: # and ? terminate the
+// authority during URL parsing but are matched by *, so a raw match lets
+// https://evil.com#.windshift.dev/ satisfy https://*.windshift.dev/** and
+// send credential-backed headers to a host the allowlist never named.
+func isURLAllowed(rawURL string, patterns []string) bool {
 	if len(patterns) == 0 {
 		return false
 	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Opaque != "" {
+		return false
+	}
+	// parsed.Host excludes userinfo and cannot contain /, ?, or #, so
+	// wildcards matched against it stay confined to the authority the
+	// HTTP client will actually contact. Scheme and host compare
+	// case-insensitively, as they do on the wire.
+	scheme := strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Host)
+	pathAndAfter := parsed.EscapedPath()
+	if parsed.RawQuery != "" {
+		pathAndAfter += "?" + parsed.RawQuery
+	}
+	if parsed.Fragment != "" {
+		pathAndAfter += "#" + parsed.Fragment
+	}
 	for _, pattern := range patterns {
-		if matchURLPattern(url, pattern) {
+		schemePattern, hostPattern, pathPattern, ok := splitURLPattern(pattern)
+		if !ok {
+			continue
+		}
+		if matchURLComponent(scheme, schemePattern) &&
+			matchURLComponent(host, hostPattern) &&
+			matchURLComponent(pathAndAfter, pathPattern) {
 			return true
 		}
 	}
 	return false
 }
 
-// matchURLPattern matches a URL against a pattern with * and ** wildcards.
-func matchURLPattern(url, pattern string) bool {
-	// Convert pattern to regex
+// splitURLPattern splits an allowlist pattern at its scheme delimiter and
+// the first path, query, or fragment separator. ok is false for patterns
+// without a scheme, which can never have matched a full URL. When a pattern
+// carries no separator at all, a trailing ** still spans the path as it did
+// under raw-string matching (https://** allows every https URL); since a
+// host can never contain /, a single * reattached to the authority segment
+// preserves the same prefix reach without bridging into query or fragment.
+func splitURLPattern(pattern string) (scheme, authority, path string, ok bool) {
+	schemePart, rest, found := strings.Cut(pattern, "://")
+	if !found {
+		return "", "", "", false
+	}
+	if cut := strings.IndexAny(rest, "/?#"); cut >= 0 {
+		return strings.ToLower(schemePart), strings.ToLower(rest[:cut]), rest[cut:], true
+	}
+	if strings.HasSuffix(rest, "**") {
+		return strings.ToLower(schemePart), strings.ToLower(rest[:len(rest)-2]) + "*", "**", true
+	}
+	return strings.ToLower(schemePart), strings.ToLower(rest), "", true
+}
+
+// matchURLComponent matches a single URL component against one pattern
+// segment with * and ** wildcards, anchored at both ends. An empty segment
+// matches only an empty component.
+func matchURLComponent(component, pattern string) bool {
+	if pattern == "" {
+		return component == ""
+	}
 	regexStr := "^"
 	for i := 0; i < len(pattern); i++ {
 		switch {
@@ -3181,20 +3103,15 @@ func matchURLPattern(url, pattern string) bool {
 	}
 	regexStr += "$"
 
-	matched, err := regexp.MatchString(regexStr, url)
-	if err != nil {
-		return false
-	}
-	return matched
+	matched, err := regexp.MatchString(regexStr, component)
+	return err == nil && matched
 }
 
-// doHTTPRequest performs an HTTP request with the given parameters.
-// allowedPatterns is the URL allowlist from the caller's capability — it is
-// re-checked on every redirect hop to prevent a compliant initial URL from
-// bouncing to an arbitrary target. A scoped http.Client with a dialer that
-// rejects loopback / private / link-local addresses also defends against DNS
-// rebinding to internal services (169.254.169.254, 127.0.0.1, etc.).
-func doHTTPRequest(ctx context.Context, method, url, body string, headers, defaultHeaders map[string]string, timeoutSecs int, allowedPatterns []string) (string, error) {
+// doHTTPRequest enforces the URL allowlist on every redirect and blocks
+// loopback, private, and link-local destinations to prevent SSRF and rebinding.
+// Destination blocking honors the process-wide ALLOW_LOCAL_CONNECTIONS switch
+// via utils.IsBlockedSSRFAddr, like every other server-side HTTP client.
+func doHTTPRequest(ctx context.Context, method, targetURL, body string, headers, defaultHeaders map[string]string, timeoutSecs int, allowedPatterns []string) (string, error) {
 	if timeoutSecs <= 0 {
 		timeoutSecs = 30
 	}
@@ -3207,9 +3124,9 @@ func doHTTPRequest(ctx context.Context, method, url, body string, headers, defau
 		bodyReader = strings.NewReader(body)
 	}
 
-	req, err := http.NewRequestWithContext(httpCtx, method, url, bodyReader)
+	req, err := http.NewRequestWithContext(httpCtx, method, targetURL, bodyReader)
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return "", fmt.Errorf("failed to create request for %q", redactHTTPURLForDiagnostics(targetURL))
 	}
 
 	// Apply default headers first, then override with specific headers
@@ -3223,7 +3140,7 @@ func doHTTPRequest(ctx context.Context, method, url, body string, headers, defau
 	client := newSSRFSafeClient(time.Duration(timeoutSecs)*time.Second, allowedPatterns)
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
+		return "", fmt.Errorf("request failed: %s", redactHTTPRequestError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -3232,7 +3149,7 @@ func doHTTPRequest(ctx context.Context, method, url, body string, headers, defau
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
-	result := map[string]interface{}{
+	result := map[string]any{
 		"status_code": resp.StatusCode,
 		"body":        string(respBody),
 	}
@@ -3243,10 +3160,7 @@ func doHTTPRequest(ctx context.Context, method, url, body string, headers, defau
 // errDisallowedRedirect is returned when a redirect targets a URL outside the allowlist.
 var errDisallowedRedirect = errors.New("redirect URL not in allowlist")
 
-// newSSRFSafeClient returns an http.Client configured for server-side requests
-// to admin-allowed URLs: it enforces the allowlist on every redirect and blocks
-// dials to loopback/private/link-local addresses so a DNS record that resolves
-// to 127.0.0.1 or 169.254.169.254 cannot be used to pivot internally.
+// newSSRFSafeClient enforces redirect allowlists and public-only destinations.
 func newSSRFSafeClient(timeout time.Duration, allowedPatterns []string) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
@@ -3260,19 +3174,19 @@ func newSSRFSafeClient(timeout time.Duration, allowedPatterns []string) *http.Cl
 			if ip == nil {
 				return fmt.Errorf("dial host %q did not resolve to an IP", host)
 			}
-			if isBlockedIP(ip) {
-				return fmt.Errorf("dial to %s on %s blocked: non-public address", ip.String(), network)
+			if utils.IsBlockedSSRFAddr(ip) {
+				return fmt.Errorf("%w: %s (%s)", utils.ErrBlockedSSRFAddr, ip.String(), network)
 			}
 			return nil
 		},
 	}
-	transport := &http.Transport{
+	transport := utils.ConfigureHTTPTransport(&http.Transport{
 		DialContext:           dialer.DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: timeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableKeepAlives:     true,
-	}
+	})
 	return &http.Client{
 		Transport: transport,
 		Timeout:   timeout,
@@ -3281,29 +3195,70 @@ func newSSRFSafeClient(timeout time.Duration, allowedPatterns []string) *http.Cl
 				return errors.New("stopped after 5 redirects")
 			}
 			if !isURLAllowed(req.URL.String(), allowedPatterns) {
-				return fmt.Errorf("%w: %s", errDisallowedRedirect, req.URL.String())
+				return fmt.Errorf("%w: %s", errDisallowedRedirect, redactHTTPURLForDiagnostics(req.URL.String()))
+			}
+			// net/http only strips its built-in sensitive headers on some
+			// cross-host redirects. Action credentials can use custom names
+			// (for example X-API-Key), so explicitly remove every header our
+			// credential model considers sensitive once any hop changes origin.
+			if redirectChainChangesOrigin(req, via) {
+				for name := range req.Header {
+					if models.IsSensitiveHeaderName(name) {
+						req.Header.Del(name)
+					}
+				}
 			}
 			return nil
 		},
 	}
 }
 
-// isBlockedIP reports whether an IP is on a network we never want server-side
-// automation to reach: loopback, unspecified, link-local (including cloud
-// metadata services at 169.254.169.254), RFC1918 private ranges, carrier-grade
-// NAT, and IPv6 ULA / link-local.
-func isBlockedIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsPrivate() {
+func redirectChainChangesOrigin(req *http.Request, via []*http.Request) bool {
+	if len(via) == 0 {
+		return false
+	}
+	origin := via[0].URL
+	if !sameHTTPOrigin(req.URL, origin) {
 		return true
 	}
-	// Carrier-grade NAT range 100.64.0.0/10 is not caught by IsPrivate.
-	if v4 := ip.To4(); v4 != nil {
-		_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
-		if cgnat.Contains(v4) {
+	for _, previous := range via[1:] {
+		if !sameHTTPOrigin(previous.URL, origin) {
 			return true
 		}
 	}
 	return false
+}
+
+func sameHTTPOrigin(a, b *url.URL) bool {
+	return a != nil && b != nil &&
+		strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Host, b.Host)
+}
+
+// redactHTTPURLForDiagnostics deliberately removes the full query and
+// fragment, rather than trying to guess which parameter names are secret.
+// Action URL templates can interpolate arbitrary values, so even an innocent
+// parameter name may carry confidential data.
+func redactHTTPURLForDiagnostics(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[invalid URL]"
+	}
+	if parsed.User != nil {
+		parsed.User = url.User("[REDACTED]")
+	}
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func redactHTTPRequestError(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Sprintf("%s %q: %s", urlErr.Op, redactHTTPURLForDiagnostics(urlErr.URL), RedactString(urlErr.Err.Error()))
+	}
+	return RedactString(err.Error())
 }
 
 // truncateString truncates a string to n characters.

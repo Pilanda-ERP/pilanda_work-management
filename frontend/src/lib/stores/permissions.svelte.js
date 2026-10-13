@@ -1,6 +1,7 @@
-import { derived, writable } from 'svelte/store';
+import { derived, get, writable } from 'svelte/store';
 import { api } from '../api.js';
 import { authStore } from './auth.svelte.js';
+import { clearPermissionProfiles, loadPermissionProfile } from './permissionProfile.js';
 
 // Export isSystemAdmin as a standalone derived store for backward compatibility
 export const isSystemAdmin = derived(authStore, ($authStore) => {
@@ -15,20 +16,30 @@ function createPermissionStore() {
   const error = writable(null);
   const hasAssetSets = writable(false);
   const hasActivePortals = writable(false);
+  // Whether any portal channel exists, enabled or not. The customer/
+  // organisation entry uses this so a temporarily disabled portal does not
+  // hide the management surface.
+  const hasPortals = writable(false);
+  const managesChannels = writable(false);
+  const managesAssetSets = writable(false);
   const logbookAvailable = writable(false);
+  let allPermissionsLoaded = false;
+  let allPermissionsLoadPromise = null;
+  let allPermissionsLoadGeneration = 0;
 
   const canAccessAdmin = derived([authStore], ([$authStore]) => {
     return $authStore.currentUser?.is_system_admin === true;
   });
 
   const canAccessCustomers = derived(
-    [authStore, userPermissionKeys, hasActivePortals],
-    ([$authStore, $userPermissionKeys, $hasActivePortals]) => {
+    [authStore, userPermissionKeys, hasPortals],
+    ([$authStore, $userPermissionKeys, $hasPortals]) => {
       const user = $authStore.currentUser;
       if (!user) return false;
 
-      // Hide if no active portals
-      if (!$hasActivePortals) return false;
+      // Hide only when no portal exists at all; a disabled portal still needs
+      // to be manageable from here.
+      if (!$hasPortals) return false;
 
       // System admins can always access
       if (user.is_system_admin) return true;
@@ -62,11 +73,22 @@ function createPermissionStore() {
     }
   );
 
-  const canManageAssets = derived([authStore, userPermissionKeys], ([$authStore, $keys]) => {
-    if (!$authStore.currentUser) return false;
-    if ($authStore.currentUser.is_system_admin) return true;
-    return $keys.has('asset.manage');
-  });
+  const canManageAssets = derived(
+    [authStore, userPermissionKeys, managesAssetSets],
+    ([$authStore, $keys, $managesAssetSets]) => {
+      if (!$authStore.currentUser) return false;
+      if ($authStore.currentUser.is_system_admin) return true;
+      return $keys.has('asset.manage') || $managesAssetSets;
+    }
+  );
+
+  const canManageChannels = derived(
+    [authStore, managesChannels],
+    ([$authStore, $managesChannels]) => {
+      if (!$authStore.currentUser) return false;
+      return $managesChannels;
+    }
+  );
 
   // Create a combined derived store for easy subscription
   const combined = derived(
@@ -83,6 +105,8 @@ function createPermissionStore() {
       canAccessPortalHub,
       canAccessLogbook,
       canManageAssets,
+      canManageChannels,
+      managesAssetSets,
     ],
     ([
       $permissions,
@@ -97,6 +121,8 @@ function createPermissionStore() {
       $canAccessPortalHub,
       $canAccessLogbook,
       $canManageAssets,
+      $canManageChannels,
+      $managesAssetSets,
     ]) => ({
       permissions: $permissions,
       userPermissions: $userPermissions,
@@ -110,6 +136,8 @@ function createPermissionStore() {
       canAccessPortalHub: $canAccessPortalHub,
       canAccessLogbook: $canAccessLogbook,
       canManageAssets: $canManageAssets,
+      canManageChannels: $canManageChannels,
+      managesAssetSets: $managesAssetSets,
     })
   );
 
@@ -160,6 +188,18 @@ function createPermissionStore() {
       return value;
     },
 
+    get canManageChannels() {
+      let value;
+      canManageChannels.subscribe((v) => (value = v))();
+      return value;
+    },
+
+    get managesAssetSets() {
+      let value;
+      managesAssetSets.subscribe((v) => (value = v))();
+      return value;
+    },
+
     // Set whether asset sets exist
     setHasAssetSets(value) {
       hasAssetSets.set(value);
@@ -168,6 +208,21 @@ function createPermissionStore() {
     // Set whether active portals exist
     setHasActivePortals(value) {
       hasActivePortals.set(value);
+    },
+
+    // Set whether any portal exists (enabled or not)
+    setHasPortals(value) {
+      hasPortals.set(value);
+    },
+
+    // Set whether the current user manages at least one channel
+    setManagesChannels(value) {
+      managesChannels.set(value);
+    },
+
+    // Set whether the current user administers at least one asset set
+    setManagesAssetSets(value) {
+      managesAssetSets.set(value);
     },
 
     // Set whether logbook service is available
@@ -189,17 +244,12 @@ function createPermissionStore() {
       error.set(null);
 
       try {
-        const response = await api.permissions.getUserPermissions(userId);
-        const globalPerms = response.global_permissions || [];
-        const globalPermissionIds = new Set(globalPerms.map((p) => p.permission_id));
-        const globalPermKeys = new Set(
-          globalPerms
-            .filter((p) => p.permission?.permission_key)
-            .map((p) => p.permission.permission_key)
-        );
-
-        userPermissions.set(globalPermissionIds);
-        userPermissionKeys.set(globalPermKeys);
+        const response = await loadPermissionProfile(userId);
+        // Compact profile: global permission keys only. The ID-keyed set is
+        // kept for the PermissionGuard contract but no permission is ever
+        // passed by ID.
+        userPermissions.set(new Set());
+        userPermissionKeys.set(new Set(response.global_permissions || []));
         loading.set(false);
         error.set(null);
       } catch (err) {
@@ -214,35 +264,61 @@ function createPermissionStore() {
     },
 
     // Load all permissions (for admin only)
-    async loadAllPermissions(user) {
-      loading.set(true);
-
+    loadAllPermissions(user, { force = false } = {}) {
       // Only load all permissions if user is system admin
       if (!user?.is_system_admin) {
+        allPermissionsLoadGeneration += 1;
+        allPermissionsLoaded = false;
+        allPermissionsLoadPromise = null;
         permissions.set([]);
         loading.set(false);
         error.set(null);
-        return;
+        return Promise.resolve([]);
       }
 
-      try {
-        const allPermissions = await api.permissions.getAll();
-        permissions.set(allPermissions);
-        loading.set(false);
-        error.set(null);
-      } catch (err) {
-        console.warn('Failed to load all permissions:', err);
-        permissions.set([]);
-        loading.set(false);
-        error.set(err.message);
-      }
+      if (!force && allPermissionsLoaded) return Promise.resolve(get(permissions));
+      if (!force && allPermissionsLoadPromise) return allPermissionsLoadPromise;
+
+      const generation = ++allPermissionsLoadGeneration;
+      loading.set(true);
+      const request = api.permissions
+        .getAll()
+        .then((allPermissions) => {
+          if (generation !== allPermissionsLoadGeneration) return [];
+          const nextPermissions = allPermissions || [];
+          permissions.set(nextPermissions);
+          allPermissionsLoaded = true;
+          error.set(null);
+          return nextPermissions;
+        })
+        .catch((err) => {
+          if (generation !== allPermissionsLoadGeneration) return [];
+          console.warn('Failed to load all permissions:', err);
+          permissions.set([]);
+          allPermissionsLoaded = false;
+          error.set(err.message);
+          return [];
+        })
+        .finally(() => {
+          if (generation === allPermissionsLoadGeneration) loading.set(false);
+          if (allPermissionsLoadPromise === request) allPermissionsLoadPromise = null;
+        });
+
+      allPermissionsLoadPromise = request;
+      return request;
     },
 
     // Clear permissions
     clear() {
+      clearPermissionProfiles();
+      allPermissionsLoadGeneration += 1;
+      allPermissionsLoaded = false;
+      allPermissionsLoadPromise = null;
       permissions.set([]);
       userPermissions.set(new Set());
       userPermissionKeys.set(new Set());
+      managesChannels.set(false);
+      managesAssetSets.set(false);
       loading.set(false);
       error.set(null);
     },

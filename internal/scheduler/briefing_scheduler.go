@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,8 @@ import (
 // endpoint and the Postgres connection pool are the real ceilings, so this is
 // deliberately modest.
 const briefingConcurrency = 8
+
+const dailyBriefingMaxTokens = 5000
 
 // BriefingScheduler generates daily briefings for all users in the background.
 type BriefingScheduler struct {
@@ -212,54 +215,26 @@ func (bs *BriefingScheduler) generateAllBriefings(stop <-chan struct{}) {
 	}
 	wg.Wait()
 
-	// Surface aggregate failures to scheduler_runs. A panic-recovery path returns
-	// false too, so the success metric stays honest even when individual users
-	// hit LLM errors or DB hiccups.
+	// Recovered panics count as failures in the scheduler result.
 	if failures > 0 {
 		runErr = fmt.Errorf("%d of %d daily briefings failed", failures, usersProcessed)
 	}
 }
 
-// generateBriefingForUser returns true on success (or when nothing needs doing).
-// It returns false only when the actual generation step (LLM call or storage)
-// failed, so the caller can roll up failures into the scheduler_run record.
-//
-// lookups holds the global id→name reference maps, loaded once per tick and
-// shared across all users (the maps are workspace-global, not per-user).
-// nowUTC is the tick's reference instant, injected for testability.
-//
-// Cross-instance dedup (WI-418): before invoking the LLM the method takes a
-// leased claim on the (userID, date) row via ClaimBriefing. Only the instance
-// that wins the claim generates; every other concurrently-ticking instance
-// gets ErrBriefingAlreadyRunning and returns success ("nothing to do"). The
-// claim is released on every exit path so a crashed holder's lease (10m)
-// self-heals before the next tick.
-// last review: ser, 300526
+// generateBriefingForUser returns false only for generation or storage failure.
+// Shared lookups and the tick time are injected. A leased per-user/day claim
+// deduplicates instances and self-heals after a crashed holder.
 func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, lookups *repository.NameMaps, itemRepo *repository.ItemRepository, workspaceRepo *repository.WorkspaceRepository, u models.User, regenerate bool, nowUTC time.Time) bool {
 	userID := u.ID
 	firstName := u.FirstName
-	timezone := u.Timezone
-	if timezone == "" {
-		timezone = "UTC"
-	}
-
-	// Compute "today" / "yesterday" + their day boundaries in the *user's*
-	// timezone, not the server's. The previous server-local calculation meant a
-	// user in PT could get yesterday's briefing repeated after their local
-	// midnight, or could miss their own Sunday-evening activity because the 24h
-	// window was anchored at server midnight UTC.
-	loc, err := time.LoadLocation(timezone)
-	if err != nil || loc == nil {
-		loc = time.UTC
-	}
+	// Compute briefing boundaries in the user's timezone, not the server's.
+	timezone, loc := services.ResolveTimezoneOrUTC(u.Timezone)
 	nowLocal := nowUTC.In(loc)
 	todayStart := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), 0, 0, 0, 0, loc)
 	yesterdayStart := todayStart.AddDate(0, 0, -1)
 	today := todayStart.Format("2006-01-02")
 
-	// Atomic cross-instance claim. With regenerate disabled this is also the
-	// "already generated today" short-circuit; with regenerate enabled it still
-	// ensures only one instance generates per (user, date) at a time.
+	// Claim atomically deduplicates this user's daily generation.
 	claimed, err := bs.aiRepo.ClaimBriefing(userID, today, nowUTC, regenerate)
 	if err != nil {
 		if errors.Is(err, repository.ErrBriefingAlreadyRunning) {
@@ -270,13 +245,7 @@ func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, looku
 		slog.Warn("briefing: failed to claim generation lock", slog.Int("user_id", userID), slog.Any("error", err))
 		return false
 	}
-	// Release the lease on every exit. The storeBriefing paths clear the lock
-	// themselves via their UPSERT, so guard the deferred release with `stored`
-	// to avoid a redundant write on those paths — while still covering the
-	// early returns AND a panic mid-generation. The caller recovers panics, so
-	// without this defer a panic between the claim and storeBriefing would leave
-	// the row leased until it self-heals 10m later. claimed is always true here
-	// (the failure branches above returned), but the guard keeps it explicit.
+	// Release unpersisted claims on every exit, including panic recovery.
 	stored := false
 	defer func() {
 		if claimed && !stored {
@@ -297,10 +266,12 @@ func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, looku
 			slog.Int("workspaces", len(accessibleWSIDs)),
 			slog.Any("error", err),
 		)
-		// "No accessible workspaces" isn't a generation failure — the user simply
-		// has nothing to brief on. Don't penalize the run. The deferred release
-		// clears the lease (no storeBriefing on this path).
-		return err == nil
+		if err != nil {
+			return false
+		}
+		bs.storeBriefing(userID, today, "", time.Since(start).Milliseconds(), "", accessibleWSIDs)
+		stored = true
+		return true
 	}
 
 	// Gather context: recent activity
@@ -382,42 +353,30 @@ func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, looku
 	// outside UTC see worklogs from the wrong window (or none at all).
 	var worklogLines []string
 	if bs.timePermService != nil {
-		wlRows, err := bs.db.Query(`SELECT tw.description, tw.duration_minutes, tp.name
-			FROM time_worklogs tw
-			JOIN time_projects tp ON tw.project_id = tp.id
-			WHERE tw.user_id = ? AND tw.date >= ? AND tw.date < ?
-			ORDER BY tw.date DESC`,
-			userID, yesterdayStart.Unix(), todayStart.Unix())
+		worklogs, err := repository.NewTimeWorklogRepository(bs.db).ListBriefingWorklogs(userID, yesterdayStart, todayStart)
 		if err != nil {
 			slog.Warn("briefing: worklogs query failed", slog.Int("user_id", userID), slog.Any("error", err))
 		} else {
-			defer func() { _ = wlRows.Close() }()
-			for wlRows.Next() {
-				var desc, projectName string
-				var durationMins int
-				if err := wlRows.Scan(&desc, &durationMins, &projectName); err == nil {
-					worklogLines = append(worklogLines, fmt.Sprintf("- %s (%s): %dm", desc, projectName, durationMins))
-				}
-			}
-			if err := wlRows.Err(); err != nil {
-				slog.Warn("briefing: worklogs iteration failed", slog.Int("user_id", userID), slog.Any("error", err))
+			for _, worklog := range worklogs {
+				worklogLines = append(worklogLines, fmt.Sprintf("- %s (%s): %dm", worklog.Description, worklog.ProjectName, worklog.DurationMinutes))
 			}
 		}
 	}
 
-	// Build the data block
+	// Build the data block with open work first. Recent activity is supporting
+	// context, not the briefing's main subject.
 	var contextParts []string
+	if len(itemLines) > 0 {
+		contextParts = append(contextParts, "### Open Items (primary context)\n"+strings.Join(itemLines, "\n"))
+	}
 	if len(activityLines) > 0 {
-		contextParts = append(contextParts, "### Recent Changes (last 24h)\n"+strings.Join(activityLines, "\n"))
+		contextParts = append(contextParts, "### Recent Changes (supporting context; do not recap exhaustively)\n"+strings.Join(activityLines, "\n"))
 	}
 	if len(commentLines) > 0 {
-		contextParts = append(contextParts, "### Recent Comments (last 24h)\n"+strings.Join(commentLines, "\n"))
-	}
-	if len(itemLines) > 0 {
-		contextParts = append(contextParts, "### Your Open Items\n"+strings.Join(itemLines, "\n"))
+		contextParts = append(contextParts, "### Recent Comments (supporting context; include only when actionable)\n"+strings.Join(commentLines, "\n"))
 	}
 	if len(worklogLines) > 0 {
-		contextParts = append(contextParts, "### Yesterday's Worklogs\n"+strings.Join(worklogLines, "\n"))
+		contextParts = append(contextParts, "### Yesterday's Worklogs (background only)\n"+strings.Join(worklogLines, "\n"))
 	}
 
 	slog.Info("briefing: context gathered",
@@ -430,7 +389,7 @@ func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, looku
 
 	if len(contextParts) == 0 {
 		slog.Info("briefing: no context found", slog.Int("user_id", userID))
-		bs.storeBriefing(userID, today, "", time.Since(start).Milliseconds(), "")
+		bs.storeBriefing(userID, today, "", time.Since(start).Milliseconds(), "", accessibleWSIDs)
 		stored = true
 		return true
 	}
@@ -442,14 +401,7 @@ func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, looku
 	ctx, cancel := context.WithTimeout(context.Background(), llm.DefaultRequestTimeout)
 	defer cancel()
 
-	resp, err := llmClient.ChatCompletion(ctx, llm.ChatCompletionRequest{
-		Messages: []llm.Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		Temperature: 0.3,
-		MaxTokens:   2048,
-	})
+	resp, err := llmClient.Complete(ctx, dailyBriefingCompletionRequest(systemPrompt, userPrompt))
 
 	durationMs := time.Since(start).Milliseconds()
 
@@ -459,13 +411,13 @@ func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, looku
 			errMsg = err.Error()
 		}
 		slog.Warn("briefing generation failed", slog.Int("user_id", userID), slog.String("error", errMsg))
-		bs.storeBriefing(userID, today, "", durationMs, errMsg)
+		bs.storeBriefing(userID, today, "", durationMs, errMsg, accessibleWSIDs)
 		stored = true
 		return false
 	}
 
 	content := resp.Choices[0].Message.Content
-	bs.storeBriefing(userID, today, content, durationMs, "")
+	bs.storeBriefing(userID, today, content, durationMs, "", accessibleWSIDs)
 	stored = true
 
 	slog.Info("briefing: generated",
@@ -474,6 +426,17 @@ func (bs *BriefingScheduler) generateBriefingForUser(llmClient llm.Client, looku
 		slog.Int64("duration_ms", durationMs),
 	)
 	return true
+}
+
+func dailyBriefingCompletionRequest(systemPrompt, userPrompt string) llm.CompletionRequest {
+	return llm.CompletionRequest{
+		Messages: []llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Temperature: 0.3,
+		MaxTokens:   dailyBriefingMaxTokens,
+	}
 }
 
 // resolveLookup returns a human-readable value for the given history field/raw
@@ -508,8 +471,8 @@ func resolveLookup(maps *repository.NameMaps, field, raw string) string {
 	return raw
 }
 
-func (bs *BriefingScheduler) storeBriefing(userID int, date, content string, durationMs int64, errMsg string) {
-	var errVal interface{}
+func (bs *BriefingScheduler) storeBriefing(userID int, date, content string, durationMs int64, errMsg string, sourceWorkspaceIDs []int) {
+	var errVal any
 	if errMsg != "" {
 		errVal = errMsg
 	}
@@ -518,12 +481,18 @@ func (bs *BriefingScheduler) storeBriefing(userID int, date, content string, dur
 	// is cleared alongside the content/error so the row isn't left claimed.
 	// This UPSERT covers both the "we claimed the row first" path (UPDATE
 	// branch) and a defensive "no row yet" path (INSERT branch).
-	_, err := bs.db.ExecWrite(`INSERT INTO daily_briefings (user_id, date, content, generation_duration_ms, error, lock_until)
-		VALUES (?, ?, ?, ?, ?, NULL)
+	sourceJSON, err := json.Marshal(sourceWorkspaceIDs)
+	if err != nil {
+		slog.Error("failed to encode briefing workspace provenance", slog.Int("user_id", userID), slog.Any("error", err))
+		return
+	}
+	_, err = bs.db.ExecWrite(`INSERT INTO daily_briefings (user_id, date, content, source_workspace_ids, generation_duration_ms, error, lock_until)
+		VALUES (?, ?, ?, ?, ?, ?, NULL)
 		ON CONFLICT (user_id, date) DO UPDATE SET
-		content = excluded.content, generation_duration_ms = excluded.generation_duration_ms,
+		content = excluded.content, source_workspace_ids = excluded.source_workspace_ids,
+		generation_duration_ms = excluded.generation_duration_ms,
 		error = excluded.error, lock_until = NULL, updated_at = CURRENT_TIMESTAMP`,
-		userID, date, content, durationMs, errVal)
+		userID, date, content, string(sourceJSON), durationMs, errVal)
 	if err != nil {
 		slog.Error("failed to store briefing", slog.Int("user_id", userID), slog.Any("error", err))
 	}

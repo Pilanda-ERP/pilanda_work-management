@@ -5,13 +5,17 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"windshift/internal/constants"
 	"windshift/internal/database"
+	"windshift/internal/itemevents"
 	"windshift/internal/models"
 	"windshift/internal/repository"
+	"windshift/internal/validation"
 )
 
 // initialStatusCacheEntry holds a cached initial status ID with expiry
@@ -139,42 +143,15 @@ func initialStatusCacheKey(workspaceID int, itemTypeID *int) string {
 //
 // Returns nil only if NO workflow exists at any level
 func (s *WorkflowService) GetWorkflowIDForItem(workspaceID int, itemTypeID *int) (*int, error) {
-	// Personal workspaces are not bound by workflow rules
-	var isPersonal bool
-	err := s.db.QueryRow(`SELECT is_personal FROM workspaces WHERE id = ?`, workspaceID).Scan(&isPersonal)
-	if err == nil && isPersonal {
+	resolved, err := repository.NewConfigurationSetRepository(s.db).ResolveForWorkspace(context.Background(), workspaceID, itemTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != nil && resolved.IsPersonal {
 		return nil, nil
 	}
-
-	var workflowID *int
-
-	// Try item type + config set workflow (COALESCE handles item type workflow being NULL)
-	if itemTypeID != nil {
-		err = s.db.QueryRow(`
-			SELECT COALESCE(csit.workflow_id, cs.workflow_id) as workflow_id
-			FROM workspace_configuration_sets wcs
-			JOIN configuration_sets cs ON wcs.configuration_set_id = cs.id
-			LEFT JOIN configuration_set_item_types csit
-				ON cs.id = csit.configuration_set_id AND csit.item_type_id = ?
-			WHERE wcs.workspace_id = ?
-		`, *itemTypeID, workspaceID).Scan(&workflowID)
-
-		if err == nil && workflowID != nil {
-			return workflowID, nil
-		}
-		// Continue to fallback if error or NULL result
-	}
-
-	// Try config set default workflow (no item type consideration)
-	err = s.db.QueryRow(`
-		SELECT cs.workflow_id
-		FROM workspace_configuration_sets wcs
-		JOIN configuration_sets cs ON wcs.configuration_set_id = cs.id
-		WHERE wcs.workspace_id = ?
-	`, workspaceID).Scan(&workflowID)
-
-	if err == nil && workflowID != nil {
-		return workflowID, nil
+	if resolved != nil && resolved.WorkflowID != nil {
+		return resolved.WorkflowID, nil
 	}
 
 	// Final fallback: global default workflow
@@ -233,20 +210,116 @@ func (s *WorkflowService) IsValidStatusTransition(workspaceID int, itemTypeID *i
 		return true, nil
 	}
 
-	// Check if the transition exists in the workflow
+	// Check if the transition exists in the workflow: either a direct edge or a
+	// from-all row that admits every source status.
 	var exists bool
 	err = s.db.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM workflow_transitions
-			WHERE workflow_id = ? AND from_status_id = ? AND to_status_id = ?
+			WHERE workflow_id = ?
+			  AND to_status_id = ?
+			  AND (from_status_id = ? OR from_all_statuses = TRUE)
 		)
-	`, *workflowID, fromStatusID, toStatusID).Scan(&exists)
+	`, *workflowID, toStatusID, fromStatusID).Scan(&exists)
 
 	if err != nil {
 		return false, fmt.Errorf("failed to check transition: %w", err)
 	}
 
 	return exists, nil
+}
+
+// ValidateCreateStatusOverride checks whether a user/API create request may set
+// status_id instead of letting creation use the workflow initial status. This is
+// intentionally stricter than a normal status transition: create-time placement
+// may target the initial status itself, or a direct transition from the initial
+// status, but it must not bypass condition/validator rules or approval gates.
+func (s *WorkflowService) ValidateCreateStatusOverride(ctx context.Context, workspaceID int, itemTypeID *int, requestedStatusID int) error {
+	workflowID, err := s.GetWorkflowIDForItem(workspaceID, itemTypeID)
+	if err != nil {
+		return err
+	}
+	// Workspaces without a workflow keep the legacy behavior.
+	if workflowID == nil {
+		return nil
+	}
+
+	initialStatusID, err := s.GetInitialStatusID(*workflowID)
+	if err != nil {
+		return err
+	}
+	if initialStatusID == nil {
+		return &TransitionRejection{Code: "workflow_invalid", Message: "workflow has no initial status"}
+	}
+	if requestedStatusID == *initialStatusID {
+		return nil
+	}
+
+	var transitionID int
+	err = s.db.QueryRow(`
+		SELECT id FROM workflow_transitions
+		WHERE workflow_id = ? AND from_status_id = ? AND to_status_id = ?
+	`, *workflowID, *initialStatusID, requestedStatusID).Scan(&transitionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &TransitionRejection{Code: "workflow_invalid", Message: "requested status is not reachable from the workflow initial status"}
+		}
+		return fmt.Errorf("check create status transition: %w", err)
+	}
+
+	conditionSetID, err := NewConditionService(s.db, nil, nil).GetConditionSetIDForItem(workspaceID, itemTypeID)
+	if err != nil {
+		return err
+	}
+	if conditionSetID != nil {
+		var conditionCount int
+		err = s.db.QueryRow(`
+			SELECT COUNT(*)
+			FROM condition_set_transitions cst
+			JOIN conditions c ON c.condition_set_transition_id = cst.id
+			WHERE cst.condition_set_id = ?
+			  AND cst.transition_id = ?
+			  AND c.mode IN ('condition', 'validator')
+		`, *conditionSetID, transitionID).Scan(&conditionCount)
+		if err != nil {
+			return fmt.Errorf("check create status conditions: %w", err)
+		}
+		if conditionCount > 0 {
+			return &TransitionRejection{Code: "condition_blocked", Message: "requested status is gated by workflow conditions or validators"}
+		}
+	}
+
+	approvalService := NewApprovalService(s.db, nil, s)
+	approvalSetStatus, err := approvalService.GetApprovalSetStatusForItem(ctx, workspaceID, itemTypeID, requestedStatusID)
+	if err != nil {
+		return err
+	}
+	if approvalSetStatus != nil {
+		return &TransitionRejection{Code: "approval_pending", Message: "requested status requires approval and cannot be set during creation"}
+	}
+
+	approvalSetID, err := approvalService.GetApprovalSetIDForItem(ctx, workspaceID, itemTypeID)
+	if err != nil {
+		return err
+	}
+	if approvalSetID != nil {
+		var approvalTransitionCount int
+		err = s.db.QueryRow(`
+			SELECT COUNT(*)
+			FROM approval_set_statuses
+			WHERE approval_set_id = ?
+			  AND is_active = true
+			  AND (approve_transition_id = ? OR deny_transition_id = ?)
+		`, *approvalSetID, transitionID, transitionID).Scan(&approvalTransitionCount)
+		if err != nil {
+			return fmt.Errorf("check create status approval transitions: %w", err)
+		}
+		if approvalTransitionCount > 0 {
+			return &TransitionRejection{Code: "approval_must_decide", Message: "requested status uses an approval decision transition and cannot be set during creation"}
+		}
+	}
+
+	return nil
 }
 
 // IsValidStatusTransitionForUser checks if a transition is allowed by workflow AND conditions.
@@ -257,7 +330,7 @@ func (s *WorkflowService) IsValidStatusTransition(workspaceID int, itemTypeID *i
 // transition endpoint where condition-mode also blocks.
 // Returns (allowed, failureMessage, error). failureMessage is set when a condition with an
 // error_message fails.
-func (s *WorkflowService) IsValidStatusTransitionForUser(ctx context.Context, workspaceID int, itemTypeID *int, fromStatusID, toStatusID int64, userID int, item map[string]interface{}, conditionService *ConditionService, modes []string) (allowed bool, failureMessage string, err error) {
+func (s *WorkflowService) IsValidStatusTransitionForUser(ctx context.Context, workspaceID int, itemTypeID *int, fromStatusID, toStatusID int64, userID int, item map[string]any, conditionService *ConditionService, modes []string) (allowed bool, failureMessage string, err error) {
 	// Same status is always valid
 	if fromStatusID == toStatusID {
 		return true, "", nil
@@ -271,12 +344,17 @@ func (s *WorkflowService) IsValidStatusTransitionForUser(ctx context.Context, wo
 		return true, "", nil
 	}
 
-	// Check workflow transition exists and get its ID
+	// Resolve the governing transition row: a direct edge wins over a from-all
+	// row so a specific edge keeps its own conditions and validators.
 	var transitionID int
 	err = s.db.QueryRow(`
 		SELECT id FROM workflow_transitions
-		WHERE workflow_id = ? AND from_status_id = ? AND to_status_id = ?
-	`, *workflowID, fromStatusID, toStatusID).Scan(&transitionID)
+		WHERE workflow_id = ?
+		  AND to_status_id = ?
+		  AND (from_status_id = ? OR from_all_statuses = TRUE)
+		ORDER BY CASE WHEN from_status_id IS NULL THEN 1 ELSE 0 END, display_order
+		LIMIT 1
+	`, *workflowID, toStatusID, fromStatusID).Scan(&transitionID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, "", nil
@@ -303,9 +381,10 @@ func (s *WorkflowService) IsValidStatusTransitionForUser(ctx context.Context, wo
 
 // PerformTransitionRequest is the input to WorkflowService.PerformTransition.
 type PerformTransitionRequest struct {
-	ItemID      int
-	ToStatusID  int
-	ActorUserID int
+	ItemID        int
+	ToStatusID    int
+	ActorUserID   int
+	EventMetadata itemevents.Metadata
 	// Modes selects which condition modes to enforce (e.g. []string{"validator", "condition"}
 	// for user-initiated transitions, or nil/empty for automation that should only be
 	// gated by workflow validity). Callers pass this through to
@@ -313,12 +392,20 @@ type PerformTransitionRequest struct {
 	Modes []string
 }
 
-// PerformTransitionResult is returned on a successful transition (including no-ops).
+// PerformTransitionResult is returned once a transition commits, including
+// when a post-commit approval hook also returns an error.
 type PerformTransitionResult struct {
 	Item        *models.Item
 	OldStatusID *int
 	NewStatusID *int
 	NoOp        bool
+}
+
+type transitionApprovalService interface {
+	IsTransitionGatedByApproval(ctx context.Context, itemID, fromStatusID, toStatusID int) (*int, error)
+	GetPendingForItem(ctx context.Context, itemID int) (*models.ApprovalRequest, error)
+	Cancel(ctx context.Context, requestID, actorUserID int, comment, reason string) error
+	MaybeOpenForStatusEntry(ctx context.Context, itemID, statusID, fromStatusID, actorUserID int) (*models.ApprovalRequest, error)
 }
 
 // TransitionRejection is returned as an error when a transition is rejected
@@ -362,23 +449,35 @@ func (s *WorkflowService) PerformTransition(
 	req PerformTransitionRequest,
 	itemRepo *repository.ItemRepository,
 	conditionService *ConditionService,
-	approvalService *ApprovalService,
+	approvalService transitionApprovalService,
 ) (*PerformTransitionResult, error) {
 	item, err := itemRepo.FindByID(req.ItemID)
 	if err != nil {
 		return nil, err
 	}
-
-	if item.StatusID == nil {
-		return nil, &TransitionRejection{
-			Code:    "no_current_status",
-			Message: "item has no current status; cannot transition",
-		}
+	if err := validation.ValidateTaskState(s.db, item.WorkspaceID, req.ActorUserID, item.IsTask, &req.ToStatusID); err != nil {
+		return nil, err
 	}
-	oldStatusID := *item.StatusID
+
+	missingStatus := item.StatusID == nil
+	oldStatusID := constants.StatusIDOpen
+	if missingStatus {
+		isPersonal, err := repository.IsPersonalWorkspace(s.db, item.WorkspaceID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve item workspace: %w", err)
+		}
+		if !isPersonal {
+			return nil, &TransitionRejection{
+				Code:    "no_current_status",
+				Message: "item has no current status; cannot transition",
+			}
+		}
+	} else {
+		oldStatusID = *item.StatusID
+	}
 
 	// No-op: target equals current status.
-	if oldStatusID == req.ToStatusID {
+	if !missingStatus && oldStatusID == req.ToStatusID {
 		return &PerformTransitionResult{
 			Item:        item,
 			OldStatusID: &oldStatusID,
@@ -423,7 +522,7 @@ func (s *WorkflowService) PerformTransition(
 	// transition. ApprovalService.Decide is the only legitimate path to those
 	// commits and bypasses PerformTransition entirely.
 	if approvalService != nil {
-		gatingRequestID, err := approvalService.IsTransitionGatedByApproval(req.ItemID, oldStatusID, req.ToStatusID)
+		gatingRequestID, err := approvalService.IsTransitionGatedByApproval(ctx, req.ItemID, oldStatusID, req.ToStatusID)
 		if err != nil {
 			return nil, fmt.Errorf("check approval gating: %w", err)
 		}
@@ -438,42 +537,64 @@ func (s *WorkflowService) PerformTransition(
 
 	// Transactional write + history entry.
 	if err := database.WithTx(s.db, func(tx database.Tx) error {
-		return s.CommitTransition(tx, itemRepo, req.ItemID, oldStatusID, req.ToStatusID, req.ActorUserID)
+		metadata := mergeItemEventMetadata(req.EventMetadata, itemEventMetadata(req.ActorUserID, "application", nil))
+		return s.CommitTransition(ctx, tx, itemRepo, req.ItemID, oldStatusID, req.ToStatusID, req.ActorUserID, metadata)
 	}); err != nil {
 		return nil, err
 	}
 
 	// Live-update publish (WI-483): the status transition committed. Reached only
 	// on a real transition (the no-op case short-circuits earlier).
-	PublishItemChange(req.ItemID, ItemChangeStatus)
-
-	// Post-commit approval hooks. Cancel any pending approval (we just left the
-	// approval-bound status by a non-gated transition), then open a new one if
-	// the destination status is itself approval-bound.
-	if approvalService != nil {
-		if pending, err := approvalService.GetPendingForItem(req.ItemID); err == nil && pending != nil {
-			_ = approvalService.Cancel(ctx, pending.ID, req.ActorUserID, "", "left_status")
-		}
-		if _, err := approvalService.MaybeOpenForStatusEntry(ctx, req.ItemID, req.ToStatusID, oldStatusID, req.ActorUserID); err != nil {
-			// Non-fatal: log via err return path? We've already committed the transition,
-			// so a failure here leaves the item in the new status without an open approval.
-			// Surface it so callers can decide how to handle.
-			return nil, fmt.Errorf("open approval after commit: %w", err)
-		}
-	}
+	PublishItemChange(req.ItemID)
 
 	updated, err := itemRepo.FindByIDWithDetails(req.ItemID)
 	if err != nil {
 		return nil, fmt.Errorf("reload item: %w", err)
 	}
+	PublishWorkspaceChange(updated.WorkspaceID)
 
 	newStatusID := req.ToStatusID
-	return &PerformTransitionResult{
+	result := &PerformTransitionResult{
 		Item:        updated,
 		OldStatusID: &oldStatusID,
 		NewStatusID: &newStatusID,
 		NoOp:        false,
-	}, nil
+	}
+
+	// Post-commit approval hooks. Cancel any pending approval (we just left the
+	// approval-bound status by a non-gated transition), then open a new one if
+	// the destination status is itself approval-bound.
+	if approvalService != nil {
+		pending, err := approvalService.GetPendingForItem(ctx, req.ItemID)
+		if err != nil {
+			logPostCommitApprovalError(req, oldStatusID, "get_pending", err)
+			return result, fmt.Errorf("get pending approval after commit: %w", err)
+		}
+		if pending != nil {
+			if err := approvalService.Cancel(ctx, pending.ID, req.ActorUserID, "", "left_status"); err != nil {
+				logPostCommitApprovalError(req, oldStatusID, "cancel", err)
+				return result, fmt.Errorf("cancel approval after commit: %w", err)
+			}
+		}
+		if _, err := approvalService.MaybeOpenForStatusEntry(ctx, req.ItemID, req.ToStatusID, oldStatusID, req.ActorUserID); err != nil {
+			logPostCommitApprovalError(req, oldStatusID, "maybe_open", err)
+			return result, fmt.Errorf("open approval after commit: %w", err)
+		}
+	}
+
+	return result, nil
+}
+
+func logPostCommitApprovalError(req PerformTransitionRequest, oldStatusID int, hook string, err error) {
+	slog.Error("post-commit approval hook failed",
+		slog.String("component", "workflow"),
+		slog.String("hook", hook),
+		slog.Int("item_id", req.ItemID),
+		slog.Int("old_status_id", oldStatusID),
+		slog.Int("new_status_id", req.ToStatusID),
+		slog.Int("actor_user_id", req.ActorUserID),
+		slog.Any("error", err),
+	)
 }
 
 // CommitTransition writes the status change and a corresponding item_history row
@@ -483,24 +604,90 @@ func (s *WorkflowService) PerformTransition(
 // because the approval itself is the gate; PerformTransition calls it after its
 // own gating logic for user-driven transitions.
 func (s *WorkflowService) CommitTransition(
-	tx database.Tx, itemRepo *repository.ItemRepository,
+	ctx context.Context, tx database.Tx, itemRepo *repository.ItemRepository,
 	itemID, oldStatusID, newStatusID, actorUserID int,
+	metadata itemevents.Metadata,
 ) error {
-	if err := itemRepo.UpdateFields(tx, itemID, map[string]interface{}{
+	item, err := itemRepo.FindByIDForUpdate(tx, itemID)
+	if err != nil {
+		return err
+	}
+	if err := validation.ValidateTaskState(tx, item.WorkspaceID, actorUserID, item.IsTask, &newStatusID); err != nil {
+		return err
+	}
+	changedAt := time.Now()
+	if err := itemRepo.UpdateFields(tx, itemID, map[string]any{
 		"status_id": newStatusID,
 	}); err != nil {
 		return err
 	}
 
-	if _, err := tx.Exec(`
-		INSERT INTO item_history (item_id, user_id, field_name, old_value, new_value, changed_at)
-		VALUES (?, ?, 'status_id', ?, ?, ?)
-	`, itemID, actorUserID,
-		fmt.Sprintf("%d", oldStatusID),
-		fmt.Sprintf("%d", newStatusID),
-		time.Now(),
-	); err != nil {
+	if err := itemRepo.RecordHistory(tx, repository.HistoryEntry{
+		ItemID:     itemID,
+		UserID:     actorUserID,
+		FieldName:  "status_id",
+		OldValue:   fmt.Sprintf("%d", oldStatusID),
+		NewValue:   fmt.Sprintf("%d", newStatusID),
+		ChangedAt:  changedAt,
+		Source:     historySourceForAgent(metadata),
+		AgentRunID: historyRunForAgent(metadata),
+	}); err != nil {
 		return fmt.Errorf("record transition history: %w", err)
+	}
+	item, err = itemRepo.FindByIDForUpdate(tx, itemID)
+	if err != nil {
+		return err
+	}
+	if metadata.OccurredAt.IsZero() {
+		metadata.OccurredAt = changedAt
+	}
+	oldStatus, newStatus := oldStatusID, newStatusID
+	changes := []itemevents.FieldChange{{Field: "status_id", OldValue: oldStatus, NewValue: newStatus}}
+	if _, err := itemevents.NewRecorder(s.db).StatusChanged(ctx, tx, item, &oldStatus, &newStatus, changes, metadata); err != nil {
+		return err
+	}
+	if err := s.recordSupportTransitionFacts(tx, itemID, oldStatusID, newStatusID, changedAt); err != nil {
+		return err
+	}
+	return nil
+}
+
+// statusCompleted reports whether a status belongs to a completed category.
+func (s *WorkflowService) statusCompleted(tx database.Tx, statusID int) (bool, error) {
+	if statusID == 0 {
+		return false, nil
+	}
+	var completed bool
+	err := tx.QueryRow(`
+		SELECT COALESCE(sc.is_completed, false)
+		FROM statuses st
+		LEFT JOIN status_categories sc ON sc.id = st.category_id
+		WHERE st.id = ?`, statusID).Scan(&completed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return completed, err
+}
+
+// recordSupportTransitionFacts writes the append-only ticket facts for
+// support metrics (WI-1133): resolved on first entry into a completed
+// category, reopened on every exit. The repository no-ops for items that
+// are not customer-facing tickets.
+func (s *WorkflowService) recordSupportTransitionFacts(tx database.Tx, itemID, oldStatusID, newStatusID int, changedAt time.Time) error {
+	oldCompleted, err := s.statusCompleted(tx, oldStatusID)
+	if err != nil {
+		return fmt.Errorf("resolve old status category: %w", err)
+	}
+	newCompleted, err := s.statusCompleted(tx, newStatusID)
+	if err != nil {
+		return fmt.Errorf("resolve new status category: %w", err)
+	}
+	events := repository.NewItemSupportEventRepository(s.db)
+	switch {
+	case newCompleted && !oldCompleted:
+		return events.RecordResolved(tx, itemID, changedAt)
+	case oldCompleted && !newCompleted:
+		return events.RecordReopened(tx, itemID, changedAt)
 	}
 	return nil
 }
@@ -514,13 +701,18 @@ func IsTransitionRejection(err error) *TransitionRejection {
 	return nil
 }
 
-// GetTransitionID returns the transition ID for a workflow transition.
+// GetTransitionID returns the transition ID for a workflow transition. A
+// direct edge is preferred over a from-all row targeting the same status.
 func (s *WorkflowService) GetTransitionID(workflowID int, fromStatusID, toStatusID int64) (int, error) {
 	var id int
 	err := s.db.QueryRow(`
 		SELECT id FROM workflow_transitions
-		WHERE workflow_id = ? AND from_status_id = ? AND to_status_id = ?
-	`, workflowID, fromStatusID, toStatusID).Scan(&id)
+		WHERE workflow_id = ?
+		  AND to_status_id = ?
+		  AND (from_status_id = ? OR from_all_statuses = TRUE)
+		ORDER BY CASE WHEN from_status_id IS NULL THEN 1 ELSE 0 END, display_order
+		LIMIT 1
+	`, workflowID, toStatusID, fromStatusID).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
@@ -541,14 +733,24 @@ func (s *WorkflowService) GetAvailableTransitions(workspaceID int, itemTypeID *i
 		return []StatusTransition{}, nil
 	}
 
-	// Get valid transitions from current status
+	// Get valid transitions from the current status. From-all rows add targets
+	// that have no direct edge from this status.
 	rows, err := s.db.Query(`
 		SELECT s.id, s.name, sc.color
 		FROM workflow_transitions wt
 		JOIN statuses s ON wt.to_status_id = s.id
 		LEFT JOIN status_categories sc ON s.category_id = sc.id
-		WHERE wt.workflow_id = ? AND wt.from_status_id = ?
-	`, *workflowID, currentStatusID)
+		WHERE wt.workflow_id = ?
+		  AND (
+			wt.from_status_id = ?
+			OR (
+				wt.from_all_statuses = TRUE
+				AND wt.to_status_id NOT IN (
+					SELECT to_status_id FROM workflow_transitions WHERE workflow_id = ? AND from_status_id = ?
+				)
+			)
+		  )
+	`, *workflowID, currentStatusID, *workflowID, currentStatusID)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transitions: %w", err)
@@ -636,7 +838,8 @@ type StatusTransition struct {
 }
 
 // GetInitialStatusID returns the initial status ID for a workflow
-// The initial status is identified by from_status_id IS NULL in workflow_transitions
+// The initial status is identified by from_status_id IS NULL (and not a
+// from-all row) in workflow_transitions
 func (s *WorkflowService) GetInitialStatusID(workflowID int) (*int, error) {
 	var statusID int
 	err := s.db.QueryRow(`
@@ -644,6 +847,7 @@ func (s *WorkflowService) GetInitialStatusID(workflowID int) (*int, error) {
 		FROM workflow_transitions wt
 		WHERE wt.workflow_id = ?
 		  AND wt.from_status_id IS NULL
+		  AND wt.from_all_statuses = FALSE
 		ORDER BY wt.display_order ASC
 		LIMIT 1
 	`, workflowID).Scan(&statusID)
@@ -665,6 +869,7 @@ func (s *WorkflowService) GetInitialStatusID(workflowID int) (*int, error) {
 // WorkflowResult represents a workflow for listing/reading.
 type WorkflowResult struct {
 	ID          int
+	BuiltinKey  string
 	Name        string
 	Description string
 	IsDefault   bool
@@ -674,76 +879,80 @@ type WorkflowResult struct {
 
 // WorkflowTransitionResult represents a workflow transition.
 type WorkflowTransitionResult struct {
-	ID                int
-	FromStatusID      *int
-	FromStatusName    string
-	FromCategoryName  string
-	FromCategoryColor string
-	ToStatusID        int
-	ToStatusName      string
-	ToCategoryName    string
-	ToCategoryColor   string
+	ID                     int
+	FromStatusID           *int
+	FromAllStatuses        bool
+	FromStatusBuiltinKey   string
+	FromStatusName         string
+	FromCategoryBuiltinKey string
+	FromCategoryName       string
+	FromCategoryColor      string
+	ToStatusID             int
+	ToStatusBuiltinKey     string
+	ToStatusName           string
+	ToCategoryBuiltinKey   string
+	ToCategoryName         string
+	ToCategoryColor        string
 }
 
 // List retrieves all workflows.
 func (s *WorkflowService) List() ([]WorkflowResult, error) {
-	rows, err := s.db.Query(`
-		SELECT id, name, description, is_default, created_at, updated_at
-		FROM workflows
-		ORDER BY name
-	`)
+	workflowModels, err := repository.NewWorkflowRepository(s.db).List()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list workflows: %w", err)
+		return nil, fmt.Errorf("list workflows: %w", err)
 	}
-	defer rows.Close()
+	workflows := make([]WorkflowResult, 0, len(workflowModels))
+	for _, workflow := range workflowModels {
+		workflows = append(workflows, workflowResult(workflow))
+	}
+	return workflows, nil
+}
 
-	var workflows []WorkflowResult
-	for rows.Next() {
-		var wf WorkflowResult
-		var description sql.NullString
-		err := rows.Scan(&wf.ID, &wf.Name, &description, &wf.IsDefault, &wf.CreatedAt, &wf.UpdatedAt)
-		if err != nil {
-			continue
-		}
-		wf.Description = description.String
-		workflows = append(workflows, wf)
+// ListForWorkspace returns the distinct workflows effective for a workspace's
+// configured item types. Item-type overrides take precedence over the
+// configuration-set workflow, which in turn falls back to the global default.
+// Personal workspaces have no workflow restrictions and return an empty list.
+func (s *WorkflowService) ListForWorkspace(workspaceID int) ([]WorkflowResult, error) {
+	workflowIDs, err := repository.NewConfigurationSetRepository(s.db).ListEffectiveWorkflowIDs(workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list workspace workflows: %w", err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate workflows: %w", err)
+	workflowModels, err := repository.NewWorkflowRepository(s.db).ListByIDs(workflowIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load workspace workflows: %w", err)
 	}
-
-	if workflows == nil {
-		workflows = []WorkflowResult{}
+	workflows := make([]WorkflowResult, 0, len(workflowModels))
+	for _, workflow := range workflowModels {
+		workflows = append(workflows, WorkflowResult{
+			ID: workflow.ID, BuiltinKey: workflow.BuiltinKey, Name: workflow.Name, Description: workflow.Description,
+			IsDefault: workflow.IsDefault, CreatedAt: workflow.CreatedAt, UpdatedAt: workflow.UpdatedAt,
+		})
 	}
-
 	return workflows, nil
 }
 
 // GetByID retrieves a workflow by ID.
 func (s *WorkflowService) GetByID(id int) (*WorkflowResult, error) {
-	var wf WorkflowResult
-	var description sql.NullString
-	err := s.db.QueryRow(`
-		SELECT id, name, description, is_default, created_at, updated_at
-		FROM workflows WHERE id = ?
-	`, id).Scan(&wf.ID, &wf.Name, &description, &wf.IsDefault, &wf.CreatedAt, &wf.UpdatedAt)
-
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("workflow not found: %d", id)
-	}
+	model, err := repository.NewWorkflowRepository(s.db).Get(id)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get workflow: %w", err)
+		return nil, fmt.Errorf("get workflow %d: %w", id, err)
 	}
+	result := workflowResult(*model)
+	return &result, nil
+}
 
-	wf.Description = description.String
-	return &wf, nil
+func workflowResult(workflow models.Workflow) WorkflowResult {
+	return WorkflowResult{
+		ID: workflow.ID, BuiltinKey: workflow.BuiltinKey, Name: workflow.Name,
+		Description: workflow.Description, IsDefault: workflow.IsDefault,
+		CreatedAt: workflow.CreatedAt, UpdatedAt: workflow.UpdatedAt,
+	}
 }
 
 // Exists checks if a workflow exists.
 func (s *WorkflowService) Exists(id int) (bool, error) {
-	var exists int
-	err := s.db.QueryRow("SELECT 1 FROM workflows WHERE id = ?", id).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
+	_, err := repository.NewWorkflowRepository(s.db).Get(id)
+	if errors.Is(err, repository.ErrNotFound) {
 		return false, nil
 	}
 	if err != nil {
@@ -758,12 +967,13 @@ func (s *WorkflowService) scanTransitions(rows *sql.Rows) ([]WorkflowTransitionR
 	for rows.Next() {
 		var t WorkflowTransitionResult
 		var fromStatusID sql.NullInt64
-		var fromStatusName, fromCategoryName, fromCategoryColor sql.NullString
+		var fromStatusBuiltinKey, fromStatusName sql.NullString
+		var fromCategoryBuiltinKey, fromCategoryName, fromCategoryColor sql.NullString
 
-		err := rows.Scan(&t.ID, &fromStatusID, &t.ToStatusID,
-			&fromStatusName, &t.ToStatusName,
-			&fromCategoryName, &fromCategoryColor,
-			&t.ToCategoryName, &t.ToCategoryColor)
+		err := rows.Scan(&t.ID, &fromStatusID, &t.ToStatusID, &t.FromAllStatuses,
+			&fromStatusBuiltinKey, &fromStatusName, &t.ToStatusBuiltinKey, &t.ToStatusName,
+			&fromCategoryBuiltinKey, &fromCategoryName, &fromCategoryColor,
+			&t.ToCategoryBuiltinKey, &t.ToCategoryName, &t.ToCategoryColor)
 		if err != nil {
 			continue
 		}
@@ -771,7 +981,9 @@ func (s *WorkflowService) scanTransitions(rows *sql.Rows) ([]WorkflowTransitionR
 		if fromStatusID.Valid {
 			id := int(fromStatusID.Int64)
 			t.FromStatusID = &id
+			t.FromStatusBuiltinKey = fromStatusBuiltinKey.String
 			t.FromStatusName = fromStatusName.String
+			t.FromCategoryBuiltinKey = fromCategoryBuiltinKey.String
 			t.FromCategoryName = fromCategoryName.String
 			t.FromCategoryColor = fromCategoryColor.String
 		}
@@ -788,46 +1000,92 @@ func (s *WorkflowService) scanTransitions(rows *sql.Rows) ([]WorkflowTransitionR
 
 // GetTransitions retrieves all transitions for a workflow.
 func (s *WorkflowService) GetTransitions(workflowID int) ([]WorkflowTransitionResult, error) {
+	transitionModels, err := repository.NewWorkflowRepository(s.db).ListTransitions(workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("get workflow transitions: %w", err)
+	}
+	transitions := make([]WorkflowTransitionResult, 0, len(transitionModels))
+	for _, transition := range transitionModels {
+		transitions = append(transitions, WorkflowTransitionResult{
+			ID: transition.ID, FromStatusID: transition.FromStatusID,
+			FromAllStatuses:      transition.FromAllStatuses,
+			FromStatusBuiltinKey: transition.FromStatusBuiltinKey, FromStatusName: transition.FromStatusName,
+			FromCategoryBuiltinKey: transition.FromCategoryBuiltinKey, FromCategoryName: transition.FromCategoryName,
+			FromCategoryColor: transition.FromCategoryColor, ToStatusID: transition.ToStatusID,
+			ToStatusBuiltinKey: transition.ToStatusBuiltinKey, ToStatusName: transition.ToStatusName,
+			ToCategoryBuiltinKey: transition.ToCategoryBuiltinKey, ToCategoryName: transition.ToCategoryName,
+			ToCategoryColor: transition.ToCategoryColor,
+		})
+	}
+	return transitions, nil
+}
+
+// GetTransitionsFromStatus retrieves directed transitions from a given status
+// ID. NULL from-status rows define item creation and are not available moves
+// from an existing item.
+func (s *WorkflowService) GetTransitionsFromStatus(statusID int) ([]WorkflowTransitionResult, error) {
 	rows, err := s.db.Query(`
-		SELECT wt.id, wt.from_status_id, wt.to_status_id,
-		       fs.name as from_status_name, ts.name as to_status_name,
-		       fsc.name as from_category_name, fsc.color as from_category_color,
-		       tsc.name as to_category_name, tsc.color as to_category_color
+		SELECT wt.id, wt.from_status_id, wt.to_status_id, wt.from_all_statuses,
+		       fs.builtin_key as from_status_builtin_key, fs.name as from_status_name,
+		       COALESCE(ts.builtin_key, ''), ts.name as to_status_name,
+		       fsc.builtin_key as from_category_builtin_key, fsc.name as from_category_name, fsc.color as from_category_color,
+		       COALESCE(tsc.builtin_key, ''), tsc.name as to_category_name, tsc.color as to_category_color
 		FROM workflow_transitions wt
 		LEFT JOIN statuses fs ON wt.from_status_id = fs.id
 		JOIN statuses ts ON wt.to_status_id = ts.id
 		LEFT JOIN status_categories fsc ON fs.category_id = fsc.id
 		JOIN status_categories tsc ON ts.category_id = tsc.id
-		WHERE wt.workflow_id = ?
+		WHERE wt.from_status_id = ?
 		ORDER BY wt.display_order
-	`, workflowID)
+	`, statusID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get transitions: %w", err)
+		return nil, fmt.Errorf("failed to get transitions from status: %w", err)
 	}
 	defer rows.Close()
 
 	return s.scanTransitions(rows)
 }
 
-// GetTransitionsFromStatus retrieves available transitions from a given status ID.
-// This queries transitions where from_status_id matches the given status OR from_status_id IS NULL (initial transitions).
-// Used by the V1 API to show available status transitions for an item.
-func (s *WorkflowService) GetTransitionsFromStatus(statusID int) ([]WorkflowTransitionResult, error) {
+// GetTransitionsForItem retrieves the transitions available from an item's
+// current status in its effective workspace/item-type workflow. Statuses are
+// global records and may be shared by several workflows, so filtering only by
+// status ID can leak transitions that the item can never perform.
+func (s *WorkflowService) GetTransitionsForItem(
+	workspaceID int, itemTypeID *int, statusID int,
+) ([]WorkflowTransitionResult, error) {
+	workflowID, err := s.GetWorkflowIDForItem(workspaceID, itemTypeID)
+	if err != nil {
+		return nil, err
+	}
+	if workflowID == nil {
+		return []WorkflowTransitionResult{}, nil
+	}
+
 	rows, err := s.db.Query(`
-		SELECT wt.id, wt.from_status_id, wt.to_status_id,
-		       fs.name as from_status_name, ts.name as to_status_name,
-		       fsc.name as from_category_name, fsc.color as from_category_color,
-		       tsc.name as to_category_name, tsc.color as to_category_color
+		SELECT wt.id, wt.from_status_id, wt.to_status_id, wt.from_all_statuses,
+		       fs.builtin_key as from_status_builtin_key, fs.name as from_status_name,
+		       COALESCE(ts.builtin_key, ''), ts.name as to_status_name,
+		       fsc.builtin_key as from_category_builtin_key, fsc.name as from_category_name, fsc.color as from_category_color,
+		       COALESCE(tsc.builtin_key, ''), tsc.name as to_category_name, tsc.color as to_category_color
 		FROM workflow_transitions wt
 		LEFT JOIN statuses fs ON wt.from_status_id = fs.id
 		JOIN statuses ts ON wt.to_status_id = ts.id
 		LEFT JOIN status_categories fsc ON fs.category_id = fsc.id
 		JOIN status_categories tsc ON ts.category_id = tsc.id
-		WHERE wt.from_status_id = ? OR wt.from_status_id IS NULL
-		ORDER BY wt.display_order
-	`, statusID)
+		WHERE wt.workflow_id = ?
+		  AND (
+			wt.from_status_id = ?
+			OR (
+				wt.from_all_statuses = TRUE
+				AND wt.to_status_id NOT IN (
+					SELECT to_status_id FROM workflow_transitions WHERE workflow_id = ? AND from_status_id = ?
+				)
+			)
+		  )
+		ORDER BY CASE WHEN wt.from_all_statuses THEN 1 ELSE 0 END, wt.display_order
+	`, *workflowID, statusID, *workflowID, statusID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get transitions from status: %w", err)
+		return nil, fmt.Errorf("failed to get item workflow transitions: %w", err)
 	}
 	defer rows.Close()
 

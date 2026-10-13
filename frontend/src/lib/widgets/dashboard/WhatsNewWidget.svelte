@@ -1,12 +1,23 @@
 <script>
-  import { Bell, Eye, Inbox } from '@lucide/svelte';
+  import { Inbox } from '@lucide/svelte';
   import { homepageStore, workspacesStore } from '../../stores';
+  import { notifications, notificationActions } from '../../stores/notifications.js';
   import { navigate } from '../../router.js';
+  import DashboardItemRow from './DashboardItemRow.svelte';
+  import { t } from '../../stores/i18n.svelte.js';
 
   const MAX_ENTRIES_PER_WORKSPACE = 5;
   const MAX_WORKSPACES = 5;
+  // What's New is a feed of recent issue updates, so only surface entries
+  // from the last two weeks regardless of read state.
+  const RECENT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 
-  let notifications = $derived(homepageStore.notifications);
+  function isRecent(timestamp) {
+    const ts = new Date(timestamp).getTime();
+    return Number.isFinite(ts) && ts >= Date.now() - RECENT_WINDOW_MS;
+  }
+
+  let recentNotifications = $derived($notifications.filter((n) => isRecent(n.timestamp)));
   let watchedItems = $derived(homepageStore.watchedItems);
   let loading = $derived(homepageStore.loading);
 
@@ -17,33 +28,31 @@
   let groups = $derived.by(() => {
     const entries = [];
 
-    for (const n of notifications) {
-      const m = n.action_url?.match(/^\/workspaces\/(\d+)\//);
+    for (const n of recentNotifications) {
+      const actionUrl = n.actionUrl || n.action_url;
+      const m = actionUrl?.match(/^\/workspaces\/(\d+)\//);
       if (!m) continue;
       entries.push({
         id: `n-${n.id}`,
+        kind: 'notification',
         notificationId: n.id,
         workspaceId: parseInt(m[1], 10),
         timestamp: n.timestamp,
-        source: 'notification',
-        title: n.message || n.title || 'Notification',
-        subtitle: null,
-        link: n.action_url,
+        title: n.message || n.title || t('notifications.notification'),
         read: n.read,
+        link: actionUrl,
       });
     }
 
     for (const w of watchedItems) {
-      if (!w.last_activity) continue;
+      if (!w.last_active_at || !isRecent(w.last_active_at)) continue;
       entries.push({
         id: `w-${w.item_id}`,
+        kind: 'item',
         workspaceId: w.workspace_id,
-        timestamp: w.last_activity,
-        source: 'watched',
-        title: w.title,
-        subtitle: w.status,
+        timestamp: w.last_active_at,
+        item: w,
         link: `/workspaces/${w.workspace_id}/items/${w.item_id}`,
-        read: true,
       });
     }
 
@@ -73,10 +82,15 @@
   });
 
   function open(entry) {
-    if (entry?.source === 'notification' && !entry.read) {
-      homepageStore.markNotificationRead(entry.notificationId);
+    if (entry?.kind === 'notification' && !entry.read) {
+      notificationActions.markAsRead(entry.notificationId);
     }
     if (entry?.link) navigate(entry.link);
+  }
+
+  function itemKey(item) {
+    if (item.workspace_key == null || item.workspace_item_number == null) return null;
+    return `${item.workspace_key}-${item.workspace_item_number}`;
   }
 </script>
 
@@ -89,7 +103,7 @@
 {:else if groups.length === 0}
   <div class="flex flex-col items-center text-center py-6" style="color: var(--ds-text-subtle);">
     <Inbox class="w-6 h-6 mb-2 opacity-60" />
-    <p class="text-sm">You're all caught up</p>
+    <p class="text-sm">{t('dashboard.allCaughtUp')}</p>
   </div>
 {:else}
   <div class="flex flex-col gap-3">
@@ -104,46 +118,29 @@
         <ul class="flex flex-col gap-1.5">
           {#each g.entries as e (e.id)}
             <li>
-              <button
-                data-testid="whats-new-entry"
-                data-entry-id={e.id}
-                data-read={e.read}
-                class="w-full text-left p-2 flex items-start gap-2 rounded border transition-colors"
-                style="border-color: var(--ds-border); background-color: var(--ds-surface); color: var(--ds-text);"
-                onmouseenter={(e2) =>
-                  (e2.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)')}
-                onmouseleave={(e2) => (e2.currentTarget.style.backgroundColor = 'var(--ds-surface)')}
-                onclick={() => open(e)}
-              >
-                {#if e.source === 'watched'}
-                  <Eye
-                    class="w-4 h-4 mt-0.5 flex-shrink-0"
-                    style="color: var(--ds-text-subtlest);"
-                  />
-                {:else}
-                  <Bell
-                    class="w-4 h-4 mt-0.5 flex-shrink-0"
-                    style={e.read
-                      ? 'color: var(--ds-text-subtlest);'
-                      : 'color: var(--ds-icon-accent-blue);'}
-                  />
-                {/if}
-                <div class="min-w-0 flex-1">
-                  <p
-                    class="text-sm truncate"
-                    style={e.read ? 'color: var(--ds-text-subtle);' : 'color: var(--ds-text); font-weight: 500;'}
-                  >
-                    {e.title}
-                  </p>
-                  <p
-                    class="text-[0.7rem] mt-0.5 flex items-center gap-1.5"
-                    style="color: var(--ds-text-subtle);"
-                  >
-                    {#if e.subtitle}<span class="truncate">{e.subtitle}</span><span>·</span>{/if}
-                    <span>{homepageStore.formatRelativeTime(e.timestamp)}</span>
-                  </p>
-                </div>
-              </button>
+              {#if e.kind === 'item'}
+                <DashboardItemRow
+                  title={e.item.title}
+                  itemKey={itemKey(e.item)}
+                  statusName={e.item.status}
+                  statusBuiltinKey={e.item.status_builtin_key}
+                  statusColor={e.item.status_color}
+                  priorityName={e.item.priority_name}
+                  priorityBuiltinKey={e.item.priority_builtin_key}
+                  priorityColor={e.item.priority_color}
+                  timestamp={homepageStore.formatRelativeTime(e.timestamp)}
+                  dataTestid="whats-new-entry"
+                  onclick={() => open(e)}
+                />
+              {:else}
+                <DashboardItemRow
+                  title={e.title}
+                  timestamp={homepageStore.formatRelativeTime(e.timestamp)}
+                  unread={!e.read}
+                  dataTestid="whats-new-entry"
+                  onclick={() => open(e)}
+                />
+              {/if}
             </li>
           {/each}
         </ul>

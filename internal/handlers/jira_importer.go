@@ -1,193 +1,72 @@
 package handlers
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"windshift/internal/jiraimport"
 	"windshift/internal/logger"
 	"windshift/internal/repository"
 	"windshift/internal/restapi"
 	"windshift/internal/sanitize"
 	"windshift/internal/utils"
+	"windshift/internal/xray"
 
-	"github.com/google/uuid"
+	"uuid"
 )
+
+// ReconcileInterruptedImports fails Jira import jobs whose worker lease
+// expired, so a server restart cannot leave a queued/running job blocking
+// retry or cleanup forever. Safe to call at startup and on demand.
+func (h *JiraImportHandler) ReconcileInterruptedImports() (int, error) {
+	return h.imports.ReconcileInterrupted(time.Now().UTC())
+}
 
 // GetJobStatus handles GET /api/admin/jira-import/jobs/{jobId}
 func (h *JiraImportHandler) GetJobStatus(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobId")
-
-	var status, phase, progressJSON, resultJSON, errorMessage sql.NullString
-	var startedAt, completedAt sql.NullTime
-
-	err := h.db.QueryRow(`
-		SELECT status, phase, progress_json, result_json, error_message, started_at, completed_at
-		FROM jira_import_jobs
-		WHERE id = ?
-	`, jobID).Scan(&status, &phase, &progressJSON, &resultJSON, &errorMessage, &startedAt, &completedAt)
-	if err != nil {
+	status, err := h.imports.GetJobStatus(r.PathValue("jobId"))
+	if errors.Is(err, jiraimport.ErrJobNotFound) {
 		respondNotFound(w, r, "job")
 		return
 	}
-
-	response := ImportJobStatus{
-		JobID:  jobID,
-		Status: status.String,
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
 	}
-	if phase.Valid {
-		response.Phase = phase.String
-	}
-	if errorMessage.Valid {
-		response.ErrorMessage = errorMessage.String
-	}
-	if startedAt.Valid {
-		response.StartedAt = &startedAt.Time
-	}
-	if completedAt.Valid {
-		response.CompletedAt = &completedAt.Time
-	}
-	if progressJSON.Valid {
-		var progress map[string]interface{}
-		if err := json.Unmarshal([]byte(progressJSON.String), &progress); err == nil {
-			response.Progress = progress
-		}
-	}
-
-	respondJSONOK(w, response)
+	respondJSONOK(w, status)
 }
 
 // GetImportJobs handles GET /api/admin/jira-import/jobs
 func (h *JiraImportHandler) GetImportJobs(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.db.Query(`
-		SELECT j.id, j.connection_id, c.instance_url, c.instance_name, j.status, j.phase, j.scope,
-		       j.config_json, j.progress_json, j.result_json, j.error_message, j.created_at, j.started_at, j.completed_at
-		FROM jira_import_jobs j
-		LEFT JOIN jira_import_connections c ON j.connection_id = c.id
-		ORDER BY j.created_at DESC
-	`)
+	jobs, err := h.imports.ListJobs()
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-
-	jobs := make([]ImportJobInfo, 0)
-	for rows.Next() {
-		var job ImportJobInfo
-		var instanceURL, instanceName, phase, configJSON, progressJSON, resultJSON, errorMessage sql.NullString
-		var startedAt, completedAt sql.NullTime
-
-		if err := rows.Scan(&job.ID, &job.ConnectionID, &instanceURL, &instanceName, &job.Status,
-			&phase, &job.Scope, &configJSON, &progressJSON, &resultJSON, &errorMessage,
-			&job.CreatedAt, &startedAt, &completedAt); err != nil {
-			slog.Warn("Failed to scan job", slog.String("component", "jira"), slog.Any("error", err))
-			continue
-		}
-
-		if instanceURL.Valid {
-			job.InstanceURL = instanceURL.String
-		}
-		if instanceName.Valid {
-			job.InstanceName = instanceName.String
-		}
-		if phase.Valid {
-			job.Phase = phase.String
-		}
-		if errorMessage.Valid {
-			job.ErrorMessage = errorMessage.String
-		}
-		if startedAt.Valid {
-			job.StartedAt = &startedAt.Time
-		}
-		if completedAt.Valid {
-			job.CompletedAt = &completedAt.Time
-		}
-		if progressJSON.Valid {
-			var progress map[string]interface{}
-			if err := json.Unmarshal([]byte(progressJSON.String), &progress); err == nil {
-				job.Progress = progress
-			}
-		}
-		if resultJSON.Valid {
-			var result map[string]interface{}
-			if err := json.Unmarshal([]byte(resultJSON.String), &result); err == nil {
-				job.Result = result
-			}
-		}
-		if configJSON.Valid {
-			job.ProjectKeys = extractJiraImportProjectKeys(configJSON.String)
-		}
-		job.ImportedWorkspaceCount, job.ImportedItemCount = h.importJobEntityCounts(job.ID)
-		job.ImportedWorkspaces = h.importJobWorkspaces(job.ID)
-
-		jobs = append(jobs, job)
-	}
-	if err := rows.Err(); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
 	respondJSONOK(w, jobs)
 }
 
-func (h *JiraImportHandler) importJobEntityCounts(jobID string) (workspaceCount, itemCount int) {
-	if err := h.db.QueryRow(`SELECT COUNT(*) FROM jira_import_id_mappings WHERE job_id = ? AND entity_type = 'workspace'`, jobID).Scan(&workspaceCount); err != nil {
-		slog.Warn("Failed to count Jira import workspace mappings", slog.String("component", "jira"), slog.String("job_id", jobID), slog.Any("error", err))
-	}
-	if err := h.db.QueryRow(`SELECT COUNT(*) FROM jira_import_id_mappings WHERE job_id = ? AND entity_type = 'item'`, jobID).Scan(&itemCount); err != nil {
-		slog.Warn("Failed to count Jira import item mappings", slog.String("component", "jira"), slog.String("job_id", jobID), slog.Any("error", err))
-	}
-	return workspaceCount, itemCount
-}
-
-func (h *JiraImportHandler) importJobWorkspaces(jobID string) []ImportedWorkspaceInfo {
-	rows, err := h.db.Query(`
-		SELECT DISTINCT w.id, w.key, w.name
-		FROM jira_import_id_mappings m
-		JOIN workspaces w ON w.id = m.windshift_id
-		WHERE m.job_id = ? AND m.entity_type = 'workspace'
-		ORDER BY w.key
-	`, jobID)
-	if err != nil {
-		slog.Warn("Failed to load Jira import workspace mappings", slog.String("component", "jira"), slog.String("job_id", jobID), slog.Any("error", err))
-		return nil
-	}
-	defer func() { _ = rows.Close() }()
-
-	workspaces := []ImportedWorkspaceInfo{}
-	for rows.Next() {
-		var ws ImportedWorkspaceInfo
-		if err := rows.Scan(&ws.ID, &ws.Key, &ws.Name); err != nil {
-			slog.Warn("Failed to scan Jira import workspace mapping", slog.String("component", "jira"), slog.String("job_id", jobID), slog.Any("error", err))
-			continue
-		}
-		workspaces = append(workspaces, ws)
-	}
-	if err := rows.Err(); err != nil {
-		slog.Warn("Failed to iterate Jira import workspace mappings", slog.String("component", "jira"), slog.String("job_id", jobID), slog.Any("error", err))
-	}
-	return workspaces
-}
-
-// sanitizeStartImportRequest scrubs the user-supplied strings on the import
-// payload. Jira keys/IDs/types are identifier-shaped; the Jira-side names
-// render in the wizard + job summaries and become workspace / item-type /
-// status / milestone names on import. ConnectionID is UUID-shaped but its
-// shape is never validated, and it is persisted, audit-logged, and echoed
-// back via job listings — bound it like the analyzer handlers do. The
-// numeric Windshift IDs are ints and stay untouched.
+// sanitizeStartImportRequest bounds persisted/rendered Jira identifiers and
+// names; numeric Windshift IDs remain untouched.
 func sanitizeStartImportRequest(req *StartImportRequest) {
 	sanitize.Apply(&req.ConnectionID, sanitize.ShortIdentifier)
 	for i := range req.ProjectKeys {
 		sanitize.Apply(&req.ProjectKeys[i], sanitize.ShortIdentifier)
+	}
+	sanitize.ApplyAll(
+		sanitize.Pair{Target: &req.Xray.Region, Policy: sanitize.ShortIdentifier},
+		sanitize.Pair{Target: &req.Xray.ClientID, Policy: sanitize.ShortIdentifier},
+	)
+	for i := range req.Xray.TestIssueTypeIDs {
+		sanitize.Apply(&req.Xray.TestIssueTypeIDs[i], sanitize.ShortIdentifier)
 	}
 	m := &req.Mappings
 	for i := range m.Workspaces {
@@ -235,6 +114,124 @@ func sanitizeStartImportRequest(req *StartImportRequest) {
 	}
 }
 
+func (h *JiraImportHandler) validateJiraWorkspaceMappings(req StartImportRequest) error {
+	existingKeys, err := h.imports.WorkspaceKeys()
+	if err != nil {
+		return fmt.Errorf("load existing workspace keys: %w", err)
+	}
+
+	mappingsByJiraKey := make(map[string]WorkspaceMapping, len(req.Mappings.Workspaces))
+	for _, mapping := range req.Mappings.Workspaces {
+		jiraKey := normalizeJiraProjectKey(mapping.JiraKey)
+		if jiraKey == "" {
+			continue
+		}
+		if _, duplicate := mappingsByJiraKey[jiraKey]; duplicate {
+			return fmt.Errorf("jira project %s has more than one workspace mapping", jiraKey)
+		}
+		mappingsByJiraKey[jiraKey] = mapping
+	}
+
+	targetKeys := make(map[string]string, len(req.ProjectKeys))
+	targetWorkspaceIDs := make(map[int]string, len(req.ProjectKeys))
+	for _, requestedKey := range req.ProjectKeys {
+		jiraKey := normalizeJiraProjectKey(requestedKey)
+		mapping, ok := mappingsByJiraKey[jiraKey]
+		if !ok {
+			return fmt.Errorf("jira project %s is missing a workspace mapping", jiraKey)
+		}
+
+		if !mapping.CreateNew {
+			if mapping.WindshiftID == nil {
+				return fmt.Errorf("jira project %s must choose a target workspace", jiraKey)
+			}
+			target, err := h.imports.WorkspaceImportTarget(*mapping.WindshiftID)
+			if errors.Is(err, repository.ErrNotFound) || (err == nil && target == nil) {
+				return fmt.Errorf("jira project %s references a workspace that cannot be imported into", jiraKey)
+			}
+			if err != nil {
+				return fmt.Errorf("load workspace target for %s: %w", jiraKey, err)
+			}
+			if otherJiraKey, duplicate := targetWorkspaceIDs[target.ID]; duplicate {
+				return fmt.Errorf("jira projects %s and %s cannot import into the same workspace", otherJiraKey, jiraKey)
+			}
+			targetWorkspaceIDs[target.ID] = jiraKey
+			continue
+		}
+
+		if mapping.WindshiftID != nil {
+			return fmt.Errorf("jira project %s cannot both create a new workspace and reuse an existing one", jiraKey)
+		}
+		if strings.TrimSpace(mapping.NewWorkspaceName) == "" {
+			return fmt.Errorf("jira project %s requires a workspace name", jiraKey)
+		}
+
+		targetKey := normalizeJiraProjectKey(mapping.NewWorkspaceKey)
+		if targetKey == "" {
+			return fmt.Errorf("jira project %s requires a workspace key", jiraKey)
+		}
+		if _, exists := existingKeys[targetKey]; exists {
+			return fmt.Errorf("workspace key %s is already in use; analyze the projects again to assign a new Jira alias", targetKey)
+		}
+		if otherJiraKey, duplicate := targetKeys[targetKey]; duplicate {
+			return fmt.Errorf("jira projects %s and %s cannot use the same workspace key %s", otherJiraKey, jiraKey, targetKey)
+		}
+		targetKeys[targetKey] = jiraKey
+
+		_, originalKeyExists := existingKeys[jiraKey]
+		aliasRequired := originalKeyExists || targetKey != jiraKey
+		if aliasRequired && !mapping.KeyAliasAcknowledged {
+			return fmt.Errorf("acknowledge that Jira project %s will use workspace key alias %s", jiraKey, targetKey)
+		}
+	}
+	return nil
+}
+
+// validateJiraEntityMappings rejects stale reuse targets so a deleted status,
+// item type, or custom field cannot silently degrade into a new entity.
+func (h *JiraImportHandler) validateJiraEntityMappings(req StartImportRequest) error {
+	for _, mapping := range req.Mappings.Statuses {
+		if mapping.CreateNew || mapping.WindshiftID == nil {
+			continue
+		}
+		exists, err := h.imports.StatusExists(*mapping.WindshiftID)
+		if err != nil {
+			return fmt.Errorf("load mapped status for %s: %w", mapping.JiraName, err)
+		}
+		if !exists {
+			return fmt.Errorf("jira status %s references a status that does not exist", mapping.JiraName)
+		}
+	}
+	for _, mapping := range req.Mappings.IssueTypes {
+		if mapping.CreateNew || mapping.WindshiftID == nil {
+			continue
+		}
+		exists, err := h.imports.ItemTypeExists(*mapping.WindshiftID)
+		if err != nil {
+			return fmt.Errorf("load mapped item type for %s: %w", mapping.JiraName, err)
+		}
+		if !exists {
+			return fmt.Errorf("jira issue type %s references an item type that does not exist", mapping.JiraName)
+		}
+	}
+	for _, mapping := range req.Mappings.CustomFields {
+		if mapping.Action != "map" || mapping.WindshiftID == nil {
+			continue
+		}
+		existingType, err := h.imports.CustomFieldTargetType(*mapping.WindshiftID)
+		if err != nil {
+			return fmt.Errorf("load mapped custom field for %s: %w", mapping.JiraName, err)
+		}
+		if existingType == "" {
+			return fmt.Errorf("jira field %s references a custom field that does not exist", mapping.JiraName)
+		}
+		if !jiraimport.CustomFieldTypesCompatible(existingType, mapping.WindshiftType) {
+			return fmt.Errorf("jira field %s (%s) cannot map to a %s custom field", mapping.JiraName, mapping.WindshiftType, existingType)
+		}
+	}
+	return nil
+}
+
 // StartImport handles POST /api/admin/jira-import/start
 // Starts a background import job and returns immediately with the job ID
 func (h *JiraImportHandler) StartImport(w http.ResponseWriter, r *http.Request) {
@@ -248,49 +245,84 @@ func (h *JiraImportHandler) StartImport(w http.ResponseWriter, r *http.Request) 
 		respondValidationError(w, r, "connection_id and project_keys are required")
 		return
 	}
-
-	if !req.ForceReimport {
-		conflicts, err := h.findConflictingJiraImports(req)
+	if err := h.validateJiraWorkspaceMappings(req); err != nil {
+		respondValidationError(w, r, err.Error())
+		return
+	}
+	if err := h.validateJiraEntityMappings(req); err != nil {
+		respondValidationError(w, r, err.Error())
+		return
+	}
+	if req.Xray.ImportTests {
+		deploymentType, err := h.imports.ConnectionDeploymentType(req.ConnectionID)
 		if err != nil {
-			respondInternalError(w, r, err)
+			respondValidationError(w, r, "Jira connection was not found")
 			return
 		}
-		if len(conflicts) > 0 {
-			err := restapi.NewAPIError(http.StatusConflict, "JIRA_IMPORT_CONFLICT", "One or more selected Jira projects have already been imported. Delete the previous import data or explicitly force a re-import.").WithDetails(map[string]interface{}{
-				"conflicting_imports": conflicts,
+		isDataCenter := deploymentType == "datacenter"
+		if !isDataCenter {
+			if strings.TrimSpace(req.Xray.ClientID) == "" || strings.TrimSpace(req.Xray.ClientSecret) == "" {
+				respondValidationError(w, r, "Xray Cloud client ID and client secret are required")
+				return
+			}
+			switch req.Xray.Region {
+			case "", "global":
+				req.Xray.Region = "global"
+			case "us", "eu", "au":
+			default:
+				respondValidationError(w, r, "Xray Cloud region must be global, us, eu, or au")
+				return
+			}
+			xrayClient, err := xray.NewCloudClient(xray.CloudConfig{
+				ClientID:     req.Xray.ClientID,
+				ClientSecret: req.Xray.ClientSecret,
+				Region:       req.Xray.Region,
 			})
-			respondError(w, r, err)
-			return
+			if err != nil {
+				respondValidationError(w, r, err.Error())
+				return
+			}
+			if err := xrayClient.Validate(r.Context()); err != nil {
+				slog.Debug("Xray Cloud credential validation failed",
+					slog.String("component", "jira"),
+					slog.Any("error", err))
+				respondError(w, r, restapi.NewAPIError(
+					http.StatusBadRequest,
+					"XRAY_AUTH_FAILED",
+					"Xray Cloud credentials could not be validated.",
+				))
+				return
+			}
 		}
+	}
+
+	planFingerprint, err := jiraImportPlanFingerprint(req)
+	if err != nil {
+		respondInternalError(w, r, err)
+		return
 	}
 
 	// Get user ID from context
 	userID := getUserIDFromContext(r)
 
-	// Generate a new job ID
-	jobID := generateUUID()
-
-	// Store the configuration as JSON
-	configJSON, err := json.Marshal(map[string]interface{}{
-		"project_keys":     req.ProjectKeys,
-		"open_issues_only": req.OpenIssuesOnly,
-		"mappings":         req.Mappings,
-		"force_reimport":   req.ForceReimport,
-	})
+	enqueueResult, err := h.enqueueJiraImport(req, planFingerprint, userID)
 	if err != nil {
+		var conflictErr *jiraImportConflictError
+		if errors.As(err, &conflictErr) {
+			apiErr := restapi.NewAPIError(
+				http.StatusConflict,
+				"JIRA_IMPORT_CONFLICT",
+				conflictErr.Message,
+			).WithDetails(map[string]any{
+				"conflicting_imports": conflictErr.Conflicts,
+			})
+			respondError(w, r, apiErr)
+			return
+		}
 		respondInternalError(w, r, err)
 		return
 	}
-
-	// Create the import job in the database
-	_, err = h.db.ExecWrite(`
-		INSERT INTO jira_import_jobs (id, connection_id, status, scope, config_json, created_by)
-		VALUES (?, ?, 'queued', 'work_items', ?, ?)
-	`, jobID, req.ConnectionID, string(configJSON), userID)
-	if err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
+	jobID := enqueueResult.JobID
 
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
@@ -302,7 +334,7 @@ func (h *JiraImportHandler) StartImport(w http.ResponseWriter, r *http.Request) 
 			ActionType:   logger.ActionJiraImport,
 			ResourceType: logger.ResourceJiraImport,
 			ResourceName: jobID,
-			Details: map[string]interface{}{
+			Details: map[string]any{
 				"connection_id": req.ConnectionID,
 				"project_keys":  req.ProjectKeys,
 			},
@@ -311,7 +343,7 @@ func (h *JiraImportHandler) StartImport(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Start the import in a background goroutine
-	go h.executeImport(jobID, req)
+	go h.executeImport(jobID, req) //nolint:gosec // G118: an import job must outlive its initiating HTTP request.
 
 	respondJSONOK(w, StartImportResponse{
 		JobID:   jobID,
@@ -319,68 +351,264 @@ func (h *JiraImportHandler) StartImport(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-type jiraImportConflict struct {
-	JobID       string     `json:"job_id"`
-	Status      string     `json:"status"`
-	ProjectKeys []string   `json:"project_keys"`
-	CreatedAt   time.Time  `json:"created_at"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
+type jiraImportEnqueueResult struct {
+	JobID     string
+	Conflicts []jiraImportConflict
 }
 
-func (h *JiraImportHandler) findConflictingJiraImports(req StartImportRequest) ([]jiraImportConflict, error) {
+type jiraImportConflictError struct {
+	Message   string
+	Conflicts []jiraImportConflict
+}
+
+func (e *jiraImportConflictError) Error() string {
+	return e.Message
+}
+
+func (h *JiraImportHandler) enqueueJiraImport(
+	req StartImportRequest,
+	planFingerprint string,
+	userID *int,
+) (*jiraImportEnqueueResult, error) {
+	// Recover jobs whose worker lease expired before checking conflicts so a
+	// server crash cannot permanently block a retry.
+	if _, err := h.imports.ReconcileInterrupted(time.Now().UTC()); err != nil {
+		return nil, fmt.Errorf("reconcile interrupted Jira imports: %w", err)
+	}
+
+	jobID := uuid.New().String()
+	jobRepository := repository.NewJiraImportJobRepository(h.db)
+	var result *jiraImportEnqueueResult
+	err := jobRepository.WithLockedConnection(req.ConnectionID, func(jobs repository.JiraImportJobStore) error {
+		conflicts, err := findConflictingJiraImportsWithQuery(jobs, req, planFingerprint)
+		if err != nil {
+			return err
+		}
+		activeConflicts := make([]jiraImportConflict, 0, len(conflicts))
+		for _, conflict := range conflicts {
+			if conflict.Status == "queued" || conflict.Status == "running" {
+				activeConflicts = append(activeConflicts, conflict)
+			}
+		}
+		if len(activeConflicts) > 0 {
+			return &jiraImportConflictError{
+				Message:   "One or more selected Jira projects already have an import queued or running.",
+				Conflicts: activeConflicts,
+			}
+		}
+		if !req.ForceReimport && len(conflicts) > 0 {
+			return &jiraImportConflictError{
+				Message:   "One or more selected Jira projects have already been imported. Delete the previous import data or explicitly force a re-import.",
+				Conflicts: conflicts,
+			}
+		}
+
+		// Store only the durable, non-secret configuration. The Xray Cloud
+		// client ID and secret remain solely in the in-memory request.
+		configJSON, err := jiraImportJobConfigJSON(req, conflicts...)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Insert(repository.JiraImportJobInsert{
+			ID:             jobID,
+			ConnectionID:   req.ConnectionID,
+			ConfigJSON:     string(configJSON),
+			CreatedBy:      userID,
+			LeaseExpiresAt: time.Now().UTC().Add(jiraimport.JiraImportLeaseDuration).Unix(),
+		}); err != nil {
+			return err
+		}
+		result = &jiraImportEnqueueResult{JobID: jobID, Conflicts: conflicts}
+		return nil
+	})
+	return result, err
+}
+
+func jiraImportJobConfigJSON(req StartImportRequest, conflicts ...jiraImportConflict) ([]byte, error) {
+	fingerprint, err := jiraImportPlanFingerprint(req)
+	if err != nil {
+		return nil, err
+	}
+	configurationDrift := false
+	for _, conflict := range conflicts {
+		if conflict.ConfigurationDrift {
+			configurationDrift = true
+			break
+		}
+	}
+	return json.Marshal(map[string]any{
+		"project_keys":        req.ProjectKeys,
+		"open_issues_only":    req.OpenIssuesOnly,
+		"mappings":            req.Mappings,
+		"plan_fingerprint":    fingerprint,
+		"configuration_drift": configurationDrift,
+		"previous_imports":    conflicts,
+		"xray": map[string]any{
+			"import_tests": req.Xray.ImportTests,
+			"region":       req.Xray.Region,
+		},
+		"force_reimport": req.ForceReimport,
+	})
+}
+
+type jiraImportCandidateLister interface {
+	ListCandidates(connectionID string) ([]repository.JiraImportJobRecord, error)
+}
+
+func findConflictingJiraImportsWithQuery(
+	jobs jiraImportCandidateLister,
+	req StartImportRequest,
+	fingerprints ...string,
+) ([]jiraImportConflict, error) {
+	fingerprint := ""
+	if len(fingerprints) > 0 {
+		fingerprint = fingerprints[0]
+	} else {
+		var err error
+		fingerprint, err = jiraImportPlanFingerprint(req)
+		if err != nil {
+			return nil, err
+		}
+	}
 	requested := projectKeySet(req.ProjectKeys)
 	if len(requested) == 0 || req.ConnectionID == "" {
 		return nil, nil
 	}
 
-	rows, err := h.db.Query(`
-		SELECT id, status, config_json, created_at, completed_at
-		FROM jira_import_jobs
-		WHERE connection_id = ?
-		  AND scope = 'work_items'
-		  AND status <> 'data_deleted'
-		ORDER BY created_at DESC
-	`, req.ConnectionID)
+	candidates, err := jobs.ListCandidates(req.ConnectionID)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
 
 	var conflicts []jiraImportConflict
-	for rows.Next() {
-		var jobID, status, configJSON string
-		var createdAt time.Time
-		var completedAt sql.NullTime
-		if err := rows.Scan(&jobID, &status, &configJSON, &createdAt, &completedAt); err != nil {
-			return nil, err
-		}
-		projectKeys := extractJiraImportProjectKeys(configJSON)
+	for _, candidate := range candidates {
+		projectKeys := extractJiraImportProjectKeys(candidate.ConfigJSON)
 		if !projectKeysOverlap(requested, projectKeys) {
 			continue
 		}
 		conflict := jiraImportConflict{
-			JobID:       jobID,
-			Status:      status,
-			ProjectKeys: projectKeys,
-			CreatedAt:   createdAt,
+			JobID:                   candidate.ID,
+			Status:                  candidate.Status,
+			ProjectKeys:             projectKeys,
+			PreviousPlanFingerprint: jiraImportPlanFingerprintFromConfig(candidate.ConfigJSON),
+			CreatedAt:               candidate.CreatedAt,
+			CompletedAt:             candidate.CompletedAt,
 		}
-		if completedAt.Valid {
-			conflict.CompletedAt = &completedAt.Time
-		}
+		conflict.ConfigurationDrift = conflict.PreviousPlanFingerprint == "" ||
+			conflict.PreviousPlanFingerprint != fingerprint
 		conflicts = append(conflicts, conflict)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	return conflicts, nil
 }
 
+func jiraImportPlanFingerprintFromConfig(configJSON string) string {
+	var stored struct {
+		ProjectKeys     []string          `json:"project_keys"`
+		OpenIssuesOnly  bool              `json:"open_issues_only"`
+		Mappings        ImportMappings    `json:"mappings"`
+		Xray            XrayImportOptions `json:"xray"`
+		PlanFingerprint string            `json:"plan_fingerprint"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &stored); err != nil {
+		return ""
+	}
+	if stored.PlanFingerprint != "" {
+		return stored.PlanFingerprint
+	}
+	fingerprint, err := jiraImportPlanFingerprint(StartImportRequest{
+		ProjectKeys:    stored.ProjectKeys,
+		OpenIssuesOnly: stored.OpenIssuesOnly,
+		Mappings:       stored.Mappings,
+		Xray:           stored.Xray,
+	})
+	if err != nil {
+		return ""
+	}
+	return fingerprint
+}
+
+func jiraImportPlanFingerprint(req StartImportRequest) (string, error) {
+	projectKeys := make([]string, 0, len(req.ProjectKeys))
+	for key := range projectKeySet(req.ProjectKeys) {
+		projectKeys = append(projectKeys, key)
+	}
+	sort.Strings(projectKeys)
+
+	mappings := req.Mappings
+	mappings.Workspaces = append([]WorkspaceMapping(nil), mappings.Workspaces...)
+	for i := range mappings.Workspaces {
+		mappings.Workspaces[i].IssueCount = 0
+		mappings.Workspaces[i].KeyAliasAcknowledged = false
+	}
+	sort.Slice(mappings.Workspaces, func(i, j int) bool {
+		return normalizeJiraProjectKey(mappings.Workspaces[i].JiraKey) <
+			normalizeJiraProjectKey(mappings.Workspaces[j].JiraKey)
+	})
+
+	mappings.IssueTypes = append([]IssueTypeMapping(nil), mappings.IssueTypes...)
+	for i := range mappings.IssueTypes {
+		mappings.IssueTypes[i].JiraIDs = append([]string(nil), mappings.IssueTypes[i].JiraIDs...)
+		sort.Strings(mappings.IssueTypes[i].JiraIDs)
+	}
+	sort.Slice(mappings.IssueTypes, func(i, j int) bool {
+		left := strings.Join(mappings.IssueTypes[i].JiraIDs, ",") + "\x00" + mappings.IssueTypes[i].JiraName
+		right := strings.Join(mappings.IssueTypes[j].JiraIDs, ",") + "\x00" + mappings.IssueTypes[j].JiraName
+		return left < right
+	})
+
+	mappings.Statuses = append([]StatusMapping(nil), mappings.Statuses...)
+	for i := range mappings.Statuses {
+		mappings.Statuses[i].JiraIDs = append([]string(nil), mappings.Statuses[i].JiraIDs...)
+		sort.Strings(mappings.Statuses[i].JiraIDs)
+	}
+	sort.Slice(mappings.Statuses, func(i, j int) bool {
+		left := strings.Join(mappings.Statuses[i].JiraIDs, ",") + "\x00" + mappings.Statuses[i].JiraName
+		right := strings.Join(mappings.Statuses[j].JiraIDs, ",") + "\x00" + mappings.Statuses[j].JiraName
+		return left < right
+	})
+
+	mappings.CustomFields = append([]CustomFieldMapping(nil), mappings.CustomFields...)
+	sort.Slice(mappings.CustomFields, func(i, j int) bool {
+		return mappings.CustomFields[i].JiraID < mappings.CustomFields[j].JiraID
+	})
+	mappings.Versions = append([]VersionMapping(nil), mappings.Versions...)
+	sort.Slice(mappings.Versions, func(i, j int) bool {
+		left := normalizeJiraProjectKey(mappings.Versions[i].ProjectKey) + "\x00" + mappings.Versions[i].JiraID
+		right := normalizeJiraProjectKey(mappings.Versions[j].ProjectKey) + "\x00" + mappings.Versions[j].JiraID
+		return left < right
+	})
+
+	testIssueTypeIDs := append([]string(nil), req.Xray.TestIssueTypeIDs...)
+	sort.Strings(testIssueTypeIDs)
+	plan := struct {
+		ProjectKeys    []string          `json:"project_keys"`
+		OpenIssuesOnly bool              `json:"open_issues_only"`
+		Mappings       ImportMappings    `json:"mappings"`
+		Xray           XrayImportOptions `json:"xray"`
+	}{
+		ProjectKeys:    projectKeys,
+		OpenIssuesOnly: req.OpenIssuesOnly,
+		Mappings:       mappings,
+		Xray: XrayImportOptions{
+			ImportTests:      req.Xray.ImportTests,
+			Region:           req.Xray.Region,
+			TestIssueTypeIDs: testIssueTypeIDs,
+		},
+	}
+	data, err := json.Marshal(plan)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", sum), nil
+}
+
 func extractJiraImportProjectKeys(configJSON string) []string {
-	var config map[string]interface{}
+	var config map[string]any
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 		return nil
 	}
-	rawKeys, ok := config["project_keys"].([]interface{})
+	rawKeys, ok := config["project_keys"].([]any)
 	if !ok {
 		return nil
 	}
@@ -423,150 +651,10 @@ func projectKeySet(keys []string) map[string]struct{} {
 	return set
 }
 
+type jiraImportConflict = jiraimport.Conflict
+
 func normalizeJiraProjectKey(key string) string {
 	return strings.ToUpper(strings.TrimSpace(key))
-}
-
-func (h *JiraImportHandler) deleteImportedAttachment(attachmentID int) bool {
-	var filePath string
-	var thumbnailPath sql.NullString
-	if err := h.db.QueryRow(`SELECT file_path, thumbnail_path FROM attachments WHERE id = ?`, attachmentID).Scan(&filePath, &thumbnailPath); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			slog.Warn("Failed to load imported attachment before deletion", slog.String("component", "jira"), slog.Int("attachmentID", attachmentID), slog.Any("error", err))
-		}
-		return false
-	}
-
-	result, err := h.db.ExecWrite(`DELETE FROM attachments WHERE id = ?`, attachmentID)
-	if err != nil {
-		slog.Error("Failed to delete imported attachment row", slog.String("component", "jira"), slog.Int("attachmentID", attachmentID), slog.Any("error", err))
-		return false
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil || rowsAffected == 0 {
-		if err != nil {
-			slog.Warn("Failed to verify imported attachment deletion", slog.String("component", "jira"), slog.Int("attachmentID", attachmentID), slog.Any("error", err))
-		}
-		return false
-	}
-
-	h.removeImportedAttachmentFile(filePath)
-	if thumbnailPath.Valid && strings.TrimSpace(thumbnailPath.String) != "" {
-		h.removeImportedAttachmentFile(thumbnailPath.String)
-	}
-	return true
-}
-
-func (h *JiraImportHandler) removeImportedAttachmentFile(storedPath string) {
-	resolvedPath, err := h.resolveImportedAttachmentPath(storedPath)
-	if err != nil {
-		slog.Warn("Refusing to delete imported attachment file outside storage root", slog.String("component", "jira"), slog.String("filePath", storedPath), slog.Any("error", err))
-		return
-	}
-	if err := os.Remove(resolvedPath); err != nil && !os.IsNotExist(err) { //nolint:gosec // path is validated by resolveImportedAttachmentPath
-		slog.Warn("Failed to delete imported attachment file", slog.String("component", "jira"), slog.String("filePath", resolvedPath), slog.Any("error", err))
-	}
-}
-
-func (h *JiraImportHandler) resolveImportedAttachmentPath(storedPath string) (string, error) {
-	root, err := h.currentAttachmentRoot()
-	if err != nil {
-		return "", err
-	}
-	return resolvePathWithinRoot(root, storedPath)
-}
-
-func (h *JiraImportHandler) currentAttachmentRoot() (string, error) {
-	var root string
-	err := h.db.QueryRow(`SELECT attachment_path FROM attachment_settings WHERE enabled = true LIMIT 1`).Scan(&root)
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(root) == "" {
-		return "", errAttachmentPathOutsideRoot
-	}
-	return root, nil
-}
-
-func resolvePathWithinRoot(root, storedPath string) (string, error) {
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	isInsideRoot := func(candidate string) (string, bool, error) {
-		absPath, err := filepath.Abs(candidate)
-		if err != nil {
-			return "", false, err
-		}
-		inside := absPath == absRoot || strings.HasPrefix(absPath, absRoot+string(os.PathSeparator))
-		return absPath, inside, nil
-	}
-
-	if filepath.IsAbs(storedPath) {
-		absPath, inside, err := isInsideRoot(storedPath)
-		if err != nil {
-			return "", err
-		}
-		if !inside {
-			return "", errAttachmentPathOutsideRoot
-		}
-		return absPath, nil
-	}
-	if absPath, inside, err := isInsideRoot(storedPath); err != nil {
-		return "", err
-	} else if inside {
-		return absPath, nil
-	}
-	absPath, inside, err := isInsideRoot(filepath.Join(root, storedPath))
-	if err != nil {
-		return "", err
-	}
-	if !inside {
-		return "", errAttachmentPathOutsideRoot
-	}
-	return absPath, nil
-}
-
-func shouldSkipReusedJiraImportEntityDelete(db interface {
-	QueryRow(query string, args ...interface{}) *sql.Row
-}, jobID, entityType string, windshiftID int) bool {
-	var metadataJSON sql.NullString
-	err := db.QueryRow(`
-		SELECT metadata_json
-		FROM jira_import_id_mappings
-		WHERE job_id = ? AND entity_type = ? AND windshift_id = ?
-		LIMIT 1
-	`, jobID, entityType, windshiftID).Scan(&metadataJSON)
-	if err != nil || !metadataJSON.Valid {
-		return false
-	}
-	var meta map[string]interface{}
-	if err := json.Unmarshal([]byte(metadataJSON.String), &meta); err != nil {
-		return false
-	}
-	action, _ := meta["action"].(string)
-	return action == "reuse_existing"
-}
-
-func shouldSkipJiraImportTimeProjectDelete(db interface {
-	QueryRow(query string, args ...interface{}) *sql.Row
-}, jobID string, timeProjectID int) bool {
-	var metadataJSON sql.NullString
-	err := db.QueryRow(`
-		SELECT metadata_json
-		FROM jira_import_id_mappings
-		WHERE job_id = ? AND entity_type = 'time_project' AND windshift_id = ?
-		LIMIT 1
-	`, jobID, timeProjectID).Scan(&metadataJSON)
-	if err != nil || !metadataJSON.Valid {
-		return false
-	}
-	var meta map[string]interface{}
-	if err := json.Unmarshal([]byte(metadataJSON.String), &meta); err != nil {
-		return false
-	}
-	action, _ := meta["action"].(string)
-	return action == "reuse_workspace_default"
 }
 
 type deleteImportedDataRequest struct {
@@ -575,15 +663,13 @@ type deleteImportedDataRequest struct {
 	ConfirmDeleteImportedData bool   `json:"confirm_delete_imported_data"`
 }
 
-// DeleteImportedData handles DELETE /api/admin/jira-import/jobs/{jobId}/data
-// Deletes all entities created during an import job for re-import purposes
+// DeleteImportedData handles DELETE /api/admin/jira-import/jobs/{jobId}/data.
 func (h *JiraImportHandler) DeleteImportedData(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
 	if jobID == "" {
 		respondInvalidID(w, r, "jobId")
 		return
 	}
-
 	req, ok := decodeJSON[deleteImportedDataRequest](w, r)
 	if !ok {
 		return
@@ -592,389 +678,163 @@ func (h *JiraImportHandler) DeleteImportedData(w http.ResponseWriter, r *http.Re
 		respondValidationError(w, r, "Deleting imported Jira data requires confirm_job_id to match the job path and confirm_delete_imported_data=true.")
 		return
 	}
-
-	var status string
-	if err := h.db.QueryRow(`SELECT status FROM jira_import_jobs WHERE id = ?`, jobID).Scan(&status); err != nil {
+	deleted, err := h.imports.DeleteImportedData(jobID, req.ConfirmWorkspaceCount)
+	if errors.Is(err, jiraimport.ErrJobNotFound) {
 		respondNotFound(w, r, "job")
 		return
 	}
-	if status == "queued" || status == "running" {
+	if errors.Is(err, jiraimport.ErrJobActive) {
 		respondConflict(w, r, "Cannot delete imported data while the import job is queued or running.")
 		return
 	}
-
-	currentWorkspaceCount, _ := h.importJobEntityCounts(jobID)
-	if req.ConfirmWorkspaceCount != currentWorkspaceCount {
-		respondValidationError(w, r, fmt.Sprintf("Workspace confirmation count mismatch: request confirmed %d workspace(s), but this import currently maps %d workspace(s). Refresh and try again.", req.ConfirmWorkspaceCount, currentWorkspaceCount))
+	var mismatch *jiraimport.WorkspaceCountMismatchError
+	if errors.As(err, &mismatch) {
+		respondValidationError(w, r, fmt.Sprintf("Workspace confirmation count mismatch: request confirmed %d workspace(s), but this import currently maps %d workspace(s). Refresh and try again.", mismatch.Confirmed, mismatch.Current))
 		return
 	}
-
-	// Get all mappings for this job, ordered for proper deletion
-	rows, err := h.db.Query(`
-		SELECT entity_type, windshift_id
-		FROM jira_import_id_mappings
-		WHERE job_id = ?
-		ORDER BY
-			CASE entity_type
-				WHEN 'link' THEN 1
-				WHEN 'worklog' THEN 2
-				WHEN 'comment' THEN 3
-				WHEN 'attachment' THEN 4
-				WHEN 'item' THEN 5
-				WHEN 'asset' THEN 6
-				WHEN 'asset_type' THEN 7
-				WHEN 'asset_set' THEN 8
-				WHEN 'board_configuration' THEN 9
-				WHEN 'collection' THEN 10
-				WHEN 'iteration' THEN 11
-				WHEN 'milestone' THEN 12
-				WHEN 'configuration_set' THEN 13
-				WHEN 'workflow' THEN 14
-				WHEN 'custom_field' THEN 15
-				WHEN 'status' THEN 16
-				WHEN 'item_type' THEN 17
-				WHEN 'time_project' THEN 18
-				WHEN 'workspace' THEN 19
-				ELSE 20
-			END
-	`, jobID)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-
-	type mapping struct {
-		entityType  string
-		windshiftID int
-	}
-	var mappings []mapping
-	for rows.Next() {
-		var m mapping
-		if err = rows.Scan(&m.entityType, &m.windshiftID); err != nil {
-			slog.Warn("Failed to scan mapping", slog.String("component", "jira"), slog.Any("error", err))
-			continue
-		}
-		mappings = append(mappings, m)
-	}
-	if err := rows.Err(); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
-	// Delete entities in order (most dependent first)
-	deleted := make(map[string]int)
-	for _, m := range mappings {
-		var tableName string
-		switch m.entityType {
-		case "item":
-			tableName = "items"
-		case "workspace":
-			tableName = "workspaces"
-		case "asset":
-			tableName = "assets"
-		case "asset_type":
-			if shouldSkipReusedJiraImportEntityDelete(h.db, jobID, "asset_type", m.windshiftID) {
-				continue
-			}
-			tableName = "asset_types"
-		case "asset_set":
-			if shouldSkipReusedJiraImportEntityDelete(h.db, jobID, "asset_set", m.windshiftID) {
-				continue
-			}
-			tableName = "asset_management_sets"
-		case "status":
-			tableName = "statuses"
-		case "item_type":
-			tableName = "item_types"
-		case "milestone":
-			tableName = "milestones"
-		case "custom_field":
-			tableName = "custom_fields"
-		case "board_configuration":
-			tableName = "board_configurations"
-		case "collection":
-			tableName = "collections"
-		case "attachment":
-			if h.deleteImportedAttachment(m.windshiftID) {
-				deleted[m.entityType]++
-			}
-			continue
-		case "comment":
-			tableName = "comments"
-		case "link":
-			tableName = "item_links"
-		case "worklog":
-			tableName = "time_worklogs"
-		case "iteration":
-			tableName = "iterations"
-		case "time_project":
-			if shouldSkipJiraImportTimeProjectDelete(h.db, jobID, m.windshiftID) {
-				continue
-			}
-			_, _ = h.db.ExecWrite("UPDATE workspaces SET time_project_id = NULL WHERE time_project_id = ?", m.windshiftID)
-			tableName = "time_projects"
-		case "configuration_set":
-			// Delete dependent rows first
-			_, _ = h.db.ExecWrite("DELETE FROM workspace_configuration_sets WHERE configuration_set_id = ?", m.windshiftID)
-			_, _ = h.db.ExecWrite("DELETE FROM configuration_set_item_types WHERE configuration_set_id = ?", m.windshiftID)
-			_, _ = h.db.ExecWrite("DELETE FROM configuration_set_screens WHERE configuration_set_id = ?", m.windshiftID)
-			_, _ = h.db.ExecWrite("DELETE FROM configuration_set_priorities WHERE configuration_set_id = ?", m.windshiftID)
-			tableName = "configuration_sets"
-		case "workflow":
-			// Wrap the transition delete in a tx so we can cancel approval
-			// requests pinned to the doomed transitions first — otherwise the
-			// CASCADE chain from workflow_transitions → approval_set_statuses
-			// trips the RESTRICT-FK on approval_requests (SQLite 1811).
-			if wfTx, txErr := h.db.Begin(); txErr != nil {
-				slog.Error("Failed to begin tx for workflow transitions cleanup", slog.String("component", "jira"), slog.Int("windshiftID", m.windshiftID), slog.Any("error", txErr))
-			} else {
-				wfTxOK := true
-				transitionIDs := []int{}
-				if tRows, qErr := wfTx.Query("SELECT id FROM workflow_transitions WHERE workflow_id = ?", m.windshiftID); qErr != nil {
-					slog.Error("Failed to load workflow transition ids", slog.String("component", "jira"), slog.Int("windshiftID", m.windshiftID), slog.Any("error", qErr))
-					wfTxOK = false
-				} else {
-					for tRows.Next() {
-						var tid int
-						if sErr := tRows.Scan(&tid); sErr != nil {
-							slog.Error("Failed to scan transition id", slog.String("component", "jira"), slog.Any("error", sErr))
-							wfTxOK = false
-							break
-						}
-						transitionIDs = append(transitionIDs, tid)
-					}
-					if rErr := tRows.Err(); rErr != nil {
-						slog.Error("Failed to iterate transition ids", slog.String("component", "jira"), slog.Any("error", rErr))
-						wfTxOK = false
-					}
-					_ = tRows.Close()
-				}
-				if wfTxOK {
-					if _, cancelErr := repository.CancelApprovalRequestsForTransitions(wfTx, transitionIDs); cancelErr != nil {
-						slog.Error("Failed to cancel blocking approval_requests", slog.String("component", "jira"), slog.Int("windshiftID", m.windshiftID), slog.Any("error", cancelErr))
-						wfTxOK = false
-					}
-				}
-				if wfTxOK {
-					if _, delErr := wfTx.Exec("DELETE FROM workflow_transitions WHERE workflow_id = ?", m.windshiftID); delErr != nil {
-						slog.Error("Failed to delete workflow_transitions", slog.String("component", "jira"), slog.Int("windshiftID", m.windshiftID), slog.Any("error", delErr))
-						wfTxOK = false
-					}
-				}
-				if wfTxOK {
-					if cErr := wfTx.Commit(); cErr != nil {
-						slog.Error("Failed to commit workflow transitions cleanup", slog.String("component", "jira"), slog.Int("windshiftID", m.windshiftID), slog.Any("error", cErr))
-					}
-				} else {
-					_ = wfTx.Rollback()
-				}
-			}
-			tableName = "workflows"
-		default:
-			slog.Warn("Unknown entity type", slog.String("component", "jira"), slog.String("entityType", m.entityType))
-			continue
-		}
-
-		_, err = h.db.ExecWrite(fmt.Sprintf("DELETE FROM %s WHERE id = ?", tableName), m.windshiftID) //nolint:gosec // G201: tableName is from the hardcoded whitelist switch above
-		if err != nil {
-			slog.Error("Failed to delete entity", slog.String("component", "jira"), slog.String("entityType", m.entityType), slog.Int("windshiftID", m.windshiftID), slog.Any("error", err))
-		} else {
-			deleted[m.entityType]++
-		}
-	}
-
-	// Clear the mappings for this job
-	_, err = h.db.ExecWrite(`DELETE FROM jira_import_id_mappings WHERE job_id = ?`, jobID)
-	if err != nil {
-		slog.Error("Failed to delete mappings", slog.String("component", "jira"), slog.Any("error", err))
-	}
-
-	// Update job status to indicate data was deleted
-	if _, err := h.db.ExecWrite(`
-		UPDATE jira_import_jobs
-		SET status = 'data_deleted', result_json = ?
-		WHERE id = ?
-	`, fmt.Sprintf(`{"deleted": %v}`, deleted), jobID); err != nil {
-		slog.Warn("failed to update job status after data deletion", slog.String("component", "jira"), slog.String("job_id", jobID), slog.Any("error", err))
-	}
-
 	currentUser := utils.GetCurrentUser(r)
 	if currentUser != nil {
 		_ = logger.LogAudit(h.db, logger.AuditEvent{
-			UserID:       currentUser.ID,
-			Username:     currentUser.Username,
-			IPAddress:    utils.GetClientIP(r),
-			UserAgent:    r.UserAgent(),
+			UserID: currentUser.ID, Username: currentUser.Username,
+			IPAddress: utils.GetClientIP(r), UserAgent: r.UserAgent(),
 			ActionType:   logger.ActionJiraImportDeleteData,
-			ResourceType: logger.ResourceJiraImport,
-			ResourceName: jobID,
-			Details: map[string]interface{}{
-				"job_id":  jobID,
-				"deleted": deleted,
-			},
+			ResourceType: logger.ResourceJiraImport, ResourceName: jobID,
+			Details: map[string]any{"job_id": jobID, "deleted": deleted},
 			Success: true,
 		})
 	}
-
-	respondJSONOK(w, map[string]interface{}{
-		"success": true,
-		"deleted": deleted,
-	})
+	respondJSONOK(w, map[string]any{"success": true, "deleted": deleted})
 }
 
-// GetPreviousImports handles GET /api/admin/jira-import/previous-imports
-// Returns previous imports for the same projects to enable re-import
+// GetPreviousImports handles GET /api/admin/jira-import/previous-imports.
 func (h *JiraImportHandler) GetPreviousImports(w http.ResponseWriter, r *http.Request) {
 	projectKeys := r.URL.Query()["project_key"]
 	if len(projectKeys) == 0 {
 		respondValidationError(w, r, "At least one project_key is required")
 		return
 	}
-
-	// Query all completed imports and filter by project keys
-	rows, err := h.db.Query(`
-		SELECT j.id, j.connection_id, j.status, j.config_json, j.created_at, j.completed_at,
-		       (SELECT COUNT(*) FROM jira_import_id_mappings m WHERE m.job_id = j.id AND m.entity_type = 'workspace') as workspace_count,
-		       (SELECT COUNT(*) FROM jira_import_id_mappings m WHERE m.job_id = j.id AND m.entity_type = 'item') as item_count
-		FROM jira_import_jobs j
-		WHERE j.status = 'completed'
-		ORDER BY j.completed_at DESC
-		LIMIT 10
-	`)
+	imports, err := h.imports.PreviousImports(projectKeys)
 	if err != nil {
 		respondInternalError(w, r, err)
 		return
 	}
-	defer func() { _ = rows.Close() }()
-
-	type previousImport struct {
-		JobID          string     `json:"job_id"`
-		ConnectionID   string     `json:"connection_id"`
-		Status         string     `json:"status"`
-		ProjectKeys    []string   `json:"project_keys"`
-		WorkspaceCount int        `json:"workspace_count"`
-		ItemCount      int        `json:"item_count"`
-		CreatedAt      time.Time  `json:"created_at"`
-		CompletedAt    *time.Time `json:"completed_at,omitempty"`
-	}
-
-	imports := make([]previousImport, 0)
-	for rows.Next() {
-		var pi previousImport
-		var configJSON string
-		var completedAt sql.NullTime
-
-		if err := rows.Scan(&pi.JobID, &pi.ConnectionID, &pi.Status, &configJSON,
-			&pi.CreatedAt, &completedAt, &pi.WorkspaceCount, &pi.ItemCount); err != nil {
-			slog.Warn("Failed to scan import", slog.String("component", "jira"), slog.Any("error", err))
-			continue
-		}
-
-		if completedAt.Valid {
-			pi.CompletedAt = &completedAt.Time
-		}
-
-		// Extract project keys from config
-		var config map[string]interface{}
-		if err := json.Unmarshal([]byte(configJSON), &config); err == nil {
-			if keys, ok := config["project_keys"].([]interface{}); ok {
-				for _, k := range keys {
-					if str, ok := k.(string); ok {
-						pi.ProjectKeys = append(pi.ProjectKeys, str)
-					}
-				}
-			}
-		}
-
-		// Check if this import matches any of the requested project keys
-		for _, requestedKey := range projectKeys {
-			for _, importedKey := range pi.ProjectKeys {
-				if requestedKey == importedKey {
-					imports = append(imports, pi)
-					goto nextRow
-				}
-			}
-		}
-	nextRow:
-	}
-	if err := rows.Err(); err != nil {
-		respondInternalError(w, r, err)
-		return
-	}
-
 	respondJSONOK(w, imports)
 }
 
-// recordMapping records an entity mapping in the database
-func (h *JiraImportHandler) recordMapping(jobID, entityType, jiraID, jiraKey string, windshiftID int, metadata map[string]interface{}) {
-	metadataJSON := "{}"
-	if metadata != nil {
-		if data, err := json.Marshal(metadata); err == nil {
-			metadataJSON = string(data)
-		}
-	}
+type previousJiraImportMapping = jiraimport.PreviousMapping
 
-	_, err := h.db.ExecWrite(`
-		INSERT INTO jira_import_id_mappings (job_id, entity_type, jira_id, jira_key, windshift_id, metadata_json)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT (job_id, entity_type, jira_id) DO UPDATE SET
-			windshift_id = excluded.windshift_id,
-			metadata_json = excluded.metadata_json
-	`, jobID, entityType, jiraID, jiraKey, windshiftID, metadataJSON)
-	if err != nil {
-		slog.Error("Failed to record mapping", slog.String("component", "jira"), slog.Any("error", err))
-	}
+func jiraImportMappingWasCreated(metadata sql.NullString) bool {
+	return jiraimport.MappingWasCreated(metadata)
 }
 
-// updateJobStatus updates the status of an import job
-func (h *JiraImportHandler) updateJobStatus(jobID, status, phase string, progress *ImportProgress, errorMessage string) {
-	progressJSON := "{}"
+func jiraImportMappingMetadata(metadata sql.NullString) map[string]any {
+	return jiraimport.Metadata(metadata)
+}
+
+func (h *JiraImportHandler) findPreviousJiraImportMapping(
+	currentJobID, entityType, jiraID string,
+) (*previousJiraImportMapping, error) {
+	return h.imports.FindPreviousMapping(currentJobID, entityType, jiraID)
+}
+
+func (h *JiraImportHandler) rememberMappingFailure(jobID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	h.mappingFailuresMu.Lock()
+	defer h.mappingFailuresMu.Unlock()
+	if h.mappingFailures == nil {
+		h.mappingFailures = make(map[string]error)
+	}
+	if _, exists := h.mappingFailures[jobID]; !exists {
+		h.mappingFailures[jobID] = err
+	}
+	return err
+}
+
+func (h *JiraImportHandler) mappingFailure(jobID string) error {
+	h.mappingFailuresMu.Lock()
+	defer h.mappingFailuresMu.Unlock()
+	return h.mappingFailures[jobID]
+}
+
+func (h *JiraImportHandler) clearMappingFailure(jobID string) {
+	h.mappingFailuresMu.Lock()
+	defer h.mappingFailuresMu.Unlock()
+	delete(h.mappingFailures, jobID)
+}
+
+func (h *JiraImportHandler) setJobToken(jobID, token string) {
+	h.mappingFailuresMu.Lock()
+	defer h.mappingFailuresMu.Unlock()
+	if h.jobTokens == nil {
+		h.jobTokens = make(map[string]string)
+	}
+	h.jobTokens[jobID] = token
+}
+
+func (h *JiraImportHandler) jobToken(jobID string) string {
+	h.mappingFailuresMu.Lock()
+	defer h.mappingFailuresMu.Unlock()
+	return h.jobTokens[jobID]
+}
+
+func (h *JiraImportHandler) clearJobToken(jobID string) {
+	h.mappingFailuresMu.Lock()
+	defer h.mappingFailuresMu.Unlock()
+	delete(h.jobTokens, jobID)
+}
+
+func (h *JiraImportHandler) failOnMappingFailure(jobID string, progress *ImportProgress) bool {
+	err := h.mappingFailure(jobID)
+	if err == nil {
+		return false
+	}
 	if progress != nil {
-		if data, err := json.Marshal(progress); err == nil {
-			progressJSON = string(data)
-		}
+		progress.Phase = "failed"
 	}
+	h.updateJobStatus(jobID, "failed", "mapping", progress, fmt.Sprintf("Failed to persist Jira import mapping: %v", err))
+	return true
+}
 
-	var query string
-	var args []interface{}
-
-	switch status {
-	case "running":
-		query = `UPDATE jira_import_jobs SET status = ?, phase = ?, progress_json = ?, started_at = CURRENT_TIMESTAMP WHERE id = ?`
-		args = []interface{}{status, phase, progressJSON, jobID}
-	case "completed", "failed":
-		query = `UPDATE jira_import_jobs SET status = ?, phase = ?, progress_json = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?`
-		args = []interface{}{status, phase, progressJSON, errorMessage, jobID}
-	default:
-		query = `UPDATE jira_import_jobs SET status = ?, phase = ?, progress_json = ? WHERE id = ?`
-		args = []interface{}{status, phase, progressJSON, jobID}
+// recordMapping records an entity mapping through the Jira import module.
+func (h *JiraImportHandler) recordMapping(jobID, entityType, jiraID, jiraKey string, windshiftID int, metadata map[string]any) error {
+	if err := h.imports.RecordMapping(jobID, entityType, jiraID, jiraKey, windshiftID, metadata); err != nil {
+		slog.Error("Failed to record mapping", slog.String("component", "jira"), slog.String("job_id", jobID),
+			slog.String("entity_type", entityType), slog.String("jira_id", jiraID), slog.Any("error", err))
+		return h.rememberMappingFailure(jobID, err)
 	}
+	return nil
+}
 
-	_, err := h.db.ExecWrite(query, args...)
-	if err != nil {
+func (h *JiraImportHandler) recordMappingAndTransferOwnership(
+	jobID, entityType, jiraID, jiraKey string,
+	windshiftID int,
+	metadata map[string]any,
+	previous *previousJiraImportMapping,
+) error {
+	err := h.imports.RecordMappingAndTransferOwnership(
+		jobID, entityType, jiraID, jiraKey, windshiftID, metadata, previous,
+	)
+	return h.rememberMappingFailure(jobID, err)
+}
+
+// updateJobStatus updates the status of an import job. The write is fenced by
+// the worker's ownership token so a recovered worker cannot change job state.
+func (h *JiraImportHandler) updateJobStatus(jobID, status, phase string, progress *ImportProgress, errorMessage string) {
+	if err := h.imports.UpdateStatus(jobID, h.jobToken(jobID), status, phase, progress, errorMessage); err != nil {
 		slog.Error("Failed to update job status", slog.String("component", "jira"), slog.Any("error", err))
 	}
 }
 
-// updateJobProgress updates just the progress of a running job
+// updateJobProgress updates just the progress of a running job, fenced by the
+// worker's ownership token.
 func (h *JiraImportHandler) updateJobProgress(jobID string, progress *ImportProgress) {
-	progressJSON := "{}"
-	if progress != nil {
-		if data, err := json.Marshal(progress); err == nil {
-			progressJSON = string(data)
-		}
-	}
-
-	_, err := h.db.ExecWrite(`
-		UPDATE jira_import_jobs SET phase = ?, progress_json = ? WHERE id = ?
-	`, progress.Phase, progressJSON, jobID)
-	if err != nil {
+	if err := h.imports.UpdateProgress(jobID, h.jobToken(jobID), progress); err != nil {
 		slog.Error("Failed to update job progress", slog.String("component", "jira"), slog.Any("error", err))
 	}
-}
-
-// generateUUID generates a UUID for job IDs
-func generateUUID() string {
-	return uuid.New().String()
 }

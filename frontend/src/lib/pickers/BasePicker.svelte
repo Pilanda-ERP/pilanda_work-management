@@ -1,9 +1,10 @@
 <script>
+  import { untrack } from 'svelte';
   import { createCombobox, melt } from '@melt-ui/svelte';
-  import { fly } from 'svelte/transition';
   import { Check, ChevronDown, X, Search } from '@lucide/svelte';
   import Spinner from '../components/Spinner.svelte';
   import { t } from '../stores/i18n.svelte.js';
+  import { controlSizeClasses } from '../utils/controlSizes.js';
 
   let {
     // Core props
@@ -17,6 +18,7 @@
     id = undefined,
     placeholder = '',
     label = '',
+    ariaLabel = undefined,
     class: className = '',
 
     // Feature toggles
@@ -29,8 +31,16 @@
 
     // Item configuration
     searchFields = ['name'],
+    // (item) => string | null. When set, options are rendered under a header
+    // per returned label (first-appearance order); null/empty leaves the item
+    // ungrouped and without a header.
+    groupBy = null,
     getValue = (item) => item?.id,
     getLabel = (item) => item?.name ?? '',
+    // (value) => string | null. Labels a selected value that is not present in
+    // items (options load lazily in pickers/editors); null falls back to the
+    // empty label/placeholder behavior.
+    resolveMissingLabel = null,
 
     // Snippets for customization
     itemSnippet = null,
@@ -45,10 +55,17 @@
 
     // E2E instrumentation. BasePicker is shared by UserPicker/ItemPicker, so
     // picker-specific testids are threaded as props rather than hardcoded:
+    //   inputTestid — applied to the combobox-mode input
     //   searchTestid — applied to the popover-mode search input
     //   optionTestid — (opt) => string, applied per option row
+    //   menuTestid — the portalled menu container
+    //   scrollTestid — the option-list scroll container
+    inputTestid = undefined,
     searchTestid = undefined,
+    searchPlaceholder = '',
     optionTestid = null,
+    menuTestid = undefined,
+    scrollTestid = undefined,
 
     // Create functionality
     allowCreate = false,
@@ -58,6 +75,10 @@
     serverSearch = false,
     onSearchChange = null,
     searchDebounce = 300,
+
+    // Render cap: mount at most this many options and hint to narrow the
+    // search instead (WI-1445). ArrowDown past the cap reveals more.
+    maxVisibleOptions = 100,
 
     // Popover mode: open on mount
     autoOpen = false,
@@ -71,6 +92,8 @@
     values = $bindable([]),
 
     // Event callbacks
+    onOpen = () => {},
+    onClose = () => {},
     onSelect = () => {},
     onCancel = () => {},
     onChange = () => {}
@@ -89,24 +112,24 @@
   }
 
   // Create Melt combobox
+  // Melt builds the positioning action once with the component. Callers pass
+  // a static layout policy; changing it requires remounting the picker.
+  // svelte-ignore state_referenced_locally
   const {
     elements: { menu, input, option, label: labelEl },
     states: { open, inputValue, touchedInput, selected },
     helpers: { isSelected }
   } = createCombobox({
     forceVisible: true,
-    // Lock background scroll while the dropdown is open (melt's default). With
-    // it off, scrolling the page/modal behind an open picker makes floating-ui
-    // chase the moving trigger and the portalled menu repositions/detaches
-    // mid-interaction — inside a tall scrollable modal the option can end up
-    // behind the dialog footer and become unclickable (teams on-call layer
-    // members, test-run assignee).
+    // Keep the page scrollable and fit the menu around its moving trigger.
     preventScroll: false,
     multiple: false, // We handle multi-select manually
-    positioning: positioning ?? {
+    positioning: {
       strategy: 'fixed',
       placement: 'bottom-start',
-      sameWidth: false
+      sameWidth: false,
+      ...positioning,
+      fitViewport: true
     },
     portal: 'body'
   });
@@ -114,10 +137,12 @@
   // In popover mode we maintain our own search term inside the dropdown.
   let popoverSearchTerm = $state('');
 
-  // Debounced server-side search
+  // Debounced server-side search notifications. Providing onSearchChange
+  // alone activates them; the caller decides when to switch from local
+  // filtering to server results via the serverSearch prop.
   let debounceTimer;
   $effect(() => {
-    if (!serverSearch || !onSearchChange) return;
+    if (!onSearchChange) return;
     const query = popoverMode ? popoverSearchTerm : $inputValue;
     clearTimeout(debounceTimer);
     if (!popoverMode && !$touchedInput) return;
@@ -131,13 +156,9 @@
   const filteredItems = $derived.by(() => {
     if (serverSearch) return items;
 
-    // Combobox mode echoes the selected item's label into $inputValue purely
-    // for display. Don't treat that display text as a live search filter until
-    // the user actually types (touchedInput) — otherwise a pre-selected
-    // single-select whose items lack the default `name` search field (e.g.
-    // milestone status, {value,label} vs searchFields=['name']) filters out
-    // every option the moment its dropdown opens (WI-428). Popover mode owns
-    // its own search term, which is cleared on open, so it needs no such guard.
+    // Ignore displayed selected labels until typing begins; otherwise preselected
+    // items lacking default search fields can filter every option. Popovers own
+    // a cleared search term.
     if (!popoverMode && !$touchedInput) return items;
 
     const query = popoverMode ? popoverSearchTerm : $inputValue;
@@ -145,9 +166,7 @@
 
     const search = query.toLowerCase();
     return items.filter(item =>
-      // Always match against the visible label so a picker whose items lack the
-      // default `name` search field (e.g. milestone status, {value,label} vs
-      // searchFields=['name']) can still be filtered by typing what's shown.
+      // Always match visible labels, even without the default name field.
       getLabel(item)?.toString().toLowerCase().includes(search) ||
       searchFields.some(field => {
         const fieldValue = typeof field === 'function' ? field(item) : item[field];
@@ -177,12 +196,70 @@
     return opts;
   });
 
-  // For multi-select: get array of selected items
+  // Rendered slice of options: the DOM mounts at most maxVisibleOptions rows.
+  // Narrowing the search resets the reveal window; ArrowDown past the end of
+  // the slice grows it, so keyboard users can still reach every option.
+  // Initial reveal window only; later changes to the prop must not reset it.
+  let revealedCount = $state(untrack(() => maxVisibleOptions));
+  const visibleOptions = $derived(options.slice(0, revealedCount));
+  const hiddenOptionCount = $derived(options.length - visibleOptions.length);
+
+  // Group the rendered slice for display. The keyboard highlight index still
+  // refers to visibleOptions, so headers never shift selection.
+  const groupedVisibleOptions = $derived.by(() => {
+    const groups = [];
+    const byLabel = new Map();
+    visibleOptions.forEach((opt, index) => {
+      const label = groupBy && !opt.isUnassigned ? groupBy(opt.item) : null;
+      const key = label || '__ungrouped__';
+      let group = byLabel.get(key);
+      if (!group) {
+        group = { key, label, items: [] };
+        byLabel.set(key, group);
+        groups.push(group);
+      }
+      group.items.push({ opt, index });
+    });
+    return groups;
+  });
+
+  $effect(() => {
+    // New filter results collapse the reveal window back to the first page.
+    void filteredItems;
+    revealedCount = maxVisibleOptions;
+  });
+
+  function labelFor(item) {
+    if (item && item.__unresolved) return item.label;
+    return getLabel(item);
+  }
+
+  // Unresolved chips carry their raw value in .value; resolved ones go through
+  // the picker's getValue. Both removal and the each key must use this so a
+  // chip is never identified as undefined. An unresolved value can never
+  // collide with a resolved key: it is a value no item's getValue matched.
+  function itemKey(item) {
+    return itemValue(item);
+  }
+
+  function itemValue(item) {
+    if (item && item.__unresolved) return item.value;
+    return getValue(item);
+  }
+
+  // For multi-select: get array of selected items. Values missing from items
+  // render as unresolved chips labeled via resolveMissingLabel so a set value
+  // never silently disappears from the trigger.
   const selectedItems = $derived.by(() => {
     if (!multiple) return [];
     const valueArray = popoverMode ? (Array.isArray(values) ? values : []) : (Array.isArray(value) ? value : []);
     return valueArray
-      .map(v => items.find(item => getValue(item) === v))
+      .map(v => {
+        const found = items.find(item => getValue(item) === v);
+        if (found) return found;
+        const missingLabel = resolveMissingLabel?.(v);
+        return missingLabel ? { __unresolved: true, value: v, label: missingLabel } : null;
+      })
       .filter(Boolean);
   });
 
@@ -215,9 +292,7 @@
     if (!multiple && !$touchedInput && !popoverMode) {
       if (value != null && showSelectedInTrigger) {
         const item = items.find(i => getValue(i) === value);
-        if (item) {
-          $inputValue = getLabel(item);
-        }
+        $inputValue = item ? getLabel(item) : (resolveMissingLabel?.(value) ?? '');
       } else {
         $inputValue = '';
       }
@@ -314,14 +389,18 @@
     // intercepting Tab.
     if (!$open) return;
 
-    const totalItems = options.length;
+    const totalItems = visibleOptions.length;
 
     if (event.key === 'ArrowDown') {
       if (totalItems === 0) return;
       event.preventDefault();
       event.stopPropagation();
       highlightViaKeyboard = true;
-      highlightedIndex = (highlightedIndex + 1) % totalItems;
+      if (highlightedIndex === totalItems - 1 && hiddenOptionCount > 0) {
+        // Reveal the next page instead of wrapping; the highlight follows.
+        revealedCount += maxVisibleOptions;
+      }
+      highlightedIndex = (highlightedIndex + 1) % visibleOptions.length;
     } else if (event.key === 'ArrowUp') {
       if (totalItems === 0) return;
       event.preventDefault();
@@ -338,47 +417,53 @@
       }
 
       if (highlightedIndex >= 0 && highlightedIndex < totalItems) {
-        selectOption(options[highlightedIndex]);
+        selectOption(visibleOptions[highlightedIndex]);
       }
     }
   }
 
-  // Handle dropdown close without selection (single-select only)
+  // Notify callers whenever the dropdown closes. Preserve the legacy
+  // single-select cancellation callback for closes without a selection.
   let wasOpen = $state(false);
   $effect(() => {
-    if (wasOpen && !$open && !$selected && !multiple) {
-      onCancel();
+    if (wasOpen && !$open) {
+      onClose();
+      if (!$selected && !multiple) {
+        onCancel();
+      }
     }
     if (!wasOpen && $open) {
       highlightedIndex = 0;
-      // Remember what had focus before we move it into the portalled dropdown,
-      // so a Tab that closes the menu can return there (WI-455).
+      onOpen();
+      // Remember focus before entering the portalled dropdown.
       activeElementBeforeOpen = document.activeElement;
       if (popoverMode) {
-        popoverSearchTerm = '';
         setTimeout(() => searchInputRef?.focus(), 50);
       }
     }
     wasOpen = $open;
   });
 
-  // Return focus to the element that had it before the (portalled) dropdown
-  // opened — the trigger, which lives inside the owning dialog — so the next Tab
-  // continues inside the modal instead of escaping behind it (WI-455). The rAF
-  // lets the menu unmount first: while open, focus sits on the portalled search
-  // input/list, and a synchronous focus() is undone when Svelte tears that node
-  // down, dropping focus to <body>. Skip if that element is gone or sits inside
-  // the menu being closed.
+  // Restore focus after unmount so portalled menus cannot drop Tab navigation
+  // outside the owning dialog.
   function restoreFocusToTrigger() {
     const target = activeElementBeforeOpen;
     if (target instanceof HTMLElement && !menuRef?.contains(target)) {
-      requestAnimationFrame(() => target.focus());
+      requestAnimationFrame(() => {
+        const active = document.activeElement;
+        // Recover focus only when closing the portalled menu left it nowhere
+        // useful. A user may already have moved to the next field before this
+        // frame runs; never steal focus back from that newer target.
+        if (!active || active === document.body || menuRef?.contains(active)) {
+          target.focus();
+        }
+      });
     }
   }
 
-  // Reset highlighted index when options change
+  // Reset highlighted index when the visible options change
   $effect(() => {
-    const len = options.length;
+    const len = visibleOptions.length;
     if (highlightedIndex >= len) {
       highlightedIndex = Math.max(0, len - 1);
     }
@@ -427,23 +512,14 @@
   // Search input inside popover dropdown
   let searchInputRef = $state(null);
 
-  // The element that was focused just before the dropdown opened. The menu is
-  // portalled to <body>; when the user Tabs out of it we restore focus here so
-  // the next Tab is routed by the owning dialog's focus trap instead of
-  // escaping behind a modal overlay such as the create-item modal (WI-455).
+  // Restore prior focus when leaving the portalled menu to keep dialog Tab flow.
   let activeElementBeforeOpen = null;
 
   // Reference to dropdown menu for scrolling
   let menuRef = $state(null);
 
-  // Only scroll the highlighted option into view for KEYBOARD navigation.
-  // Mouse hover also moves the highlight (option onmouseenter), but the pointer
-  // is already on that item so there is nothing to scroll — and calling
-  // scrollIntoView on hover fires a scroll that closes the open combobox menu
-  // (the dropdown vanishes the instant the cursor reaches an option, so a
-  // programmatic click then lands on whatever is behind it). The original code
-  // also indexed menuRef.children (the search box / listbox wrappers) rather
-  // than the option elements, so it scrolled the wrong node entirely.
+  // Scroll only keyboard highlights: hover scrolling closes the menu. Query
+  // option nodes directly rather than menu wrapper children.
   let highlightViaKeyboard = false;
 
   $effect(() => {
@@ -455,7 +531,13 @@
   // Popover mode trigger handler
   function handleTriggerClick() {
     if (disabled) return;
-    $open = !$open;
+    const opening = !$open;
+    if (opening) {
+      // Reset before exposing the search input. Clearing from the later open
+      // effect can erase text entered immediately after the trigger click.
+      popoverSearchTerm = '';
+    }
+    $open = opening;
   }
 </script>
 
@@ -477,7 +559,9 @@
              class="absolute inset-0 w-full h-full opacity-0 pointer-events-none" />
       <div
         role="combobox"
+        tabindex={disabled ? -1 : 0}
         aria-expanded={$open}
+        aria-controls={$menu.id}
         aria-haspopup="listbox"
         aria-disabled={disabled}
         onclick={handleTriggerClick}
@@ -489,34 +573,33 @@
   {:else if multiple}
     <!-- Multi-select: Container with chips + input (original behavior) -->
     <div
-      class="w-full min-h-[38px] px-2.5 py-1.5 pr-10 rounded border transition-all duration-200
-             focus-within:outline-none focus-within:ring-2 focus-within:ring-blue-500 focus-within:ring-opacity-50
+      class="w-full min-h-[38px] {controlSizeClasses('medium')} pr-10 rounded border transition-all duration-200
+             focus-within:outline-none focus-within:ring-2 focus-within:ring-ds-border-focused
              disabled:opacity-50 disabled:cursor-not-allowed flex flex-wrap items-center gap-1.5"
       style="background-color: var(--ds-background-input); border-color: var(--ds-border);"
       onclick={focusInput}
       onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && focusInput()}
       role="button" tabindex="-1"
     >
-      {#each selectedItems as item (getValue(item))}
+      {#each selectedItems as item (itemKey(item))}
         <div class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs border"
              style="background-color: var(--ds-surface-raised); border-color: var(--ds-border); color: var(--ds-text);">
           {#if chipSnippet}
             {@render chipSnippet({ item })}
           {:else}
-            <span class="font-medium truncate max-w-[150px]">{getLabel(item)}</span>
+            <span class="font-medium truncate max-w-[150px]">{labelFor(item)}</span>
           {/if}
-          <button type="button" onclick={(e) => removeItem(e, getValue(item))}
-                  class="rounded p-0.5 transition-colors" {disabled}
-                  onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                  onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}>
+          <button type="button" onclick={(e) => removeItem(e, itemValue(item))}
+                  class="picker-clear rounded p-0.5 transition-colors" {disabled}>
             <X class="w-3 h-3" style="color: var(--ds-text-subtle);" />
           </button>
         </div>
       {/each}
-      <input bind:this={inputRef} use:melt={$input} type="text"
+      <input bind:this={inputRef} use:melt={$input} {id} type="text"
+             data-testid={inputTestid}
              placeholder={selectedItems.length === 0 ? resolvedPlaceholder : ''}
-             {disabled} onkeydowncapture={handleKeydown}
-             class="flex-1 min-w-[120px] px-1 py-0.5 bg-transparent border-0 outline-none text-sm"
+             {disabled} aria-label={ariaLabel} onkeydowncapture={handleKeydown}
+             class="min-w-0 basis-[120px] flex-1 px-1 py-0.5 bg-transparent border-0 outline-none text-sm"
              style="color: var(--ds-text);" />
     </div>
     <div class="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-1 pointer-events-none">
@@ -526,18 +609,18 @@
   {:else}
     <!-- Single-select: Input/Trigger (original combobox mode) -->
     <input use:melt={$input} {id} type="text" placeholder={resolvedPlaceholder} {disabled}
+           data-testid={inputTestid}
+           aria-label={ariaLabel}
            onkeydowncapture={handleKeydown}
-           class="w-full px-4 py-2 pr-16 rounded border transition-all duration-200
-                  focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50
-                  disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+           class="w-full {controlSizeClasses('medium')} pr-16 rounded border transition-all duration-200
+                  focus:outline-none focus:ring-2 focus:ring-ds-border-focused
+                  disabled:opacity-50 disabled:cursor-not-allowed"
            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);" />
     <div class="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-1">
       {#if allowClear && value != null && !disabled && showSelectedInTrigger}
         <button type="button" onclick={handleClear}
-                class="p-0.5 rounded transition-colors" style="color: var(--ds-text-subtle);"
-                aria-label={t('pickers.clearSelection')}
-                onmouseenter={(e) => e.currentTarget.style.backgroundColor = 'var(--ds-background-neutral-hovered)'}
-                onmouseleave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}>
+                class="picker-clear p-0.5 rounded transition-colors" style="color: var(--ds-text-subtle);"
+                aria-label={t('pickers.clearSelection')}>
           <X size={14} />
         </button>
       {/if}
@@ -548,18 +631,17 @@
 
   <!-- Dropdown Menu -->
   {#if $open}
-    <div bind:this={menuRef} use:melt={$menu} data-testid="picker-dropdown"
-         class="fixed z-[70] min-w-[250px] rounded border shadow-lg overflow-hidden"
-         style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);"
-         in:fly={{ duration: 150, y: -5 }}>
+    <div bind:this={menuRef} use:melt={$menu} data-testid={menuTestid || 'picker-dropdown'}
+         class="fixed z-[70] min-w-[250px] rounded border shadow-lg flex flex-col overflow-y-auto overscroll-contain"
+         style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
       {#if popoverMode}
         <!-- Search input inside dropdown -->
-        <div class="p-2 border-b" style="border-color: var(--ds-border);">
+        <div class="p-2 border-b shrink-0" style="border-color: var(--ds-border);">
           <div class="relative">
             <Search size={14} class="absolute left-2.5 top-1/2 -translate-y-1/2" style="color: var(--ds-text-subtle);" />
             <input bind:this={searchInputRef} bind:value={popoverSearchTerm} type="text"
                    data-testid={searchTestid}
-                   placeholder={t('pickers.search')}
+                   placeholder={searchPlaceholder || t('pickers.search')}
                    onkeydown={handleKeydown}
                    class="w-full pl-8 pr-3 py-2 rounded text-sm outline-none"
                    style="background-color: var(--ds-background-input); border: 1px solid var(--ds-border); color: var(--ds-text);"
@@ -571,38 +653,51 @@
       {#if loading}
         <div class="p-4 text-center" style="color: var(--ds-text-subtle);">{t('common.loading')}</div>
       {:else if options.length > 0}
-        <div role="listbox" class="max-h-60 overflow-y-auto">
-          {#each options as opt, index (opt.value ?? 'unassigned')}
-            {@const itemSelected = multiple ? isItemSelected(opt.value) : $isSelected(opt)}
-            {@const isHighlighted = highlightedIndex === index}
-            {@const disabledByMax = atMaxSelections && !itemSelected}
-            <div use:melt={$option(opt)} data-option-value={opt.value ?? ''}
-                 data-option-id={opt.value ?? ''}
-                 data-testid={optionTestid ? optionTestid(opt) : undefined}
-                 onclick={() => { if (!disabledByMax) selectOption(opt); }}
-                 onmouseenter={() => { highlightViaKeyboard = false; highlightedIndex = index; }}
-                 class="px-4 py-3 cursor-pointer border-b last:border-b-0 transition-colors duration-150"
-                 style="border-color: var(--ds-border); {disabledByMax ? 'opacity: 0.4; pointer-events: none;' : ''} {itemSelected ? 'background-color: var(--ds-background-selected); color: var(--ds-text);' : isHighlighted ? 'background-color: var(--ds-background-neutral-hovered); color: var(--ds-text);' : 'color: var(--ds-text);'}">
-              <div class="flex items-center justify-between">
-                <div class="flex items-center gap-3 flex-1 min-w-0">
-                  {#if opt.isUnassigned}
-                    <span class="font-medium truncate" style="color: var(--ds-text-subtle);">{resolvedUnassignedLabel}</span>
-                  {:else if itemSnippet}
-                    {@render itemSnippet({ item: opt.item, isSelected: itemSelected })}
-                  {:else}
-                    {#if iconSnippet}{@render iconSnippet({ item: opt.item })}{/if}
-                    <div class="flex flex-col min-w-0">
-                      <span class="font-medium truncate">{opt.label}</span>
-                    </div>
-                  {/if}
-                </div>
-                {#if itemSelected}<Check class="w-4 h-4 text-blue-600 flex-shrink-0" />{/if}
+        <div role="listbox" data-testid={scrollTestid || 'picker-option-list'} class="min-h-0 max-h-60 overflow-y-auto overscroll-contain">
+          {#each groupedVisibleOptions as group (group.key)}
+            {#if group.label}
+              <div class="px-3 py-2 text-xs font-semibold uppercase tracking-wide" style="background-color: var(--ds-background-neutral); color: var(--ds-text-subtle);">
+                {group.label}
               </div>
-            </div>
+            {/if}
+            {#each group.items as { opt, index } (opt.value ?? 'unassigned')}
+              {@const itemSelected = multiple ? isItemSelected(opt.value) : $isSelected(opt)}
+              {@const isHighlighted = highlightedIndex === index}
+              {@const disabledByMax = atMaxSelections && !itemSelected}
+              <div use:melt={$option(opt)} data-option-value={opt.value ?? ''}
+                   data-option-id={opt.value ?? ''}
+                   data-testid={optionTestid ? optionTestid(opt) : undefined}
+                   onclick={() => { if (!disabledByMax) selectOption(opt); }}
+                   onmouseenter={() => { highlightViaKeyboard = false; highlightedIndex = index; }}
+                   class="px-4 py-3 cursor-pointer border-b last:border-b-0 transition-colors duration-150"
+                   style="border-color: var(--ds-border); {disabledByMax ? 'opacity: 0.4; pointer-events: none;' : ''} {itemSelected ? 'background-color: var(--ds-background-selected); color: var(--ds-text);' : isHighlighted ? 'background-color: var(--ds-surface-raised-hovered); color: var(--ds-text);' : 'color: var(--ds-text);'}">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center gap-3 flex-1 min-w-0">
+                    {#if opt.isUnassigned}
+                      <span class="font-medium truncate" style="color: var(--ds-text-subtle);">{resolvedUnassignedLabel}</span>
+                    {:else if itemSnippet}
+                      {@render itemSnippet({ item: opt.item, isSelected: itemSelected })}
+                    {:else}
+                      {#if iconSnippet}{@render iconSnippet({ item: opt.item })}{/if}
+                      <div class="flex flex-col min-w-0">
+                        <span class="font-medium truncate">{opt.label}</span>
+                      </div>
+                    {/if}
+                  </div>
+                  {#if itemSelected}<Check class="w-4 h-4 text-ds-interactive flex-shrink-0" />{/if}
+                </div>
+              </div>
+            {/each}
           {/each}
+          {#if hiddenOptionCount > 0}
+            <div data-testid="picker-more-hint" class="px-4 py-2.5 text-xs text-center border-t" style="border-color: var(--ds-border); color: var(--ds-text-subtle);">
+              {t('pickers.showingOfTotal', { shown: visibleOptions.length, total: options.length })}
+            </div>
+          {/if}
           {#if canCreateCurrentInput()}
             <div role="button" tabindex="0"
-                 class="px-4 py-3 cursor-pointer border-t hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors duration-150 flex items-center gap-2"
+                 data-testid="picker-create-option"
+                 class="px-4 py-3 cursor-pointer border-t hover:bg-ds-background-neutral-hovered transition-colors duration-150 flex items-center gap-2"
                  style="border-color: var(--ds-border); color: var(--ds-interactive);"
                  onclick={handleCreateOption}
                  onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleCreateOption(); } }}>
@@ -611,11 +706,23 @@
             </div>
           {/if}
         </div>
+      {:else if noResultsSnippet && getCreateQuery()}
+        <!-- Custom no-results content (for example, inline label creation). -->
+        {@render noResultsSnippet({ searchQuery: getCreateQuery(), onCreate: handleCreateOption })}
+      {:else if canCreateCurrentInput()}
+        <!-- Keep creation discoverable when filtering leaves no options. -->
+        <div role="button" tabindex="0"
+             class="px-4 py-3 cursor-pointer hover:bg-ds-background-neutral-hovered transition-colors duration-150 flex items-center gap-2"
+             style="color: var(--ds-interactive);"
+             onclick={handleCreateOption}
+             onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleCreateOption(); } }}>
+          {#if createOptionSnippet}{@render createOptionSnippet({ searchQuery: getCreateQuery(), onCreate })}
+          {:else if onCreate}<span class="text-sm">+ {t('pickers.createItem', { value: getCreateQuery() })}</span>{/if}
+        </div>
       {:else if popoverMode && popoverSearchTerm && !loading}
         <!-- No results (popover mode with search) -->
         <div class="p-4 text-center text-sm" style="color: var(--ds-text-subtle);">
-          {#if noResultsSnippet}{@render noResultsSnippet({ searchQuery: popoverSearchTerm })}
-          {:else}{t('pickers.noResultsFor', { query: popoverSearchTerm })}{/if}
+          {t('pickers.noResultsFor', { query: popoverSearchTerm })}
         </div>
       {:else if !popoverMode}
         <!-- No results (combobox mode) -->
@@ -634,7 +741,13 @@
   {#if error && !popoverMode}
     <div class="absolute z-50 w-full mt-2 rounded border shadow-lg"
          style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-      <div class="px-4 py-4 text-center text-sm text-red-600">{error}</div>
+      <div class="px-4 py-4 text-center text-sm text-ds-text-danger">{error}</div>
     </div>
   {/if}
 </div>
+
+<style>
+  .picker-clear:hover {
+    background-color: var(--ds-background-neutral-hovered);
+  }
+</style>

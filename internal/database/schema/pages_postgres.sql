@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS pages (
     workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     parent_id INTEGER REFERENCES pages(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
+    -- Display-only, derived from the title. Nothing resolves a page by slug:
+    -- every route addresses pages by numeric id. Deliberately NOT unique —
+    -- see the note above idx_pages_frac_index_scoped.
     slug TEXT NOT NULL,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     content TEXT NOT NULL DEFAULT '',
@@ -23,8 +26,7 @@ CREATE TABLE IF NOT EXISTS pages (
     depth INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    archived_at TIMESTAMPTZ,
-    UNIQUE(workspace_id, parent_id, slug)
+    archived_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_pages_workspace ON pages(workspace_id);
@@ -35,6 +37,14 @@ CREATE INDEX IF NOT EXISTS idx_pages_path ON pages(path);
 CREATE INDEX IF NOT EXISTS idx_pages_content_hash ON pages(content_hash) WHERE content_hash != '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_workspace_home ON pages(workspace_id) WHERE is_home = true AND archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_pages_workspace_parent_rank ON pages(workspace_id, parent_id, rank) WHERE rank IS NOT NULL;
+-- Slug carries no uniqueness rule. It used to be constrained by
+-- UNIQUE(workspace_id, parent_id, slug) plus a partial index covering root
+-- pages, in anticipation of path-style page URLs. Those URLs were never
+-- built — pages are addressed by numeric id — so the constraints only ever
+-- produced 409s on create, move and unarchive, and forced a retry loop to
+-- pick a free slug on every write. Removed; do not reinstate without a
+-- reader that actually resolves pages by slug.
+--
 -- frac_index uniqueness is per sibling set, not global. KeyBetween("","")
 -- deterministically produces the same first key for every group, so a
 -- global UNIQUE(frac_index) would mean only one page in the whole table
@@ -42,18 +52,14 @@ CREATE INDEX IF NOT EXISTS idx_pages_workspace_parent_rank ON pages(workspace_id
 -- parent_id) so each sibling set has its own key space. COALESCE makes
 -- NULL parent_id (root pages) collate as a sibling set in its own
 -- right, since both SQLite and PostgreSQL treat NULL = NULL as false
--- inside unique constraints.
+-- inside unique constraints. Archived pages are excluded: they leave the
+-- live sibling ordering (ListChildren filters archived_at IS NULL) and the
+-- move backfill re-mints keys only for live siblings, so an archived row
+-- still holding an old key must not occupy that key space or the backfill
+-- collides on re-sequence.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_frac_index_scoped
     ON pages(workspace_id, COALESCE(parent_id, -1), frac_index)
-    WHERE frac_index IS NOT NULL;
--- UNIQUE(workspace_id, parent_id, slug) above is bypassed for root pages
--- because parent_id IS NULL collates as NOT EQUAL to itself in both
--- SQLite and PostgreSQL. This partial unique index plugs that gap for
--- live (non-archived) root pages so concurrent inserts cannot race past
--- the service-level pickAvailableSlug check. Archived root pages may
--- still share a slug — once archived they're frozen and out of the
--- caller's address space.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_workspace_root_slug ON pages(workspace_id, slug) WHERE parent_id IS NULL AND archived_at IS NULL;
+    WHERE frac_index IS NOT NULL AND archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_pages_fts ON pages USING GIN (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(excerpt, '')));
 
 CREATE TABLE IF NOT EXISTS page_revisions (
@@ -163,3 +169,28 @@ ON CONFLICT (role_id, permission_id) DO NOTHING;
 INSERT INTO system_settings (key, value, value_type, description, category) VALUES
     ('knowledge.full_text_search_enabled', 'true', 'boolean', 'Enable full-text knowledge search', 'knowledge')
 ON CONFLICT (key) DO NOTHING;
+
+-- Portal knowledge-base usage signals (WI-1134). Insert-only event log:
+-- search / no_result / view / deflection rows recorded by the portal KB
+-- endpoints. Stores IDs and the submitted query only — never page content —
+-- so unauthorized bodies can never leak through analytics. Lives here because
+-- every FK target (channels, portal_customers, pages) exists earlier in the
+-- fresh-install load order.
+CREATE TABLE IF NOT EXISTS kb_events (
+	id SERIAL PRIMARY KEY,
+	channel_id INTEGER NOT NULL,
+	portal_customer_id INTEGER,
+	event_type TEXT NOT NULL,
+	page_id INTEGER,
+	workspace_id INTEGER,
+	source TEXT,
+	query TEXT,
+	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+	FOREIGN KEY (portal_customer_id) REFERENCES portal_customers(id) ON DELETE SET NULL,
+	FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE SET NULL,
+	CHECK (event_type IN ('search', 'no_result', 'view', 'deflection'))
+);
+CREATE INDEX IF NOT EXISTS idx_kb_events_channel_created ON kb_events(channel_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_kb_events_type_created ON kb_events(event_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_kb_events_customer_created ON kb_events(portal_customer_id, created_at);

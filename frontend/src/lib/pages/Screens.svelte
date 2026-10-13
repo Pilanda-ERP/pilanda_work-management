@@ -10,17 +10,22 @@
   import { confirm } from '../composables/useConfirm.js';
   import { formatDateSimple } from '../utils/dateFormatter.js';
   import Button from '../components/Button.svelte';
+  import TextField from '../components/TextField.svelte';
   import Input from '../components/Input.svelte';
-  import Textarea from '../components/Textarea.svelte';
-  import Label from '../components/Label.svelte';
+  import TextareaField from '../components/TextareaField.svelte';
   import DataTable from '../components/DataTable.svelte';
   import PageHeader from '../layout/PageHeader.svelte';
   import Modal from '../dialogs/Modal.svelte';
   import ModalHeader from '../dialogs/ModalHeader.svelte';
-  import DropIndicator from '../layout/DropIndicator.svelte';
+  import DragHandleDots from '../components/DragHandleDots.svelte';
+  import DraggableFieldRow from '../components/DraggableFieldRow.svelte';
+  import FieldRemovalAction from '../components/FieldRemovalAction.svelte';
   import DialogFooter from '../dialogs/DialogFooter.svelte';
   import { toHotkeyString } from '../utils/keyboardShortcuts.js';
+  import { isAlwaysVisibleSystemField } from '../utils/screenFields.js';
   import Checkbox from '../components/Checkbox.svelte';
+  import LocalizedObjectFields from '../settings/LocalizedObjectFields.svelte';
+  import { objectDisplayValue } from '../utils/systemLabels.js';
 
   // Bind to store values
   let screens = $derived(screenEditorStore.screens);
@@ -35,9 +40,16 @@
   let draggedField = $derived(screenEditorStore.draggedField);
   let fieldDragState = $derived(screenEditorStore.fieldDragState);
   let fieldWidths = $derived(screenEditorStore.fieldWidths);
+  let screenCanonicalName = $state('');
+  let screenCanonicalDescription = $state('');
+  let translationEditor = $state(null);
 
   let setupCleanups = [];
   let setupTimeout;
+
+  function getScreenDisplayValue(screen, field) {
+    return objectDisplayValue(screen, field, 'screen');
+  }
 
   onMount(async () => {
     await screenEditorStore.loadScreens();
@@ -163,6 +175,8 @@
   }
 
   function startEdit(screen) {
+    screenCanonicalName = screen.name || '';
+    screenCanonicalDescription = screen.description || '';
     screenEditorStore.startEdit(screen);
   }
 
@@ -181,7 +195,15 @@
 
   async function saveScreen() {
     try {
+      if (editingScreen) {
+        translationEditor?.validate();
+        setFormData('name', screenCanonicalName);
+        setFormData('description', screenCanonicalDescription);
+      }
+      const editor = translationEditor;
       await screenEditorStore.saveScreen();
+      await editor?.save();
+      await screenEditorStore.loadScreens();
     } catch (error) {
       errorToast(t('dialogs.alerts.failedToSave', { error: error.message || error }));
     }
@@ -196,14 +218,14 @@
   }
 
   async function deleteScreen(screen) {
-    if (screen.id === 1) {
+    if (screen.builtin_key) {
       errorToast(t('dialogs.alerts.cannotDeleteDefaultScreen'));
       return;
     }
 
     const confirmed = await confirm({
       title: t('common.delete'),
-      message: t('dialogs.confirmations.deleteScreen', { name: screen.name }),
+      message: t('dialogs.confirmations.deleteScreen', { name: getScreenDisplayValue(screen, 'name') }),
       confirmText: t('common.delete'),
       cancelText: t('common.cancel'),
       variant: 'danger'
@@ -222,7 +244,8 @@
   }
 
   function getFieldWidthLabel(width) {
-    return screenEditorStore.getFieldWidthLabel(width);
+    const key = ['full', 'half', 'third', 'quarter'].includes(width) ? width : null;
+    return key ? t(`screensPage.fieldWidths.${key}`) : width;
   }
 
   function getFieldDisplayName(field) {
@@ -257,8 +280,9 @@
       }
     ];
 
-    // Don't show delete option for default screen (ID 1)
-    if (screen.id !== 1) {
+    // Built-in screens back the default configuration set and cannot be
+    // removed.
+    if (!screen.builtin_key) {
       items.push({
         id: 'delete',
         type: 'regular',
@@ -319,11 +343,25 @@
       <!-- Modal content -->
       <div class="px-6 py-4">
         <form onsubmit={(e) => { e.preventDefault(); saveScreen(); }}>
+          {#if editingScreen}
+            {#key editingScreen.id}
+              <LocalizedObjectFields
+                bind:this={translationEditor}
+                objectType="screen"
+                objectId={editingScreen.id}
+                bind:canonicalName={screenCanonicalName}
+                bind:canonicalDescription={screenCanonicalDescription}
+                displayName={editingScreen.display_name || editingScreen.name}
+                displayDescription={editingScreen.display_description || editingScreen.description}
+              />
+            {/key}
+          {:else}
           <div class="grid grid-cols-1 gap-6">
             <div>
-              <Label for="screen-name" required class="mb-2">{t('screensPage.screenName')}</Label>
-              <Input
+              <TextField
+                label={t('screensPage.screenName')}
                 id="screen-name"
+                labelClass="mb-2"
                 value={formData.name}
                 oninput={(e) => setFormData('name', e.target.value)}
                 placeholder={t('screensPage.screenNamePlaceholder')}
@@ -332,9 +370,10 @@
             </div>
 
             <div>
-              <Label for="screen-description" class="mb-2">{t('screensPage.description')}</Label>
-              <Textarea
+              <TextareaField
+                label={t('screensPage.description')}
                 id="screen-description"
+                labelClass="mb-2"
                 value={formData.description}
                 oninput={(e) => setFormData('description', e.target.value)}
                 rows={3}
@@ -342,6 +381,7 @@
               />
             </div>
           </div>
+          {/if}
         </form>
       </div>
 
@@ -363,9 +403,9 @@
     >
       {#snippet name(screen)}
         <div>
-          <div style="color: var(--ds-text);">{screen.name}</div>
-          {#if screen.description}
-            <div class="text-sm mt-1" style="color: var(--ds-text-subtle);">{screen.description}</div>
+          <div style="color: var(--ds-text);">{getScreenDisplayValue(screen, 'name')}</div>
+          {#if getScreenDisplayValue(screen, 'description')}
+            <div class="text-sm mt-1" style="color: var(--ds-text-subtle);">{getScreenDisplayValue(screen, 'description')}</div>
           {/if}
         </div>
       {/snippet}
@@ -374,7 +414,7 @@
     <PageHeader
       icon={Settings}
       title={t('screensPage.configureFields')}
-      subtitle={t('screensPage.screenSubtitle', { name: editingScreenFields?.name })}
+      subtitle={t('screensPage.screenSubtitle', { name: getScreenDisplayValue(editingScreenFields, 'name') })}
     >
       {#snippet actions()}
         <div class="flex gap-3">
@@ -415,32 +455,16 @@
             </div>
           {:else}
             {#each screenFields as field, index (field.field_identifier)}
-              <div
-                data-screen-field
-                data-field-index={index}
-                data-field-id={field.field_identifier}
-                class="relative group flex items-center gap-3 px-4 py-3 rounded border hover:shadow-sm transition-all duration-200 h-16"
+              <DraggableFieldRow
+                attributes={{ 'data-screen-field': true }}
+                fieldIndex={index}
+                fieldId={field.field_identifier}
+                closestEdge={fieldDragState.get(field.field_identifier)?.closestEdge}
+                class="gap-3 px-4 py-3 rounded border hover:shadow-sm transition-all duration-200 h-16"
                 style="border-color: var(--ds-border); background-color: var(--ds-surface-raised); user-select: none;"
+                handleClass="w-4 h-4 group-hover:text-[var(--ds-icon-accent)]"
+                handleColor="var(--ds-text-subtle)"
               >
-                <!-- Drop indicator -->
-                {#if fieldDragState.get(field.field_identifier)?.closestEdge}
-                  <DropIndicator edge={fieldDragState.get(field.field_identifier)?.closestEdge} gap={8} />
-                {/if}
-                <!-- Drag Handle -->
-                <div
-                  class="cursor-grab active:cursor-grabbing flex-shrink-0 p-1 rounded hover-bg transition-colors"
-                  style="touch-action: none;"
-                >
-                  <svg class="w-4 h-4 drag-handle-icon" style="color: var(--ds-text-subtle);" fill="currentColor" viewBox="0 0 24 24">
-                    <circle cx="9" cy="6" r="1.5"/>
-                    <circle cx="15" cy="6" r="1.5"/>
-                    <circle cx="9" cy="12" r="1.5"/>
-                    <circle cx="15" cy="12" r="1.5"/>
-                    <circle cx="9" cy="18" r="1.5"/>
-                    <circle cx="15" cy="18" r="1.5"/>
-                  </svg>
-                </div>
-
                 <div class="flex-1">
                   <div class="font-medium flex items-center gap-2" style="color: var(--ds-text);">
                     {getFieldDisplayName(field)}
@@ -459,25 +483,17 @@
                     size="small"
                   />
 
-                  {#if field.field_type === 'system' && (field.field_identifier === 'title' || field.field_identifier === 'status')}
-                    <div class="w-9 h-9 flex items-center justify-center flex-shrink-0">
-                      <svg class="w-4 h-4" style="color: var(--ds-text-disabled);" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
-                      </svg>
-                    </div>
-                  {:else}
-                    <button
-                      onclick={() => removeField(index)}
-                      class="transition-colors p-1 rounded hover-danger flex-shrink-0" style="color: var(--ds-icon-danger);"
-                      title={t('screensPage.removeField')}
-                    >
-                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-                      </svg>
-                    </button>
-                  {/if}
+                  <FieldRemovalAction
+                    locked={field.field_type === 'system' && isAlwaysVisibleSystemField(field.field_identifier)}
+                    lockedClass="w-9 h-9 flex items-center justify-center flex-shrink-0"
+                    lockedColor="var(--ds-text-disabled)"
+                    removeClass="transition-colors p-1 rounded hover-danger flex-shrink-0"
+                    removeStyle="color: var(--ds-icon-danger);"
+                    removeTitle={t('screensPage.removeField')}
+                    onremove={() => removeField(index)}
+                  />
                 </div>
-              </div>
+              </DraggableFieldRow>
             {/each}
           {/if}
         </div>
@@ -510,14 +526,7 @@
             >
               <!-- Drag Handle -->
               <div class="flex-shrink-0">
-                <svg class="w-4 h-4 drag-handle-icon" style="color: var(--ds-text-subtle);" fill="currentColor" viewBox="0 0 24 24">
-                  <circle cx="9" cy="6" r="1.5"/>
-                  <circle cx="15" cy="6" r="1.5"/>
-                  <circle cx="9" cy="12" r="1.5"/>
-                  <circle cx="15" cy="12" r="1.5"/>
-                  <circle cx="9" cy="18" r="1.5"/>
-                  <circle cx="15" cy="18" r="1.5"/>
-                </svg>
+                <DragHandleDots class="w-4 h-4 group-hover:text-[var(--ds-icon-accent)]" color="var(--ds-text-subtle)" />
               </div>
 
               <div class="flex-1">
@@ -556,10 +565,5 @@
   .available-field:hover {
     background-color: var(--ds-background-input-hovered) !important;
     border-color: var(--ds-border-focused) !important;
-  }
-
-  :global(.group):hover .drag-handle-icon,
-  .available-field:hover .drag-handle-icon {
-    color: var(--ds-icon-accent) !important;
   }
 </style>

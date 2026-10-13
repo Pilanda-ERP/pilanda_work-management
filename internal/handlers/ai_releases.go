@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"windshift/internal/llm"
 	"windshift/internal/models"
+	"windshift/internal/repository"
 	"windshift/internal/services"
 )
 
@@ -17,6 +19,8 @@ type GenerateReleaseNotesResponse struct {
 	Name    string `json:"name"`
 	Notes   string `json:"notes"`
 }
+
+var errNoCompletedReleaseItems = errors.New("milestone has no completed work items to use as release-note sources")
 
 // GenerateReleaseNotes generates release notes for a milestone using the LLM.
 func (h *AIHandler) GenerateReleaseNotes(w http.ResponseWriter, r *http.Request) {
@@ -34,7 +38,7 @@ func (h *AIHandler) GenerateReleaseNotes(w http.ResponseWriter, r *http.Request)
 	planningService := services.NewPlanningService(h.db)
 	milestone, err := planningService.GetMilestone(milestoneID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, repository.ErrNotFound) {
 			respondNotFound(w, r, "milestone")
 			return
 		}
@@ -57,8 +61,14 @@ func (h *AIHandler) GenerateReleaseNotes(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	workspaceIDs, err := h.permService.AccessibleWorkspaceIDs(user.ID)
+	if err != nil {
+		respondInternalError(w, r, fmt.Errorf("failed to load visible workspaces: %w", err))
+		return
+	}
+
 	// Load progress report for item counts and breakdown
-	progress, err := planningService.GetMilestoneProgress(milestoneID)
+	progress, err := planningService.GetMilestoneProgress(milestoneID, workspaceIDs)
 	if err != nil {
 		respondInternalError(w, r, fmt.Errorf("failed to load milestone progress: %w", err))
 		return
@@ -70,7 +80,54 @@ func (h *AIHandler) GenerateReleaseNotes(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Build prompt context
+	// Load test stats if available
+	var testStats *services.MilestoneTestStats
+	loadedTestStats, testErr := planningService.GetMilestoneTestStatistics(milestoneID, workspaceIDs)
+	if testErr == nil && loadedTestStats.TotalTestPlans > 0 {
+		testStats = loadedTestStats
+	}
+
+	userPrompt, err := buildReleaseNotesUserPrompt(milestone, progress, testStats)
+	if errors.Is(err, errNoCompletedReleaseItems) {
+		respondConflict(w, r, "This milestone has no completed work items to generate release notes from.")
+		return
+	}
+	if err != nil {
+		respondInternalError(w, r, fmt.Errorf("failed to build release notes prompt: %w", err))
+		return
+	}
+
+	systemPrompt := h.promptStore.Get(llm.PromptReleaseNotes)
+
+	extendWriteDeadline(w)
+	ctx, cancel := context.WithTimeout(r.Context(), llm.DefaultRequestTimeout)
+	defer cancel()
+
+	resp, err := llmClient.Complete(ctx, llm.CompletionRequest{
+		Messages: []llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Temperature: 0.2,
+	})
+	if err != nil {
+		respondLLMError(w, r, err)
+		return
+	}
+	if len(resp.Choices) == 0 {
+		respondServiceUnavailable(w, r, "AI service returned no response.")
+		return
+	}
+
+	notes := strings.TrimSpace(resp.Choices[0].Message.Content)
+	respondJSONOK(w, GenerateReleaseNotesResponse{Notes: notes})
+}
+
+func buildReleaseNotesUserPrompt(
+	milestone *services.MilestoneResult,
+	progress *services.MilestoneProgressReport,
+	testStats *services.MilestoneTestStats,
+) (string, error) {
 	var contextLines []string
 	contextLines = append(contextLines, fmt.Sprintf("Milestone: %s", milestone.Name))
 	if milestone.Description != "" {
@@ -118,38 +175,18 @@ func (h *AIHandler) GenerateReleaseNotes(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
+	if totalItemsListed == 0 {
+		return "", errNoCompletedReleaseItems
+	}
 
-	// Load test stats if available
-	testStats, testErr := planningService.GetMilestoneTestStatistics(milestoneID)
-	if testErr == nil && testStats.TotalTestPlans > 0 {
+	if testStats != nil {
 		contextLines = append(contextLines, fmt.Sprintf("\nTest coverage: %d test plans, %d runs (%d successful, %d failed)",
 			testStats.TotalTestPlans, testStats.TotalTestRuns, testStats.SuccessfulTestRuns, testStats.FailedTestRuns))
 	}
 
-	systemPrompt := h.promptStore.Get(llm.PromptReleaseNotes)
+	return fmt.Sprintf(`Generate release notes for this milestone using only the facts below.
+Every release-note bullet must cite one or more supplied work-item keys. Do not infer features,
+implementation details, user impact, or test results that are not explicitly supported by the input.
 
-	userPrompt := fmt.Sprintf("Generate release notes for this milestone:\n\n%s", strings.Join(contextLines, "\n"))
-
-	extendWriteDeadline(w)
-	ctx, cancel := context.WithTimeout(r.Context(), llm.DefaultRequestTimeout)
-	defer cancel()
-
-	resp, err := llmClient.ChatCompletion(ctx, llm.ChatCompletionRequest{
-		Messages: []llm.Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		Temperature: 0.7,
-	})
-	if err != nil {
-		respondLLMError(w, r, err)
-		return
-	}
-	if len(resp.Choices) == 0 {
-		respondServiceUnavailable(w, r, "AI service returned no response.")
-		return
-	}
-
-	notes := strings.TrimSpace(resp.Choices[0].Message.Content)
-	respondJSONOK(w, GenerateReleaseNotesResponse{Notes: notes})
+%s`, strings.Join(contextLines, "\n")), nil
 }

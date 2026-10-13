@@ -1,9 +1,11 @@
 <script>
   import { Search, Users, Plus } from '@lucide/svelte';
   import Button from '../components/Button.svelte';
+  import Input from '../components/Input.svelte';
   import Avatar from '../components/Avatar.svelte';
   import { t } from '../stores/i18n.svelte.js';
   import SidebarHeader from '../layout/SidebarHeader.svelte';
+  import NavigationSidebar from '../layout/NavigationSidebar.svelte';
 
   let {
     organisations = [],
@@ -22,43 +24,50 @@
     )
   );
 
-  function getButtonStyle(orgId, isActive, isDragOver) {
-    if (isDragOver) {
-      return 'background: rgba(59, 130, 246, 0.1); color: var(--ds-text); ring: 2px solid rgba(59, 130, 246, 0.5);';
-    }
-    if (isActive) {
-      return 'background: var(--ds-surface-selected); color: var(--ds-text);';
-    }
-    return 'color: var(--ds-text-subtle);';
-  }
 </script>
 
-<div class="w-64 min-w-64 flex-shrink-0 border-r flex flex-col p-6" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-  <!-- Header -->
-  <SidebarHeader title={t('workspaces.customers.title')} description={t('workspaces.customers.subtitle')} noBorder />
+{#snippet sidebarHeader()}
+  <div class="px-6 pt-6 pb-3">
+    <SidebarHeader title={t('workspaces.customers.title')} description={t('workspaces.customers.subtitle')} noBorder />
 
-  <!-- Search -->
-  <div class="relative mb-4">
-    <Search class="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2" style="color: var(--ds-icon-subtle);" />
-    <input
-      type="text"
-      bind:value={searchQuery}
-      placeholder={t('workspaces.customers.searchOrganisations')}
-      class="w-full pl-9 pr-3 py-2 text-sm border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-      style="background-color: var(--ds-surface); border-color: var(--ds-border); color: var(--ds-text);"
-    />
+    <!-- Search remains available while the organisation list scrolls. -->
+    <div class="relative">
+      <Search class="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2" style="color: var(--ds-icon-subtle);" />
+      <Input
+        type="text"
+        bind:value={searchQuery}
+        placeholder={t('workspaces.customers.searchOrganisations')}
+        class="pl-9"
+        size="small"
+      />
+    </div>
   </div>
+{/snippet}
 
+{#snippet sidebarFooter()}
+  <div class="px-6 pb-6 pt-4 border-t" style="border-color: var(--ds-border);">
+    <Button variant="default" icon={Plus} onclick={onManageOrgs} class="w-full justify-center">
+      {t('workspaces.customers.manageOrganisations')}
+    </Button>
+  </div>
+{/snippet}
+
+<NavigationSidebar
+  title={t('workspaces.customers.title')}
+  header={sidebarHeader}
+  footer={sidebarFooter}
+  contentClass="px-6 pb-6"
+>
   <!-- Navigation -->
-  <nav class="flex-1 overflow-y-auto space-y-1 -mx-1 px-1 -mt-1 pt-1">
+  <nav class="space-y-1 -mx-1 px-1 -mt-1 pt-1">
     <!-- Unassigned -->
     <button
       data-org-id="null"
+      data-testid="customer-organization-unassigned"
       onclick={() => onSelect(null)}
-      class="w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 {dragOverOrgId === null ? 'ring-2 ring-blue-400' : ''}"
-      style={getButtonStyle(null, selectedOrgId === null, dragOverOrgId === null)}
-      onmouseenter={(e) => { if (selectedOrgId !== null && dragOverOrgId !== null) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-      onmouseleave={(e) => { if (selectedOrgId !== null && dragOverOrgId !== null) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+      class="org-nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 {dragOverOrgId === null ? 'ring-2 ring-ds-border-focused' : ''}"
+      class:active={selectedOrgId === null}
+      class:drag-over={dragOverOrgId === null}
     >
       <div class="w-6 h-6 flex items-center justify-center flex-shrink-0">
         <Users class="w-4 h-4" />
@@ -73,11 +82,11 @@
       {@const isDragOver = dragOverOrgId === org.id}
       <button
         data-org-id={org.id}
+        data-testid="customer-organization"
         onclick={() => onSelect(org.id)}
-        class="w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 {isDragOver ? 'ring-2 ring-blue-400' : ''}"
-        style={getButtonStyle(org.id, isActive, isDragOver)}
-        onmouseenter={(e) => { if (!isActive && !isDragOver) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-        onmouseleave={(e) => { if (!isActive && !isDragOver) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+        class="org-nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 {isDragOver ? 'ring-2 ring-ds-border-focused' : ''}"
+        class:active={isActive}
+        class:drag-over={isDragOver}
       >
         <Avatar
           src={org.avatar_url}
@@ -104,10 +113,25 @@
     {/if}
   </nav>
 
-  <!-- Footer -->
-  <div class="pt-4 border-t" style="border-color: var(--ds-border);">
-    <Button variant="default" icon={Plus} onclick={onManageOrgs} class="w-full justify-center">
-      {t('workspaces.customers.manageOrganisations')}
-    </Button>
-  </div>
-</div>
+</NavigationSidebar>
+
+<style>
+  .org-nav-btn {
+    color: var(--ds-text-subtle);
+  }
+
+  .org-nav-btn:hover:not(.active):not(.drag-over) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .org-nav-btn.active {
+    background: var(--ds-surface-selected);
+    color: var(--ds-text);
+  }
+
+  .org-nav-btn.drag-over {
+    background: rgba(59, 130, 246, 0.1);
+    color: var(--ds-text);
+  }
+</style>

@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { slide } from 'svelte/transition';
+  import Badge from '../../components/Badge.svelte';
   import { api } from '../../api.js';
   import { Plus, Check, X, Trash2, ChevronDown, ChevronRight } from '@lucide/svelte';
   import WorkItemRow from './WorkItemRow.svelte';
@@ -11,10 +11,15 @@
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
   import Checkbox from '../../components/Checkbox.svelte';
+  import Input from '../../components/Input.svelte';
   import EmptyState from '../../components/EmptyState.svelte';
   import Button from '../../components/Button.svelte';
 
-  let { workspaceId } = $props();
+  /**
+   * Optional row-click delegate: when provided (mobile shell), tapping a row
+   * hands the item id to the host instead of opening the desktop modal.
+   */
+  let { workspaceId, onopen = null } = $props();
 
   let personalTodos = $state([]);
   let assignedWork = $state([]);
@@ -37,17 +42,23 @@
   const COLLAPSED_KEY = `todo-collapsed-${workspaceId}`;
   let personalCollapsed = $state(false);
   let assignedCollapsed = $state(false);
+  // The completed-history filter starts collapsed on the phone (sm+ shows it
+  // inline regardless); the choice persists with the section state.
+  let filterOpen = $state(false);
 
   // Done-items date range: caps the indefinitely-growing completed list.
-  // '7' | '30' | '90' | 'all' | 'custom'; default = last 7 days.
-  const RANGE_KEY = `todo-done-range-${workspaceId}`;
+  // 'none' | '7' | '30' | '90' | 'all' | 'custom'; default = last 7 days.
   // svelte-ignore state_referenced_locally
+  const RANGE_KEY = `todo-done-range-${workspaceId}`;
   let completedRange = $state('7');
   let customDate = $state('');
 
-  // ISO date (YYYY-MM-DD) sent as completed_since, or null for "All time".
+  // ISO date (YYYY-MM-DD) sent as completed_since, null for "All time", or a
+  // far-future date for "None" so no completed item can match while open items
+  // still pass the server-side filter.
   let completedSince = $derived.by(() => {
     if (completedRange === 'all') return null;
+    if (completedRange === 'none') return '9999-12-31';
     if (completedRange === 'custom') return customDate || null;
     const days = parseInt(completedRange, 10);
     const d = new Date();
@@ -56,6 +67,7 @@
   });
 
   const RANGE_PRESETS = [
+    { value: 'none', label: () => t('todo.rangeNone') },
     { value: '7', label: () => t('todo.range7d') },
     { value: '30', label: () => t('todo.range30d') },
     { value: '90', label: () => t('todo.range90d') },
@@ -69,6 +81,7 @@
         const parsed = JSON.parse(saved);
         personalCollapsed = parsed.personal ?? false;
         assignedCollapsed = parsed.assigned ?? false;
+        filterOpen = parsed.filter ?? false;
       }
     } catch { /* ignore */ }
   }
@@ -77,9 +90,15 @@
     try {
       localStorage.setItem(COLLAPSED_KEY, JSON.stringify({
         personal: personalCollapsed,
-        assigned: assignedCollapsed
+        assigned: assignedCollapsed,
+        filter: filterOpen
       }));
     } catch { /* ignore */ }
+  }
+
+  function toggleFilterOpen() {
+    filterOpen = !filterOpen;
+    persistCollapsedState();
   }
 
   function togglePersonalCollapsed() {
@@ -161,7 +180,7 @@
       };
       if (completedSince) filters.completed_since = completedSince;
       const response = await api.items.getAll(filters);
-      personalTodos = response?.items || response || [];
+      personalTodos = response?.data ?? [];
     } catch (error) {
       console.error('Failed to load personal todos:', error);
       personalTodos = [];
@@ -182,7 +201,7 @@
       };
       if (completedSince) filters.completed_since = completedSince;
       const response = await api.items.getAll(filters);
-      let allAssigned = response?.items || response || [];
+      let allAssigned = response?.data ?? [];
       assignedWork = allAssigned.filter(item => item.workspace_id !== parseInt(workspaceId));
     } catch (error) {
       console.error('Failed to load assigned work:', error);
@@ -207,13 +226,10 @@
     if (!newTodoTitle.trim()) return;
 
     try {
-      const defaultStatus = statuses.find(s => s.is_default) || statuses.find(s => s.name.toLowerCase() === 'open') || statuses[0];
-
       const todoData = {
         title: newTodoTitle.trim(),
         description: '',
-        workspace_id: parseInt(workspaceId),
-        status_id: defaultStatus?.id || 1
+        workspace_id: parseInt(workspaceId)
       };
 
       await api.items.create(todoData);
@@ -269,6 +285,10 @@
   }
 
   function openItem(itemId) {
+    if (onopen) {
+      onopen(itemId);
+      return;
+    }
     selectedItemId = itemId;
     showItemModal = true;
   }
@@ -335,38 +355,74 @@
 </script>
 
 <div style="background-color: var(--ds-surface);">
-  <div class="p-6">
+  <div class="p-4 sm:p-6">
     {#if loading}
       <div class="text-center py-12 animate-pulse" style="color: var(--ds-text-subtle);">{t('todo.loadingTasks')}</div>
     {:else}
       <div class="flex flex-col gap-4">
-        <!-- Completed-items range filter (caps the indefinitely-growing done list) -->
-        <div class="flex flex-wrap items-center gap-3 px-3 py-2 rounded-lg" style="background-color: var(--ds-surface-raised);">
-          <span class="text-xs font-medium" style="color: var(--ds-text-subtle);">{t('todo.doneFilterLabel')}</span>
-          <div class="flex items-center gap-1">
-            {#each RANGE_PRESETS as preset (preset.value)}
-              <Button
-                dataTestid={`done-range-${preset.value}`}
-                variant={completedRange === preset.value ? 'primary' : 'ghost'}
-                size="small"
-                onclick={() => selectRange(preset.value)}
-              >
-                {preset.label()}
-              </Button>
-            {/each}
+        <!-- Completed-history filter: inline on sm+, collapsed behind a
+             toggle on the phone where the full bar eats the task list. -->
+        <button
+          class="flex w-full items-center justify-between gap-2 px-3 py-2 rounded-lg select-none sm:hidden"
+          style="background-color: var(--ds-surface-raised);"
+          onclick={toggleFilterOpen}
+          data-testid="todo-filter-toggle"
+          aria-expanded={filterOpen}
+          aria-controls="todo-done-filter"
+          type="button"
+        >
+          <span class="text-sm font-medium" style="color: var(--ds-text);">{t('todo.doneFilterLabel')}</span>
+          <span class="flex-shrink-0" style="color: var(--ds-text-subtle);">
+            {#if filterOpen}
+              <ChevronDown class="w-4 h-4" />
+            {:else}
+              <ChevronRight class="w-4 h-4" />
+            {/if}
+          </span>
+        </button>
+        <div
+          id="todo-done-filter"
+          data-testid="todo-done-filter"
+          class="{filterOpen ? 'flex' : 'hidden'} sm:flex flex-wrap items-center justify-between gap-x-6 gap-y-3 px-3 py-2.5 sm:px-4 sm:py-3 rounded-lg"
+          style="background-color: var(--ds-surface-raised);"
+        >
+          <div class="min-w-48">
+            <div class="text-sm font-medium" style="color: var(--ds-text);">{t('todo.doneFilterLabel')}</div>
+            <div class="mt-0.5 text-xs" style="color: var(--ds-text-subtle);">{t('todo.completedHistoryHint')}</div>
           </div>
-          <input
-            type="date"
-            data-testid="done-range-date"
-            value={customDate}
-            onchange={onCustomDateChange}
-            aria-label={t('todo.doneFilterLabel')}
-            class="date-input text-sm rounded border px-3 py-1.5 transition-colors bg-[var(--ds-background-input)] text-[var(--ds-text)] hover:border-[var(--ds-interactive)] focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50 {completedRange === 'custom' ? 'border-[var(--ds-interactive)]' : 'border-[var(--ds-border)]'}"
-          />
+          <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <div class="flex flex-wrap items-center gap-1" role="group" aria-label={t('todo.doneFilterLabel')}>
+              {#each RANGE_PRESETS as preset (preset.value)}
+                <Button
+                  dataTestid={`done-range-${preset.value}`}
+                  variant={completedRange === preset.value ? 'primary' : 'ghost'}
+                  size="small"
+                  onclick={() => selectRange(preset.value)}
+                >
+                  {preset.label()}
+                </Button>
+              {/each}
+            </div>
+            <div class="flex items-center gap-2">
+              <label for="done-range-date" class="text-xs font-medium" style="color: var(--ds-text-subtle);">
+                {t('todo.customDateLabel')}
+              </label>
+              <Input
+                id="done-range-date"
+                type="date"
+                dataTestid="done-range-date"
+                value={customDate}
+                onchange={onCustomDateChange}
+                ariaLabel={t('todo.customDateAriaLabel')}
+                class="date-input {completedRange === 'custom' ? 'border-[var(--ds-interactive)]' : 'border-[var(--ds-border)]'}"
+                size="small"
+              />
+            </div>
+          </div>
         </div>
 
         <!-- Personal Tasks Section -->
-        <div>
+        <div data-testid="todo-personal-section">
           <button
             class="w-full flex items-center gap-2 px-3 py-2 rounded-lg transition-colors select-none section-header"
             onclick={togglePersonalCollapsed}
@@ -379,30 +435,28 @@
               {/if}
             </span>
             <span class="font-semibold text-sm" style="color: var(--ds-text);">{t('todo.myPersonalTasks')}</span>
-            <span class="ml-auto text-xs px-2 py-0.5 rounded-full" style="background-color: var(--ds-surface-raised); color: var(--ds-text-subtle);">
-              {personalTodos.length} {personalTodos.length === 1 ? 'item' : 'items'}
-            </span>
+            <Badge size="sm" class="ml-auto">{t('todo.itemCount', { count: personalTodos.length })}</Badge>
           </button>
 
           {#if !personalCollapsed}
-            <div transition:slide={{ duration: 200 }} class="mt-1">
+            <div class="mt-1">
               <!-- Add Todo -->
               <div class="mb-2 px-1">
                 {#if isAddingTodo}
                   <div class="flex items-center gap-3 p-3 border rounded-lg" style="border-color: var(--ds-interactive); background-color: var(--ds-background-selected);">
-                    <input
+                    <Input
                       id="new-todo-input"
                       type="text"
                       bind:value={newTodoTitle}
                       onkeydown={handleKeydown}
                       placeholder={t('todo.whatNeedsToBeDone')}
-                      class="flex-1 px-3 py-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      style="background-color: var(--ds-background-input); color: var(--ds-text); border-color: var(--ds-border);"
+                      class="flex-1"
+                      size="small"
                     />
                     <button
                       onclick={saveTodo}
                       disabled={!newTodoTitle.trim()}
-                      class="p-2 text-green-600 hover:text-green-700 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed add-btn"
+                      class="p-2 text-ds-text-success hover:opacity-80 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed add-btn"
                     >
                       <Check class="w-5 h-5" />
                     </button>
@@ -417,6 +471,7 @@
                 {:else}
                   <button
                     onclick={startAddingTodo}
+                    data-testid="todo-add-task"
                     class="w-full flex items-center gap-3 p-3 border-2 border-dashed rounded-lg transition-colors add-task-btn"
                     style="border-color: var(--ds-border); color: var(--ds-text-subtle);"
                   >
@@ -441,6 +496,7 @@
                       {statusCategories}
                       showIcon={false}
                       showStatus={false}
+                      dataTestid="todo-personal-row"
                       onclick={() => openItem(todo.id)}
                     >
                       {#snippet leading()}
@@ -451,16 +507,17 @@
                             checked={isPersonalTaskCompleted(todo)}
                             onchange={() => togglePersonalTask(todo)}
                             size="small"
+                            dataTestid="todo-personal-checkbox"
                           />
                         </div>
                       {/snippet}
                       {#snippet trailing()}
                         <!-- svelte-ignore a11y_click_events_have_key_events -->
                         <!-- svelte-ignore a11y_no_static_element_interactions -->
-                        <div class="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" onclick={(e) => e.stopPropagation()}>
+                        <div class="flex-shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity" onclick={(e) => e.stopPropagation()}>
                           <button
                             onclick={() => deleteTodo(todo, true)}
-                            class="p-1 text-red-500 hover:text-red-700 rounded transition-colors delete-btn"
+                            class="p-1 text-ds-text-danger hover:opacity-80 rounded transition-colors delete-btn"
                           >
                             <Trash2 class="w-4 h-4" />
                           </button>
@@ -483,7 +540,7 @@
         </div>
 
         <!-- Assigned to Me Section -->
-        <div>
+        <div data-testid="todo-assigned-section">
           <button
             class="w-full flex items-center gap-2 px-3 py-2 rounded-lg transition-colors select-none section-header"
             onclick={toggleAssignedCollapsed}
@@ -496,13 +553,11 @@
               {/if}
             </span>
             <span class="font-semibold text-sm" style="color: var(--ds-text);">{t('todo.assignedToMe')}</span>
-            <span class="ml-auto text-xs px-2 py-0.5 rounded-full" style="background-color: var(--ds-surface-raised); color: var(--ds-text-subtle);">
-              {assignedWork.length} {assignedWork.length === 1 ? 'item' : 'items'}
-            </span>
+            <Badge size="sm" class="ml-auto">{t('todo.itemCount', { count: assignedWork.length })}</Badge>
           </button>
 
           {#if !assignedCollapsed}
-            <div transition:slide={{ duration: 200 }} class="mt-1">
+            <div class="mt-1">
               {#if assignedWork.length === 0}
                 <EmptyState
                   title={t('todo.noAssignedWork')}
@@ -517,15 +572,16 @@
                       {statusCategories}
                       showWorkspace={true}
                       showStatus={true}
+                      dataTestid="todo-assigned-row"
                       onclick={() => openItem(item.id)}
                     >
                       {#snippet trailing()}
                         <!-- svelte-ignore a11y_click_events_have_key_events -->
                         <!-- svelte-ignore a11y_no_static_element_interactions -->
-                        <div class="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" onclick={(e) => e.stopPropagation()}>
+                        <div class="flex-shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity" onclick={(e) => e.stopPropagation()}>
                           <button
                             onclick={() => deleteTodo(item, false)}
-                            class="p-1 text-red-500 hover:text-red-700 rounded transition-colors delete-btn"
+                            class="p-1 text-ds-text-danger hover:opacity-80 rounded transition-colors delete-btn"
                           >
                             <Trash2 class="w-4 h-4" />
                           </button>
@@ -549,7 +605,6 @@
     <PersonalTaskDetail
       itemId={selectedItemId}
       workspaceId={getWorkspaceIdForItem(selectedItemId)}
-      {statuses}
       onclose={closeItemModal}
       onupdate={handleItemUpdate}
     />
@@ -599,7 +654,7 @@
 
   /* Tint the native calendar picker indicator so it reads correctly in dark
      mode — a vendor pseudo-element that can't be targeted via Tailwind. */
-  :global(.dark) .date-input::-webkit-calendar-picker-indicator {
+  :global(.dark .date-input::-webkit-calendar-picker-indicator) {
     filter: invert(1) opacity(0.7);
   }
 </style>

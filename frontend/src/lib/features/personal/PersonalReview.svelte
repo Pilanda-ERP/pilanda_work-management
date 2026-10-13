@@ -6,10 +6,10 @@
   import EmptyState from '../../components/EmptyState.svelte';
   import Card from '../../components/Card.svelte';
   import WorkItemRow from '../items/WorkItemRow.svelte';
-  import { scale } from 'svelte/transition';
   import PageHeader from '../../layout/PageHeader.svelte';
   import MilkdownEditor from '../../editors/LazyMilkdownEditor.svelte';
   import Button from '../../components/Button.svelte';
+  import Input from '../../components/Input.svelte';
   import { getShortcut, matchesShortcut, toHotkeyString } from '../../utils/keyboardShortcuts.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { formatDate, formatDateSimple, formatDateWithOptions } from '../../utils/dateFormatter.js';
@@ -95,8 +95,10 @@ ${t('personal.placeholderImprovements')}`;
     currentDate = formatDate(new Date());
   }
 
-  // Load completed items for the date range
-  async function loadCompletedItems() {
+  // Load completed items for the date range. Callers pass their request
+  // generation so a superseded load cannot overwrite completedItems/itemTypes
+  // with results for an older date (WI-1419).
+  async function loadCompletedItems(generation = reviewGeneration) {
     try {
       let startDate, endDate;
 
@@ -112,19 +114,27 @@ ${t('personal.placeholderImprovements')}`;
         api.reviews.getCompletedItems(startDate, endDate),
         api.itemTypes.getAll()
       ]);
+      if (generation !== reviewGeneration) return;
       completedItems = items || [];
       itemTypes = types || [];
     } catch (error) {
+      if (generation !== reviewGeneration) return;
       console.error('Failed to load completed items:', error);
       completedItems = [];
     }
   }
 
-  // Load existing review for the current date and type
+  // Load existing review for the current date and type. A request-generation
+  // guard discards stale responses when the user navigates faster than the
+  // network resolves (WI-1386): without it, reviewContent/existingReview could
+  // end up belonging to an older date while autosave stamps the current one.
+  let reviewGeneration = 0;
   async function loadReview() {
+    const generation = ++reviewGeneration;
     loading = true;
     try {
-      await loadCompletedItems();
+      await loadCompletedItems(generation);
+      if (generation !== reviewGeneration) return;
 
       const reviews = await api.reviews.getAll({
         type: reviewType,
@@ -132,6 +142,8 @@ ${t('personal.placeholderImprovements')}`;
         end_date: currentDate,
         limit: 1
       });
+
+      if (generation !== reviewGeneration) return;
 
       if (reviews && reviews.length > 0) {
         existingReview = reviews[0];
@@ -154,9 +166,13 @@ ${t('personal.placeholderImprovements')}`;
       }
       previousContent = reviewContent;
     } catch (error) {
-      console.error('Failed to load review:', error);
+      if (generation === reviewGeneration) {
+        console.error('Failed to load review:', error);
+      }
     } finally {
-      loading = false;
+      if (generation === reviewGeneration) {
+        loading = false;
+      }
     }
   }
 
@@ -310,19 +326,20 @@ ${t('personal.placeholderImprovements')}`;
         <!-- Date Navigation -->
         <div class="flex items-center space-x-2">
           <button
+            data-testid="review-nav-prev"
             class="p-2 rounded transition-colors"
             style="color: var(--ds-text-subtle); hover:background-color: var(--ds-background-neutral-hovered);"
             onclick={() => navigateDate(-1)}
           >
             <ChevronLeft class="w-4 h-4" />
           </button>
-          <input
+          <Input
             type="date"
             bind:value={currentDate}
-            class="text-sm border-none bg-transparent cursor-pointer rounded px-2 py-1 transition-colors"
-            style="color: var(--ds-text-subtle); hover:background-color: var(--ds-background-neutral-hovered);"
+            class="w-auto border-0 bg-transparent cursor-pointer px-2 py-1"
           />
           <button
+            data-testid="review-nav-next"
             class="p-2 rounded transition-colors"
             style="color: var(--ds-text-subtle); hover:background-color: var(--ds-background-neutral-hovered);"
             onclick={() => navigateDate(1)}
@@ -372,7 +389,6 @@ ${t('personal.placeholderImprovements')}`;
             <div
               class="absolute right-0 top-12 w-80 rounded shadow-lg border z-50 p-4"
               style="background-color: var(--ds-surface); border-color: var(--ds-border);"
-              transition:scale={{ duration: 150, start: 0.95 }}
             >
               <div class="flex items-center space-x-3 mb-4">
                 <Clock class="w-4 h-4" style="color: var(--ds-text-subtle);" />

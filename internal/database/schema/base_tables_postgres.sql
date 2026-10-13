@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS users (
 	email_verification_expires TIMESTAMPTZ, -- Expiry time for verification token
 	scim_external_id TEXT, -- SCIM externalId from identity provider
 	scim_managed BOOLEAN DEFAULT false, -- If true, user is managed via SCIM
+	scim_deleted_at TIMESTAMPTZ, -- Set when the IdP deprovisioned the user via SCIM DELETE; row retained but hidden from every SCIM query (RFC 7644 §3.6)
+	offboarded_at TIMESTAMPTZ, -- Set when the account is administratively offboarded; never cleared, every activation path must reject it
+	erased_at TIMESTAMPTZ, -- Set when the account completed Article 17 erasure; implies offboarded_at and is never cleared
 	is_agent BOOLEAN DEFAULT false, -- If true, user is a non-human agent (API-only; cannot log in)
 	agent_owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, -- NULL = service user (admin-provisioned); non-NULL = owned agent
 	-- Distinguishes how an agent row got created. 'user' covers both the
@@ -74,6 +77,26 @@ CREATE TRIGGER users_is_agent_immutable_trigger
 BEFORE UPDATE ON users
 FOR EACH ROW EXECUTE FUNCTION users_is_agent_immutable();
 
+-- OAuth agent provenance is fixed at account creation. Allowing either field
+-- to change later would break the audit trail tying the agent to its client.
+-- migration: trig_users_oauth_provenance_immutable_postgres
+CREATE OR REPLACE FUNCTION users_oauth_provenance_immutable() RETURNS TRIGGER AS $$
+BEGIN
+	IF COALESCE(NEW.agent_provenance, '') IS DISTINCT FROM COALESCE(OLD.agent_provenance, '') THEN
+		RAISE EXCEPTION 'agent_provenance is immutable';
+	END IF;
+	IF NEW.oauth_client_id IS DISTINCT FROM OLD.oauth_client_id THEN
+		RAISE EXCEPTION 'oauth_client_id is immutable';
+	END IF;
+	RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS users_oauth_provenance_immutable_trigger ON users;
+CREATE TRIGGER users_oauth_provenance_immutable_trigger
+BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION users_oauth_provenance_immutable();
+
 -- Channel Categories table for organizing channels
 CREATE TABLE IF NOT EXISTS channel_categories (
 	id SERIAL PRIMARY KEY,
@@ -90,10 +113,11 @@ CREATE TABLE IF NOT EXISTS channels (
 	name TEXT NOT NULL,
 	type TEXT NOT NULL, -- smtp, webhook, portal, imap, etc.
 	direction TEXT NOT NULL, -- inbound, outbound
-	description TEXT,
+	description TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL DEFAULT 'disabled', -- enabled, disabled
-	is_default BOOLEAN DEFAULT false,
-	config TEXT, -- JSON configuration data specific to channel type
+	is_default BOOLEAN NOT NULL DEFAULT false,
+	config TEXT NOT NULL DEFAULT '{}', -- JSON configuration data specific to channel type
+	public_slug TEXT, -- normalized portal/form slug used for race-safe uniqueness
 	plugin_name TEXT, -- NULL for user-created, plugin name for plugin-managed
 	plugin_webhook_id TEXT, -- Plugin's internal webhook identifier
 	category_id INTEGER REFERENCES channel_categories(id) ON DELETE SET NULL,
@@ -108,6 +132,9 @@ CREATE INDEX IF NOT EXISTS idx_channels_status ON channels(status);
 CREATE INDEX IF NOT EXISTS idx_channels_is_default ON channels(is_default);
 CREATE INDEX IF NOT EXISTS idx_channels_plugin_name ON channels(plugin_name);
 CREATE INDEX IF NOT EXISTS idx_channels_category_id ON channels(category_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channels_public_slug
+	ON channels(type, public_slug)
+	WHERE direction = 'inbound' AND public_slug IS NOT NULL;
 
 -- From time_tracking_postgres.sql
 CREATE TABLE IF NOT EXISTS customer_organisations (
@@ -118,6 +145,9 @@ CREATE TABLE IF NOT EXISTS customer_organisations (
 	active BOOLEAN DEFAULT true,
 	avatar_url TEXT,
 	custom_field_values JSONB,
+	-- Flexible per-organisation attributes (portal request sharing, etc.).
+	-- Empty object means "all defaults".
+	settings JSONB NOT NULL DEFAULT '{}'::JSONB,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
@@ -164,6 +194,7 @@ CREATE TABLE IF NOT EXISTS custom_field_indexes (
 -- From config_workflows_postgres.sql
 CREATE TABLE IF NOT EXISTS workflows (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL,
 	description TEXT,
 	is_default BOOLEAN DEFAULT false,
@@ -173,6 +204,7 @@ CREATE TABLE IF NOT EXISTS workflows (
 
 CREATE TABLE IF NOT EXISTS screens (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL,
 	description TEXT,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -182,6 +214,7 @@ CREATE TABLE IF NOT EXISTS screens (
 
 CREATE TABLE IF NOT EXISTS priorities (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL UNIQUE,
 	description TEXT,
 	is_default BOOLEAN DEFAULT false,
@@ -194,6 +227,7 @@ CREATE TABLE IF NOT EXISTS priorities (
 
 CREATE TABLE IF NOT EXISTS item_types (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	configuration_set_id INTEGER, -- Made nullable for many-to-many relationship
 	name TEXT NOT NULL UNIQUE, -- Changed to global unique (not per config set)
 	description TEXT,
@@ -208,6 +242,7 @@ CREATE TABLE IF NOT EXISTS item_types (
 
 CREATE TABLE IF NOT EXISTS hierarchy_levels (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	level INTEGER NOT NULL UNIQUE,
 	name TEXT NOT NULL,
 	description TEXT DEFAULT '',
@@ -217,6 +252,7 @@ CREATE TABLE IF NOT EXISTS hierarchy_levels (
 
 CREATE TABLE IF NOT EXISTS status_categories (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL UNIQUE,
 	color TEXT NOT NULL,  -- Hex color code (e.g., "#3b82f6")
 	description TEXT,
@@ -270,6 +306,7 @@ CREATE INDEX IF NOT EXISTS idx_system_settings_category ON system_settings(categ
 
 CREATE TABLE IF NOT EXISTS themes (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL,
 	description TEXT,
 	is_default BOOLEAN DEFAULT false,
@@ -278,19 +315,25 @@ CREATE TABLE IF NOT EXISTS themes (
 	nav_text_color_light TEXT NOT NULL DEFAULT '#374151',
 	nav_background_color_dark TEXT NOT NULL DEFAULT '#1f2937',
 	nav_text_color_dark TEXT NOT NULL DEFAULT '#f3f4f6',
+	logo_url TEXT,
+	logo_url_dark TEXT,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_themes_builtin_key ON themes(builtin_key) WHERE builtin_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS board_configurations (
 	id SERIAL PRIMARY KEY,
 	workspace_id INTEGER,
 	collection_id INTEGER,
-	backlog_status_ids TEXT,
-	list_columns TEXT,
-	roadmap_config TEXT,
-	card_fields TEXT,
+	backlog_status_ids JSONB,
+	list_columns JSONB,
+	roadmap_config JSONB,
+	card_fields JSONB,
+	view_settings JSONB,
 	show_rightmost_column_last_50 BOOLEAN DEFAULT false,
+	completed_item_retention_days INTEGER,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
@@ -308,6 +351,7 @@ CREATE TABLE IF NOT EXISTS attachment_settings (
 
 CREATE TABLE IF NOT EXISTS link_types (
 	id SERIAL PRIMARY KEY,
+	builtin_key TEXT,
 	name TEXT NOT NULL UNIQUE,
 	description TEXT,
 	forward_label TEXT NOT NULL,
@@ -319,6 +363,8 @@ CREATE TABLE IF NOT EXISTS link_types (
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_link_types_builtin_key ON link_types(builtin_key) WHERE builtin_key IS NOT NULL;
 
 -- Email templates: per-sender HTML/text/subject Go templates editable from the
 -- admin UI. `name` is the lookup key consumed by senders (e.g. "magic_link",
@@ -386,6 +432,7 @@ CREATE TABLE IF NOT EXISTS contact_roles (
 	name TEXT NOT NULL UNIQUE,
 	description TEXT,
 	is_system BOOLEAN DEFAULT false,
+	sort_order INTEGER NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 

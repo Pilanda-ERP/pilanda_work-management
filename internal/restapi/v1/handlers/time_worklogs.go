@@ -1,19 +1,15 @@
 package handlers
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
-	"windshift/internal/database"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/restapi"
-	"windshift/internal/sanitize"
 	"windshift/internal/services"
-	"windshift/internal/utils"
 )
 
 // TimeWorklogHandler provides the v1 bearer-token REST surface for time
@@ -21,7 +17,8 @@ import (
 // authenticated user's entries; create/update/delete target their own.
 type TimeWorklogHandler struct {
 	BaseHandler
-	timePerm *services.TimePermissionService
+	timePerm    *services.TimePermissionService
+	application *services.TimeWorklogService
 }
 
 // NewTimeWorklogHandler wires the handler with the shared permission pipeline.
@@ -29,6 +26,7 @@ func NewTimeWorklogHandler(base BaseHandler, timePerm *services.TimePermissionSe
 	return &TimeWorklogHandler{
 		BaseHandler: base,
 		timePerm:    timePerm,
+		application: services.NewTimeWorklogService(base.DB),
 	}
 }
 
@@ -78,7 +76,23 @@ func mapWorklogToResponse(wl models.Worklog) worklogResponse {
 	}
 }
 
-// ListMine returns worklogs for the authenticated user.
+// ListMine handles GET /rest/api/v1/time/worklogs
+//
+// @Summary      List my worklogs
+// @Description  Returns the authenticated user's worklogs, newest first, with optional date-range and project filters.
+// @Tags         time-tracking
+// @Produce      json
+// @Security     BearerAuth
+// @Param        date_from   query     string  false  "Inclusive start date (YYYY-MM-DD)"
+// @Param        date_to     query     string  false  "Inclusive end date (YYYY-MM-DD)"
+// @Param        timezone    query     string  false  "IANA timezone used to interpret date_from/date_to (defaults to the profile timezone)"
+// @Param        project_id  query     int     false  "Filter by time project ID"
+// @Param        page        query     int     false  "Page (1-indexed)"
+// @Param        limit       query     int     false  "Page size"
+// @Success      200  {object}  handlers.PaginatedResponse{data=[]handlers.worklogResponse}
+// @Failure      400  {object}  restapi.ErrorResponse
+// @Failure      401  {object}  restapi.ErrorResponse
+// @Router       /time/worklogs [get]
 func (h *TimeWorklogHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.RequireAuth(w, r)
 	if !ok {
@@ -92,23 +106,29 @@ func (h *TimeWorklogHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		Offset: pagination.Offset,
 	}
 
+	reportLocation, locationErr := h.resolveReportTimezone(r, user.Timezone)
+	if locationErr != nil {
+		h.RespondError(w, r, locationErr)
+		return
+	}
+
 	if dateFrom := r.URL.Query().Get("date_from"); dateFrom != "" {
-		t, err := time.Parse("2006-01-02", dateFrom)
+		start, _, err := services.CivilDateRangeUTC(dateFrom, dateFrom, reportLocation)
 		if err != nil {
 			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "invalid date_from format, use YYYY-MM-DD"))
 			return
 		}
-		from := t.Unix()
+		from := start.Unix()
 		filter.DateFromUnix = &from
 	}
 	if dateTo := r.URL.Query().Get("date_to"); dateTo != "" {
-		t, err := time.Parse("2006-01-02", dateTo)
+		_, endExclusive, err := services.CivilDateRangeUTC(dateTo, dateTo, reportLocation)
 		if err != nil {
 			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "invalid date_to format, use YYYY-MM-DD"))
 			return
 		}
-		to := t.Add(24*time.Hour - time.Second).Unix()
-		filter.DateToUnix = &to
+		to := endExclusive.Unix()
+		filter.DateToExclusiveUnix = &to
 	}
 	if projectIDStr := r.URL.Query().Get("project_id"); projectIDStr != "" {
 		pid, err := strconv.Atoi(projectIDStr)
@@ -124,6 +144,9 @@ func (h *TimeWorklogHandler) ListMine(w http.ResponseWriter, r *http.Request) {
 		h.RespondInternalError(w, r)
 		return
 	}
+	worklogs = services.RedactInaccessibleWorklogItems(worklogs, func(workspaceID int) (bool, error) {
+		return h.PermissionService.HasWorkspacePermission(user.ID, workspaceID, models.PermissionItemView)
+	})
 
 	out := make([]worklogResponse, 0, len(worklogs))
 	for _, wl := range worklogs {
@@ -142,9 +165,23 @@ type createWorklogRequest struct {
 	EndTime         string `json:"end_time,omitempty"`
 	ItemID          *int   `json:"item_id,omitempty"`
 	ItemKey         string `json:"item_key,omitempty"`
+	Timezone        string `json:"timezone,omitempty"`
 }
 
-// Create logs a new time entry for the authenticated user.
+// Create handles POST /rest/api/v1/time/worklogs
+//
+// @Summary      Log time
+// @Description  Creates a worklog for the authenticated user. Provide either `duration`/`duration_minutes` or a `start_time`+`end_time` pair; `item_id`/`item_key` optionally link the entry to a work item.
+// @Tags         time-tracking
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      handlers.createWorklogRequest  true  "Worklog to create"
+// @Success      201   {object}  map[string]any
+// @Failure      400   {object}  restapi.ErrorResponse
+// @Failure      401   {object}  restapi.ErrorResponse
+// @Failure      403   {object}  restapi.ErrorResponse  "No permission to book time on this project"
+// @Router       /time/worklogs [post]
 func (h *TimeWorklogHandler) Create(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.RequireAuth(w, r)
 	if !ok {
@@ -171,117 +208,68 @@ func (h *TimeWorklogHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sanitize.Apply(&req.Description, sanitize.RichText)
-
-	project, err := repository.NewTimeProjectRepository(h.DB).GetBookingInfo(req.ProjectID)
-	if err != nil {
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusNotFound, "NOT_FOUND", "project not found"))
-		return
-	}
-	if project.Status != "Active" {
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, fmt.Sprintf("project %q is not active (status: %s)", project.Name, project.Status)))
-		return
-	}
-	if project.CustomerID == nil {
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "project has no customer assigned, cannot log time"))
-		return
-	}
-
-	date, err := time.Parse("2006-01-02", req.Date)
-	if err != nil {
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "invalid date format, use YYYY-MM-DD"))
-		return
-	}
-
-	var durationMins int
-	var startUnix, endUnix int64
-	switch {
-	case req.Duration != "":
-		dur, err := utils.ParseDuration(req.Duration)
-		if err != nil {
-			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, fmt.Sprintf("invalid duration: %s", err.Error())))
-			return
-		}
-		durationMins = int(dur.Minutes())
-		startUnix = date.Unix()
-		endUnix = date.Add(dur).Unix()
-	case req.DurationMinutes > 0:
-		durationMins = req.DurationMinutes
-		startUnix = date.Unix()
-		endUnix = date.Add(time.Duration(req.DurationMinutes) * time.Minute).Unix()
-	case req.StartTime != "" && req.EndTime != "":
-		sp := strings.SplitN(req.StartTime, ":", 2)
-		ep := strings.SplitN(req.EndTime, ":", 2)
-		if len(sp) != 2 || len(ep) != 2 {
-			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "start_time and end_time must be in HH:MM format"))
-			return
-		}
-		sh, e1 := strconv.Atoi(sp[0])
-		sm, e2 := strconv.Atoi(sp[1])
-		eh, e3 := strconv.Atoi(ep[0])
-		em, e4 := strconv.Atoi(ep[1])
-		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
-			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "start_time and end_time must be in HH:MM format"))
-			return
-		}
-		st := date.Add(time.Duration(sh)*time.Hour + time.Duration(sm)*time.Minute)
-		et := date.Add(time.Duration(eh)*time.Hour + time.Duration(em)*time.Minute)
-		if !et.After(st) {
-			h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "end_time must be after start_time"))
-			return
-		}
-		durationMins = int(et.Sub(st).Minutes())
-		startUnix, endUnix = st.Unix(), et.Unix()
-	default:
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeMissingField, "provide duration, duration_minutes, or start_time and end_time"))
-		return
-	}
-
-	if durationMins <= 0 {
-		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, "duration must be positive"))
-		return
-	}
-
 	// Resolve optional item link
 	var itemID *int
-	if req.ItemKey != "" {
-		id, err := resolveItemByKey(h.DB, h.PermissionService, user.ID, req.ItemKey)
+	if req.ItemKey != "" || (req.ItemID != nil && *req.ItemID > 0) {
+		rawID := 0
+		if req.ItemID != nil {
+			rawID = *req.ItemID
+		}
+		id, err := services.ResolveAccessibleWorklogItem(h.DB, rawID, req.ItemKey, func(workspaceID int) (bool, error) {
+			return h.PermissionService.HasWorkspacePermission(user.ID, workspaceID, models.PermissionItemView)
+		})
 		if err != nil {
 			h.RespondError(w, r, restapi.NewAPIError(http.StatusNotFound, "NOT_FOUND", "item not found"))
 			return
 		}
 		itemID = &id
-	} else if req.ItemID != nil && *req.ItemID > 0 {
-		itemID = req.ItemID
 	}
 
-	id, err := repository.NewTimeWorklogRepository(h.DB).Create(repository.NewWorklog{
-		ProjectID:       req.ProjectID,
-		CustomerID:      *project.CustomerID,
-		UserID:          user.ID,
-		ItemID:          itemID,
-		Description:     req.Description,
-		DateUnix:        date.Unix(),
-		StartTimeUnix:   startUnix,
-		EndTimeUnix:     endUnix,
-		DurationMinutes: durationMins,
+	result, err := h.application.Create(user.ID, services.WorklogMutationInput{
+		ProjectID: req.ProjectID, ItemID: itemID, Description: req.Description, Date: req.Date,
+		Duration: req.Duration, DurationMinutes: req.DurationMinutes,
+		StartTime: req.StartTime, EndTime: req.EndTime, Timezone: req.Timezone,
 	})
 	if err != nil {
-		h.RespondInternalError(w, r)
+		h.respondMutationError(w, r, err)
 		return
 	}
 
 	h.RespondCreated(w, map[string]any{
-		"id":               id,
+		"id":               result.Worklog.ID,
 		"project_id":       req.ProjectID,
-		"project_name":     project.Name,
+		"project_name":     result.Worklog.ProjectName,
 		"date":             req.Date,
-		"duration_minutes": durationMins,
-		"description":      req.Description,
+		"duration_minutes": result.DurationMinutes,
+		"description":      result.Worklog.Description,
+		"timezone":         result.Timezone,
+		"start_time_local": time.Unix(result.StartTimeUnix, 0).In(result.Location).Format("15:04"),
+		"end_time_local":   time.Unix(result.EndTimeUnix, 0).In(result.Location).Format("15:04"),
+		"start_at":         time.Unix(result.StartTimeUnix, 0).UTC().Format(time.RFC3339),
+		"end_at":           time.Unix(result.EndTimeUnix, 0).UTC().Format(time.RFC3339),
 	})
 }
 
-// Update changes the description of an existing worklog. Only the owning user can update.
+type updateWorklogRequest struct {
+	Description string `json:"description"`
+}
+
+// Update handles PUT /rest/api/v1/time/worklogs/{id}
+//
+// @Summary      Update a worklog description
+// @Description  Changes the description of an existing worklog. Only the owning user may update; other users get 403.
+// @Tags         time-tracking
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      int                            true  "Worklog ID"
+// @Param        body  body      handlers.updateWorklogRequest  true  "New description"
+// @Success      200   {object}  map[string]any
+// @Failure      400   {object}  restapi.ErrorResponse
+// @Failure      401   {object}  restapi.ErrorResponse
+// @Failure      403   {object}  restapi.ErrorResponse  "Caller does not own the worklog"
+// @Failure      404   {object}  restapi.ErrorResponse
+// @Router       /time/worklogs/{id} [put]
 func (h *TimeWorklogHandler) Update(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.RequireAuth(w, r)
 	if !ok {
@@ -293,9 +281,7 @@ func (h *TimeWorklogHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Description string `json:"description"`
-	}
+	var req updateWorklogRequest
 	if !h.DecodeBodyOrRespond(w, r, &req) {
 		return
 	}
@@ -311,8 +297,7 @@ func (h *TimeWorklogHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sanitize.Apply(&req.Description, sanitize.RichText)
-	if err := worklogRepo.UpdateDescription(worklogID, req.Description); err != nil {
+	if _, err := h.application.UpdateDescription(worklogID, req.Description); err != nil {
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -320,7 +305,19 @@ func (h *TimeWorklogHandler) Update(w http.ResponseWriter, r *http.Request) {
 	h.RespondOK(w, map[string]any{"id": worklogID, "updated": true})
 }
 
-// Delete removes a worklog. Only the owning user can delete.
+// Delete handles DELETE /rest/api/v1/time/worklogs/{id}
+//
+// @Summary      Delete a worklog
+// @Description  Removes a worklog. Only the owning user may delete; other users get 403.
+// @Tags         time-tracking
+// @Security     BearerAuth
+// @Param        id   path  int  true  "Worklog ID"
+// @Success      204  "Deleted"
+// @Failure      400  {object}  restapi.ErrorResponse
+// @Failure      401  {object}  restapi.ErrorResponse
+// @Failure      403  {object}  restapi.ErrorResponse  "Caller does not own the worklog"
+// @Failure      404  {object}  restapi.ErrorResponse
+// @Router       /time/worklogs/{id} [delete]
 func (h *TimeWorklogHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.RequireAuth(w, r)
 	if !ok {
@@ -343,7 +340,7 @@ func (h *TimeWorklogHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := worklogRepo.Delete(worklogID); err != nil {
+	if err := h.application.Delete(worklogID); err != nil {
 		h.RespondInternalError(w, r)
 		return
 	}
@@ -351,32 +348,25 @@ func (h *TimeWorklogHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	h.RespondNoContent(w)
 }
 
-// resolveItemByKey looks up an item by its key (e.g. "PROJ-42") and verifies
-// the user can view the item's workspace. Returns the item's numeric ID.
-func resolveItemByKey(db database.Database, permService *services.PermissionService, userID int, itemKey string) (int, error) {
-	parts := strings.SplitN(itemKey, "-", 2)
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("invalid item key format")
+func (h *TimeWorklogHandler) resolveReportTimezone(r *http.Request, profileTimezone string) (*time.Location, *restapi.APIError) {
+	raw := r.URL.Query().Get("timezone")
+	if raw == "" {
+		raw = profileTimezone
 	}
-	itemNum, err := strconv.Atoi(parts[1])
+	_, location, err := services.ResolveTimezone(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid item number in key")
+		return nil, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, err.Error())
 	}
+	return location, nil
+}
 
-	itemRepo := repository.NewItemRepository(db)
-	itemID, err := itemRepo.FindIDByKeyAndNumber(parts[0], itemNum)
-	if err != nil {
-		return 0, fmt.Errorf("item not found")
+func (h *TimeWorklogHandler) respondMutationError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, services.ErrWorklogProjectNotFound):
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusNotFound, restapi.ErrCodeNotFound, "project not found"))
+	case errors.Is(err, services.ErrWorklogProjectInactive), errors.Is(err, services.ErrWorklogCustomerMissing), errors.Is(err, services.ErrWorklogInvalidInput):
+		h.RespondError(w, r, restapi.NewAPIError(http.StatusBadRequest, restapi.ErrCodeInvalidInput, err.Error()))
+	default:
+		h.RespondInternalError(w, r)
 	}
-	wsID, err := itemRepo.GetWorkspaceID(itemID)
-	if err != nil {
-		return 0, fmt.Errorf("item not found")
-	}
-
-	canView, err := permService.HasWorkspacePermission(userID, wsID, models.PermissionItemView)
-	if err != nil || !canView {
-		return 0, fmt.Errorf("item not found")
-	}
-
-	return itemID, nil
 }

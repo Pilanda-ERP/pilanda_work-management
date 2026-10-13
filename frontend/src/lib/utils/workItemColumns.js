@@ -1,21 +1,9 @@
-import { formatDate } from './dateFormatter.js';
+import { formatAuthenticatedInstant } from './authenticatedDateFormatter.js';
 import { escapeHtml } from './sanitize.ts';
 import { getStatusInlineStyle } from './statusColors.js';
 
-/**
- * Build the standard work-item table column set used by Collections and
- * SearchPage. The columns are otherwise identical; the differences are:
- *
- *   - itemUrl(item):    URL for the Key/Title links. Pages compose this
- *                       differently (one uses itemUrl util, one inlines).
- *   - lastColumn:       trailing column before the row-actions cell
- *                       (Collections shows "Created", Search shows "Updated").
- *   - allStatuses,
- *     statusCategories: passed to getStatusInlineStyle for the Status cell.
- *
- * The functions called inside `render` (escapeHtml/formatDate/getStatusInlineStyle)
- * are re-imported from the helper file's location, so callers don't need to.
- */
+/** Build the shared Collections/Search table columns with page-specific URL,
+ * trailing date column, and status styling inputs. */
 export function buildWorkItemColumns({ itemUrl, lastColumn, allStatuses, statusCategories }) {
   return [
     {
@@ -66,9 +54,7 @@ export function buildWorkItemColumns({ itemUrl, lastColumn, allStatuses, statusC
   ];
 }
 
-/**
- * Default "Created" trailing column. Collections uses this.
- */
+/** Default Created column for Collections. */
 export function createdAtColumn() {
   return {
     key: 'created_at',
@@ -76,13 +62,11 @@ export function createdAtColumn() {
     width: 'w-28',
     html: true,
     render: (item) =>
-      `<span class="whitespace-nowrap">${formatDate(item.created_at) || '—'}</span>`,
+      `<span class="whitespace-nowrap">${formatAuthenticatedInstant(item.created_at, { year: 'numeric', month: '2-digit', day: '2-digit' }) || '—'}</span>`,
   };
 }
 
-/**
- * "Updated" trailing column with a translatable label. SearchPage uses this.
- */
+/** Updated column with a caller-supplied label for SearchPage. */
 export function updatedAtColumn(label) {
   return {
     key: 'updated_at',
@@ -90,6 +74,6 @@ export function updatedAtColumn(label) {
     width: 'w-28',
     html: true,
     render: (item) =>
-      `<span class="whitespace-nowrap">${formatDate(item.updated_at) || '—'}</span>`,
+      `<span class="whitespace-nowrap">${formatAuthenticatedInstant(item.updated_at, { year: 'numeric', month: '2-digit', day: '2-digit' }) || '—'}</span>`,
   };
 }

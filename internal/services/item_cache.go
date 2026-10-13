@@ -1,10 +1,10 @@
 package services
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,36 +25,37 @@ type ItemHierarchyCache struct {
 	CachedAt               time.Time `json:"cached_at"`
 }
 
-// ProjectInheritanceCache caches project inheritance for a workspace
-type ProjectInheritanceCache struct {
-	WorkspaceID    int          `json:"workspace_id"`
-	ItemProjectMap map[int]*int `json:"item_project_map"` // item_id -> effective_project_id
-	Version        int64        `json:"version"`          // For invalidation
-	CachedAt       time.Time    `json:"cached_at"`
-}
-
-// ItemCacheService handles cached item hierarchy and project data
+// ItemCacheService handles cached per-item hierarchy data.
 type ItemCacheService struct {
 	hierarchyCache *bigcache.BigCache
-	projectCache   *bigcache.BigCache
 	db             database.Database
+	closeOnce      sync.Once
+	closeErr       error
 
 	// Cache statistics
 	hierarchyHits   int64
 	hierarchyMisses int64
-	projectHits     int64
-	projectMisses   int64
 	errors          int64
 
 	// Configuration
 	config ItemCacheConfig
 }
 
+// Close stops the hierarchy cache's background worker without closing the
+// shared database. It may be called more than once.
+func (ics *ItemCacheService) Close() error {
+	ics.closeOnce.Do(func() {
+		if ics.hierarchyCache != nil {
+			ics.closeErr = ics.hierarchyCache.Close()
+		}
+	})
+	return ics.closeErr
+}
+
 // ItemCacheConfig represents configuration for the item cache
 type ItemCacheConfig struct {
-	HierarchyTTL    time.Duration `json:"hierarchy_ttl"`     // Default: 5min
-	ProjectTTL      time.Duration `json:"project_ttl"`       // Default: 15min
-	MaxCacheSize    int           `json:"max_cache_size"`    // Default: 512MB total
+	HierarchyTTL    time.Duration `json:"hierarchy_ttl"`     // Default: 30min
+	MaxCacheSize    int           `json:"max_cache_size"`    // Default: 196MB
 	WarmupBatchSize int           `json:"warmup_batch_size"` // Default: 500
 	EnablePreWarm   bool          `json:"enable_pre_warm"`   // Default: true
 }
@@ -62,9 +63,11 @@ type ItemCacheConfig struct {
 // DefaultItemCacheConfig returns default configuration
 func DefaultItemCacheConfig() ItemCacheConfig {
 	return ItemCacheConfig{
-		HierarchyTTL:    5 * time.Minute,
-		ProjectTTL:      15 * time.Minute,
-		MaxCacheSize:    512, // 512MB total
+		// The measured workload revisits a deterministic hot set throughout a
+		// qualification window longer than five minutes. Retain those entries;
+		// mutation paths explicitly invalidate affected items and ancestors.
+		HierarchyTTL:    30 * time.Minute,
+		MaxCacheSize:    196,
 		WarmupBatchSize: 500,
 		EnablePreWarm:   true,
 	}
@@ -73,36 +76,20 @@ func DefaultItemCacheConfig() ItemCacheConfig {
 // NewItemCacheService creates a new item cache service
 func NewItemCacheService(db database.Database, config ItemCacheConfig) (*ItemCacheService, error) {
 	// Configure hierarchy cache
-	hierarchyConfig := cacheutil.NewBigCacheConfig(cacheutil.BigCacheOptions{
-		TTL:             config.HierarchyTTL,
-		MaxCacheMB:      config.MaxCacheSize / 2, // Half for hierarchy
-		MaxEntrySize:    4096,                    // 4KB per entry
-		MaxEntriesInWin: 100000,                  // Support up to 100k items
-		CleanWindow:     1 * time.Minute,
+	hierarchyCache, err := cacheutil.New("item_hierarchy", cacheutil.BigCacheOptions{
+		TTL:               config.HierarchyTTL,
+		MaxCacheMB:        config.MaxCacheSize,
+		Shards:            128,
+		MaxEntrySize:      4096, // 4KB per entry
+		InitialCapacityMB: 4,
+		CleanWindow:       1 * time.Minute,
 	})
-
-	hierarchyCache, err := bigcache.New(context.Background(), hierarchyConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create hierarchy cache: %w", err)
 	}
 
-	// Configure project cache
-	projectConfig := cacheutil.NewBigCacheConfig(cacheutil.BigCacheOptions{
-		TTL:             config.ProjectTTL,
-		MaxCacheMB:      config.MaxCacheSize / 2, // Half for projects
-		Shards:          256,
-		MaxEntrySize:    65536, // 64KB per entry (can be large for big workspaces)
-		MaxEntriesInWin: 10000, // Support up to 10k workspaces
-	})
-
-	projectCache, err := bigcache.New(context.Background(), projectConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create project cache: %w", err)
-	}
-
 	service := &ItemCacheService{
 		hierarchyCache: hierarchyCache,
-		projectCache:   projectCache,
 		db:             db,
 		config:         config,
 	}
@@ -164,12 +151,6 @@ func (ics *ItemCacheService) InvalidateItemHierarchy(itemID int, ancestorIDs []i
 	return nil
 }
 
-// InvalidateWorkspaceProjects clears project cache for a workspace
-func (ics *ItemCacheService) InvalidateWorkspaceProjects(workspaceID int) error {
-	key := ics.getProjectKey(workspaceID)
-	return ics.projectCache.Delete(key)
-}
-
 // WarmCache pre-loads frequently accessed items
 func (ics *ItemCacheService) WarmCache() error {
 	// Identify hot items (recently accessed or frequently updated)
@@ -182,7 +163,7 @@ func (ics *ItemCacheService) WarmCache() error {
 			GROUP BY item_id
 			ORDER BY last_change DESC
 			LIMIT ?
-		)
+		) AS hot
 	`
 
 	oneHourAgo := time.Now().Add(-time.Hour).UTC()
@@ -217,20 +198,15 @@ func (ics *ItemCacheService) WarmCache() error {
 }
 
 // GetStats returns cache statistics
-func (ics *ItemCacheService) GetStats() map[string]interface{} {
+func (ics *ItemCacheService) GetStats() map[string]any {
 	hierarchyTotal := ics.hierarchyHits + ics.hierarchyMisses
-	projectTotal := ics.projectHits + ics.projectMisses
 
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"hierarchy_hits":       ics.hierarchyHits,
 		"hierarchy_misses":     ics.hierarchyMisses,
 		"hierarchy_hit_rate":   float64(ics.hierarchyHits) / float64(max(hierarchyTotal, 1)),
-		"project_hits":         ics.projectHits,
-		"project_misses":       ics.projectMisses,
-		"project_hit_rate":     float64(ics.projectHits) / float64(max(projectTotal, 1)),
 		"errors":               ics.errors,
 		"hierarchy_cache_size": ics.hierarchyCache.Len(),
-		"project_cache_size":   ics.projectCache.Len(),
 	}
 
 	return stats
@@ -238,7 +214,7 @@ func (ics *ItemCacheService) GetStats() map[string]interface{} {
 
 // GetEffectiveProjectForItem retrieves or calculates the effective project for an item
 // This method first checks the cache, then falls back to database calculation if needed
-func (ics *ItemCacheService) GetEffectiveProjectForItem(itemID, workspaceID int) (effectiveProjectID *int, projectInheritanceMode string, err error) {
+func (ics *ItemCacheService) GetEffectiveProjectForItem(itemID int) (effectiveProjectID *int, projectInheritanceMode string, err error) {
 	// Try cache first. A populated entry always carries the resolved mode
 	// (including "none"), so the mode gates the hit — this both avoids the old
 	// hardcoded "direct" on every hit and lets "none" items hit the cache
@@ -289,8 +265,4 @@ func (ics *ItemCacheService) calculateEffectiveProject(itemID int) (effectivePro
 
 func (ics *ItemCacheService) getHierarchyKey(itemID int) string {
 	return fmt.Sprintf("item:hierarchy:%d", itemID)
-}
-
-func (ics *ItemCacheService) getProjectKey(workspaceID int) string {
-	return fmt.Sprintf("workspace:projects:%d", workspaceID)
 }

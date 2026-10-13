@@ -3,7 +3,7 @@
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
   import { portal } from '../../actions/portal.js';
-  import { fade, scale } from 'svelte/transition';
+  import { api } from '../../api.js';
 
   let {
     attachments = [],
@@ -47,11 +47,11 @@
   }
 
   function thumbUrl(att) {
-    return `/api/attachments/${att.id}/thumbnail`;
+    return api.attachments.getThumbnailUrl(att.id);
   }
 
   function contentUrl(att) {
-    return `/api/attachments/${att.id}/download`;
+    return api.attachments.getDownloadUrl(att.id);
   }
 
   function formatFileSize(bytes) {
@@ -64,7 +64,7 @@
 
   async function handleDownload(attachment) {
     try {
-      const downloadUrl = `/api/attachments/${attachment.id}/download`;
+      const downloadUrl = api.attachments.getDownloadUrl(attachment.id);
       const response = await fetch(downloadUrl);
       if (!response.ok) {
         throw new Error(`Download failed: ${response.statusText}`);
@@ -104,7 +104,7 @@
 {#if attachments.length > 0 || diagrams.length > 0}
   <div class="space-y-1">
     {#each attachments as attachment}
-      <div class="flex items-center gap-2 py-1 px-2 -mx-2 rounded group hover:bg-[var(--ds-background-neutral-hovered)] transition-colors">
+      <div data-testid="item-attachment" class="flex items-center gap-2 py-1 px-2 -mx-2 rounded group hover:bg-[var(--ds-background-neutral-hovered)] transition-colors">
         {#if attachment.has_thumbnail}
           <button
             type="button"
@@ -148,7 +148,7 @@
         </span>
         {#if canDelete}
           <button
-            class="p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity hover:bg-[var(--ds-background-danger-hovered)]"
+            class="p-1 rounded opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity hover:bg-[var(--ds-background-danger-hovered)]"
             style="color: var(--ds-text-danger);"
             onclick={() => handleDelete(attachment)}
             title={t('common.delete')}
@@ -159,13 +159,17 @@
       </div>
     {/each}
     {#each diagrams as diagram}
-      <div class="flex items-center gap-2 py-1 px-2 -mx-2 rounded group hover:bg-[var(--ds-background-neutral-hovered)] transition-colors">
+      <div
+        class="flex items-center gap-2 py-1 px-2 -mx-2 rounded group hover:bg-[var(--ds-background-neutral-hovered)] transition-colors"
+        data-testid={`item-diagram-${diagram.id}`}
+      >
         <IconPencil class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--ds-text-subtle);" />
         <button
           class="flex-1 text-sm truncate text-left hover:underline"
           style="color: var(--ds-text);"
           onclick={() => handleEditDiagram(diagram)}
           title={t('assets.editDiagram')}
+          data-testid={`item-diagram-edit-${diagram.id}`}
         >
           {diagram.name || t('assets.untitledDiagram')}
         </button>
@@ -174,10 +178,11 @@
         </span>
         {#if canDelete}
           <button
-            class="p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity hover:bg-[var(--ds-background-danger-hovered)]"
+            class="p-1 rounded opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity hover:bg-[var(--ds-background-danger-hovered)]"
             style="color: var(--ds-text-danger);"
             onclick={() => handleDeleteDiagram(diagram)}
             title={t('common.delete')}
+            data-testid={`item-diagram-delete-${diagram.id}`}
           >
             <IconTrash class="w-3.5 h-3.5" />
           </button>
@@ -195,7 +200,6 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     use:portal
-    transition:fade={{ duration: 120 }}
     class="fixed inset-0 z-50 flex items-center justify-center p-6"
     style="background-color: rgba(0,0,0,0.85);"
     onclick={(e) => { if (e.target === e.currentTarget) closeLightbox(); }}
@@ -212,7 +216,7 @@
     >
       ×
     </button>
-    <div class="max-w-full max-h-full" transition:scale={{ duration: 150, start: 0.97 }}>
+    <div class="max-w-full max-h-full">
       {#if isImage(lightbox)}
         <img
           src={contentUrl(lightbox)}

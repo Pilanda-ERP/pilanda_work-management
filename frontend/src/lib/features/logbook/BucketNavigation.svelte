@@ -9,10 +9,10 @@
   import Modal from '../../dialogs/Modal.svelte';
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
-  import Label from '../../components/Label.svelte';
-  import Textarea from '../../components/Textarea.svelte';
   import { IconPlus as Plus, IconFolderOpen as FolderOpen } from '@tabler/icons-svelte-runes';
-  import SidebarHeader from '../../layout/SidebarHeader.svelte';
+  import NavigationSidebar from '../../layout/NavigationSidebar.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
+	import TextField from '../../components/TextField.svelte';
 
   let { activeBucketId = null } = $props();
 
@@ -43,22 +43,34 @@
   let isAllActive = $derived(activeBucketId === null);
 </script>
 
-<!-- Bucket Navigation Sidebar -->
-<div class="w-64 border-r flex flex-col p-6 flex-shrink-0" style="border-color: var(--ds-border); background-color: var(--ds-surface-raised);">
-  <!-- Header -->
-  <SidebarHeader title={t('logbook.title')} description={t('logbook.subtitle')} noBorder />
+{#snippet sidebarFooter()}
+  {#if $permissionStore.isSystemAdmin}
+    <div class="px-6 pb-6 pt-4 border-t" style="border-color: var(--ds-border);">
+      <!-- shortcut-guard-exempt: contextual sidebar action; the modal owns its submit behavior -->
+      <Button
+        dataTestid="logbook-create-bucket"
+        variant="default"
+        icon={Plus}
+        onclick={() => showCreateForm = true}
+        class="w-full justify-center"
+      >
+        {t('logbook.createBucket')}
+      </Button>
+    </div>
+  {/if}
+{/snippet}
 
+<!-- Bucket Navigation Sidebar -->
+<NavigationSidebar title={t('logbook.title')} description={t('logbook.subtitle')} footer={sidebarFooter}>
   <!-- Navigation -->
   <nav class="flex-1 space-y-1">
     <!-- All Documents -->
     <a
       href={bucketHref(null)}
-      class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
-      style={isAllActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-      onmouseenter={(e) => { if (!isAllActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-      onmouseleave={(e) => { if (!isAllActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+      class="nav-link w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
+      class:active={isAllActive}
     >
-      <div class="w-4 h-4 rounded bg-gradient-to-br from-blue-400 to-blue-600 flex-shrink-0"></div>
+      <div class="w-4 h-4 rounded bg-gradient-to-br from-ds-nav-blue-from to-ds-nav-blue-to flex-shrink-0"></div>
       <span>{t('logbook.allDocuments')}</span>
     </a>
 
@@ -67,10 +79,9 @@
       {@const isBucketActive = activeBucketId === bucket.id}
       <a
         href={bucketHref(bucket.id)}
-        class="w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
-        style={isBucketActive ? 'background: var(--ds-surface-selected); color: var(--ds-text);' : 'color: var(--ds-text-subtle);'}
-        onmouseenter={(e) => { if (!isBucketActive) e.currentTarget.style.cssText = 'background: var(--ds-background-neutral-hovered); color: var(--ds-text);'; }}
-        onmouseleave={(e) => { if (!isBucketActive) e.currentTarget.style.cssText = 'color: var(--ds-text-subtle);'; }}
+        data-testid={`logbook-bucket-${bucket.id}`}
+        class="nav-link w-full text-left cursor-pointer px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-3 no-underline"
+        class:active={isBucketActive}
         title={bucket.description || bucket.name}
       >
         <FolderOpen class="w-4 h-4 flex-shrink-0" style="color: var(--ds-icon);" />
@@ -82,20 +93,7 @@
     {/each}
   </nav>
 
-  <!-- Footer - Create Bucket (admin only) -->
-  {#if $permissionStore.isSystemAdmin}
-    <div class="pt-4 border-t" style="border-color: var(--ds-border);">
-      <Button
-        variant="default"
-        icon={Plus}
-        onclick={() => showCreateForm = true}
-        class="w-full justify-center"
-      >
-        {t('logbook.createBucket')}
-      </Button>
-    </div>
-  {/if}
-</div>
+</NavigationSidebar>
 
 <!-- Create Bucket Modal -->
 <Modal
@@ -112,25 +110,24 @@
     <form onsubmit={(e) => { e.preventDefault(); createBucket(); }}>
       <div class="space-y-4">
         <div>
-          <Label for="bucket-name" required class="mb-2">{t('logbook.bucketName')}</Label>
-          <input
+          <TextField
+            label={t('logbook.bucketName')}
             id="bucket-name"
-            type="text"
-            bind:value={formData.name}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            placeholder={t('logbook.bucketNamePlaceholder')}
             required
+            dataTestid="logbook-bucket-name"
+            type="text"
+            placeholder={t('logbook.bucketNamePlaceholder')}
+            bind:value={formData.name}
           />
         </div>
 
         <div>
-          <Label for="bucket-description" class="mb-2">{t('logbook.bucketDescription')}</Label>
-          <Textarea
+          <TextareaField
+            label={t('logbook.bucketDescription')}
             id="bucket-description"
-            bind:value={formData.description}
             rows={3}
             placeholder={t('logbook.bucketDescriptionPlaceholder')}
+            bind:value={formData.description}
           />
         </div>
       </div>
@@ -147,3 +144,19 @@
   />
   {/snippet}
 </Modal>
+
+<style>
+  .nav-link {
+    color: var(--ds-text-subtle);
+  }
+
+  .nav-link:hover:not(.active) {
+    background: var(--ds-background-neutral-hovered);
+    color: var(--ds-text);
+  }
+
+  .nav-link.active {
+    background: var(--ds-surface-selected);
+    color: var(--ds-text);
+  }
+</style>

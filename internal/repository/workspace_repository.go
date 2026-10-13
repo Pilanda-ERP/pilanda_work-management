@@ -1,10 +1,10 @@
 package repository
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,23 +24,42 @@ func NewWorkspaceRepository(db database.Database) *WorkspaceRepository {
 }
 
 // workspaceSelectBase is the common SELECT columns for workspace queries.
-const workspaceSelectBase = `SELECT w.id, w.name, w.key, w.description, w.active, w.time_project_id, w.is_personal, w.owner_id, w.icon, w.color, w.avatar_url, w.default_view, w.display_mode, w.internal_comments_enabled, w.created_at, w.updated_at,
+const workspaceSelectBase = `SELECT w.id, w.name, w.key, w.description, w.active, w.is_template, w.time_project_id, w.is_personal, w.owner_id, w.icon, w.color, w.avatar_url, w.default_view, w.display_mode, w.internal_comments_enabled, w.created_at, w.updated_at,
        tp.name as time_project_name`
 
 const workspaceFromJoinsBase = ` FROM workspaces w
 LEFT JOIN time_projects tp ON w.time_project_id = tp.id`
 
-const workspaceGroupByBase = ` GROUP BY w.id, w.name, w.key, w.description, w.active, w.time_project_id, w.is_personal, w.owner_id, w.icon, w.color, w.avatar_url, w.default_view, w.display_mode, w.internal_comments_enabled, w.created_at, w.updated_at, tp.name`
+const workspaceGroupByBase = ` GROUP BY w.id, w.name, w.key, w.description, w.active, w.is_template, w.time_project_id, w.is_personal, w.owner_id, w.icon, w.color, w.avatar_url, w.default_view, w.display_mode, w.internal_comments_enabled, w.created_at, w.updated_at, tp.name`
 
 // scanWorkspaceBase scans a standard workspace row and applies nullable fields.
 func scanWorkspaceBase(s interface{ Scan(dest ...any) error }) (models.Workspace, error) {
 	var ws models.Workspace
 	var icon, color, defaultView, displayMode, timeProjectName sql.NullString
 	err := s.Scan(&ws.ID, &ws.Name, &ws.Key, &ws.Description,
-		&ws.Active, &ws.TimeProjectID, &ws.IsPersonal, &ws.OwnerID,
+		&ws.Active, &ws.IsTemplate, &ws.TimeProjectID, &ws.IsPersonal, &ws.OwnerID,
 		&icon, &color, &ws.AvatarURL, &defaultView, &displayMode,
 		&ws.InternalCommentsEnabled,
 		&ws.CreatedAt, &ws.UpdatedAt, &timeProjectName)
+	if err != nil {
+		return ws, err
+	}
+	ws.Icon = icon.String
+	ws.Color = color.String
+	ws.DefaultView = defaultView.String
+	ws.TimeProjectName = timeProjectName.String
+	return ws, nil
+}
+
+// scanWorkspaceBase additionally reads the COUNT(*) OVER () window column.
+func scanWorkspaceBaseWithTotal(s interface{ Scan(dest ...any) error }, total *int) (models.Workspace, error) {
+	var ws models.Workspace
+	var icon, color, defaultView, displayMode, timeProjectName sql.NullString
+	err := s.Scan(&ws.ID, &ws.Name, &ws.Key, &ws.Description,
+		&ws.Active, &ws.IsTemplate, &ws.TimeProjectID, &ws.IsPersonal, &ws.OwnerID,
+		&icon, &color, &ws.AvatarURL, &defaultView, &displayMode,
+		&ws.InternalCommentsEnabled,
+		&ws.CreatedAt, &ws.UpdatedAt, &timeProjectName, total)
 	if err != nil {
 		return ws, err
 	}
@@ -79,11 +98,47 @@ func (r *WorkspaceRepository) ListNameKeyToIDMap() (map[string]int, error) {
 		}
 		m[strings.ToLower(name)] = id
 		m[strings.ToLower(key)] = id
+		m[strconv.Itoa(id)] = id
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate workspace name/key map: %w", err)
 	}
 	return m, nil
+}
+
+// ListIDsByName returns every workspace with the given case-insensitive name.
+func (r *WorkspaceRepository) ListIDsByName(name string) ([]int, error) {
+	rows, err := r.db.Query("SELECT id FROM workspaces WHERE LOWER(name) = LOWER(?) ORDER BY id", name)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace ids by name: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan workspace id by name: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workspace ids by name: %w", err)
+	}
+	return ids, nil
+}
+
+// FindIDByKey resolves a case-insensitive workspace key.
+func (r *WorkspaceRepository) FindIDByKey(key string) (int, error) {
+	var id int
+	err := r.db.QueryRow("SELECT id FROM workspaces WHERE LOWER(key) = LOWER(?)", key).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("find workspace id by key: %w", err)
+	}
+	return id, nil
 }
 
 // ListActiveIDs returns the IDs of every workspace where active = true.
@@ -103,6 +158,37 @@ func (r *WorkspaceRepository) ListActiveIDs() ([]int, error) {
 			return nil, fmt.Errorf("scan workspace id: %w", err)
 		}
 		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// WorkspaceIDsWithViewerAssignments returns the set of workspace IDs where
+// the built-in Viewer role has at least one explicit user or group
+// assignment. That assignment is what flips a workspace into restricted
+// visibility: unassigned users lose the everyone-fallback permissions and the
+// workspace disappears from their directory.
+func (r *WorkspaceRepository) WorkspaceIDsWithViewerAssignments() (map[int]bool, error) {
+	rows, err := r.db.Query(`
+		SELECT DISTINCT uwr.workspace_id
+		FROM user_workspace_roles uwr
+		JOIN workspace_roles wr ON wr.id = uwr.role_id AND wr.builtin_key = ?
+		UNION
+		SELECT DISTINCT gwr.workspace_id
+		FROM group_workspace_roles gwr
+		JOIN workspace_roles wr ON wr.id = gwr.role_id AND wr.builtin_key = ?
+	`, models.RoleBuiltinViewer, models.RoleBuiltinViewer)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace viewer assignments: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	ids := make(map[int]bool)
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan workspace viewer assignment: %w", err)
+		}
+		ids[id] = true
 	}
 	return ids, rows.Err()
 }
@@ -165,7 +251,7 @@ func (r *WorkspaceRepository) FindByID(id int) (*models.Workspace, error) {
 		LEFT JOIN workspace_configuration_sets wcs ON w.id = wcs.workspace_id
 		WHERE w.id = ?`+workspaceGroupByBase+`, wcs.configuration_set_id
 	`, id).Scan(&workspace.ID, &workspace.Name, &workspace.Key, &workspace.Description,
-		&workspace.Active, &workspace.TimeProjectID, &workspace.IsPersonal, &workspace.OwnerID,
+		&workspace.Active, &workspace.IsTemplate, &workspace.TimeProjectID, &workspace.IsPersonal, &workspace.OwnerID,
 		&icon, &color, &workspace.AvatarURL, &defaultView, &displayMode,
 		&workspace.InternalCommentsEnabled,
 		&workspace.CreatedAt, &workspace.UpdatedAt,
@@ -195,11 +281,11 @@ func (r *WorkspaceRepository) FindByIDBasic(id int) (*models.Workspace, error) {
 	var icon, color sql.NullString
 
 	err := r.db.QueryRow(`
-		SELECT id, name, key, description, active, is_personal, icon, color, internal_comments_enabled
+		SELECT id, name, key, COALESCE(description, ''), active, is_personal, is_template, icon, color, internal_comments_enabled
 		FROM workspaces
 		WHERE id = ?
 	`, id).Scan(&workspace.ID, &workspace.Name, &workspace.Key, &workspace.Description,
-		&workspace.Active, &workspace.IsPersonal, &icon, &color, &workspace.InternalCommentsEnabled)
+		&workspace.Active, &workspace.IsPersonal, &workspace.IsTemplate, &icon, &color, &workspace.InternalCommentsEnabled)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -212,6 +298,125 @@ func (r *WorkspaceRepository) FindByIDBasic(id int) (*models.Workspace, error) {
 	workspace.Color = color.String
 
 	return &workspace, nil
+}
+
+// WorkspaceCandidateStatus carries the (id, active) pair needed to decide
+// visibility without materializing full workspace rows.
+type WorkspaceCandidateStatus struct {
+	ID     int
+	Active bool
+}
+
+// ListCandidateStatuses returns (id, active) for the same candidate set as
+// FindAll(userID, false) — every non-personal workspace plus the user's own
+// personal workspace — so visibility can be filtered in memory and only the
+// visible IDs handed to a paged query.
+func (r *WorkspaceRepository) ListCandidateStatuses(userID int) ([]WorkspaceCandidateStatus, error) {
+	rows, err := r.db.Query(`
+		SELECT id, COALESCE(active, false)
+		FROM workspaces
+		WHERE is_personal = false OR is_personal IS NULL OR owner_id = ?
+	`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list workspace candidates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var statuses []WorkspaceCandidateStatus
+	for rows.Next() {
+		var status WorkspaceCandidateStatus
+		if err := rows.Scan(&status.ID, &status.Active); err != nil {
+			return nil, fmt.Errorf("failed to scan workspace candidate: %w", err)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, rows.Err()
+}
+
+// WorkspaceIDPageParams filters one page of workspaces by an already-visible
+// ID set. The ID list is produced by the per-user permission snapshot, so it
+// is bounded by the user's accessible workspace count (the 10k-workspace
+// target stays far below SQLite's 32k and Postgres' 65k parameter limits).
+type WorkspaceIDPageParams struct {
+	IDs    []int
+	Search string
+	Sort   string // name | key | created_at; anything else falls back to name
+	Desc   bool
+	Limit  int
+	Offset int
+}
+
+// FindByIDsPage returns one SQL-side page of the given workspaces with a
+// total computed in the same query, instead of materializing every row.
+func (r *WorkspaceRepository) FindByIDsPage(params WorkspaceIDPageParams) ([]models.Workspace, int, error) {
+	if len(params.IDs) == 0 {
+		return []models.Workspace{}, 0, nil
+	}
+
+	where := " WHERE w.id IN (" + placeholders(len(params.IDs)) + ")"
+	args := make([]any, 0, len(params.IDs)+6)
+	for _, id := range params.IDs {
+		args = append(args, id)
+	}
+	if search := strings.TrimSpace(params.Search); search != "" {
+		pattern := "%" + escapeLikePattern(search) + "%"
+		where += ` AND (LOWER(w.name) LIKE LOWER(?) ESCAPE '\'`
+		where += ` OR LOWER(w.key) LIKE LOWER(?) ESCAPE '\'`
+		where += ` OR LOWER(w.description) LIKE LOWER(?) ESCAPE '\')`
+		args = append(args, pattern, pattern, pattern)
+	}
+
+	sortColumn := "LOWER(w.name)"
+	switch params.Sort {
+	case "key":
+		sortColumn = "LOWER(w.key)"
+	case "created_at":
+		sortColumn = "w.created_at"
+	}
+	direction := " ASC"
+	if params.Desc {
+		direction = " DESC"
+	}
+	// The id tiebreak stays ascending regardless of direction, matching the
+	// previous in-memory sort (only the key comparison is flipped).
+	orderBy := " ORDER BY " + sortColumn + direction + ", w.id ASC"
+
+	args = append(args, params.Limit, params.Offset)
+	// COUNT(*) OVER () is evaluated after the GROUP BY, so it counts
+	// workspaces, not joined rows, and the total arrives with the page in one
+	// round trip.
+	query := workspaceSelectBase + `,
+	       COUNT(*) OVER () AS page_total_count` + workspaceFromJoinsBase +
+		where + workspaceGroupByBase + orderBy + `
+		LIMIT ? OFFSET ?`
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to list workspaces by ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var workspaces []models.Workspace
+	total := 0
+	for rows.Next() {
+		var pageTotal int
+		workspace, scanErr := scanWorkspaceBaseWithTotal(rows, &pageTotal)
+		if scanErr != nil {
+			return nil, 0, fmt.Errorf("failed to scan workspace: %w", scanErr)
+		}
+		total = pageTotal
+		workspaces = append(workspaces, workspace)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("failed to iterate workspaces: %w", err)
+	}
+	if workspaces == nil {
+		workspaces = []models.Workspace{}
+	}
+	return workspaces, total, nil
+}
+
+func placeholders(count int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
 
 // FindAll retrieves all workspaces accessible to a user
@@ -248,18 +453,21 @@ func (r *WorkspaceRepository) FindAll(userID int, isPersonalOnly bool) ([]models
 	return workspaces, rows.Err()
 }
 
-// GrantAdministratorRoleTx grants the Administrator role on a workspace to a user within a transaction.
-func (r *WorkspaceRepository) GrantAdministratorRoleTx(tx database.Tx, workspaceID int64, userID int) error {
+// GrantBuiltinRoleTx grants a built-in workspace role to a user within a
+// transaction. Creation uses it to hand the creator both Administrator and,
+// for restricted workspaces, Viewer — the Viewer grant is what flips the
+// permission cache into gated visibility.
+func (r *WorkspaceRepository) GrantBuiltinRoleTx(tx database.Tx, workspaceID int64, userID int, builtinKey string) error {
 	result, err := tx.Exec(`
 		INSERT INTO user_workspace_roles (workspace_id, user_id, role_id, granted_by, granted_at)
-		SELECT ?, ?, id, ?, CURRENT_TIMESTAMP FROM workspace_roles WHERE name = 'Administrator'
-	`, workspaceID, userID, userID)
+		SELECT ?, ?, id, ?, CURRENT_TIMESTAMP FROM workspace_roles WHERE builtin_key = ?
+	`, workspaceID, userID, userID, builtinKey)
 	if err != nil {
-		return fmt.Errorf("failed to grant admin role to workspace creator: %w", err)
+		return fmt.Errorf("failed to grant %s role to workspace creator: %w", builtinKey, err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("administrator role not found; workspace creation aborted")
+		return fmt.Errorf("%s role not found; workspace creation aborted", builtinKey)
 	}
 	return nil
 }
@@ -269,11 +477,11 @@ func (r *WorkspaceRepository) CreateTx(tx database.Tx, workspace *models.Workspa
 	var id int64
 
 	err := tx.QueryRow(`
-		INSERT INTO workspaces (name, key, description, active, time_project_id, is_personal, owner_id, icon, color, avatar_url, default_view, display_mode, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO workspaces (name, key, description, active, is_template, time_project_id, is_personal, owner_id, icon, color, avatar_url, default_view, display_mode, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id
 	`, workspace.Name, workspace.Key, workspace.Description, workspace.Active,
-		workspace.TimeProjectID, workspace.IsPersonal, workspace.OwnerID,
+		workspace.IsTemplate, workspace.TimeProjectID, workspace.IsPersonal, workspace.OwnerID,
 		workspace.Icon, workspace.Color, workspace.AvatarURL, workspace.DefaultView, "default",
 		now, now).Scan(&id)
 
@@ -287,26 +495,37 @@ func (r *WorkspaceRepository) CreateTx(tx database.Tx, workspace *models.Workspa
 	return id, nil
 }
 
-// Update updates an existing workspace
-func (r *WorkspaceRepository) Update(workspace *models.Workspace) error {
-	now := time.Now()
+// AssignTimeProjectIfUnset attaches an imported time project without replacing
+// an existing workspace default.
+func (r *WorkspaceRepository) AssignTimeProjectIfUnset(workspaceID, timeProjectID int) error {
 	_, err := r.db.ExecWrite(`
 		UPDATE workspaces
-		SET name = ?, key = ?, description = ?, active = ?, time_project_id = ?, is_personal = ?, owner_id = ?, icon = ?, color = ?, avatar_url = ?, default_view = ?, internal_comments_enabled = ?, updated_at = ?
-		WHERE id = ?
-	`, workspace.Name, workspace.Key, workspace.Description, workspace.Active,
-		workspace.TimeProjectID, workspace.IsPersonal, workspace.OwnerID,
-		workspace.Icon, workspace.Color, workspace.AvatarURL, workspace.DefaultView,
-		workspace.InternalCommentsEnabled,
-		now, workspace.ID)
-
-	return err
+		SET time_project_id = ?, updated_at = ?
+		WHERE id = ? AND time_project_id IS NULL
+	`, timeProjectID, time.Now(), workspaceID)
+	if err != nil {
+		return fmt.Errorf("assign workspace time project: %w", err)
+	}
+	return nil
 }
 
 // Delete removes a workspace by ID
 func (r *WorkspaceRepository) Delete(id int) error {
 	_, err := r.db.ExecWrite("DELETE FROM workspaces WHERE id = ?", id)
-	return err
+	if err != nil {
+		return err
+	}
+	InvalidateItemListCountCache(r.db, id)
+	return nil
+}
+
+// DeleteTx removes a workspace inside the caller's transaction. Cache
+// invalidation remains the caller's post-commit responsibility.
+func (r *WorkspaceRepository) DeleteTx(tx database.Tx, id int) error {
+	if _, err := tx.ExecWrite("DELETE FROM workspaces WHERE id = ?", id); err != nil {
+		return err
+	}
+	return nil
 }
 
 // FindMissingOrPersonal accepts a set of workspace IDs and returns those that
@@ -319,12 +538,14 @@ func (r *WorkspaceRepository) FindMissingOrPersonal(ids []int) ([]int, error) {
 		return nil, nil
 	}
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	for i, id := range ids {
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := `SELECT id, is_personal FROM workspaces WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+	// COALESCE keeps NULL is_personal rows (legacy data) eligible, matching
+	// the NULL-as-shared semantics used by every other workspace predicate.
+	query := `SELECT id, COALESCE(is_personal, false) FROM workspaces WHERE id IN (` + strings.Join(placeholders, ",") + `)`
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query workspace eligibility: %w", err)
@@ -361,6 +582,20 @@ func (r *WorkspaceRepository) Exists(id int) (bool, error) {
 	var exists bool
 	err := r.db.QueryRow("SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?)", id).Scan(&exists)
 	return exists, err
+}
+
+// LockForDeleteTx locks a workspace before its items are fenced and deleted.
+func (r *WorkspaceRepository) LockForDeleteTx(tx database.Tx, id int) (bool, error) {
+	query := "SELECT id FROM workspaces WHERE id = ?"
+	if r.db.GetDriverName() == "postgres" {
+		query += " FOR UPDATE"
+	}
+	var lockedID int
+	err := tx.QueryRow(query, id).Scan(&lockedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // KeyExists checks if a workspace key exists
@@ -452,15 +687,20 @@ func (r *WorkspaceRepository) GetActivePersonalWorkspaceID(userID int) (int, err
 	return id, nil
 }
 
-// CountNonPersonal returns the number of non-personal workspaces.
-// Rows where is_personal is NULL are treated as non-personal.
-func (r *WorkspaceRepository) CountNonPersonal() (int, error) {
+// CountNonPersonalByIDs returns the number of non-personal workspaces in ids.
+func (r *WorkspaceRepository) CountNonPersonalByIDs(ids []int) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders, args := inPlaceholders(ids)
 	var count int
-	err := r.db.QueryRow(
-		`SELECT COUNT(*) FROM workspaces WHERE is_personal = false OR is_personal IS NULL`,
-	).Scan(&count)
+	err := r.db.QueryRow(`
+		SELECT COUNT(*) FROM workspaces
+		WHERE id IN (`+placeholders+`)
+		  AND (is_personal = false OR is_personal IS NULL)
+	`, args...).Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("count non-personal workspaces: %w", err)
+		return 0, fmt.Errorf("count visible non-personal workspaces: %w", err)
 	}
 	return count, nil
 }
@@ -477,6 +717,33 @@ type WorkspaceBasic struct {
 	AvatarURL string
 }
 
+// ListActiveBasics returns active, non-personal, non-template workspaces
+// ordered by name. These are the workspaces an operator can import into.
+func (r *WorkspaceRepository) ListActiveBasics() ([]WorkspaceBasic, error) {
+	rows, err := r.db.Query(`
+		SELECT id, name, key, COALESCE(icon, ''), COALESCE(color, ''), COALESCE(avatar_url, '')
+		FROM workspaces
+		WHERE active = true
+		  AND COALESCE(is_personal, false) = false
+		  AND COALESCE(is_template, false) = false
+		ORDER BY name, id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list active workspace basics: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	results := make([]WorkspaceBasic, 0)
+	for rows.Next() {
+		var wb WorkspaceBasic
+		if err := rows.Scan(&wb.ID, &wb.Name, &wb.Key, &wb.Icon, &wb.Color, &wb.AvatarURL); err != nil {
+			return nil, fmt.Errorf("scan active workspace basic: %w", err)
+		}
+		results = append(results, wb)
+	}
+	return results, rows.Err()
+}
+
 // FindBasicsByIDs returns basic workspace metadata for the given IDs.
 // Inactive workspaces and missing IDs are silently omitted (this method
 // powers activity widgets where inactives shouldn't surface). Order is
@@ -486,7 +753,7 @@ func (r *WorkspaceRepository) FindBasicsByIDs(ids []int) ([]WorkspaceBasic, erro
 		return []WorkspaceBasic{}, nil
 	}
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids))
+	args := make([]any, len(ids))
 	for i, id := range ids {
 		placeholders[i] = "?"
 		args[i] = id
@@ -534,184 +801,16 @@ type ProjectStats struct {
 	CompletionPercent float64
 }
 
-// MilestoneStatusBreakdown represents the distribution of items per status category within a milestone
-type MilestoneStatusBreakdown struct {
-	CategoryName  string
-	CategoryColor string
-	ItemCount     int
-	IsCompleted   bool
-}
-
-// MilestoneStatusProgress aggregates milestone progress for a workspace
-type MilestoneStatusProgress struct {
-	MilestoneID     int
-	MilestoneName   string
-	TargetDate      *string
-	Status          string
-	CategoryColor   string
-	TotalItems      int
-	CompletedItems  int
-	PercentComplete float64
-	StatusBreakdown []MilestoneStatusBreakdown
-}
-
-// GetMilestoneProgress returns milestone progress for a workspace
-func (r *WorkspaceRepository) GetMilestoneProgress(workspaceID int, filterSQL string, filterArgs []interface{}) ([]MilestoneStatusProgress, error) {
-	query := `
-		SELECT
-			m.id,
-			m.name,
-			m.target_date,
-			m.status,
-			mc.color,
-			sc.name,
-			sc.color,
-			sc.is_completed,
-			COUNT(i.id) as item_count
-		FROM items i
-		JOIN item_milestones im ON im.item_id = i.id
-		JOIN milestones m ON m.id = im.milestone_id
-		LEFT JOIN milestone_categories mc ON m.category_id = mc.id
-		LEFT JOIN statuses s ON i.status_id = s.id
-		LEFT JOIN status_categories sc ON s.category_id = sc.id
-		WHERE i.workspace_id = ?
-		  AND (m.status IS NULL OR LOWER(m.status) <> 'completed')`
-
-	args := []interface{}{workspaceID}
-	if filterSQL != "" {
-		query += " AND (" + filterSQL + ")"
-		args = append(args, filterArgs...)
-	}
-	query += `
-		GROUP BY m.id, m.name, m.target_date, m.status, mc.color, sc.name, sc.color, sc.is_completed
-		ORDER BY m.target_date IS NULL, m.target_date, m.name`
-
-	rows, err := r.db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	progressMap := make(map[int]*MilestoneStatusProgress)
-
-	for rows.Next() {
-		var milestoneID int
-		var milestoneName string
-		var targetDate sql.NullString
-		var milestoneStatus sql.NullString
-		var milestoneColor sql.NullString
-		var categoryName sql.NullString
-		var categoryColor sql.NullString
-		var categoryCompleted sql.NullBool
-		var itemCount int
-
-		if err := rows.Scan(
-			&milestoneID,
-			&milestoneName,
-			&targetDate,
-			&milestoneStatus,
-			&milestoneColor,
-			&categoryName,
-			&categoryColor,
-			&categoryCompleted,
-			&itemCount,
-		); err != nil {
-			return nil, err
-		}
-
-		if itemCount == 0 {
-			continue
-		}
-
-		progress, exists := progressMap[milestoneID]
-		if !exists {
-			progress = &MilestoneStatusProgress{
-				MilestoneID:     milestoneID,
-				MilestoneName:   milestoneName,
-				StatusBreakdown: []MilestoneStatusBreakdown{},
-			}
-			if targetDate.Valid {
-				progress.TargetDate = &targetDate.String
-			}
-			progress.Status = milestoneStatus.String
-			progress.CategoryColor = milestoneColor.String
-			progressMap[milestoneID] = progress
-		}
-
-		label := strings.TrimSpace(categoryName.String)
-		if label == "" {
-			label = "No Status"
-		}
-
-		breakdown := MilestoneStatusBreakdown{
-			CategoryName:  label,
-			ItemCount:     itemCount,
-			IsCompleted:   categoryCompleted.Valid && categoryCompleted.Bool,
-			CategoryColor: categoryColor.String,
-		}
-
-		progress.StatusBreakdown = append(progress.StatusBreakdown, breakdown)
-		progress.TotalItems += itemCount
-		if breakdown.IsCompleted {
-			progress.CompletedItems += itemCount
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	if len(progressMap) == 0 {
-		return []MilestoneStatusProgress{}, nil
-	}
-
-	// Build a deterministic order: upcoming target date first, then name
-	keys := make([]int, 0, len(progressMap))
-	for id := range progressMap {
-		keys = append(keys, id)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		left := progressMap[keys[i]]
-		right := progressMap[keys[j]]
-
-		if left.TargetDate == nil && right.TargetDate != nil {
-			return false
-		}
-		if left.TargetDate != nil && right.TargetDate == nil {
-			return true
-		}
-		if left.TargetDate != nil && right.TargetDate != nil && *left.TargetDate != *right.TargetDate {
-			return *left.TargetDate < *right.TargetDate
-		}
-		return strings.ToLower(left.MilestoneName) < strings.ToLower(right.MilestoneName)
-	})
-
-	results := make([]MilestoneStatusProgress, 0, len(progressMap))
-	for _, id := range keys {
-		entry := progressMap[id]
-		if entry.TotalItems > 0 {
-			entry.PercentComplete = float64(entry.CompletedItems) / float64(entry.TotalItems) * 100.0
-		}
-
-		// Order breakdown by count desc
-		sort.SliceStable(entry.StatusBreakdown, func(i, j int) bool {
-			if entry.StatusBreakdown[i].ItemCount == entry.StatusBreakdown[j].ItemCount {
-				return strings.ToLower(entry.StatusBreakdown[i].CategoryName) < strings.ToLower(entry.StatusBreakdown[j].CategoryName)
-			}
-			return entry.StatusBreakdown[i].ItemCount > entry.StatusBreakdown[j].ItemCount
-		})
-
-		results = append(results, *entry)
-	}
-
-	return results, nil
-}
-
 // BuildWorkspaceMap creates a mapping of workspace identifiers (id, name, key) to IDs
 func (r *WorkspaceRepository) BuildWorkspaceMap() (map[string]int, error) {
+	return r.BuildWorkspaceMapContext(context.Background())
+}
+
+// BuildWorkspaceMapContext is the request-aware form of BuildWorkspaceMap.
+func (r *WorkspaceRepository) BuildWorkspaceMapContext(ctx context.Context) (map[string]int, error) {
 	workspaceMap := make(map[string]int)
 
-	rows, err := r.db.Query("SELECT id, name, key FROM workspaces")
+	rows, err := r.db.QueryContext(ctx, "SELECT id, name, key FROM workspaces")
 	if err != nil {
 		return nil, err
 	}
@@ -781,10 +880,15 @@ func (r *WorkspaceRepository) CountCollections(workspaceID int) (int, error) {
 
 // GetCollectionQuery retrieves the QL query and workspace ID for a collection
 func (r *WorkspaceRepository) GetCollectionQuery(collectionID int) (workspaceID *int64, qlQuery string, err error) {
+	return r.GetCollectionQueryContext(context.Background(), collectionID)
+}
+
+// GetCollectionQueryContext is the request-aware form of GetCollectionQuery.
+func (r *WorkspaceRepository) GetCollectionQueryContext(ctx context.Context, collectionID int) (workspaceID *int64, qlQuery string, err error) {
 	var collectionWorkspaceID sql.NullInt64
 	var collectionQuery sql.NullString
 
-	err = r.db.QueryRow(`SELECT workspace_id, ql_query FROM collections WHERE id = ?`, collectionID).
+	err = r.db.QueryRowContext(ctx, `SELECT workspace_id, ql_query FROM collections WHERE id = ?`, collectionID).
 		Scan(&collectionWorkspaceID, &collectionQuery)
 
 	if errors.Is(err, sql.ErrNoRows) {

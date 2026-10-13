@@ -5,11 +5,11 @@
  */
 import { api } from '../api.js';
 import { createSearchFilteredFields } from '../utils/fieldSearchUtils.js';
+import { DragStateStore } from './DragStateStore.svelte.js';
 import { getSystemFieldName } from './fieldConfig.js';
 import { createFieldObject, fieldExists } from './fieldUtils.js';
-import { applyDragStateMixin } from './storeUtils.js';
 
-class FormBuilderStore {
+class FormBuilderStore extends DragStateStore {
   // === Form List ===
   forms = $state([]);
   loading = $state(false);
@@ -19,6 +19,9 @@ class FormBuilderStore {
   editingForm = $state(null);
   formFields = $state([]);
   showFieldEditor = $state(false);
+  savedFieldsSnapshot = $state('');
+  savedConfigSnapshot = $state('');
+  savedRoutingSnapshot = $state('');
 
   // === Available Fields ===
   availableFields = $state([]);
@@ -26,35 +29,27 @@ class FormBuilderStore {
   // === Per-form Config ===
   formConfig = $state({
     require_auth: false,
+    allow_attachments: false,
     success_message: '',
     submit_button_text: 'Submit',
     redirect_url: '',
   });
 
+  // === Routing Metadata (name/description/icon/color + routing target) ===
+  // Editable identity + routing fields, persisted via the request-type Update
+  // endpoint. workspace_id / item_type_id determine where submissions land and
+  // which fields resolve, so the builder needs to correct them after create.
+  routingMeta = $state({
+    name: '',
+    description: '',
+    icon: 'FileText',
+    color: '#6b7280',
+    workspace_id: null,
+    item_type_id: null,
+  });
+
   // === Field Search ===
   fieldSearchQuery = $state('');
-
-  // === Drag State ===
-  draggedField = $state(null);
-  fieldDragState = $state(new Map());
-
-  // === Drag state methods (defined here so TS sees them; mixin would otherwise add at runtime) ===
-  setDragState(fieldId, state) {
-    this.fieldDragState.set(fieldId, state);
-    this.fieldDragState = new Map(this.fieldDragState);
-  }
-  clearDragState() {
-    this.fieldDragState.forEach((_, id) => {
-      this.fieldDragState.set(id, { closestEdge: null });
-    });
-    this.fieldDragState = new Map(this.fieldDragState);
-  }
-  setDraggedField(field) {
-    this.draggedField = field;
-  }
-  clearDraggedField() {
-    this.draggedField = null;
-  }
 
   // === Derived Values ===
 
@@ -72,6 +67,19 @@ class FormBuilderStore {
       () => this.availableFieldsFiltered,
       () => this.fieldSearchQuery
     );
+  }
+
+  get hasUnsavedChanges() {
+    if (!this.showFieldEditor) return false;
+    return (
+      JSON.stringify(this.formFields) !== this.savedFieldsSnapshot ||
+      JSON.stringify(this.formConfig) !== this.savedConfigSnapshot ||
+      this.hasUnsavedRoutingChanges
+    );
+  }
+
+  get hasUnsavedRoutingChanges() {
+    return JSON.stringify(this.routingMeta) !== this.savedRoutingSnapshot;
   }
 
   // === Data Loading ===
@@ -100,6 +108,14 @@ class FormBuilderStore {
   async startEditFields(form) {
     this.editingForm = form;
     this.showFieldEditor = true;
+    this.routingMeta = {
+      name: form.name || '',
+      description: form.description || '',
+      icon: form.icon || 'FileText',
+      color: form.color || '#6b7280',
+      workspace_id: form.workspace_id ?? null,
+      item_type_id: form.item_type_id ?? null,
+    };
 
     try {
       const [fields, available] = await Promise.all([
@@ -156,6 +172,7 @@ class FormBuilderStore {
           const config = typeof form.config === 'string' ? JSON.parse(form.config) : form.config;
           this.formConfig = {
             require_auth: config.require_auth || false,
+            allow_attachments: config.allow_attachments === true,
             success_message: config.success_message || '',
             submit_button_text: config.submit_button_text || 'Submit',
             redirect_url: config.redirect_url || '',
@@ -166,6 +183,7 @@ class FormBuilderStore {
       } else {
         this.resetFormConfig();
       }
+      this.markBuilderSaved();
     } catch (err) {
       console.error('Failed to load form fields:', err);
       this.formFields = [];
@@ -176,6 +194,7 @@ class FormBuilderStore {
   async saveFormFields() {
     try {
       await api.requestTypes.updateFields(this.channelId, this.editingForm.id, this.formFields);
+      this.savedFieldsSnapshot = JSON.stringify(this.formFields);
     } catch (err) {
       console.error('Failed to save form fields:', err);
       throw err;
@@ -185,8 +204,36 @@ class FormBuilderStore {
   async saveFormConfig() {
     try {
       await api.requestTypes.updateConfig(this.editingForm.id, this.formConfig);
+      this.savedConfigSnapshot = JSON.stringify(this.formConfig);
     } catch (err) {
       console.error('Failed to save form config:', err);
+      throw err;
+    }
+  }
+
+  async saveRoutingMetadata() {
+    try {
+      // The Update endpoint preserves omitted fields; send the editable
+      // identity and routing fields the builder exposes.
+      const updated = await api.requestTypes.update(this.channelId, this.editingForm.id, {
+        name: this.routingMeta.name.trim(),
+        description: (this.routingMeta.description || '').trim(),
+        icon: this.routingMeta.icon,
+        color: this.routingMeta.color,
+        item_type_id: this.routingMeta.item_type_id,
+        workspace_id: this.routingMeta.workspace_id || null,
+        is_active: this.editingForm.is_active ?? true,
+      });
+      // Reflect the saved values locally so the list + header stay in sync
+      // without a full reload.
+      this.editingForm = { ...this.editingForm, ...this.routingMeta };
+      this.forms = this.forms.map((f) =>
+        f.id === this.editingForm.id ? { ...f, ...this.routingMeta } : f
+      );
+      this.savedRoutingSnapshot = JSON.stringify(this.routingMeta);
+      return updated;
+    } catch (err) {
+      console.error('Failed to save routing metadata:', err);
       throw err;
     }
   }
@@ -268,17 +315,33 @@ class FormBuilderStore {
     this.formFields = [...this.formFields];
   }
 
-  // Drag state methods are added via applyDragStateMixin below.
-
   // === Helpers ===
 
   resetFormConfig() {
     this.formConfig = {
       require_auth: false,
+      allow_attachments: false,
       success_message: '',
       submit_button_text: 'Submit',
       redirect_url: '',
     };
+  }
+
+  resetRoutingMeta() {
+    this.routingMeta = {
+      name: '',
+      description: '',
+      icon: 'FileText',
+      color: '#6b7280',
+      workspace_id: null,
+      item_type_id: null,
+    };
+  }
+
+  markBuilderSaved() {
+    this.savedFieldsSnapshot = JSON.stringify(this.formFields);
+    this.savedConfigSnapshot = JSON.stringify(this.formConfig);
+    this.savedRoutingSnapshot = JSON.stringify(this.routingMeta);
   }
 
   cancelFieldEditor() {
@@ -288,7 +351,11 @@ class FormBuilderStore {
     this.availableFields = [];
     this.fieldSearchQuery = '';
     this.clearDragState();
+    this.savedFieldsSnapshot = '';
+    this.savedConfigSnapshot = '';
+    this.savedRoutingSnapshot = '';
     this.resetFormConfig();
+    this.resetRoutingMeta();
   }
 
   reset() {
@@ -299,13 +366,14 @@ class FormBuilderStore {
     this.formFields = [];
     this.showFieldEditor = false;
     this.availableFields = [];
+    this.savedFieldsSnapshot = '';
+    this.savedConfigSnapshot = '';
+    this.savedRoutingSnapshot = '';
     this.fieldSearchQuery = '';
-    this.draggedField = null;
-    this.fieldDragState = new Map();
+    this.resetDragState();
     this.resetFormConfig();
+    this.resetRoutingMeta();
   }
 }
-
-applyDragStateMixin(FormBuilderStore);
 
 export const formBuilderStore = new FormBuilderStore();

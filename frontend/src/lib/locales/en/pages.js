@@ -70,10 +70,18 @@ export default {
     statusUnsaved: 'Unsaved',
     statusError: 'Save failed',
 
+    // Public knowledge-base publication banner (green bar above the page)
+    publiclyViewableBanner:
+      'Publicly viewable — this page is published through a portal knowledge base and can be read by portal users.',
+    publiclyViewableBannerWithPortals:
+      'Publicly viewable — this page is published through the {portals} knowledge base and can be read by portal users.',
+
     // Segmented Edit / Read mode toggle
     modeEdit: 'Edit',
     modeRead: 'Read',
     modeAria: 'View mode',
+    canvasWide: 'Use full-width canvas',
+    canvasComfortable: 'Use readable-width canvas',
 
     // Error fallbacks
     errorLoadTree: 'Failed to load pages',
@@ -90,7 +98,7 @@ export default {
     discardCancel: 'Keep editing',
     archiveTitle: 'Archive "{title}"?',
     archiveMessage:
-      'This archives the page and every child page. Phase 1 has no undo for this action.',
+      'This archives the page and every child page. This action cannot be undone.',
     archiveConfirm: 'Archive',
 
     // Archived pages list (admin-only full-page view opened from the sidebar header)
@@ -115,10 +123,17 @@ export default {
     moveTitle: 'Move "{title}"',
     moveSubtitle:
       'Pick a new parent. Pages under the current page are hidden because they would create a cycle.',
+    moveWorkspaceLabel: 'Destination workspace',
+    moveWorkspacePlaceholder: 'Select a workspace…',
+    moveParentLabel: 'Parent page',
     moveSearchPlaceholder: 'Search pages…',
     moveRoot: 'Workspace root',
+    moveCrossWorkspaceSummary: 'Pages in this subtree: {count}.',
+    moveCrossWorkspacePolicy:
+      'Matching labels are kept. Explicit permissions, work-item links, and agent-skill references are removed.',
     moveButton: 'Move',
     moveCancel: 'Cancel',
+    errorLoadWorkspaces: 'Failed to load workspaces',
     errorMove: 'Move failed',
 
     // Permissions dialog

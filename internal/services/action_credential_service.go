@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"windshift/internal/database"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/sso"
@@ -42,6 +43,18 @@ var ErrCredentialScopeMismatch = errors.New("action credential not in scope")
 // is_enabled = false.
 var ErrCredentialDisabled = errors.New("action credential disabled")
 
+// ErrCredentialPurposeMismatch prevents provider-managed credentials from
+// being reused by generic HTTP capabilities or another provider instance.
+var ErrCredentialPurposeMismatch = errors.New("action credential purpose mismatch")
+
+type managedCredentialMetadata struct {
+	Marker    string `json:"_windshift_managed_credential"`
+	ManagedBy string `json:"managed_by"`
+	OwnerID   string `json:"owner_id"`
+}
+
+const managedCredentialMetadataMarker = "v1"
+
 // validCredentialTypes enumerates the credential_type values the API accepts.
 var validCredentialTypes = map[models.ActionCredentialType]struct{}{
 	models.CredentialBearerToken:  {},
@@ -54,6 +67,27 @@ var validCredentialTypes = map[models.ActionCredentialType]struct{}{
 // returned model has EncryptedSecret populated but never plaintext; callers
 // should immediately Sanitize() before returning to clients.
 func (s *ActionCredentialService) Create(req models.CreateActionCredentialRequest, createdBy *int) (*models.ActionCredential, error) {
+	if isManagedCredentialMetadata(req.SecretMetadata) {
+		return nil, errors.New("managed credential metadata is reserved")
+	}
+	return s.create(req, createdBy)
+}
+
+// CreateManaged creates a credential that only its owning provider service can
+// resolve or mutate. It is omitted from generic credential management APIs.
+func (s *ActionCredentialService) CreateManaged(req models.CreateActionCredentialRequest, createdBy *int, purpose, ownerID string) (*models.ActionCredential, error) {
+	if strings.TrimSpace(purpose) == "" || strings.TrimSpace(ownerID) == "" {
+		return nil, errors.New("managed credential purpose and owner are required")
+	}
+	metadata, err := json.Marshal(managedCredentialMetadata{Marker: managedCredentialMetadataMarker, ManagedBy: purpose, OwnerID: ownerID})
+	if err != nil {
+		return nil, err
+	}
+	req.SecretMetadata = string(metadata)
+	return s.create(req, createdBy)
+}
+
+func (s *ActionCredentialService) create(req models.CreateActionCredentialRequest, createdBy *int) (*models.ActionCredential, error) {
 	if strings.TrimSpace(req.Name) == "" {
 		return nil, errors.New("name is required")
 	}
@@ -63,6 +97,9 @@ func (s *ActionCredentialService) Create(req models.CreateActionCredentialReques
 	if strings.TrimSpace(req.Secret) == "" {
 		return nil, errors.New("secret is required")
 	}
+	if err := validateCredentialSecret(req.CredentialType, req.Secret); err != nil {
+		return nil, err
+	}
 	if err := validateSecretMetadata(req.SecretMetadata); err != nil {
 		return nil, err
 	}
@@ -70,7 +107,10 @@ func (s *ActionCredentialService) Create(req models.CreateActionCredentialReques
 	if req.AppliesToAllWorkspaces != nil {
 		appliesAll = *req.AppliesToAllWorkspaces
 	}
-	workspaceIDs := dedupeWorkspaceIDs(req.WorkspaceIDs)
+	workspaceIDs, err := normalizeCredentialWorkspaceIDs(req.WorkspaceIDs)
+	if err != nil {
+		return nil, err
+	}
 	if !appliesAll && len(workspaceIDs) == 0 {
 		return nil, errors.New("workspace_ids must contain at least one workspace when applies_to_all_workspaces is false")
 	}
@@ -98,13 +138,10 @@ func (s *ActionCredentialService) Create(req models.CreateActionCredentialReques
 		SecretMetadata:         req.SecretMetadata,
 		IsEnabled:              enabled,
 	}
-	if _, err := s.repo.CreateActionCredential(c); err != nil {
+	if _, err := s.repo.CreateActionCredentialWithWorkspaces(c, workspaceIDs); err != nil {
 		return nil, err
 	}
 	if !appliesAll {
-		if err := s.repo.SetCredentialWorkspaces(c.ID, workspaceIDs); err != nil {
-			return nil, err
-		}
 		c.WorkspaceIDs = workspaceIDs
 	}
 	return c, nil
@@ -121,6 +158,101 @@ func (s *ActionCredentialService) UpdateMetadata(id int, req models.UpdateAction
 	if err != nil {
 		return nil, err
 	}
+	if isManagedCredential(c) || (req.SecretMetadata != nil && isManagedCredentialMetadata(*req.SecretMetadata)) {
+		return nil, repository.ErrNotFound
+	}
+	return s.updateMetadata(c, req, false)
+}
+
+func (s *ActionCredentialService) UpdateManagedMetadata(id int, req models.UpdateActionCredentialRequest, purpose, ownerID string) (*models.ActionCredential, error) {
+	c, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if !credentialMatchesPurpose(c, purpose, ownerID) {
+		return nil, ErrCredentialPurposeMismatch
+	}
+	return s.updateMetadata(c, req, true)
+}
+
+// PrepareManagedUpdate applies provider-owned secret and metadata changes and
+// returns a rollback closure for the caller's adjacent provider-table update.
+// This keeps the credential restorable when the second persistence step fails.
+func (s *ActionCredentialService) PrepareManagedUpdate(id int, name string, appliesToAll bool, workspaceIDs []int, secret *string, purpose, ownerID string) (func(database.Tx) error, error) {
+	existing, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if !credentialMatchesPurpose(existing, purpose, ownerID) {
+		return nil, ErrCredentialPurposeMismatch
+	}
+	normalizedWorkspaceIDs, err := normalizeCredentialWorkspaceIDs(workspaceIDs)
+	if err != nil {
+		return nil, err
+	}
+	if !appliesToAll && len(normalizedWorkspaceIDs) == 0 {
+		return nil, errors.New("workspace_ids must contain at least one workspace when applies_to_all_workspaces is false")
+	}
+	if appliesToAll {
+		normalizedWorkspaceIDs = nil
+	}
+	existing.Name = name
+	existing.AppliesToAllWorkspaces = appliesToAll
+	var encryptedSecret, prefix *string
+	if secret != nil && strings.TrimSpace(*secret) != "" {
+		if err := validateCredentialSecret(existing.CredentialType, *secret); err != nil {
+			return nil, err
+		}
+		ciphertext, err := s.encryption.Encrypt(*secret)
+		if err != nil {
+			return nil, err
+		}
+		secretPrefix := models.SecretPrefixFor(*secret)
+		encryptedSecret = &ciphertext
+		prefix = &secretPrefix
+	}
+	return func(tx database.Tx) error {
+		return s.repo.UpdateManagedCredentialTx(tx, existing, normalizedWorkspaceIDs, encryptedSecret, prefix)
+	}, nil
+}
+
+// PrepareManagedSecretUpdate encrypts a replacement secret and returns a
+// transaction closure that changes only secret material. Long-running OAuth
+// operations use this so a stale connection snapshot cannot roll back a
+// concurrent credential rename or workspace-scope update.
+func (s *ActionCredentialService) PrepareManagedSecretUpdate(id int, secret, purpose, ownerID string) (func(database.Tx) error, error) {
+	existing, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if !credentialMatchesPurpose(existing, purpose, ownerID) {
+		return nil, ErrCredentialPurposeMismatch
+	}
+	if strings.TrimSpace(secret) == "" {
+		return nil, errors.New("secret is required")
+	}
+	if err := validateCredentialSecret(existing.CredentialType, secret); err != nil {
+		return nil, err
+	}
+	ciphertext, err := s.encryption.Encrypt(secret)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt credential: %w", err)
+	}
+	prefix := models.SecretPrefixFor(secret)
+	expectedMetadata := existing.SecretMetadata
+	return func(tx database.Tx) error {
+		updated, err := s.repo.UpdateManagedCredentialSecretTx(tx, id, expectedMetadata, ciphertext, prefix)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			return ErrCredentialPurposeMismatch
+		}
+		return nil
+	}, nil
+}
+
+func (s *ActionCredentialService) updateMetadata(c *models.ActionCredential, req models.UpdateActionCredentialRequest, preserveManagedMetadata bool) (*models.ActionCredential, error) {
 	if req.Name != nil {
 		if strings.TrimSpace(*req.Name) == "" {
 			return nil, errors.New("name cannot be empty")
@@ -128,6 +260,9 @@ func (s *ActionCredentialService) UpdateMetadata(id int, req models.UpdateAction
 		c.Name = *req.Name
 	}
 	if req.SecretMetadata != nil {
+		if preserveManagedMetadata {
+			return nil, errors.New("managed credential metadata cannot be changed")
+		}
 		if err := validateSecretMetadata(*req.SecretMetadata); err != nil {
 			return nil, err
 		}
@@ -144,10 +279,14 @@ func (s *ActionCredentialService) UpdateMetadata(id int, req models.UpdateAction
 		nextAppliesAll = *req.AppliesToAllWorkspaces
 	}
 	var nextWorkspaceIDs []int
+	var err error
 	scopeTouched := req.AppliesToAllWorkspaces != nil || req.WorkspaceIDs != nil
 	if scopeTouched {
 		if req.WorkspaceIDs != nil {
-			nextWorkspaceIDs = dedupeWorkspaceIDs(*req.WorkspaceIDs)
+			nextWorkspaceIDs, err = normalizeCredentialWorkspaceIDs(*req.WorkspaceIDs)
+			if err != nil {
+				return nil, err
+			}
 		} else {
 			nextWorkspaceIDs = append([]int(nil), c.WorkspaceIDs...)
 		}
@@ -160,25 +299,45 @@ func (s *ActionCredentialService) UpdateMetadata(id int, req models.UpdateAction
 		c.AppliesToAllWorkspaces = nextAppliesAll
 	}
 
-	if err := s.repo.UpdateActionCredentialMetadata(c); err != nil {
-		return nil, err
-	}
 	if scopeTouched {
-		if err := s.repo.SetCredentialWorkspaces(c.ID, nextWorkspaceIDs); err != nil {
+		if err := s.repo.UpdateActionCredentialMetadataWithWorkspaces(c, nextWorkspaceIDs); err != nil {
 			return nil, err
 		}
 		c.WorkspaceIDs = nextWorkspaceIDs
+	} else if err := s.repo.UpdateActionCredentialMetadata(c); err != nil {
+		return nil, err
 	}
 	return c, nil
 }
 
 // Rotate re-encrypts the secret for an existing credential.
 func (s *ActionCredentialService) Rotate(id int, req models.RotateActionCredentialRequest) (*models.ActionCredential, error) {
+	existing, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if isManagedCredential(existing) {
+		return nil, repository.ErrNotFound
+	}
+	return s.rotate(existing, req)
+}
+
+func (s *ActionCredentialService) RotateManaged(id int, req models.RotateActionCredentialRequest, purpose, ownerID string) (*models.ActionCredential, error) {
+	existing, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if !credentialMatchesPurpose(existing, purpose, ownerID) {
+		return nil, ErrCredentialPurposeMismatch
+	}
+	return s.rotate(existing, req)
+}
+
+func (s *ActionCredentialService) rotate(existing *models.ActionCredential, req models.RotateActionCredentialRequest) (*models.ActionCredential, error) {
 	if strings.TrimSpace(req.Secret) == "" {
 		return nil, errors.New("secret is required")
 	}
-	existing, err := s.repo.GetActionCredentialByID(id)
-	if err != nil {
+	if err := validateCredentialSecret(existing.CredentialType, req.Secret); err != nil {
 		return nil, err
 	}
 	ciphertext, err := s.encryption.Encrypt(req.Secret)
@@ -186,7 +345,7 @@ func (s *ActionCredentialService) Rotate(id int, req models.RotateActionCredenti
 		return nil, fmt.Errorf("encrypt credential: %w", err)
 	}
 	prefix := models.SecretPrefixFor(req.Secret)
-	if err := s.repo.RotateActionCredential(id, ciphertext, prefix); err != nil {
+	if err := s.repo.RotateActionCredential(existing.ID, ciphertext, prefix); err != nil {
 		return nil, err
 	}
 	existing.EncryptedSecret = ciphertext
@@ -194,15 +353,47 @@ func (s *ActionCredentialService) Rotate(id int, req models.RotateActionCredenti
 	return existing, nil
 }
 
+func validateCredentialSecret(credentialType models.ActionCredentialType, secret string) error {
+	if credentialType == models.CredentialBasicAuth && !strings.Contains(secret, ":") {
+		return errors.New("basic_auth secret must use username:password format")
+	}
+	return nil
+}
+
 // Delete removes a credential. Callers must enforce permission/scope first.
 func (s *ActionCredentialService) Delete(id int) error {
+	c, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return err
+	}
+	if isManagedCredential(c) {
+		return repository.ErrNotFound
+	}
+	return s.repo.DeleteActionCredential(id)
+}
+
+func (s *ActionCredentialService) DeleteManaged(id int, purpose, ownerID string) error {
+	c, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return err
+	}
+	if !credentialMatchesPurpose(c, purpose, ownerID) {
+		return ErrCredentialPurposeMismatch
+	}
 	return s.repo.DeleteActionCredential(id)
 }
 
 // Get returns a credential record (ciphertext + metadata). The handler is
 // responsible for Sanitize() before sending to clients.
 func (s *ActionCredentialService) Get(id int) (*models.ActionCredential, error) {
-	return s.repo.GetActionCredentialByID(id)
+	c, err := s.repo.GetActionCredentialByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if isManagedCredential(c) {
+		return nil, repository.ErrNotFound
+	}
+	return c, nil
 }
 
 // ListForWorkspace returns credentials usable in the given workspace: those
@@ -210,17 +401,20 @@ func (s *ActionCredentialService) Get(id int) (*models.ActionCredential, error) 
 // The execution engine uses this to validate that a credential reference is
 // in-scope.
 func (s *ActionCredentialService) ListForWorkspace(workspaceID int) ([]*models.ActionCredential, error) {
-	return s.repo.ListActionCredentialsForWorkspace(workspaceID)
+	credentials, err := s.repo.ListActionCredentialsForWorkspace(workspaceID)
+	return filterManagedCredentials(credentials), err
 }
 
 // ListGlobal returns credentials that apply to all workspaces.
 func (s *ActionCredentialService) ListGlobal() ([]*models.ActionCredential, error) {
-	return s.repo.ListActionCredentialsGlobal()
+	credentials, err := s.repo.ListActionCredentialsGlobal()
+	return filterManagedCredentials(credentials), err
 }
 
 // ListAll returns every credential (system-admin view).
 func (s *ActionCredentialService) ListAll() ([]*models.ActionCredential, error) {
-	return s.repo.ListAllActionCredentials()
+	credentials, err := s.repo.ListAllActionCredentials()
+	return filterManagedCredentials(credentials), err
 }
 
 // Resolve loads a credential and returns the plaintext secret, but only if
@@ -235,6 +429,24 @@ func (s *ActionCredentialService) Resolve(_ context.Context, credentialID, works
 	if err != nil {
 		return "", nil, err
 	}
+	if isManagedCredential(c) {
+		return "", nil, ErrCredentialPurposeMismatch
+	}
+	return s.resolve(c, workspaceID)
+}
+
+func (s *ActionCredentialService) ResolveManaged(_ context.Context, credentialID, workspaceID int, purpose, ownerID string) (string, *models.ActionCredential, error) {
+	c, err := s.repo.GetActionCredentialByID(credentialID)
+	if err != nil {
+		return "", nil, err
+	}
+	if !credentialMatchesPurpose(c, purpose, ownerID) {
+		return "", nil, ErrCredentialPurposeMismatch
+	}
+	return s.resolve(c, workspaceID)
+}
+
+func (s *ActionCredentialService) resolve(c *models.ActionCredential, workspaceID int) (string, *models.ActionCredential, error) {
 	if !c.IsEnabled {
 		return "", c, ErrCredentialDisabled
 	}
@@ -252,6 +464,44 @@ func (s *ActionCredentialService) Resolve(_ context.Context, credentialID, works
 		return "", c, fmt.Errorf("decrypt credential: %w", err)
 	}
 	return plaintext, c, nil
+}
+
+func isManagedCredentialMetadata(raw string) bool {
+	var metadata managedCredentialMetadata
+	return json.Unmarshal([]byte(raw), &metadata) == nil &&
+		metadata.Marker == managedCredentialMetadataMarker &&
+		strings.TrimSpace(metadata.ManagedBy) != "" &&
+		strings.TrimSpace(metadata.OwnerID) != ""
+}
+
+func isManagedCredential(c *models.ActionCredential) bool {
+	return c != nil && isManagedCredentialMetadata(c.SecretMetadata)
+}
+
+func credentialMatchesPurpose(c *models.ActionCredential, purpose, ownerID string) bool {
+	if c == nil {
+		return false
+	}
+	var metadata managedCredentialMetadata
+	if json.Unmarshal([]byte(c.SecretMetadata), &metadata) != nil {
+		return false
+	}
+	return isManagedCredentialMetadata(c.SecretMetadata) &&
+		metadata.ManagedBy == purpose && metadata.OwnerID == ownerID &&
+		strings.TrimSpace(purpose) != "" && strings.TrimSpace(ownerID) != ""
+}
+
+func filterManagedCredentials(credentials []*models.ActionCredential) []*models.ActionCredential {
+	if len(credentials) == 0 {
+		return credentials
+	}
+	filtered := credentials[:0]
+	for _, credential := range credentials {
+		if !isManagedCredential(credential) {
+			filtered = append(filtered, credential)
+		}
+	}
+	return filtered
 }
 
 // CanCapabilityReference returns whether a given capability scope is allowed
@@ -283,17 +533,18 @@ func CanCapabilityReference(credential *models.ActionCredential, capabilityWorks
 	return true
 }
 
-// dedupeWorkspaceIDs removes duplicates and zero/negative IDs while preserving
-// the input order. Returns nil for an empty/all-invalid input.
-func dedupeWorkspaceIDs(ids []int) []int {
+// normalizeCredentialWorkspaceIDs rejects invalid IDs and removes duplicates
+// while preserving input order. Silently dropping a zero/negative value can
+// hide a broken scope request when other IDs happen to be valid.
+func normalizeCredentialWorkspaceIDs(ids []int) ([]int, error) {
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	seen := make(map[int]struct{}, len(ids))
 	out := make([]int, 0, len(ids))
 	for _, id := range ids {
 		if id <= 0 {
-			continue
+			return nil, errors.New("workspace_ids must contain positive workspace IDs")
 		}
 		if _, ok := seen[id]; ok {
 			continue
@@ -301,28 +552,13 @@ func dedupeWorkspaceIDs(ids []int) []int {
 		seen[id] = struct{}{}
 		out = append(out, id)
 	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return out, nil
 }
 
 // validateSecretMetadata rejects metadata that's not parsable JSON or that
 // contains keys that look like plaintext secrets.
 func validateSecretMetadata(metadata string) error {
-	if metadata == "" {
-		return nil
-	}
-	var parsed map[string]interface{}
-	if err := json.Unmarshal([]byte(metadata), &parsed); err != nil {
-		return fmt.Errorf("secret_metadata must be a JSON object: %w", err)
-	}
-	for k := range parsed {
-		if isSensitiveMetadataKey(k) {
-			return fmt.Errorf("secret_metadata must not contain sensitive key %q (use the secret field)", k)
-		}
-	}
-	return nil
+	return models.ValidateActionCredentialMetadata(metadata)
 }
 
 // ScanLegacyInlineSecrets walks every http_client capability and emits a
@@ -355,11 +591,11 @@ func ScanLegacyInlineSecrets(db scanLegacyDB) int {
 		if err := rows.Scan(&id, &name, &cfg); err != nil {
 			continue
 		}
-		var hc map[string]interface{}
+		var hc map[string]any
 		if err := json.Unmarshal([]byte(cfg), &hc); err != nil {
 			continue
 		}
-		raw, ok := hc["default_headers"].(map[string]interface{})
+		raw, ok := hc["default_headers"].(map[string]any)
 		if !ok {
 			continue
 		}
@@ -392,22 +628,5 @@ func ScanLegacyInlineSecrets(db scanLegacyDB) int {
 // scanLegacyDB narrows the database.Database interface to the one method
 // the scanner needs, so tests can pass a stub.
 type scanLegacyDB interface {
-	Query(query string, args ...interface{}) (*sql.Rows, error)
-}
-
-// isSensitiveMetadataKey rejects keys that look like they hold plaintext
-// secret material. The credential's secret belongs in encrypted_secret only.
-func isSensitiveMetadataKey(k string) bool {
-	lk := strings.ToLower(strings.TrimSpace(k))
-	if lk == "" {
-		return false
-	}
-	switch lk {
-	case "secret", "token", "password", "api_key", "apikey", "authorization", "client_secret", "private_key":
-		return true
-	}
-	if strings.HasSuffix(lk, "_token") || strings.HasSuffix(lk, "_secret") || strings.HasSuffix(lk, "_password") || strings.HasSuffix(lk, "_key") {
-		return true
-	}
-	return false
+	Query(query string, args ...any) (*sql.Rows, error)
 }

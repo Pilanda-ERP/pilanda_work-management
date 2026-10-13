@@ -2,8 +2,9 @@
   import { CheckSquare } from '@lucide/svelte';
   import { authStore } from '../stores';
   import { api } from '../api.js';
-  import { formatDueDate, getDueBadgeClass } from '../utils/dateFormatter.js';
+  import DueMark from './dashboard/DueMark.svelte';
   import WidgetState from './WidgetState.svelte';
+  import ItemKey from '../components/ItemKey.svelte';
   import { t } from '../stores/i18n.svelte.js';
 
   let { workspaceId = null, collectionFilter = null, maxItems = 8 } = $props();
@@ -44,6 +45,7 @@
       }
       parts.push(`workspace_id = ${workspaceId}`);
       parts.push(`assignee_id = ${userId}`);
+      parts.push('status_completed = false');
       const ql = parts.join(' AND ');
 
       const response = await api.items.getAll({
@@ -54,21 +56,17 @@
 
       if (currentVersion !== fetchVersion) return;
 
-      const rawItems = Array.isArray(response)
-        ? response
-        : (response?.items ?? []);
+      const rawItems = response?.data ?? [];
 
       const normalized = rawItems
         .filter(item => item && item.id)
         .map(item => ({
           ...item,
-          dueDate: item.due_date ? new Date(item.due_date) : null,
+          dueDate: item.due_date || null,
           updatedDate: item.updated_at ? new Date(item.updated_at) : null
         }));
 
-      const active = normalized.filter(item => !item.completed_at);
-
-      active.sort((a, b) => {
+      normalized.sort((a, b) => {
         if (a.dueDate && b.dueDate) return a.dueDate - b.dueDate;
         if (a.dueDate) return -1;
         if (b.dueDate) return 1;
@@ -76,7 +74,7 @@
         return 0;
       });
 
-      tasks = active.slice(0, maxItems);
+      tasks = normalized.slice(0, maxItems);
     } catch (err) {
       if (currentVersion !== fetchVersion) return;
       console.error('Failed to load My Tasks widget:', err);
@@ -110,7 +108,7 @@
           <div class="min-w-0 flex-1">
             <p class="truncate text-sm" style="color: var(--ds-text);">{task.title}</p>
             <p class="mt-0.5 flex items-center gap-1 text-xs" style="color: var(--ds-text-subtle);">
-              <span>{task.workspace_key}-{task.workspace_item_number}</span>
+              <ItemKey item={task} clickable={false} />
               {#if task.status_name}
                 <span aria-hidden="true">•</span>
                 <span>{task.status_name}</span>
@@ -118,9 +116,7 @@
             </p>
           </div>
           <div class="flex flex-col items-end gap-1 text-xs">
-            <span class={`inline-flex items-center rounded-full px-2 py-0.5 font-semibold ${getDueBadgeClass(task.dueDate)}`}>
-              {formatDueDate(task.dueDate)}
-            </span>
+            <DueMark dueDate={task.dueDate} />
             {#if task.priority_name}
               <span class="uppercase tracking-wide text-[0.65rem]" style="color: var(--ds-text-subtle);">
                 {task.priority_name}

@@ -1,7 +1,8 @@
 <script>
   import { onMount } from 'svelte';
-  import { IconArrowLeft, IconCalendar, IconTarget, IconEdit, IconTrash, IconDots, IconWorld, IconBuilding, IconSparkles } from '@tabler/icons-svelte-runes';
-  import Chart from '../../widgets/Chart.svelte';
+  import StateDisplay from '../../components/StateDisplay.svelte';
+  import { IconArrowLeft, IconCalendar, IconTarget, IconEdit, IconTrash, IconDots, IconWorld, IconBuilding, IconSparkles, IconCircleCheck } from '@tabler/icons-svelte-runes';
+  import IterationBurndown from './IterationBurndown.svelte';
   import { api } from '../../api.js';
   import { navigate } from '../../router.js';
   import Button from '../../components/Button.svelte';
@@ -10,23 +11,20 @@
   import ModalHeader from '../../dialogs/ModalHeader.svelte';
   import DropdownMenu from '../../layout/DropdownMenu.svelte';
   import Label from '../../components/Label.svelte';
-  import Textarea from '../../components/Textarea.svelte';
   import { formatDateShort, daysUntil } from '../../utils/dateFormatter.js';
-  import {
-    PROGRESS_CHART_CIRCUMFERENCE,
-    PROGRESS_CHART_RADIUS,
-    buildProgressSegments,
-    formatPercent,
-  } from '../../utils/progressChart.js';
+  import ProgressSummary from '../../components/ProgressSummary.svelte';
   import ItemsByStatusCategory from '../../components/ItemsByStatusCategory.svelte';
   import BasePicker from '../../pickers/BasePicker.svelte';
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
+  import CompleteIterationDialog from '../../dialogs/CompleteIterationDialog.svelte';
   import { t } from '../../stores/i18n.svelte.js';
-  import { errorToast } from '../../stores/toasts.svelte.js';
+  import { errorToast, successToast } from '../../stores/toasts.svelte.js';
   import { confirm } from '../../composables/useConfirm.js';
   import { aiStore } from '../../stores/aiStore.svelte.js';
   import { permissionStore, isSystemAdmin } from '../../stores/permissions.svelte.js';
   import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
+	import TextField from '../../components/TextField.svelte';
+	import TextareaField from '../../components/TextareaField.svelte';
 
   let { iterationId, workspaceId = null } = $props();
 
@@ -37,6 +35,8 @@
   let burndownData = $state(null);
   let expandedCategories = $state({});
   let showEditModal = $state(false);
+  let showCompleteDialog = $state(false);
+  let completionTargets = $state([]);
   let formData = $state({
     name: '',
     description: '',
@@ -64,12 +64,12 @@
   let statusOptions = $derived([
     { value: 'planned', label: t('iterations.status.planned'), lozengeColor: 'grey' },
     { value: 'active', label: t('iterations.status.active'), lozengeColor: 'blue' },
-    { value: 'completed', label: t('iterations.status.completed'), lozengeColor: 'green' },
+    ...(iteration?.status === 'completed'
+      ? [{ value: 'completed', label: t('iterations.status.completed'), lozengeColor: 'green' }]
+      : []),
     { value: 'cancelled', label: t('iterations.status.cancelled'), lozengeColor: 'red' }
   ]);
 
-  const radius = PROGRESS_CHART_RADIUS;
-  const circumference = PROGRESS_CHART_CIRCUMFERENCE;
 
   onMount(async () => {
     await loadProgress();
@@ -112,8 +112,6 @@
   function getStatusInfo(status) {
     return statusOptions.find(s => s.value === status) || statusOptions[0];
   }
-
-  const buildSegments = buildProgressSegments;
 
   function toggleCategory(categoryName) {
     expandedCategories[categoryName] = !expandedCategories[categoryName];
@@ -165,7 +163,34 @@
     }
   }
 
-  const segments = $derived(progress ? buildSegments(progress.status_breakdown, progress.total_items) : []);
+  async function openCompleteDialog() {
+    try {
+      const filters = iteration?.is_global
+        ? { include_global: true }
+        : { workspace_id: iteration?.workspace_id || workspaceId, include_global: true };
+      const candidates = await api.iterations.getAll(filters);
+      completionTargets = (candidates || []).filter(candidate => {
+        if (candidate.id === iteration.id || !['planned', 'active'].includes(candidate.status)) return false;
+        if (iteration.is_global) return candidate.is_global;
+        return candidate.is_global || candidate.workspace_id === iteration.workspace_id;
+      });
+      showCompleteDialog = true;
+    } catch (err) {
+      errorToast(t('dialogs.alerts.failedToLoad', { error: err.message || err }));
+    }
+  }
+
+  async function completeIteration(moveTarget) {
+    try {
+      const targetIterationId = moveTarget.type === 'iteration' ? moveTarget.iterationId : null;
+      await api.iterations.complete(iterationId, targetIterationId);
+      successToast(t('iterations.iterationCompleted', { name: iteration.name }));
+      await loadProgress();
+    } catch (err) {
+      errorToast(t('dialogs.alerts.failedToUpdate', { error: err.message || err }));
+    }
+  }
+
   const daysInfo = $derived(progress?.end_date ? daysUntil(progress.end_date, {
     overdue: (n) => t('iterations.daysOverdue', { count: n }),
     today: t('iterations.endsToday'),
@@ -177,6 +202,16 @@
     const items = [];
 
     if (canManage) {
+      if (iteration.status === 'planned' || iteration.status === 'active') {
+        items.push({
+          id: 'complete',
+          type: 'regular',
+          icon: IconCircleCheck,
+          title: t('iterations.completeIteration'),
+          hoverClass: 'hover-bg',
+          onClick: openCompleteDialog
+        });
+      }
       items.push({
         id: 'edit',
         type: 'regular',
@@ -241,12 +276,10 @@
     </div>
 
     {#if loading}
-      <div class="flex items-center justify-center py-20">
-        <div class="animate-spin rounded-full h-8 w-8 border-b-2" style="border-color: var(--ds-text-subtle);"></div>
-      </div>
+      <StateDisplay type="loading" />
     {:else if error}
       <div class="text-center py-20">
-        <p class="text-red-500">{error}</p>
+        <p class="text-ds-text-danger">{error}</p>
         <Button onclick={loadProgress} class="mt-4">{t('common.retry')}</Button>
       </div>
     {:else if progress}
@@ -300,127 +333,20 @@
         </div>
       </div>
 
-      <!-- Progress Section -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-        <!-- Circular Progress Chart -->
-        <div class="rounded-xl border p-6 flex flex-col items-center" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <div class="relative">
-            {#if progress.total_items > 0}
-              <svg viewBox="0 0 140 140" class="w-36 h-36" role="img" aria-label="Iteration progress">
-                <circle
-                  cx="70"
-                  cy="70"
-                  r={radius}
-                  fill="transparent"
-                  stroke="var(--ds-border)"
-                  stroke-width="16"
-                />
-                {#each segments as segment (segment.category_name)}
-                  <circle
-                    cx="70"
-                    cy="70"
-                    r={radius}
-                    fill="transparent"
-                    stroke={segment.color}
-                    stroke-width="16"
-                    stroke-linecap="butt"
-                    stroke-dasharray={segment.dasharray}
-                    stroke-dashoffset={segment.offset}
-                    transform="rotate(-90 70 70)"
-                  />
-                {/each}
-                <text class="text-2xl font-bold" x="70" y="68" text-anchor="middle" fill="var(--ds-text)">
-                  {formatPercent(progress.percent_complete)}%
-                </text>
-                <text class="text-xs uppercase" x="70" y="86" text-anchor="middle" fill="var(--ds-text-subtle)">
-                  {t('iterations.complete')}
-                </text>
-              </svg>
-            {:else}
-              <div class="w-36 h-36 rounded-full border-2 border-dashed flex items-center justify-center" style="border-color: var(--ds-border);">
-                <span class="text-sm" style="color: var(--ds-text-subtlest);">{t('iterations.noItems')}</span>
-              </div>
-            {/if}
-          </div>
-        </div>
+      <ProgressSummary
+        {progress}
+        ariaLabel="Iteration progress"
+        completeLabel={t('iterations.complete')}
+        noItemsLabel={t('iterations.noItems')}
+        summaryLabel={t('iterations.summary')}
+        totalLabel={t('iterations.totalItems')}
+        completedLabel={t('iterations.completed')}
+        remainingLabel={t('iterations.remaining')}
+        statusLabel={t('iterations.byStatusCategory')}
+        noStatusDataLabel={t('iterations.noStatusData')}
+      />
 
-        <!-- Summary Stats -->
-        <div class="rounded-xl border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <h3 class="text-sm font-medium mb-4" style="color: var(--ds-text-subtle);">{t('iterations.summary')}</h3>
-          <div class="space-y-3">
-            <div class="flex justify-between items-center">
-              <span style="color: var(--ds-text-subtle);">{t('iterations.totalItems')}</span>
-              <span class="font-semibold" style="color: var(--ds-text);">{progress.total_items}</span>
-            </div>
-            <div class="flex justify-between items-center">
-              <span style="color: var(--ds-text-subtle);">{t('iterations.completed')}</span>
-              <span class="font-semibold" style="color: var(--ds-text-success);">{progress.completed_items}</span>
-            </div>
-            <div class="flex justify-between items-center">
-              <span style="color: var(--ds-text-subtle);">{t('iterations.remaining')}</span>
-              <span class="font-semibold" style="color: var(--ds-text);">{progress.total_items - progress.completed_items}</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Status Breakdown Legend -->
-        <div class="rounded-xl border p-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <h3 class="text-sm font-medium mb-4" style="color: var(--ds-text-subtle);">{t('iterations.byStatusCategory')}</h3>
-          <div class="space-y-2">
-            {#if progress.status_breakdown && progress.status_breakdown.length > 0}
-              {#each progress.status_breakdown as breakdown}
-                <div class="flex items-center justify-between">
-                  <div class="flex items-center gap-2">
-                    <div
-                      class="w-3 h-3 rounded-full"
-                      style="background-color: {breakdown.category_color || '#9ca3af'};"
-                    ></div>
-                    <span class="text-sm" style="color: var(--ds-text);">{breakdown.category_name}</span>
-                  </div>
-                  <span class="text-sm font-medium" style="color: var(--ds-text-subtle);">{breakdown.item_count}</span>
-                </div>
-              {/each}
-            {:else}
-              <p class="text-sm" style="color: var(--ds-text-subtlest);">{t('iterations.noStatusData')}</p>
-            {/if}
-          </div>
-        </div>
-      </div>
-
-      <!-- Burndown Chart -->
-      {#if burndownData && burndownData.data_points?.length > 1}
-        {@const pts = burndownData.data_points}
-        {@const fmtD = (s) => { const d = new Date(s); return `${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`; }}
-        <div class="rounded-xl border p-6 mb-6" style="background-color: var(--ds-surface-raised); border-color: var(--ds-border);">
-          <h3 class="text-sm font-semibold mb-4" style="color: var(--ds-text);">{t('iterations.burndownChart')}</h3>
-          <Chart
-            type="line"
-            series={[
-              { key: 'remaining', label: t('iterations.remaining'), color: '#3b82f6', values: pts.map(d => d.remaining), smooth: false, showArea: true, showPoints: true, strokeWidth: 2.5 },
-              { key: 'ideal', label: t('iterations.idealProgress'), color: '#9ca3af', values: pts.map(d => d.ideal), smooth: false, showArea: false, showPoints: true, pointRadius: 3, strokeWidth: 2, dashed: true }
-            ]}
-            categories={pts.map(d => fmtD(d.date))}
-            maxValue={burndownData.total_items}
-            emptyMessage={t('iterations.noBurndownData')}
-          >
-            {#snippet tooltipContent({ index, category, seriesValues })}
-              <div style="font-weight:600;margin-bottom:0.25rem;border-bottom:1px solid var(--ds-border);padding-bottom:0.25rem;">{category}</div>
-              <div style="display:flex;justify-content:space-between;gap:0.5rem;margin-top:0.25rem;">
-                <span style="color:var(--ds-text-subtle);">{t('iterations.remaining')}:</span>
-                <span style="font-weight:500;color:#3b82f6;">{seriesValues[0].value}</span>
-              </div>
-              <div style="display:flex;justify-content:space-between;gap:0.5rem;margin-top:0.25rem;">
-                <span style="color:var(--ds-text-subtle);">{t('iterations.completed')}:</span>
-                <span style="font-weight:500;color:#22c55e;">{pts[index].completed}</span>
-              </div>
-              <div style="display:flex;justify-content:space-between;gap:0.5rem;margin-top:0.25rem;color:var(--ds-text-subtle);font-size:0.7rem;">
-                <span>{t('iterations.ideal')}:</span>
-                <span>{seriesValues[1].value}</span>
-              </div>
-            {/snippet}
-          </Chart>
-        </div>
-      {/if}
+      <IterationBurndown data={burndownData} />
 
       <!-- Items Grouped by Category -->
       <ItemsByStatusCategory
@@ -452,15 +378,13 @@
     <form onsubmit={(e) => { e.preventDefault(); saveIteration(); }}>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
-          <Label for="iteration-name" required class="mb-2">{t('iterations.iterationName')}</Label>
-          <input
+          <TextField
+            label={t('iterations.iterationName')}
             id="iteration-name"
-            type="text"
-            bind:value={formData.name}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            placeholder={t('iterations.iterationNamePlaceholder')}
             required
+            type="text"
+            placeholder={t('iterations.iterationNamePlaceholder')}
+            bind:value={formData.name}
           />
         </div>
 
@@ -476,36 +400,32 @@
         </div>
 
         <div>
-          <Label for="iteration-start-date" required class="mb-2">{t('iterations.startDate')}</Label>
-          <input
+          <TextField
+            label={t('iterations.startDate')}
             id="iteration-start-date"
+            required
             type="date"
             bind:value={formData.start_date}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            required
           />
         </div>
 
         <div>
-          <Label for="iteration-end-date" required class="mb-2">{t('iterations.endDate')}</Label>
-          <input
+          <TextField
+            label={t('iterations.endDate')}
             id="iteration-end-date"
+            required
             type="date"
             bind:value={formData.end_date}
-            class="w-full px-4 py-3 rounded border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-            style="background-color: var(--ds-background-input); border-color: var(--ds-border); color: var(--ds-text);"
-            required
           />
         </div>
 
         <div class="md:col-span-2">
-          <Label for="iteration-description" class="mb-2">{t('common.description')}</Label>
-          <Textarea
+          <TextareaField
+            label={t('common.description')}
             id="iteration-description"
-            bind:value={formData.description}
             rows={3}
             placeholder={t('iterations.descriptionPlaceholder')}
+            bind:value={formData.description}
           />
         </div>
       </div>
@@ -523,3 +443,10 @@
   {/snippet}
 </Modal>
 
+<CompleteIterationDialog
+  bind:show={showCompleteDialog}
+  iteration={iteration ? { ...iteration, _totalItems: progress?.total_items || 0 } : null}
+  incompleteItems={Array.from({ length: Math.max(0, (progress?.total_items || 0) - (progress?.completed_items || 0)) })}
+  targetIterations={completionTargets}
+  onconfirm={completeIteration}
+/>

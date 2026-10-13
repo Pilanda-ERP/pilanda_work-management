@@ -25,6 +25,7 @@ var (
 	pageEditContent        string
 	pageEditUploadAssets   bool
 	pageMoveParent         int
+	pageMoveToWorkspace    string
 	pageMoveToRoot         bool
 	pageMoveBefore         int
 	pageMoveAfter          int
@@ -91,11 +92,11 @@ var pageSearchLimit int
 
 var pageSearchCmd = &cobra.Command{
 	Use:   "search <query>",
-	Short: "Search pages by title in the current workspace",
-	Long: `Title search over pages the caller can view in the configured
+	Short: "Search pages by keyword in the current workspace",
+	Long: `Keyword search over pages the caller can view in the configured
 workspace. Multiple arguments are joined into a single query string.
-Matching is a case-insensitive substring on the page title. Results omit
-the page body — fetch it with ws page get <id>.
+Matching is a case-insensitive substring on the page title or Markdown body.
+Results omit the page body — fetch a match with ws page get <id>.
 
 A workspace must be configured via -w, $WS_WORKSPACE, or
 defaults.workspace_key in ws.toml.
@@ -394,7 +395,8 @@ var pageMoveCmd = &cobra.Command{
 	Use:   "move <id>",
 	Short: "Move a page under a new parent (or to the workspace root)",
 	Long: `Move a page under a new parent. Either --parent <id> or --root
-must be supplied. The server enforces cycle and depth limits.
+must be supplied. Use --to-workspace <key> to move the whole subtree to
+another workspace. The server enforces cycle and depth limits.
 
 Pass --before <id> or --after <id> to place the page at a specific
 position among its siblings (mutually exclusive). Combine freely with
@@ -404,7 +406,8 @@ Examples:
   ws page move 42 --parent 7
   ws page move 42 --root
   ws page move 42 --parent 7 --after 11
-  ws page move 42 --parent 7 --before 9`,
+  ws page move 42 --parent 7 --before 9
+  ws page move 42 --root --to-workspace MA`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(_ *cobra.Command, args []string) error {
 		client, err := NewClient()
@@ -428,6 +431,14 @@ Examples:
 		if pageMoveBefore != 0 && pageMoveAfter != 0 {
 			return fmt.Errorf("--before and --after are mutually exclusive")
 		}
+		var destinationWorkspaceID *int
+		if strings.TrimSpace(pageMoveToWorkspace) != "" {
+			destinationID, resolveErr := client.ResolveWorkspaceID(strings.TrimSpace(pageMoveToWorkspace))
+			if resolveErr != nil {
+				return fmt.Errorf("failed to resolve destination workspace: %w", resolveErr)
+			}
+			destinationWorkspaceID = &destinationID
+		}
 		var parent *int
 		if !pageMoveToRoot {
 			pid := pageMoveParent
@@ -446,7 +457,7 @@ Examples:
 			v := pageMoveBefore
 			nextSibling = &v
 		}
-		page, err := client.MovePage(wsID, pageID, parent, prevSibling, nextSibling)
+		page, err := client.MovePage(wsID, pageID, parent, prevSibling, nextSibling, destinationWorkspaceID)
 		if err != nil {
 			return fmt.Errorf("failed to move page: %w", err)
 		}
@@ -454,6 +465,9 @@ Examples:
 			dest := "root"
 			if parent != nil {
 				dest = fmt.Sprintf("under page %d", *parent)
+			}
+			if pageMoveToWorkspace != "" {
+				dest = fmt.Sprintf("to workspace %s, %s", pageMoveToWorkspace, dest)
 			}
 			_, _ = fmt.Fprintf(stdout, "Moved page %d %s (new path: %s)\n", page.ID, dest, page.Path)
 			return nil
@@ -659,20 +673,11 @@ var pageInheritanceCmd = &cobra.Command{
 
 // --- helpers ---
 
-// h1Regex captures the first ATX H1 from a Markdown body. Multi-line
-// regex anchors so we can match a heading anywhere in the file rather
-// than only at the very start, which is brittle when files lead with a
-// frontmatter block or blank lines.
+// h1Regex finds the first ATX H1 anywhere after frontmatter or blank lines.
 var h1Regex = regexp.MustCompile(`(?m)^#\s+(.+?)\s*$`)
 
-// resolvePageInput applies the create-time title-and-content rules:
-//
-//   - content comes from --file when set, otherwise --content
-//   - title flag wins; else first H1 in the content; else filename
-//
-// Returns (title, content, error). title can still be "" if neither
-// flag nor heading nor file was supplied — caller decides whether to
-// fail.
+// resolvePageInput reads --file or --content and prioritizes title flag, H1,
+// then filename. Callers decide whether an empty title is invalid.
 func resolvePageInput(flagTitle, flagContent, file string) (title, content string, err error) {
 	var fileTitle string
 	if file != "" {
@@ -697,11 +702,8 @@ func resolvePageInput(flagTitle, flagContent, file string) (title, content strin
 	return title, content, nil
 }
 
-// readMarkdownFile reads the given file (- means stdin) and extracts the
-// first H1 heading as a candidate title. The H1 text is returned
-// separately so the caller can decide whether to honor it; the body is
-// returned verbatim (including the heading) so the server-side excerpt
-// and chunker see the full document.
+// readMarkdownFile reads a file or stdin, returns its first H1, and preserves
+// the complete body for server excerpts and chunking.
 func readMarkdownFile(path string) (content, h1Title string, err error) {
 	var data []byte
 	if path == "-" {
@@ -752,6 +754,7 @@ func init() {
 	pageEditCmd.Flags().BoolVar(&pageEditUploadAssets, "upload-assets", false, "scan --file for ![](./local.png) image refs, upload each as a page attachment, and rewrite the markdown to point at the uploaded URL before the update")
 
 	pageMoveCmd.Flags().IntVar(&pageMoveParent, "parent", 0, "new parent page id")
+	pageMoveCmd.Flags().StringVar(&pageMoveToWorkspace, "to-workspace", "", "destination workspace key or id (moves the whole subtree)")
 	pageMoveCmd.Flags().BoolVar(&pageMoveToRoot, "root", false, "move the page to the workspace root")
 	pageMoveCmd.Flags().IntVar(&pageMoveBefore, "before", 0, "insert the moved page immediately before this sibling id")
 	pageMoveCmd.Flags().IntVar(&pageMoveAfter, "after", 0, "insert the moved page immediately after this sibling id")

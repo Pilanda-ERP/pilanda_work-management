@@ -256,11 +256,19 @@ type LogbookActionNode struct {
 
 func (n LogbookActionNode) GetID() int { return n.ID }
 
+// GetNodeType returns the node type for the shared action-flow runner.
+func (n LogbookActionNode) GetNodeType() string { return string(n.NodeType) }
+
 // FlowNodeID returns the node's ID for generic action-flow helpers.
 func (n LogbookActionNode) FlowNodeID() int { return n.ID }
 
 // SetFlowActionID sets the node's action ID for generic action-flow helpers.
 func (n *LogbookActionNode) SetFlowActionID(id int) { n.ActionID = id }
+
+// FlowNodeData returns the node fields for storage-level flow conversion.
+func (n LogbookActionNode) FlowNodeData() (actionID int, nodeType, config string, x, y float64) {
+	return n.ActionID, string(n.NodeType), n.NodeConfig, n.PositionX, n.PositionY
+}
 
 // LogbookActionEdge represents a connection between nodes in a logbook action flow
 type LogbookActionEdge struct {
@@ -293,17 +301,26 @@ func (e *LogbookActionEdge) SetFlowSourceNodeID(id int) { e.SourceNodeID = id }
 // SetFlowTargetNodeID sets the edge's target node ID for generic action-flow helpers.
 func (e *LogbookActionEdge) SetFlowTargetNodeID(id int) { e.TargetNodeID = id }
 
+// FlowEdgeID returns the edge's ID for storage-level flow conversion.
+func (e LogbookActionEdge) FlowEdgeID() int { return e.ID }
+
+// FlowEdgeData returns the edge fields for storage-level flow conversion.
+func (e LogbookActionEdge) FlowEdgeData() (actionID int, edgeType, sourceHandle, targetHandle string) {
+	return e.ActionID, e.EdgeType, e.SourceHandle, e.TargetHandle
+}
+
 // LogbookActionExecutionLog represents the audit trail for logbook action executions
 type LogbookActionExecutionLog struct {
-	ID             int                   `json:"id"`
-	ActionID       int                   `json:"action_id"`
-	DocumentID     *string               `json:"document_id,omitempty"`
-	TriggerEvent   string                `json:"trigger_event"`
-	Status         ActionExecutionStatus `json:"status"`
-	StartedAt      time.Time             `json:"started_at"`
-	CompletedAt    *time.Time            `json:"completed_at,omitempty"`
-	ErrorMessage   string                `json:"error_message,omitempty"`
-	ExecutionTrace string                `json:"execution_trace,omitempty"`
+	ID              int                   `json:"id"`
+	ActionID        int                   `json:"action_id"`
+	DocumentID      *string               `json:"document_id,omitempty"`
+	TriggerEvent    string                `json:"trigger_event"`
+	Status          ActionExecutionStatus `json:"status"`
+	StartedAt       time.Time             `json:"started_at"`
+	CompletedAt     *time.Time            `json:"completed_at,omitempty"`
+	ErrorMessage    string                `json:"error_message,omitempty"`
+	ExecutionTrace  string                `json:"execution_trace,omitempty"`
+	DurableEventKey string                `json:"durable_event_key,omitempty"`
 
 	// Joined fields
 	ActionName    string `json:"action_name,omitempty"`
@@ -349,6 +366,7 @@ type LogbookActionEvent struct {
 	ExecutionChainID  string `json:"execution_chain_id,omitempty"`
 	CascadeDepth      int    `json:"cascade_depth,omitempty"`
 	SourceApplication string `json:"source_application,omitempty"`
+	CausationEventKey string `json:"causation_event_key,omitempty"`
 }
 
 // CreateLogbookActionRequest represents the API request to create a logbook action
@@ -387,6 +405,6 @@ type NodeExecutionRequest struct {
 
 // NodeExecutionResponse is returned by the main server after executing a node.
 type NodeExecutionResponse struct {
-	Output map[string]interface{} `json:"output,omitempty"`
-	Error  string                 `json:"error,omitempty"`
+	Output map[string]any `json:"output,omitempty"`
+	Error  string         `json:"error,omitempty"`
 }
