@@ -1,9 +1,13 @@
 name: Docker Publish
 
+# Pilanda fork: publishes only the server image to ghcr.io/pilanda-erp/windshift
+# (amd64 – Azure Container Apps). Upstream images under windshiftapp/* are not
+# writable from this repository.
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,22 +26,13 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - name: windshiftapp/windshift
+          - name: pilanda-erp/windshift
             dockerfile: Dockerfile
             short: windshift
-          - name: windshiftapp/ws-carrier
-            dockerfile: deploy/coding-agent/Dockerfile
-            short: ws-carrier
-          - name: windshiftapp/windshift-runner
-            dockerfile: deploy/windshift-runner/Dockerfile
-            short: windshift-runner
         platform:
           - os: linux/amd64
             runner: ubuntu-latest
             arch: amd64
-          - os: linux/arm64
-            runner: ubuntu-24.04-arm
-            arch: arm64
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
@@ -114,12 +109,8 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - name: windshiftapp/windshift
+          - name: pilanda-erp/windshift
             short: windshift
-          - name: windshiftapp/ws-carrier
-            short: ws-carrier
-          - name: windshiftapp/windshift-runner
-            short: windshift-runner
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
@@ -149,13 +140,13 @@ jobs:
           IMG: ${{ env.REGISTRY }}/${{ matrix.image.name }}
           STAGE: stage-${{ github.sha }}
         run: |
-          # Combine the two per-arch staging tags into the final tags. Tags
+          # Fork builds amd64 only; the staging tag is promoted to the final tags. Tags
           # always resolve in the registry (unlike a by-digest index digest),
           # so this is reliable. A short retry covers transient registry blips.
           create() {
             docker buildx imagetools create \
               $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-              "${IMG}:${STAGE}-amd64" "${IMG}:${STAGE}-arm64"
+              "${IMG}:${STAGE}-amd64"
           }
           for attempt in 1 2 3; do
             if create; then
@@ -182,12 +173,12 @@ jobs:
           # Best-effort cleanup: delete the two ephemeral stage-<sha>-<arch>
           # tags now that the real multi-arch manifest is published. Never fails
           # the job — leftover staging tags are harmless if this can't run.
-          for arch in amd64 arm64; do
+          for arch in amd64; do
             tag="stage-${{ github.sha }}-${arch}"
-            vid=$(gh api --paginate "/orgs/windshiftapp/packages/container/${PKG}/versions" \
+            vid=$(gh api --paginate "/orgs/pilanda-erp/packages/container/${PKG}/versions" \
               --jq ".[] | select(.metadata.container.tags | index(\"${tag}\")) | .id" | head -n1)
             if [ -n "$vid" ]; then
-              gh api --method DELETE "/orgs/windshiftapp/packages/container/${PKG}/versions/${vid}" \
+              gh api --method DELETE "/orgs/pilanda-erp/packages/container/${PKG}/versions/${vid}" \
                 && echo "pruned ${tag} (version ${vid})" || echo "could not prune ${tag}"
             else
               echo "no version found for ${tag}"
