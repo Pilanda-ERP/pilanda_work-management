@@ -96,7 +96,7 @@ func (s *UserStore) FindExternalAccount(providerID int, externalID string) (*Ext
 // email_verified, created_at, updated_at.
 func (s *UserStore) getUserByQuery(query string, arg any) (*models.User, error) {
 	var user models.User
-	var avatarURL, timezone, language sql.NullString
+	var avatarURL, passwordHash, timezone, language sql.NullString
 
 	err := s.db.QueryRow(query, arg).Scan(
 		&user.ID,
@@ -106,7 +106,8 @@ func (s *UserStore) getUserByQuery(query string, arg any) (*models.User, error) 
 		&user.LastName,
 		&user.IsActive,
 		&avatarURL,
-		&user.PasswordHash,
+		&passwordHash, // NULL for accounts created without a password
+
 		&user.RequiresPasswordReset,
 		&timezone,
 		&language,
@@ -123,6 +124,7 @@ func (s *UserStore) getUserByQuery(query string, arg any) (*models.User, error) 
 	}
 
 	user.AvatarURL = avatarURL.String
+	user.PasswordHash = passwordHash.String
 	user.Timezone = timezone.String
 	user.Language = language.String
 
@@ -248,6 +250,9 @@ func (s *UserStore) FindOrCreateUser(provider *SSOProvider, claims *OIDCClaims) 
 
 	// 1. Check if external account already linked
 	extAccount, err := s.FindExternalAccount(provider.ID, claims.Subject)
+	if err != nil && !errors.Is(err, ErrExternalAccountNotFound) {
+		return nil, fmt.Errorf("failed to look up external account: %w", err)
+	}
 	if err == nil {
 		// Update last login time
 		_ = s.UpdateLastLogin(extAccount.ID)
@@ -264,6 +269,12 @@ func (s *UserStore) FindOrCreateUser(provider *SSOProvider, claims *OIDCClaims) 
 	if claims.Email != "" {
 		var existingUser *models.User
 		existingUser, err = s.FindUserByEmail(claims.Email)
+		// Only a genuine miss may fall through to provisioning; any other
+		// lookup failure would otherwise surface as a misleading duplicate
+		// email error from CreateUser.
+		if err != nil && !errors.Is(err, ErrUserNotFound) {
+			return nil, fmt.Errorf("failed to look up user by email: %w", err)
+		}
 		if err == nil {
 			// Never grant an unverified SSO identity access to an existing account.
 			if !claimVerifiesEmail && !provider.RequireVerifiedEmail {
