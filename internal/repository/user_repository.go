@@ -170,19 +170,20 @@ func (r *UserRepository) ListAdmin() ([]models.User, error) {
 // GetByEmailOrUsernameForAuth returns a user with password fields for login/change-password flows.
 func (r *UserRepository) GetByEmailOrUsernameForAuth(emailOrUsername string) (*models.User, error) {
 	var u models.User
-	var avatarURL sql.NullString
+	var avatarURL, passwordHash sql.NullString
 	err := r.db.QueryRow(`
 		SELECT id, email, username, first_name, last_name, is_active, avatar_url, password_hash, requires_password_reset, COALESCE(is_agent, false), created_at, updated_at
 		FROM users
 		WHERE email = ? OR username = ?
 	`, emailOrUsername, emailOrUsername).Scan(
 		&u.ID, &u.Email, &u.Username, &u.FirstName, &u.LastName,
-		&u.IsActive, &avatarURL, &u.PasswordHash,
+		&u.IsActive, &avatarURL, &passwordHash,
 		&u.RequiresPasswordReset, &u.IsAgent, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if err != nil {
 		return nil, notFoundOrWrap(err, fmt.Sprintf("get auth user %q", emailOrUsername))
 	}
+	u.PasswordHash = passwordHash.String // NULL for accounts created without a password
 	if avatarURL.Valid {
 		u.AvatarURL = avatarURL.String
 	}
