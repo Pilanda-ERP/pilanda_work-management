@@ -73,6 +73,7 @@ import { leave } from './leave.js';
 import { logbook } from './logbook.js';
 import { iterations, iterationTypes, milestoneCategories, milestones } from './milestones.js';
 import {
+  addCommentReaction,
   attachmentSettings,
   attachments,
   calendarFeed,
@@ -87,6 +88,7 @@ import {
   jiraImport,
   labels,
   personalLabels,
+  removeCommentReaction,
   reviews,
   search,
   updateComment,
@@ -301,6 +303,8 @@ export const api = {
   createComment,
   updateComment,
   deleteComment,
+  addCommentReaction,
+  removeCommentReaction,
 
   // Time tracking API functions
   time,
