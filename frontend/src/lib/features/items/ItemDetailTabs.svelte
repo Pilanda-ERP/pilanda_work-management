@@ -1,6 +1,18 @@
 <script>
-  import { MessageSquare, Clock, Play, Info, History, Edit, Trash2, MoreHorizontal, Bot, Activity, CalendarClock, TimerReset, RefreshCw } from '@lucide/svelte';
-  import { api } from '../../api.js';
+  import MessageSquare from '@lucide/svelte/icons/message-square';
+  import Clock from '@lucide/svelte/icons/clock';
+  import Play from '@lucide/svelte/icons/play';
+  import Info from '@lucide/svelte/icons/info';
+  import History from '@lucide/svelte/icons/history';
+  import Edit from '@lucide/svelte/icons/edit';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import MoreHorizontal from '@lucide/svelte/icons/more-horizontal';
+  import Bot from '@lucide/svelte/icons/bot';
+  import Activity from '@lucide/svelte/icons/activity';
+  import CalendarClock from '@lucide/svelte/icons/calendar-clock';
+  import TimerReset from '@lucide/svelte/icons/timer-reset';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import { items } from '../../api/items.js';
   import Button from '../../components/Button.svelte';
   import DropdownMenu from '../../layout/DropdownMenu.svelte';
   import Comments from '../items/Comments.svelte';
@@ -28,7 +40,9 @@
   // Direct store access for the child-item rollup keeps the time-tab logic
   // co-located and avoids threading four extra props through ItemDetail and
   // ItemDetailContent for a feature that only lives in this tab.
-  import { itemDetailStore, workItemStalenessSettings, workspaceDataStore } from '../../stores';
+  import { itemDetailStore } from '../../stores/itemDetailStore.svelte.js';
+  import { workItemStalenessSettings } from '../../stores/workItemStalenessSettings.svelte.js';
+  import { workspaceDataStore } from '../../stores/workspaceDataStore.svelte.js';
 
   let {
     item,
@@ -119,7 +133,7 @@
     const controller = new AbortController();
     statusDurationsLoading = true;
     statusDurationsError = false;
-    api.items.getStatusDurations(id, { signal: controller.signal })
+    items.getStatusDurations(id, { signal: controller.signal })
       .then((result) => {
         if (!controller.signal.aborted && item?.id === id && statusDurationsRetry === requestVersion) {
           statusDurations = Array.isArray(result?.statuses) ? result.statuses : [];

@@ -1,13 +1,22 @@
 <script>
   import { onMount } from 'svelte';
-  import { api } from '../../api.js';
+  import { customerOrganisations } from '../../api/portal.js';
+  import { time } from '../../api/time.js';
   import Button from '../../components/Button.svelte';
   import Card from '../../components/Card.svelte';
   import DataTable from '../../components/DataTable.svelte';
   import Input from '../../components/Input.svelte';
   import BasePicker from '../../pickers/BasePicker.svelte';
   import PageHeader from '../../layout/PageHeader.svelte';
-  import { Filter, Download, FileText, Clock, Hash, TrendingUp, Briefcase, Users, PieChart } from '@lucide/svelte';
+  import Filter from '@lucide/svelte/icons/filter';
+  import Download from '@lucide/svelte/icons/download';
+  import FileText from '@lucide/svelte/icons/file-text';
+  import Clock from '@lucide/svelte/icons/clock';
+  import Hash from '@lucide/svelte/icons/hash';
+  import TrendingUp from '@lucide/svelte/icons/trending-up';
+  import Briefcase from '@lucide/svelte/icons/briefcase';
+  import Users from '@lucide/svelte/icons/users';
+  import PieChart from '@lucide/svelte/icons/pie-chart';
   import StatCard from '../../components/StatCard.svelte';
   import Chart from '../../widgets/Chart.svelte';
   import { t } from '../../stores/i18n.svelte.js';
@@ -148,7 +157,7 @@
 
   async function loadCustomers() {
     try {
-      customers = (await api.customerOrganisations.getAll()) || [];
+      customers = (await customerOrganisations.getAll()) || [];
     } catch (error) {
       console.error('Failed to load customers:', error);
       customers = [];
@@ -157,7 +166,7 @@
 
   async function loadProjects() {
     try {
-      projects = (await api.time.projects.getAll()) || [];
+      projects = (await time.projects.getAll()) || [];
     } catch (error) {
       console.error('Failed to load projects:', error);
       projects = [];
@@ -172,8 +181,8 @@
     try {
       const query = { ...filters, timezone: reportTimezone };
       const [aggregate, page] = await Promise.all([
-        api.time.worklogs.aggregate(query),
-        api.time.worklogs.getPage({ ...query, page_size: ENTRY_PAGE_SIZE, page: 1 }),
+        time.worklogs.aggregate(query),
+        time.worklogs.getPage({ ...query, page_size: ENTRY_PAGE_SIZE, page: 1 }),
       ]);
       summary = buildSummary(aggregate?.totals, { dateFrom: filters.date_from, dateTo: filters.date_to });
       worklogs = page?.data || [];
@@ -190,7 +199,7 @@
     const nextPage = Math.floor(worklogs.length / ENTRY_PAGE_SIZE) + 1;
     loadingMoreEntries = true;
     try {
-      const page = await api.time.worklogs.getPage(
+      const page = await time.worklogs.getPage(
         { ...filters, timezone: reportTimezone, page_size: ENTRY_PAGE_SIZE, page: nextPage }
       );
       worklogs = [...worklogs, ...(page?.data || [])];
@@ -210,7 +219,7 @@
     let page = 1;
     let totalPages = 1;
     while (page <= totalPages) {
-      const document = await api.time.worklogs.getPage(
+      const document = await time.worklogs.getPage(
         { ...filters, timezone: reportTimezone, page_size: EXPORT_PAGE_SIZE, page }
       );
       for (const row of document?.data || []) {
@@ -241,7 +250,7 @@
         date_from: projectDateFrom,
         date_to: projectDateTo,
       };
-      const aggregate = await api.time.worklogs.aggregate(dateFilters);
+      const aggregate = await time.worklogs.aggregate(dateFilters);
       projectAggregate = aggregate || { daily: [], totals: [] };
     } catch (error) {
       console.error('Failed to load project worklogs:', error);
@@ -258,7 +267,7 @@
       const dateFilters = { timezone: reportTimezone, project_id: selectedProjectId };
       if (projectDateFrom) dateFilters.date_from = projectDateFrom;
       if (projectDateTo) dateFilters.date_to = projectDateTo;
-      const document = await api.time.projects.getWorklogsPage(selectedProjectId, {
+      const document = await time.projects.getWorklogsPage(selectedProjectId, {
         ...dateFilters, page_size: EXPORT_PAGE_SIZE, page,
       });
       rows.push(...(document?.data || []));

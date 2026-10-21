@@ -1,14 +1,24 @@
 <script>
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { t } from '../../stores/i18n.svelte.js';
-  import { api } from '../../api.js';
+  import { collections } from '../../api/collections.js';
+  import { items as itemsApi } from '../../api/items.js';
+  import { teams as teamsApi } from '../../api/teams.js';
   import { fetchV2Data } from '../../api/core.js';
   import { errorToast, successToast } from '../../stores/toasts.svelte.js';
-  import { authStore, collectionStore, workspaceDataStore } from '../../stores';
+  import { authStore } from '../../stores/auth.svelte.js';
+  import { collectionStore } from '../../stores/collectionContext.js';
+  import { workspaceDataStore } from '../../stores/workspaceDataStore.svelte.js';
   import { navigate } from '../../router.js';
   import { confirm } from '../../composables/useConfirm.js';
   import { useCollectionEventStream } from '../../composables/useCollectionEventStream.svelte.js';
-  import { ArrowLeft, ArrowRight, EyeOff, MoreHorizontal, Pencil, Plus, Trash2 } from '@lucide/svelte';
+  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
+  import ArrowRight from '@lucide/svelte/icons/arrow-right';
+  import EyeOff from '@lucide/svelte/icons/eye-off';
+  import MoreHorizontal from '@lucide/svelte/icons/more-horizontal';
+  import Pencil from '@lucide/svelte/icons/pencil';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
   import Badge from '../../components/Badge.svelte';
   import Button from '../../components/Button.svelte';
   import Input from '../../components/Input.svelte';
@@ -187,16 +197,18 @@
       return;
     }
 
-    collectionEditorOptions.prime(
-      id,
-      {
-        statuses,
-        users,
-        milestones,
-        iterations,
-        projects,
-      },
-      workspaceDataStore.planningCompleteness
+    untrack(() =>
+      collectionEditorOptions.prime(
+        id,
+        {
+          statuses,
+          users,
+          milestones,
+          iterations,
+          projects,
+        },
+        workspaceDataStore.planningCompleteness
+      )
     );
   });
 
@@ -206,7 +218,7 @@
       return;
     }
     try {
-      collection = await api.collections.get(collectionId);
+      collection = await collections.get(collectionId);
     } catch (error) {
       collection = null;
     }
@@ -215,7 +227,7 @@
   // Reuses the list view's column configuration so both views stay in sync.
   async function loadBoardConfiguration() {
     try {
-      const config = await api.collections.getBoardConfiguration(collectionId, workspaceId);
+      const config = await collections.getBoardConfiguration(collectionId, workspaceId);
       boardConfig = config;
       listColumns = listColumnsFromConfig(config);
     } catch (error) {
@@ -231,13 +243,13 @@
     try {
       const configData = buildListColumnConfiguration(boardConfig, newColumns);
       const saved = boardConfig?.id
-        ? await api.collections.updateBoardConfiguration(
+        ? await collections.updateBoardConfiguration(
             collectionId,
             boardConfig.id,
             configData,
             workspaceId
           )
-        : await api.collections.createBoardConfiguration(collectionId, workspaceId, configData);
+        : await collections.createBoardConfiguration(collectionId, workspaceId, configData);
       boardConfig = saved;
       listColumns = listColumnsFromConfig(saved);
       // The list view reads this scope's configuration through the shared
@@ -288,7 +300,7 @@
     const loadId = ++itemsLoadId;
     loadingItems = true;
     try {
-      const response = await api.items.getAll({
+      const response = await itemsApi.getAll({
         workspace_id: workspaceId,
         ql: activeQueue.ql,
         page,
@@ -380,7 +392,7 @@
     if (ids.length === 0 || bulkRunning) return;
     bulkRunning = true;
     try {
-      await api.items.bulkUpdate(ids, fields);
+      await itemsApi.bulkUpdate(ids, fields);
       successToast(t('supportQueue.bulkSuccess', { n: ids.length }));
       clearSelection();
       await refreshQueuesAndItems();
@@ -409,7 +421,7 @@
     if (ids.length === 0 || bulkRunning || !bulkStatusId) return;
     bulkRunning = true;
     try {
-      const result = await api.items.bulkTransition(ids, Number(bulkStatusId));
+      const result = await itemsApi.bulkTransition(ids, Number(bulkStatusId));
       if (result.failed_count > 0) {
         errorToast(
           t('supportQueue.bulkPartial', {
@@ -444,7 +456,7 @@
     if (!confirmed) return;
     bulkRunning = true;
     try {
-      const result = await api.items.bulkDelete(ids);
+      const result = await itemsApi.bulkDelete(ids);
       if (result.failed_count > 0) {
         errorToast(
           t('supportQueue.bulkPartial', {
@@ -652,7 +664,7 @@
     void loadBoardConfiguration();
     void loadQueues().then(() => loadItems({ page: 1 }));
     void workspaceDataStore.initialize(workspaceId);
-    api.teams
+    teamsApi
       .getAll()
       .then((list) => {
         teams = list ?? [];

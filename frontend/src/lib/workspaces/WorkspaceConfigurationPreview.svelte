@@ -1,6 +1,9 @@
 <script>
-  import { api } from '../api.js';
-  import { Settings, Workflow, Monitor, Bell } from '@lucide/svelte';
+  import { configurationSets } from '../api/configuration.js';
+  import Settings from '@lucide/svelte/icons/settings';
+  import Workflow from '@lucide/svelte/icons/workflow';
+  import Monitor from '@lucide/svelte/icons/monitor';
+  import Bell from '@lucide/svelte/icons/bell';
   import Lozenge from '../components/Lozenge.svelte';
   import { t } from '../stores/i18n.svelte.js';
 
@@ -38,7 +41,7 @@
       loading = true;
 
       // Load all configuration sets and find the one assigned to this workspace
-      const response = await api.configurationSets.getAll();
+      const response = await configurationSets.getAll();
       if (response?.configuration_sets) {
         // First, try to find workspace-assigned config set
         configurationSet = response.configuration_sets.find(cs =>

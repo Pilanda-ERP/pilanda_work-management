@@ -1,9 +1,14 @@
 <script>
   import { onDestroy, onMount } from 'svelte';
-  import { api } from '../api.js';
+  import { workspaces } from '../api/workspaces.js';
+  import { time } from '../api/time.js';
   import { navigate } from '../router.js';
-  import { workspacePermissions, workspacesStore, currentWorkspace } from '../stores';
-  import { Trash2, AlertTriangle, Clock, Shield } from '@lucide/svelte';
+  import { workspacePermissions } from '../stores/workspacePermissions.svelte.js';
+  import { workspacesStore, currentWorkspace } from '../stores/workspaces.svelte.js';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
+  import Clock from '@lucide/svelte/icons/clock';
+  import Shield from '@lucide/svelte/icons/shield';
   import { moduleSettings } from '../stores/moduleSettings.js';
   import { viewSettingsStore } from '../stores/viewSettings.svelte.js';
   import WorkspaceConfigurationAssigner from './WorkspaceConfigurationAssigner.svelte';
@@ -162,7 +167,7 @@ import WorkspaceCannedResponses from './WorkspaceCannedResponses.svelte';
 
   async function loadWorkspace(version) {
     try {
-      const loaded = await api.workspaces.get(workspaceId);
+      const loaded = await workspaces.get(workspaceId);
       // A newer workspace is already loading — its response owns the form.
       if (version !== workspaceLoadVersion) return;
       workspace = loaded;
@@ -187,7 +192,7 @@ import WorkspaceCannedResponses from './WorkspaceCannedResponses.svelte';
 
   async function loadTimeProjects() {
     try {
-      timeProjects = await api.time.projects.getAll() || [];
+      timeProjects = await time.projects.getAll() || [];
     } catch (error) {
       console.error('Failed to load time projects:', error);
       timeProjects = [];
@@ -196,7 +201,7 @@ import WorkspaceCannedResponses from './WorkspaceCannedResponses.svelte';
 
   async function loadTimeProjectCategories() {
     try {
-      timeProjectCategories = await api.time.projectCategories.getAll() || [];
+      timeProjectCategories = await time.projectCategories.getAll() || [];
     } catch (error) {
       console.error('Failed to load time project categories:', error);
       timeProjectCategories = [];
@@ -240,7 +245,7 @@ import WorkspaceCannedResponses from './WorkspaceCannedResponses.svelte';
 
     try {
       saving = true;
-      await api.workspaces.update(targetId, payload);
+      await workspaces.update(targetId, payload);
 
       // Update stores so sidebar dropdown reflects name/description changes immediately
       workspacesStore.updateWorkspace(targetId, {
@@ -285,7 +290,7 @@ import WorkspaceCannedResponses from './WorkspaceCannedResponses.svelte';
     const targetName = workspace.name;
 
     try {
-      await api.workspaces.delete(targetId);
+      await workspaces.delete(targetId);
       workspacesStore.remove(targetId);
 
       if (targetId !== workspaceId) return;

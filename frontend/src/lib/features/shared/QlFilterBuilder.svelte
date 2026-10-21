@@ -1,8 +1,9 @@
 <script>
   import { onMount } from 'svelte';
-  import { Plus, X } from '@lucide/svelte';
+  import Plus from '@lucide/svelte/icons/plus';
+  import X from '@lucide/svelte/icons/x';
   import { t } from '../../stores/i18n.svelte.js';
-  import { api } from '../../api.js';
+  import { queryLanguage } from '../../api/queryLanguage.js';
   import { QLBuilder } from '../../utils/ql.js';
   import { completionFieldToFilterField } from '../../utils/qlCompletion.js';
   import Button from '../../components/Button.svelte';
@@ -64,7 +65,7 @@
   async function ensureCatalog() {
     if (catalog) return catalog;
     try {
-      catalog = await api.queryLanguage.getCatalog();
+      catalog = await queryLanguage.getCatalog();
     } catch (error) {
       console.warn('Failed to load QL catalog for builder hydration:', error);
       catalog = null;

@@ -1,8 +1,10 @@
 <script>
   import { onMount } from 'svelte';
   import { currentRoute, navigate } from '../../router.js';
-  import { api } from '../../api.js';
-  import { IconPlayerPlay, IconEdit, IconTrash } from '@tabler/icons-svelte-runes';
+  import { tests } from '../../api/tests/index.js';
+  import IconPlayerPlay from '@tabler/icons-svelte-runes/icons/player-play';
+  import IconEdit from '@tabler/icons-svelte-runes/icons/edit';
+  import IconTrash from '@tabler/icons-svelte-runes/icons/trash';
   import Button from '../../components/Button.svelte';
   import BackButton from '../../components/BackButton.svelte';
   import { confirm } from '../../composables/useConfirm.js';
@@ -43,11 +45,11 @@
   async function loadTemplate(templateId) {
     try {
       loading = true;
-      template = await api.tests.testRunTemplates.get(workspaceId, templateId);
-      executions = await api.tests.testRunTemplates.getExecutions(workspaceId, templateId);
+      template = await tests.testRunTemplates.get(workspaceId, templateId);
+      executions = await tests.testRunTemplates.getExecutions(workspaceId, templateId);
 
       if (template.plan_id) {
-        testSet = await api.tests.testPlans.get(workspaceId, template.plan_id);
+        testSet = await tests.testPlans.get(workspaceId, template.plan_id);
       }
     } catch (error) {
       console.error('Failed to load template:', error);
@@ -83,7 +85,7 @@
     }
 
     try {
-      await api.tests.testRunTemplates.update(workspaceId, templateId, {
+      await tests.testRunTemplates.update(workspaceId, templateId, {
         plan_id: template.plan_id,
         name: editName,
         description: editDescription
@@ -113,7 +115,7 @@
     });
     if (!ok) return;
     try {
-      await api.tests.testRunTemplates.delete(workspaceId, templateId);
+      await tests.testRunTemplates.delete(workspaceId, templateId);
       navigate(testPath('/templates'));
     } catch (error) {
       console.error('Failed to delete template:', error);
@@ -129,7 +131,7 @@
 
   async function executeTemplate() {
     try {
-      const newRun = await api.tests.testRunTemplates.execute(workspaceId, templateId);
+      const newRun = await tests.testRunTemplates.execute(workspaceId, templateId);
       navigate(testPath(`/runs/${newRun.id}/execute`));
     } catch (error) {
       console.error('Failed to execute template:', error);

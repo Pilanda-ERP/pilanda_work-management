@@ -1,8 +1,29 @@
 <script>
   import { onMount, untrack } from 'svelte';
-  import { api } from '../api.js';
+  import { assetSets as assetSetsApi } from '../api/assets.js';
+  import { customFields as customFieldsApi, itemTypes as itemTypesApi, linkTypes as linkTypesApi } from '../api/configuration.js';
   import { currentRoute, navigate } from '../router.js';
-  import { Plus, Edit, Trash2, MoreHorizontal, Circle, Database, Settings, Type, AlignLeft, ChevronDownCircle, ListChecks, Hash, Calendar, User, Repeat, Flag, Box, Globe, Building2, Link2, CheckSquare } from '@lucide/svelte';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Edit from '@lucide/svelte/icons/edit';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import MoreHorizontal from '@lucide/svelte/icons/more-horizontal';
+  import Circle from '@lucide/svelte/icons/circle';
+  import Database from '@lucide/svelte/icons/database';
+  import Settings from '@lucide/svelte/icons/settings';
+  import Type from '@lucide/svelte/icons/type';
+  import AlignLeft from '@lucide/svelte/icons/align-left';
+  import ChevronDownCircle from '@lucide/svelte/icons/chevron-down-circle';
+  import ListChecks from '@lucide/svelte/icons/list-checks';
+  import Hash from '@lucide/svelte/icons/hash';
+  import Calendar from '@lucide/svelte/icons/calendar';
+  import User from '@lucide/svelte/icons/user';
+  import Repeat from '@lucide/svelte/icons/repeat';
+  import Flag from '@lucide/svelte/icons/flag';
+  import Box from '@lucide/svelte/icons/box';
+  import Globe from '@lucide/svelte/icons/globe';
+  import Building2 from '@lucide/svelte/icons/building-2';
+  import Link2 from '@lucide/svelte/icons/link-2';
+  import CheckSquare from '@lucide/svelte/icons/check-square';
   import Button from '../components/Button.svelte';
   import Input from '../components/Input.svelte';
   import DataTable from '../components/DataTable.svelte';
@@ -24,7 +45,7 @@
   import { formatDateSimple } from '../utils/dateFormatter.js';
   import BasePicker from '../pickers/BasePicker.svelte';
   import { fieldOptionsObject, parseFieldOptions, serializeOptions } from '../utils/optionUtils.js';
-  import { X as XIcon } from '@lucide/svelte';
+  import XIcon from '@lucide/svelte/icons/x';
   import DescriptionText from '../components/DescriptionText.svelte';
   import { customFieldFormData, customFieldUpdatePayload, linkingFieldOptions, loadCustomFieldsOverview } from './customFieldsData.js';
   import { BOOLEAN_CUSTOM_FIELD_TYPE, canonicalCustomFieldType, isBooleanCustomFieldType } from '../utils/customFieldTypes.js';
@@ -154,9 +175,9 @@
     };
     const [, loadedAssetSets, loadedLinkTypes, loadedItemTypes] = await Promise.all([
       loadCustomFields(),
-      loadCatalog(() => api.assetSets.getAll(), 'asset sets'),
-      loadCatalog(() => api.linkTypes.getAll(), 'link types'),
-      loadCatalog(() => api.itemTypes.getAll(), 'item types'),
+      loadCatalog(() => assetSetsApi.getAll(), 'asset sets'),
+      loadCatalog(() => linkTypesApi.getAll(), 'link types'),
+      loadCatalog(() => itemTypesApi.getAll(), 'item types'),
     ]);
     assetSets = loadedAssetSets;
     linkTypes = loadedLinkTypes;
@@ -165,7 +186,7 @@
 
   async function loadCustomFields() {
     try {
-      const overview = await loadCustomFieldsOverview(api);
+      const overview = await loadCustomFieldsOverview();
       customFields = overview.customFields;
       indexCounts = overview.indexCounts;
       screens = overview.screens;
@@ -184,7 +205,7 @@
 
   async function saveSettings() {
     try {
-      await api.customFields.updateSettings({ max_indexes_per_table: settingsMaxIndexes });
+      await customFieldsApi.updateSettings({ max_indexes_per_table: settingsMaxIndexes });
       showSettingsModal = false;
       await loadCustomFields();
     } catch (error) {
@@ -400,9 +421,9 @@
         if (isIndexableType(formData.field_type)) {
           data.indexed = { items: indexedItems, assets: indexedAssets };
         }
-        saveResult = await api.customFields.update(editingField.id, data);
+        saveResult = await customFieldsApi.update(editingField.id, data);
       } else {
-        saveResult = await api.customFields.create(data);
+        saveResult = await customFieldsApi.create(data);
       }
 
       if (saveResult?.indexing_deferred) {
@@ -434,7 +455,7 @@
     });
     if (confirmed) {
       try {
-        await api.customFields.delete(field.id);
+        await customFieldsApi.delete(field.id);
         await loadCustomFields();
         window.dispatchEvent(new CustomEvent('refresh-workspace-data'));
       } catch (error) {

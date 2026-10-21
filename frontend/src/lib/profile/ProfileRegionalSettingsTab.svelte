@@ -1,13 +1,13 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { Globe } from '@lucide/svelte';
-  import { api } from '../api.js';
+  import Globe from '@lucide/svelte/icons/globe';
+  import { updateUserRegionalSettings } from '../api/users.js';
   import AlertBox from '../components/AlertBox.svelte';
   import Button from '../components/Button.svelte';
   import FormField from '../components/FormField.svelte';
   import BasePicker from '../pickers/BasePicker.svelte';
   import TimezonePicker from '../pickers/TimezonePicker.svelte';
-  import { authStore } from '../stores';
+  import { authStore } from '../stores/auth.svelte.js';
   import { i18n, SUPPORTED_LOCALES, t } from '../stores/i18n.svelte.js';
 
   let { user = $bindable(null), userId = null } = $props();
@@ -40,7 +40,7 @@
     saved = false;
     error = '';
     try {
-      const updatedUser = await api.updateUserRegionalSettings(userId, {
+      const updatedUser = await updateUserRegionalSettings(userId, {
         timezone: selectedTimezone,
         language: selectedLanguage,
       });

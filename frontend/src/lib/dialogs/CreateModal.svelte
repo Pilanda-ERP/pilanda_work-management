@@ -3,9 +3,22 @@
   import { useEventListener } from 'runed';
   import { navigate, currentRoute } from '../router.js';
   import { milestonesStore } from '../stores/milestones.js';
-  import { workspacesStore, shouldNavigateAfterCreate, workItemFormStore, permissionStore, isSystemAdmin, workspacePermissions } from '../stores';
-  import { api } from '../api.js';
-  import { X, Target, Building, FolderOpen, ChevronRight, FileText } from '@lucide/svelte';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
+  import { shouldNavigateAfterCreate } from '../stores/navigationConfig.svelte.js';
+  import { workItemFormStore } from '../stores/workItemFormStore.svelte.js';
+  import { permissionStore, isSystemAdmin } from '../stores/permissions.svelte.js';
+  import { workspacePermissions } from '../stores/workspacePermissions.svelte.js';
+  import { packs as packsApi } from '../api/packs.js';
+  import { workspaces } from '../api/workspaces.js';
+  import { attachments } from '../api/misc.js';
+  import { items } from '../api/items.js';
+  import { collections } from '../api/collections.js';
+  import X from '@lucide/svelte/icons/x';
+  import Target from '@lucide/svelte/icons/target';
+  import Building from '@lucide/svelte/icons/building';
+  import FolderOpen from '@lucide/svelte/icons/folder-open';
+  import ChevronRight from '@lucide/svelte/icons/chevron-right';
+  import FileText from '@lucide/svelte/icons/file-text';
   import { t } from '../stores/i18n.svelte.js';
   import Button from '../components/Button.svelte';
   import ModalBackdrop from '../components/ModalBackdrop.svelte';
@@ -204,7 +217,7 @@
     workspacePacksLoading = true;
     workspacePacksError = null;
     try {
-      const packs = await api.packs.list();
+      const packs = await packsApi.list();
       workspacePackOptions = Array.isArray(packs) ? packs : [];
       workspacePacksLoaded = true;
     } catch (error) {
@@ -221,7 +234,7 @@
     workspaceTemplatesLoading = true;
     workspaceTemplatesError = null;
     try {
-      const templates = await api.workspaces.getTemplates();
+      const templates = await workspaces.getTemplates();
       workspaceTemplateOptions = Array.isArray(templates) ? templates : [];
       workspaceTemplatesLoaded = true;
     } catch (error) {
@@ -242,13 +255,13 @@
     for (const image of workItemFormStore.pendingDescriptionImages) {
       if (!updatedDescription.includes(image.url)) continue;
 
-      const attachment = await api.attachments.uploadToItem(itemId, image.file);
+      const attachment = await attachments.uploadToItem(itemId, image.file);
       const attachmentId = attachment?.id;
       if (!attachmentId) {
         throw new Error('Image upload failed');
       }
 
-      const downloadUrl = api.attachments.getContentUrl(attachmentId);
+      const downloadUrl = attachments.getContentUrl(attachmentId);
       updatedDescription = updatedDescription.split(image.url).join(downloadUrl);
     }
 
@@ -275,7 +288,7 @@
         // Creation may have committed on an earlier attempt whose post-create
         // work failed. Reuse that item instead of posting a duplicate.
         const reusingItem = recoverableItemId != null;
-        let result = reusingItem ? { id: recoverableItemId } : await api.items.create(formData);
+        let result = reusingItem ? { id: recoverableItemId } : await items.create(formData);
         recoverableItemId = result.id;
 
         const originalDescription = formData.description || '';
@@ -283,7 +296,7 @@
         // Always reconcile the description when retrying a committed item: the
         // first attempt stored the pre-upload text and may hold a temporary URL.
         if (updatedDescription !== originalDescription || reusingItem) {
-          result = await api.items.update(result.id, { description: updatedDescription });
+          result = await items.update(result.id, { description: updatedDescription });
           formData.description = updatedDescription;
         }
 
@@ -342,7 +355,7 @@
         if (workspaceFormData.template_pack) {
           payload.template_pack = workspaceFormData.template_pack;
         }
-        const result = await api.workspaces.create(payload);
+        const result = await workspaces.create(payload);
 
         // The creator becomes the workspace administrator server-side; refresh
         // the permission profile so the workspace nav immediately shows the
@@ -358,7 +371,7 @@
         }
         close();
       } else if (selectedType === 'collection') {
-        const result = await api.collections.create({
+        const result = await collections.create({
           name: collectionFormData.name,
           description: collectionFormData.description || '',
           ql_query: '',

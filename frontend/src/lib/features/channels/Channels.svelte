@@ -3,8 +3,16 @@
   import StateDisplay from '../../components/StateDisplay.svelte';
   import { useEventListener } from 'runed';
   import { t } from '../../stores/i18n.svelte.js';
-  import { IconLifebuoy, IconPlus, IconTrash, IconSettings, IconSearch, IconTag, IconPower, IconFileText, IconMail } from '@tabler/icons-svelte-runes';
-  import { api } from '../../api.js';
+  import IconLifebuoy from '@tabler/icons-svelte-runes/icons/lifebuoy';
+  import IconPlus from '@tabler/icons-svelte-runes/icons/plus';
+  import IconTrash from '@tabler/icons-svelte-runes/icons/trash';
+  import IconSettings from '@tabler/icons-svelte-runes/icons/settings';
+  import IconSearch from '@tabler/icons-svelte-runes/icons/search';
+  import IconTag from '@tabler/icons-svelte-runes/icons/tag';
+  import IconPower from '@tabler/icons-svelte-runes/icons/power';
+  import IconFileText from '@tabler/icons-svelte-runes/icons/file-text';
+  import IconMail from '@tabler/icons-svelte-runes/icons/mail';
+  import { channels as channelsApi } from '../../api/channels.js';
   import { currentRoute, navigate } from '../../router.js';
   import { channelCategoriesStore } from '../../stores/channelCategories.js';
   import { toHotkeyString, getShortcutDisplay } from '../../utils/keyboardShortcuts.js';
@@ -124,7 +132,7 @@
 
   async function toggleChannelEnabled(channel) {
     try {
-      await api.channels.toggle(channel.id);
+      await channelsApi.toggle(channel.id);
       await loadChannels();
       successToast(`Channel ${channel.status === 'enabled' ? 'disabled' : 'enabled'} successfully`);
     } catch (err) {
@@ -258,7 +266,7 @@
     try {
       loading = true;
       error = null;
-      channels = await api.channels.getAll({ include_disabled: true });
+      channels = await channelsApi.getAll({ include_disabled: true });
     } catch (err) {
       console.error('Failed to load channels:', err);
       error = 'Failed to load channels';
@@ -338,7 +346,7 @@
         category_id: channelFormData.category_id || null
       };
 
-      const newChannel = await api.channels.create(channelData);
+      const newChannel = await channelsApi.create(channelData);
 
       await loadChannels();
       cancelChannelForm();
@@ -387,7 +395,7 @@
     }
     let impact;
     try {
-      impact = await api.channels.getDeleteImpact(channel.id);
+      impact = await channelsApi.getDeleteImpact(channel.id);
     } catch (error) {
       console.error('Failed to load channel delete impact:', error);
       errorToast('Could not verify what this deletion would remove. Please try again.');
@@ -421,7 +429,7 @@
     });
     if (!ok) return;
     try {
-      await api.channels.delete(channel.id);
+      await channelsApi.delete(channel.id);
       await loadChannels();
 
       if (selectedChannel?.id === channel.id) {

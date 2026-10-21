@@ -12,8 +12,18 @@
   import { nord } from '@milkdown/theme-nord';
   import '@milkdown/theme-nord/style.css';
   import { imageBlockComponent } from '@milkdown/kit/component/image-block';
-  import { Bold, Italic, Code, List, ListOrdered, Strikethrough, Image as ImageIcon, Workflow, BookOpen } from '@lucide/svelte';
-  import { api } from '../api.js';
+  import Bold from '@lucide/svelte/icons/bold';
+  import Italic from '@lucide/svelte/icons/italic';
+  import Code from '@lucide/svelte/icons/code';
+  import List from '@lucide/svelte/icons/list';
+  import ListOrdered from '@lucide/svelte/icons/list-ordered';
+  import Strikethrough from '@lucide/svelte/icons/strikethrough';
+  import ImageIcon from '@lucide/svelte/icons/image';
+  import Workflow from '@lucide/svelte/icons/workflow';
+  import BookOpen from '@lucide/svelte/icons/book-open';
+  import { getAssignableUsers, getUsers } from '../api/users.js';
+  import { attachments as attachmentsApi } from '../api/misc.js';
+  import { pages } from '../api/pages.js';
   import { confirm } from '../composables/useConfirm.js';
   import Tooltip from '../components/Tooltip.svelte';
   import FileInput from '../components/FileInput.svelte';
@@ -234,8 +244,8 @@
     if (mentionRoster) return Promise.resolve(mentionRoster);
     if (!mentionRosterPromise) {
       mentionRosterPromise = (workspaceId
-        ? api.getAssignableUsers(workspaceId)
-        : api.getUsers())
+        ? getAssignableUsers(workspaceId)
+        : getUsers())
         .then((roster) => {
           mentionRoster = roster || [];
           return mentionRoster;
@@ -381,7 +391,7 @@
 
           let result;
           if (!customUploadFn && effectiveEntityType === 'item' && effectiveEntityId) {
-            const attachment = await api.attachments.uploadToItem(effectiveEntityId, image);
+            const attachment = await attachmentsApi.uploadToItem(effectiveEntityId, image);
             result = { success: true, attachment };
           } else {
             const formData = new FormData();
@@ -392,11 +402,11 @@
             }
             result = customUploadFn
               ? await customUploadFn(formData)
-              : await api.attachments.upload(formData);
+              : await attachmentsApi.upload(formData);
           }
           if (result.success && result.attachment) {
             const src = downloadUrlBase === '/api/attachments'
-              ? api.attachments.getContentUrl(result.attachment.id)
+              ? attachmentsApi.getContentUrl(result.attachment.id)
               : `${downloadUrlBase}/${result.attachment.id}/download`;
             const node = schema?.nodes?.image?.createAndFill({
               src,
@@ -781,7 +791,7 @@
     const version = ++pageLinkSearchVersion;
     pageLinkTimer = setTimeout(async () => {
       try {
-        const result = await api.pages.searchPages(workspaceId, trimmed, { limit: 8 });
+        const result = await pages.searchPages(workspaceId, trimmed, { limit: 8 });
         if (version !== pageLinkSearchVersion) return;
         pageLinkResults = result?.results ?? (Array.isArray(result) ? result : []);
       } catch (error) {
@@ -863,7 +873,7 @@
   onfocusout={handleEditorFocusOut}
 >
   {#if toolbarVisible}
-    <div class="milkdown-toolbar" tabindex="-1">
+    <div class="milkdown-toolbar" tabindex="-1" data-testid="milkdown-toolbar">
       <Tooltip content={t('editors.bold')} placement="bottom">
         {#snippet children()}
           <button type="button" class="toolbar-btn" tabindex="-1" onclick={toggleBold} aria-label={t('editors.bold')}>

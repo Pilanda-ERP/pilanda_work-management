@@ -2,7 +2,9 @@
   import { onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import { useDebounce } from 'runed';
-  import { api } from '../api.js';
+  import { workspaces } from '../api/workspaces.js';
+  import { statusCategories as statusCategoriesApi, statuses } from '../api/workflows.js';
+  import { items as itemsApi } from '../api/items.js';
   import {
     useGradientStyles,
     loadWorkspaceGradient,
@@ -13,7 +15,12 @@
   } from '../stores/workspaceGradient.svelte.js';
 
   import { getCollection } from '../features/collections/collectionService.js';
-  import { Edit3, Plus, X, LayoutGrid, Pencil, Trash2 } from '@lucide/svelte';
+  import Edit3 from '@lucide/svelte/icons/edit-3';
+  import Plus from '@lucide/svelte/icons/plus';
+  import X from '@lucide/svelte/icons/x';
+  import LayoutGrid from '@lucide/svelte/icons/layout-grid';
+  import Pencil from '@lucide/svelte/icons/pencil';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
   import { t } from '../stores/i18n.svelte.js';
   import { formatDateOnly } from '../utils/dateFormatter.js';
   import { errorToast } from '../stores/toasts.svelte.js';
@@ -230,7 +237,7 @@
 
   async function loadWorkspace() {
     try {
-      workspace = await api.workspaces.get(workspaceId);
+      workspace = await workspaces.get(workspaceId);
     } catch (error) {
       console.error('Failed to load workspace:', error);
     }
@@ -238,7 +245,7 @@
 
   async function loadStatusCategories() {
     try {
-      statusCategories = await api.statusCategories.getAll();
+      statusCategories = await statusCategoriesApi.getAll();
     } catch (error) {
       console.error('Failed to load status categories:', error);
     }
@@ -250,7 +257,7 @@
       if (collectionId) {
         params.collection_id = collectionId;
       }
-      const statsData = await api.workspaces.getStats(workspaceId, params);
+      const statsData = await workspaces.getStats(workspaceId, params);
       stats.totalCollections = statsData.total_collections || 0;
       stats.totalItems = statsData.total_items || 0;
       stats.itemsByStatusCategory = statsData.items_by_status_category || {};
@@ -267,9 +274,9 @@
         filters.collection_id = collectionId;
       }
 
-      const itemsResponse = await api.items.getAll(filters);
+      const itemsResponse = await itemsApi.getAll(filters);
       const items = itemsResponse?.data ?? [];
-      const fetchedStatuses = await api.statuses.getAll();
+      const fetchedStatuses = await statuses.getAll();
       const statusList = Array.isArray(fetchedStatuses) ? fetchedStatuses : [];
       const localStatusById = new Map(
         statusList
@@ -381,7 +388,7 @@
         backgroundImageUrl: get(workspaceBackgroundImageUrl) || ''
       };
 
-      await api.workspaces.updateHomepageLayout(workspaceId, attemptedLayout);
+      await workspaces.updateHomepageLayout(workspaceId, attemptedLayout);
       hydrateWorkspaceGradientLayout(workspaceId, attemptedLayout);
       savedWidgetWidths = captureWorkspaceWidgetWidths(attemptedLayout.widgets);
     } catch (error) {

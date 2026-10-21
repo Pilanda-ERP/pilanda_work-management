@@ -1,5 +1,5 @@
 <script>
-  import { api } from '../../api.js';
+  import { sla } from '../../api/sla.js';
   import PageHeader from '../../layout/PageHeader.svelte';
   import Button from '../../components/Button.svelte';
   import DataTable from '../../components/DataTable.svelte';
@@ -10,7 +10,10 @@
   import DialogFooter from '../../dialogs/DialogFooter.svelte';
   import Input from '../../components/Input.svelte';
   import Select from '../../components/Select.svelte';
-  import { BellRing, Plus, Trash2, Edit } from '@lucide/svelte';
+  import BellRing from '@lucide/svelte/icons/bell-ring';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Edit from '@lucide/svelte/icons/edit';
   import { t } from '../../stores/i18n.svelte.js';
   import { confirm } from '../../composables/useConfirm.js';
   import { successToast, errorToast } from '../../stores/toasts.svelte.js';
@@ -43,7 +46,7 @@
     try {
       loading = true;
       error = null;
-      thresholds = (await api.sla.getWarningThresholds(workspaceId)) ?? [];
+      thresholds = (await sla.getWarningThresholds(workspaceId)) ?? [];
     } catch (err) {
       error = err?.message || t('workspaceSettings.serviceLevels.loadThresholdsFailed');
     } finally {
@@ -52,7 +55,7 @@
   }
 
   async function loadMetrics() {
-    metrics = (await api.sla.getMetrics(workspaceId).catch(() => [])) ?? [];
+    metrics = (await sla.getMetrics(workspaceId).catch(() => [])) ?? [];
   }
 
   // WorkspaceSettings keeps one component mounted across routes.
@@ -98,10 +101,10 @@
         is_active: formData.is_active,
       };
       if (editing) {
-        await api.sla.updateWarningThreshold(workspaceId, editing.id, payload);
+        await sla.updateWarningThreshold(workspaceId, editing.id, payload);
         successToast(t('workspaceSettings.serviceLevels.thresholdUpdated'));
       } else {
-        await api.sla.createWarningThreshold(workspaceId, payload);
+        await sla.createWarningThreshold(workspaceId, payload);
         successToast(t('workspaceSettings.serviceLevels.thresholdCreated'));
       }
       // Successful mutation: drop cached thresholds and refresh mounted badges.
@@ -126,7 +129,7 @@
     });
     if (!ok) return;
     try {
-      await api.sla.deleteWarningThreshold(workspaceId, threshold.id);
+      await sla.deleteWarningThreshold(workspaceId, threshold.id);
       successToast(t('workspaceSettings.serviceLevels.thresholdDeleted'));
       invalidateSLAThresholds(workspaceId);
       await loadThresholds();

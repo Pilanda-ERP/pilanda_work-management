@@ -1,10 +1,11 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
-  import { api } from '../../api.js';
+  import { collections } from '../../api/collections.js';
   import { navigate } from '../../router.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast, warningToast } from '../../stores/toasts.svelte.js';
-  import { IconFilter as Filter, IconSearch as Search } from '@tabler/icons-svelte-runes';
+  import Filter from '@tabler/icons-svelte-runes/icons/filter';
+  import Search from '@tabler/icons-svelte-runes/icons/search';
   import Card from '../../components/Card.svelte';
   import Pagination from '../../components/Pagination.svelte';
   import CollectionsSidebar from './CollectionsSidebar.svelte';
@@ -22,7 +23,9 @@
   import Modal from '../../dialogs/Modal.svelte';
   import WorkspacePicker from '../../pickers/WorkspacePicker.svelte';
   import { collectionCategoriesStore } from '../../stores/collectionCategories.js';
-  import { permissionStore, isSystemAdmin, authStore, workspaceDataStore } from '../../stores';
+  import { permissionStore, isSystemAdmin } from '../../stores/permissions.svelte.js';
+  import { authStore } from '../../stores/auth.svelte.js';
+  import { workspaceDataStore } from '../../stores/workspaceDataStore.svelte.js';
   import ColumnSelector from './ColumnSelector.svelte';
   import WorkItemListTable from './WorkItemListTable.svelte';
   import {
@@ -134,7 +137,7 @@
 
   async function loadCollectionById(id, restoreURLQuery = false) {
     try {
-      const collection = await api.collections.get(id);
+      const collection = await collections.get(id);
       if (!collection) return;
       currentCollection = collection;
       slugSaved = !!(collection.is_public && collection.public_slug);
@@ -156,7 +159,7 @@
 
   async function loadBoardConfiguration(id) {
     try {
-      const bootstrap = await api.collections.getBoardConfigurationBootstrap(id);
+      const bootstrap = await collections.getBoardConfigurationBootstrap(id);
       const config = bootstrap?.board_configuration ?? null;
       boardConfig = config;
       listColumns = listColumnsFromConfig(config);
@@ -175,12 +178,12 @@
     try {
       const configData = buildListColumnConfiguration(boardConfig, newColumns);
       const savedConfig = boardConfig?.id
-        ? await api.collections.updateBoardConfiguration(
+        ? await collections.updateBoardConfiguration(
             currentCollection.id,
             boardConfig.id,
             configData,
           )
-        : await api.collections.createBoardConfiguration(
+        : await collections.createBoardConfiguration(
             currentCollection.id,
             null,
             configData,
@@ -301,7 +304,7 @@
     if (!currentCollection) return;
     const next = !currentCollection.is_private;
     try {
-      const updated = await api.collections.update(
+      const updated = await collections.update(
         currentCollection.id,
         buildCollectionUpdate({ is_private: next })
       );
@@ -322,7 +325,7 @@
         is_public: isPublic,
         public_slug: publicSlug,
       });
-      await api.collections.update(currentCollection.id, update);
+      await collections.update(currentCollection.id, update);
       currentCollection = {
         ...currentCollection,
         ql_query: update.ql_query,
@@ -350,7 +353,7 @@
       return;
     }
     try {
-      await api.collections.update(currentCollection.id, buildCollectionUpdate());
+      await collections.update(currentCollection.id, buildCollectionUpdate());
       navigate(returnPath || '/collections');
     } catch (error) {
       console.error('Failed to update collection:', error);
@@ -380,7 +383,7 @@
     try {
       // Association is not a publishing operation: omit public-sharing fields so
       // an ordinary owner without public_board.manage can move the collection.
-      await api.collections.update(
+      await collections.update(
         currentCollection.id,
         buildCollectionAssociationUpdate({
           collection: currentCollection,

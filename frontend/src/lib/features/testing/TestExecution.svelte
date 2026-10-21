@@ -2,9 +2,17 @@
   import { onMount } from 'svelte';
   import ModalBackdrop from '../../components/ModalBackdrop.svelte';
   import { currentRoute, navigate } from '../../router.js';
-  import { api } from '../../api.js';
+  import { items } from '../../api/items.js';
+  import { tests } from '../../api/tests/index.js';
   import { isExpectedBackgroundSyncError } from '../../utils/backgroundSync.js';
-  import { IconCheck, IconX, IconBug, IconChevronRight, IconChevronLeft, IconPlus, IconLink, IconPlayerSkipForward } from '@tabler/icons-svelte-runes';
+  import IconCheck from '@tabler/icons-svelte-runes/icons/check';
+  import IconX from '@tabler/icons-svelte-runes/icons/x';
+  import IconBug from '@tabler/icons-svelte-runes/icons/bug';
+  import IconChevronRight from '@tabler/icons-svelte-runes/icons/chevron-right';
+  import IconChevronLeft from '@tabler/icons-svelte-runes/icons/chevron-left';
+  import IconPlus from '@tabler/icons-svelte-runes/icons/plus';
+  import IconLink from '@tabler/icons-svelte-runes/icons/link';
+  import IconPlayerSkipForward from '@tabler/icons-svelte-runes/icons/player-skip-forward';
   import { confirm } from '../../composables/useConfirm.js';
   import Button from '../../components/Button.svelte';
   import BackButton from '../../components/BackButton.svelte';
@@ -22,7 +30,7 @@
   import Textarea from '../../components/Textarea.svelte';
   import { getStatusLabel, getTestStatusColor } from '../../utils/statusColors.js';
   import { t } from '../../stores/i18n.svelte.js';
-  import { workspacePermissions } from '../../stores/index.js';
+  import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
   import DescriptionText from '../../components/DescriptionText.svelte';
   import { loadTestRunDetail } from './testRunDetailData.js';
 import BDDExampleExecution from './BDDExampleExecution.svelte';
@@ -78,7 +86,7 @@ import { parseScenarioSpec, flattenExamples } from './bddSpec.js';
 
   async function loadWorkspaceItems() {
     try {
-      const response = await api.items.getAll({ workspace_id: workspaceId });
+      const response = await items.getAll({ workspace_id: workspaceId });
       workspaceItems = response?.data ?? [];
     } catch (error) {
       // Navigating away aborts the in-flight fetch — expected control flow,
@@ -94,7 +102,7 @@ import { parseScenarioSpec, flattenExamples } from './bddSpec.js';
     try {
       loading = true;
 
-      const detail = await loadTestRunDetail(api, workspaceId, runId);
+      const detail = await loadTestRunDetail(workspaceId, runId);
       testRun = detail.run;
       bddSnapshots = detail.bddSnapshots;
       const groupedExampleResults = {};
@@ -362,7 +370,7 @@ import { parseScenarioSpec, flattenExamples } from './bddSpec.js';
     // backend overwrites items.item_id with whatever this payload carries.
     try {
       const resultData = stepResults[stepId];
-      await api.tests.testRuns.updateStepResult(workspaceId, runId, stepId, {
+      await tests.testRuns.updateStepResult(workspaceId, runId, stepId, {
         status: status,
         actual_result: resultData.actual_result || '',
         notes: resultData.notes || '',
@@ -388,7 +396,7 @@ import { parseScenarioSpec, flattenExamples } from './bddSpec.js';
     // Save to backend, preserving any previously linked item_id.
     try {
       const resultData = stepResults[stepId];
-      await api.tests.testRuns.updateStepResult(workspaceId, runId, stepId, {
+      await tests.testRuns.updateStepResult(workspaceId, runId, stepId, {
         status: resultData.status || 'not_run',
         actual_result: resultData.actual_result || '',
         notes: resultData.notes || '',
@@ -408,7 +416,7 @@ import { parseScenarioSpec, flattenExamples } from './bddSpec.js';
     });
     if (!ok) return;
     try {
-      await api.tests.testRuns.end(workspaceId, runId);
+      await tests.testRuns.end(workspaceId, runId);
       if (fromPage === 'reports') {
         navigate(testPath('/reports'));
       } else {
@@ -486,7 +494,7 @@ import { parseScenarioSpec, flattenExamples } from './bddSpec.js';
     // Save to backend
     try {
       const resultData = stepResults[stepId];
-      await api.tests.testRuns.updateStepResult(workspaceId, runId, stepId, {
+      await tests.testRuns.updateStepResult(workspaceId, runId, stepId, {
         status: resultData.status || 'not_run',
         actual_result: resultData.actual_result || '',
         notes: resultData.notes || '',

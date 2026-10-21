@@ -1,7 +1,9 @@
 <script>
   import { onMount } from 'svelte';
   import { useEventListener } from 'runed';
-  import { api } from '../../api.js';
+  import { configurationSets, screens } from '../../api/configuration.js';
+  import { items } from '../../api/items.js';
+  import { iterations } from '../../api/milestones.js';
   import { t } from '../../stores/i18n.svelte.js';
   import {
     collectionStore,
@@ -10,7 +12,8 @@
   } from '../../stores/collectionContext.js';
   import { resolveCreatedItemMembership } from './collectionService.js';
   import { useGradientStyles, loadWorkspaceGradient } from '../../stores/workspaceGradient.svelte.js';
-  import { List, Plus } from '@lucide/svelte';
+  import List from '@lucide/svelte/icons/list';
+  import Plus from '@lucide/svelte/icons/plus';
   import EmptyState from '../../components/EmptyState.svelte';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
   import { attachClosestEdge, extractClosestEdge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -21,7 +24,9 @@
   import BacklogIterationSection from './BacklogIterationSection.svelte';
   import { sortBacklogIterations } from './backlogIterationOrder.js';
   import ItemPicker from '../../pickers/ItemPicker.svelte';
-  import { backlogStore, workspaceDataStore, itemModalStore } from '../../stores/index.js';
+  import { backlogStore } from '../../stores/backlogStore.svelte.js';
+  import { workspaceDataStore } from '../../stores/workspaceDataStore.svelte.js';
+  import { itemModalStore } from '../../stores/itemModalStore.svelte.js';
   import { useCollectionEventStream } from '../../composables/useCollectionEventStream.svelte.js';
   import { errorToast, successToast, warningToast } from '../../stores/toasts.svelte.js';
   import { getIncompleteIterationItems } from './iterationCompletion.js';
@@ -164,10 +169,10 @@
     )];
 
     const [screensOutcome, configSetOutcomes] = await Promise.all([
-      api.screens.getAllWithFields()
+      screens.getAllWithFields()
         .then((screens) => ({ status: 'fulfilled', value: screens }))
         .catch((error) => ({ status: 'rejected', reason: error })),
-      Promise.allSettled(configSetIds.map((configSetId) => api.configurationSets.get(configSetId))),
+      Promise.allSettled(configSetIds.map((configSetId) => configurationSets.get(configSetId))),
     ]);
 
     if (screensOutcome.status === 'rejected') {
@@ -228,7 +233,7 @@
     setStoryPointsPending(item.id, true);
 
     try {
-      await api.items.update(item.id, { story_points: value });
+      await items.update(item.id, { story_points: value });
       collectionStore.patchItem(item.id, { story_points: value });
     } catch (error) {
       console.error('Failed to update story points:', error);
@@ -256,7 +261,7 @@
   async function handleRefreshWorkItems(event) {
     if (!event.detail?.itemId) return;
     try {
-      const newItem = event.detail.item ?? await api.items.get(event.detail.itemId);
+      const newItem = event.detail.item ?? await items.get(event.detail.itemId);
       // Collection QL and sub-filters depend on server state, so verify rather
       // than assume membership. Unknown never permits an insert; it reconciles.
       const membership = await resolveCreatedItemMembership(newItem, {
@@ -293,7 +298,7 @@
             (iteration) => !isPersonal || !iteration.is_global
           );
         } else {
-          const iters = await api.iterations.getAll({
+          const iters = await iterations.getAll({
             workspace_id: workspaceId,
             include_global: !isPersonal,
           });
@@ -348,7 +353,7 @@
   // --- Start / Complete iteration ---
   async function startIteration(iteration) {
     try {
-      await api.iterations.update(iteration.id, {
+      await iterations.update(iteration.id, {
         status: 'active',
         is_global: iteration.is_global,
         workspace_id: iteration.workspace_id,
@@ -381,7 +386,7 @@
 
     try {
       const targetIterationId = moveTarget.type === 'iteration' ? moveTarget.iterationId : null;
-      await api.iterations.complete(iteration.id, targetIterationId);
+      await iterations.complete(iteration.id, targetIterationId);
       allIterations = allIterations.map(i =>
         i.id === iteration.id ? { ...i, status: 'completed' } : i
       );
@@ -419,7 +424,7 @@
     setItemActionPending(item.id, true);
 
     try {
-      const boundaryItem = await api.items.getBacklogBoundary(
+      const boundaryItem = await items.getBacklogBoundary(
         workspaceId,
         collectionId,
         collectionStore.effectiveSubFilterQL,
@@ -427,7 +432,7 @@
       );
       if (!boundaryItem || boundaryItem.id === item.id) return;
 
-      await api.items.updateFracIndex(item.id, boundary === 'start'
+      await items.updateFracIndex(item.id, boundary === 'start'
         ? { previous_item_id: null, next_item_id: boundaryItem.id }
         : { previous_item_id: boundaryItem.id, next_item_id: null });
 
@@ -452,7 +457,7 @@
       if (iteration.status === 'active') {
         warningToast(t('iterations.activeScopeWarning'));
       }
-      await api.items.update(item.id, { iteration_id: iteration.id });
+      await items.update(item.id, { iteration_id: iteration.id });
       collectionStore.patchItem(item.id, {
         iteration_id: iteration.id,
         iteration_name: iteration.name,
@@ -612,7 +617,7 @@
         if (targetIteration?.status === 'active') {
           warningToast(t('iterations.activeScopeWarning'));
         }
-        await api.items.update(draggedItem.id, { iteration_id: targetIterationId });
+        await items.update(draggedItem.id, { iteration_id: targetIterationId });
         collectionStore.patchItem(draggedItem.id, { iteration_id: targetIterationId });
       }
 
@@ -654,7 +659,7 @@
         previous_item_id: prevItemId,
         next_item_id: nextItemId
       };
-      await api.items.updateFracIndex(draggedItem.id, indexData);
+      await items.updateFracIndex(draggedItem.id, indexData);
 
       // Reload data from central store to get the correct ordering
       reloadCollection();
@@ -692,7 +697,7 @@
         warningToast(t('iterations.activeScopeWarning'));
       }
 
-      await api.items.update(draggedItem.id, { iteration_id: newIterationId });
+      await items.update(draggedItem.id, { iteration_id: newIterationId });
       collectionStore.patchItem(draggedItem.id, { iteration_id: newIterationId });
       reloadCollection();
     } catch (error) {

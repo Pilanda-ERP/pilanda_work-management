@@ -1,5 +1,9 @@
 <script>
-  import { Link2, Trash2, Plus, GripVertical, FileText } from '@lucide/svelte';
+  import Link2 from '@lucide/svelte/icons/link-2';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Plus from '@lucide/svelte/icons/plus';
+  import GripVertical from '@lucide/svelte/icons/grip-vertical';
+  import FileText from '@lucide/svelte/icons/file-text';
   import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
   import Button from '../../components/Button.svelte';
   import LinkComponent from '../../components/Link.svelte';
@@ -7,7 +11,7 @@
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
   import { attachClosestEdge, extractClosestEdge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
   import DropIndicator from '../../layout/DropIndicator.svelte';
-  import { api } from '../../api.js';
+  import { items } from '../../api/items.js';
   import { t } from '../../stores/i18n.svelte.js';
   import ItemKey from '../../components/ItemKey.svelte';
   import StatusBadge from '../../components/StatusBadge.svelte';
@@ -101,7 +105,7 @@
     if (pendingStatusItemIds.has(rowItemId)) return;
     pendingStatusItemIds = new Set(pendingStatusItemIds).add(rowItemId);
     try {
-      await api.items.transition(rowItemId, statusId);
+      await items.transition(rowItemId, statusId);
       await onstatuschanged?.({ itemId: rowItemId, kind });
     } catch (error) {
       errorToast(t('dialogs.alerts.failedToUpdate', { error: `status: ${error.message || error}` }));
@@ -250,7 +254,7 @@
         }
       }
 
-      await api.items.updateFracIndex(draggedItem.id, {
+      await items.updateFracIndex(draggedItem.id, {
         previous_item_id: prevItemId,
         next_item_id: nextItemId
       });

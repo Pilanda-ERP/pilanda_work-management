@@ -2,9 +2,17 @@
   import { onMount } from 'svelte';
   import StateDisplay from '../../components/StateDisplay.svelte';
   import BackButton from '../../components/BackButton.svelte';
-  import { IconCalendar, IconTarget, IconEdit, IconTrash, IconDots, IconWorld, IconBuilding, IconSparkles, IconCircleCheck } from '@tabler/icons-svelte-runes';
+  import IconCalendar from '@tabler/icons-svelte-runes/icons/calendar';
+  import IconTarget from '@tabler/icons-svelte-runes/icons/target';
+  import IconEdit from '@tabler/icons-svelte-runes/icons/edit';
+  import IconTrash from '@tabler/icons-svelte-runes/icons/trash';
+  import IconDots from '@tabler/icons-svelte-runes/icons/dots';
+  import IconWorld from '@tabler/icons-svelte-runes/icons/world';
+  import IconBuilding from '@tabler/icons-svelte-runes/icons/building';
+  import IconSparkles from '@tabler/icons-svelte-runes/icons/sparkles';
+  import IconCircleCheck from '@tabler/icons-svelte-runes/icons/circle-check';
   import IterationBurndown from './IterationBurndown.svelte';
-  import { api } from '../../api.js';
+  import { iterations } from '../../api/milestones.js';
   import { navigate } from '../../router.js';
   import Button from '../../components/Button.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
@@ -81,9 +89,9 @@
     error = null;
     try {
       const [progressData, iterationData, burndownResult] = await Promise.all([
-        api.iterations.getProgress(iterationId),
-        api.iterations.get(iterationId),
-        api.iterations.getBurndown(iterationId).catch(() => null)
+        iterations.getProgress(iterationId),
+        iterations.get(iterationId),
+        iterations.getBurndown(iterationId).catch(() => null)
       ]);
       progress = progressData;
       iteration = iterationData;
@@ -136,7 +144,7 @@
 
   async function saveIteration() {
     try {
-      await api.iterations.update(iterationId, formData);
+      await iterations.update(iterationId, formData);
       showEditModal = false;
       await loadProgress();
     } catch (err) {
@@ -155,7 +163,7 @@
     });
     if (confirmed) {
       try {
-        await api.iterations.delete(iterationId);
+        await iterations.delete(iterationId);
         goBack();
       } catch (err) {
         console.error('Failed to delete iteration:', err);
@@ -169,7 +177,7 @@
       const filters = iteration?.is_global
         ? { include_global: true }
         : { workspace_id: iteration?.workspace_id || workspaceId, include_global: true };
-      const candidates = await api.iterations.getAll(filters);
+      const candidates = await iterations.getAll(filters);
       completionTargets = (candidates || []).filter(candidate => {
         if (candidate.id === iteration.id || !['planned', 'active'].includes(candidate.status)) return false;
         if (iteration.is_global) return candidate.is_global;
@@ -184,7 +192,7 @@
   async function completeIteration(moveTarget) {
     try {
       const targetIterationId = moveTarget.type === 'iteration' ? moveTarget.iterationId : null;
-      await api.iterations.complete(iterationId, targetIterationId);
+      await iterations.complete(iterationId, targetIterationId);
       successToast(t('iterations.iterationCompleted', { name: iteration.name }));
       await loadProgress();
     } catch (err) {

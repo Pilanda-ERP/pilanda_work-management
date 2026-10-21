@@ -4,13 +4,17 @@
   // existing requester/organisation/linked-asset endpoints and only loads when
   // the agent expands the section, so internal items never trigger the calls.
   import { onDestroy } from 'svelte';
-  import { Building2, ChevronRight, Package, User } from '@lucide/svelte';
+  import Building2 from '@lucide/svelte/icons/building-2';
+  import ChevronRight from '@lucide/svelte/icons/chevron-right';
+  import Package from '@lucide/svelte/icons/package';
+  import User from '@lucide/svelte/icons/user';
   import Spinner from '../../components/Spinner.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
   import Text from '../../components/Text.svelte';
   import ItemKey from '../../components/ItemKey.svelte';
   import { t } from '../../stores/i18n.svelte.js';
-  import { api } from '../../api.js';
+  import { customerOrganisations } from '../../api/portal.js';
+  import { itemLinkedAssets } from '../../api/assets.js';
   import { itemUrl } from '../../utils/urls.js';
 
   let { item } = $props();
@@ -39,11 +43,11 @@
     // still shows the requester and any linked assets.
     const [orgResult, assetResult] = await Promise.all([
       organisationId
-        ? api.customerOrganisations
+        ? customerOrganisations
             .getTickets(organisationId, { signal: controller.signal })
             .catch(() => [])
         : Promise.resolve([]),
-      api.itemLinkedAssets
+      itemLinkedAssets
         .get(item.id, { signal: controller.signal })
         .catch(() => []),
     ]);

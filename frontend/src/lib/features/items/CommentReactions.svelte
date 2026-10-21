@@ -2,10 +2,10 @@
 	// Emoji reactions under a comment (core#298): a quick way to acknowledge a
 	// comment without writing a reply. Clicking a chip toggles the viewer's own
 	// reaction; the picker offers the fixed server-side reaction set.
-	import { SmilePlus } from '@lucide/svelte';
+	import SmilePlus from '@lucide/svelte/icons/smile-plus';
 	import { useEventListener } from 'runed';
-	import { api } from '../../api.js';
-	import { authStore } from '../../stores';
+	import { addCommentReaction, removeCommentReaction } from '../../api/misc.js';
+	import { authStore } from '../../stores/auth.svelte.js';
 	import { t } from '../../stores/i18n.svelte.js';
 	import Tooltip from '../../components/Tooltip.svelte';
 
@@ -71,10 +71,10 @@
 		onChange?.(withToggle(previous, key, add));
 		try {
 			if (add) {
-				const updated = await api.addCommentReaction(comment.id, key);
+				const updated = await addCommentReaction(comment.id, key);
 				if (Array.isArray(updated)) onChange?.(updated);
 			} else {
-				await api.removeCommentReaction(comment.id, key);
+				await removeCommentReaction(comment.id, key);
 			}
 		} catch (err) {
 			console.error('Failed to update reaction:', err);

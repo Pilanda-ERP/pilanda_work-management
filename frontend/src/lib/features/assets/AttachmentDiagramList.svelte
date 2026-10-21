@@ -1,9 +1,13 @@
 <script>
-  import { IconPaperclip, IconPencil, IconTrash, IconPhoto, IconDownload } from '@tabler/icons-svelte-runes';
+  import IconPaperclip from '@tabler/icons-svelte-runes/icons/paperclip';
+  import IconPencil from '@tabler/icons-svelte-runes/icons/pencil';
+  import IconTrash from '@tabler/icons-svelte-runes/icons/trash';
+  import IconPhoto from '@tabler/icons-svelte-runes/icons/photo';
+  import IconDownload from '@tabler/icons-svelte-runes/icons/download';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
   import { portal } from '../../actions/portal.js';
-  import { api } from '../../api.js';
+  import { attachments as attachmentsApi } from '../../api/misc.js';
 
   let {
     attachments = [],
@@ -47,11 +51,11 @@
   }
 
   function thumbUrl(att) {
-    return api.attachments.getThumbnailUrl(att.id);
+    return attachmentsApi.getThumbnailUrl(att.id);
   }
 
   function contentUrl(att) {
-    return api.attachments.getContentUrl(att.id);
+    return attachmentsApi.getContentUrl(att.id);
   }
 
   function formatFileSize(bytes) {
@@ -64,7 +68,7 @@
 
   async function handleDownload(attachment) {
     try {
-      const downloadUrl = api.attachments.getDownloadUrl(attachment.id);
+      const downloadUrl = attachmentsApi.getDownloadUrl(attachment.id);
       const response = await fetch(downloadUrl);
       if (!response.ok) {
         throw new Error(`Download failed: ${response.statusText}`);

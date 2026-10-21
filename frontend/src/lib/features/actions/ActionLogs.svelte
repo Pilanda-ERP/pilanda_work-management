@@ -1,13 +1,17 @@
 <script>
   import { onMount } from 'svelte';
   import StateDisplay from '../../components/StateDisplay.svelte';
-  import { api } from '../../api.js';
+  import { actions } from '../../api/actions.js';
   import { t } from '../../stores/i18n.svelte.js';
   import DataTable from '../../components/DataTable.svelte';
   import Button from '../../components/Button.svelte';
   import BackButton from '../../components/BackButton.svelte';
   import ExecutionTraceModal from './ExecutionTraceModal.svelte';
-  import { CheckCircle, XCircle, Clock, SkipForward, Eye } from '@lucide/svelte';
+  import CheckCircle from '@lucide/svelte/icons/check-circle';
+  import XCircle from '@lucide/svelte/icons/x-circle';
+  import Clock from '@lucide/svelte/icons/clock';
+  import SkipForward from '@lucide/svelte/icons/skip-forward';
+  import Eye from '@lucide/svelte/icons/eye';
   import { formatAuthenticatedDateTime } from '../../utils/authenticatedDateFormatter.js';
 
   let { workspaceId, action, onBack } = $props();
@@ -52,7 +56,7 @@
   async function loadLogs() {
     loading = true;
     try {
-      logs = await api.actions.getLogs(workspaceId, action.id) || [];
+      logs = await actions.getLogs(workspaceId, action.id) || [];
     } catch (err) {
       console.error('Failed to load logs:', err);
       logs = [];

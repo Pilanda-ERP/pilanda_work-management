@@ -1,6 +1,6 @@
 <script>
   import { onMount, untrack } from 'svelte';
-  import { api } from '../../api.js';
+  import { items as itemsApi } from '../../api/items.js';
   import {
     applyCollectionItem,
     collectionStore,
@@ -11,7 +11,10 @@
   import { errorToast } from '../../stores/toasts.svelte.js';
   import { workspacePermissions } from '../../stores/workspacePermissions.svelte.js';
   import { useGradientStyles, loadWorkspaceGradient } from '../../stores/workspaceGradient.svelte.js';
-  import { ChevronRight, ChevronDown, FileCheck, Minus } from '@lucide/svelte';
+  import ChevronRight from '@lucide/svelte/icons/chevron-right';
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import FileCheck from '@lucide/svelte/icons/file-check';
+  import Minus from '@lucide/svelte/icons/minus';
   import ViewHeader from '../../layout/ViewHeader.svelte';
   import StaticViewBackground from '../../layout/StaticViewBackground.svelte';
   import SubFilterBar from './SubFilterBar.svelte';
@@ -20,12 +23,10 @@
   import EmptyState from '../../components/EmptyState.svelte';
   import TableHeaderBar from '../../components/TableHeaderBar.svelte';
   import { moduleSettings } from '../../stores/moduleSettings.js';
-  import {
-    collectionEditorOptions,
-    collectionFieldLinks,
-    itemTestCaseLinksStore,
-    workspaceDataStore,
-  } from '../../stores/index.js';
+  import { collectionEditorOptions } from '../../stores/collectionEditorOptions.svelte.js';
+  import { collectionFieldLinks } from '../../stores/collectionFieldLinks.svelte.js';
+  import { itemTestCaseLinksStore } from '../../stores/itemTestCaseLinksStore.svelte.js';
+  import { workspaceDataStore } from '../../stores/workspaceDataStore.svelte.js';
   import {
     getListColumnLabel,
     listGridMinWidth,
@@ -145,10 +146,12 @@
     ) {
       return;
     }
-    collectionEditorOptions.prime(
-      id,
-      { statuses, users, milestones, iterations, projects },
-      workspaceDataStore.planningCompleteness
+    untrack(() =>
+      collectionEditorOptions.prime(
+        id,
+        { statuses, users, milestones, iterations, projects },
+        workspaceDataStore.planningCompleteness
+      )
     );
   });
 
@@ -224,7 +227,7 @@
     }
     ancestorsRequestInFlight = true;
     try {
-      const entries = await api.items.getManyAncestors(orphanIds);
+      const entries = await itemsApi.getManyAncestors(orphanIds);
       for (const { item_id: orphanId, ancestors } of entries) {
         // The gap may have closed while the request was in flight.
         const parentId = parentByOrphanId.get(orphanId);

@@ -1,8 +1,15 @@
 <script>
   import { onMount } from 'svelte';
   import Badge from '../components/Badge.svelte';
-  import { IconUsers as Users, IconMail as Mail, IconPhone as Phone, IconEdit as Edit2, IconSend as Send, IconMessage as MessageCircle, IconTrash as Trash2, IconDots as MoreHorizontal } from '@tabler/icons-svelte-runes';
-  import { api } from '../api.js';
+  import Users from '@tabler/icons-svelte-runes/icons/users';
+  import Mail from '@tabler/icons-svelte-runes/icons/mail';
+  import Phone from '@tabler/icons-svelte-runes/icons/phone';
+  import Edit2 from '@tabler/icons-svelte-runes/icons/edit';
+  import Send from '@tabler/icons-svelte-runes/icons/send';
+  import MessageCircle from '@tabler/icons-svelte-runes/icons/message';
+  import Trash2 from '@tabler/icons-svelte-runes/icons/trash';
+  import MoreHorizontal from '@tabler/icons-svelte-runes/icons/dots';
+  import { contactRoles as contactRolesApi, portalCustomers } from '../api/portal.js';
   import { confirm } from '../composables/useConfirm.js';
   import { errorToast } from '../stores/toasts.svelte.js';
   import Button from '../components/Button.svelte';
@@ -84,7 +91,7 @@
   onMount(async () => {
     await loadCustomer();
     try {
-      const roles = await api.contactRoles.getAll();
+      const roles = await contactRolesApi.getAll();
       contactRoles = Array.isArray(roles) ? roles : (roles?.data ?? []);
     } catch (err) {
       console.error('Failed to load contact roles:', err);
@@ -101,7 +108,7 @@
     loading = true;
     error = null;
     try {
-      customer = await api.portalCustomers.getById(contactId);
+      customer = await portalCustomers.getById(contactId);
     } catch (err) {
       console.error('Failed to load customer:', err);
       error = t('workspaces.customers.failedToLoadCustomer') || 'Failed to load customer';
@@ -134,8 +141,8 @@
   async function saveChanges() {
     saving = true;
     try {
-      await api.portalCustomers.update(customer.id, editFormData);
-      customer = await api.portalCustomers.getById(contactId);
+      await portalCustomers.update(customer.id, editFormData);
+      customer = await portalCustomers.getById(contactId);
       isEditing = false;
       onCustomerUpdated();
     } catch (err) {
@@ -160,7 +167,7 @@
 
     deleting = true;
     try {
-      await api.portalCustomers.delete(customer.id);
+      await portalCustomers.delete(customer.id);
       await onCustomerUpdated();
       onBack();
     } catch (err) {
@@ -198,7 +205,7 @@
     if (submissions !== null) return;
     loadingSubmissions = true;
     try {
-      submissions = await api.portalCustomers.getSubmissions(contactId);
+      submissions = await portalCustomers.getSubmissions(contactId);
     } catch (err) {
       console.error('Failed to load submissions:', err);
       submissions = [];
@@ -211,7 +218,7 @@
     if (channels !== null) return;
     loadingChannels = true;
     try {
-      channels = await api.portalCustomers.getChannels(contactId);
+      channels = await portalCustomers.getChannels(contactId);
     } catch (err) {
       console.error('Failed to load channels:', err);
       channels = [];

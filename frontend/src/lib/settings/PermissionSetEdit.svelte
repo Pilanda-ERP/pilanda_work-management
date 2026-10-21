@@ -1,10 +1,12 @@
 <script>
   import { onMount } from 'svelte';
   import { currentRoute, navigate } from '../router.js';
-  import { api } from '../api.js';
+  import { del, get, post, put } from '../api/core.js';
   import { t } from '../stores/i18n.svelte.js';
   import { errorToast } from '../stores/toasts.svelte.js';
-  import { Save, X, UserPlus } from '@lucide/svelte';
+  import Save from '@lucide/svelte/icons/save';
+  import X from '@lucide/svelte/icons/x';
+  import UserPlus from '@lucide/svelte/icons/user-plus';
   import Button from '../components/Button.svelte';
   import BackButton from '../components/BackButton.svelte';
   import Modal from '../dialogs/Modal.svelte';
@@ -91,8 +93,8 @@
       loading = true;
 
       const [setData, assignmentData] = await Promise.all([
-        api.get(`/permission-sets/${permissionSetId}`),
-        api.get(`/permission-sets/${permissionSetId}/assignments`)
+        get(`/permission-sets/${permissionSetId}`),
+        get(`/permission-sets/${permissionSetId}/assignments`)
       ]);
 
       permissionSet = setData;
@@ -122,7 +124,7 @@
 
   async function loadPermissions() {
     try {
-      const data = await api.get('/permissions') || [];
+      const data = await get('/permissions') || [];
       const workspacePerms = data.filter(p => p.scope === 'workspace');
 
       // Define permission order (least to most privileged)
@@ -165,7 +167,7 @@
         return;
       }
 
-      const updated = await api.put(`/permission-sets/${permissionSetId}`, {
+      const updated = await put(`/permission-sets/${permissionSetId}`, {
         name: formData.name,
         description: formData.description,
         permission_ids: []
@@ -199,10 +201,10 @@
       else if (type === 'group') payload.group_id = entityId;
       else if (type === 'user') payload.user_id = entityId;
 
-      await api.post(`/permission-sets/${permissionSetId}/assignments`, payload);
+      await post(`/permission-sets/${permissionSetId}/assignments`, payload);
 
       // Reload assignments
-      const assignmentData = await api.get(`/permission-sets/${permissionSetId}/assignments`);
+      const assignmentData = await get(`/permission-sets/${permissionSetId}/assignments`);
 
       assignments = {
         role_assignments: assignmentData.role_assignments || [],
@@ -242,10 +244,10 @@
     if (!confirmed) return;
 
     try {
-      await api.delete(`/permission-sets/${permissionSetId}/assignments/${assignmentId}?type=${type}`);
+      await del(`/permission-sets/${permissionSetId}/assignments/${assignmentId}?type=${type}`);
 
       // Reload assignments
-      const assignmentData = await api.get(`/permission-sets/${permissionSetId}/assignments`);
+      const assignmentData = await get(`/permission-sets/${permissionSetId}/assignments`);
       assignments = {
         role_assignments: assignmentData.role_assignments || [],
         group_assignments: assignmentData.group_assignments || [],

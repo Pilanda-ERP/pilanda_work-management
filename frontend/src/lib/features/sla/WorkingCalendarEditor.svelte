@@ -10,9 +10,10 @@
   import TextareaField from '../../components/TextareaField.svelte';
   import Toggle from '../../components/Toggle.svelte';
   import TimezonePicker from '../../pickers/TimezonePicker.svelte';
-  import { Plus, Trash2 } from '@lucide/svelte';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
   import { t } from '../../stores/i18n.svelte.js';
-  import { api } from '../../api.js';
+  import { sla } from '../../api/sla.js';
 
   let {
     isOpen = $bindable(false),
@@ -57,13 +58,13 @@
   $effect(() => {
     const id = calendar?.id;
     const ownedByWorkspace = !!calendar?.workspace_id;
-    if (!isOpen || !id || !workspaceId || !ownedByWorkspace || !api.sla?.getCoveragePreview) {
+    if (!isOpen || !id || !workspaceId || !ownedByWorkspace || !sla?.getCoveragePreview) {
       coverage = null;
       return;
     }
     let active = true;
     coverageLoading = true;
-    api.sla
+    sla
       .getCoveragePreview(workspaceId, id)
       .then((value) => {
         if (active) coverage = value;
@@ -91,9 +92,9 @@
     const teamId = calendar?.team_id;
     let request;
     if (teamId) {
-      request = api.sla?.getTeamCalendarImpact?.(teamId, id);
+      request = sla?.getTeamCalendarImpact?.(teamId, id);
     } else if (workspaceId) {
-      request = api.sla?.getCalendarImpact?.(workspaceId, id);
+      request = sla?.getCalendarImpact?.(workspaceId, id);
     }
     if (!request) {
       ongoingImpact = null;

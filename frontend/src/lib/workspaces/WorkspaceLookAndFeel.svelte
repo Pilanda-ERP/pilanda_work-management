@@ -1,9 +1,12 @@
 <script>
   import { onMount } from 'svelte';
   import { useDebounce } from 'runed';
-  import { api } from '../api.js';
+  import { workspaces } from '../api/workspaces.js';
+  import { attachments } from '../api/misc.js';
   import { navigate } from '../router.js';
-  import { workspacePermissions, currentWorkspace, attachmentStatus, workspacesStore } from '../stores';
+  import { workspacePermissions } from '../stores/workspacePermissions.svelte.js';
+  import { currentWorkspace, workspacesStore } from '../stores/workspaces.svelte.js';
+  import { attachmentStatus } from '../stores/attachmentStatus.svelte.js';
   import { workspaceDataStore } from '../stores/workspaceDataStore.svelte.js';
   import {
     workspaceGradientIndex,
@@ -14,7 +17,11 @@
   } from '../stores/workspaceGradient.svelte.js';
   import { gradients } from '../utils/gradients.js';
   import { workspaceIconMap } from '../utils/icons.js';
-  import { Palette, Camera, Trash2, Shield, Package } from '@lucide/svelte';
+  import Palette from '@lucide/svelte/icons/palette';
+  import Camera from '@lucide/svelte/icons/camera';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Shield from '@lucide/svelte/icons/shield';
+  import Package from '@lucide/svelte/icons/package';
   import IconSelector from '../pickers/IconSelector.svelte';
   import BackgroundImageSelector from '../components/BackgroundImageSelector.svelte';
   import GradientPicker from '../components/GradientPicker.svelte';
@@ -114,12 +121,12 @@
       };
 
       await Promise.all([
-        api.workspaces.update(workspaceId, {
+        workspaces.update(workspaceId, {
           icon,
           color,
           avatar_url: avatarUrl
         }),
-        api.workspaces.updateHomepageLayout(workspaceId, layoutPayload)
+        workspaces.updateHomepageLayout(workspaceId, layoutPayload)
       ]);
 
       // Update currentWorkspace store immediately (no full reload)
@@ -169,7 +176,7 @@
       uploadFormData.append('entity_type', 'workspace_avatar');
       uploadFormData.append('category', 'workspace_avatar');
 
-      const uploadResult = await api.attachments.upload(uploadFormData);
+      const uploadResult = await attachments.upload(uploadFormData);
 
       if (uploadResult && uploadResult.success && uploadResult.avatar_url) {
         avatarUrl = uploadResult.avatar_url;
@@ -254,7 +261,7 @@
       uploadFormData.append('entity_type', 'workspace_background');
       uploadFormData.append('category', 'workspace_background');
 
-      const uploadResult = await api.attachments.upload(uploadFormData);
+      const uploadResult = await attachments.upload(uploadFormData);
       if (uploadResult?.success && uploadResult.background_url) {
         selectBackgroundImage(uploadResult.background_url);
         successToast(t('lookAndFeel.backgroundUploadedSuccess'));

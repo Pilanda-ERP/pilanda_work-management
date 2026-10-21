@@ -2,7 +2,7 @@
   import { t } from '../../stores/i18n.svelte.js';
   import { collectionEditorOptions } from '../../stores/collectionEditorOptions.svelte.js';
   import { collectionFieldLinks } from '../../stores/collectionFieldLinks.svelte.js';
-  import { api } from '../../api.js';
+  import { items } from '../../api/items.js';
   import { updateCustomFieldValue } from '../../utils/customFieldValueUpdates.js';
   import InlineFieldEditor from '../../editors/InlineFieldEditor.svelte';
   import ItemPicker from '../../pickers/ItemPicker.svelte';
@@ -12,7 +12,10 @@
   import ColorDot from '../../components/ColorDot.svelte';
   import Checkbox from '../../components/Checkbox.svelte';
   import ListCustomFieldCell from './ListCustomFieldCell.svelte';
-  import { Calendar, User, Target, FolderKanban } from '@lucide/svelte';
+  import Calendar from '@lucide/svelte/icons/calendar';
+  import User from '@lucide/svelte/icons/user';
+  import Target from '@lucide/svelte/icons/target';
+  import FolderKanban from '@lucide/svelte/icons/folder-kanban';
   import ItemTypeIcon from '../../components/ItemTypeIcon.svelte';
   import { formatDate, formatDateOnly, formatDateTimeLocale } from '../../utils/dateFormatter.js';
   import { durationToString } from '../../utils/timeUtils.js';
@@ -74,8 +77,8 @@
   async function handleItemUpdate(field, value) {
     try {
       const updatedItem = field === 'status_id'
-        ? await api.items.transition(item.id, value)
-        : await api.items.update(item.id, { [field]: value });
+        ? await items.transition(item.id, value)
+        : await items.update(item.id, { [field]: value });
       onitemUpdated?.({ item: updatedItem, field, value });
     } catch (error) {
       onupdateError?.({ error: error.message, field, value });
@@ -86,7 +89,7 @@
   // is sent.
   async function handleCustomFieldUpdate(fieldIdentifier, value) {
     try {
-      const updatedItem = await updateCustomFieldValue(api, item.id, fieldIdentifier, value);
+      const updatedItem = await updateCustomFieldValue(item.id, fieldIdentifier, value);
       onitemUpdated?.({ item: updatedItem, field: fieldIdentifier, value });
     } catch (error) {
       onupdateError?.({ error: error.message, field: fieldIdentifier, value });
@@ -100,7 +103,7 @@
     const PERSONAL_STATUS_OPEN = 1;
     const PERSONAL_STATUS_DONE = 3;
     try {
-      const updatedItem = await api.items.transition(item.id, isCompleted ? PERSONAL_STATUS_DONE : PERSONAL_STATUS_OPEN);
+      const updatedItem = await items.transition(item.id, isCompleted ? PERSONAL_STATUS_DONE : PERSONAL_STATUS_OPEN);
       item = { ...item, status_id: updatedItem.status_id, status_name: updatedItem.status_name };
       onitemUpdated?.({ item, field: 'status', value: updatedItem.status_id });
     } catch (error) {

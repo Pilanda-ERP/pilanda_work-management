@@ -1,6 +1,8 @@
 <script>
   import { currentRoute, isWorkspaceRoute } from '../router.js';
-  import { permissionStore, uiStore, workspacesStore } from '../stores';
+  import { permissionStore } from '../stores/permissions.svelte.js';
+  import { uiStore } from '../stores/ui.svelte.js';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import { themeStore } from '../stores/theme.svelte.js';
   import { aiStore } from '../stores/aiStore.svelte.js';
@@ -13,11 +15,15 @@
   import UserAvatar from '../components/UserAvatar.svelte';
   import NotificationTray from '../features/notifications/NotificationTray.svelte';
   import ScrollableSidebar from './ScrollableSidebar.svelte';
-  import {
-    IconSearch, IconPlus, IconGridDots, IconUserScan,
-    IconFolders, IconLayoutSidebarLeftExpand, IconLayoutSidebarLeftCollapse,
-    IconMessage, IconTerminal2,
-  } from '@tabler/icons-svelte-runes';
+  import IconSearch from '@tabler/icons-svelte-runes/icons/search';
+  import IconPlus from '@tabler/icons-svelte-runes/icons/plus';
+  import IconGridDots from '@tabler/icons-svelte-runes/icons/grid-dots';
+  import IconUserScan from '@tabler/icons-svelte-runes/icons/user-scan';
+  import IconFolders from '@tabler/icons-svelte-runes/icons/folders';
+  import IconLayoutSidebarLeftExpand from '@tabler/icons-svelte-runes/icons/layout-sidebar-left-expand';
+  import IconLayoutSidebarLeftCollapse from '@tabler/icons-svelte-runes/icons/layout-sidebar-left-collapse';
+  import IconMessage from '@tabler/icons-svelte-runes/icons/message';
+  import IconTerminal2 from '@tabler/icons-svelte-runes/icons/terminal-2';
   import { mainNavItems, bottomNavItems } from '../navigation/mainNavigation.js';
 
   let {

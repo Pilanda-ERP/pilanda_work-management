@@ -1,6 +1,9 @@
 <script>
-  import { Plus, RefreshCw, Search } from '@lucide/svelte';
-  import { api } from '../../api.js';
+  import Plus from '@lucide/svelte/icons/plus';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import Search from '@lucide/svelte/icons/search';
+  import { collections as collectionsApi } from '../../api/collections.js';
+  import { items as itemsApi } from '../../api/items.js';
   import { workspacesStore } from '../../stores/workspaces.svelte.js';
   import BasePicker from '../../pickers/BasePicker.svelte';
   import { t } from '../../stores/i18n.svelte.js';
@@ -79,7 +82,7 @@
 
     try {
       const filters = workspaceId ? { workspace_id: workspaceId } : {};
-      const collectionResponse = await api.collections.getAll(filters);
+      const collectionResponse = await collectionsApi.getAll(filters);
       if (version !== collectionLoadVersion) return;
 
       collections = Array.isArray(collectionResponse) ? collectionResponse : [];
@@ -119,7 +122,7 @@
     error = null;
 
     try {
-      const response = await api.items.getAll({
+      const response = await itemsApi.getAll({
         collection_id: selectedCollectionId,
         limit: fetchLimit,
         order_by: 'updated_at',

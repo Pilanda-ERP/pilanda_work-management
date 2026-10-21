@@ -1,21 +1,22 @@
 <script>
   import { onMount, onDestroy, tick } from 'svelte';
-  import { authStore, homepageStore, permissionStore, isSystemAdmin, workspacesStore } from '../stores';
+  import { authStore } from '../stores/auth.svelte.js';
+  import { homepageStore } from '../stores/homepageStore.svelte.js';
+  import { permissionStore, isSystemAdmin } from '../stores/permissions.svelte.js';
+  import { workspacesStore } from '../stores/workspaces.svelte.js';
   import { t } from '../stores/i18n.svelte.js';
   import DashboardOnboarding from './DashboardOnboarding.svelte';
   import Text from '../components/Text.svelte';
   import Button from '../components/Button.svelte';
   import Input from '../components/Input.svelte';
-  import {
-    ChevronDown,
-    ChevronUp,
-    Edit3,
-    LayoutGrid,
-    Plus,
-    Pencil,
-    Trash2,
-    X,
-  } from '@lucide/svelte';
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import ChevronUp from '@lucide/svelte/icons/chevron-up';
+  import Edit3 from '@lucide/svelte/icons/edit-3';
+  import LayoutGrid from '@lucide/svelte/icons/layout-grid';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Pencil from '@lucide/svelte/icons/pencil';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import X from '@lucide/svelte/icons/x';
   import { useEventListener } from 'runed';
   import { confirm } from '../composables/useConfirm.js';
   import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';

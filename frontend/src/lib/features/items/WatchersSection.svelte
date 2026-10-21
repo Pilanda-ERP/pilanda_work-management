@@ -1,11 +1,16 @@
 <script>
-  import { Eye, X, Plus, ChevronDown, ChevronRight } from '@lucide/svelte';
+  import Eye from '@lucide/svelte/icons/eye';
+  import X from '@lucide/svelte/icons/x';
+  import Plus from '@lucide/svelte/icons/plus';
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import Spinner from '../../components/Spinner.svelte';
   import Text from '../../components/Text.svelte';
   import Avatar from '../../components/Avatar.svelte';
   import UserPicker from '../../pickers/UserPicker.svelte';
-  import { api } from '../../api.js';
-  import { authStore, itemDetailStore } from '../../stores';
+  import { getAssignableUsers } from '../../api/users.js';
+  import { authStore } from '../../stores/auth.svelte.js';
+  import { itemDetailStore } from '../../stores/itemDetailStore.svelte.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
 
@@ -64,7 +69,7 @@
     showAddForm = true;
     if (candidates !== null || !workspaceId) return;
     try {
-      candidates = (await api.getAssignableUsers(workspaceId)) ?? [];
+      candidates = (await getAssignableUsers(workspaceId)) ?? [];
     } catch (error) {
       candidates = [];
       errorToast(error?.message || t('items.watchersAddFailed'));

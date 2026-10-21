@@ -1,25 +1,25 @@
 <script>
   import { onMount } from 'svelte';
-  import {
-    IconPlus as Plus,
-    IconArrowLeft as ArrowLeft,
-    IconSquareCheck as CheckSquare,
-    IconCalendar as Calendar,
-    IconHome as Home,
-    IconSettings as Settings,
-    IconBook as BookOpen,
-    IconChevronDown as ChevronDown,
-    IconChevronRight,
-    IconPalette as Palette,
-    IconSparkles as Sparkles,
-    IconPencil as Pencil,
-  } from '@tabler/icons-svelte-runes';
+  import Plus from '@tabler/icons-svelte-runes/icons/plus';
+  import ArrowLeft from '@tabler/icons-svelte-runes/icons/arrow-left';
+  import CheckSquare from '@tabler/icons-svelte-runes/icons/square-check';
+  import Calendar from '@tabler/icons-svelte-runes/icons/calendar';
+  import Home from '@tabler/icons-svelte-runes/icons/home';
+  import Settings from '@tabler/icons-svelte-runes/icons/settings';
+  import BookOpen from '@tabler/icons-svelte-runes/icons/book';
+  import ChevronDown from '@tabler/icons-svelte-runes/icons/chevron-down';
+  import IconChevronRight from '@tabler/icons-svelte-runes/icons/chevron-right';
+  import Palette from '@tabler/icons-svelte-runes/icons/palette';
+  import Sparkles from '@tabler/icons-svelte-runes/icons/sparkles';
+  import Pencil from '@tabler/icons-svelte-runes/icons/pencil';
   import { workspaceViewItems, workspaceOnlyViews, testNavigationItems, visibleWorkspaceSettingsItems, workspaceSettingsViews, workspaceSettingsRoute, collectionSwitchUrl } from '../navigation/workspaceNavigation.js';
   import { viewSettingsStore } from '../stores/viewSettings.svelte.js';
   import { navigate, currentRoute } from '../router.js';
-  import { authStore, currentWorkspace, workspacePermissions } from '../stores';
+  import { authStore } from '../stores/auth.svelte.js';
+  import { currentWorkspace } from '../stores/workspaces.svelte.js';
+  import { workspacePermissions } from '../stores/workspacePermissions.svelte.js';
   import { moduleSettings } from '../stores/moduleSettings.js';
-  import { api } from '../api.js';
+  import { collections as collectionsApi } from '../api/collections.js';
   import DropdownMenu from '../layout/DropdownMenu.svelte';
   import ScrollableSidebar from '../layout/ScrollableSidebar.svelte';
   import SidebarResizeHandle from '../layout/SidebarResizeHandle.svelte';
@@ -189,7 +189,7 @@
 
   async function loadCollections() {
     try {
-      const result = await api.collections.getAll();
+      const result = await collectionsApi.getAll();
       allCollections = result || [];
 
       // Filter collections for this workspace

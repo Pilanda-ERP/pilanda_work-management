@@ -1,7 +1,8 @@
 <script>
   import { onMount } from 'svelte';
   import TabStrip from '../../components/TabStrip.svelte';
-  import { api } from '../../api.js';
+  import { time } from '../../api/time.js';
+  import { customerOrganisations } from '../../api/portal.js';
   import Button from '../../components/Button.svelte';
   import TimeProjectCategories from './TimeProjectCategories.svelte';
   import TimeProjectModal from '../../dialogs/TimeProjectModal.svelte';
@@ -10,14 +11,18 @@
   import PageHeader from '../../layout/PageHeader.svelte';
   import DataTable from '../../components/DataTable.svelte';
   import Lozenge from '../../components/Lozenge.svelte';
-  import { Plus, Briefcase, Edit, Trash2, Shield } from '@lucide/svelte';
+  import Plus from '@lucide/svelte/icons/plus';
+  import Briefcase from '@lucide/svelte/icons/briefcase';
+  import Edit from '@lucide/svelte/icons/edit';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Shield from '@lucide/svelte/icons/shield';
   import SearchInput from '../../components/SearchInput.svelte';
   import ColorDot from '../../components/ColorDot.svelte';
   import { toHotkeyString } from '../../utils/keyboardShortcuts.js';
   import { t } from '../../stores/i18n.svelte.js';
   import { customerDisplayName, isNoCustomer } from '../../utils/customerLabel.js';
   import { errorToast } from '../../stores/toasts.svelte.js';
-  import { permissionStore, isSystemAdmin } from '../../stores';
+  import { permissionStore, isSystemAdmin } from '../../stores/permissions.svelte.js';
   import { confirm } from '../../composables/useConfirm.js';
 
   let activeTab = $state('projects');
@@ -54,7 +59,7 @@
 
   async function loadProjects() {
     try {
-      const result = await api.time.projects.getAll();
+      const result = await time.projects.getAll();
       projects = result || [];
     } catch (error) {
       console.error('Failed to load projects:', error);
@@ -64,7 +69,7 @@
 
   async function loadCustomers() {
     try {
-      const result = await api.customerOrganisations.getAll();
+      const result = await customerOrganisations.getAll();
       customers = result || [];
     } catch (error) {
       console.error('Failed to load customers:', error);
@@ -74,7 +79,7 @@
 
   async function loadCategories() {
     try {
-      const result = await api.time.projectCategories.getAll();
+      const result = await time.projectCategories.getAll();
       categories = result || [];
     } catch (error) {
       console.error('Failed to load categories:', error);
@@ -144,9 +149,9 @@
       };
 
       if (editingProject) {
-        await api.time.projects.update(editingProject.id, data);
+        await time.projects.update(editingProject.id, data);
       } else {
-        await api.time.projects.create(data);
+        await time.projects.create(data);
       }
       await loadProjects();
       cancelForm();
@@ -167,7 +172,7 @@
 
     if (confirmed) {
       try {
-        await api.time.projects.delete(project.id);
+        await time.projects.delete(project.id);
         await loadProjects();
       } catch (error) {
         console.error('Failed to delete project:', error);
